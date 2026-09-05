@@ -35,7 +35,7 @@ async function main() {
     throw new Error('Application isolation settings are missing.');
   }
   const result = await window.webContents.executeJavaScript(`(async () => {
-    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId, studyId: fixture.studyId })};
+    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId, studyId: fixture.studyId, held: Boolean(fixture.held) })};
     const waitFor = async predicate => {
       const deadline = Date.now() + 10000;
       while (!predicate()) {
@@ -52,12 +52,19 @@ async function main() {
     const project = [...document.querySelectorAll('#projects button')].find(button => button.dataset.projectId === expected.projectId);
     if (!project) throw new Error('Expected synthetic project is missing.');
     project.click();
-    await waitFor(() => document.querySelector('#decisions textarea'));
-    const card = [...document.querySelectorAll('#decisions article')].find(node => node.textContent.includes(expected.decisionId));
-    if (!card) throw new Error('Expected synthetic decision is missing.');
-    card.querySelector('textarea').value = 'Synthetic UI acceptance fixture.';
-    [...card.querySelectorAll('button')].find(button => button.textContent === 'Approve').click();
-    await waitFor(() => document.querySelector('#decisions').textContent.includes('No pending decisions.'));
+    if (expected.held) {
+      await waitFor(() => !document.querySelector('#recovery-banner').hidden);
+      for (const id of ['project-new', 'task-new', 'thread-new']) {
+        if (!document.querySelector('#' + id).disabled) throw new Error('Held control is enabled: ' + id);
+      }
+    } else {
+      await waitFor(() => document.querySelector('#decisions textarea'));
+      const card = [...document.querySelectorAll('#decisions article')].find(node => node.textContent.includes(expected.decisionId));
+      if (!card) throw new Error('Expected synthetic decision is missing.');
+      card.querySelector('textarea').value = 'Synthetic UI acceptance fixture.';
+      [...card.querySelectorAll('button')].find(button => button.textContent === 'Approve').click();
+      await waitFor(() => document.querySelector('#decisions').textContent.includes('No pending decisions.'));
+    }
     await waitFor(() => [...document.querySelectorAll('[data-study-id]')].some(node => node.dataset.studyId === expected.studyId));
     [...document.querySelectorAll('[data-study-id]')].find(node => node.dataset.studyId === expected.studyId).click();
     await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 80);
@@ -73,7 +80,7 @@ async function main() {
       if (!detail.textContent.includes(expectedText)) throw new Error('Missing research record: ' + expectedText);
     }
     if (typeof window.require !== 'undefined') throw new Error('Node is exposed to renderer.');
-    return { href: location.href, decisionRemoved: true, researchVariants: 80 };
+    return { href: location.href, decisionRemoved: !expected.held, held: expected.held, researchVariants: 80 };
   })()`, true);
   if (result.href !== 'tessera://app/index.html' || errors.length) throw new Error('Unexpected renderer state.');
   console.log(JSON.stringify(result));

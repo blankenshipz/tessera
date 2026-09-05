@@ -116,6 +116,10 @@ def create_app(state_dir: Path) -> FastAPI:
     def me(actor: Annotated[dict[str, Any], Depends(principal)]) -> dict[str, Any]:
         return store.me(actor)
 
+    @app.get("/recovery")
+    def recovery(actor: Annotated[dict[str, Any], Depends(principal)]) -> dict[str, Any]:
+        return store.recovery_status(actor)
+
     @app.get("/credentials")
     def list_credentials(
         actor: Annotated[dict[str, Any], Depends(principal)],

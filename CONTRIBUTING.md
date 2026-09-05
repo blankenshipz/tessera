@@ -71,7 +71,8 @@ stub selects the fixture credential; actual renderer, IPC, authentication and
 decision routes record an explicit synthetic approval. It verifies that no
 execution grant or lease was created. It also browses the complete 80-variant
 synthetic study and its correction history without changing any research record.
-No real project or credential is used.
+A second pass restores the backup, browses the same ledger with a fresh credential,
+and verifies that write controls are disabled. No real project or credential is used.
 
 The maintainer has paused PRs while the initial implementation takes shape.
 Use logical, tested commits on `main`; PRs can resume when requested.
@@ -121,3 +122,13 @@ For the development Compose volume, stop `control`, rebuild, then run
 `docker compose run --rm control tessera migrate --state-dir /state/control`
 before `docker compose up -d --wait control`. This preserves the original owner
 credential and labbook. Do not use `down -v` as an upgrade procedure.
+
+## Local backup and held recovery
+
+Schema 11 provides `tessera backup --state-dir SOURCE --output NEW_BACKUP` and
+`tessera restore --backup BACKUP --state-dir NEW_STATE`. Backup uses SQLite's
+online consistent-copy API and includes retained database BLOBs; restore creates a
+new permanently read-only held history copy with a fresh owner header. Read [the
+recovery runbook](docs/recovery.md) before using either command. It explains the
+1 GiB/30-second cooperative limits and why restore does not stop the original
+control service, workers, or provider jobs.

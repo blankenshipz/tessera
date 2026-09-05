@@ -48,10 +48,10 @@ def test_schema5_requires_migration_and_preserves_snapshot_bytes(tmp_path):
     state, actor, snapshot = old_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 10
+    assert migrate_state(state) == 11
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
     assert verified["integrity"] == "verified" and verified["digest"] == snapshot["digest"]
-    assert migrate_state(state) == 10
+    assert migrate_state(state) == 11
 
 
 def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
@@ -78,7 +78,7 @@ def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
             ).fetchone()[0]
             == b"Retain exact bytes"
         )
-    assert migrate_state(state) == 10
+    assert migrate_state(state) == 11
 
 
 def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monkeypatch):
@@ -108,5 +108,5 @@ def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monk
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 10
-    assert migrate_state(state) == 10
+    assert migrate_state(state) == 11
+    assert migrate_state(state) == 11

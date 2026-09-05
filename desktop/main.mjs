@@ -66,6 +66,7 @@ const handlers = {
   status: () => connection.status(), connect,
   disconnect: () => connection.disconnect(),
   projects: page => connection.projects(page), tasks: (id, page) => connection.tasks(id, page),
+  recovery: () => connection.recovery(),
   threads: (id, page) => connection.threads(id, page), messages: (id, page) => connection.messages(id, page),
   decisions: (id, page) => connection.decisions(id, page),
   studies: (id, page) => connection.studies(id, page), study: id => connection.study(id),

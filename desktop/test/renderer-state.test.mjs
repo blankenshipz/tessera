@@ -28,6 +28,7 @@ function fixture(overrides = {}) {
   const api = { status: async () => ({ id: 'connection' }), commandId: async () => 'command',
     tasks: async () => ({ tasks: [] }), labbook: async () => ({ events: [] }),
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
+    recovery: async () => ({ state: 'active', recovery_hold: false }),
     decisions: async () => ({ decisions: [] }), studies: async () => ({ studies: [] }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
   const context = vm.createContext({ window: { tessera: api },
@@ -35,7 +36,7 @@ function fixture(overrides = {}) {
     FormData: class { constructor(form) { this.fields = { ...form.fields }; } get(name) { return this.fields[name]; } },
   });
   const source = readFileSync(new URL('../renderer.mjs', import.meta.url), 'utf8');
-  vm.runInContext(source + '\nglobalThis.hooks = { selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadStudies, selectStudy, clearContext, state: () => ({ activeProject, activeThread, activeStudy }) };', context);
+  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadStudies, selectStudy, clearContext, state: () => ({ activeProject, activeThread, activeStudy }) };', context);
   return { ...context.hooks, get, api, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
 }
 const thread = id => ({ id, title: id });
@@ -338,4 +339,31 @@ test('refresh while a decision command ID is pending shares one ID allocation', 
   assert.deepEqual(keys, ['shared-command']);
   find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click(); await flush();
   assert.deepEqual(keys, ['shared-command', 'shared-command']);
+});
+
+test('held recovery displays history but blocks desktop commands and decision actions', async () => {
+  let commands = 0;
+  const ui = fixture({ decisions: async () => ({ decisions: [pendingDecision()] }),
+    resolveDecision: async () => { commands++; } });
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  await ui.selectProject(project('p1'));
+  assert.equal(ui.get('recovery-banner').hidden, false);
+  assert.match(ui.get('recovery-banner').textContent, /original control plane.*may still be active/);
+  for (const id of ['project-new', 'task-new', 'thread-new']) assert.equal(ui.get(id).disabled, true);
+  for (const choice of ['Approve', 'Reject']) {
+    const button = find(ui.get('decisions'), node => node.textContent === choice);
+    assert.equal(button.disabled, true);
+    button.listeners.click();
+  }
+  await assert.rejects(ui.command('synthetic', {}, async () => { commands++; }), /read-only/);
+  await flush();
+  assert.equal(commands, 0);
+});
+
+test('missing or inconsistent recovery metadata fails closed for commands', async () => {
+  for (const value of [null, {}, { state: 'active', recovery_hold: true }]) {
+    const ui = fixture();
+    assert.throws(() => ui.applyRecoveryStatus(value), /supported recovery state/);
+    await assert.rejects(ui.command('synthetic', {}, async () => {}), /read-only/);
+  }
 });

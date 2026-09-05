@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 10
+LATEST_SCHEMA_VERSION = 11
 LOCAL_ORG_ID = "org_local"
 
 
@@ -255,6 +255,14 @@ def migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 10 WHERE singleton = 1")
 
 
+def migrate_v10_to_v11(connection: sqlite3.Connection) -> None:
+    """Add explicit recovery lineage and a fail-closed restored-state hold."""
+    from .recovery import create_recovery_schema
+
+    create_recovery_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 11 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -265,6 +273,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: migrate_v7_to_v8,
     8: migrate_v8_to_v9,
     9: migrate_v9_to_v10,
+    10: migrate_v10_to_v11,
 }
 
 

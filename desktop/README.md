@@ -1,5 +1,10 @@
 # Desktop workspace
 
+When the connected control service reports a held recovery state, the desktop shows
+recovered history in read-only mode. It cannot clear the hold or resume mutations.
+The recovery banner does not claim that the original control service or a provider
+job was stopped; see [the recovery runbook](../docs/recovery.md).
+
 This desktop slice keeps credentials and HTTP requests in Electron's main process.
 The sandboxed renderer has a small operation-specific IPC bridge, a restrictive
 CSP, no Node access, no remote navigation, and no external-content execution.

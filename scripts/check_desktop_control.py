@@ -18,6 +18,7 @@ from pathlib import Path
 from check_control_runtime import serve
 
 from tessera_control.interaction import InteractionStore
+from tessera_control.recovery import backup_state, restore_state
 from tessera_control.research import ResearchStore
 from tessera_control.store import Store, _connect, canonical_digest, initialize_state
 
@@ -119,16 +120,18 @@ def main() -> None:
             (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         )
         research_snapshot = prepare_research(state, owner, project["id"])
-        with serve(state) as endpoint:
-            fixture = root / "fixture.json"
+
+        def run_smoke(endpoint: str, header: Path, held: bool) -> None:
+            fixture = root / ("held-fixture.json" if held else "fixture.json")
             fixture.write_text(
                 json.dumps(
                     {
                         "endpoint": endpoint,
-                        "header": str(state / "owner.header"),
+                        "header": str(header),
                         "projectId": project["id"],
                         "decisionId": decision["id"],
                         "studyId": research_snapshot["study"]["id"],
+                        "held": held,
                     }
                 )
             )
@@ -148,6 +151,9 @@ def main() -> None:
             )
             if result.returncode:
                 raise RuntimeError(f"Desktop control fixture failed: {result.stderr[-2000:]}")
+
+        with serve(state) as endpoint:
+            run_smoke(endpoint, state / "owner.header", held=False)
             resolved = interaction.list_decisions(owner, project["id"], status="approved")
             assert len(resolved) == 1 and resolved[0]["id"] == decision["id"]
             assert resolved[0]["rationale"] == "Synthetic UI acceptance fixture."
@@ -163,10 +169,32 @@ def main() -> None:
                 assert (
                     connection.execute("SELECT count(*) FROM execution_leases").fetchone()[0] == 0
                 )
+
+        backup = root / "backup"
+        backup_state(state, backup)
+        restored = root / "restored"
+        restore_state(backup, restored)
+        restored_owner = Store(restored).authenticate(
+            (restored / "owner.header").read_text().strip().split("Bearer ", 1)[1]
+        )
+        with serve(restored) as endpoint:
+            run_smoke(endpoint, restored / "owner.header", held=True)
+            assert (
+                ResearchStore(restored).get_study(restored_owner, research_snapshot["study"]["id"])
+                == research_snapshot
+            )
+            restored_interaction = InteractionStore(Store(restored))
+            restored_decisions = restored_interaction.list_decisions(
+                restored_owner, project["id"], status="approved"
+            )
+            assert len(restored_decisions) == 1
+            assert restored_decisions[0]["id"] == decision["id"]
+            assert restored_decisions[0]["resolved_by_principal_id"] == owner["id"]
             print(
                 json.dumps(
                     {
                         "desktop_decision": "approved",
+                        "held_restore_pass": True,
                         "research_variants_displayed": 80,
                         "research_history_unchanged": True,
                         "execution_started": False,

@@ -155,3 +155,18 @@ test('IPC callers must name the active connection before dispatch', async () => 
   assert.throws(() => connection.assertActive(undefined), /another context/);
   connection.assertActive('two');
 });
+
+test('recovery status is an authenticated read on the selected control connection', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org' } :
+      { state: 'held_restore', recovery_hold: true });
+  });
+  await connection.connect(config());
+  assert.deepEqual(await connection.recovery(), { state: 'held_restore', recovery_hold: true });
+  assert.match(calls[1].url, /\/recovery$/);
+  assert.equal(calls[1].options.method, 'GET');
+  assert.equal(calls[1].options.body, undefined);
+  assert.equal(calls[1].options.headers.Authorization, `Bearer ${tokenA}`);
+});

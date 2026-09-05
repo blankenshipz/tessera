@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 10);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 11);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -188,6 +188,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .artifacts import create_artifact_schema, create_artifact_upload_schema
     from .execution import create_execution_schema
     from .interaction import create_interaction_schema
+    from .recovery import create_recovery_schema
     from .research import create_research_schema
     from .snapshot_releases import create_release_schema
     from .snapshots import create_snapshot_schema
@@ -201,6 +202,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_artifact_upload_schema(connection)
     create_artifact_manifest_schema(connection)
     create_artifact_disposition_schema(connection)
+    create_recovery_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
@@ -221,6 +223,20 @@ def validate_database(database_path: Path) -> None:
         raise ValueError("Control-plane database requires an explicit `tessera migrate`.")
     if row["schema_version"] > SCHEMA_VERSION:
         raise ValueError("Control-plane database schema version is unsupported.")
+    connection = _connect(database_path)
+    try:
+        recovery = connection.execute(
+            "SELECT state FROM control_recovery WHERE singleton = 1"
+        ).fetchone()
+    except sqlite3.Error as error:
+        raise ValueError("Control-plane database has no recovery state.") from error
+    finally:
+        connection.close()
+    if recovery is None:
+        raise ValueError("Control-plane database has no recovery state.")
+    marker = database_path.parent / ".restore-complete"
+    if recovery["state"] == "held_restore" and (_lstat_is_symlink(marker) or not marker.is_file()):
+        raise ValueError("Restored control-plane state was not completely published.")
 
 
 def migrate_state(state_dir: Path) -> int:
@@ -528,6 +544,58 @@ class Store:
         try:
             actor = self._live_principal(connection, principal)
             return self._credential_response(actor)
+        finally:
+            connection.close()
+
+    def recovery_status(self, principal: dict[str, Any]) -> dict[str, Any]:
+        connection = _connect(self.database_path)
+        try:
+            connection.execute("BEGIN")
+            actor = self._live_principal(connection, principal)
+            row = connection.execute("SELECT * FROM control_recovery WHERE singleton=1").fetchone()
+            grant_scope = ""
+            parameters: list[Any] = [actor["org_id"]]
+            if actor["project_id"] is not None:
+                grant_scope = " AND project_id=?"
+                parameters.append(actor["project_id"])
+            count = connection.execute(
+                (
+                    """SELECT COUNT(*) FROM execution_grants
+                    WHERE status IN ('active', 'cancel_requested')
+                    AND project_id IN (SELECT id FROM projects WHERE org_id=?)"""
+                    + grant_scope
+                ),
+                parameters,
+            ).fetchone()[0]
+            grants = connection.execute(
+                """SELECT id, project_id, task_id, status, revision, epoch, expires_at,
+                currency, max_exposure_cents
+                FROM execution_grants WHERE status IN ('active', 'cancel_requested')
+                AND project_id IN (SELECT id FROM projects WHERE org_id=?)
+                """
+                + grant_scope
+                + " ORDER BY created_at, id LIMIT 100",
+                parameters,
+            ).fetchall()
+            return {
+                "state": row["state"],
+                "recovery_hold": row["state"] == "held_restore",
+                "incarnation_id": row["incarnation"],
+                "restore_id": row["restore_id"],
+                "source_backup": {
+                    "digest": row["source_backup_digest"],
+                    "event_watermark": row["event_watermark"],
+                    "restored_at": row["restored_at"],
+                },
+                "original_branch_fenced": False,
+                "unknown_post_backup_activity": row["state"] == "held_restore",
+                "unresolved_grants": {
+                    "count": count,
+                    "listed_count": len(grants),
+                    "truncated": count > len(grants),
+                    "grants": [dict(grant) for grant in grants],
+                },
+            }
         finally:
             connection.close()
 
@@ -937,6 +1005,11 @@ class Store:
         try:
             connection.execute("BEGIN IMMEDIATE")
             live_principal = self._live_principal(connection, principal, audience=audience)
+            recovery = connection.execute(
+                "SELECT state FROM control_recovery WHERE singleton=1"
+            ).fetchone()
+            if recovery is None or recovery["state"] != "active":
+                raise Forbidden("Control state is held after restore; mutations are disabled.")
             existing = connection.execute(
                 """SELECT request_digest, response_status, response_json FROM idempotency
                 WHERE principal_id = ? AND org_id = ? AND idempotency_key = ?

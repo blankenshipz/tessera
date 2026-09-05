@@ -6,10 +6,10 @@ pilot are not complete.
 
 ## Verified evidence
 
-- 311 Python tests pass natively; isolated Docker Compose verification also passes.
+- 342 Python tests pass natively; current Linux CI verification follows publication.
 - Ruff lint and format checks pass.
-- Twenty-nine desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v10 preserve historical records, input bytes,
+- Thirty-two desktop connection/IPC and renderer tests pass using Node 22.12.
+- Explicit migrations through schema v11 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -82,6 +82,14 @@ representative investigation have not passed end-to-end acceptance.
     nothing. Historical replay remains subject to live credential and project
     access checks. Result acceptance and data release remain unimplemented.
 
+12. **Held recovery:** online SQLite backups preserve records and retained bytes.
+    Restores revoke copied credentials and create a fresh owner on a permanently
+    read-only branch. Review fixes reject executable schema and changed foreign-key
+    or index definitions before publication. Concurrent-write, partial-upload,
+    cached-replay and publication-fault tests pass. Native Electron browses the
+    restored 80-variant ledger with writes disabled. This does not fence the original
+    control service or reconcile its providers; see [recovery](recovery.md).
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -106,6 +114,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `ebe5d8d`: rejected Mac fixed-image backend after Docker execution probe.
 - `ae76de5`: desktop decision resolution and live Electron/control acceptance.
 - `7efc7b8`: fenced human quarantine review with schema v10.
+- `c2bc4c5`: complete read-only study browsing in the desktop.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -124,7 +133,7 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed through `ae76de5`. No force push or authentication reconfiguration was used.
+CI passed through `c2bc4c5`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
 A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's
@@ -143,7 +152,7 @@ representative research question/dataset remain open configuration inputs.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
 4. Desktop adoption, skills, research editing/export, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
-5. Backup/restore fencing, lifecycle recovery, cleanup/retention, packaging and
+5. Operational restore fencing/resumption, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.
 6. A maintainer-selected real investigation and measured pilot, including trusted
    signing, identity and infrastructure configuration where required.

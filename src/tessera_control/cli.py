@@ -9,6 +9,7 @@ from pathlib import Path
 import uvicorn
 
 from .api import create_app
+from .recovery import backup_state, restore_state
 from .store import StoreError, initialize_state, migrate_state
 from .workspace import WorkspaceError
 from .workspace_cli import add_workspace_commands, run_workspace
@@ -22,6 +23,12 @@ def parser() -> argparse.ArgumentParser:
     initialize.add_argument("--state-dir", required=True, type=Path)
     migrate = subcommands.add_parser("migrate")
     migrate.add_argument("--state-dir", required=True, type=Path)
+    backup = subcommands.add_parser("backup")
+    backup.add_argument("--state-dir", required=True, type=Path)
+    backup.add_argument("--output", required=True, type=Path)
+    restore = subcommands.add_parser("restore")
+    restore.add_argument("--backup", required=True, type=Path)
+    restore.add_argument("--state-dir", required=True, type=Path)
     serve = subcommands.add_parser("serve")
     serve.add_argument("--state-dir", required=True, type=Path)
     serve.add_argument("--port", required=True, type=int, choices=range(1, 65_536))
@@ -43,6 +50,14 @@ def main() -> int:
         return 0
     if arguments.command == "migrate":
         print(migrate_state(arguments.state_dir))
+        return 0
+    if arguments.command == "backup":
+        print(backup_state(arguments.state_dir, arguments.output)["backup_id"])
+        return 0
+    if arguments.command == "restore":
+        database_path, header_path = restore_state(arguments.backup, arguments.state_dir)
+        print(database_path)
+        print(header_path)
         return 0
     if arguments.command == "serve":
         # No host option is intentional: this local mode must never bind publicly.

@@ -70,7 +70,7 @@ show complete variant, source, finding, correction and ledger histories, includi
 failed and excluded variants. Browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v10
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v11
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest

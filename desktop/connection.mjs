@@ -143,6 +143,7 @@ export class ControlConnection {
   }
 
   projects(page) { return this.#request(`/projects?${pageQuery(page)}`); }
+  recovery() { return this.#request('/recovery'); }
   tasks(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/tasks?${pageQuery(page)}`); }
   threads(projectId, page) { return this.#request(`/interaction/projects/${resourceId(projectId)}/threads?${interactionPageQuery(page)}`); }
   messages(threadId, page) { return this.#request(`/interaction/threads/${resourceId(threadId)}/messages?${interactionPageQuery(page)}`); }

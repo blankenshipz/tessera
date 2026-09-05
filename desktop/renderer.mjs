@@ -11,6 +11,7 @@ const api = window.tessera;
 const $ = id => document.getElementById(id);
 let epoch = 0;
 let connectionId = null;
+let recoveryHeld = true;
 let activeProject = null;
 let projectOffset = 0;
 let taskOffset = 0;
@@ -29,6 +30,19 @@ const loading = new Set();
 const readVersion = { threads: 0, messages: 0, decisions: 0, studies: 0, study: 0 };
 
 function notice(message = '') { $('notice').textContent = message; }
+function applyRecoveryStatus(status) {
+  recoveryHeld = true;
+  if (!status || typeof status.recovery_hold !== 'boolean' ||
+      status.state !== (status.recovery_hold ? 'held_restore' : 'active')) {
+    throw new Error('The control plane did not return a supported recovery state.');
+  }
+  recoveryHeld = status.recovery_hold;
+  $('recovery-banner').hidden = !recoveryHeld;
+  $('recovery-banner').textContent = recoveryHeld ?
+    'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
+  for (const id of ['project-new', 'task-new', 'thread-new']) $(id).disabled = recoveryHeld;
+  $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
+}
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -38,6 +52,8 @@ function element(tag, text, className) {
 function clearContext() {
   epoch++;
   connectionId = null;
+  recoveryHeld = true;
+  $('recovery-banner').hidden = true;
   activeProject = null;
   projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
   activeThread = null; threadEpoch++; activeStudy = null; studyEpoch++;
@@ -74,6 +90,7 @@ async function keyFor(scope, body) {
   }
 }
 async function command(scope, body, execute, valid = () => true) {
+  if (recoveryHeld) throw new Error('Restored or unverified control state is read-only.');
   const id = connectionId;
   const version = epoch;
   const fingerprint = JSON.stringify([scope, body]);
@@ -126,7 +143,7 @@ async function loadTasks() {
     card.append(element('h3', task.title), element('p', task.purpose));
     card.append(element('p', `Recorded budget: ${task.budget_cents} cents · limit: ${task.max_duration_seconds} seconds`, 'muted'));
     const button = element('button', task.status === 'approved' ? 'Plan approved' : 'Approve this plan');
-    button.disabled = task.status !== 'draft';
+    button.disabled = recoveryHeld || task.status !== 'draft';
     button.addEventListener('click', () => guarded(async () => {
       button.disabled = true;
       const body = { expected_revision: task.revision, expected_plan_digest: task.plan_digest };
@@ -134,7 +151,7 @@ async function loadTasks() {
         if (version !== epoch) return;
         await command(`approve:${task.id}`, body, (id, key) => api.approve(id, task.id, body, key));
         if (version === epoch) { await selectProject(project); notice('Plan approval recorded. No execution was started.'); }
-      } finally { if (button.isConnected) button.disabled = false; }
+      } finally { if (button.isConnected) button.disabled = recoveryHeld || task.status !== 'draft'; }
     }));
     card.append(button);
     $('tasks').append(card);
@@ -253,6 +270,7 @@ async function loadDecisions(reset = false) {
       const actions = element('div', undefined, 'decision-actions');
       const approve = element('button', 'Approve'); approve.type = 'button';
       const reject = element('button', 'Reject'); reject.type = 'button';
+      approve.disabled = reject.disabled = recoveryHeld;
       if (retry?.projectId === project.id && retry.revision === decision.revision) {
         (retry.body.decision === 'approve' ? reject : approve).disabled = true;
       }
@@ -304,8 +322,8 @@ async function loadDecisions(reset = false) {
           throw new Error('Decision outcome is unknown. Refresh this project before retrying; retry will keep the original request and command identifier.');
         } finally {
           const pending = pendingDecisionResolutions.get(decision.id);
-          approve.disabled = pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'reject';
-          reject.disabled = pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'approve';
+          approve.disabled = recoveryHeld || (pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'reject');
+          reject.disabled = recoveryHeld || (pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'approve');
         }
       });
       approve.addEventListener('click', () => resolve('approve'));
@@ -486,13 +504,22 @@ $('connection-form').addEventListener('submit', event => {
   event.preventDefault();
   guarded(async () => {
     clearContext(); $('connection-dialog').close();
+    const version = epoch;
     const fields = new FormData(event.target);
     const state = await api.connect({ name: fields.get('name'), endpoint: fields.get('endpoint') });
+    if (version !== epoch) return;
     if (!state) { $('connection-status').textContent = 'Not connected'; return; }
     connectionId = state.id;
     $('connection-status').textContent = `${state.name}\n${state.endpoint}\n${state.organizationId}`;
-    $('project-new').disabled = $('refresh').disabled = false;
     $('disconnect').hidden = false;
+    let recovery;
+    try { recovery = await api.recovery(connectionId); } catch (error) {
+      if (version !== epoch) return;
+      throw error;
+    }
+    if (version !== epoch) return;
+    applyRecoveryStatus(recovery);
+    $('refresh').disabled = false;
     await loadProjects(true);
   });
 });
@@ -534,7 +561,7 @@ $('thread-form').addEventListener('submit', event => {
       $('thread-dialog').close(); event.target.reset(); await loadThreads(true);
       if (version !== epoch) return;
       await selectThread(thread);
-    } finally { button.disabled = false; }
+    } finally { button.disabled = recoveryHeld; }
   });
 });
 $('message-form').addEventListener('submit', event => {
@@ -549,7 +576,7 @@ $('message-form').addEventListener('submit', event => {
       await command(`message:${thread.id}`, body, (id, key) => api.sendMessage(id, body, key),
         () => version === epoch && thread === activeThread && selection === threadEpoch);
       if (version === epoch && thread === activeThread && selection === threadEpoch) { event.target.reset(); await loadMessages(version, threadEpoch, true); }
-    } finally { button.disabled = false; }
+    } finally { button.disabled = recoveryHeld; }
   });
 });
 $('refresh').addEventListener('click', () => guarded(async () => {
