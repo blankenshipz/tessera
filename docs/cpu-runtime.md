@@ -50,7 +50,16 @@ threads. Its daemon thread cannot hold up supervisor shutdown. A timed-out reque
 may still commit at the server; callers must retain their idempotency keys and
 reconcile, never infer that a timeout means an action did not occur.
 
-Worker trust/build enrollment, capability probes, real Docker validation, artifact
+Synthetic live Docker probes now verify isolation, read-only released inputs,
+control-plane revocation, and duration stops. Run `scripts/check_cpu_runtime.py`
+and `scripts/check_control_runtime.py` with the native environment and the pinned
+image already available. The latter uses a temporary loopback HTTP service and
+records actual provider observations; it does not collect outputs or settle costs.
+
+Worker trust/build enrollment, capability probes, persistent output storage and
 collection/validation, pinned skill execution, accounting feeds and restore
 fencing remain required before enabling unattended research execution. A private
 test fixture and a successful simulated stop are not proof of those guarantees.
+
+See [the persistent output-storage decision](decisions/0003-persistent-output-storage.md)
+for the quota and custody gates before collection can be enabled.
