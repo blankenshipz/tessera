@@ -76,3 +76,20 @@ late output in quarantine.
 The current macOS Docker Desktop environment has passed synthetic isolation,
 read-only input, control revocation, and duration probes. No persistent output
 quota backend has been verified there.
+
+### macOS fixed-image feasibility result
+
+A disposable 32 MiB read/write UDIF image with case-sensitive journaled HFS+
+was mounted as the ordinary user with `noexec,nosuid,nodev`. A synthetic Docker
+container used UID 65532, a read-only root, no network, dropped capabilities and
+`no-new-privileges`, with only the image's workspace shared using `:consistent`.
+Inside Linux, `/work` reported `rw,nosuid,nodev` on virtiofs, without `noexec`;
+direct execution of a newly written executable script succeeded with exit 0.
+
+This candidate therefore fails the current profile's execution restriction.
+Capacity/exhaustion and recovery acceptance were not attempted after that failure.
+The synthetic container exited and was removed. Normal detach reported a busy
+volume; after verifying no container retained the fixture mount, its owned image
+was detached and the temporary fixture removed. Host mount options alone cannot
+admit this Docker Desktop backend, and cleanup behavior also needs a supported
+recovery contract before activation.

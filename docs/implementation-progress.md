@@ -90,6 +90,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `4d806ba`: desktop conversations and read-only decision inbox.
 - `802a06d`: live control-to-Docker and sandboxed Electron smoke checks.
 - `d48f038`: bounded stopped-workspace collector and storage admission decision.
+- `7ed75ed`: complete quarantined output manifests and resumable transfers.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -108,11 +109,14 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed for `4d806ba`. No force push or authentication reconfiguration was used.
+CI passed through `7ed75ed`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
-The storage contract requires actual enforced capacity and custody evidence;
-an ordinary host directory is not sufficient. The target execution host and
+A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's
+virtiofs share omitted host `noexec` and executed a workspace script successfully.
+The temporary fixture was removed; this backend remains inadmissible. See the
+[storage decision](decisions/0003-persistent-output-storage.md) for evidence and
+cleanup limits. The target execution host and
 representative research question/dataset remain open configuration inputs.
 
 ## Remaining milestones
