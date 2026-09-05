@@ -253,6 +253,10 @@ def backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
                 raise StoreError("Backup exceeds its size limit.")
 
         source.backup(destination, pages=128, progress=progress, sleep=0.001)
+        # A WAL source copies its journal-mode header too. Normalize only the
+        # private destination so validation cannot leave sidecars in the bundle.
+        if destination.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+            raise StoreError("Backup could not produce a standalone snapshot.")
     finally:
         destination.close()
         source.close()

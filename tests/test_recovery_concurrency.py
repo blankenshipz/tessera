@@ -91,6 +91,8 @@ def test_backup_snapshot_is_consistent_while_source_writer_commits(tmp_path: Pat
     backup_state(source, backup)
     thread.join(5)
     assert not thread.is_alive() and not writer_errors
+    assert {path.name for path in backup.iterdir()} == {"snapshot.sqlite3", "manifest.json"}
+    restore_state(backup, tmp_path / "restored")
     with _connect(backup / "snapshot.sqlite3") as connection:
         assert (
             connection.execute(
