@@ -1,0 +1,20 @@
+# Local development only. The native CLI remains loopback-only.
+services:
+  control:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - control-state:/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  test:
+    build: .
+    profiles: [test]
+    command: ["sh", "-c", "ruff check . && ruff format --check . && pytest"]
+    network_mode: none
+volumes:
+  control-state:

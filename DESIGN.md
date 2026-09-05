@@ -1,6 +1,7 @@
 # Tessera design
 
-Status: implementation proposal; no application exists yet.
+Status: implementation contract and roadmap. The local control-plane foundation
+is implemented; README.md lists the runnable scope.
 This document defines the pilot, the contracts it must satisfy, and the order of
 implementation. “Required” describes intended behavior, not a verified guarantee.
 
