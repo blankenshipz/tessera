@@ -74,6 +74,50 @@ test('streaming response size is bounded even without content-length', async () 
   await assert.rejects(connection.projects(), /too large/);
 });
 
+test('interaction routes carry bounded pages, pending status, and explicit idempotency keys', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ id: 'human', org_id: 'org' }) : json({ threads: [], messages: [], decisions: [] });
+  });
+  await connection.connect(config());
+  await connection.threads('project_1', { offset: 12, limit: 100 });
+  await connection.messages('thread_1', { offset: 2, limit: 50 });
+  await connection.decisions('project_1', { offset: 0, limit: 100 });
+  await connection.createThread({ project_id: 'project_1', title: 'Question' }, 'thread-command');
+  await connection.sendMessage({ thread_id: 'thread_1', intent: 'question', body: 'Why?' }, 'message-command');
+  assert.match(calls[1].url, /\/interaction\/projects\/project_1\/threads\?offset=12&limit=100$/);
+  assert.match(calls[2].url, /\/interaction\/threads\/thread_1\/messages\?offset=2&limit=50$/);
+  assert.match(calls[3].url, /\/interaction\/projects\/project_1\/decisions\?offset=0&limit=100&status=pending$/);
+  assert.equal(calls[4].options.headers['Idempotency-Key'], 'thread-command');
+  assert.equal(calls[5].options.headers['Idempotency-Key'], 'message-command');
+});
+
+test('interaction identifiers and API page bounds fail closed', async () => {
+  const connection = new ControlConnection(async () => json({ id: 'human', org_id: 'org' }));
+  await connection.connect(config());
+  assert.throws(() => connection.threads('../project'));
+  assert.throws(() => connection.messages('thread_1', { offset: 100001 }));
+  assert.throws(() => connection.decisions('project_1', { limit: 101 }));
+  assert.throws(() => connection.createThread({ project_id: 'project_1', title: 'x' }));
+});
+
+test('an interaction read cannot cross a connection switch', async () => {
+  let resolveOld;
+  const connection = new ControlConnection(async url => {
+    if (url.endsWith('/me')) return json({ id: 'human', org_id: url.includes('8765') ? 'A' : 'B' });
+    if (url.includes('8765')) return new Promise(resolve => { resolveOld = resolve; });
+    return json({ threads: [{ id: 'thread_B' }] });
+  });
+  await connection.connect(config());
+  const stale = connection.threads('project_1');
+  const rejected = assert.rejects(stale, /Connection changed/);
+  await connection.connect(config('two', tokenB));
+  resolveOld(json({ threads: [{ id: 'thread_A' }] }));
+  await rejected;
+  assert.deepEqual(await connection.threads('project_1'), { threads: [{ id: 'thread_B' }] });
+});
+
 test('IPC callers must name the active connection before dispatch', async () => {
   const connection = new ControlConnection(async () => json({ id: 'human', org_id: 'org' }));
   await connection.connect(config());

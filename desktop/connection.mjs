@@ -27,6 +27,14 @@ function pageQuery({ offset = 0, limit = 100 } = {}) {
   }
   return `offset=${offset}&limit=${limit}`;
 }
+function interactionPageQuery(page) {
+  const query = pageQuery(page);
+  const params = new URLSearchParams(query);
+  if (Number(params.get('offset')) > 100000 || Number(params.get('limit')) > 100) {
+    throw new ConnectionError('Invalid page bounds.');
+  }
+  return query;
+}
 
 export class ControlConnection {
   #fetch;
@@ -136,6 +144,11 @@ export class ControlConnection {
 
   projects(page) { return this.#request(`/projects?${pageQuery(page)}`); }
   tasks(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/tasks?${pageQuery(page)}`); }
+  threads(projectId, page) { return this.#request(`/interaction/projects/${resourceId(projectId)}/threads?${interactionPageQuery(page)}`); }
+  messages(threadId, page) { return this.#request(`/interaction/threads/${resourceId(threadId)}/messages?${interactionPageQuery(page)}`); }
+  decisions(projectId, page) {
+    return this.#request(`/interaction/projects/${resourceId(projectId)}/decisions?${interactionPageQuery(page)}&status=pending`);
+  }
   revisions(taskId, page) { return this.#request(`/tasks/${resourceId(taskId)}/revisions?${pageQuery(page)}`); }
   labbook(projectId, after = 0) {
     if (!Number.isSafeInteger(after) || after < 0) throw new ConnectionError('Invalid event cursor.');
@@ -143,6 +156,8 @@ export class ControlConnection {
   }
   createProject(body, key) { return this.#request('/projects', body, key); }
   createTask(projectId, body, key) { return this.#request(`/projects/${resourceId(projectId)}/tasks`, body, key); }
+  createThread(body, key) { return this.#request('/interaction/threads', body, key); }
+  sendMessage(body, key) { return this.#request('/interaction/messages', body, key); }
   approve(taskId, body, key) { return this.#request(`/tasks/${resourceId(taskId)}/approve`, body, key); }
   commandId() { return randomUUID(); }
 }

@@ -1,3 +1,12 @@
+function interactionReadIsCurrent({
+  requestedEpoch, currentEpoch, requestedThreadEpoch, currentThreadEpoch,
+  requestedProject, currentProject, requestedThread, currentThread,
+}) {
+  return requestedEpoch === currentEpoch && requestedProject === currentProject &&
+    (requestedThreadEpoch === undefined || requestedThreadEpoch === currentThreadEpoch) &&
+    (requestedThread === undefined || requestedThread === currentThread);
+}
+
 const api = window.tessera;
 const $ = id => document.getElementById(id);
 let epoch = 0;
@@ -6,7 +15,14 @@ let activeProject = null;
 let projectOffset = 0;
 let taskOffset = 0;
 let eventCursor = 0;
+let threadOffset = 0;
+let decisionOffset = 0;
+let messageOffset = 0;
+let activeThread = null;
+let threadEpoch = 0;
 const pendingKeys = new Map();
+const loading = new Set();
+const readVersion = { threads: 0, messages: 0, decisions: 0 };
 
 function notice(message = '') { $('notice').textContent = message; }
 function element(tag, text, className) {
@@ -19,15 +35,18 @@ function clearContext() {
   epoch++;
   connectionId = null;
   activeProject = null;
-  projectOffset = taskOffset = eventCursor = 0;
+  projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = messageOffset = 0;
+  activeThread = null; threadEpoch++;
   pendingKeys.clear();
-  for (const name of ['projects', 'tasks', 'events']) $(name).replaceChildren();
+  for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions']) $(name).replaceChildren();
   $('project-title').textContent = 'Start with a question.';
   $('welcome').hidden = false;
   $('workspace').hidden = true;
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
-  for (const name of ['projects-more', 'tasks-more', 'events-more']) $(name).hidden = true;
+  for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more']) $(name).hidden = true;
+  $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
+  loading.clear();
 }
 async function guarded(work) {
   notice();
@@ -44,11 +63,11 @@ async function keyFor(scope, body) {
   if (!pendingKeys.has(fingerprint)) pendingKeys.set(fingerprint, await api.commandId());
   return pendingKeys.get(fingerprint);
 }
-async function command(scope, body, execute) {
+async function command(scope, body, execute, valid = () => true) {
   const id = connectionId;
   const version = epoch;
   const key = await keyFor(scope, body);
-  if (version !== epoch || id !== connectionId) throw new Error('Connection or project changed.');
+  if (version !== epoch || id !== connectionId || !valid()) throw new Error('Connection or project changed.');
   const result = await execute(id, key);
   pendingKeys.delete(JSON.stringify([scope, body]));
   return result;
@@ -70,15 +89,18 @@ async function loadProjects(reset = false) {
 async function selectProject(project) {
   epoch++;
   activeProject = project;
-  taskOffset = eventCursor = 0;
-  $('tasks').replaceChildren(); $('events').replaceChildren();
+  taskOffset = eventCursor = threadOffset = decisionOffset = messageOffset = 0;
+  activeThread = null; threadEpoch++;
+  for (const name of ['threads-more', 'messages-more', 'decisions-more']) $(name).hidden = true;
+  $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren();
+  $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
   for (const button of $('projects').children) {
     if (button.dataset.projectId === project.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   }
-  await Promise.all([loadTasks(), loadEvents()]);
+  await Promise.all([loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true)]);
 }
 async function loadTasks() {
   const version = epoch;
@@ -108,6 +130,112 @@ async function loadTasks() {
   $('tasks-more').hidden = response.tasks.length < 100;
   if (!taskOffset) $('tasks').append(element('p', 'No research plans yet. Create a draft to begin.', 'muted'));
 }
+async function loadThreads(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) readVersion.threads++;
+  const requestVersion = readVersion.threads;
+  const loadingKey = `threads:${version}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('threads-more').disabled = true;
+  if (reset) { threadOffset = 0; $('threads').replaceChildren(element('p', 'Loading threads…', 'muted')); }
+  try {
+    const response = await api.threads(connectionId, project.id, { offset: threadOffset, limit: 100 });
+    if (!interactionReadIsCurrent({ requestedEpoch: version, currentEpoch: epoch,
+      requestedProject: project, currentProject: activeProject })) return;
+    if (requestVersion !== readVersion.threads) return;
+    if (reset) $('threads').replaceChildren();
+    for (const thread of response.threads) {
+      const button = element('button', thread.title); button.dataset.threadId = thread.id;
+      button.addEventListener('click', () => guarded(() => selectThread(thread))); $('threads').append(button);
+    }
+    threadOffset += response.threads.length; $('threads-more').hidden = response.threads.length < 100 || threadOffset > 100000;
+    if (!threadOffset) $('threads').append(element('p', 'No threads yet.', 'muted'));
+  } catch (error) {
+    if (version === epoch && requestVersion === readVersion.threads) {
+      if (reset) $('threads').replaceChildren(element('p', 'Could not load threads. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey); if (version === epoch && requestVersion === readVersion.threads) $('threads-more').disabled = false;
+  }
+}
+async function selectThread(thread) {
+  const version = epoch; const selection = ++threadEpoch;
+  activeThread = thread; messageOffset = 0; $('messages').replaceChildren();
+  $('messages-more').hidden = true;
+  $('thread-title').textContent = thread.title; $('message-form').reset(); $('message-form').hidden = false;
+  for (const button of $('threads').children) {
+    if (button.dataset.threadId === thread.id) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  await loadMessages(version, selection, true);
+}
+async function loadMessages(version = epoch, selection = threadEpoch, reset = false) {
+  const thread = activeThread; if (!thread) return;
+  if (reset) readVersion.messages++;
+  const requestVersion = readVersion.messages;
+  const loadingKey = `messages:${version}:${selection}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('messages-more').disabled = true;
+  if (reset) { messageOffset = 0; $('messages').replaceChildren(element('p', 'Loading messages…', 'muted')); }
+  try {
+    const response = await api.messages(connectionId, thread.id, { offset: messageOffset, limit: 100 });
+    if (!interactionReadIsCurrent({ requestedEpoch: version, currentEpoch: epoch,
+      requestedThreadEpoch: selection, currentThreadEpoch: threadEpoch,
+      requestedProject: activeProject, currentProject: activeProject,
+      requestedThread: thread, currentThread: activeThread })) return;
+    if (requestVersion !== readVersion.messages) return;
+    if (reset) $('messages').replaceChildren();
+    for (const message of response.messages) {
+      const row = element('article', undefined, 'message');
+      row.append(element('span', `${message.intent} · ${message.sender_principal_id}`, 'tag'));
+      row.append(element('p', message.body)); row.append(element('time', new Date(message.created_at).toLocaleString(), 'muted'));
+      $('messages').append(row);
+    }
+    messageOffset += response.messages.length; $('messages-more').hidden = response.messages.length < 100 || messageOffset > 100000;
+    if (!messageOffset) $('messages').append(element('p', 'No messages yet.', 'muted'));
+  } catch (error) {
+    if (version === epoch && requestVersion === readVersion.messages && selection === threadEpoch) {
+      if (reset) $('messages').replaceChildren(element('p', 'Could not load messages. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey); if (version === epoch && requestVersion === readVersion.messages && selection === threadEpoch) $('messages-more').disabled = false;
+  }
+}
+async function loadDecisions(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) readVersion.decisions++;
+  const requestVersion = readVersion.decisions;
+  const loadingKey = `decisions:${version}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('decisions-more').disabled = true;
+  if (reset) { decisionOffset = 0; $('decisions').replaceChildren(element('p', 'Loading decisions…', 'muted')); }
+  try {
+    const response = await api.decisions(connectionId, project.id, { offset: decisionOffset, limit: 100 });
+    if (!interactionReadIsCurrent({ requestedEpoch: version, currentEpoch: epoch,
+      requestedProject: project, currentProject: activeProject })) return;
+    if (requestVersion !== readVersion.decisions) return;
+    if (reset) $('decisions').replaceChildren();
+    for (const decision of response.decisions) {
+      const card = element('article', undefined, 'card');
+      card.append(element('span', `${decision.kind} · pending`, 'tag'));
+      card.append(element('h3', `Decision ${decision.id}`));
+      card.append(element('p', `Scope: ${JSON.stringify(decision.scope)}`));
+      card.append(element('p', `Reviewer: ${decision.reviewer_principal_id} · expires ${decision.expires_at}`, 'muted'));
+      card.append(element('p', `Revision ${decision.revision}`, 'muted')); $('decisions').append(card);
+    }
+    decisionOffset += response.decisions.length; $('decisions-more').hidden = response.decisions.length < 100 || decisionOffset > 100000;
+    if (!decisionOffset) $('decisions').append(element('p', 'No pending decisions.', 'muted'));
+  } catch (error) {
+    if (version === epoch && requestVersion === readVersion.decisions) {
+      if (reset) $('decisions').replaceChildren(element('p', 'Could not load decisions. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey); if (version === epoch && requestVersion === readVersion.decisions) $('decisions-more').disabled = false;
+  }
+}
 const eventLabels = {
   'project.created': 'Project created', 'task.created': 'Research plan drafted',
   'task.approved': 'Plan approved by a human', 'task.plan_revised': 'Plan revised; new review required',
@@ -131,6 +259,7 @@ for (const button of document.querySelectorAll('[data-close]')) {
 $('connection-open').addEventListener('click', () => $('connection-dialog').showModal());
 $('project-new').addEventListener('click', () => $('project-dialog').showModal());
 $('task-new').addEventListener('click', () => $('task-dialog').showModal());
+$('thread-new').addEventListener('click', () => $('thread-dialog').showModal());
 $('disconnect').addEventListener('click', () => guarded(async () => {
   clearContext(); await api.disconnect(); $('connection-status').textContent = 'Not connected';
 }));
@@ -173,12 +302,46 @@ $('task-form').addEventListener('submit', event => {
     $('task-dialog').close(); event.target.reset(); await selectProject(activeProject);
   });
 });
+$('thread-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const button = event.target.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const version = epoch; const body = { project_id: activeProject.id, title: new FormData(event.target).get('title') };
+      const thread = await command(`thread:${activeProject.id}`, body, (id, key) => api.createThread(id, body, key));
+      if (version !== epoch) return;
+      $('thread-dialog').close(); event.target.reset(); await loadThreads(true);
+      if (version !== epoch) return;
+      await selectThread(thread);
+    } finally { button.disabled = false; }
+  });
+});
+$('message-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const button = event.target.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const version = epoch; const selection = threadEpoch; const thread = activeThread; const fields = new FormData(event.target);
+      const body = { thread_id: thread.id, intent: fields.get('intent'), body: fields.get('body') };
+      await command(`message:${thread.id}`, body, (id, key) => api.sendMessage(id, body, key),
+        () => version === epoch && thread === activeThread && selection === threadEpoch);
+      if (version === epoch && thread === activeThread && selection === threadEpoch) { event.target.reset(); await loadMessages(version, threadEpoch, true); }
+    } finally { button.disabled = false; }
+  });
+});
 $('refresh').addEventListener('click', () => guarded(async () => {
   await loadProjects(true); if (activeProject) await selectProject(activeProject);
 }));
 $('projects-more').addEventListener('click', () => guarded(() => loadProjects()));
 $('tasks-more').addEventListener('click', () => guarded(() => loadTasks()));
 $('events-more').addEventListener('click', () => guarded(() => loadEvents()));
+$('threads-more').addEventListener('click', () => guarded(() => loadThreads()));
+$('messages-more').addEventListener('click', () => guarded(() => loadMessages()));
+$('decisions-more').addEventListener('click', () => guarded(() => loadDecisions()));
 if (!api) {
   $('connection-open').disabled = true;
   notice('Open this workspace in the Tessera desktop application.');

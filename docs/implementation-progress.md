@@ -6,10 +6,10 @@ pilot are not complete.
 
 ## Verified evidence
 
-- 233 Python tests pass natively and in the isolated Docker Compose test service.
+- 263 Python tests pass natively and in the isolated Docker Compose test service.
 - Ruff lint and format checks pass.
-- Seven desktop connection/IPC tests pass using Node 22.12.
-- Explicit migrations through schema v7 preserve historical records, input bytes,
+- Sixteen desktop connection/IPC and renderer tests pass using Node 22.12.
+- Explicit migrations through schema v8 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -49,10 +49,16 @@ have not passed end-to-end acceptance.
 8. **Artifact quarantine:** immutable, checksum-checked, bounded worker outputs,
    including attributable late uploads. Records remain quarantined/unclassified;
    they cannot establish success or settle charges. Review fixed lease-expiry
-   classification and BLOB reads in metadata operations. See [artifact quarantine](artifact-quarantine.md).
+   classification and BLOB reads in metadata operations. Resumable uploads reserve
+   declared bytes and recover committed progress after lost replies; binary chunks
+   remain quarantined after checksum verification. Review corrected restart field
+   matching, SQLite binary concatenation and metadata queries. See [artifact quarantine](artifact-quarantine.md).
 9. **Desktop shell:** isolated renderer, sender-checked IPC, named connections,
-   project/draft/approval/labbook views and connection-switch fencing. The research
-   and interaction APIs are not yet exposed throughout the UI.
+   project/draft/approval/labbook views, attributed conversations and a read-only
+   pending decision inbox. Review corrected draft carryover, delayed thread
+   selection, pagination replacement and overlapping refreshes. Tests execute the
+   actual renderer with deferred replies to verify context fences and stable
+   message retry keys. Research-ledger views and decision resolution remain absent.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
@@ -70,6 +76,8 @@ these additional implementation commits are saved locally:
 - `6e44d1d`: durable control records, execution authority and artifact quarantine.
 - `d987aaa`: frozen control packages connected to the CPU supervisor.
 - `00b04c8`: isolated desktop shell and connection boundary tests.
+- `466296a`: implemented contracts and remaining acceptance gates.
+- `18977cd`: bounded resumable artifact uploads and worker recovery.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -90,12 +98,12 @@ pending; no force push or remote/authentication reconfiguration is used.
 
 ## Remaining milestones
 
-1. Chunked artifact upload, bounded container collection, manifest completion,
+1. Bounded container collection, manifest completion,
    validation/quarantine disposition and fenced authoritative result acceptance.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, conversations, research/inbox views, telemetry and
+4. Desktop adoption, skills, research views, decision resolution, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
 5. Backup/restore fencing, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.

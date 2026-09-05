@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 // Each bridge method represents one supported operation. Never expose send,
 // invoke, fetch, arbitrary filesystem reads, or the owner credential itself.
 const methods = ['status', 'connect', 'disconnect', 'projects', 'tasks', 'revisions',
-  'labbook', 'createProject', 'createTask', 'approve', 'commandId'];
+  'threads', 'messages', 'decisions', 'labbook', 'createProject', 'createTask',
+  'createThread', 'sendMessage', 'approve', 'commandId'];
 contextBridge.exposeInMainWorld('tessera', Object.fromEntries(methods.map(method => [method,
   (...args) => ipcRenderer.invoke(`tessera:${method}`, ...args)])));

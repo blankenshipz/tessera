@@ -27,6 +27,18 @@
     <div id="notice" role="status" aria-live="polite"></div>
     <section id="welcome"><h2>Keep the work. Follow the evidence.</h2><p>Connect to your control plane to organize a project, review its plans, and revisit the decisions behind it.</p><p class="muted">This build records plans and approvals. Experiment dispatch is not enabled yet.</p></section>
     <section id="workspace" hidden>
+      <section class="interaction-grid">
+        <div>
+          <div class="section-title"><div><h2>Threads</h2><p class="muted">Questions and directions stay attributed and durable.</p></div><button id="thread-new">New thread</button></div>
+          <div id="threads" class="cards compact"></div><button id="threads-more" hidden>More threads</button>
+        </div>
+        <div>
+          <div class="section-title"><div><h2 id="thread-title">Select a thread</h2><p class="muted">Messages are recorded; no automated reply is implied.</p></div></div>
+          <div id="messages" class="messages"></div><button id="messages-more" hidden>More messages</button>
+          <form id="message-form" hidden><label>Intent<select name="intent"><option value="question">Question</option><option value="direction">Direction</option><option value="status">Status</option><option value="evidence">Evidence</option></select></label><label>Message<textarea name="body" required maxlength="8000" rows="3"></textarea></label><button type="submit">Send message</button></form>
+        </div>
+      </section>
+      <section class="inbox"><div class="section-title"><div><h2>Pending human decisions</h2><p class="muted">Review inbox records. This desktop does not resolve decisions.</p></div></div><div id="decisions" class="cards"></div><button id="decisions-more" hidden>More decisions</button></section>
       <div class="section-title"><div><h2>Research plans</h2><p class="muted">Review purpose, limits, and the current plan before approving.</p></div><button id="task-new">New plan</button></div>
       <div id="tasks" class="cards"></div><button id="tasks-more" hidden>More plans</button>
       <section class="labbook"><div class="section-title"><h2>Labbook</h2><span class="caption">A durable record of the work</span></div><ol id="events"></ol><button id="events-more" hidden>Load more events</button></section>
@@ -35,6 +47,7 @@
   <dialog id="connection-dialog"><form id="connection-form"><h2>Connect to a control plane</h2><p>Your credential stays in the desktop’s main process and is cleared when you disconnect.</p><label>Connection name<input name="name" value="Personal workspace" required maxlength="200"></label><label>Endpoint<input name="endpoint" value="http://127.0.0.1:8765" required></label><p class="muted">Next, select your private credential header file.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Select credential</button></div></form></dialog>
   <dialog id="project-dialog"><form id="project-form"><h2>New project</h2><label>Project name<input name="name" required maxlength="200" placeholder="What are you investigating?"></label><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Create project</button></div></form></dialog>
   <dialog id="task-dialog"><form id="task-form"><h2>Draft a research plan</h2><label>Title<input name="title" required maxlength="200"></label><label>Purpose<textarea name="purpose" required maxlength="4000" rows="4"></textarea></label><div class="columns"><label>Recorded budget (whole units)<input name="budget" type="number" min="0" max="1000000" step="0.01" value="0" required></label><label>Duration limit (seconds)<input name="duration" type="number" min="1" max="86400" step="1" value="120" required></label></div><p class="muted">Creating or approving a plan does not run an experiment or spend funds.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Save draft</button></div></form></dialog>
+  <dialog id="thread-dialog"><form id="thread-form"><h2>New thread</h2><label>Title<input name="title" required maxlength="200" placeholder="A question for the workspace"></label><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Create thread</button></div></form></dialog>
   <script type="module" src="renderer.mjs"></script>
 </body>
 </html>

@@ -66,9 +66,13 @@ const handlers = {
   status: () => connection.status(), connect,
   disconnect: () => connection.disconnect(),
   projects: page => connection.projects(page), tasks: (id, page) => connection.tasks(id, page),
+  threads: (id, page) => connection.threads(id, page), messages: (id, page) => connection.messages(id, page),
+  decisions: (id, page) => connection.decisions(id, page),
   revisions: (id, page) => connection.revisions(id, page), labbook: (id, after) => connection.labbook(id, after),
   createProject: (body, key) => connection.createProject(body, key),
   createTask: (id, body, key) => connection.createTask(id, body, key),
+  createThread: (body, key) => connection.createThread(body, key),
+  sendMessage: (body, key) => connection.sendMessage(body, key),
   approve: (id, body, key) => connection.approve(id, body, key), commandId: () => connection.commandId(),
 };
 for (const [method, handler] of Object.entries(handlers)) {
