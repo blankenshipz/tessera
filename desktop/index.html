@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+  <title>Tessera</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside>
+    <div class="brand"><span class="mosaic" aria-hidden="true">▦</span> Tessera</div>
+    <p class="caption">A workspace for inquiry</p>
+    <section class="connection">
+      <h2>Control plane</h2>
+      <p id="connection-status">Not connected</p>
+      <button id="connection-open">Connect</button>
+      <button id="disconnect" hidden>Disconnect</button>
+    </section>
+    <div class="section-title"><h2>Projects</h2><button id="project-new" aria-label="New project" disabled>+</button></div>
+    <nav id="projects" aria-label="Projects"></nav>
+    <button id="projects-more" hidden>More projects</button>
+    <p class="aside-note">Your labbook persists when this window closes.</p>
+  </aside>
+  <main>
+    <header><div><p class="eyebrow">RESEARCH WORKSPACE</p><h1 id="project-title">Start with a question.</h1></div><button id="refresh" disabled>Refresh</button></header>
+    <div id="notice" role="status" aria-live="polite"></div>
+    <section id="welcome"><h2>Keep the work. Follow the evidence.</h2><p>Connect to your control plane to organize a project, review its plans, and revisit the decisions behind it.</p><p class="muted">This build records plans and approvals. Experiment dispatch is not enabled yet.</p></section>
+    <section id="workspace" hidden>
+      <div class="section-title"><div><h2>Research plans</h2><p class="muted">Review purpose, limits, and the current plan before approving.</p></div><button id="task-new">New plan</button></div>
+      <div id="tasks" class="cards"></div><button id="tasks-more" hidden>More plans</button>
+      <section class="labbook"><div class="section-title"><h2>Labbook</h2><span class="caption">A durable record of the work</span></div><ol id="events"></ol><button id="events-more" hidden>Load more events</button></section>
+    </section>
+  </main>
+  <dialog id="connection-dialog"><form id="connection-form"><h2>Connect to a control plane</h2><p>Your credential stays in the desktop’s main process and is cleared when you disconnect.</p><label>Connection name<input name="name" value="Personal workspace" required maxlength="200"></label><label>Endpoint<input name="endpoint" value="http://127.0.0.1:8765" required></label><p class="muted">Next, select your private credential header file.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Select credential</button></div></form></dialog>
+  <dialog id="project-dialog"><form id="project-form"><h2>New project</h2><label>Project name<input name="name" required maxlength="200" placeholder="What are you investigating?"></label><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Create project</button></div></form></dialog>
+  <dialog id="task-dialog"><form id="task-form"><h2>Draft a research plan</h2><label>Title<input name="title" required maxlength="200"></label><label>Purpose<textarea name="purpose" required maxlength="4000" rows="4"></textarea></label><div class="columns"><label>Recorded budget (whole units)<input name="budget" type="number" min="0" max="1000000" step="0.01" value="0" required></label><label>Duration limit (seconds)<input name="duration" type="number" min="1" max="86400" step="1" value="120" required></label></div><p class="muted">Creating or approving a plan does not run an experiment or spend funds.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Save draft</button></div></form></dialog>
+  <script type="module" src="renderer.mjs"></script>
+</body>
+</html>

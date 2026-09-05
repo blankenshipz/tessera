@@ -16,3 +16,7 @@ owner.header
 .env.*
 !.env.example
 .DS_Store
+
+node_modules/
+desktop/out/
+desktop/release/

@@ -6,6 +6,15 @@ on:
 permissions:
   contents: read
 jobs:
+  desktop-boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test desktop connection and IPC boundaries
+        run: npm test --prefix desktop
   control:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,148 @@
+/** Main-process connection boundary. Never export this object to the renderer. */
+import { randomUUID } from 'node:crypto';
+
+export class ConnectionError extends Error {}
+
+export function normalizeEndpoint(value) {
+  let url;
+  try { url = new URL(value); } catch { throw new ConnectionError('Invalid control-plane URL.'); }
+  const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+  if (!(url.protocol === 'https:' || (url.protocol === 'http:' && loopback)) ||
+      url.username || url.password || url.search || url.hash || url.pathname !== '/') {
+    throw new ConnectionError('Use HTTPS, or HTTP on loopback, without credentials or a path.');
+  }
+  return url.origin;
+}
+
+function resourceId(value) {
+  if (typeof value !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value)) {
+    throw new ConnectionError('Invalid resource identifier.');
+  }
+  return encodeURIComponent(value);
+}
+
+function pageQuery({ offset = 0, limit = 100 } = {}) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    throw new ConnectionError('Invalid page bounds.');
+  }
+  return `offset=${offset}&limit=${limit}`;
+}
+
+export class ControlConnection {
+  #fetch;
+  #active = null;
+  #generation = 0;
+  #pending = new Set();
+  #timeout;
+
+  constructor(fetchImpl = globalThis.fetch, timeoutMs = 15000) {
+    this.#fetch = fetchImpl;
+    this.#timeout = timeoutMs;
+  }
+
+  disconnect() {
+    this.#generation++;
+    for (const controller of this.#pending) controller.abort();
+    this.#pending.clear();
+    this.#active = null;
+  }
+
+  async connect({ id, name, endpoint, token }) {
+    if (typeof id !== 'string' || !id || typeof name !== 'string' || !name.trim() || name.length > 200 ||
+        typeof token !== 'string' || !/^[A-Za-z0-9_-]{32,256}$/.test(token)) {
+      throw new ConnectionError('Invalid connection credentials.');
+    }
+    const origin = normalizeEndpoint(endpoint);
+    this.disconnect();
+    const generation = this.#generation;
+    // Candidate credentials can authenticate only this endpoint. Failed connection
+    // switches leave no active connection and cannot revive previous context.
+    const candidate = { id, name, origin, token, generation };
+    const identity = await this.#send(candidate, '/me');
+    if (generation !== this.#generation) throw new ConnectionError('Connection changed.');
+    if (typeof identity.id !== 'string' || typeof identity.org_id !== 'string') {
+      throw new ConnectionError('The endpoint did not return an authenticated identity.');
+    }
+    this.#active = { ...candidate, identity };
+    return this.status();
+  }
+
+  status() {
+    if (!this.#active) return null;
+    const { id, name, origin, identity } = this.#active;
+    return { id, name, endpoint: origin, principalId: identity.id, organizationId: identity.org_id,
+      role: identity.role, projectId: identity.project_id ?? null, expiresAt: identity.expires_at ?? null };
+  }
+
+  assertActive(expectedId) {
+    if (!this.#active || typeof expectedId !== 'string' || this.#active.id !== expectedId) {
+      throw new ConnectionError('Connection changed; this command belongs to another context.');
+    }
+  }
+
+  async #send(connection, path, body, key) {
+    const controller = new AbortController();
+    this.#pending.add(controller);
+    const timer = setTimeout(() => controller.abort(), this.#timeout);
+    try {
+      const response = await this.#fetch(connection.origin + path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: { Authorization: `Bearer ${connection.token}`,
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json', 'Idempotency-Key': key }) },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        redirect: 'error', signal: controller.signal,
+      });
+      if (connection.generation !== this.#generation) throw new ConnectionError('Connection changed.');
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) this.disconnect();
+        // No response bodies in errors: servers may include sensitive source data.
+        throw new ConnectionError(`Control request failed (${response.status}).`);
+      }
+      const declaredSize = Number(response.headers.get('content-length') ?? 0);
+      if (declaredSize > 4 * 1024 * 1024) throw new ConnectionError('Control response is too large.');
+      const reader = response.body.getReader();
+      const chunks = [];
+      let size = 0;
+      try {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          size += part.value.byteLength;
+          if (size > 4 * 1024 * 1024) throw new ConnectionError('Control response is too large.');
+          chunks.push(part.value);
+        }
+      } finally {
+        await reader.cancel();
+      }
+      if (connection.generation !== this.#generation) throw new ConnectionError('Connection changed.');
+      return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    } catch (error) {
+      if (error instanceof ConnectionError) throw error;
+      throw new ConnectionError(body === undefined ? 'Control plane unavailable.' :
+        'Command outcome is unknown. Reconnect to this connection and inspect its history before retrying.');
+    } finally {
+      clearTimeout(timer);
+      this.#pending.delete(controller);
+    }
+  }
+
+  #request(path, body, key) {
+    if (!this.#active) throw new ConnectionError('Select an authenticated connection first.');
+    if (body !== undefined && (typeof key !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(key))) {
+      throw new ConnectionError('An explicit command identifier is required.');
+    }
+    return this.#send(this.#active, path, body, key);
+  }
+
+  projects(page) { return this.#request(`/projects?${pageQuery(page)}`); }
+  tasks(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/tasks?${pageQuery(page)}`); }
+  revisions(taskId, page) { return this.#request(`/tasks/${resourceId(taskId)}/revisions?${pageQuery(page)}`); }
+  labbook(projectId, after = 0) {
+    if (!Number.isSafeInteger(after) || after < 0) throw new ConnectionError('Invalid event cursor.');
+    return this.#request(`/projects/${resourceId(projectId)}/labbook?after=${after}&limit=200`);
+  }
+  createProject(body, key) { return this.#request('/projects', body, key); }
+  createTask(projectId, body, key) { return this.#request(`/projects/${resourceId(projectId)}/tasks`, body, key); }
+  approve(taskId, body, key) { return this.#request(`/tasks/${resourceId(taskId)}/approve`, body, key); }
+  commandId() { return randomUUID(); }
+}

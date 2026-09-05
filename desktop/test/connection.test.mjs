@@ -1,0 +1,85 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { ControlConnection, normalizeEndpoint } from '../connection.mjs';
+
+const tokenA = 'a'.repeat(43);
+const tokenB = 'b'.repeat(43);
+const config = (id = 'one', token = tokenA) => ({ id, token, name: id, endpoint: `http://127.0.0.1:${id === 'one' ? 8765 : 8766}` });
+const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
+
+test('connection metadata never returns bearer credentials', async () => {
+  const connection = new ControlConnection(async () => json({ id: 'human', org_id: 'org', role: 'human' }));
+  const status = await connection.connect(config());
+  assert.equal(status.organizationId, 'org');
+  assert.ok(!JSON.stringify(status).includes(tokenA));
+  connection.disconnect();
+  assert.equal(connection.status(), null);
+});
+
+test('a late response from an old connection cannot become current data', async () => {
+  let resolveOld;
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    if (url.endsWith('/me')) return json({ id: 'human', org_id: url.includes('8765') ? 'A' : 'B' });
+    if (url.includes('8765')) return new Promise(resolve => { resolveOld = resolve; });
+    return json({ projects: [{ id: 'project_B' }] });
+  });
+  await connection.connect(config());
+  const stale = connection.projects();
+  const rejected = assert.rejects(stale, /Connection changed/);
+  await connection.connect(config('two', tokenB));
+  resolveOld(json({ projects: [{ id: 'project_A' }] }));
+  await rejected;
+  assert.equal(connection.status().organizationId, 'B');
+  assert.deepEqual(await connection.projects(), { projects: [{ id: 'project_B' }] });
+  for (const call of calls) {
+    assert.equal(call.options.headers.Authorization, `Bearer ${call.url.includes('8765') ? tokenA : tokenB}`);
+    assert.equal(call.options.redirect, 'error');
+  }
+});
+
+test('mutations are not automatically retried or replayed after a connection switch', async () => {
+  const commands = [];
+  const connection = new ControlConnection(async (url, options) => {
+    if (url.endsWith('/me')) return json({ id: 'human', org_id: 'org' });
+    commands.push({ url, options });
+    throw new Error('lost reply');
+  });
+  await connection.connect(config());
+  await assert.rejects(connection.createProject({ name: 'Study' }, 'command-1'), /outcome is unknown/);
+  await connection.connect(config('two', tokenB));
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].options.headers['Idempotency-Key'], 'command-1');
+});
+
+test('TLS, route scope, and authorization failures fail closed', async () => {
+  for (const endpoint of ['http://remote.example', 'https://user:pass@remote.example', 'file:///tmp', 'https://host/path']) {
+    assert.throws(() => normalizeEndpoint(endpoint));
+  }
+  assert.equal(normalizeEndpoint('https://trusted.example'), 'https://trusted.example');
+  const connection = new ControlConnection(async url => url.endsWith('/me') ?
+    json({ id: 'human', org_id: 'org' }) : json({ detail: tokenA }, 401));
+  await connection.connect(config());
+  assert.throws(() => connection.tasks('../credentials'));
+  assert.throws(() => connection.createProject({ name: 'Study' }));
+  await assert.rejects(connection.projects(), error => !error.message.includes(tokenA) && /401/.test(error.message));
+  assert.equal(connection.status(), null);
+});
+
+test('streaming response size is bounded even without content-length', async () => {
+  const connection = new ControlConnection(async url => url.endsWith('/me') ?
+    json({ id: 'human', org_id: 'org' }) : new Response('x'.repeat(4 * 1024 * 1024 + 1)));
+  await connection.connect(config());
+  await assert.rejects(connection.projects(), /too large/);
+});
+
+test('IPC callers must name the active connection before dispatch', async () => {
+  const connection = new ControlConnection(async () => json({ id: 'human', org_id: 'org' }));
+  await connection.connect(config());
+  connection.assertActive('one');
+  await connection.connect(config('two', tokenB));
+  assert.throws(() => connection.assertActive('one'), /another context/);
+  assert.throws(() => connection.assertActive(undefined), /another context/);
+  connection.assertActive('two');
+});

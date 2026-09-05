@@ -1,0 +1,43 @@
+:root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #273b35; background: #f4f2ed; font-size: 15px; }
+* { box-sizing: border-box; }
+body { margin: 0; display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; }
+aside { padding: 30px 22px; background: #e9e9df; border-right: 1px solid #d5d9cd; display: flex; flex-direction: column; }
+.brand { font-family: Georgia, serif; font-size: 32px; letter-spacing: -1px; }
+.mosaic { color: #6b7e55; margin-right: 6px; }
+.caption, .muted, .aside-note { color: #69736a; font-size: 13px; line-height: 1.65; }
+.connection { border-top: 1px solid #cfd5c8; border-bottom: 1px solid #cfd5c8; margin: 28px 0; padding: 18px 0; overflow-wrap: anywhere; }
+h2 { font-size: 17px; font-weight: 600; margin: 0 0 12px; }
+main { padding: 44px 48px; max-width: 1400px; width: 100%; }
+header, .section-title { display: flex; justify-content: space-between; align-items: center; gap: 18px; }
+header { margin-bottom: 32px; }
+h1 { font-family: Georgia, serif; font-weight: normal; font-size: 37px; line-height: 1.2; margin: 10px 0; }
+.eyebrow { font-size: 10px; letter-spacing: 2px; color: #788468; }
+button { border: 1px solid #bbc6b4; border-radius: 6px; background: #fafbf5; color: #2c4738; font: inherit; font-size: 13px; padding: 9px 14px; cursor: pointer; }
+button:hover:enabled { background: #e4ebda; }
+button:disabled { opacity: .45; cursor: default; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid #557d50; outline-offset: 3px; }
+nav button { display: block; width: 100%; text-align: left; margin-bottom: 8px; overflow-wrap: anywhere; }
+nav button[aria-current="page"] { background: #d4dfc9; border-color: #8fa282; }
+.aside-note { margin-top: auto; padding-top: 40px; }
+#welcome { border: 1px solid #d9ded1; border-radius: 12px; background: #fbfaf5; padding: 40px; max-width: 700px; }
+#welcome h2 { font-family: Georgia, serif; font-weight: normal; font-size: 28px; }
+p { line-height: 1.65; }
+#notice:not(:empty) { border-left: 3px solid #9b7543; padding: 12px 16px; margin-bottom: 20px; background: #fff6e6; overflow-wrap: anywhere; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin: 18px 0; }
+.card { background: #fcfbf6; border: 1px solid #d8ddcf; border-radius: 10px; padding: 23px; }
+.card h3 { margin: 12px 0; font-size: 19px; font-weight: 500; overflow-wrap: anywhere; }
+.card p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.tag { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: #65724f; }
+.labbook { border-top: 1px solid #d5dccd; margin-top: 40px; padding-top: 25px; }
+ol { list-style: none; padding-left: 0; }
+li { border-left: 2px solid #c2ceb5; padding: 4px 0 18px 20px; margin-left: 4px; }
+li time { display: block; font-size: 12px; color: #7b8073; margin-top: 6px; }
+dialog { border: 1px solid #b5c0ad; border-radius: 12px; background: #faf9f3; color: inherit; padding: 30px; max-width: 530px; width: 90%; }
+dialog::backdrop { background: #1d302a66; }
+label { display: block; font-size: 13px; margin: 20px 0; }
+input, textarea { display: block; width: 100%; margin-top: 8px; background: white; border: 1px solid #c2cabb; border-radius: 5px; padding: 11px; font: inherit; color: inherit; }
+.actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 25px; }
+.actions button[type="submit"] { background: #3d5c47; color: #fff; }
+.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+[hidden] { display: none !important; }
+@media (max-width: 1000px) { body { grid-template-columns: 210px minmax(0,1fr); } main { padding: 30px; } }
