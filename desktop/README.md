@@ -20,10 +20,17 @@ Use Node 22.12 or newer, then `npm ci --prefix desktop` and
 `npm start --prefix desktop` against the current control plane. The boundary tests
 are dependency-free; Electron installation is required to launch the interface.
 
-The lockfile was generated and audited without reported vulnerabilities. Full
-installation currently fails fetching a dependency tarball due to a registry DNS
-error in this session. Electron launch, visual QA, signed packaging and desktop
-E2E tests have **not** been validated.
+Locked dependency installation and the native Electron smoke now pass. Run:
+
+```sh
+env -u ELECTRON_RUN_AS_NODE desktop/node_modules/.bin/electron desktop/test/electron-smoke.cjs
+```
+
+Run this from the repository root in a desktop-capable environment. The smoke
+uses temporary application state, checks the real application URL and renderer
+bridge, rejects disabled sandbox settings, and reports renderer errors. It does
+not connect to a control plane or establish visual, signed-package, or full
+desktop E2E acceptance.
 
 Renderer tests execute the application code with synthetic DOM nodes and deferred
 API replies. They verify pagination, draft clearing on context switches, delayed

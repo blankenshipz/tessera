@@ -52,12 +52,15 @@ development Python image, then run the script against your local Docker daemon:
 ```sh
 docker pull python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
 .venv/bin/python scripts/check_cpu_runtime.py
+.venv/bin/python scripts/check_control_runtime.py
 ```
 
-The script runs synthetic probes in networkless, non-root containers and cleans
-up only its own labeled containers. It requires Docker socket access and runs
-outside the isolated Compose test service. It does not exercise control-plane
-dispatch, data transfer, artifact collection or a research investigation. Unknown
+The scripts run synthetic probes in networkless, non-root containers and clean
+up only their own labeled containers. They require Docker socket access and run
+outside the isolated Compose test service. The second starts a temporary loopback
+control service, creates fixture-only authority through storage commands, transfers
+released input bytes over HTTP, and records actual Docker observations. They do
+not exercise automatic artifact collection or a research investigation. Unknown
 cleanup is reported with the fixture container name for reconciliation.
 
 The maintainer has paused PRs while the initial implementation takes shape.

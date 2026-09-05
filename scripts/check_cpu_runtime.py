@@ -26,11 +26,23 @@ IMAGE = (
 ISOLATION_PROBE = """
 import errno
 import os
+import socket
 from pathlib import Path
 
 assert os.getuid() == 65532
 assert not Path('/var/run/docker.sock').exists()
-assert set(Path('/sys/class/net').iterdir()) == {Path('/sys/class/net/lo')}
+# Some kernels expose dormant tunnel devices even in a networkless namespace.
+# Check usable interfaces and routing rather than assuming only one sysfs entry.
+for _, name in socket.if_nameindex():
+    flags = int(Path('/sys/class/net', name, 'flags').read_text(), 16)
+    assert name == 'lo' or not flags & 1, 'non-loopback interface is up'
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+    try:
+        probe.connect(('192.0.2.1', 9))
+    except OSError as error:
+        assert error.errno == errno.ENETUNREACH
+    else:
+        raise AssertionError('external route exists')
 status = Path('/proc/self/status').read_text().splitlines()
 assert 'NoNewPrivs:\t1' in status
 assert any(line.startswith('CapEff:') and int(line.split()[1], 16) == 0 for line in status)
