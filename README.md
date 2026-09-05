@@ -12,8 +12,50 @@ The desktop, control plane, and execution workers run independently. Here,
 “remote” means outside Electron: all three can run on one machine or across
 separate machines and clusters.
 
-**Status:** Design only. The workflows and controls below are requirements, not
-implemented capabilities. There is no runnable application yet.
+**Status:** A runnable local control-plane foundation is implemented: owner bearer
+authentication, tenant-scoped projects and draft tasks, revision-checked human
+plan approval, idempotent writes, and persistent labbook events. Approval records
+intent only; it never grants execution. Desktop, agents, experiment execution,
+and the broader workflows below remain planned.
+
+## Run the foundation
+
+Docker Compose is the development/test workflow; uv manages the Python lockfile.
+
+```sh
+docker compose up --build -d --wait control
+docker compose run --build --rm test
+curl http://127.0.0.1:8765/health
+```
+
+For an authenticated request without printing the owner credential, copy its
+header to a private temporary directory, use it, and delete it when finished:
+
+```sh
+credential_dir=$(mktemp -d)
+docker compose cp control:/state/control/owner.header "$credential_dir/owner.header"
+chmod 600 "$credential_dir/owner.header"
+curl -H @"$credential_dir/owner.header" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: first-project' \
+  -d '{"name":"First investigation"}' http://127.0.0.1:8765/projects
+rm "$credential_dir/owner.header"
+rmdir "$credential_dir"
+```
+
+Stop with `docker compose down`; the named volume retains the database and owner
+credential. See [CONTRIBUTING.md](./CONTRIBUTING.md) for native uv setup and the PR
+workflow. Compose is not required for deployment. No license has been selected.
+
+The API exposes project creation/listing, task creation/listing/retrieval,
+`POST /tasks/{id}/approve` with `expected_revision`, and
+`GET /projects/{id}/labbook?after=0&limit=100`. Mutations require an
+`Idempotency-Key`; reusing one with different input returns a conflict.
+Project/task lists accept `limit` (1–200, default 100) and `offset` (default 0);
+increase the offset by the number returned until the page is shorter than the limit.
+Task inputs are `title`, `purpose`, `budget_cents`, and `max_duration_seconds`.
+Budgets are recorded bounds, with no execution or spending enforcement yet.
+Browser origins are rejected; the owner credential is for trusted local human
+clients. It is not production organization authentication.
 
 ## The first workflow
 
