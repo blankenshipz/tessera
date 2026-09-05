@@ -130,6 +130,26 @@ test('research ledger routes use bounded read-only study requests', async () => 
   assert.throws(() => connection.study('../study'));
 });
 
+test('study authoring routes are scoped, typed POST commands', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ id: 'recorded' });
+  });
+  await connection.connect(config());
+  const study = { purpose: 'Purpose', protocol: 'Protocol', mode: 'exploratory' };
+  const variant = { name: 'Variant', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: {}, replication_label: 'unavailable' };
+  await connection.createStudy('project_1', study, 'study-command');
+  await connection.registerVariant('study_1', variant, 'variant-command');
+  assert.match(calls[1].url, /\/projects\/project_1\/studies$/);
+  assert.match(calls[2].url, /\/studies\/study_1\/variants$/);
+  assert.equal(calls[1].options.method, 'POST');
+  assert.equal(calls[1].options.headers['Idempotency-Key'], 'study-command');
+  assert.deepEqual(JSON.parse(calls[2].options.body), variant);
+  assert.throws(() => connection.createStudy('../project', study, 'key'));
+  assert.throws(() => connection.registerVariant('study_1', variant));
+});
+
 test('an interaction read cannot cross a connection switch', async () => {
   let resolveOld;
   const connection = new ControlConnection(async url => {

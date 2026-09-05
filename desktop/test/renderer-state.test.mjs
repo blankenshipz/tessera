@@ -13,8 +13,8 @@ class Element {
   removeAttribute() {}
   querySelector() { return this.submit ??= new Element(); }
   reset() { this.fields = {}; }
-  close() {}
-  showModal() {}
+  close() { this.open = false; }
+  showModal() { this.open = true; }
 }
 function deferred() {
   let resolve, reject;
@@ -31,6 +31,8 @@ function fixture(overrides = {}) {
     studySelection: async () => {},
     recovery: async () => ({ state: 'active', recovery_hold: false }),
     decisions: async () => ({ decisions: [] }), studies: async () => ({ studies: [] }),
+    createStudy: async () => ({ id: 's-created', purpose: 'Created', protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1, project_id: 'p1' }),
+    registerVariant: async () => ({ id: 'v-created' }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
   const context = vm.createContext({ window: { tessera: api },
     document: { getElementById: get, createElement: tag => new Element(tag), querySelectorAll: () => [] },
@@ -137,6 +139,72 @@ test('a reset supersedes an in-flight page and errors replace loading placeholde
   ui.api.threads = async () => { throw new Error('synthetic failure'); };
   await assert.rejects(ui.loadThreads(true), /synthetic failure/);
   assert.match(ui.get('threads').children[0].textContent, /Could not load/);
+});
+
+test('study creation sends typed metadata, refreshes, and opens the complete ledger', async () => {
+  const calls = [];
+  const ui = fixture({
+    createStudy: async (_connection, _id, body, key) => { calls.push({ body, key }); return { id: 's-created', purpose: 'Created', protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1, project_id: 'p1' }; },
+    study: async (_connection, id) => ledger(id),
+  });
+  await ui.selectProject(project('p1'));
+  ui.get('study-form').fields = { purpose: 'Purpose', protocol: 'Protocol', mode: 'exploratory' };
+  ui.submit('study-form'); await flush();
+  assert.equal(JSON.stringify(calls[0].body), JSON.stringify({ purpose: 'Purpose', protocol: 'Protocol', mode: 'exploratory' }));
+  assert.equal(calls[0].key, 'command');
+  assert.equal(ui.state().activeStudy.id, 's-created');
+  assert.ok(find(ui.get('study-detail'), node => node.textContent === 'Completeness: complete in-scope study ledger.'));
+});
+
+test('variant registration preserves the selected study fence and refreshes its ledger', async () => {
+  const calls = [];
+  const ui = fixture({ registerVariant: async (_connection, _id, body, key) => { calls.push({ body, key }); return { id: 'v-created' }; }, study: async (_connection, id) => ledger(id) });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1', project_id: 'p1', purpose: 'Study', status: 'open' });
+  ui.get('variant-form').fields = { name: 'Variant', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: '{"source":"fixture"}', replication_label: 'unavailable' };
+  ui.submit('variant-form'); await flush();
+  assert.equal(JSON.stringify(calls[0].body), JSON.stringify({ name: 'Variant', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: { source: 'fixture' }, replication_label: 'unavailable' }));
+  assert.equal(calls[0].key, 'command');
+  assert.equal(ui.state().activeStudy.id, 's1');
+  assert.equal(ui.get('variant-form').querySelector('button[type="submit"]').disabled, false);
+  ui.get('variant-form').fields = { name: 'Variant two', method_digest: 'c'.repeat(64), input_digest: 'd'.repeat(64), metadata: '{}', replication_label: 'rerun' };
+  ui.submit('variant-form'); await flush();
+  assert.equal(calls.length, 2);
+});
+
+test('a stale study creation cannot close or disable a form in the new project', async () => {
+  const pending = deferred(); let created = 0;
+  const ui = fixture({ createStudy: async () => { created++; return pending.promise; } });
+  await ui.selectProject(project('p1'));
+  ui.get('study-form').fields = { purpose: 'Old', protocol: 'Old protocol', mode: 'exploratory' };
+  ui.submit('study-form'); await flush();
+  await ui.selectProject(project('p2'));
+  pending.resolve({ id: 's-old', purpose: 'Old', protocol: 'Old protocol', mode: 'exploratory', status: 'open', revision: 1, project_id: 'p1' });
+  await flush();
+  assert.equal(created, 1);
+  assert.equal(ui.state().activeProject.id, 'p2');
+  assert.equal(ui.get('study-form').querySelector('button[type="submit"]').disabled, false);
+});
+
+test('held recovery disables study and variant authoring and does not call APIs', async () => {
+  let created = 0; let registered = 0;
+  const ui = fixture({ createStudy: async () => { created++; }, registerVariant: async () => { registered++; } });
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  await ui.selectProject(project('p1'));
+  assert.equal(ui.get('study-new').disabled, true);
+  ui.get('study-form').fields = { purpose: 'x', protocol: 'y', mode: 'exploratory' }; ui.submit('study-form');
+  await flush();
+  assert.equal(created, 0); assert.equal(registered, 0);
+});
+
+test('uncertain study creation keeps the same command key for retry', async () => {
+  let call = 0; let generated = 0; const keys = [];
+  const ui = fixture({ commandId: async () => `command-${++generated}`, createStudy: async (_connection, _id, _body, key) => { keys.push(key); if (++call === 1) throw new Error('Outcome unknown'); return { id: 's-created', purpose: 'Created', protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1, project_id: 'p1' }; } });
+  await ui.selectProject(project('p1'));
+  ui.get('study-form').fields = { purpose: 'Purpose', protocol: 'Protocol', mode: 'exploratory' };
+  ui.submit('study-form'); await flush();
+  ui.submit('study-form'); await flush();
+  assert.deepEqual(keys, ['command-1', 'command-1']);
+  assert.equal(generated, 1);
 });
 
 test('message submission blocks duplicate clicks and keeps its key after an uncertain response', async () => {
@@ -311,10 +379,14 @@ test('late study reads cannot replace a newer study or project view', async () =
 });
 
 test('an incomplete or over-limit ledger response is not presented as complete', async () => {
-  const ui = fixture({ study: async () => { throw new Error('Control request failed (409).'); } });
+  let registered = 0;
+  const ui = fixture({ study: async () => { throw new Error('Control request failed (409).'); }, registerVariant: async () => { registered++; } });
   await ui.selectProject(project('p1'));
   await assert.rejects(ui.selectStudy({ id: 's1', purpose: 'Study', status: 'open' }), /409/);
   assert.match(ui.get('study-detail').children[0].textContent, /Partial records are not shown as complete/);
+  ui.get('variant-form').fields = { name: 'Variant', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: '{}', replication_label: 'unavailable' };
+  ui.submit('variant-form'); await flush();
+  assert.equal(registered, 0);
   for (const value of [
     { ...ledger(), completeness: 'partial' },
     ledger('another-study'),
@@ -401,4 +473,35 @@ test('project changes invalidate exports and late failures cannot announce into 
   assert.equal(ui.get('study-export').hidden, true);
   pending.reject(new Error('Old export failed')); await flush();
   assert.equal(ui.get('notice').textContent, '');
+});
+
+
+test('variant authoring rejects closed studies and closes drafts on project changes', async () => {
+  let calls = 0;
+  const ui = fixture({ study: async (_connection, id) => ({ ...ledger(id), study: { ...ledger(id).study, status: 'closed' } }),
+    registerVariant: async () => { calls++; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1', status: 'open' });
+  assert.equal(ui.get('variant-new').hidden, true);
+  ui.get('variant-form').fields = { name: 'x', metadata: '{}' };
+  ui.submit('variant-form'); await flush();
+  assert.equal(calls, 0);
+  assert.match(ui.get('notice').textContent, /open study/);
+  ui.get('study-dialog').showModal(); ui.get('variant-dialog').showModal();
+  await ui.selectProject(project('p2'));
+  assert.equal(ui.get('study-dialog').open, false);
+  assert.equal(ui.get('variant-dialog').open, false);
+});
+
+test('variant submit blocks duplicates and a late failure cannot affect another study', async () => {
+  const pending = deferred(); let calls = 0;
+  const ui = fixture({ study: async (_connection, id) => ledger(id),
+    registerVariant: async () => { calls++; return pending.promise; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  ui.get('variant-form').fields = { name: 'x', metadata: '{}' };
+  ui.submit('variant-form'); ui.submit('variant-form'); await flush();
+  assert.equal(calls, 1);
+  await ui.selectStudy({ id: 's2' });
+  pending.reject(new Error('Old failure')); await flush();
+  assert.equal(ui.get('notice').textContent, '');
+  assert.equal(ui.get('variant-form').querySelector('button[type="submit"]').disabled, false);
 });

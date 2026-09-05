@@ -21,7 +21,14 @@ it does not issue a grant, start an experiment, or spend funds. Credential files
 main-process memory; saved encrypted sessions and organization login are later
 work. Closing the desktop does not stop the backend.
 
-The research-ledger panel is read-only. It lists a project's studies and renders
+The research-ledger panel can create a study with purpose, protocol and mode,
+then register variants with method/input digests and explicit metadata. These are
+attributed records; they do not launch work or prove that the supplied digests
+identify a validated scientific method. Registration requires a loaded open study.
+Held recovery disables authoring. Context changes clear authoring drafts, and
+uncertain submissions retain their command key for an explicit retry.
+
+The panel lists a project's studies and renders
 only a control-plane `complete_in_scope_study_ledger` envelope: every returned
 variant, source, finding, correction, and ledger event. Recorded outcomes remain
 manual or imported assertions where identified and have no execution receipt in
@@ -60,7 +67,9 @@ synthetic decision through the actual sandboxed renderer, IPC and loopback contr
 API. It uses temporary control and application state, with a test-only native
 file-picker stub selecting the fixture credential. The fixture verifies human
 attribution and absence of execution grants or leases. It also displays all 80
-synthetic registered variants and source-correction history, then verifies that
+synthetic registered variants and source-correction history. It also creates a new
+study and registers a variant through the UI, checks the stored attribution and
+metadata, then verifies that
 browsing left the study ledger unchanged. It saves JSON on both the active and
 held restored branches and compares each file with the complete control ledger. This exposed and corrected
 the desktop's identity-field mismatch with the real `/me` response. It remains a

@@ -135,6 +135,7 @@ def main() -> None:
                         "studyId": research_snapshot["study"]["id"],
                         "held": held,
                         "exportPath": str(export_path),
+                        "authoredExportPath": str(root / "authored-study.json"),
                     }
                 )
             )
@@ -168,6 +169,23 @@ def main() -> None:
 
         with serve(state) as endpoint:
             run_smoke(endpoint, state / "owner.header", held=False)
+            research = ResearchStore(state)
+            authored = [
+                study
+                for study in research.list_studies(owner, project["id"])
+                if study["purpose"] == "Synthetic authored study"
+            ]
+            assert len(authored) == 1
+            authored_snapshot = research.get_study(owner, authored[0]["id"])
+            assert authored_snapshot["study"]["created_by_principal_id"] == owner["id"]
+            assert len(authored_snapshot["variants"]) == 2
+            assert json.loads((root / "authored-study.json").read_text()) == authored_snapshot
+            registered = authored_snapshot["variants"][0]
+            assert registered["status"] == "registered"
+            assert registered["method_digest"] == "e" * 64
+            assert registered["input_digest"] == "f" * 64
+            assert registered["metadata"] == {"synthetic": True}
+            assert registered["execution_receipt"] is None
             resolved = interaction.list_decisions(owner, project["id"], status="approved")
             assert len(resolved) == 1 and resolved[0]["id"] == decision["id"]
             assert resolved[0]["rationale"] == "Synthetic UI acceptance fixture."
@@ -197,6 +215,10 @@ def main() -> None:
                 ResearchStore(restored).get_study(restored_owner, research_snapshot["study"]["id"])
                 == research_snapshot
             )
+            assert (
+                ResearchStore(restored).get_study(restored_owner, authored[0]["id"])
+                == authored_snapshot
+            )
             restored_interaction = InteractionStore(Store(restored))
             restored_decisions = restored_interaction.list_decisions(
                 restored_owner, project["id"], status="approved"
@@ -208,6 +230,7 @@ def main() -> None:
                 json.dumps(
                     {
                         "desktop_decision": "approved",
+                        "desktop_study_and_variant": "registered",
                         "held_restore_pass": True,
                         "research_variants_displayed": 80,
                         "research_history_unchanged": True,

@@ -25,7 +25,9 @@ app.on('browser-window-created', (_event, candidate) => {
 // Only the native picker is substituted; the main process still reads and
 // validates the temporary header, and no bearer token enters renderer memory.
 dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [fixture.header] });
-dialog.showSaveDialog = async () => ({ canceled: false, filePath: fixture.exportPath });
+let saves = 0;
+dialog.showSaveDialog = async () => ({ canceled: false,
+  filePath: !fixture.held && saves++ === 0 ? fixture.authoredExportPath : fixture.exportPath });
 async function main() {
   if (app.commandLine.hasSwitch('no-sandbox')) throw new Error('Sandbox is required.');
   app.setPath('userData', userDataDir);
@@ -55,7 +57,7 @@ async function main() {
     project.click();
     if (expected.held) {
       await waitFor(() => !document.querySelector('#recovery-banner').hidden);
-      for (const id of ['project-new', 'task-new', 'thread-new']) {
+      for (const id of ['project-new', 'task-new', 'thread-new', 'study-new']) {
         if (!document.querySelector('#' + id).disabled) throw new Error('Held control is enabled: ' + id);
       }
     } else {
@@ -66,10 +68,45 @@ async function main() {
       [...card.querySelectorAll('button')].find(button => button.textContent === 'Approve').click();
       await waitFor(() => document.querySelector('#decisions').textContent.includes('No pending decisions.'));
     }
+    if (!expected.held) {
+      document.querySelector('#study-new').click();
+      const studyForm = document.querySelector('#study-form');
+      studyForm.elements.purpose.value = 'Synthetic authored study';
+      studyForm.elements.protocol.value = 'Record-only UI fixture; no execution.';
+      studyForm.elements.mode.value = 'exploratory';
+      studyForm.requestSubmit();
+      await waitFor(() => [...document.querySelectorAll('[data-study-id]')].some(node => node.textContent.includes('Synthetic authored study')));
+      [...document.querySelectorAll('[data-study-id]')].find(node => node.textContent.includes('Synthetic authored study')).click();
+      await waitFor(() => !document.querySelector('#variant-new').hidden && !document.querySelector('#variant-new').disabled);
+      document.querySelector('#variant-new').click();
+      const variantForm = document.querySelector('#variant-form');
+      variantForm.elements.name.value = 'Synthetic registered variant';
+      variantForm.elements.method_digest.value = 'e'.repeat(64);
+      variantForm.elements.input_digest.value = 'f'.repeat(64);
+      variantForm.elements.metadata.value = '{"synthetic":true}';
+      variantForm.elements.replication_label.value = 'unavailable';
+      variantForm.requestSubmit();
+      await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 1);
+      if (!document.querySelector('#study-detail').textContent.includes('Synthetic registered variant')) {
+        throw new Error('Registered variant is missing.');
+      }
+      document.querySelector('#variant-new').click();
+      variantForm.elements.name.value = 'Synthetic second registered variant';
+      variantForm.elements.method_digest.value = 'e'.repeat(64);
+      variantForm.elements.input_digest.value = 'f'.repeat(64);
+      variantForm.elements.metadata.value = '{"synthetic":true}';
+      variantForm.elements.replication_label.value = 'unavailable';
+      variantForm.requestSubmit();
+      await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 2);
+      document.querySelector('#study-export').click();
+      await waitFor(() => document.querySelector('#notice').textContent.endsWith('authored-study.json'));
+
+    }
     await waitFor(() => [...document.querySelectorAll('[data-study-id]')].some(node => node.dataset.studyId === expected.studyId));
     [...document.querySelectorAll('[data-study-id]')].find(node => node.dataset.studyId === expected.studyId).click();
     await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 80);
     const detail = document.querySelector('#study-detail');
+    if (expected.held && !document.querySelector('#variant-new').disabled) throw new Error('Held variant registration is enabled.');
     if (detail.querySelectorAll('[data-source-id]').length !== 2 ||
         detail.querySelectorAll('[data-finding-id]').length !== 1 ||
         detail.querySelectorAll('[data-correction-id]').length !== 1) {
@@ -82,7 +119,7 @@ async function main() {
     }
     await waitFor(() => !document.querySelector('#study-export').hidden);
     document.querySelector('#study-export').click();
-    await waitFor(() => document.querySelector('#notice').textContent.startsWith('Saved study ledger JSON:'));
+    await waitFor(() => document.querySelector('#notice').textContent === 'Saved study ledger JSON: ' + (expected.held ? 'held-study.json' : 'study.json'));
     if (typeof window.require !== 'undefined') throw new Error('Node is exposed to renderer.');
     return { href: location.href, decisionRemoved: !expected.held, held: expected.held, researchVariants: 80 };
   })()`, true);

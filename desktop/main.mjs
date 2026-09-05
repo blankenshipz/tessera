@@ -73,6 +73,8 @@ const handlers = {
   threads: (id, page) => connection.threads(id, page), messages: (id, page) => connection.messages(id, page),
   decisions: (id, page) => connection.decisions(id, page),
   studies: (id, page) => connection.studies(id, page), study: id => connection.study(id),
+  createStudy: (id, body, key) => connection.createStudy(id, body, key),
+  registerVariant: (id, body, key) => connection.registerVariant(id, body, key),
   studySelection: (studyId, selection, projectId) => {
     if (!Number.isSafeInteger(selection) || selection < 0) throw new Error('Invalid study selection.');
     selectedStudy = studyId === null ? null : { id: connection.status()?.id, studyId, selection, projectId };

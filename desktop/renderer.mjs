@@ -40,7 +40,8 @@ function applyRecoveryStatus(status) {
   $('recovery-banner').hidden = !recoveryHeld;
   $('recovery-banner').textContent = recoveryHeld ?
     'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
-  for (const id of ['project-new', 'task-new', 'thread-new']) $(id).disabled = recoveryHeld;
+  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new']) $(id).disabled = recoveryHeld;
+  for (const id of ['study-form', 'variant-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
   $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
 }
 function element(tag, text, className) {
@@ -48,6 +49,12 @@ function element(tag, text, className) {
   if (text !== undefined) node.textContent = text;
   if (className) node.className = className;
   return node;
+}
+function resetAuthoringForms() {
+  for (const id of ['study-form', 'variant-form']) {
+    const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
+    form.querySelector('button[type="submit"]').disabled = recoveryHeld;
+  }
 }
 function clearContext() {
   epoch++;
@@ -66,7 +73,8 @@ function clearContext() {
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
   for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
-  $('study-title').textContent = 'Select a study';
+  $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true;
+  resetAuthoringForms();
   $('study-export').hidden = true;
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   loading.clear();
@@ -127,6 +135,8 @@ async function selectProject(project) {
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
   $('study-export').hidden = true;
+  $('variant-new').hidden = true;
+  resetAuthoringForms();
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
   for (const button of $('projects').children) {
@@ -454,8 +464,13 @@ async function selectStudy(study) {
   const version = epoch; const project = activeProject; const selection = ++studyEpoch;
   const requestVersion = ++readVersion.study;
   activeStudy = study;
+  // A list row's status is advisory until the complete authoritative ledger
+  // arrives. Keep authoring disabled while that read is pending or failed.
+  study.status = null;
   $('study-export').hidden = true; $('study-export').disabled = false;
   $('study-title').textContent = `Study ${study.id}`;
+  $('variant-new').hidden = true; $('variant-new').disabled = true;
+  $('variant-dialog').close(); resetAuthoringForms();
   $('study-detail').replaceChildren(element('p', 'Loading complete study ledger…', 'muted'));
   for (const button of $('studies').children) {
     if (button.dataset.studyId === study.id) button.setAttribute('aria-current', 'page');
@@ -471,8 +486,11 @@ async function selectStudy(study) {
         !['variants', 'sources', 'findings', 'corrections', 'events'].every(name => Array.isArray(ledger[name]))) {
       throw new Error('The control plane did not return a complete study ledger.');
     }
+    study.status = ledger.study.status;
     renderStudyLedger(ledger);
     $('study-export').hidden = false;
+    $('variant-new').hidden = ledger.study.status !== 'open';
+    $('variant-new').disabled = recoveryHeld;
   } catch (error) {
     if (studyReadIsCurrent(version, project, selection, study, requestVersion)) {
       $('study-detail').replaceChildren(element('p', 'Could not load a complete study ledger. Partial records are not shown as complete; use Refresh to retry.', 'muted'));
@@ -521,6 +539,8 @@ $('connection-open').addEventListener('click', () => $('connection-dialog').show
 $('project-new').addEventListener('click', () => $('project-dialog').showModal());
 $('task-new').addEventListener('click', () => $('task-dialog').showModal());
 $('thread-new').addEventListener('click', () => $('thread-dialog').showModal());
+$('study-new').addEventListener('click', () => $('study-dialog').showModal());
+$('variant-new').addEventListener('click', () => $('variant-dialog').showModal());
 $('disconnect').addEventListener('click', () => guarded(async () => {
   clearContext(); await api.disconnect(); $('connection-status').textContent = 'Not connected';
 }));
@@ -586,6 +606,64 @@ $('thread-form').addEventListener('submit', event => {
       if (version !== epoch) return;
       await selectThread(thread);
     } finally { button.disabled = recoveryHeld; }
+  });
+});
+$('study-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const button = event.target.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    const version = epoch; const project = activeProject;
+    if (!project) throw new Error('Select a project first.');
+    const fields = new FormData(event.target);
+    const body = { purpose: fields.get('purpose'), protocol: fields.get('protocol'), mode: fields.get('mode') };
+    button.disabled = true;
+    try {
+      let study;
+      try {
+        study = await command(`study:${project.id}`, body,
+          (id, key) => api.createStudy(id, project.id, body, key),
+          () => version === epoch && project === activeProject);
+      } catch (error) {
+        if (version !== epoch || project !== activeProject) return;
+        throw error;
+      }
+      if (version !== epoch || project !== activeProject) return;
+      $('study-dialog').close(); event.target.reset();
+      await loadStudies(true);
+      if (version === epoch && project === activeProject) await selectStudy(study);
+    } finally { if (version === epoch && project === activeProject) button.disabled = recoveryHeld; }
+  });
+});
+$('variant-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const button = event.target.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    const version = epoch; const project = activeProject; const study = activeStudy; const selection = studyEpoch;
+    const fields = new FormData(event.target);
+    let metadata;
+    try { metadata = JSON.parse(fields.get('metadata')); } catch { throw new Error('Metadata must be valid JSON.'); }
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new Error('Metadata must be a JSON object.');
+    const body = { name: fields.get('name'), method_digest: fields.get('method_digest'), input_digest: fields.get('input_digest'), metadata, replication_label: fields.get('replication_label') };
+    button.disabled = true;
+    try {
+      if (!study || study.status !== 'open') throw new Error('Select an open study first.');
+      try {
+        await command(`variant:${study.id}`, body,
+          (id, key) => api.registerVariant(id, study.id, body, key),
+          () => version === epoch && project === activeProject && study === activeStudy && selection === studyEpoch);
+      } catch (error) {
+        if (version !== epoch || project !== activeProject || study !== activeStudy || selection !== studyEpoch) return;
+        throw error;
+      }
+      if (version !== epoch || project !== activeProject || study !== activeStudy || selection !== studyEpoch) return;
+      $('variant-dialog').close(); event.target.reset(); await selectStudy(study);
+    } finally {
+      if (version === epoch && project === activeProject && study === activeStudy && selection === studyEpoch) {
+        button.disabled = recoveryHeld;
+      }
+    }
   });
 });
 $('message-form').addEventListener('submit', event => {
