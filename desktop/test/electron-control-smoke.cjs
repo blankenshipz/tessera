@@ -25,6 +25,7 @@ app.on('browser-window-created', (_event, candidate) => {
 // Only the native picker is substituted; the main process still reads and
 // validates the temporary header, and no bearer token enters renderer memory.
 dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [fixture.header] });
+dialog.showSaveDialog = async () => ({ canceled: false, filePath: fixture.exportPath });
 async function main() {
   if (app.commandLine.hasSwitch('no-sandbox')) throw new Error('Sandbox is required.');
   app.setPath('userData', userDataDir);
@@ -79,6 +80,9 @@ async function main() {
         'Needs review.', 'Outcome provenance: manual', 'Execution receipt: none recorded']) {
       if (!detail.textContent.includes(expectedText)) throw new Error('Missing research record: ' + expectedText);
     }
+    await waitFor(() => !document.querySelector('#study-export').hidden);
+    document.querySelector('#study-export').click();
+    await waitFor(() => document.querySelector('#notice').textContent.startsWith('Saved study ledger JSON:'));
     if (typeof window.require !== 'undefined') throw new Error('Node is exposed to renderer.');
     return { href: location.href, decisionRemoved: !expected.held, held: expected.held, researchVariants: 80 };
   })()`, true);

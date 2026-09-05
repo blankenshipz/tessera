@@ -67,6 +67,7 @@ function clearContext() {
   $('disconnect').hidden = true;
   for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
   $('study-title').textContent = 'Select a study';
+  $('study-export').hidden = true;
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   loading.clear();
 }
@@ -120,17 +121,19 @@ async function selectProject(project) {
   activeProject = project;
   taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
   activeThread = null; threadEpoch++; activeStudy = null; studyEpoch++;
+  const selectionUpdate = api.studySelection(connectionId, null, studyEpoch, null);
   for (const name of ['threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
   $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
+  $('study-export').hidden = true;
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
   for (const button of $('projects').children) {
     if (button.dataset.projectId === project.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   }
-  await Promise.all([loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true), loadStudies(true)]);
+  await Promise.all([selectionUpdate, loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true), loadStudies(true)]);
 }
 async function loadTasks() {
   const version = epoch;
@@ -451,6 +454,7 @@ async function selectStudy(study) {
   const version = epoch; const project = activeProject; const selection = ++studyEpoch;
   const requestVersion = ++readVersion.study;
   activeStudy = study;
+  $('study-export').hidden = true; $('study-export').disabled = false;
   $('study-title').textContent = `Study ${study.id}`;
   $('study-detail').replaceChildren(element('p', 'Loading complete study ledger…', 'muted'));
   for (const button of $('studies').children) {
@@ -458,6 +462,8 @@ async function selectStudy(study) {
     else button.removeAttribute('aria-current');
   }
   try {
+    await api.studySelection(connectionId, study.id, selection, project.id);
+    if (!studyReadIsCurrent(version, project, selection, study, requestVersion)) return;
     const ledger = await api.study(connectionId, study.id);
     if (!studyReadIsCurrent(version, project, selection, study, requestVersion)) return;
     if (ledger.completeness !== 'complete_in_scope_study_ledger' || !ledger.study ||
@@ -466,6 +472,7 @@ async function selectStudy(study) {
       throw new Error('The control plane did not return a complete study ledger.');
     }
     renderStudyLedger(ledger);
+    $('study-export').hidden = false;
   } catch (error) {
     if (studyReadIsCurrent(version, project, selection, study, requestVersion)) {
       $('study-detail').replaceChildren(element('p', 'Could not load a complete study ledger. Partial records are not shown as complete; use Refresh to retry.', 'muted'));
@@ -473,6 +480,23 @@ async function selectStudy(study) {
     }
   }
 }
+$('study-export').addEventListener('click', () => guarded(async () => {
+  const version = epoch; const study = activeStudy; const selection = studyEpoch;
+  const button = $('study-export');
+  if (button.disabled) return;
+  if (!study) throw new Error('Select a study first.');
+  const current = () => version === epoch && study === activeStudy && selection === studyEpoch;
+  button.disabled = true;
+  try {
+    const result = await api.saveStudyExport(connectionId, study.id, selection);
+    if (!current() || result.status === 'stale') return;
+    if (result.status === 'cancelled') { notice('Study ledger export cancelled.'); return; }
+    if (result.status !== 'saved' || typeof result.basename !== 'string') throw new Error('Study ledger export failed.');
+    notice(`Saved study ledger JSON: ${result.basename}`);
+  } catch (error) {
+    if (current()) throw error;
+  } finally { if (current()) button.disabled = false; }
+}));
 const eventLabels = {
   'project.created': 'Project created', 'task.created': 'Research plan drafted',
   'task.approved': 'Plan approved by a human', 'task.plan_revised': 'Plan revised; new review required',

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import tempfile
 from contextlib import closing
@@ -123,6 +124,7 @@ def main() -> None:
 
         def run_smoke(endpoint: str, header: Path, held: bool) -> None:
             fixture = root / ("held-fixture.json" if held else "fixture.json")
+            export_path = root / ("held-study.json" if held else "study.json")
             fixture.write_text(
                 json.dumps(
                     {
@@ -132,25 +134,37 @@ def main() -> None:
                         "decisionId": decision["id"],
                         "studyId": research_snapshot["study"]["id"],
                         "held": held,
+                        "exportPath": str(export_path),
                     }
                 )
             )
             environment = dict(os.environ)
             environment.pop("ELECTRON_RUN_AS_NODE", None)
-            result = subprocess.run(
+            harness = repository / "desktop/test/electron-control-smoke.cjs"
+            subprocess.run(["node", "--check", str(harness)], check=True, timeout=10)
+            process = subprocess.Popen(
                 [
                     str(repository / "desktop/node_modules/.bin/electron"),
-                    str(repository / "desktop/test/electron-control-smoke.cjs"),
+                    str(harness),
                     str(fixture),
                 ],
                 env=environment,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=35,
-                check=False,
+                start_new_session=True,
             )
-            if result.returncode:
-                raise RuntimeError(f"Desktop control fixture failed: {result.stderr[-2000:]}")
+            try:
+                _stdout, stderr = process.communicate(timeout=35)
+            except subprocess.TimeoutExpired:
+                # The npm Electron launcher owns a child process. Stop this
+                # fixture's whole process group so a failed launch cannot leak it.
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+                raise
+            if process.returncode:
+                raise RuntimeError(f"Desktop control fixture failed: {stderr[-2000:]}")
+            assert json.loads(export_path.read_text()) == research_snapshot
 
         with serve(state) as endpoint:
             run_smoke(endpoint, state / "owner.header", held=False)
@@ -197,6 +211,7 @@ def main() -> None:
                         "held_restore_pass": True,
                         "research_variants_displayed": 80,
                         "research_history_unchanged": True,
+                        "study_exports_match": True,
                         "execution_started": False,
                     }
                 )

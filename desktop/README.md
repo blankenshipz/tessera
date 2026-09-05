@@ -26,9 +26,16 @@ only a control-plane `complete_in_scope_study_ledger` envelope: every returned
 variant, source, finding, correction, and ledger event. Recorded outcomes remain
 manual or imported assertions where identified and have no execution receipt in
 this slice. Source URIs are displayed as text; the renderer does not open them,
-fetch external content, accept findings, or export files. If the server cannot
+fetch external content, or accept findings. If the server cannot
 produce its bounded complete ledger, the desktop shows an error rather than a
 partial view labeled complete.
+
+“Save study ledger JSON” fetches a fresh, complete selected-study snapshot and
+uses a native save dialog to create a private JSON file. Choose a new filename;
+existing files are never replaced. Connection or study changes before publication
+cancel the save. This also works for held restored history. The file preserves the
+entire returned ledger envelope; it is not a reproduction bundle containing code,
+artifacts, reports, or environment files.
 
 Run the dependency-free boundary tests with `npm test --prefix desktop`.
 Electron 44.2.0 and its dependencies are pinned in `package-lock.json`.
@@ -54,7 +61,8 @@ API. It uses temporary control and application state, with a test-only native
 file-picker stub selecting the fixture credential. The fixture verifies human
 attribution and absence of execution grants or leases. It also displays all 80
 synthetic registered variants and source-correction history, then verifies that
-browsing left the study ledger unchanged. This exposed and corrected
+browsing left the study ledger unchanged. It saves JSON on both the active and
+held restored branches and compares each file with the complete control ledger. This exposed and corrected
 the desktop's identity-field mismatch with the real `/me` response. It remains a
 platform fixture, not a research investigation or visual acceptance test.
 

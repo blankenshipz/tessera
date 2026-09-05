@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ControlConnection } from './connection.mjs';
 import { validateSender } from './ipc-policy.mjs';
+import { saveStudyExport } from './study-export.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const assets = new Map([
@@ -13,6 +14,8 @@ const assets = new Map([
 const connection = new ControlConnection();
 let window;
 let connecting = false;
+let selectedStudy = null;
+let exporting = false;
 protocol.registerSchemesAsPrivileged([{ scheme: 'tessera', privileges: {
   standard: true, secure: true, supportFetchAPI: false,
 } }]);
@@ -63,13 +66,27 @@ session.defaultSession.setPermissionRequestHandler((_contents, _permission, call
 session.defaultSession.setPermissionCheckHandler(() => false);
 
 const handlers = {
-  status: () => connection.status(), connect,
-  disconnect: () => connection.disconnect(),
+  status: () => connection.status(), connect: async settings => { selectedStudy = null; return connect(settings); },
+  disconnect: () => { selectedStudy = null; return connection.disconnect(); },
   projects: page => connection.projects(page), tasks: (id, page) => connection.tasks(id, page),
   recovery: () => connection.recovery(),
   threads: (id, page) => connection.threads(id, page), messages: (id, page) => connection.messages(id, page),
   decisions: (id, page) => connection.decisions(id, page),
   studies: (id, page) => connection.studies(id, page), study: id => connection.study(id),
+  studySelection: (studyId, selection, projectId) => {
+    if (!Number.isSafeInteger(selection) || selection < 0) throw new Error('Invalid study selection.');
+    selectedStudy = studyId === null ? null : { id: connection.status()?.id, studyId, selection, projectId };
+  },
+  saveStudyExport: async (studyId, selection) => {
+    if (exporting) throw new Error('A study export is already in progress.');
+    exporting = true;
+    try {
+      return await saveStudyExport({ dialog, window, connection, id: connection.status()?.id,
+        studyId, selection, projectId: selectedStudy?.projectId,
+        current: (id, study, version) => selectedStudy?.id === id &&
+          selectedStudy.studyId === study && selectedStudy.selection === version });
+    } finally { exporting = false; }
+  },
   revisions: (id, page) => connection.revisions(id, page), labbook: (id, after) => connection.labbook(id, after),
   createProject: (body, key) => connection.createProject(body, key),
   createTask: (id, body, key) => connection.createTask(id, body, key),
@@ -100,7 +117,7 @@ function createWindow() {
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.on('will-attach-webview', event => event.preventDefault());
-  window.on('closed', () => { connection.disconnect(); window = null; });
+  window.on('closed', () => { connection.disconnect(); selectedStudy = null; window = null; });
   window.loadURL('tessera://app/index.html');
 }
 createWindow();

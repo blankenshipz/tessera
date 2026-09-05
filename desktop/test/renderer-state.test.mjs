@@ -28,6 +28,7 @@ function fixture(overrides = {}) {
   const api = { status: async () => ({ id: 'connection' }), commandId: async () => 'command',
     tasks: async () => ({ tasks: [] }), labbook: async () => ({ events: [] }),
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
+    studySelection: async () => {},
     recovery: async () => ({ state: 'active', recovery_hold: false }),
     decisions: async () => ({ decisions: [] }), studies: async () => ({ studies: [] }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
@@ -366,4 +367,38 @@ test('missing or inconsistent recovery metadata fails closed for commands', asyn
     assert.throws(() => ui.applyRecoveryStatus(value), /supported recovery state/);
     await assert.rejects(ui.command('synthetic', {}, async () => {}), /read-only/);
   }
+});
+
+
+test('study export uses displayed context, survives held mode, and blocks duplicate clicks', async () => {
+  const pending = deferred(); const calls = []; const selections = [];
+  const ui = fixture({ study: async (_connection, id) => ledger(id),
+    studySelection: async (...args) => selections.push(args),
+    saveStudyExport: async (...args) => { calls.push(args); return pending.promise; } });
+  await ui.selectProject(project('p1'));
+  await ui.selectStudy({ id: 's1' });
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  const button = ui.get('study-export');
+  button.listeners.click(); button.listeners.click(); await flush();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1], 's1');
+  assert.equal(calls[0][2], selections.at(-1)[2]);
+  assert.equal(selections.at(-1)[3], 'p1');
+  pending.resolve({ status: 'saved', basename: 'study.json' }); await flush();
+  assert.equal(ui.get('notice').textContent, 'Saved study ledger JSON: study.json');
+  assert.equal(button.disabled, false);
+});
+
+test('project changes invalidate exports and late failures cannot announce into a new context', async () => {
+  const pending = deferred(); const selections = [];
+  const ui = fixture({ study: async (_connection, id) => ledger(id),
+    studySelection: async (...args) => selections.push(args),
+    saveStudyExport: async () => pending.promise });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  ui.get('study-export').listeners.click(); await flush();
+  await ui.selectProject(project('p2'));
+  assert.equal(selections.at(-1)[1], null);
+  assert.equal(ui.get('study-export').hidden, true);
+  pending.reject(new Error('Old export failed')); await flush();
+  assert.equal(ui.get('notice').textContent, '');
 });
