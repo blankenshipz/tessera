@@ -1,6 +1,7 @@
 # Artifact quarantine
 
 Schema v7 adds immutable artifact quarantine; v8 adds resumable upload sessions.
+Schema v9 adds immutable complete output manifests.
 Upgrade existing state explicitly
 with `tessera migrate` after stopping the service and backing up its private state.
 The migration preserves grants, leases, reservations and retained inputs; failure
@@ -59,8 +60,32 @@ credentials cannot use even a previously successful replay key.
 credential, using `offset` and `limit` (1–200). The query excludes BLOB content.
 There is no raw artifact download or release endpoint yet.
 
-This slice does not collect files from containers, scan or validate results,
-acknowledge complete output manifests, publish evidence, or schedule retention and
+`POST /worker/leases/{lease_id}/artifact-manifest` records a complete output set.
+Its body contains `expected_epoch`, `operation_id`, and `artifacts`, each with
+`id`, `relative_path`, `sha256`, and `size`. Entries must match exactly the
+historically approved output paths and completed artifacts for that lease and
+worker. Control checks stored BLOB type and length before reading bounded bytes,
+then rechecks their hashes. Missing, foreign, or corrupted artifacts prevent
+manifest creation.
+
+One immutable manifest is retained per lease, with sorted entries and a version-1
+digest over its frozen project/task/grant/lease/worker/epoch/operation/plan identity
+and entries. A repeated command cannot replace it. Live credential and tenant
+checks apply to replay as well as new commands. Expired or revoked execution
+authority can produce attributable late quarantine, but never accepted results.
+`GET /projects/{project_id}/artifact-manifests` provides scoped metadata pagination.
+
+`tessera_worker.outputs.collect_outputs` provides a bounded reader for a caller-
+verified stopped workspace. It checks declared paths through directory descriptors,
+rejects links and special files, and returns immutable bytes only after the entire
+collection succeeds. `upload_output_set` transfers those retained bytes and records
+the manifest; retries resume the same uploads and manifest. Neither helper proves
+provider termination, enforces a filesystem quota, or durably seals source bytes.
+Automatic runtime collection remains disabled until the
+[persistent output-storage gates](decisions/0003-persistent-output-storage.md) pass.
+
+This slice does not collect files automatically from containers, perform scientific
+result validation, release quarantine, publish evidence, or schedule retention and
 cleanup. The CPU runtime still needs a bounded output-storage contract: Docker
 [removes tmpfs contents when a container stops](https://docs.docker.com/engine/storage/tmpfs/),
 so the current `/work` mount cannot provide post-exit artifact collection.

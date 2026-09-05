@@ -69,10 +69,10 @@ decision inbox. Research-ledger views and decision resolution are not yet expose
 in the desktop UI.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v8
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v9
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
-and resumable upload sessions.
+and resumable upload sessions with complete output manifests.
 Migration retains an unambiguous local bootstrap owner and revokes other legacy
 principals, which must be enrolled again as scoped, expiring credentials.
 
@@ -94,6 +94,12 @@ worker outputs, including late results. Chunked uploads resume after interrupted
 transfers and share the approved output budget with direct uploads. Uploads remain
 unclassified and cannot declare execution success, accept findings or release
 reserved exposure.
+
+Synthetic live fixtures now verify Docker isolation, read-only released inputs,
+control-plane revocation, duration stops, and the native Electron renderer/bridge.
+Complete artifact manifests verify the declared output set and retained bytes;
+they remain quarantined. Automatic container output collection still requires
+verified persistent storage limits, and full research E2E acceptance remains pending.
 
 ## The first workflow (target)
 

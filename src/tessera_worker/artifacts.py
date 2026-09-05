@@ -13,6 +13,8 @@ import re
 import uuid
 from typing import Any, Protocol
 
+from .outputs import CollectedOutput
+
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 CHUNK_BYTES = 256 * 1024
 
@@ -119,4 +121,108 @@ def upload_artifact(
         or receipt.get("classification") != "unclassified"
     ):
         raise ArtifactTransferError("Artifact completion receipt does not match retained bytes.")
+    return receipt
+
+
+def upload_output_set(
+    channel: ArtifactChannel,
+    *,
+    lease_id: str,
+    expected_epoch: int,
+    outputs: tuple[CollectedOutput, ...],
+) -> dict[str, Any]:
+    """Upload retained outputs and record a complete quarantined manifest.
+
+    The caller owns custody, termination checks and durable retention. Retrying
+    with the same immutable tuple resumes individual transfers and manifest
+    publication. Completeness is checked against the approved plan by control.
+    This helper does not run in the cancellation loop or accept research results.
+    """
+    if type(outputs) is not tuple or len(outputs) > 128:
+        raise ArtifactTransferError("Invalid retained output set.")
+    if (
+        not isinstance(lease_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", lease_id)
+        or type(expected_epoch) is not int
+        or not 1 <= expected_epoch <= 2**63 - 1
+    ):
+        raise ArtifactTransferError("Invalid lease identity or epoch.")
+    seen: set[str] = set()
+    total = 0
+    for output in outputs:
+        if (
+            not isinstance(output, CollectedOutput)
+            or type(output.content) is not bytes
+            or not isinstance(output.relative_path, str)
+            or output.relative_path in seen
+        ):
+            raise ArtifactTransferError("Invalid retained output set.")
+        total += len(output.content)
+        if (
+            total > MAX_ARTIFACT_BYTES
+            or hashlib.sha256(output.content).hexdigest() != output.sha256
+        ):
+            raise ArtifactTransferError("Retained output size or checksum is invalid.")
+        seen.add(output.relative_path)
+    entries = []
+    for output in sorted(outputs, key=lambda item: item.relative_path):
+        receipt = upload_artifact(
+            channel,
+            lease_id=lease_id,
+            expected_epoch=expected_epoch,
+            relative_path=output.relative_path,
+            content=output.content,
+        )
+        artifact_id = receipt.get("id")
+        if not isinstance(artifact_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", artifact_id
+        ):
+            raise ArtifactTransferError("Invalid retained artifact identity.")
+        entries.append(
+            {
+                "id": artifact_id,
+                "relative_path": output.relative_path,
+                "sha256": output.sha256,
+                "size": len(output.content),
+            }
+        )
+    operation_id = hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
+    body = {"expected_epoch": expected_epoch, "operation_id": operation_id, "artifacts": entries}
+    path = f"/worker/leases/{lease_id}/artifact-manifest"
+    receipt = channel.post(path, body, _key(path, body))
+    if (
+        receipt.get("lease_id") != lease_id
+        or type(receipt.get("epoch")) is not int
+        or receipt.get("epoch") != expected_epoch
+        or receipt.get("operation_id") != operation_id
+        or receipt.get("artifacts") != entries
+        or type(receipt.get("total_bytes")) is not int
+        or receipt["total_bytes"] != total
+        or receipt.get("status") != "quarantined"
+        or receipt.get("classification") != "unclassified"
+    ):
+        raise ArtifactTransferError("Output manifest receipt does not match retained outputs.")
+    canonical = {"version": 1}
+    for name in (
+        "project_id",
+        "task_id",
+        "grant_id",
+        "lease_id",
+        "worker_principal_id",
+        "epoch",
+        "operation_id",
+        "plan_digest",
+        "artifacts",
+    ):
+        if name not in receipt:
+            raise ArtifactTransferError("Output manifest receipt is incomplete.")
+        canonical[name] = receipt[name]
+    # Hash our typed entries, rather than relying on Python's equality between
+    # booleans and integers in an otherwise matching response object.
+    canonical["artifacts"] = entries
+    digest = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if digest != receipt.get("manifest_digest"):
+        raise ArtifactTransferError("Output manifest checksum is invalid.")
     return receipt

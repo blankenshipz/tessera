@@ -6,16 +6,17 @@ pilot are not complete.
 
 ## Verified evidence
 
-- 263 Python tests pass natively and in the isolated Docker Compose test service.
+- 298 Python tests pass natively; isolated Docker Compose verification also passes.
 - Ruff lint and format checks pass.
 - Sixteen desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v8 preserve historical records, input bytes,
+- Explicit migrations through schema v9 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
-These are component and API integration results. Container execution, Electron
-runtime/visual QA, scientific output validation and a representative investigation
-have not passed end-to-end acceptance.
+These include component tests and synthetic live acceptance of container
+isolation, read-only released inputs, control revocation, duration stops, and
+sandboxed Electron startup. Visual QA, scientific output validation, and a
+representative investigation have not passed end-to-end acceptance.
 
 ## Reviewed implementation steps
 
@@ -52,7 +53,10 @@ have not passed end-to-end acceptance.
    classification and BLOB reads in metadata operations. Resumable uploads reserve
    declared bytes and recover committed progress after lost replies; binary chunks
    remain quarantined after checksum verification. Review corrected restart field
-   matching, SQLite binary concatenation and metadata queries. See [artifact quarantine](artifact-quarantine.md).
+   matching, SQLite binary concatenation and metadata queries. Complete output
+   manifests now require the exact approved path set and recheck bounded retained
+   bytes before recording immutable quarantine metadata. Worker transfer resumes
+   after lost manifest responses. See [artifact quarantine](artifact-quarantine.md).
 9. **Desktop shell:** isolated renderer, sender-checked IPC, named connections,
    project/draft/approval/labbook views, attributed conversations and a read-only
    pending decision inbox. Review corrected draft carryover, delayed thread
@@ -60,15 +64,20 @@ have not passed end-to-end acceptance.
    actual renderer with deferred replies to verify context fences and stable
    message retry keys. Research-ledger views and decision resolution remain absent.
 
+10. **Stopped-workspace collector:** declared-path, descriptor-relative reads reject
+    links, aliases, special files, cross-device traversal and oversized outputs.
+    Independent review found and fixed a hardlink race between preflight and open.
+    The low-level reader returns immutable bytes; automatic runtime collection
+    remains gated on verified persistent storage and durable sealing.
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
 real execution receipts or scientific findings.
 
-## Local commits
+## Implementation checkpoints
 
-The foundation was merged earlier as `0599b96`. Git commit access now works and
-these additional implementation commits are saved locally:
+The foundation was merged earlier as `0599b96`. Implementation checkpoints include:
 
 - `8551689`: bounded workspace inventory and reviewed byte capture.
 - `2e9261c`: structured harness transport.
@@ -78,28 +87,38 @@ these additional implementation commits are saved locally:
 - `00b04c8`: isolated desktop shell and connection boundary tests.
 - `466296a`: implemented contracts and remaining acceptance gates.
 - `18977cd`: bounded resumable artifact uploads and worker recovery.
+- `4d806ba`: desktop conversations and read-only decision inbox.
+- `802a06d`: live control-to-Docker and sandboxed Electron smoke checks.
+- `d48f038`: bounded stopped-workspace collector and storage admission decision.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
 
 ## Environment checks
 
-Docker Compose builds and tests work. The native CPU smoke script still cannot
-access the Docker socket, so its real isolation/cancellation fixtures remain
-unvalidated. No alternate socket mount or privileged workaround was used.
+Docker Compose builds and tests work. Native Docker access is now available.
+`scripts/check_cpu_runtime.py` passed isolation, revocation, and duration probes;
+`scripts/check_control_runtime.py` passed real HTTP package/input delivery and
+control revocation with actual provider observations. The isolation probe checks
+usable interfaces and absence of routing, accommodating dormant tunnel devices.
 
-Electron installation was retried with supported Node 22.12 and failed fetching
-`sumchecker` from the npm registry with DNS `ENOTFOUND`. Desktop launch, visual QA
-and signed packaging remain unvalidated.
+Locked Electron installation now succeeds. The native in-process smoke passes
+without disabling the sandbox: actual URL, bridge, load state, lack of renderer
+Node access, and absence of renderer errors are checked. Visual QA and signed
+packaging remain unvalidated.
 
-Git staging and committing work. Fetch still fails writing `.git/FETCH_HEAD`, and
-the remote read check failed resolving `ssh.github.com`. Remote publication is
-pending; no force push or remote/authentication reconfiguration is used.
+Git publication works again. The previous nine pending commits were pushed and
+CI passed for `4d806ba`. No force push or authentication reconfiguration was used.
+
+Persistent container output quotas are not verified on this Mac's Docker Desktop.
+The storage contract requires actual enforced capacity and custody evidence;
+an ordinary host directory is not sufficient. The target execution host and
+representative research question/dataset remain open configuration inputs.
 
 ## Remaining milestones
 
-1. Bounded container collection, manifest completion,
-   validation/quarantine disposition and fenced authoritative result acceptance.
+1. Verified persistent output storage, durable sealing and runtime collection,
+   quarantine disposition, and fenced authoritative result acceptance.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.

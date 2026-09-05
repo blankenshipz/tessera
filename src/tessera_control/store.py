@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 8);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 9);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -183,6 +183,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     # Imported only after Store itself is initialized to avoid schema helpers'
     # operation-layer imports forming a module cycle during startup.
+    from .artifact_manifests import create_artifact_manifest_schema
     from .artifacts import create_artifact_schema, create_artifact_upload_schema
     from .execution import create_execution_schema
     from .interaction import create_interaction_schema
@@ -197,6 +198,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_execution_schema(connection)
     create_artifact_schema(connection)
     create_artifact_upload_schema(connection)
+    create_artifact_manifest_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
