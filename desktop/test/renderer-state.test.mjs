@@ -24,7 +24,7 @@ function deferred() {
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 function fixture(overrides = {}) {
   const nodes = new Map();
-  const get = id => { if (!nodes.has(id)) nodes.set(id, new Element()); return nodes.get(id); };
+  const get = id => { if (!nodes.has(id)) nodes.set(id, Object.assign(new Element(), { id })); return nodes.get(id); };
   const api = { status: async () => ({ id: 'connection' }), commandId: async () => 'command',
     tasks: async () => ({ tasks: [] }), labbook: async () => ({ events: [] }),
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
@@ -504,4 +504,78 @@ test('variant submit blocks duplicates and a late failure cannot affect another 
   pending.reject(new Error('Old failure')); await flush();
   assert.equal(ui.get('notice').textContent, '');
   assert.equal(ui.get('variant-form').querySelector('button[type="submit"]').disabled, false);
+});
+
+const registeredVariant = (id = 'v1') => ({ id, study_id: 's1', name: id, revision: 3,
+  status: 'registered', replication_label: 'unavailable', independence_status: 'unavailable',
+  method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: {},
+  reason: null, outcome: null, outcome_provenance: null, execution_receipt: null });
+
+test('outcomes bind the displayed revision and study closure retains every accounted variant', async () => {
+  const calls = []; let data = ledger('s1', [registeredVariant()]);
+  const ui = fixture({ study: async () => data,
+    recordVariant: async (_connection, id, body) => {
+      calls.push({ id, body }); data = { ...data, variants: [{ ...data.variants[0], ...body,
+        outcome_provenance: body.provenance, revision: 4 }] }; return data.variants[0];
+    },
+    closeStudy: async (_connection, id, body) => {
+      calls.push({ id, body }); data = { ...data, study: { ...data.study, status: 'closed', revision: 2 } }; return data.study;
+    } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  assert.equal(ui.get('study-close').disabled, true);
+  ui.get('study-close').listeners.click(); await flush();
+  assert.equal(calls.length, 0);
+  find(ui.get('study-detail'), node => node.dataset?.recordVariantId === 'v1').listeners.click(); await flush();
+  ui.get('outcome-form').fields = { status: 'completed', reason: '', provenance: 'manual', outcome: '{"score":0.7}' };
+  ui.submit('outcome-form'); await flush();
+  assert.equal(JSON.stringify(calls[0]), JSON.stringify({ id: 'v1', body: {
+    expected_revision: 3, status: 'completed', reason: null, outcome: { score: 0.7 }, provenance: 'manual' } }));
+  assert.equal(ui.get('study-close').disabled, false);
+  assert.ok(find(ui.get('study-detail'), node => node.textContent?.includes('Outcome provenance: manual')));
+  ui.get('study-close').listeners.click(); await flush(); ui.submit('study-close-form'); await flush();
+  assert.equal(JSON.stringify(calls[1]), JSON.stringify({ id: 's1', body: { expected_revision: 1 } }));
+  assert.equal(ui.get('study-close').hidden, true);
+  assert.equal(findAll(ui.get('study-detail'), node => node.dataset?.variantId).length, 1);
+});
+
+test('outcome forms reject missing exclusion reasons, nonobject JSON, and held authority', async () => {
+  let calls = 0;
+  const ui = fixture({ study: async () => ledger('s1', [registeredVariant()]), recordVariant: async () => { calls++; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.recordVariantId === 'v1').listeners.click(); await flush();
+  ui.get('outcome-form').fields = { status: 'excluded', reason: '', provenance: 'manual', outcome: '{}' };
+  ui.submit('outcome-form'); await flush(); assert.match(ui.get('notice').textContent, /requires a reason/);
+  ui.get('outcome-form').fields = { status: 'failed', reason: 'Fixture', provenance: 'manual', outcome: '[]' };
+  ui.submit('outcome-form'); await flush(); assert.match(ui.get('notice').textContent, /JSON object/);
+  ui.get('outcome-form').fields.outcome = '{}';
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  ui.submit('outcome-form'); await flush();
+  assert.equal(calls, 0);
+});
+
+test('outcome retry preserves its key, blocks duplicates, and suppresses stale failures', async () => {
+  const pending = deferred(); let generated = 0; const keys = [];
+  const ui = fixture({ commandId: async () => `outcome-${++generated}`,
+    study: async (_connection, id) => ledger(id, [registeredVariant()]),
+    recordVariant: async (_connection, _variant, _body, key) => { keys.push(key); if (keys.length === 1) throw new Error('Unknown outcome'); return pending.promise; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.recordVariantId === 'v1').listeners.click(); await flush();
+  ui.get('outcome-form').fields = { status: 'abandoned', reason: 'Fixture', provenance: 'manual', outcome: '' };
+  ui.submit('outcome-form'); await flush();
+  ui.submit('outcome-form'); ui.submit('outcome-form'); await flush();
+  assert.deepEqual(keys, ['outcome-1', 'outcome-1']);
+  await ui.selectStudy({ id: 's2' });
+  pending.reject(new Error('Old failure')); await flush();
+  assert.equal(ui.get('notice').textContent, '');
+  assert.equal(ui.get('outcome-dialog').open, false);
+});
+
+test('changing study while a close command ID is pending prevents dispatch', async () => {
+  const key = deferred(); let calls = 0;
+  const ui = fixture({ commandId: async () => key.promise,
+    study: async (_connection, id) => ledger(id), closeStudy: async () => { calls++; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  ui.get('study-close').listeners.click(); await flush(); ui.submit('study-close-form'); await flush();
+  await ui.selectStudy({ id: 's2' }); key.resolve('old-key'); await flush();
+  assert.equal(calls, 0); assert.equal(ui.get('study-close-dialog').open, false);
 });

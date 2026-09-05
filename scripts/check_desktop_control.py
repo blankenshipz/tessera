@@ -181,7 +181,11 @@ def main() -> None:
             assert len(authored_snapshot["variants"]) == 2
             assert json.loads((root / "authored-study.json").read_text()) == authored_snapshot
             registered = authored_snapshot["variants"][0]
-            assert registered["status"] == "registered"
+            assert authored_snapshot["study"]["status"] == "closed"
+            assert {variant["status"] for variant in authored_snapshot["variants"]} == {
+                "failed",
+                "abandoned",
+            }
             assert registered["method_digest"] == "e" * 64
             assert registered["input_digest"] == "f" * 64
             assert registered["metadata"] == {"synthetic": True}
@@ -230,7 +234,7 @@ def main() -> None:
                 json.dumps(
                     {
                         "desktop_decision": "approved",
-                        "desktop_study_and_variant": "registered",
+                        "desktop_study_and_variant": "accounted_and_closed",
                         "held_restore_pass": True,
                         "research_variants_displayed": 80,
                         "research_history_unchanged": True,

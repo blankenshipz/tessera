@@ -8,7 +8,7 @@ pilot are not complete.
 
 - 342 Python tests pass natively and in isolated Linux CI.
 - Ruff lint and format checks pass.
-- Forty-seven desktop connection/IPC and renderer tests pass using Node 22.12.
+- Fifty-one desktop connection/IPC and renderer tests pass using Node 22.12.
 - Explicit migrations through schema v11 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
@@ -72,7 +72,8 @@ representative investigation have not passed end-to-end acceptance.
    on both active and held restored branches. Study creation and variant registration
    now use the same scoped, idempotent command boundary, with authoritative open-study
    checks and context-cleared drafts. Native authoring creates and exports two
-   registered variants without asserting execution. Review corrected a stale-read mock signature and
+   variants, records their failed/abandoned outcomes, closes the accounted study,
+   and exports both without asserting execution. Review corrected a stale-read mock signature and
    ensured that returned study/project identity matches the selected context.
 
 10. **Stopped-workspace collector:** declared-path, descriptor-relative reads reject
@@ -121,6 +122,8 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `c2bc4c5`: complete read-only study browsing in the desktop.
 - `6173b8f`: online backup and held schema-v11 recovery.
 - `046303d`: standalone snapshots from WAL-mode sources.
+- `b1c4adc`: native complete study JSON export.
+- `f90eda8`: desktop study creation and variant registration.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -139,7 +142,7 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed through `b1c4adc`. No force push or authentication reconfiguration was used.
+CI passed through `f90eda8`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
 A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's

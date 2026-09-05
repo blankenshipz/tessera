@@ -24,7 +24,11 @@ work. Closing the desktop does not stop the backend.
 The research-ledger panel can create a study with purpose, protocol and mode,
 then register variants with method/input digests and explicit metadata. These are
 attributed records; they do not launch work or prove that the supplied digests
-identify a validated scientific method. Registration requires a loaded open study.
+identify a validated scientific method. Registration requires a loaded open study. A registered variant can receive a
+revision-bound completed, failed, excluded, or abandoned record with explicit
+manual/imported provenance. Exclusion and abandonment require a reason. Closing
+a study requires every registered variant to be accounted for; it preserves all
+variants and does not establish scientific validity.
 Held recovery disables authoring. Context changes clear authoring drafts, and
 uncertain submissions retain their command key for an explicit retry.
 
@@ -68,7 +72,8 @@ API. It uses temporary control and application state, with a test-only native
 file-picker stub selecting the fixture credential. The fixture verifies human
 attribution and absence of execution grants or leases. It also displays all 80
 synthetic registered variants and source-correction history. It also creates a new
-study and registers a variant through the UI, checks the stored attribution and
+study and registers two variants through the UI, records failed/abandoned
+outcomes, closes the accounted study, and checks the stored attribution and
 metadata, then verifies that
 browsing left the study ledger unchanged. It saves JSON on both the active and
 held restored branches and compares each file with the complete control ledger. This exposed and corrected

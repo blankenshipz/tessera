@@ -139,15 +139,25 @@ test('study authoring routes are scoped, typed POST commands', async () => {
   await connection.connect(config());
   const study = { purpose: 'Purpose', protocol: 'Protocol', mode: 'exploratory' };
   const variant = { name: 'Variant', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: {}, replication_label: 'unavailable' };
+  const outcome = { expected_revision: 1, status: 'completed', reason: null, provenance: 'manual', outcome: {} };
+  const close = { expected_revision: 2 };
   await connection.createStudy('project_1', study, 'study-command');
   await connection.registerVariant('study_1', variant, 'variant-command');
+  await connection.recordVariant('variant_1', outcome, 'outcome-command');
+  await connection.closeStudy('study_1', close, 'close-command');
   assert.match(calls[1].url, /\/projects\/project_1\/studies$/);
   assert.match(calls[2].url, /\/studies\/study_1\/variants$/);
+  assert.match(calls[3].url, /\/variants\/variant_1\/record$/);
+  assert.match(calls[4].url, /\/studies\/study_1\/close$/);
   assert.equal(calls[1].options.method, 'POST');
   assert.equal(calls[1].options.headers['Idempotency-Key'], 'study-command');
   assert.deepEqual(JSON.parse(calls[2].options.body), variant);
+  assert.deepEqual(JSON.parse(calls[3].options.body), outcome);
+  assert.deepEqual(JSON.parse(calls[4].options.body), close);
   assert.throws(() => connection.createStudy('../project', study, 'key'));
   assert.throws(() => connection.registerVariant('study_1', variant));
+  assert.throws(() => connection.recordVariant('../variant', outcome, 'key'));
+  assert.throws(() => connection.closeStudy('study_1', close));
 });
 
 test('an interaction read cannot cross a connection switch', async () => {

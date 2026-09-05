@@ -13,6 +13,9 @@ let epoch = 0;
 let connectionId = null;
 let recoveryHeld = true;
 let activeProject = null;
+let activeLedger = null;
+let outcomeContext = null;
+let closeContext = null;
 let projectOffset = 0;
 let taskOffset = 0;
 let eventCursor = 0;
@@ -40,8 +43,8 @@ function applyRecoveryStatus(status) {
   $('recovery-banner').hidden = !recoveryHeld;
   $('recovery-banner').textContent = recoveryHeld ?
     'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
-  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new']) $(id).disabled = recoveryHeld;
-  for (const id of ['study-form', 'variant-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
+  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close']) $(id).disabled = recoveryHeld;
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
   $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
 }
 function element(tag, text, className) {
@@ -51,7 +54,8 @@ function element(tag, text, className) {
   return node;
 }
 function resetAuthoringForms() {
-  for (const id of ['study-form', 'variant-form']) {
+  outcomeContext = closeContext = null;
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form']) {
     const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
     form.querySelector('button[type="submit"]').disabled = recoveryHeld;
   }
@@ -63,7 +67,7 @@ function clearContext() {
   $('recovery-banner').hidden = true;
   activeProject = null;
   projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
-  activeThread = null; threadEpoch++; activeStudy = null; studyEpoch++;
+  activeThread = null; threadEpoch++; activeStudy = null; activeLedger = null; studyEpoch++;
   pendingKeys.clear();
   pendingDecisionResolutions.clear();
   for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions', 'studies', 'study-detail']) $(name).replaceChildren();
@@ -73,7 +77,7 @@ function clearContext() {
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
   for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
-  $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true;
+  $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true; $('study-close').hidden = true;
   resetAuthoringForms();
   $('study-export').hidden = true;
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
@@ -128,14 +132,14 @@ async function selectProject(project) {
   if (activeProject?.id !== project.id) pendingDecisionResolutions.clear();
   activeProject = project;
   taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
-  activeThread = null; threadEpoch++; activeStudy = null; studyEpoch++;
+  activeThread = null; threadEpoch++; activeStudy = null; activeLedger = null; studyEpoch++;
   const selectionUpdate = api.studySelection(connectionId, null, studyEpoch, null);
   for (const name of ['threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
   $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
   $('study-export').hidden = true;
-  $('variant-new').hidden = true;
+  $('variant-new').hidden = true; $('study-close').hidden = true;
   resetAuthoringForms();
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
@@ -373,7 +377,7 @@ function renderStudyLedger(ledger) {
   summary.append(element('p', `Purpose: ${study.purpose}`));
   summary.append(element('p', `Protocol: ${study.protocol}`));
   summary.append(element('p', 'Completeness: complete in-scope study ledger.', 'muted'));
-  summary.append(element('p', 'This is a read-only record. Manual or imported outcomes remain assertions, and this view has no execution receipts.', 'muted'));
+  summary.append(element('p', 'Manual or imported outcomes remain assertions. No execution receipts are recorded in this ledger.', 'muted'));
   detail.append(summary);
   const appendSection = (title, records, render) => {
     detail.append(element('h4', `${title} (${records.length})`));
@@ -390,6 +394,21 @@ function renderStudyLedger(ledger) {
     if (variant.outcome_provenance) card.append(element('p', `Outcome provenance: ${variant.outcome_provenance} (assertion; no execution receipt)`, 'muted'));
     card.append(element('p', `Execution receipt: ${variant.execution_receipt === null ? 'none recorded' : ledgerText(variant.execution_receipt)}`, 'muted'));
     card.append(element('p', `Independence: ${variant.independence_status}`, 'muted'));
+    if (variant.status === 'registered') {
+      const record = element('button', 'Record outcome');
+      record.dataset.recordVariantId = variant.id;
+      record.disabled = recoveryHeld || study.status !== 'open';
+      record.addEventListener('click', () => guarded(async () => {
+        if (recoveryHeld || ledger !== activeLedger || study.status !== 'open') {
+          throw new Error('Select a current open study to record an outcome.');
+        }
+        outcomeContext = researchContext(ledger, variant);
+        $('outcome-form').reset();
+        $('outcome-form').querySelector('button[type="submit"]').disabled = false;
+        $('outcome-dialog').showModal();
+      }));
+      card.append(record);
+    }
     return card;
   });
   appendSection('Sources', sources, source => {
@@ -463,13 +482,13 @@ async function loadStudies(reset = false) {
 async function selectStudy(study) {
   const version = epoch; const project = activeProject; const selection = ++studyEpoch;
   const requestVersion = ++readVersion.study;
-  activeStudy = study;
+  activeStudy = study; activeLedger = null;
   // A list row's status is advisory until the complete authoritative ledger
   // arrives. Keep authoring disabled while that read is pending or failed.
   study.status = null;
   $('study-export').hidden = true; $('study-export').disabled = false;
   $('study-title').textContent = `Study ${study.id}`;
-  $('variant-new').hidden = true; $('variant-new').disabled = true;
+  $('variant-new').hidden = true; $('study-close').hidden = true; $('variant-new').disabled = true;
   $('variant-dialog').close(); resetAuthoringForms();
   $('study-detail').replaceChildren(element('p', 'Loading complete study ledger…', 'muted'));
   for (const button of $('studies').children) {
@@ -486,8 +505,11 @@ async function selectStudy(study) {
         !['variants', 'sources', 'findings', 'corrections', 'events'].every(name => Array.isArray(ledger[name]))) {
       throw new Error('The control plane did not return a complete study ledger.');
     }
-    study.status = ledger.study.status;
+    Object.assign(study, ledger.study);
+    activeLedger = ledger;
     renderStudyLedger(ledger);
+    $('study-close').hidden = ledger.study.status !== 'open';
+    $('study-close').disabled = recoveryHeld || ledger.variants.some(variant => variant.status === 'registered');
     $('study-export').hidden = false;
     $('variant-new').hidden = ledger.study.status !== 'open';
     $('variant-new').disabled = recoveryHeld;
@@ -498,6 +520,80 @@ async function selectStudy(study) {
     }
   }
 }
+function researchContext(ledger, variant = null) {
+  return { ledger, variant, project: activeProject, study: activeStudy, version: epoch, selection: studyEpoch };
+}
+function currentResearchContext(context) {
+  return context && !recoveryHeld && context.version === epoch && context.project === activeProject &&
+    context.study === activeStudy && context.selection === studyEpoch && context.ledger === activeLedger;
+}
+async function submitResearchRecord(form, context, scope, body, invoke) {
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  if (!currentResearchContext(context)) throw new Error('Select a current open study first.');
+  button.disabled = true;
+  try {
+    try {
+      await command(scope, body, invoke, () => currentResearchContext(context));
+    } catch (error) {
+      if (currentResearchContext(context)) throw error;
+      return;
+    }
+    if (!currentResearchContext(context)) return;
+    $(form.id.replace('form', 'dialog')).close(); form.reset();
+    await selectStudy(context.study);
+    if (context.version === epoch && context.project === activeProject && context.study === activeStudy) {
+      await loadStudies(true);
+    }
+  } finally {
+    if (currentResearchContext(context)) button.disabled = false;
+  }
+}
+$('outcome-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const context = outcomeContext;
+    if (!currentResearchContext(context) || context.variant?.status !== 'registered') {
+      throw new Error('Select a current registered variant first.');
+    }
+    const fields = new FormData(event.target);
+    const status = fields.get('status'); const reason = fields.get('reason')?.trim();
+    if (!['completed', 'failed', 'excluded', 'abandoned'].includes(status)) throw new Error('Choose an outcome status.');
+    if (['excluded', 'abandoned'].includes(status) && !reason) throw new Error('Exclusion or abandonment requires a reason.');
+    const raw = fields.get('outcome')?.trim();
+    let outcome = null;
+    if (raw) {
+      try { outcome = JSON.parse(raw); } catch { throw new Error('Outcome must be a JSON object.'); }
+      if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) throw new Error('Outcome must be a JSON object.');
+    }
+    const body = { expected_revision: context.variant.revision, status, reason: reason || null,
+      outcome, provenance: fields.get('provenance') };
+    await submitResearchRecord(event.target, context, `outcome:${context.variant.id}`, body,
+      (id, key) => api.recordVariant(id, context.variant.id, body, key));
+  });
+});
+$('study-close').addEventListener('click', () => guarded(async () => {
+  if (!activeLedger || recoveryHeld || activeLedger.study.status !== 'open' ||
+      activeLedger.variants.some(variant => variant.status === 'registered')) {
+    throw new Error('Account for every registered variant before closing the study.');
+  }
+  closeContext = researchContext(activeLedger);
+  $('study-close-form').querySelector('button[type="submit"]').disabled = false;
+  $('study-close-dialog').showModal();
+}));
+$('study-close-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const context = closeContext;
+    if (!currentResearchContext(context) || context.ledger.study.status !== 'open' ||
+        context.ledger.variants.some(variant => variant.status === 'registered')) {
+      throw new Error('Account for every registered variant before closing the study.');
+    }
+    const body = { expected_revision: context.ledger.study.revision };
+    await submitResearchRecord(event.target, context, `close-study:${context.study.id}`, body,
+      (id, key) => api.closeStudy(id, context.study.id, body, key));
+  });
+});
 $('study-export').addEventListener('click', () => guarded(async () => {
   const version = epoch; const study = activeStudy; const selection = studyEpoch;
   const button = $('study-export');

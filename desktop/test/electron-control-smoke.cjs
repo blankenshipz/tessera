@@ -98,6 +98,22 @@ async function main() {
       variantForm.elements.replication_label.value = 'unavailable';
       variantForm.requestSubmit();
       await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 2);
+      if (!document.querySelector('#study-close').disabled) throw new Error('Unaccounted study can close.');
+      for (const [index, status] of ['failed', 'abandoned'].entries()) {
+        document.querySelector('#study-detail [data-record-variant-id]').click();
+        const outcomeForm = document.querySelector('#outcome-form');
+        outcomeForm.elements.status.value = status;
+        outcomeForm.elements.reason.value = 'Synthetic accounting fixture; no provider execution.';
+        outcomeForm.elements.provenance.value = 'manual';
+        outcomeForm.elements.outcome.value = '{"synthetic":true}';
+        outcomeForm.requestSubmit();
+        await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 2 &&
+          document.querySelectorAll('#study-detail [data-record-variant-id]').length === 1 - index);
+      }
+      document.querySelector('#study-close').click();
+      document.querySelector('#study-close-form').requestSubmit();
+      await waitFor(() => document.querySelector('#study-detail').textContent.includes('closed · revision 2'));
+
       document.querySelector('#study-export').click();
       await waitFor(() => document.querySelector('#notice').textContent.endsWith('authored-study.json'));
 
@@ -106,7 +122,10 @@ async function main() {
     [...document.querySelectorAll('[data-study-id]')].find(node => node.dataset.studyId === expected.studyId).click();
     await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 80);
     const detail = document.querySelector('#study-detail');
-    if (expected.held && !document.querySelector('#variant-new').disabled) throw new Error('Held variant registration is enabled.');
+    if (expected.held && (!document.querySelector('#variant-new').disabled ||
+        [...detail.querySelectorAll('[data-record-variant-id]')].some(button => !button.disabled))) {
+      throw new Error('Held research authoring is enabled.');
+    }
     if (detail.querySelectorAll('[data-source-id]').length !== 2 ||
         detail.querySelectorAll('[data-finding-id]').length !== 1 ||
         detail.querySelectorAll('[data-correction-id]').length !== 1) {
