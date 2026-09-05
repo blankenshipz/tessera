@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 // Exercise the actual renderer without Electron. Deferred replies reproduce races.
 class Element {
-  constructor() { this.children = []; this.listeners = {}; this.dataset = {}; this.fields = {}; this.hidden = false; this.disabled = false; this.textContent = ''; }
+  constructor() { this.children = []; this.listeners = {}; this.dataset = {}; this.fields = {}; this.hidden = false; this.disabled = false; this.textContent = ''; this.value = ''; }
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   addEventListener(name, handler) { this.listeners[name] = handler; }
@@ -39,6 +39,18 @@ function fixture(overrides = {}) {
 }
 const thread = id => ({ id, title: id });
 const project = id => ({ id, name: id });
+function find(node, predicate) {
+  if (predicate(node)) return node;
+  for (const child of node.children ?? []) {
+    const match = find(child, predicate);
+    if (match) return match;
+  }
+  return null;
+}
+const pendingDecision = (id = 'd1', projectId = 'p1') => ({
+  id, project_id: projectId, task_id: 't1', kind: 'spending', scope: { budget_cents: 100, access: 'public-data' },
+  expires_at: '2030-01-01T00:00:00Z', expected_task_revision: 3, reviewer_principal_id: 'human', revision: 4,
+});
 
 test('renderer keeps earlier pages, removes loading markers, and deduplicates concurrent More reads', async () => {
   const next = deferred(); let calls = 0;
@@ -127,4 +139,124 @@ test('message submission blocks duplicate clicks and keeps its key after an unce
   ui.submit('message-form'); await flush();
   assert.deepEqual(keys, ['command-1', 'command-1']);
   assert.equal(ui.get('message-form').fields.body, undefined);
+});
+
+test('decision resolution sends an explicit revision-bound intent and does not approve on load', async () => {
+  const calls = [];
+  const ui = fixture({ decisions: async () => ({ decisions: [pendingDecision()] }),
+    resolveDecision: async (_id, body, key) => { calls.push({ body, key }); return { status: 'approved' }; } });
+  await ui.selectProject(project('p1'));
+  assert.equal(calls.length, 0);
+  const card = ui.get('decisions').children[0];
+  const rationale = find(card, node => node.placeholder === 'Optional rationale');
+  rationale.value = 'Reviewed within the stated limit';
+  find(card, node => node.textContent === 'Approve').listeners.click(); await flush();
+  assert.equal(JSON.stringify(calls), JSON.stringify([{ body: { decision_id: 'd1', expected_revision: 4, decision: 'approve', rationale: 'Reviewed within the stated limit' }, key: 'command' }]));
+  assert.match(ui.get('notice').textContent, /intent record; no grant or execution started/);
+});
+
+test('decision rejection sends the displayed revision and remains intent only', async () => {
+  const calls = [];
+  const ui = fixture({ decisions: async () => ({ decisions: [pendingDecision()] }),
+    resolveDecision: async (_id, body, key) => { calls.push({ body, key }); return { status: 'rejected' }; } });
+  await ui.selectProject(project('p1'));
+  const card = ui.get('decisions').children[0];
+  find(card, node => node.placeholder === 'Optional rationale').value = 'The disclosed access is not acceptable.';
+  find(card, node => node.textContent === 'Reject').listeners.click(); await flush();
+  assert.equal(JSON.stringify(calls), JSON.stringify([{ body: {
+    decision_id: 'd1', expected_revision: 4, decision: 'reject', rationale: 'The disclosed access is not acceptable.',
+  }, key: 'command' }]));
+  assert.match(ui.get('notice').textContent, /Decision rejection recorded\. This is an intent record/);
+});
+
+test('decision retry preserves its idempotency key after an uncertain result', async () => {
+  const keys = []; const bodies = []; let attempts = 0;
+  const ui = fixture({ commandId: async () => `command-${keys.length + 1}`,
+    decisions: async () => ({ decisions: [pendingDecision()] }),
+    resolveDecision: async (_id, body, key) => { bodies.push(body); keys.push(key); if (++attempts === 1) throw new Error('Outcome unknown'); return {}; } });
+  await ui.selectProject(project('p1'));
+  const card = ui.get('decisions').children[0];
+  const approve = find(card, node => node.textContent === 'Approve');
+  approve.listeners.click(); await flush();
+  assert.match(ui.get('notice').textContent, /outcome is unknown/);
+  await ui.selectProject(project('p1'));
+  const refreshed = ui.get('decisions').children[0];
+  find(refreshed, node => node.placeholder === 'Retry will use the original rationale').value = 'Cannot change an uncertain request';
+  find(refreshed, node => node.textContent === 'Approve').listeners.click(); await flush();
+  assert.deepEqual(keys, ['command-1', 'command-1']);
+  assert.equal(JSON.stringify(bodies), JSON.stringify([
+    { decision_id: 'd1', expected_revision: 4, decision: 'approve' },
+    { decision_id: 'd1', expected_revision: 4, decision: 'approve' },
+  ]));
+});
+
+test('a confirmed decision is retained when its inbox refresh fails', async () => {
+  let reads = 0;
+  const ui = fixture({ decisions: async () => {
+    if (++reads === 1) return { decisions: [pendingDecision()] };
+    throw new Error('inbox unavailable');
+  }, resolveDecision: async () => ({ status: 'approved' }) });
+  await ui.selectProject(project('p1'));
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click(); await flush();
+  assert.match(ui.get('notice').textContent, /Decision recorded\. The inbox could not refresh/);
+});
+
+test('an old completion cannot clear a retry created after reselecting the same project', async () => {
+  const first = deferred(); const second = deferred(); const keys = []; let calls = 0;
+  const ui = fixture({ commandId: async () => 'command-1',
+    decisions: async () => ({ decisions: [pendingDecision()] }),
+    resolveDecision: async (_id, _body, key) => {
+      keys.push(key); calls++;
+      if (calls === 1) return first.promise;
+      if (calls === 2) return second.promise;
+      return {};
+    } });
+  await ui.selectProject(project('p1'));
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click(); await flush();
+  await ui.selectProject(project('p1'));
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click(); await flush();
+  first.resolve({ status: 'approved' }); await flush();
+  second.reject(new Error('Outcome unknown')); await flush();
+  assert.match(ui.get('notice').textContent, /outcome is unknown/);
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click(); await flush();
+  assert.deepEqual(keys, ['command-1', 'command-1', 'command-1']);
+});
+
+test('a stale resolution failure does not announce into a different project', async () => {
+  const response = deferred();
+  const ui = fixture({ decisions: async (_id, projectId) => ({ decisions: projectId === 'p1' ? [pendingDecision()] : [] }),
+    resolveDecision: async () => response.promise });
+  await ui.selectProject(project('p1'));
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click(); await flush();
+  await ui.selectProject(project('p2'));
+  response.reject(new Error('Control request failed (409).')); await flush();
+  assert.equal(ui.get('notice').textContent, '');
+});
+
+test('a pending decision cannot resolve after its project switches', async () => {
+  const key = deferred(); let resolutions = 0;
+  const ui = fixture({ commandId: () => key.promise,
+    decisions: async (_id, projectId) => ({ decisions: projectId === 'p1' ? [pendingDecision()] : [] }),
+    resolveDecision: async () => { resolutions++; } });
+  await ui.selectProject(project('p1'));
+  find(ui.get('decisions').children[0], node => node.textContent === 'Reject').listeners.click();
+  await ui.selectProject(project('p2')); key.resolve('command'); await flush();
+  assert.equal(resolutions, 0);
+  assert.equal(ui.state().activeProject.id, 'p2');
+});
+
+test('refresh while a decision command ID is pending shares one ID allocation', async () => {
+  const allocation = deferred(); let allocations = 0; const keys = [];
+  const ui = fixture({ commandId: () => { allocations++; return allocation.promise; },
+    decisions: async () => ({ decisions: [pendingDecision()] }),
+    resolveDecision: async (_id, _body, key) => { keys.push(key); throw new Error('Outcome unknown'); } });
+  await ui.selectProject(project('p1'));
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click();
+  await ui.selectProject(project('p1'));
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click();
+  assert.equal(allocations, 1);
+  allocation.resolve('shared-command'); await flush();
+  assert.deepEqual(keys, ['shared-command']);
+  find(ui.get('decisions').children[0], node => node.textContent === 'Approve').listeners.click(); await flush();
+  assert.deepEqual(keys, ['shared-command', 'shared-command']);
 });

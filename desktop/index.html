@@ -38,7 +38,7 @@
           <form id="message-form" hidden><label>Intent<select name="intent"><option value="question">Question</option><option value="direction">Direction</option><option value="status">Status</option><option value="evidence">Evidence</option></select></label><label>Message<textarea name="body" required maxlength="8000" rows="3"></textarea></label><button type="submit">Send message</button></form>
         </div>
       </section>
-      <section class="inbox"><div class="section-title"><div><h2>Pending human decisions</h2><p class="muted">Review inbox records. This desktop does not resolve decisions.</p></div></div><div id="decisions" class="cards"></div><button id="decisions-more" hidden>More decisions</button></section>
+      <section class="inbox"><div class="section-title"><div><h2>Pending human decisions</h2><p class="muted">Approve or reject the displayed request revision. A recorded decision is intent only; it does not issue a grant or start execution.</p></div></div><div id="decisions" class="cards"></div><button id="decisions-more" hidden>More decisions</button></section>
       <div class="section-title"><div><h2>Research plans</h2><p class="muted">Review purpose, limits, and the current plan before approving.</p></div><button id="task-new">New plan</button></div>
       <div id="tasks" class="cards"></div><button id="tasks-more" hidden>More plans</button>
       <section class="labbook"><div class="section-title"><h2>Labbook</h2><span class="caption">A durable record of the work</span></div><ol id="events"></ol><button id="events-more" hidden>Load more events</button></section>

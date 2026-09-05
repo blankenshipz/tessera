@@ -68,7 +68,7 @@ export class ControlConnection {
     const candidate = { id, name, origin, token, generation };
     const identity = await this.#send(candidate, '/me');
     if (generation !== this.#generation) throw new ConnectionError('Connection changed.');
-    if (typeof identity.id !== 'string' || typeof identity.org_id !== 'string') {
+    if (typeof identity.principal_id !== 'string' || typeof identity.org_id !== 'string') {
       throw new ConnectionError('The endpoint did not return an authenticated identity.');
     }
     this.#active = { ...candidate, identity };
@@ -78,7 +78,7 @@ export class ControlConnection {
   status() {
     if (!this.#active) return null;
     const { id, name, origin, identity } = this.#active;
-    return { id, name, endpoint: origin, principalId: identity.id, organizationId: identity.org_id,
+    return { id, name, endpoint: origin, principalId: identity.principal_id, organizationId: identity.org_id,
       role: identity.role, projectId: identity.project_id ?? null, expiresAt: identity.expires_at ?? null };
   }
 
@@ -158,6 +158,7 @@ export class ControlConnection {
   createTask(projectId, body, key) { return this.#request(`/projects/${resourceId(projectId)}/tasks`, body, key); }
   createThread(body, key) { return this.#request('/interaction/threads', body, key); }
   sendMessage(body, key) { return this.#request('/interaction/messages', body, key); }
+  resolveDecision(body, key) { return this.#request('/interaction/decisions/resolve', body, key); }
   approve(taskId, body, key) { return this.#request(`/tasks/${resourceId(taskId)}/approve`, body, key); }
   commandId() { return randomUUID(); }
 }

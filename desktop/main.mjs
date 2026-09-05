@@ -73,6 +73,7 @@ const handlers = {
   createTask: (id, body, key) => connection.createTask(id, body, key),
   createThread: (body, key) => connection.createThread(body, key),
   sendMessage: (body, key) => connection.sendMessage(body, key),
+  resolveDecision: (body, key) => connection.resolveDecision(body, key),
   approve: (id, body, key) => connection.approve(id, body, key), commandId: () => connection.commandId(),
 };
 for (const [method, handler] of Object.entries(handlers)) {

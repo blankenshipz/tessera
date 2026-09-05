@@ -8,9 +8,11 @@ reads and rejects stale replies. Mutation retries are explicit and stay with
 their original command and connection.
 
 The initial interface covers connections, projects, record-only plans, approval,
-labbook history, attributed interaction threads/messages, and a read-only pending
-decision inbox. It does not start experiments, resolve decisions, or claim a
-complete research workflow. Credential files are selected through a native dialog and held only in
+labbook history, attributed interaction threads/messages, and pending human
+decisions. The decision inbox displays the returned scope, expiry, task basis,
+and decision revision; an eligible session can explicitly approve or reject that
+exact revision with an optional rationale. Resolution is an intent record only:
+it does not issue a grant, start an experiment, or spend funds. Credential files are selected through a native dialog and held only in
 main-process memory; saved encrypted sessions and organization login are later
 work. Closing the desktop does not stop the backend.
 
@@ -32,11 +34,21 @@ bridge, rejects disabled sandbox settings, and reports renderer errors. It does
 not connect to a control plane or establish visual, signed-package, or full
 desktop E2E acceptance.
 
+`.venv/bin/python scripts/check_desktop_control.py` additionally passes a live
+synthetic decision through the actual sandboxed renderer, IPC and loopback control
+API. It uses temporary control and application state, with a test-only native
+file-picker stub selecting the fixture credential. The fixture verifies human
+attribution and absence of execution grants or leases. This exposed and corrected
+the desktop's identity-field mismatch with the real `/me` response. It remains a
+platform fixture, not a research investigation or visual acceptance test.
+
 Renderer tests execute the application code with synthetic DOM nodes and deferred
 API replies. They verify pagination, draft clearing on context switches, delayed
 thread selection, overlapping refreshes, and retry keys after uncertain message
-responses. They do not establish visual or Electron runtime acceptance. Unsent
-message drafts are cleared when switching thread, project, or connection.
+or decision-resolution responses. They also verify that stale decision actions do
+not cross a project switch. They do not establish visual or Electron runtime
+acceptance. Unsent message drafts are cleared when switching thread, project, or
+connection.
 
 Sources: [Electron security](https://www.electronjs.org/docs/latest/tutorial/security),
 [stable releases](https://releases.electronjs.org/),

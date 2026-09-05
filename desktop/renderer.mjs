@@ -21,6 +21,7 @@ let messageOffset = 0;
 let activeThread = null;
 let threadEpoch = 0;
 const pendingKeys = new Map();
+const pendingDecisionResolutions = new Map();
 const loading = new Set();
 const readVersion = { threads: 0, messages: 0, decisions: 0 };
 
@@ -38,6 +39,7 @@ function clearContext() {
   projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = messageOffset = 0;
   activeThread = null; threadEpoch++;
   pendingKeys.clear();
+  pendingDecisionResolutions.clear();
   for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions']) $(name).replaceChildren();
   $('project-title').textContent = 'Start with a question.';
   $('welcome').hidden = false;
@@ -60,16 +62,21 @@ async function guarded(work) {
 }
 async function keyFor(scope, body) {
   const fingerprint = JSON.stringify([scope, body]);
-  if (!pendingKeys.has(fingerprint)) pendingKeys.set(fingerprint, await api.commandId());
-  return pendingKeys.get(fingerprint);
+  if (!pendingKeys.has(fingerprint)) pendingKeys.set(fingerprint, api.commandId());
+  const pending = pendingKeys.get(fingerprint);
+  try { return await pending; } catch (error) {
+    if (pendingKeys.get(fingerprint) === pending) pendingKeys.delete(fingerprint);
+    throw error;
+  }
 }
 async function command(scope, body, execute, valid = () => true) {
   const id = connectionId;
   const version = epoch;
+  const fingerprint = JSON.stringify([scope, body]);
   const key = await keyFor(scope, body);
   if (version !== epoch || id !== connectionId || !valid()) throw new Error('Connection or project changed.');
   const result = await execute(id, key);
-  pendingKeys.delete(JSON.stringify([scope, body]));
+  if (version === epoch && id === connectionId && valid()) pendingKeys.delete(fingerprint);
   return result;
 }
 async function loadProjects(reset = false) {
@@ -88,6 +95,7 @@ async function loadProjects(reset = false) {
 }
 async function selectProject(project) {
   epoch++;
+  if (activeProject?.id !== project.id) pendingDecisionResolutions.clear();
   activeProject = project;
   taskOffset = eventCursor = threadOffset = decisionOffset = messageOffset = 0;
   activeThread = null; threadEpoch++;
@@ -223,7 +231,81 @@ async function loadDecisions(reset = false) {
       card.append(element('h3', `Decision ${decision.id}`));
       card.append(element('p', `Scope: ${JSON.stringify(decision.scope)}`));
       card.append(element('p', `Reviewer: ${decision.reviewer_principal_id} · expires ${decision.expires_at}`, 'muted'));
-      card.append(element('p', `Revision ${decision.revision}`, 'muted')); $('decisions').append(card);
+      card.append(element('p', `Task: ${decision.task_id ?? 'Project-level'} · task basis revision ${decision.expected_task_revision ?? 'none'}`, 'muted'));
+      card.append(element('p', `Decision revision ${decision.revision}`, 'muted'));
+      card.append(element('p', 'Safe default: leave this request pending. Silence does not approve it.', 'muted'));
+      card.append(element('p', 'A recorded decision is intent only. It does not issue a grant or start execution.', 'muted'));
+      const rationale = document.createElement('textarea');
+      rationale.maxLength = 8000; rationale.rows = 3;
+      rationale.setAttribute('aria-label', `Rationale for decision ${decision.id}`);
+      rationale.placeholder = 'Optional rationale';
+      const retry = pendingDecisionResolutions.get(decision.id);
+      if (retry?.projectId === project.id && retry.revision === decision.revision) {
+        rationale.value = retry.body.rationale ?? '';
+        rationale.disabled = true;
+        rationale.placeholder = 'Retry will use the original rationale';
+      }
+      const actions = element('div', undefined, 'decision-actions');
+      const approve = element('button', 'Approve'); approve.type = 'button';
+      const reject = element('button', 'Reject'); reject.type = 'button';
+      if (retry?.projectId === project.id && retry.revision === decision.revision) {
+        (retry.body.decision === 'approve' ? reject : approve).disabled = true;
+      }
+      const resolve = choice => guarded(async () => {
+        const action = choice === 'approve' ? approve : reject;
+        if (action.disabled) return;
+        approve.disabled = reject.disabled = true;
+        const decisionProject = project;
+        const existing = pendingDecisionResolutions.get(decision.id);
+        const text = String(rationale.value ?? '').trim();
+        const retryRecord = existing?.projectId === decisionProject.id && existing.revision === decision.revision ? existing : {
+          projectId: decisionProject.id,
+          revision: decision.revision,
+          body: { decision_id: decision.id, expected_revision: decision.revision, decision: choice,
+            ...(text ? { rationale: text } : {}) },
+        };
+        const body = retryRecord.body;
+        pendingDecisionResolutions.set(decision.id, retryRecord);
+        try {
+          await command(`decision:${decision.id}`, body,
+            (id, key) => api.resolveDecision(id, body, key),
+            () => version === epoch && decisionProject === activeProject && decision.project_id === decisionProject.id);
+          if (version === epoch && decisionProject === activeProject &&
+              pendingDecisionResolutions.get(decision.id) === retryRecord) {
+            pendingDecisionResolutions.delete(decision.id);
+          }
+          if (version === epoch && decisionProject === activeProject) {
+            try {
+              await loadDecisions(true);
+              if (version === epoch && decisionProject === activeProject) {
+                notice(`Decision ${choice === 'approve' ? 'approval' : 'rejection'} recorded. This is an intent record; no grant or execution started.`);
+              }
+            } catch {
+              if (version === epoch && decisionProject === activeProject) {
+                notice('Decision recorded. The inbox could not refresh; use Refresh to inspect the current state.');
+              }
+            }
+          }
+        } catch (error) {
+          if (version !== epoch || decisionProject !== activeProject) return;
+          rationale.value = body.rationale ?? '';
+          rationale.disabled = true;
+          if (/\(409\)/.test(error.message)) {
+            throw new Error('Decision was not recorded because its revision is stale, it expired, or it is no longer pending. Refresh before taking another action.');
+          }
+          if (/\((401|403)\)/.test(error.message)) {
+            throw new Error('This session is no longer authorized to resolve the decision. Reconnect before taking another action.');
+          }
+          throw new Error('Decision outcome is unknown. Refresh this project before retrying; retry will keep the original request and command identifier.');
+        } finally {
+          const pending = pendingDecisionResolutions.get(decision.id);
+          approve.disabled = pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'reject';
+          reject.disabled = pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'approve';
+        }
+      });
+      approve.addEventListener('click', () => resolve('approve'));
+      reject.addEventListener('click', () => resolve('reject'));
+      actions.append(approve, reject); card.append(rationale, actions); $('decisions').append(card);
     }
     decisionOffset += response.decisions.length; $('decisions-more').hidden = response.decisions.length < 100 || decisionOffset > 100000;
     if (!decisionOffset) $('decisions').append(element('p', 'No pending decisions.', 'muted'));

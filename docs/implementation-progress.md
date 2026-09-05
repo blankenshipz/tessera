@@ -8,7 +8,7 @@ pilot are not complete.
 
 - 298 Python tests pass natively; isolated Docker Compose verification also passes.
 - Ruff lint and format checks pass.
-- Sixteen desktop connection/IPC and renderer tests pass using Node 22.12.
+- Twenty-four desktop connection/IPC and renderer tests pass using Node 22.12.
 - Explicit migrations through schema v9 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
@@ -58,11 +58,15 @@ representative investigation have not passed end-to-end acceptance.
    bytes before recording immutable quarantine metadata. Worker transfer resumes
    after lost manifest responses. See [artifact quarantine](artifact-quarantine.md).
 9. **Desktop shell:** isolated renderer, sender-checked IPC, named connections,
-   project/draft/approval/labbook views, attributed conversations and a read-only
-   pending decision inbox. Review corrected draft carryover, delayed thread
+   project/draft/approval/labbook views, attributed conversations and explicit
+   revision-bound human decision resolution. Review corrected draft carryover, delayed thread
    selection, pagination replacement and overlapping refreshes. Tests execute the
    actual renderer with deferred replies to verify context fences and stable
-   message retry keys. Research-ledger views and decision resolution remain absent.
+   message retry keys. Decision tests cover uncertain responses through Refresh,
+   shared pending command IDs, and stale context completion. A native sandboxed
+   Electron/HTTP fixture passes actual authentication and decision resolution;
+   it caught and corrected a `/me` identity-field mismatch hidden by unit mocks.
+   Research-ledger views remain absent.
 
 10. **Stopped-workspace collector:** declared-path, descriptor-relative reads reject
     links, aliases, special files, cross-device traversal and oversized outputs.
@@ -126,7 +130,7 @@ representative research question/dataset remain open configuration inputs.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, research views, decision resolution, telemetry and
+4. Desktop adoption, skills, research views, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
 5. Backup/restore fencing, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.

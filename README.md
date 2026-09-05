@@ -64,9 +64,9 @@ clients. It is not production organization authentication.
 
 The [desktop shell](desktop/README.md) connects to this API and keeps bearer
 credentials in its main process. It supports projects, draft plans, approval
-records, labbook reading, attributed conversation threads, and a read-only pending
-decision inbox. Research-ledger views and decision resolution are not yet exposed
-in the desktop UI.
+records, labbook reading, attributed conversation threads, and a pending decision
+inbox with explicit revision-bound human approval/rejection. Research-ledger views
+are not yet exposed in the desktop UI.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
 startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v9
