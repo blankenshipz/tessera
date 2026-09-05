@@ -1,7 +1,7 @@
 # Artifact quarantine
 
 Schema v7 adds immutable artifact quarantine; v8 adds resumable upload sessions.
-Schema v9 adds immutable complete output manifests.
+Schema v9 adds immutable complete output manifests; v10 adds human disposition history.
 Upgrade existing state explicitly
 with `tessera migrate` after stopping the service and backing up its private state.
 The migration preserves grants, leases, reservations and retained inputs; failure
@@ -83,6 +83,30 @@ the manifest; retries resume the same uploads and manifest. Neither helper prove
 provider termination, enforces a filesystem quota, or durably seals source bytes.
 Automatic runtime collection remains disabled until the
 [persistent output-storage gates](decisions/0003-persistent-output-storage.md) pass.
+
+## Human manifest dispositions
+
+Completed worker outputs remain quarantined after a manifest is admitted. A
+human may append a disposition with
+`POST /artifact-manifests/{manifest_id}/dispositions`, supplying
+`expected_manifest_digest`, `expected_revision`, `disposition`
+(`retain_quarantined` or `reject`), and a nonblank `rationale` of at most 8000
+characters.
+
+Dispositions are immutable history. The first disposition uses expected
+revision `0`; each successful compare-and-set appends the next revision. A
+`reject` records that the manifest is rejected for use while retaining the
+evidence. `retain_quarantined` supersedes the review decision without releasing
+the manifest. Neither choice changes artifact bytes, manifest status or
+classification, execution history, accounting, release, download, deletion,
+dispatch, scientific acceptance, or settlement.
+
+`GET /artifact-manifests/{manifest_id}/dispositions` returns bounded metadata
+pages ordered by revision. Both routes enforce organization and project scope;
+only live human control credentials may write. Worker and agent credentials are
+denied. Idempotent replays return the original historical disposition after a
+newer revision is appended, provided the credential and manifest access remain
+valid.
 
 This slice does not collect files automatically from containers, perform scientific
 result validation, release quarantine, publish evidence, or schedule retention and

@@ -54,6 +54,7 @@ def _v3_state(tmp_path: Path) -> tuple[Path, dict[str, object], dict[str, object
     task = task_response.json()
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE artifact_dispositions")
         connection.execute("DROP TABLE artifact_manifests")
         connection.execute("DROP TABLE artifact_uploads")
         connection.execute("DROP TABLE artifacts")
@@ -84,13 +85,13 @@ def test_v3_to_v4_requires_explicit_migration_and_preserves_v3_records(tmp_path:
     state, project, task = _v3_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 9
+    assert migrate_state(state) == 10
     assert set(RECORD_TABLES).issubset(_table_names(state))
     client = TestClient(create_app(state))
     owner = _owner_headers(state)
     assert client.get(f"/projects/{project['id']}", headers=owner).json() == project
     assert client.get(f"/tasks/{task['id']}", headers=owner).json()["id"] == task["id"]
-    assert migrate_state(state) == 9
+    assert migrate_state(state) == 10
 
 
 def test_v3_to_v4_rolls_back_schema_installation(
@@ -114,5 +115,5 @@ def test_fresh_initialization_uses_v4_record_schema(tmp_path: Path) -> None:
     state = tmp_path / "fresh"
     initialize_state(state)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
-        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 9
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 10
     assert set(RECORD_TABLES).issubset(_table_names(state))

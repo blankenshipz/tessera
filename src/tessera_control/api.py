@@ -63,6 +63,7 @@ def create_app(state_dir: Path) -> FastAPI:
     """Build a loopback-only local control API around an existing initialized state."""
 
     from .artifact_api import router as artifact_router
+    from .artifact_disposition_api import router as artifact_disposition_router
     from .execution import ExecutionStore
     from .execution_api import router as execution_router
     from .interaction import InteractionStore
@@ -79,6 +80,7 @@ def create_app(state_dir: Path) -> FastAPI:
     app.state.snapshot_releases = SnapshotReleaseStore(state_dir)
     app.include_router(execution_router)
     app.include_router(artifact_router)
+    app.include_router(artifact_disposition_router)
     app.state.research = ResearchStore(state_dir)
     app.state.interactions = InteractionStore(store)
     snapshots = SnapshotStore(state_dir)

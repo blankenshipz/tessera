@@ -37,6 +37,7 @@ def old_state(tmp_path):
         actor, project["id"], "snapshot", inventory_digest(capture.inventory), capture
     )
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DROP TABLE artifact_dispositions")
         for table in AUTHORITY_TABLES:
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=5")
@@ -47,10 +48,10 @@ def test_schema5_requires_migration_and_preserves_snapshot_bytes(tmp_path):
     state, actor, snapshot = old_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 9
+    assert migrate_state(state) == 10
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
     assert verified["integrity"] == "verified" and verified["digest"] == snapshot["digest"]
-    assert migrate_state(state) == 9
+    assert migrate_state(state) == 10
 
 
 def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
@@ -77,13 +78,14 @@ def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
             ).fetchone()[0]
             == b"Retain exact bytes"
         )
-    assert migrate_state(state) == 9
+    assert migrate_state(state) == 10
 
 
 def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monkeypatch):
     state = tmp_path / "state"
     initialize_state(state)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DROP TABLE artifact_dispositions")
         connection.execute("DROP TABLE artifact_manifests")
         connection.execute("DROP TABLE artifact_uploads")
         connection.execute("UPDATE schema_meta SET schema_version=7")
@@ -106,5 +108,5 @@ def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monk
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 9
-    assert migrate_state(state) == 9
+    assert migrate_state(state) == 10
+    assert migrate_state(state) == 10

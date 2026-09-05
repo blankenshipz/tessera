@@ -69,10 +69,12 @@ inbox with explicit revision-bound human approval/rejection. Research-ledger vie
 are not yet exposed in the desktop UI.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v9
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v10
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
-and resumable upload sessions with complete output manifests.
+and resumable upload sessions with complete output manifests. Human manifest
+dispositions append digest-bound review history while preserving quarantine;
+they do not release data, accept scientific results, or settle execution costs.
 Migration retains an unambiguous local bootstrap owner and revokes other legacy
 principals, which must be enrolled again as scoped, expiring credentials.
 

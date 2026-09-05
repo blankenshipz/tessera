@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 10
 LOCAL_ORG_ID = "org_local"
 
 
@@ -247,6 +247,14 @@ def migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 9 WHERE singleton = 1")
 
 
+def migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
+    """Add append-only human artifact dispositions without changing manifests."""
+    from .artifact_dispositions import create_artifact_disposition_schema
+
+    create_artifact_disposition_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 10 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -256,6 +264,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     6: migrate_v6_to_v7,
     7: migrate_v7_to_v8,
     8: migrate_v8_to_v9,
+    9: migrate_v9_to_v10,
 }
 
 

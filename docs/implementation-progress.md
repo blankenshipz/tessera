@@ -6,10 +6,10 @@ pilot are not complete.
 
 ## Verified evidence
 
-- 298 Python tests pass natively; isolated Docker Compose verification also passes.
+- 311 Python tests pass natively; isolated Docker Compose verification also passes.
 - Ruff lint and format checks pass.
 - Twenty-four desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v9 preserve historical records, input bytes,
+- Explicit migrations through schema v10 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -74,6 +74,11 @@ representative investigation have not passed end-to-end acceptance.
     The low-level reader returns immutable bytes; automatic runtime collection
     remains gated on verified persistent storage and durable sealing.
 
+11. **Human quarantine review:** digest-bound, revision-checked dispositions append
+    attributed history. Rejection retains evidence; continued quarantine releases
+    nothing. Historical replay remains subject to live credential and project
+    access checks. Result acceptance and data release remain unimplemented.
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -95,6 +100,8 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `802a06d`: live control-to-Docker and sandboxed Electron smoke checks.
 - `d48f038`: bounded stopped-workspace collector and storage admission decision.
 - `7ed75ed`: complete quarantined output manifests and resumable transfers.
+- `ebe5d8d`: rejected Mac fixed-image backend after Docker execution probe.
+- `ae76de5`: desktop decision resolution and live Electron/control acceptance.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -113,7 +120,7 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed through `7ed75ed`. No force push or authentication reconfiguration was used.
+CI passed through `ae76de5`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
 A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's
@@ -126,7 +133,7 @@ representative research question/dataset remain open configuration inputs.
 ## Remaining milestones
 
 1. Verified persistent output storage, durable sealing and runtime collection,
-   quarantine disposition, and fenced authoritative result acceptance.
+   quarantine release policy, and fenced authoritative result acceptance.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
