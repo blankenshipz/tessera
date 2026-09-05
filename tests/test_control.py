@@ -4,6 +4,7 @@ import concurrent.futures
 import os
 import sqlite3
 import stat
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -62,10 +63,17 @@ def task(
 
 
 def add_principal(
-    state_dir: Path, *, principal_id: str, org_id: str, role: str, token: str
+    state_dir: Path,
+    *,
+    principal_id: str,
+    org_id: str,
+    role: str,
+    token: str,
+    project_id: str | None = None,
 ) -> dict[str, str]:
     connection = sqlite3.connect(state_dir / "tessera.sqlite3")
     try:
+        credential_created_at = datetime.now(UTC)
         if org_id != LOCAL_ORG_ID:
             connection.execute(
                 "INSERT OR IGNORE INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
@@ -75,6 +83,38 @@ def add_principal(
             """INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at)
             VALUES (?, ?, ?, ?, NULL, '2026-01-01T00:00:00Z')""",
             (principal_id, org_id, role, _token_hash(token)),
+        )
+        if role == "human":
+            credential = ("local_owner", "control", None, None, None)
+        else:
+            if project_id is None:
+                raise ValueError("Synthetic agents require a project scope.")
+            parent = connection.execute(
+                """SELECT c.id FROM credentials c JOIN principals p ON p.id = c.principal_id
+                WHERE p.org_id = ? AND c.kind = 'local_owner'""",
+                (org_id,),
+            ).fetchone()
+            if parent is None:
+                raise ValueError("Synthetic agents require a local owner parent.")
+            credential = (
+                "agent",
+                "control",
+                project_id,
+                parent[0],
+                (credential_created_at + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            )
+        connection.execute(
+            """INSERT INTO credentials
+            (id, principal_id, kind, audience, project_id, parent_id, expires_at,
+             revoked_at, created_at, created_by_principal_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+            (
+                f"credential_{principal_id}",
+                principal_id,
+                *credential,
+                credential_created_at.isoformat().replace("+00:00", "Z"),
+                principal_id,
+            ),
         )
         connection.commit()
     finally:
@@ -201,6 +241,7 @@ def test_human_approval_is_revisioned_plan_only_and_agent_is_forbidden(
         org_id=LOCAL_ORG_ID,
         role="agent",
         token="agent-token",
+        project_id=str(record["id"]),
     )
     denied = client.post(
         f"/tasks/{draft['id']}/approve",

@@ -9,11 +9,13 @@ import secrets
 import sqlite3
 import stat
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+from .migrations import LATEST_SCHEMA_VERSION, migrate_database, plan_digest
+
+SCHEMA_VERSION = LATEST_SCHEMA_VERSION
 DATABASE_NAME = "tessera.sqlite3"
 OWNER_HEADER_NAME = "owner.header"
 LOCAL_ORG_ID = "org_local"
@@ -37,6 +39,17 @@ class Forbidden(StoreError):
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("Credential expiry requires an offset.")
+    return parsed.astimezone(UTC)
+
+
+def _utc_string(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _token_hash(token: str) -> str:
@@ -69,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 1);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 7);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -84,6 +97,19 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             revoked_at TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE credentials (
+            id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL UNIQUE REFERENCES principals(id),
+            kind TEXT NOT NULL CHECK (kind IN ('local_owner', 'human_session', 'agent', 'worker')),
+            audience TEXT NOT NULL CHECK (audience IN ('control', 'worker')),
+            project_id TEXT REFERENCES projects(id),
+            parent_id TEXT REFERENCES credentials(id),
+            expires_at TEXT,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL,
+            created_by_principal_id TEXT REFERENCES principals(id)
+        );
+        CREATE INDEX credentials_by_parent ON credentials(parent_id);
         CREATE TABLE projects (
             id TEXT PRIMARY KEY,
             org_id TEXT NOT NULL REFERENCES organizations(id),
@@ -101,10 +127,34 @@ def _create_schema(connection: sqlite3.Connection) -> None:
                 CHECK (max_duration_seconds BETWEEN 1 AND 86400),
             status TEXT NOT NULL CHECK (status IN ('draft', 'approved')),
             revision INTEGER NOT NULL,
+            current_plan_digest TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
         CREATE INDEX tasks_by_project ON tasks(project_id, created_at, id);
+        CREATE TABLE task_revisions (
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            revision INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            budget_cents INTEGER NOT NULL CHECK (budget_cents >= 0),
+            max_duration_seconds INTEGER NOT NULL
+                CHECK (max_duration_seconds BETWEEN 1 AND 86400),
+            execution_spec_json TEXT,
+            plan_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            actor_principal_id TEXT REFERENCES principals(id),
+            PRIMARY KEY (task_id, revision)
+        );
+        CREATE INDEX task_revisions_by_task ON task_revisions(task_id, revision);
+        CREATE TABLE task_approvals (
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            plan_revision INTEGER NOT NULL,
+            plan_digest TEXT NOT NULL,
+            approving_principal_id TEXT NOT NULL REFERENCES principals(id),
+            approved_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, plan_revision)
+        );
         CREATE TABLE events (
             cursor INTEGER PRIMARY KEY AUTOINCREMENT,
             org_id TEXT NOT NULL REFERENCES organizations(id),
@@ -131,6 +181,21 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    # Imported only after Store itself is initialized to avoid schema helpers'
+    # operation-layer imports forming a module cycle during startup.
+    from .artifacts import create_artifact_schema
+    from .execution import create_execution_schema
+    from .interaction import create_interaction_schema
+    from .research import create_research_schema
+    from .snapshot_releases import create_release_schema
+    from .snapshots import create_snapshot_schema
+
+    create_research_schema(connection)
+    create_interaction_schema(connection)
+    create_snapshot_schema(connection)
+    create_release_schema(connection)
+    create_execution_schema(connection)
+    create_artifact_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
@@ -145,8 +210,20 @@ def validate_database(database_path: Path) -> None:
         raise ValueError("Control-plane database has no supported schema.") from error
     finally:
         connection.close()
-    if row is None or row["schema_version"] != SCHEMA_VERSION:
+    if row is None:
         raise ValueError("Control-plane database schema version is unsupported.")
+    if row["schema_version"] < SCHEMA_VERSION:
+        raise ValueError("Control-plane database requires an explicit `tessera migrate`.")
+    if row["schema_version"] > SCHEMA_VERSION:
+        raise ValueError("Control-plane database schema version is unsupported.")
+
+
+def migrate_state(state_dir: Path) -> int:
+    """Explicitly migrate an existing state database and return its schema version."""
+    database_path = _database_path(state_dir)
+    if _lstat_is_symlink(database_path) or not database_path.is_file():
+        raise ValueError("Control-plane database is not a regular file.")
+    return migrate_database(database_path, _connect)
 
 
 def initialize_state(state_dir: Path) -> tuple[Path, Path]:
@@ -173,6 +250,7 @@ def initialize_state(state_dir: Path) -> tuple[Path, Path]:
             now = utc_now()
             token = secrets.token_urlsafe(32)
             principal_id = "principal_" + uuid.uuid4().hex
+            credential_id = "credential_" + uuid.uuid4().hex
             connection.execute(
                 "INSERT INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
                 (LOCAL_ORG_ID, "Local personal organization", now),
@@ -182,6 +260,13 @@ def initialize_state(state_dir: Path) -> tuple[Path, Path]:
                 (id, org_id, role, token_hash, revoked_at, created_at)
                 VALUES (?, ?, 'human', ?, NULL, ?)""",
                 (principal_id, LOCAL_ORG_ID, _token_hash(token), now),
+            )
+            connection.execute(
+                """INSERT INTO credentials
+                (id, principal_id, kind, audience, project_id, parent_id, expires_at,
+                 revoked_at, created_at, created_by_principal_id)
+                VALUES (?, ?, 'local_owner', 'control', NULL, NULL, NULL, NULL, ?, ?)""",
+                (credential_id, principal_id, now, principal_id),
             )
             connection.execute("COMMIT")
         except Exception:
@@ -218,25 +303,132 @@ class Store:
         self.database_path = _database_path(state_dir)
         validate_database(self.database_path)
 
-    def authenticate(self, token: str) -> dict[str, str]:
+    def authenticate(self, token: str) -> dict[str, Any]:
+        return self._authenticate(token, "control")
+
+    def authenticate_worker(self, token: str) -> dict[str, Any]:
+        """Authenticate only a worker-audience credential for future worker routes."""
+        return self._authenticate(token, "worker")
+
+    def _authenticate(self, token: str, audience: str) -> dict[str, Any]:
         connection = _connect(self.database_path)
         try:
             row = connection.execute(
-                """SELECT id, org_id, role FROM principals
-                WHERE token_hash = ? AND revoked_at IS NULL""",
+                """SELECT p.id, p.org_id, p.role, c.id AS credential_id, c.kind,
+                c.audience, c.project_id, c.expires_at, c.revoked_at, c.parent_id
+                FROM principals p LEFT JOIN credentials c ON c.principal_id = p.id
+                WHERE p.token_hash = ? AND p.revoked_at IS NULL""",
                 (_token_hash(token),),
             ).fetchone()
+            return self._credential_principal(connection, row, audience)
         finally:
             connection.close()
+
+    @staticmethod
+    def _credential_principal(
+        connection: sqlite3.Connection, row: sqlite3.Row | None, audience: str
+    ) -> dict[str, Any]:
         if row is None:
             raise Forbidden("Unauthorized")
-        return dict(row)
+        principal = dict(row)
+        if principal["credential_id"] is None:
+            raise Forbidden("Unauthorized")
+        credential_id: str | None = principal["credential_id"]
+        seen_credentials: set[str] = set()
+        credential_count = 0
+        while credential_id is not None:
+            credential_count += 1
+            if credential_id in seen_credentials or credential_count > 16:
+                raise Forbidden("Unauthorized")
+            seen_credentials.add(credential_id)
+            credential = connection.execute(
+                """SELECT c.id, c.principal_id, c.kind, c.audience, c.project_id,
+                c.parent_id, c.expires_at, c.revoked_at, c.created_at,
+                p.org_id, p.role, p.revoked_at AS principal_revoked_at
+                FROM credentials c JOIN principals p ON p.id = c.principal_id WHERE c.id = ?""",
+                (credential_id,),
+            ).fetchone()
+            if (
+                credential is None
+                or credential["revoked_at"] is not None
+                or credential["principal_revoked_at"] is not None
+            ):
+                raise Forbidden("Unauthorized")
+            if credential["org_id"] != principal["org_id"]:
+                raise Forbidden("Unauthorized")
+            if credential_count == 1 and credential["audience"] != audience:
+                raise Forbidden("Unauthorized")
+            Store._validate_credential_structure(connection, credential)
+            try:
+                created_at = _parse_utc(credential["created_at"])
+            except ValueError as error:
+                raise Forbidden("Unauthorized") from error
+            expires_at = credential["expires_at"]
+            if expires_at is not None:
+                try:
+                    expiry = _parse_utc(expires_at)
+                except ValueError as error:
+                    raise Forbidden("Unauthorized") from error
+                if expiry > created_at + timedelta(hours=24) or expiry <= datetime.now(UTC):
+                    raise Forbidden("Unauthorized")
+            credential_id = credential["parent_id"]
+        return principal
+
+    @staticmethod
+    def _validate_credential_structure(
+        connection: sqlite3.Connection, credential: sqlite3.Row
+    ) -> None:
+        kind = credential["kind"]
+        role = credential["role"]
+        audience = credential["audience"]
+        project_id = credential["project_id"]
+        parent_id = credential["parent_id"]
+        expires_at = credential["expires_at"]
+        if kind == "local_owner":
+            valid = (
+                role == "human"
+                and audience == "control"
+                and project_id is None
+                and parent_id is None
+                and expires_at is None
+            )
+        elif kind == "human_session":
+            valid = role == "human" and audience == "control" and parent_id is not None
+        elif kind == "agent":
+            valid = (
+                role == "agent"
+                and audience == "control"
+                and project_id is not None
+                and parent_id is not None
+            )
+        elif kind == "worker":
+            valid = (
+                role == "agent"
+                and audience == "worker"
+                and project_id is not None
+                and parent_id is not None
+            )
+        else:
+            valid = False
+        if not valid or (kind != "local_owner" and expires_at is None):
+            raise Forbidden("Unauthorized")
+        if project_id is not None:
+            project = connection.execute(
+                "SELECT 1 FROM projects WHERE id = ? AND org_id = ?",
+                (project_id, credential["org_id"]),
+            ).fetchone()
+            if project is None:
+                raise Forbidden("Unauthorized")
 
     def list_projects(
         self, principal: dict[str, str], offset: int, limit: int
     ) -> list[dict[str, Any]]:
         connection = _connect(self.database_path)
         try:
+            principal = self._live_principal(connection, principal)
+            if principal["project_id"] is not None:
+                project = self._project(connection, principal, principal["project_id"])
+                return [project][offset : offset + limit]
             rows = connection.execute(
                 """SELECT id, org_id, name, created_at FROM projects
                 WHERE org_id = ? ORDER BY created_at, id LIMIT ? OFFSET ?""",
@@ -249,7 +441,8 @@ class Store:
     def get_project(self, principal: dict[str, str], project_id: str) -> dict[str, Any]:
         connection = _connect(self.database_path)
         try:
-            return self._project(connection, principal["org_id"], project_id)
+            principal = self._live_principal(connection, principal)
+            return self._project(connection, principal, project_id)
         finally:
             connection.close()
 
@@ -258,10 +451,11 @@ class Store:
     ) -> list[dict[str, Any]]:
         connection = _connect(self.database_path)
         try:
-            self._project(connection, principal["org_id"], project_id)
+            principal = self._live_principal(connection, principal)
+            self._project(connection, principal, project_id)
             rows = connection.execute(
                 """SELECT id, project_id, title, purpose, budget_cents,
-                max_duration_seconds, status, revision, created_at, updated_at
+                max_duration_seconds, status, revision, current_plan_digest, created_at, updated_at
                 FROM tasks WHERE project_id = ? ORDER BY created_at, id LIMIT ? OFFSET ?""",
                 (project_id, limit, offset),
             ).fetchall()
@@ -272,8 +466,26 @@ class Store:
     def get_task(self, principal: dict[str, str], task_id: str) -> dict[str, Any]:
         connection = _connect(self.database_path)
         try:
-            row = self._task(connection, principal["org_id"], task_id)
+            principal = self._live_principal(connection, principal)
+            row = self._task(connection, principal, task_id)
             return self._task_response(row)
+        finally:
+            connection.close()
+
+    def list_task_revisions(
+        self, principal: dict[str, str], task_id: str, offset: int, limit: int
+    ) -> list[dict[str, Any]]:
+        connection = _connect(self.database_path)
+        try:
+            principal = self._live_principal(connection, principal)
+            self._task(connection, principal, task_id)
+            rows = connection.execute(
+                """SELECT revision, title, purpose, budget_cents, max_duration_seconds,
+                execution_spec_json, plan_digest, created_at, actor_principal_id
+                FROM task_revisions WHERE task_id = ? ORDER BY revision LIMIT ? OFFSET ?""",
+                (task_id, limit, offset),
+            ).fetchall()
+            return [self._revision_response(row) for row in rows]
         finally:
             connection.close()
 
@@ -282,7 +494,8 @@ class Store:
     ) -> list[dict[str, Any]]:
         connection = _connect(self.database_path)
         try:
-            self._project(connection, principal["org_id"], project_id)
+            principal = self._live_principal(connection, principal)
+            self._project(connection, principal, project_id)
             rows = connection.execute(
                 """SELECT cursor, project_id, task_id, event_type, resource_revision,
                 actor_principal_id, created_at, payload_json FROM events
@@ -305,14 +518,140 @@ class Store:
         finally:
             connection.close()
 
+    def me(self, principal: dict[str, Any]) -> dict[str, Any]:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._live_principal(connection, principal)
+            return self._credential_response(actor)
+        finally:
+            connection.close()
+
+    def list_credentials(
+        self, principal: dict[str, Any], offset: int, limit: int
+    ) -> list[dict[str, Any]]:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._live_principal(connection, principal)
+            if not self._is_root_owner(actor):
+                raise Forbidden("Only a local owner can list credentials.")
+            rows = connection.execute(
+                """SELECT c.id AS credential_id, p.id, p.org_id, p.role, c.kind, c.audience,
+                c.project_id, c.expires_at, c.revoked_at, c.parent_id
+                FROM credentials c JOIN principals p ON p.id = c.principal_id
+                WHERE p.org_id = ? ORDER BY c.created_at, c.id LIMIT ? OFFSET ?""",
+                (actor["org_id"], limit, offset),
+            ).fetchall()
+            return [self._credential_response(dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def issue_credential(
+        self,
+        principal: dict[str, Any],
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+        token: str,
+    ) -> tuple[int, dict[str, Any]]:
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            if not self._is_root_owner(actor):
+                raise Forbidden("Only a local owner can issue credentials.")
+            expires_at = _parse_utc(payload["expires_at"])
+            now_datetime = datetime.now(UTC)
+            if expires_at <= now_datetime or expires_at > now_datetime + timedelta(hours=24):
+                raise Conflict("Credential expiry must be within the next 24 hours.")
+            project_id = payload.get("project_id")
+            if project_id is not None:
+                self._project(connection, actor, project_id)
+            credential_id = "credential_" + uuid.uuid4().hex
+            principal_id = "principal_" + uuid.uuid4().hex
+            role = "human" if payload["kind"] == "human_session" else "agent"
+            now = utc_now()
+            connection.execute(
+                """INSERT INTO principals
+                (id, org_id, role, token_hash, revoked_at, created_at)
+                VALUES (?, ?, ?, ?, NULL, ?)""",
+                (principal_id, actor["org_id"], role, _token_hash(token), now),
+            )
+            connection.execute(
+                """INSERT INTO credentials
+                (id, principal_id, kind, audience, project_id, parent_id, expires_at,
+                 revoked_at, created_at, created_by_principal_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                (
+                    credential_id,
+                    principal_id,
+                    payload["kind"],
+                    payload["audience"],
+                    project_id,
+                    actor["credential_id"],
+                    _utc_string(expires_at),
+                    now,
+                    actor["id"],
+                ),
+            )
+            return 201, self._credential_response(
+                {
+                    "credential_id": credential_id,
+                    "id": principal_id,
+                    "org_id": actor["org_id"],
+                    "role": role,
+                    "kind": payload["kind"],
+                    "audience": payload["audience"],
+                    "project_id": project_id,
+                    "expires_at": _utc_string(expires_at),
+                    "revoked_at": None,
+                    "parent_id": actor["credential_id"],
+                }
+            )
+
+        return self._mutate(principal, key, "POST", "/credentials", digest, command)
+
+    def revoke_credential(
+        self, principal: dict[str, Any], credential_id: str, key: str, digest: str
+    ) -> tuple[int, dict[str, Any]]:
+        path = f"/credentials/{credential_id}/revoke"
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            row = connection.execute(
+                """SELECT c.id AS credential_id, p.id, p.org_id, p.role, c.kind, c.audience,
+                c.project_id, c.expires_at, c.revoked_at, c.parent_id
+                FROM credentials c JOIN principals p ON p.id = c.principal_id
+                WHERE c.id = ? AND p.org_id = ?""",
+                (credential_id, actor["org_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Credential was not found.")
+            credential = dict(row)
+            if not self._is_root_owner(actor) and credential["id"] != actor["id"]:
+                raise Forbidden("Only a local owner can revoke other credentials.")
+            if credential["revoked_at"] is None:
+                revoked_at = utc_now()
+                connection.execute(
+                    "UPDATE credentials SET revoked_at = ? WHERE id = ?",
+                    (revoked_at, credential_id),
+                )
+                credential["revoked_at"] = revoked_at
+            return 200, self._credential_response(credential)
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
     def create_project(
         self, principal: dict[str, str], key: str, digest: str, payload: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
-        def command(connection: sqlite3.Connection) -> tuple[int, dict[str, Any]]:
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, str]
+        ) -> tuple[int, dict[str, Any]]:
+            if actor["project_id"] is not None:
+                raise Forbidden("Project-scoped credentials cannot create projects.")
             now = utc_now()
             project = {
                 "id": "project_" + uuid.uuid4().hex,
-                "org_id": principal["org_id"],
+                "org_id": actor["org_id"],
                 "name": payload["name"],
                 "created_at": now,
             }
@@ -322,7 +661,7 @@ class Store:
             )
             self._event(
                 connection,
-                principal,
+                actor,
                 project["id"],
                 None,
                 "project.created",
@@ -343,9 +682,18 @@ class Store:
     ) -> tuple[int, dict[str, Any]]:
         path = f"/projects/{project_id}/tasks"
 
-        def command(connection: sqlite3.Connection) -> tuple[int, dict[str, Any]]:
-            self._project(connection, principal["org_id"], project_id)
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, str]
+        ) -> tuple[int, dict[str, Any]]:
+            self._project(connection, actor, project_id)
             now = utc_now()
+            current_plan_digest = plan_digest(
+                payload["title"],
+                payload["purpose"],
+                payload["budget_cents"],
+                payload["max_duration_seconds"],
+                None,
+            )
             task = {
                 "id": "task_" + uuid.uuid4().hex,
                 "project_id": project_id,
@@ -355,14 +703,15 @@ class Store:
                 "max_duration_seconds": payload["max_duration_seconds"],
                 "status": "draft",
                 "revision": 1,
+                "current_plan_digest": current_plan_digest,
                 "created_at": now,
                 "updated_at": now,
                 "execution_granted": False,
             }
             connection.execute(
                 """INSERT INTO tasks (id, project_id, title, purpose, budget_cents,
-                max_duration_seconds, status, revision, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                max_duration_seconds, status, revision, current_plan_digest, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task["id"],
                     task["project_id"],
@@ -372,20 +721,42 @@ class Store:
                     task["max_duration_seconds"],
                     task["status"],
                     task["revision"],
+                    task["current_plan_digest"],
                     now,
                     now,
                 ),
             )
+            connection.execute(
+                """INSERT INTO task_revisions
+                (task_id, revision, title, purpose, budget_cents, max_duration_seconds,
+                 execution_spec_json, plan_digest, created_at, actor_principal_id)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""",
+                (
+                    task["id"],
+                    task["revision"],
+                    task["title"],
+                    task["purpose"],
+                    task["budget_cents"],
+                    task["max_duration_seconds"],
+                    task["current_plan_digest"],
+                    now,
+                    actor["id"],
+                ),
+            )
             self._event(
                 connection,
-                principal,
+                actor,
                 project_id,
                 task["id"],
                 "task.created",
                 1,
-                {"status": "draft", "title": task["title"]},
+                {
+                    "plan_digest": task["current_plan_digest"],
+                    "status": "draft",
+                    "title": task["title"],
+                },
             )
-            return 201, task
+            return 201, self._task_response(task)
 
         return self._mutate(principal, key, "POST", path, digest, command)
 
@@ -396,31 +767,48 @@ class Store:
         key: str,
         digest: str,
         expected_revision: int,
+        expected_plan_digest: str | None,
     ) -> tuple[int, dict[str, Any]]:
         path = f"/tasks/{task_id}/approve"
 
-        def command(connection: sqlite3.Connection) -> tuple[int, dict[str, Any]]:
-            task = self._task(connection, principal["org_id"], task_id)
-            if principal["role"] != "human":
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, str]
+        ) -> tuple[int, dict[str, Any]]:
+            task = self._task(connection, actor, task_id)
+            if actor["role"] != "human":
                 raise Forbidden("Human approval is required.")
             if task["revision"] != expected_revision or task["status"] != "draft":
                 raise Conflict("Task revision is no longer approvable.")
+            if (
+                expected_plan_digest is not None
+                and task["current_plan_digest"] != expected_plan_digest
+            ):
+                raise Conflict("Task plan digest is no longer approvable.")
             now = utc_now()
             connection.execute(
-                """UPDATE tasks SET status = 'approved', revision = 2, updated_at = ?
+                """UPDATE tasks SET status = 'approved', revision = revision + 1, updated_at = ?
                 WHERE id = ? AND revision = ? AND status = 'draft'""",
                 (now, task_id, expected_revision),
             )
             updated = dict(task)
-            updated.update(status="approved", revision=2, updated_at=now)
+            updated.update(status="approved", revision=expected_revision + 1, updated_at=now)
+            connection.execute(
+                """INSERT INTO task_approvals
+                (task_id, plan_revision, plan_digest, approving_principal_id, approved_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (task_id, expected_revision, task["current_plan_digest"], actor["id"], now),
+            )
             self._event(
                 connection,
-                principal,
+                actor,
                 task["project_id"],
                 task_id,
                 "task.approved",
-                2,
+                expected_revision + 1,
                 {
+                    "approved_plan_digest": task["current_plan_digest"],
+                    "approved_plan_revision": expected_revision,
+                    "approving_principal_id": actor["id"],
                     "status": "approved",
                     "approval_scope": "research_plan_only",
                     "execution_granted": False,
@@ -430,6 +818,104 @@ class Store:
 
         return self._mutate(principal, key, "POST", path, digest, command)
 
+    def revise_task_plan(
+        self,
+        principal: dict[str, str],
+        task_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        path = f"/tasks/{task_id}/plan"
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, str]
+        ) -> tuple[int, dict[str, Any]]:
+            task = self._task(connection, actor, task_id)
+            if actor["role"] != "human":
+                raise Forbidden("Human plan revision is required.")
+            if task["revision"] != payload["expected_revision"]:
+                raise Conflict("Task revision is no longer current.")
+            if connection.execute(
+                """SELECT 1 FROM execution_grants
+                WHERE task_id = ? AND status != 'reconciled' LIMIT 1""",
+                (task_id,),
+            ).fetchone():
+                raise Conflict(
+                    "Reconcile outstanding execution authority before revising the plan."
+                )
+            now = utc_now()
+            revision = task["revision"] + 1
+            execution_spec = payload["execution_spec"]
+            current_plan_digest = plan_digest(
+                payload["title"],
+                payload["purpose"],
+                payload["budget_cents"],
+                payload["max_duration_seconds"],
+                execution_spec,
+            )
+            connection.execute(
+                """UPDATE tasks SET title = ?, purpose = ?, budget_cents = ?,
+                max_duration_seconds = ?, status = 'draft', revision = ?, current_plan_digest = ?,
+                updated_at = ? WHERE id = ? AND revision = ?""",
+                (
+                    payload["title"],
+                    payload["purpose"],
+                    payload["budget_cents"],
+                    payload["max_duration_seconds"],
+                    revision,
+                    current_plan_digest,
+                    now,
+                    task_id,
+                    task["revision"],
+                ),
+            )
+            connection.execute(
+                """INSERT INTO task_revisions
+                (task_id, revision, title, purpose, budget_cents, max_duration_seconds,
+                 execution_spec_json, plan_digest, created_at, actor_principal_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_id,
+                    revision,
+                    payload["title"],
+                    payload["purpose"],
+                    payload["budget_cents"],
+                    payload["max_duration_seconds"],
+                    json.dumps(execution_spec, separators=(",", ":"), sort_keys=True),
+                    current_plan_digest,
+                    now,
+                    actor["id"],
+                ),
+            )
+            updated = dict(task)
+            updated.update(
+                title=payload["title"],
+                purpose=payload["purpose"],
+                budget_cents=payload["budget_cents"],
+                max_duration_seconds=payload["max_duration_seconds"],
+                status="draft",
+                revision=revision,
+                current_plan_digest=current_plan_digest,
+                updated_at=now,
+            )
+            self._event(
+                connection,
+                actor,
+                task["project_id"],
+                task_id,
+                "task.plan_revised",
+                revision,
+                {
+                    "invalidated_approval": task["status"] == "approved",
+                    "plan_digest": current_plan_digest,
+                    "status": "draft",
+                },
+            )
+            return 200, self._task_response(updated)
+
+        return self._mutate(principal, key, "PUT", path, digest, command)
+
     def _mutate(
         self,
         principal: dict[str, str],
@@ -438,30 +924,37 @@ class Store:
         path: str,
         digest: str,
         command: Any,
+        *,
+        audience: str = "control",
+        replay_guard: Any | None = None,
     ) -> tuple[int, dict[str, Any]]:
         connection = _connect(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            live_principal = self._live_principal(connection, principal, audience=audience)
             existing = connection.execute(
                 """SELECT request_digest, response_status, response_json FROM idempotency
                 WHERE principal_id = ? AND org_id = ? AND idempotency_key = ?
                 AND method = ? AND path = ?""",
-                (principal["id"], principal["org_id"], key, method, path),
+                (live_principal["id"], live_principal["org_id"], key, method, path),
             ).fetchone()
             if existing is not None:
                 if existing["request_digest"] != digest:
                     raise Conflict("Idempotency key was already used with a different request.")
+                response = json.loads(existing["response_json"])
+                if replay_guard is not None:
+                    replay_guard(connection, live_principal, response)
                 connection.execute("COMMIT")
-                return existing["response_status"], json.loads(existing["response_json"])
-            status, response = command(connection)
+                return existing["response_status"], response
+            status, response = command(connection, live_principal)
             connection.execute(
                 """INSERT INTO idempotency
                 (principal_id, org_id, idempotency_key, method, path, request_digest,
                  response_status, response_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    principal["id"],
-                    principal["org_id"],
+                    live_principal["id"],
+                    live_principal["org_id"],
                     key,
                     method,
                     path,
@@ -481,33 +974,98 @@ class Store:
             connection.close()
 
     @staticmethod
-    def _project(connection: sqlite3.Connection, org_id: str, project_id: str) -> dict[str, Any]:
+    def _project(
+        connection: sqlite3.Connection, principal: dict[str, Any], project_id: str
+    ) -> dict[str, Any]:
+        if principal["project_id"] is not None and principal["project_id"] != project_id:
+            raise NotFound("Project was not found.")
         row = connection.execute(
             "SELECT id, org_id, name, created_at FROM projects WHERE id = ? AND org_id = ?",
-            (project_id, org_id),
+            (project_id, principal["org_id"]),
         ).fetchone()
         if row is None:
             raise NotFound("Project was not found.")
         return dict(row)
 
     @staticmethod
-    def _task(connection: sqlite3.Connection, org_id: str, task_id: str) -> dict[str, Any]:
+    def _live_principal(
+        connection: sqlite3.Connection, principal: dict[str, Any], *, audience: str = "control"
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """SELECT p.id, p.org_id, p.role, c.id AS credential_id, c.kind,
+            c.audience, c.project_id, c.expires_at, c.revoked_at, c.parent_id
+            FROM principals p LEFT JOIN credentials c ON c.principal_id = p.id
+            WHERE p.id = ? AND p.org_id = ? AND p.revoked_at IS NULL""",
+            (principal["id"], principal["org_id"]),
+        ).fetchone()
+        return Store._credential_principal(connection, row, audience)
+
+    @staticmethod
+    def _is_root_owner(principal: dict[str, Any]) -> bool:
+        return (
+            principal["role"] == "human"
+            and principal["kind"] == "local_owner"
+            and principal["parent_id"] is None
+        )
+
+    @staticmethod
+    def _credential_response(principal: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "credential_id": principal["credential_id"],
+            "principal_id": principal["id"],
+            "org_id": principal["org_id"],
+            "role": principal["role"],
+            "kind": principal["kind"],
+            "audience": principal["audience"],
+            "project_id": principal["project_id"],
+            "expires_at": principal["expires_at"],
+            "revoked_at": principal["revoked_at"],
+            "parent_id": principal["parent_id"],
+        }
+
+    @staticmethod
+    def _task(
+        connection: sqlite3.Connection, principal: dict[str, Any], task_id: str
+    ) -> dict[str, Any]:
         row = connection.execute(
             """SELECT t.id, t.project_id, t.title, t.purpose, t.budget_cents,
-            t.max_duration_seconds, t.status, t.revision, t.created_at, t.updated_at
+            t.max_duration_seconds, t.status, t.revision, t.current_plan_digest,
+            t.created_at, t.updated_at
             FROM tasks t JOIN projects p ON p.id = t.project_id
             WHERE t.id = ? AND p.org_id = ?""",
-            (task_id, org_id),
+            (task_id, principal["org_id"]),
         ).fetchone()
         if row is None:
             raise NotFound("Task was not found.")
-        return dict(row)
+        task = dict(row)
+        if principal["project_id"] is not None and principal["project_id"] != task["project_id"]:
+            raise NotFound("Task was not found.")
+        return task
 
     @staticmethod
     def _task_response(task: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
         result = dict(task)
+        result["plan_digest"] = result["current_plan_digest"]
         result["execution_granted"] = False
         return result
+
+    @staticmethod
+    def _revision_response(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "revision": row["revision"],
+            "title": row["title"],
+            "purpose": row["purpose"],
+            "budget_cents": row["budget_cents"],
+            "max_duration_seconds": row["max_duration_seconds"],
+            "execution_spec": (
+                json.loads(row["execution_spec_json"])
+                if row["execution_spec_json"] is not None
+                else None
+            ),
+            "plan_digest": row["plan_digest"],
+            "created_at": row["created_at"],
+            "actor_principal_id": row["actor_principal_id"],
+        }
 
     @staticmethod
     def _event(
