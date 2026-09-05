@@ -39,6 +39,6 @@ directory is merged or overwritten. Downloaded bytes are not execution authority
 Synthetic tests cover HTTP delivery through local materialization, replay,
 revocation, expiry, corruption, wrong audiences/workers, stale epochs and audit
 rollback. [CPU runtime integration](cpu-runtime.md) connects these components to
-the supervisor and verified read-only mounts. Live container execution, pinned
-skill loading, receipt acknowledgement, artifact collection,
+the supervisor and verified read-only mounts. Native Docker isolation and revocation
+fixtures pass. Pinned skill loading, authoritative receipt acknowledgement, runtime artifact collection,
 retention/cleanup scheduling and end-to-end research execution remain incomplete.

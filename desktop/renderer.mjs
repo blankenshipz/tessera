@@ -16,6 +16,7 @@ let activeProject = null;
 let activeLedger = null;
 let outcomeContext = null;
 let closeContext = null;
+const evidenceContexts = new Map();
 let projectOffset = 0;
 let taskOffset = 0;
 let eventCursor = 0;
@@ -43,8 +44,8 @@ function applyRecoveryStatus(status) {
   $('recovery-banner').hidden = !recoveryHeld;
   $('recovery-banner').textContent = recoveryHeld ?
     'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
-  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close']) $(id).disabled = recoveryHeld;
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
+  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close', 'source-new', 'finding-new']) $(id).disabled = recoveryHeld;
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
   $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
 }
 function element(tag, text, className) {
@@ -54,8 +55,11 @@ function element(tag, text, className) {
   return node;
 }
 function resetAuthoringForms() {
-  outcomeContext = closeContext = null;
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form']) {
+  outcomeContext = closeContext = null; evidenceContexts.clear();
+  for (const id of ['assessment-source', 'correction-original', 'finding-review', 'finding-sources', 'finding-variants']) {
+    $(id).replaceChildren();
+  }
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form']) {
     const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
     form.querySelector('button[type="submit"]').disabled = recoveryHeld;
   }
@@ -77,7 +81,7 @@ function clearContext() {
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
   for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
-  $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true; $('study-close').hidden = true;
+  $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
   $('study-export').hidden = true;
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
@@ -139,7 +143,7 @@ async function selectProject(project) {
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
   $('study-export').hidden = true;
-  $('variant-new').hidden = true; $('study-close').hidden = true;
+  $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
@@ -421,6 +425,18 @@ function renderStudyLedger(ledger) {
     if (source.assessment_reason) card.append(element('p', `Assessment: ${source.assessment_reason}`));
     if (source.supersedes_source_id) card.append(element('p', `Supersedes source: ${source.supersedes_source_id}`, 'muted'));
     if (source.superseded_at) card.append(element('p', `Superseded at: ${source.superseded_at}`, 'muted'));
+    if (!source.superseded_at) {
+      for (const [kind, label] of [['assessment', 'Assess source'], ['correction', 'Correct source']]) {
+        const button = element('button', label); button.dataset[kind + 'SourceId'] = source.id;
+        button.disabled = recoveryHeld;
+        button.addEventListener('click', () => guarded(async () => {
+          openEvidenceForm(kind, ledger, { source });
+          $(kind === 'assessment' ? 'assessment-source' : 'correction-original').textContent =
+            `Source ${source.id} · revision ${source.revision} · ${source.verdict}\n${source.uri}\n${source.quoted_passage}`;
+        }));
+        card.append(button);
+      }
+    }
     return card;
   });
   appendSection('Findings', findings, finding => {
@@ -430,6 +446,25 @@ function renderStudyLedger(ledger) {
     card.append(element('p', `Source IDs: ${finding.source_ids.join(', ') || 'none'}`, 'muted'));
     card.append(element('p', `Variant IDs: ${finding.variant_ids.join(', ') || 'none'}`, 'muted'));
     if (finding.status === 'needs_review') card.append(element('p', 'Needs review. Consult the linked sources and ledger history.', 'muted'));
+    if (finding.status === 'candidate') {
+      const accept = element('button', 'Review acceptance'); accept.dataset.acceptFindingId = finding.id;
+      accept.disabled = recoveryHeld || !findingIsAcceptable(ledger, finding);
+      if (!findingIsAcceptable(ledger, finding)) {
+        card.append(element('p', 'Acceptance needs currently supported cited sources. Confirmatory studies must also be closed and fully accounted for.', 'muted'));
+      }
+      accept.addEventListener('click', () => guarded(async () => {
+        if (!findingIsAcceptable(ledger, finding)) throw new Error('Review the cited sources and study accounting first.');
+        openEvidenceForm('finding-accept', ledger, { finding });
+        const review = $('finding-review'); review.replaceChildren(element('p', finding.statement));
+        for (const id of finding.source_ids) {
+          const source = ledger.sources.find(item => item.id === id);
+          review.append(element('p', `${source.id} · revision ${source.revision} · ${source.verdict}`),
+            element('p', source.uri), element('p', source.quoted_passage),
+            element('p', source.assessment_reason || 'No assessment rationale recorded.'));
+        }
+      }));
+      card.append(accept);
+    }
     return card;
   });
   appendSection('Corrections', corrections, correction => {
@@ -488,7 +523,7 @@ async function selectStudy(study) {
   study.status = null;
   $('study-export').hidden = true; $('study-export').disabled = false;
   $('study-title').textContent = `Study ${study.id}`;
-  $('variant-new').hidden = true; $('study-close').hidden = true; $('variant-new').disabled = true;
+  $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true; $('variant-new').disabled = true;
   $('variant-dialog').close(); resetAuthoringForms();
   $('study-detail').replaceChildren(element('p', 'Loading complete study ledger…', 'muted'));
   for (const button of $('studies').children) {
@@ -508,6 +543,8 @@ async function selectStudy(study) {
     Object.assign(study, ledger.study);
     activeLedger = ledger;
     renderStudyLedger(ledger);
+    $('source-new').hidden = false; $('source-new').disabled = recoveryHeld;
+    $('finding-new').hidden = ledger.study.status !== 'open'; $('finding-new').disabled = recoveryHeld;
     $('study-close').hidden = ledger.study.status !== 'open';
     $('study-close').disabled = recoveryHeld || ledger.variants.some(variant => variant.status === 'registered');
     $('study-export').hidden = false;
@@ -530,7 +567,7 @@ function currentResearchContext(context) {
 async function submitResearchRecord(form, context, scope, body, invoke) {
   const button = form.querySelector('button[type="submit"]');
   if (button.disabled) return;
-  if (!currentResearchContext(context)) throw new Error('Select a current open study first.');
+  if (!currentResearchContext(context)) throw new Error('Select the current study first.');
   button.disabled = true;
   try {
     try {
@@ -594,6 +631,78 @@ $('study-close-form').addEventListener('submit', event => {
       (id, key) => api.closeStudy(id, context.study.id, body, key));
   });
 });
+function findingIsAcceptable(ledger, finding) {
+  return finding.status === 'candidate' && finding.source_ids.length > 0 &&
+    finding.source_ids.every(id => ledger.sources.some(source => source.id === id &&
+      source.verdict === 'supported' && !source.superseded_at)) &&
+    (ledger.study.mode !== 'confirmatory' || (ledger.study.status === 'closed' &&
+      !ledger.variants.some(variant => variant.status === 'registered')));
+}
+function openEvidenceForm(kind, ledger, resource = {}) {
+  if (recoveryHeld || !ledger || ledger !== activeLedger) throw new Error('Select the current study first.');
+  const context = { ...researchContext(ledger), ...resource };
+  evidenceContexts.set(kind, context);
+  const form = $(kind + '-form'); form.reset();
+  form.querySelector('button[type="submit"]').disabled = false;
+  $(kind + '-dialog').showModal();
+  return context;
+}
+$('source-new').addEventListener('click', () => guarded(async () => openEvidenceForm('source', activeLedger)));
+$('finding-new').addEventListener('click', () => guarded(async () => {
+  if (activeLedger?.study.status !== 'open') throw new Error('Select an open study to propose a finding.');
+  const context = openEvidenceForm('finding', activeLedger);
+  for (const section of ['sources', 'variants']) {
+    const container = $('finding-' + section); container.replaceChildren();
+    context[section] = activeLedger[section].map(record => {
+      const label = element('label'); const input = element('input'); input.type = 'checkbox';
+      input.dataset[section === 'sources' ? 'sourceChoiceId' : 'variantChoiceId'] = record.id;
+      label.append(input, element('span', section === 'sources' ?
+        `${record.id} · ${record.verdict} · ${record.uri}` : `${record.id} · ${record.status} · ${record.name}`));
+      container.append(label); return { input, record };
+    });
+  }
+}));
+function sourceFields(form) {
+  const fields = new FormData(form);
+  return { uri: fields.get('uri'), quoted_passage: fields.get('quoted_passage'),
+    content_digest: fields.get('content_digest'), locator: fields.get('locator')?.trim() || null };
+}
+for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-accept']) {
+  $(kind + '-form').addEventListener('submit', event => {
+    event.preventDefault();
+    guarded(async () => {
+      const context = evidenceContexts.get(kind);
+      if (!currentResearchContext(context)) throw new Error('Select the current study first.');
+      const fields = new FormData(event.target);
+      let body; let target; let method;
+      if (kind === 'source') {
+        body = sourceFields(event.target); target = context.study.id; method = 'createSource';
+      } else if (kind === 'assessment') {
+        body = { expected_revision: context.source.revision, verdict: fields.get('verdict'), reason: fields.get('reason')?.trim() || null };
+        target = context.source.id; method = 'assessSource';
+      } else if (kind === 'correction') {
+        const reason = fields.get('reason')?.trim();
+        if (!reason) throw new Error('A correction requires a reason.');
+        body = { ...sourceFields(event.target), expected_revision: context.source.revision, reason };
+        target = context.source.id; method = 'correctSource';
+      } else if (kind === 'finding') {
+        if (context.ledger.study.status !== 'open') throw new Error('Select an open study to propose a finding.');
+        body = { statement: fields.get('statement'),
+          source_ids: context.sources.filter(choice => choice.input.checked).map(choice => choice.record.id),
+          variant_ids: context.variants.filter(choice => choice.input.checked).map(choice => choice.record.id) };
+        if (![body.source_ids, body.variant_ids].every(ids => ids.length >= 1 && ids.length <= 200)) {
+          throw new Error('Select between 1 and 200 sources and variants.');
+        }
+        target = context.study.id; method = 'createFinding';
+      } else {
+        if (!findingIsAcceptable(context.ledger, context.finding)) throw new Error('Review the cited sources and study accounting first.');
+        body = { expected_revision: context.finding.revision }; target = context.finding.id; method = 'acceptFinding';
+      }
+      await submitResearchRecord(event.target, context, `${kind}:${target}`, body,
+        (id, key) => api[method](id, target, body, key));
+    });
+  });
+}
 $('study-export').addEventListener('click', () => guarded(async () => {
   const version = epoch; const study = activeStudy; const selection = studyEpoch;
   const button = $('study-export');

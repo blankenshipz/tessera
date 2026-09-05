@@ -32,12 +32,20 @@ variants and does not establish scientific validity.
 Held recovery disables authoring. Context changes clear authoring drafts, and
 uncertain submissions retain their command key for an explicit retry.
 
+A loaded ledger also supports source recording, attributed support assessments,
+finding proposals from explicitly selected source/variant records, and source
+corrections. Acceptance shows the exact cited passages and requires an explicit
+human action; unsupported or superseded citations block it. Confirmatory studies
+must be closed and accounted for. Corrections preserve source versions and mark
+dependent findings for review. The UI records judgment; it does not automatically
+verify scientific claims or fetch cited URLs.
+
 The panel lists a project's studies and renders
 only a control-plane `complete_in_scope_study_ledger` envelope: every returned
 variant, source, finding, correction, and ledger event. Recorded outcomes remain
 manual or imported assertions where identified and have no execution receipt in
 this slice. Source URIs are displayed as text; the renderer does not open them,
-fetch external content, or accept findings. If the server cannot
+fetch external content. If the server cannot
 produce its bounded complete ledger, the desktop shows an error rather than a
 partial view labeled complete.
 
@@ -74,7 +82,9 @@ attribution and absence of execution grants or leases. It also displays all 80
 synthetic registered variants and source-correction history. It also creates a new
 study and registers two variants through the UI, records failed/abandoned
 outcomes, closes the accounted study, and checks the stored attribution and
-metadata, then verifies that
+metadata. The fixture also verifies unsupported-citation blocking, explicit
+acceptance after assessment, and correction-induced review before export. It
+then verifies that
 browsing left the study ledger unchanged. It saves JSON on both the active and
 held restored branches and compares each file with the complete control ledger. This exposed and corrected
 the desktop's identity-field mismatch with the real `/me` response. It remains a

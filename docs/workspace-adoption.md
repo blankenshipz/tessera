@@ -62,8 +62,9 @@ secrets or otherwise safe to share. Every captured file remains `unclassified` a
 `imported_unverified`; checksum verification does not change those labels.
 A separate [execution admission](execution-admission.md) workflow records explicit
 public-data review and a release for one worker. It does not relabel the immutable
-original manifest. Other classifications remain unimplemented. Verified worker staging is separate
-from container mounting and execution, which are still pending.
+original manifest. Other classifications remain unimplemented. Verified worker staging, read-only container mounting, and bounded CPU supervisor
+execution are implemented in native fixtures. Persistent output collection,
+validation, and unattended research acceptance remain gated separately.
 
 This is a content capture, not an atomic filesystem snapshot across all files or
 reconstruction of historical research. The current manifest has the recorded

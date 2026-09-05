@@ -181,6 +181,11 @@ def main() -> None:
             assert len(authored_snapshot["variants"]) == 2
             assert json.loads((root / "authored-study.json").read_text()) == authored_snapshot
             registered = authored_snapshot["variants"][0]
+            assert len(authored_snapshot["sources"]) == 2
+            assert len(authored_snapshot["findings"]) == 1
+            assert authored_snapshot["findings"][0]["status"] == "needs_review"
+            assert authored_snapshot["findings"][0]["accepted_by_principal_id"] == owner["id"]
+            assert len(authored_snapshot["corrections"]) == 1
             assert authored_snapshot["study"]["status"] == "closed"
             assert {variant["status"] for variant in authored_snapshot["variants"]} == {
                 "failed",
@@ -235,6 +240,7 @@ def main() -> None:
                     {
                         "desktop_decision": "approved",
                         "desktop_study_and_variant": "accounted_and_closed",
+                        "evidence_review_and_correction": True,
                         "held_restore_pass": True,
                         "research_variants_displayed": 80,
                         "research_history_unchanged": True,

@@ -160,6 +160,44 @@ test('study authoring routes are scoped, typed POST commands', async () => {
   assert.throws(() => connection.closeStudy('study_1', close));
 });
 
+test('source and finding routes preserve typed POST bodies and reject unsafe IDs', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ id: 'recorded' });
+  });
+  await connection.connect(config());
+  const source = { uri: 'https://example.test/paper', quoted_passage: 'Quoted passage', content_digest: 'c'.repeat(64), locator: 'p. 2' };
+  const assessment = { expected_revision: 1, verdict: 'supported', reason: 'The passage supports the claim.' };
+  const correction = { expected_revision: 2, uri: 'https://example.test/correction', quoted_passage: 'Replacement passage', content_digest: 'd'.repeat(64), reason: 'The original passage was superseded.', locator: null };
+  const finding = { statement: 'The result is associated with the cited source.', source_ids: ['source_1'], variant_ids: ['variant_1'] };
+  const acceptance = { expected_revision: 1 };
+  await connection.createSource('study_1', source, 'source-command');
+  await connection.assessSource('source_1', assessment, 'assessment-command');
+  await connection.correctSource('source_1', correction, 'correction-command');
+  await connection.createFinding('study_1', finding, 'finding-command');
+  await connection.acceptFinding('finding_1', acceptance, 'acceptance-command');
+  assert.match(calls[1].url, /\/studies\/study_1\/sources$/);
+  assert.match(calls[2].url, /\/sources\/source_1\/assess$/);
+  assert.match(calls[3].url, /\/sources\/source_1\/correct$/);
+  assert.match(calls[4].url, /\/studies\/study_1\/findings$/);
+  assert.match(calls[5].url, /\/findings\/finding_1\/accept$/);
+  for (const [index, key] of [[1, 'source-command'], [2, 'assessment-command'], [3, 'correction-command'], [4, 'finding-command'], [5, 'acceptance-command']]) {
+    assert.equal(calls[index].options.method, 'POST');
+    assert.equal(calls[index].options.headers['Idempotency-Key'], key);
+  }
+  assert.deepEqual(JSON.parse(calls[1].options.body), source);
+  assert.deepEqual(JSON.parse(calls[2].options.body), assessment);
+  assert.deepEqual(JSON.parse(calls[3].options.body), correction);
+  assert.deepEqual(JSON.parse(calls[4].options.body), finding);
+  assert.deepEqual(JSON.parse(calls[5].options.body), acceptance);
+  assert.throws(() => connection.createSource('../study', source, 'key'));
+  assert.throws(() => connection.assessSource('../source', assessment, 'key'));
+  assert.throws(() => connection.correctSource('source_1', correction));
+  assert.throws(() => connection.createFinding('../study', finding, 'key'));
+  assert.throws(() => connection.acceptFinding('../finding', acceptance, 'key'));
+});
+
 test('an interaction read cannot cross a connection switch', async () => {
   let resolveOld;
   const connection = new ControlConnection(async url => {

@@ -76,7 +76,9 @@ and verifies that write controls are disabled. Both passes save the complete
 study JSON through a native dialog and compare it with the control ledger. The
 active pass also creates a study, registers two variants, records negative
 outcomes, closes the accounted study, and exports its full ledger. These manual
-records have no execution receipt or provider work. No real project or credential is used.
+records have no execution receipt or provider work. It also exercises source
+assessment, candidate selection, explicit finding acceptance, correction and
+downstream review through the UI. No real project or credential is used.
 
 The maintainer has paused PRs while the initial implementation takes shape.
 Use logical, tested commits on `main`; PRs can resume when requested.

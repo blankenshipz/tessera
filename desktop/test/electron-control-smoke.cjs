@@ -110,6 +110,45 @@ async function main() {
         await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 2 &&
           document.querySelectorAll('#study-detail [data-record-variant-id]').length === 1 - index);
       }
+      document.querySelector('#source-new').click();
+      const sourceForm = document.querySelector('#source-form');
+      sourceForm.elements.uri.value = 'urn:tessera:synthetic:authored';
+      sourceForm.elements.quoted_passage.value = 'Synthetic evidence about retained failed and abandoned variants.';
+      sourceForm.elements.content_digest.value = 'c'.repeat(64);
+      sourceForm.requestSubmit();
+      await waitFor(() => document.querySelectorAll('#study-detail [data-source-id]').length === 1);
+      document.querySelector('[data-assessment-source-id]').click();
+      const assessmentForm = document.querySelector('#assessment-form');
+      assessmentForm.elements.verdict.value = 'unsupported';
+      assessmentForm.elements.reason.value = 'Synthetic fixture has not established support.';
+      assessmentForm.requestSubmit();
+      await waitFor(() => document.querySelector('[data-source-id] .tag')?.textContent.startsWith('unsupported'));
+      document.querySelector('#finding-new').click();
+      const findingForm = document.querySelector('#finding-form');
+      findingForm.elements.statement.value = 'Synthetic finding about retained failed and abandoned variants.';
+      document.querySelector('#finding-sources input').checked = true;
+      for (const input of document.querySelectorAll('#finding-variants input')) input.checked = true;
+      findingForm.requestSubmit();
+      await waitFor(() => document.querySelector('[data-accept-finding-id]'));
+      if (!document.querySelector('[data-accept-finding-id]').disabled) throw new Error('Unsupported citation permits acceptance.');
+      document.querySelector('[data-assessment-source-id]').click();
+      assessmentForm.elements.verdict.value = 'supported';
+      assessmentForm.elements.reason.value = 'Explicit synthetic human assessment; not scientific validation.';
+      assessmentForm.requestSubmit();
+      await waitFor(() => document.querySelector('[data-accept-finding-id]') && !document.querySelector('[data-accept-finding-id]').disabled);
+      document.querySelector('[data-accept-finding-id]').click();
+      if (!document.querySelector('#finding-review').textContent.includes('Synthetic evidence about retained')) throw new Error('Review omits cited passage.');
+      document.querySelector('#finding-accept-form').requestSubmit();
+      await waitFor(() => document.querySelector('[data-finding-id] .tag')?.textContent.startsWith('accepted'));
+      document.querySelector('[data-correction-source-id]').click();
+      const correctionForm = document.querySelector('#correction-form');
+      correctionForm.elements.uri.value = 'urn:tessera:synthetic:authored-corrected';
+      correctionForm.elements.quoted_passage.value = 'Synthetic corrected evidence supersedes the original assertion.';
+      correctionForm.elements.content_digest.value = 'd'.repeat(64);
+      correctionForm.elements.reason.value = 'Synthetic correction requires review.';
+      correctionForm.requestSubmit();
+      await waitFor(() => document.querySelectorAll('#study-detail [data-source-id]').length === 2 &&
+        document.querySelector('[data-finding-id] .tag')?.textContent.startsWith('needs_review'));
       document.querySelector('#study-close').click();
       document.querySelector('#study-close-form').requestSubmit();
       await waitFor(() => document.querySelector('#study-detail').textContent.includes('closed · revision 2'));

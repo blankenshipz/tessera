@@ -77,6 +77,11 @@ const handlers = {
   registerVariant: (id, body, key) => connection.registerVariant(id, body, key),
   recordVariant: (id, body, key) => connection.recordVariant(id, body, key),
   closeStudy: (id, body, key) => connection.closeStudy(id, body, key),
+  createSource: (id, body, key) => connection.createSource(id, body, key),
+  assessSource: (id, body, key) => connection.assessSource(id, body, key),
+  correctSource: (id, body, key) => connection.correctSource(id, body, key),
+  createFinding: (id, body, key) => connection.createFinding(id, body, key),
+  acceptFinding: (id, body, key) => connection.acceptFinding(id, body, key),
   studySelection: (studyId, selection, projectId) => {
     if (!Number.isSafeInteger(selection) || selection < 0) throw new Error('Invalid study selection.');
     selectedStudy = studyId === null ? null : { id: connection.status()?.id, studyId, selection, projectId };

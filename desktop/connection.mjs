@@ -157,6 +157,11 @@ export class ControlConnection {
   registerVariant(studyId, body, key) { return this.#request(`/studies/${resourceId(studyId)}/variants`, body, key); }
   recordVariant(variantId, body, key) { return this.#request(`/variants/${resourceId(variantId)}/record`, body, key); }
   closeStudy(studyId, body, key) { return this.#request(`/studies/${resourceId(studyId)}/close`, body, key); }
+  createSource(studyId, body, key) { return this.#request(`/studies/${resourceId(studyId)}/sources`, body, key); }
+  assessSource(sourceId, body, key) { return this.#request(`/sources/${resourceId(sourceId)}/assess`, body, key); }
+  correctSource(sourceId, body, key) { return this.#request(`/sources/${resourceId(sourceId)}/correct`, body, key); }
+  createFinding(studyId, body, key) { return this.#request(`/studies/${resourceId(studyId)}/findings`, body, key); }
+  acceptFinding(findingId, body, key) { return this.#request(`/findings/${resourceId(findingId)}/accept`, body, key); }
   revisions(taskId, page) { return this.#request(`/tasks/${resourceId(taskId)}/revisions?${pageQuery(page)}`); }
   labbook(projectId, after = 0) {
     if (!Number.isSafeInteger(after) || after < 0) throw new ConnectionError('Invalid event cursor.');

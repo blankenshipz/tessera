@@ -40,7 +40,7 @@
         </div>
       </section>
       <section class="inbox"><div class="section-title"><div><h2>Pending human decisions</h2><p class="muted">Approve or reject the displayed request revision. A recorded decision is intent only; it does not issue a grant or start execution.</p></div></div><div id="decisions" class="cards"></div><button id="decisions-more" hidden>More decisions</button></section>
-      <section class="ledger"><div class="section-title"><div><h2>Research ledger</h2><p class="muted">Browse complete in-scope study records. This view is read-only and does not accept findings or start work.</p></div><button id="study-new">New study</button></div><div class="ledger-grid"><div><h3>Studies</h3><div id="studies" class="cards compact"></div><button id="studies-more" hidden>More studies</button></div><div><h3 id="study-title">Select a study</h3><div class="study-actions"><button id="study-export" hidden>Save study ledger JSON</button><button id="variant-new" hidden>Register variant</button><button id="study-close" hidden>Close study</button></div><div id="study-detail" class="ledger-detail"><p class="muted">Choose a study to inspect its complete ledger.</p></div></div></div></section>
+      <section class="ledger"><div class="section-title"><div><h2>Research ledger</h2><p class="muted">Browse complete in-scope study records. This view is read-only and does not accept findings or start work.</p></div><button id="study-new">New study</button></div><div class="ledger-grid"><div><h3>Studies</h3><div id="studies" class="cards compact"></div><button id="studies-more" hidden>More studies</button></div><div><h3 id="study-title">Select a study</h3><div class="study-actions"><button id="study-export" hidden>Save study ledger JSON</button><button id="variant-new" hidden>Register variant</button><button id="study-close" hidden>Close study</button><button id="source-new" hidden>Record source</button><button id="finding-new" hidden>Propose finding</button></div><div id="study-detail" class="ledger-detail"><p class="muted">Choose a study to inspect its complete ledger.</p></div></div></div></section>
       <div class="section-title"><div><h2>Research plans</h2><p class="muted">Review purpose, limits, and the current plan before approving.</p></div><button id="task-new">New plan</button></div>
       <div id="tasks" class="cards"></div><button id="tasks-more" hidden>More plans</button>
       <section class="labbook"><div class="section-title"><h2>Labbook</h2><span class="caption">A durable record of the work</span></div><ol id="events"></ol><button id="events-more" hidden>Load more events</button></section>
@@ -54,6 +54,54 @@
   <dialog id="variant-dialog"><form id="variant-form"><h2>Register variant</h2><label>Name<input name="name" required maxlength="200"></label><label>Method digest<input name="method_digest" required maxlength="64" pattern="[0-9a-f]{64}"></label><label>Input digest<input name="input_digest" required maxlength="64" pattern="[0-9a-f]{64}"></label><label>Replication label<select name="replication_label"><option value="unavailable">Unavailable</option><option value="same_pipeline">Same pipeline</option><option value="rerun">Rerun</option></select></label><label>Metadata JSON<textarea name="metadata" rows="4">{}</textarea></label><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Register variant</button></div></form></dialog>
   <dialog id="outcome-dialog"><form id="outcome-form"><h2>Record variant outcome</h2><p class="muted">These records are human assertions; no execution receipt is created.</p><label>Status<select name="status"><option value="completed">Completed</option><option value="failed">Failed</option><option value="excluded">Excluded</option><option value="abandoned">Abandoned</option></select></label><label>Reason<textarea name="reason" maxlength="4000" rows="3"></textarea></label><label>Provenance<select name="provenance"><option value="manual">Manual</option><option value="imported_unverified">Imported, unverified</option></select></label><label>Outcome JSON<textarea name="outcome" rows="4">{}</textarea></label><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Record outcome</button></div></form></dialog>
   <dialog id="study-close-dialog"><form id="study-close-form"><h2>Close study</h2><p class="muted">Closing records the study as complete. All registered variants must be accounted for before it can close.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Close study</button></div></form></dialog>
+  <dialog id="source-dialog">
+    <form id="source-form">
+      <h2>Record source</h2>
+      <label>URI<input name="uri" required maxlength="2000"></label>
+      <label>Quoted passage<textarea name="quoted_passage" required maxlength="4000" rows="4"></textarea></label>
+      <label>Content digest<input name="content_digest" required maxlength="64" pattern="[0-9a-f]{64}"></label>
+      <label>Locator<input name="locator" maxlength="1000"></label>
+      <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Record source</button></div>
+    </form>
+  </dialog>
+  <dialog id="assessment-dialog">
+    <form id="assessment-form">
+      <h2>Assess source</h2>
+      <div id="assessment-source"></div>
+      <label>Verdict<select name="verdict"><option value="supported">Supported</option><option value="unsupported">Unsupported</option><option value="unverified">Unverified</option></select></label>
+      <label>Reason<textarea name="reason" maxlength="4000" rows="4"></textarea></label>
+      <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Save assessment</button></div>
+    </form>
+  </dialog>
+  <dialog id="correction-dialog">
+    <form id="correction-form">
+      <h2>Correct source</h2>
+      <div id="correction-original"></div>
+      <label>URI<input name="uri" required maxlength="2000"></label>
+      <label>Replacement quoted passage<textarea name="quoted_passage" required maxlength="4000" rows="4"></textarea></label>
+      <label>Replacement content digest<input name="content_digest" required maxlength="64" pattern="[0-9a-f]{64}"></label>
+      <label>Reason<textarea name="reason" required maxlength="4000" rows="4"></textarea></label>
+      <label>Locator<input name="locator" maxlength="1000"></label>
+      <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Record correction</button></div>
+    </form>
+  </dialog>
+  <dialog id="finding-dialog">
+    <form id="finding-form">
+      <h2>Propose finding</h2>
+      <label>Statement<textarea name="statement" required maxlength="4000" rows="5"></textarea></label>
+      <fieldset><legend>Cited sources</legend><div id="finding-sources"></div></fieldset>
+      <fieldset><legend>Related variants</legend><div id="finding-variants"></div></fieldset>
+      <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Propose finding</button></div>
+    </form>
+  </dialog>
+  <dialog id="finding-accept-dialog">
+    <form id="finding-accept-form">
+      <h2>Accept this finding</h2>
+      <div id="finding-review"></div>
+      <p class="muted">This is attributed human judgment. No automated scientific validation is performed.</p>
+      <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Accept this finding</button></div>
+    </form>
+  </dialog>
   <script type="module" src="renderer.mjs"></script>
 </body>
 </html>

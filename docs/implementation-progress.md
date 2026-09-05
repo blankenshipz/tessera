@@ -8,7 +8,7 @@ pilot are not complete.
 
 - 342 Python tests pass natively and in isolated Linux CI.
 - Ruff lint and format checks pass.
-- Fifty-one desktop connection/IPC and renderer tests pass using Node 22.12.
+- Fifty-six desktop connection/IPC and renderer tests pass using Node 22.12.
 - Explicit migrations through schema v11 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
@@ -73,7 +73,9 @@ representative investigation have not passed end-to-end acceptance.
    now use the same scoped, idempotent command boundary, with authoritative open-study
    checks and context-cleared drafts. Native authoring creates and exports two
    variants, records their failed/abandoned outcomes, closes the accounted study,
-   and exports both without asserting execution. Review corrected a stale-read mock signature and
+   and exports both without asserting execution. The native evidence flow also
+   checks source assessment, unsupported-citation blocking, explicit acceptance,
+   correction history and downstream review. Review corrected a stale-read mock signature and
    ensured that returned study/project identity matches the selected context.
 
 10. **Stopped-workspace collector:** declared-path, descriptor-relative reads reject
@@ -124,6 +126,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `046303d`: standalone snapshots from WAL-mode sources.
 - `b1c4adc`: native complete study JSON export.
 - `f90eda8`: desktop study creation and variant registration.
+- `878a01a`: recorded outcomes and accounted study closure.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -142,7 +145,7 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed through `f90eda8`. No force push or authentication reconfiguration was used.
+CI passed through `878a01a`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
 A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's
@@ -159,7 +162,7 @@ representative research question/dataset remain open configuration inputs.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, research editing, broader reproduction exports, telemetry and
+4. Desktop adoption, skills, finding revision/reaffirmation, broader reproduction exports, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
 5. Operational restore fencing/resumption, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.

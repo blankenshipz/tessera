@@ -16,8 +16,9 @@ separate machines and clusters.
 human approval records, durable conversations and decisions, and a research
 ledger with complete study exports and source corrections. Approval records intent
 only; they do not grant execution. A desktop shell, safe file inventory, Codex
-transport, and CPU supervisor have component tests. Live experiment dispatch,
-desktop runtime validation, and the full pilot remain incomplete. See
+transport, and CPU supervisor have component tests. Native desktop runtime and
+CPU isolation fixtures pass. Live experiment dispatch and the full pilot remain
+incomplete. See
 [implementation progress](docs/implementation-progress.md) for acceptance limits.
 
 ## Run the foundation
@@ -84,7 +85,8 @@ bytes and their manifest, verifies them after restart, and records adoption in t
 labbook. Original snapshots retain their unclassified, imported/unverified labels;
 a separate human decision can release public inputs to one worker. Lease-scoped [input delivery](docs/input-delivery.md) and verified local worker
 staging are implemented. [CPU runtime integration](docs/cpu-runtime.md) connects
-packages, verified read-only input mounts and the supervisor in synthetic tests.
+packages, verified read-only input mounts and the supervisor in synthetic tests
+and native Docker fixtures.
 
 [Execution admission](docs/execution-admission.md) now records human-reviewed input
 release, project limits, grants, short-lived worker leases and reconciliation.

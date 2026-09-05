@@ -579,3 +579,73 @@ test('changing study while a close command ID is pending prevents dispatch', asy
   await ui.selectStudy({ id: 's2' }); key.resolve('old-key'); await flush();
   assert.equal(calls, 0); assert.equal(ui.get('study-close-dialog').open, false);
 });
+
+const evidenceSource = (overrides = {}) => ({ id: 'source1', study_id: 's1', revision: 7,
+  uri: 'urn:fixture:source', quoted_passage: 'An exact <script>passage</script>', content_digest: 'c'.repeat(64),
+  verdict: 'supported', superseded_at: null, ...overrides });
+const evidenceFinding = { id: 'finding1', study_id: 's1', revision: 4, status: 'candidate',
+  statement: 'A recorded assertion', source_ids: ['source1'], variant_ids: ['v1'] };
+const evidenceLedger = () => ({ ...ledger('s1', [registeredVariant()]),
+  sources: [evidenceSource()], findings: [evidenceFinding] });
+
+test('acceptance UI requires current supported citations and closed confirmatory accounting', async () => {
+  const fixtures = [
+    { verdict: 'unsupported', mode: 'exploratory', status: 'open', allowed: false },
+    { verdict: 'supported', mode: 'confirmatory', status: 'open', allowed: false },
+    { verdict: 'supported', mode: 'confirmatory', status: 'closed', allowed: true },
+    { verdict: 'supported', mode: 'exploratory', status: 'open', superseded_at: '2026-01-01', allowed: false },
+  ];
+  for (const entry of fixtures) {
+    const data = evidenceLedger(); data.sources[0] = evidenceSource(entry);
+    data.study = { ...data.study, mode: entry.mode, status: entry.status };
+    data.variants[0].status = 'failed';
+    let accepted = 0;
+    const ui = fixture({ study: async () => data, acceptFinding: async () => { accepted++; } });
+    await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+    const button = find(ui.get('study-detail'), node => node.dataset?.acceptFindingId);
+    assert.equal(button.disabled, !entry.allowed);
+    if (!entry.allowed) { button.listeners.click(); await flush(); assert.equal(accepted, 0); }
+  }
+});
+
+test('finding review displays cited passage as text, requires explicit submit, and clears old context', async () => {
+  const calls = []; const data = evidenceLedger();
+  const ui = fixture({ study: async () => data, acceptFinding: async (_connection, id, body) => { calls.push({ id, body }); return {}; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.acceptFindingId).listeners.click(); await flush();
+  assert.equal(calls.length, 0);
+  assert.ok(find(ui.get('finding-review'), node => node.textContent === 'An exact <script>passage</script>'));
+  ui.submit('finding-accept-form'); await flush();
+  assert.equal(JSON.stringify(calls), JSON.stringify([{ id: 'finding1', body: { expected_revision: 4 } }]));
+  assert.equal(ui.get('finding-review').children.length, 0);
+  await ui.selectProject(project('p2'));
+  assert.equal(ui.get('finding-accept-dialog').open, false);
+});
+
+test('finding proposals use only explicit selected source and variant records', async () => {
+  const calls = [];
+  const ui = fixture({ study: async () => evidenceLedger(), createFinding: async (_connection, id, body) => { calls.push({ id, body }); return {}; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  ui.get('finding-new').listeners.click(); await flush();
+  ui.get('finding-form').fields = { statement: 'Candidate' };
+  ui.submit('finding-form'); await flush(); assert.equal(calls.length, 0);
+  find(ui.get('finding-sources'), node => node.dataset?.sourceChoiceId).checked = true;
+  find(ui.get('finding-variants'), node => node.dataset?.variantChoiceId).checked = true;
+  ui.submit('finding-form'); await flush();
+  assert.equal(JSON.stringify(calls), JSON.stringify([{ id: 's1', body: {
+    statement: 'Candidate', source_ids: ['source1'], variant_ids: ['v1'] } }]));
+});
+
+test('source corrections bind the displayed revision and cannot cross a pending context switch', async () => {
+  const key = deferred(); let calls = 0;
+  const ui = fixture({ commandId: async () => key.promise, study: async () => evidenceLedger(), correctSource: async () => { calls++; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.correctionSourceId).listeners.click(); await flush();
+  ui.get('correction-form').fields = { uri: 'urn:replacement', quoted_passage: 'Replacement', content_digest: 'd'.repeat(64), reason: '' };
+  ui.submit('correction-form'); await flush(); assert.equal(calls, 0);
+  assert.match(ui.get('notice').textContent, /requires a reason/);
+  ui.get('correction-form').fields.reason = 'Corrected'; ui.submit('correction-form'); await flush();
+  await ui.selectProject(project('p2')); key.resolve('stale-key'); await flush();
+  assert.equal(calls, 0); assert.equal(ui.get('correction-dialog').open, false);
+  assert.equal(ui.get('correction-original').children.length, 0);
+});
