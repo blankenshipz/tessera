@@ -30,6 +30,11 @@ p { line-height: 1.65; }
 .message { border-bottom: 1px solid #d8ddcf; padding: 10px 0; }
 .message .tag { margin-right: 8px; }
 .inbox { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
+.ledger { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
+.ledger-grid { display: grid; grid-template-columns: minmax(220px, .65fr) minmax(360px, 1.35fr); gap: 28px; }
+.ledger-detail { min-height: 160px; }
+.ledger-detail h4 { margin: 26px 0 8px; }
+.ledger-detail .card { margin: 10px 0; }
 .card { background: #fcfbf6; border: 1px solid #d8ddcf; border-radius: 10px; padding: 23px; }
 .card h3 { margin: 12px 0; font-size: 19px; font-weight: 500; overflow-wrap: anywhere; }
 .card p { white-space: pre-wrap; overflow-wrap: anywhere; }

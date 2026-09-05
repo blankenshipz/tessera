@@ -35,7 +35,7 @@ async function main() {
     throw new Error('Application isolation settings are missing.');
   }
   const result = await window.webContents.executeJavaScript(`(async () => {
-    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId })};
+    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId, studyId: fixture.studyId })};
     const waitFor = async predicate => {
       const deadline = Date.now() + 10000;
       while (!predicate()) {
@@ -58,8 +58,22 @@ async function main() {
     card.querySelector('textarea').value = 'Synthetic UI acceptance fixture.';
     [...card.querySelectorAll('button')].find(button => button.textContent === 'Approve').click();
     await waitFor(() => document.querySelector('#decisions').textContent.includes('No pending decisions.'));
+    await waitFor(() => [...document.querySelectorAll('[data-study-id]')].some(node => node.dataset.studyId === expected.studyId));
+    [...document.querySelectorAll('[data-study-id]')].find(node => node.dataset.studyId === expected.studyId).click();
+    await waitFor(() => document.querySelectorAll('#study-detail [data-variant-id]').length === 80);
+    const detail = document.querySelector('#study-detail');
+    if (detail.querySelectorAll('[data-source-id]').length !== 2 ||
+        detail.querySelectorAll('[data-finding-id]').length !== 1 ||
+        detail.querySelectorAll('[data-correction-id]').length !== 1) {
+      throw new Error('Research history is incomplete.');
+    }
+    for (const expectedText of ['Synthetic variant 79', 'Synthetic original passage',
+        'Synthetic corrected passage', 'Synthetic correction fixture',
+        'Needs review.', 'Outcome provenance: manual', 'Execution receipt: none recorded']) {
+      if (!detail.textContent.includes(expectedText)) throw new Error('Missing research record: ' + expectedText);
+    }
     if (typeof window.require !== 'undefined') throw new Error('Node is exposed to renderer.');
-    return { href: location.href, decisionRemoved: true };
+    return { href: location.href, decisionRemoved: true, researchVariants: 80 };
   })()`, true);
   if (result.href !== 'tessera://app/index.html' || errors.length) throw new Error('Unexpected renderer state.');
   console.log(JSON.stringify(result));

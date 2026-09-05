@@ -69,7 +69,9 @@ for the synthetic desktop-to-control fixture. It starts a temporary loopback
 service and opens the sandboxed Electron application. A test-only file-picker
 stub selects the fixture credential; actual renderer, IPC, authentication and
 decision routes record an explicit synthetic approval. It verifies that no
-execution grant or lease was created. No real project or credential is used.
+execution grant or lease was created. It also browses the complete 80-variant
+synthetic study and its correction history without changing any research record.
+No real project or credential is used.
 
 The maintainer has paused PRs while the initial implementation takes shape.
 Use logical, tested commits on `main`; PRs can resume when requested.

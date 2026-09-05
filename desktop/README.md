@@ -16,6 +16,15 @@ it does not issue a grant, start an experiment, or spend funds. Credential files
 main-process memory; saved encrypted sessions and organization login are later
 work. Closing the desktop does not stop the backend.
 
+The research-ledger panel is read-only. It lists a project's studies and renders
+only a control-plane `complete_in_scope_study_ledger` envelope: every returned
+variant, source, finding, correction, and ledger event. Recorded outcomes remain
+manual or imported assertions where identified and have no execution receipt in
+this slice. Source URIs are displayed as text; the renderer does not open them,
+fetch external content, accept findings, or export files. If the server cannot
+produce its bounded complete ledger, the desktop shows an error rather than a
+partial view labeled complete.
+
 Run the dependency-free boundary tests with `npm test --prefix desktop`.
 Electron 44.2.0 and its dependencies are pinned in `package-lock.json`.
 Use Node 22.12 or newer, then `npm ci --prefix desktop` and
@@ -38,7 +47,9 @@ desktop E2E acceptance.
 synthetic decision through the actual sandboxed renderer, IPC and loopback control
 API. It uses temporary control and application state, with a test-only native
 file-picker stub selecting the fixture credential. The fixture verifies human
-attribution and absence of execution grants or leases. This exposed and corrected
+attribution and absence of execution grants or leases. It also displays all 80
+synthetic registered variants and source-correction history, then verifies that
+browsing left the study ledger unchanged. This exposed and corrected
 the desktop's identity-field mismatch with the real `/me` response. It remains a
 platform fixture, not a research investigation or visual acceptance test.
 

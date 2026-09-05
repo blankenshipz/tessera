@@ -110,6 +110,26 @@ test('interaction identifiers and API page bounds fail closed', async () => {
   assert.throws(() => connection.resolveDecision({ decision_id: 'decision_1', decision: 'approve' }));
 });
 
+test('research ledger routes use bounded read-only study requests', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ studies: [] });
+  });
+  await connection.connect(config());
+  await connection.studies('project_1', { offset: 100, limit: 200 });
+  await connection.study('study_1');
+  assert.match(calls[1].url, /\/projects\/project_1\/studies\?offset=100&limit=200$/);
+  assert.match(calls[2].url, /\/studies\/study_1$/);
+  assert.equal(calls[1].options.method, 'GET');
+  assert.equal(calls[2].options.method, 'GET');
+  assert.equal(calls[1].options.body, undefined);
+  assert.equal(calls[2].options.headers['Idempotency-Key'], undefined);
+  assert.throws(() => connection.studies('../project'));
+  assert.throws(() => connection.studies('project_1', { limit: 201 }));
+  assert.throws(() => connection.study('../study'));
+});
+
 test('an interaction read cannot cross a connection switch', async () => {
   let resolveOld;
   const connection = new ControlConnection(async url => {

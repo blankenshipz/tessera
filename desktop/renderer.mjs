@@ -17,13 +17,16 @@ let taskOffset = 0;
 let eventCursor = 0;
 let threadOffset = 0;
 let decisionOffset = 0;
+let studyOffset = 0;
 let messageOffset = 0;
 let activeThread = null;
 let threadEpoch = 0;
+let activeStudy = null;
+let studyEpoch = 0;
 const pendingKeys = new Map();
 const pendingDecisionResolutions = new Map();
 const loading = new Set();
-const readVersion = { threads: 0, messages: 0, decisions: 0 };
+const readVersion = { threads: 0, messages: 0, decisions: 0, studies: 0, study: 0 };
 
 function notice(message = '') { $('notice').textContent = message; }
 function element(tag, text, className) {
@@ -36,17 +39,18 @@ function clearContext() {
   epoch++;
   connectionId = null;
   activeProject = null;
-  projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = messageOffset = 0;
-  activeThread = null; threadEpoch++;
+  projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
+  activeThread = null; threadEpoch++; activeStudy = null; studyEpoch++;
   pendingKeys.clear();
   pendingDecisionResolutions.clear();
-  for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions']) $(name).replaceChildren();
+  for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions', 'studies', 'study-detail']) $(name).replaceChildren();
   $('project-title').textContent = 'Start with a question.';
   $('welcome').hidden = false;
   $('workspace').hidden = true;
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
-  for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more']) $(name).hidden = true;
+  for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
+  $('study-title').textContent = 'Select a study';
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   loading.clear();
 }
@@ -97,18 +101,19 @@ async function selectProject(project) {
   epoch++;
   if (activeProject?.id !== project.id) pendingDecisionResolutions.clear();
   activeProject = project;
-  taskOffset = eventCursor = threadOffset = decisionOffset = messageOffset = 0;
-  activeThread = null; threadEpoch++;
-  for (const name of ['threads-more', 'messages-more', 'decisions-more']) $(name).hidden = true;
-  $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren();
+  taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
+  activeThread = null; threadEpoch++; activeStudy = null; studyEpoch++;
+  for (const name of ['threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
+  $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
+  $('study-title').textContent = 'Select a study';
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
   for (const button of $('projects').children) {
     if (button.dataset.projectId === project.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   }
-  await Promise.all([loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true)]);
+  await Promise.all([loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true), loadStudies(true)]);
 }
 async function loadTasks() {
   const version = epoch;
@@ -318,6 +323,138 @@ async function loadDecisions(reset = false) {
     loading.delete(loadingKey); if (version === epoch && requestVersion === readVersion.decisions) $('decisions-more').disabled = false;
   }
 }
+function studyReadIsCurrent(version, project, selection, study, requestVersion) {
+  return version === epoch && project === activeProject && selection === studyEpoch &&
+    study === activeStudy && requestVersion === readVersion.study;
+}
+function ledgerCard(title, id, value) {
+  const card = element('article', undefined, 'card');
+  card.dataset[id] = value.id;
+  card.append(element('h5', title));
+  return card;
+}
+function ledgerText(value) { return JSON.stringify(value); }
+function renderStudyLedger(ledger) {
+  const { study, variants, sources, findings, corrections, events } = ledger;
+  const detail = $('study-detail'); detail.replaceChildren();
+  const summary = element('article', undefined, 'card');
+  summary.append(element('span', `${study.mode} · ${study.status} · revision ${study.revision}`, 'tag'));
+  summary.append(element('p', `Purpose: ${study.purpose}`));
+  summary.append(element('p', `Protocol: ${study.protocol}`));
+  summary.append(element('p', 'Completeness: complete in-scope study ledger.', 'muted'));
+  summary.append(element('p', 'This is a read-only record. Manual or imported outcomes remain assertions, and this view has no execution receipts.', 'muted'));
+  detail.append(summary);
+  const appendSection = (title, records, render) => {
+    detail.append(element('h4', `${title} (${records.length})`));
+    if (!records.length) { detail.append(element('p', `No ${title.toLowerCase()} recorded.`, 'muted')); return; }
+    for (const record of records) detail.append(render(record));
+  };
+  appendSection('Variants', variants, variant => {
+    const card = ledgerCard(`Variant ${variant.id}: ${variant.name}`, 'variantId', variant);
+    card.append(element('span', `${variant.status} · ${variant.replication_label}`, 'tag'));
+    card.append(element('p', `Method: ${variant.method_digest}`), element('p', `Inputs: ${variant.input_digest}`));
+    card.append(element('p', `Registered metadata: ${ledgerText(variant.metadata)}`));
+    if (variant.reason) card.append(element('p', `Reason: ${variant.reason}`));
+    if (variant.outcome !== null) card.append(element('p', `Recorded outcome: ${ledgerText(variant.outcome)}`));
+    if (variant.outcome_provenance) card.append(element('p', `Outcome provenance: ${variant.outcome_provenance} (assertion; no execution receipt)`, 'muted'));
+    card.append(element('p', `Execution receipt: ${variant.execution_receipt === null ? 'none recorded' : ledgerText(variant.execution_receipt)}`, 'muted'));
+    card.append(element('p', `Independence: ${variant.independence_status}`, 'muted'));
+    return card;
+  });
+  appendSection('Sources', sources, source => {
+    const card = ledgerCard(`Source ${source.id}`, 'sourceId', source);
+    card.append(element('span', `${source.verdict} · revision ${source.revision}`, 'tag'));
+    card.append(element('p', `Recorded URI: ${source.uri}`));
+    card.append(element('p', `Passage: ${source.quoted_passage}`));
+    card.append(element('p', `Digest: ${source.content_digest}`, 'muted'));
+    if (source.locator) card.append(element('p', `Locator: ${source.locator}`, 'muted'));
+    if (source.assessment_reason) card.append(element('p', `Assessment: ${source.assessment_reason}`));
+    if (source.supersedes_source_id) card.append(element('p', `Supersedes source: ${source.supersedes_source_id}`, 'muted'));
+    if (source.superseded_at) card.append(element('p', `Superseded at: ${source.superseded_at}`, 'muted'));
+    return card;
+  });
+  appendSection('Findings', findings, finding => {
+    const card = ledgerCard(`Finding ${finding.id}`, 'findingId', finding);
+    card.append(element('span', `${finding.status} · revision ${finding.revision}`, 'tag'));
+    card.append(element('p', finding.statement));
+    card.append(element('p', `Source IDs: ${finding.source_ids.join(', ') || 'none'}`, 'muted'));
+    card.append(element('p', `Variant IDs: ${finding.variant_ids.join(', ') || 'none'}`, 'muted'));
+    if (finding.status === 'needs_review') card.append(element('p', 'Needs review. Consult the linked sources and ledger history.', 'muted'));
+    return card;
+  });
+  appendSection('Corrections', corrections, correction => {
+    const card = ledgerCard(`Correction ${correction.id}`, 'correctionId', correction);
+    card.append(element('p', `Original source: ${correction.original_source_id}`));
+    card.append(element('p', `Replacement source: ${correction.replacement_source_id}`));
+    card.append(element('p', `Reason: ${correction.reason}`));
+    card.append(element('p', `Recorded by ${correction.actor_principal_id} at ${correction.created_at}`, 'muted'));
+    return card;
+  });
+  appendSection('Ledger history', events, event => {
+    const card = element('article', undefined, 'card');
+    card.append(element('span', `${event.event_type} · revision ${event.resource_revision}`, 'tag'));
+    card.append(element('p', `Actor: ${event.actor_principal_id} · recorded ${event.created_at}`, 'muted'));
+    card.append(element('p', `Record: ${ledgerText(event.payload)}`, 'muted'));
+    return card;
+  });
+}
+async function loadStudies(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) readVersion.studies++;
+  const requestVersion = readVersion.studies;
+  const loadingKey = `studies:${version}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('studies-more').disabled = true;
+  if (reset) { studyOffset = 0; $('studies').replaceChildren(element('p', 'Loading studies…', 'muted')); }
+  try {
+    const response = await api.studies(connectionId, project.id, { offset: studyOffset, limit: 100 });
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.studies) return;
+    if (reset) $('studies').replaceChildren();
+    for (const study of response.studies) {
+      const button = element('button', `${study.purpose} · ${study.status}`);
+      button.dataset.studyId = study.id;
+      button.addEventListener('click', () => guarded(() => selectStudy(study)));
+      $('studies').append(button);
+    }
+    studyOffset += response.studies.length;
+    $('studies-more').hidden = response.studies.length < 100 || studyOffset > 100000;
+    if (!studyOffset) $('studies').append(element('p', 'No studies recorded.', 'muted'));
+  } catch (error) {
+    if (version === epoch && project === activeProject && requestVersion === readVersion.studies) {
+      if (reset) $('studies').replaceChildren(element('p', 'Could not load studies. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey);
+    if (version === epoch && project === activeProject && requestVersion === readVersion.studies) $('studies-more').disabled = false;
+  }
+}
+async function selectStudy(study) {
+  const version = epoch; const project = activeProject; const selection = ++studyEpoch;
+  const requestVersion = ++readVersion.study;
+  activeStudy = study;
+  $('study-title').textContent = `Study ${study.id}`;
+  $('study-detail').replaceChildren(element('p', 'Loading complete study ledger…', 'muted'));
+  for (const button of $('studies').children) {
+    if (button.dataset.studyId === study.id) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  try {
+    const ledger = await api.study(connectionId, study.id);
+    if (!studyReadIsCurrent(version, project, selection, study, requestVersion)) return;
+    if (ledger.completeness !== 'complete_in_scope_study_ledger' || !ledger.study ||
+        ledger.study.id !== study.id || ledger.study.project_id !== project.id ||
+        !['variants', 'sources', 'findings', 'corrections', 'events'].every(name => Array.isArray(ledger[name]))) {
+      throw new Error('The control plane did not return a complete study ledger.');
+    }
+    renderStudyLedger(ledger);
+  } catch (error) {
+    if (studyReadIsCurrent(version, project, selection, study, requestVersion)) {
+      $('study-detail').replaceChildren(element('p', 'Could not load a complete study ledger. Partial records are not shown as complete; use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  }
+}
 const eventLabels = {
   'project.created': 'Project created', 'task.created': 'Research plan drafted',
   'task.approved': 'Plan approved by a human', 'task.plan_revised': 'Plan revised; new review required',
@@ -424,6 +561,7 @@ $('events-more').addEventListener('click', () => guarded(() => loadEvents()));
 $('threads-more').addEventListener('click', () => guarded(() => loadThreads()));
 $('messages-more').addEventListener('click', () => guarded(() => loadMessages()));
 $('decisions-more').addEventListener('click', () => guarded(() => loadDecisions()));
+$('studies-more').addEventListener('click', () => guarded(() => loadStudies()));
 if (!api) {
   $('connection-open').disabled = true;
   notice('Open this workspace in the Tessera desktop application.');

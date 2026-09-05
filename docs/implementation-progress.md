@@ -8,7 +8,7 @@ pilot are not complete.
 
 - 311 Python tests pass natively; isolated Docker Compose verification also passes.
 - Ruff lint and format checks pass.
-- Twenty-four desktop connection/IPC and renderer tests pass using Node 22.12.
+- Twenty-nine desktop connection/IPC and renderer tests pass using Node 22.12.
 - Explicit migrations through schema v10 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
@@ -66,7 +66,10 @@ representative investigation have not passed end-to-end acceptance.
    shared pending command IDs, and stale context completion. A native sandboxed
    Electron/HTTP fixture passes actual authentication and decision resolution;
    it caught and corrected a `/me` identity-field mismatch hidden by unit mocks.
-   Research-ledger views remain absent.
+   Read-only research views now retain all study variants, source versions,
+   findings and correction history. The live Electron fixture displays 80 variants
+   without changing the ledger. Review corrected a stale-read mock signature and
+   ensured that returned study/project identity matches the selected context.
 
 10. **Stopped-workspace collector:** declared-path, descriptor-relative reads reject
     links, aliases, special files, cross-device traversal and oversized outputs.
@@ -102,6 +105,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `7ed75ed`: complete quarantined output manifests and resumable transfers.
 - `ebe5d8d`: rejected Mac fixed-image backend after Docker execution probe.
 - `ae76de5`: desktop decision resolution and live Electron/control acceptance.
+- `7efc7b8`: fenced human quarantine review with schema v10.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -137,7 +141,7 @@ representative research question/dataset remain open configuration inputs.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, research views, telemetry and
+4. Desktop adoption, skills, research editing/export, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
 5. Backup/restore fencing, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.

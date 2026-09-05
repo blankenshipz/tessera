@@ -68,6 +68,7 @@ const handlers = {
   projects: page => connection.projects(page), tasks: (id, page) => connection.tasks(id, page),
   threads: (id, page) => connection.threads(id, page), messages: (id, page) => connection.messages(id, page),
   decisions: (id, page) => connection.decisions(id, page),
+  studies: (id, page) => connection.studies(id, page), study: id => connection.study(id),
   revisions: (id, page) => connection.revisions(id, page), labbook: (id, after) => connection.labbook(id, after),
   createProject: (body, key) => connection.createProject(body, key),
   createTask: (id, body, key) => connection.createTask(id, body, key),

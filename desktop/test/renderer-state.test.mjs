@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 // Exercise the actual renderer without Electron. Deferred replies reproduce races.
 class Element {
-  constructor() { this.children = []; this.listeners = {}; this.dataset = {}; this.fields = {}; this.hidden = false; this.disabled = false; this.textContent = ''; this.value = ''; }
+  constructor(tagName = '') { this.tagName = tagName; this.children = []; this.listeners = {}; this.dataset = {}; this.fields = {}; this.hidden = false; this.disabled = false; this.textContent = ''; this.value = ''; }
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   addEventListener(name, handler) { this.listeners[name] = handler; }
@@ -28,13 +28,14 @@ function fixture(overrides = {}) {
   const api = { status: async () => ({ id: 'connection' }), commandId: async () => 'command',
     tasks: async () => ({ tasks: [] }), labbook: async () => ({ events: [] }),
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
-    decisions: async () => ({ decisions: [] }), ...overrides };
+    decisions: async () => ({ decisions: [] }), studies: async () => ({ studies: [] }),
+    study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
   const context = vm.createContext({ window: { tessera: api },
-    document: { getElementById: get, createElement: () => new Element(), querySelectorAll: () => [] },
+    document: { getElementById: get, createElement: tag => new Element(tag), querySelectorAll: () => [] },
     FormData: class { constructor(form) { this.fields = { ...form.fields }; } get(name) { return this.fields[name]; } },
   });
   const source = readFileSync(new URL('../renderer.mjs', import.meta.url), 'utf8');
-  vm.runInContext(source + '\nglobalThis.hooks = { selectProject, selectThread, loadThreads, loadMessages, loadDecisions, clearContext, state: () => ({ activeProject, activeThread }) };', context);
+  vm.runInContext(source + '\nglobalThis.hooks = { selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadStudies, selectStudy, clearContext, state: () => ({ activeProject, activeThread, activeStudy }) };', context);
   return { ...context.hooks, get, api, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
 }
 const thread = id => ({ id, title: id });
@@ -47,9 +48,19 @@ function find(node, predicate) {
   }
   return null;
 }
+function findAll(node, predicate, result = []) {
+  if (predicate(node)) result.push(node);
+  for (const child of node.children ?? []) findAll(child, predicate, result);
+  return result;
+}
 const pendingDecision = (id = 'd1', projectId = 'p1') => ({
   id, project_id: projectId, task_id: 't1', kind: 'spending', scope: { budget_cents: 100, access: 'public-data' },
   expires_at: '2030-01-01T00:00:00Z', expected_task_revision: 3, reviewer_principal_id: 'human', revision: 4,
+});
+const ledger = (studyId = 's1', variants = []) => ({
+  completeness: 'complete_in_scope_study_ledger',
+  study: { id: studyId, project_id: 'p1', purpose: `Purpose ${studyId}`, protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1 },
+  variants, sources: [], findings: [], corrections: [], events: [],
 });
 
 test('renderer keeps earlier pages, removes loading markers, and deduplicates concurrent More reads', async () => {
@@ -243,6 +254,74 @@ test('a pending decision cannot resolve after its project switches', async () =>
   await ui.selectProject(project('p2')); key.resolve('command'); await flush();
   assert.equal(resolutions, 0);
   assert.equal(ui.state().activeProject.id, 'p2');
+});
+
+test('study pagination retains earlier rows and the ledger keeps every returned variant', async () => {
+  const variants = Array.from({ length: 80 }, (_, index) => ({
+    id: `v${index}`, name: `Variant ${index}`, method_digest: 'm'.repeat(64), input_digest: 'i'.repeat(64),
+    status: index === 1 ? 'failed' : index === 2 ? 'excluded' : index === 3 ? 'abandoned' : index === 4 ? 'registered' : 'completed',
+    replication_label: 'unavailable', reason: index === 1 ? 'Synthetic failure' : index === 2 ? 'Synthetic exclusion' : null,
+    outcome: index === 0 ? { score: 1 } : null, outcome_provenance: index === 0 ? 'manual' : null,
+    execution_receipt: null, independence_status: 'unavailable', metadata: { candidate: index },
+  }));
+  const studies = Array.from({ length: 101 }, (_, index) => ({ id: `s${index}`, purpose: `Study ${index}`, status: 'open' }));
+  const ui = fixture({ studies: async (_id, _project, page) => ({ studies: studies.slice(page.offset, page.offset + page.limit) }),
+    study: async (_connection, id) => ledger(id, variants) });
+  await ui.selectProject(project('p1'));
+  await ui.loadStudies();
+  assert.equal(ui.get('studies').children.length, 101);
+  await ui.selectStudy(studies[0]);
+  const cards = findAll(ui.get('study-detail'), node => node.dataset?.variantId);
+  assert.equal(cards.length, 80);
+  assert.ok(cards.some(card => card.children.some(child => child.textContent === 'failed · unavailable')));
+  assert.ok(cards.some(card => card.children.some(child => child.textContent === 'excluded · unavailable')));
+  assert.ok(cards.some(card => card.children.some(child => /manual \(assertion; no execution receipt\)/.test(child.textContent))));
+  assert.ok(cards.every(card => card.children.some(child => /Execution receipt: none recorded/.test(child.textContent))));
+});
+
+test('study ledger renders source corrections and linked needs-review findings as text only', async () => {
+  const value = ledger();
+  value.sources = [{ id: 'source-old', uri: 'https://untrusted.example/source', quoted_passage: '<script>untrusted</script>', content_digest: 'd'.repeat(64), locator: 'p. 1', verdict: 'unsupported', assessment_reason: 'Corrected', supersedes_source_id: null, superseded_at: '2026-01-01T00:00:00Z' }];
+  value.findings = [{ id: 'finding-1', statement: 'Requires review', status: 'needs_review', source_ids: ['source-old'], variant_ids: ['v1'] }];
+  value.corrections = [{ id: 'correction-1', original_source_id: 'source-old', replacement_source_id: 'source-new', reason: 'Passage was superseded', actor_principal_id: 'human', created_at: '2026-01-01T00:00:00Z' }];
+  const ui = fixture({ study: async () => value });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1', purpose: 'Study', status: 'open' });
+  assert.match(find(ui.get('study-detail'), node => /Recorded URI: https:\/\/untrusted/.test(node.textContent)).textContent, /untrusted/);
+  assert.match(find(ui.get('study-detail'), node => node.textContent === 'Needs review. Consult the linked sources and ledger history.').textContent, /Needs review/);
+  assert.match(find(ui.get('study-detail'), node => /Original source: source-old/.test(node.textContent)).textContent, /source-old/);
+  assert.equal(findAll(ui.get('study-detail'), node => node.tagName === 'a').length, 0);
+});
+
+test('late study reads cannot replace a newer study or project view', async () => {
+  const first = deferred();
+  const ui = fixture({ study: async (_connection, id) => id === 's1' ? first.promise : ledger('s2') });
+  await ui.selectProject(project('p1'));
+  const staleStudy = ui.selectStudy({ id: 's1', purpose: 'First', status: 'open' });
+  await ui.selectStudy({ id: 's2', purpose: 'Second', status: 'open' });
+  first.resolve(ledger('s1')); await staleStudy;
+  assert.equal(ui.state().activeStudy.id, 's2');
+  assert.match(ui.get('study-title').textContent, /s2/);
+  const projectRead = deferred(); ui.api.study = async () => projectRead.promise;
+  const staleProject = ui.selectStudy({ id: 's2', purpose: 'Second', status: 'open' });
+  await ui.selectProject(project('p2')); projectRead.resolve(ledger('s2')); await staleProject;
+  assert.equal(ui.state().activeProject.id, 'p2');
+  assert.equal(ui.get('study-title').textContent, 'Select a study');
+});
+
+test('an incomplete or over-limit ledger response is not presented as complete', async () => {
+  const ui = fixture({ study: async () => { throw new Error('Control request failed (409).'); } });
+  await ui.selectProject(project('p1'));
+  await assert.rejects(ui.selectStudy({ id: 's1', purpose: 'Study', status: 'open' }), /409/);
+  assert.match(ui.get('study-detail').children[0].textContent, /Partial records are not shown as complete/);
+  for (const value of [
+    { ...ledger(), completeness: 'partial' },
+    ledger('another-study'),
+    { ...ledger(), study: { ...ledger().study, project_id: 'another-project' } },
+  ]) {
+    ui.api.study = async () => value;
+    await assert.rejects(ui.selectStudy({ id: 's1' }), /complete study ledger/);
+    assert.match(ui.get('study-detail').children[0].textContent, /Partial records are not shown as complete/);
+  }
 });
 
 test('refresh while a decision command ID is pending shares one ID allocation', async () => {
