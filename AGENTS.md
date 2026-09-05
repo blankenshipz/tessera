@@ -2,7 +2,7 @@
 
 Tessera separates the desktop client, control plane, and execution plane. Read
 the relevant contract in DESIGN.md before changing behavior; README.md describes
-what is implemented. CONTRIBUTING.md owns setup and the pull-request workflow.
+what is implemented. CONTRIBUTING.md owns setup and the development workflow.
 
 ## Repository map
 
@@ -14,8 +14,9 @@ what is implemented. CONTRIBUTING.md owns setup and the pull-request workflow.
 
 ## Workflow
 
-Use a feature branch and open a PR. Do not push implementation directly to main,
-merge a PR, change repository visibility, or deploy unless the user asks.
+During initial implementation, work through logical, tested commits on `main`
+and push completed changes. PRs are paused at the maintainer's request; open one
+only when requested. Do not change repository visibility or deploy unless asked.
 Preserve unrelated work. Do not commit runtime state, credentials, or local auth
 files. Follow `.agents/skills/tessera-change/SKILL.md` for implementation and
 `.agents/skills/tessera-review/SKILL.md` for a requested review.

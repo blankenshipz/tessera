@@ -44,20 +44,38 @@ uses `uv sync --locked`, following the [uv Docker guide](https://docs.astral.sh/
 The ignored `.venv/` and `.tessera/` directories are for local development;
 credentials and runtime data must stay out of Git and image build contexts.
 
-## Pull requests
+## Initial implementation workflow
 
-1. Branch from an up-to-date `main`, e.g. `feat/local-control-auth`.
-2. Keep one reviewable behavior change per PR. Reference the relevant design
+For an opt-in live CPU isolation/cancellation fixture, first fetch the exact
+development Python image, then run the script against your local Docker daemon:
+
+```sh
+docker pull python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
+.venv/bin/python scripts/check_cpu_runtime.py
+```
+
+The script runs synthetic probes in networkless, non-root containers and cleans
+up only its own labeled containers. It requires Docker socket access and runs
+outside the isolated Compose test service. It does not exercise control-plane
+dispatch, data transfer, artifact collection or a research investigation. Unknown
+cleanup is reported with the fixture container name for reconciliation.
+
+The maintainer has paused PRs while the initial implementation takes shape.
+Use logical, tested commits on `main`; PRs can resume when requested.
+
+1. Start from an up-to-date `main` and preserve unrelated local work.
+2. Keep one reviewable behavior change per commit. Reference the relevant design
    section and add a decision note if changing a boundary or supported behavior.
 3. Add tests for the behavior and its failure cases. Use temporary directories
    and synthetic data, not real tokens, research inputs, or external paid calls.
 4. Run the checks above. Update the README if runnable behavior or setup changes.
-5. Commit explicit paths, push the feature branch, and open a PR with `gh pr create`.
+5. Commit explicit paths and push completed changes to `main`.
    State validation performed, limitations, and any migration or security impact.
-6. Wait for CI and maintainer review. Do not self-merge or bypass required checks.
+6. Check CI results and fix failures. Do not bypass required checks.
 
-The initial commit seeds the design on `main`; subsequent work uses PRs. Repository
-rules/branch protections depend on the hosting plan and are not assumed configured.
+If a PR is requested, use a feature branch and the repository PR template; merging
+still requires the maintainer's instruction. Repository rules/branch protections
+depend on the hosting plan and are not assumed configured.
 
 ## Engineering boundaries
 
@@ -77,3 +95,16 @@ Do not put credentials or sensitive research data in issues or PRs. Contact the
 repository owner privately on GitHub to arrange a secure report. Automated tests
 must not target systems outside the assigned repository. A public security-reporting
 channel and license are release prerequisites, not implemented promises.
+
+## Local schema upgrades
+
+Stop the control service and back up its private state directory before an upgrade.
+Startup refuses older schemas rather than migrating them implicitly. For native
+state, run `uv run --locked tessera migrate --state-dir .tessera`, then restart.
+The command is transactional and safe to repeat. Future schema versions are
+rejected; do not run an older binary against newer state.
+
+For the development Compose volume, stop `control`, rebuild, then run
+`docker compose run --rm control tessera migrate --state-dir /state/control`
+before `docker compose up -d --wait control`. This preserves the original owner
+credential and labbook. Do not use `down -v` as an upgrade procedure.

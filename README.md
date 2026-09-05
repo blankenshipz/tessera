@@ -12,11 +12,13 @@ The desktop, control plane, and execution workers run independently. Here,
 “remote” means outside Electron: all three can run on one machine or across
 separate machines and clusters.
 
-**Status:** A runnable local control-plane foundation is implemented: owner bearer
-authentication, tenant-scoped projects and draft tasks, revision-checked human
-plan approval, idempotent writes, and persistent labbook events. Approval records
-intent only; it never grants execution. Desktop, agents, experiment execution,
-and the broader workflows below remain planned.
+**Status:** The local API supports scoped credentials, versioned task plans,
+human approval records, durable conversations and decisions, and a research
+ledger with complete study exports and source corrections. Approval records intent
+only; they do not grant execution. A desktop shell, safe file inventory, Codex
+transport, and CPU supervisor have component tests. Live experiment dispatch,
+desktop runtime validation, and the full pilot remain incomplete. See
+[implementation progress](docs/implementation-progress.md) for acceptance limits.
 
 ## Run the foundation
 
@@ -43,21 +45,53 @@ rmdir "$credential_dir"
 ```
 
 Stop with `docker compose down`; the named volume retains the database and owner
-credential. See [CONTRIBUTING.md](./CONTRIBUTING.md) for native uv setup and the PR
+credential. See [CONTRIBUTING.md](./CONTRIBUTING.md) for native uv setup and the development
 workflow. Compose is not required for deployment. No license has been selected.
 
-The API exposes project creation/listing, task creation/listing/retrieval,
-`POST /tasks/{id}/approve` with `expected_revision`, and
-`GET /projects/{id}/labbook?after=0&limit=100`. Mutations require an
-`Idempotency-Key`; reusing one with different input returns a conflict.
+The API exposes projects, task plans, revision history, approval, and labbook
+reads. `PUT /tasks/{id}/plan` creates an immutable plan revision and invalidates
+prior approval. `POST /tasks/{id}/approve` checks the expected revision and optional
+plan digest. Mutations require an `Idempotency-Key`; reusing one with different
+input returns a conflict. [Record APIs](docs/records-api.md) describe studies,
+evidence, conversations, and human decisions.
 Project/task lists accept `limit` (1–200, default 100) and `offset` (default 0);
 increase the offset by the number returned until the page is shorter than the limit.
 Task inputs are `title`, `purpose`, `budget_cents`, and `max_duration_seconds`.
-Budgets are recorded bounds, with no execution or spending enforcement yet.
+Separate execution grants reserve against project and cumulative task budgets.
+Provider spending enforcement and dispatch integration remain incomplete.
 Browser origins are rejected; the owner credential is for trusted local human
 clients. It is not production organization authentication.
 
-## The first workflow
+The [desktop shell](desktop/README.md) connects to this API and keeps bearer
+credentials in its main process. It currently supports projects, draft plans,
+approval records, and labbook reading; the new research and interaction APIs are
+not yet exposed in the desktop UI.
+
+Existing databases require an explicit `tessera migrate --state-dir PATH` before
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v7
+includes credential metadata, immutable plans, research/interaction tables and
+retained local input snapshots, execution admission records and artifact quarantine.
+Migration retains an unambiguous local bootstrap owner and revokes other legacy
+principals, which must be enrolled again as scoped, expiring credentials.
+
+Local [workspace adoption](docs/workspace-adoption.md) now preserves reviewed input
+bytes and their manifest, verifies them after restart, and records adoption in the
+labbook. Original snapshots retain their unclassified, imported/unverified labels;
+a separate human decision can release public inputs to one worker. Lease-scoped [input delivery](docs/input-delivery.md) and verified local worker
+staging are implemented. [CPU runtime integration](docs/cpu-runtime.md) connects
+packages, verified read-only input mounts and the supervisor in synthetic tests.
+
+[Execution admission](docs/execution-admission.md) now records human-reviewed input
+release, project limits, grants, short-lived worker leases and reconciliation.
+Unknown termination retains exposure; stale lease retries cannot restore revoked
+authority. A separate lease-scoped route delivers released inputs. These routes do not
+dispatch jobs or accept results.
+
+[Artifact quarantine](docs/artifact-quarantine.md) retains bounded, attributable
+worker outputs, including late results. Uploads remain unclassified and cannot
+declare execution success, accept findings or release reserved exposure.
+
+## The first workflow (target)
 
 1. Connect to a personal, organization-managed, or Tessera-hosted control plane.
    Create a project or adopt an existing repository, notebook, or results folder;
