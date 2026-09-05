@@ -68,9 +68,10 @@ approval records, and labbook reading; the new research and interaction APIs are
 not yet exposed in the desktop UI.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v7
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v8
 includes credential metadata, immutable plans, research/interaction tables and
-retained local input snapshots, execution admission records and artifact quarantine.
+retained local input snapshots, execution admission records, artifact quarantine
+and resumable upload sessions.
 Migration retains an unambiguous local bootstrap owner and revokes other legacy
 principals, which must be enrolled again as scoped, expiring credentials.
 
@@ -88,8 +89,10 @@ authority. A separate lease-scoped route delivers released inputs. These routes 
 dispatch jobs or accept results.
 
 [Artifact quarantine](docs/artifact-quarantine.md) retains bounded, attributable
-worker outputs, including late results. Uploads remain unclassified and cannot
-declare execution success, accept findings or release reserved exposure.
+worker outputs, including late results. Chunked uploads resume after interrupted
+transfers and share the approved output budget with direct uploads. Uploads remain
+unclassified and cannot declare execution success, accept findings or release
+reserved exposure.
 
 ## The first workflow (target)
 

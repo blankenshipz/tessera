@@ -6,7 +6,13 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from .api import idempotency_key, principal, worker_principal
-from .artifacts import ArtifactStore, UploadArtifact
+from .artifacts import (
+    ArtifactStore,
+    BeginArtifactUpload,
+    EmptyUploadRequest,
+    UploadArtifact,
+    UploadChunk,
+)
 from .store import canonical_digest
 
 router = APIRouter()
@@ -31,6 +37,63 @@ def upload(lease_id: str, body: UploadArtifact, worker: Worker, key: Key, store:
     payload = body.model_dump(mode="json")
     status, response = store.upload_artifact(
         worker, lease_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/worker/leases/{lease_id}/artifact-uploads")
+def begin_upload(
+    lease_id: str, body: BeginArtifactUpload, worker: Worker, key: Key, store: StoreDependency
+):
+    payload = body.model_dump(mode="json")
+    status, response = store.begin_upload(worker, lease_id, key, canonical_digest(payload), payload)
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/worker/leases/{lease_id}/artifact-uploads/{upload_id}/chunks")
+def append_chunk(
+    lease_id: str,
+    upload_id: str,
+    body: UploadChunk,
+    worker: Worker,
+    key: Key,
+    store: StoreDependency,
+):
+    payload = body.model_dump(mode="json")
+    status, response = store.append_chunk(
+        worker, lease_id, upload_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/worker/leases/{lease_id}/artifact-uploads/{upload_id}/complete")
+def complete_upload(
+    lease_id: str,
+    upload_id: str,
+    body: EmptyUploadRequest,
+    worker: Worker,
+    key: Key,
+    store: StoreDependency,
+):
+    payload = body.model_dump(mode="json")
+    status, response = store.complete_upload(
+        worker, lease_id, upload_id, key, canonical_digest(payload)
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/worker/leases/{lease_id}/artifact-uploads/{upload_id}/status")
+def upload_status(
+    lease_id: str,
+    upload_id: str,
+    body: EmptyUploadRequest,
+    worker: Worker,
+    key: Key,
+    store: StoreDependency,
+):
+    payload = body.model_dump(mode="json")
+    status, response = store.upload_status(
+        worker, lease_id, upload_id, key, canonical_digest(payload)
     )
     return JSONResponse(status_code=status, content=response)
 

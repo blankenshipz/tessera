@@ -12,6 +12,7 @@ from tessera_control.workspace import capture_workspace, inventory_digest
 
 AUTHORITY_TABLES = (
     "artifacts",
+    "artifact_uploads",
     "execution_observations",
     "execution_leases",
     "execution_grants",
@@ -45,10 +46,10 @@ def test_schema5_requires_migration_and_preserves_snapshot_bytes(tmp_path):
     state, actor, snapshot = old_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 7
+    assert migrate_state(state) == 8
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
     assert verified["integrity"] == "verified" and verified["digest"] == snapshot["digest"]
-    assert migrate_state(state) == 7
+    assert migrate_state(state) == 8
 
 
 def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
@@ -75,4 +76,33 @@ def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
             ).fetchone()[0]
             == b"Retain exact bytes"
         )
-    assert migrate_state(state) == 7
+    assert migrate_state(state) == 8
+
+
+def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    initialize_state(state)
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DROP TABLE artifact_uploads")
+        connection.execute("UPDATE schema_meta SET schema_version=7")
+
+    def fail(connection):
+        from tessera_control.artifacts import create_artifact_upload_schema
+
+        create_artifact_upload_schema(connection)
+        raise RuntimeError("injected upload migration fault")
+
+    with monkeypatch.context() as patch:
+        patch.setitem(MIGRATIONS, 7, fail)
+        with pytest.raises(RuntimeError, match="injected upload"):
+            migrate_state(state)
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 7
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_uploads'"
+            ).fetchone()
+            is None
+        )
+    assert migrate_state(state) == 8
+    assert migrate_state(state) == 8

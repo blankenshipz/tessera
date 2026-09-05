@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 LOCAL_ORG_ID = "org_local"
 
 
@@ -231,6 +231,14 @@ def migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 7 WHERE singleton = 1")
 
 
+def migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """Add resumable artifact staging without rewriting completed v7 artifacts."""
+    from .artifacts import create_artifact_upload_schema
+
+    create_artifact_upload_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 8 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -238,6 +246,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: migrate_v4_to_v5,
     5: migrate_v5_to_v6,
     6: migrate_v6_to_v7,
+    7: migrate_v7_to_v8,
 }
 
 

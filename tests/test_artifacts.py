@@ -58,7 +58,7 @@ def test_metadata_operations_never_read_quarantined_blob(tmp_path, monkeypatch):
     assert len(listed) == 1 and "content" not in listed[0]
 
 
-def _two_path_delivery(tmp_path: Path):
+def _two_path_delivery(tmp_path: Path, max_output_bytes: int = 1024):
     state, execution, owner, worker, project, task = _setup(tmp_path)
     with _connect(execution.database_path) as connection:
         snapshot_id = connection.execute("SELECT snapshot_id FROM snapshot_releases").fetchone()[0]
@@ -69,7 +69,7 @@ def _two_path_delivery(tmp_path: Path):
         "output_paths": ["first.txt", "second.txt"],
         "profile": "local-cpu",
         "network_enabled": False,
-        "max_output_bytes": 1024,
+        "max_output_bytes": max_output_bytes,
     }
     # Use the original input snapshot digest from the execution task revision.
     with _connect(execution.database_path) as connection:
@@ -273,4 +273,236 @@ def test_api_audiences_are_isolated(tmp_path: Path) -> None:
             headers={"Authorization": "Bearer worker-token"},
         ).status_code
         == 401
+    )
+
+
+def _begin_payload(lease: dict[str, object], content: bytes, path: str = "result.txt"):
+    return {
+        "expected_epoch": lease["epoch"],
+        "operation_id": hashlib.sha256(f"tessera-cpu-v1:{lease['id']}".encode()).hexdigest()[:32],
+        "relative_path": path,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size": len(content),
+    }
+
+
+def test_resumable_api_refreshes_status_and_clears_staged_bytes(tmp_path: Path) -> None:
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    app = TestClient(create_app(state))
+    headers = {"Authorization": "Bearer worker-token", "Idempotency-Key": "begin"}
+    content = b"resumable-result"
+    begin = _begin_payload(lease, content)
+    response = app.post(
+        f"/worker/leases/{lease['id']}/artifact-uploads", headers=headers, json=begin
+    )
+    assert response.status_code == 201
+    upload = response.json()
+    upload_id = upload["id"]
+    chunk = {"offset": 0, "content_base64": base64.b64encode(content[:4]).decode()}
+    response = app.post(
+        f"/worker/leases/{lease['id']}/artifact-uploads/{upload_id}/chunks",
+        headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "chunk"},
+        json=chunk,
+    )
+    assert response.status_code == 200 and response.json()["received_bytes"] == 4
+    status_headers = {"Authorization": "Bearer worker-token", "Idempotency-Key": "status"}
+    assert (
+        app.post(
+            f"/worker/leases/{lease['id']}/artifact-uploads/{upload_id}/status",
+            headers=status_headers,
+            json={},
+        ).json()["received_bytes"]
+        == 4
+    )
+    # A replay with the same status key re-reads current metadata rather than stale cache.
+    remainder = {"offset": 4, "content_base64": base64.b64encode(content[4:]).decode()}
+    assert (
+        app.post(
+            f"/worker/leases/{lease['id']}/artifact-uploads/{upload_id}/chunks",
+            headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "remainder"},
+            json=remainder,
+        ).status_code
+        == 200
+    )
+    assert app.post(
+        f"/worker/leases/{lease['id']}/artifact-uploads/{upload_id}/status",
+        headers=status_headers,
+        json={},
+    ).json()["received_bytes"] == len(content)
+    assert (
+        app.post(
+            f"/worker/leases/{lease['id']}/artifact-uploads/{upload_id}/complete",
+            headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "complete"},
+            json={},
+        ).json()["status"]
+        == "quarantined"
+    )
+    with _connect(state / "tessera.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT status, received_bytes, staged_content FROM artifact_uploads WHERE id=?",
+            (upload_id,),
+        ).fetchone()
+        assert tuple(row) == ("completed", len(content), None)
+        cached = connection.execute(
+            "SELECT response_json FROM idempotency WHERE idempotency_key='chunk'"
+        ).fetchone()[0]
+        assert "content_base64" not in cached and content.decode() not in cached
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_type='worker.artifact_quarantined'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_resumable_api_accepts_more_than_one_megabyte_in_bounded_chunks(tmp_path: Path) -> None:
+    state, worker, lease = _two_path_delivery(tmp_path, max_output_bytes=2 * 1024 * 1024)
+    app = TestClient(create_app(state))
+    content = b"x" * (1024 * 1024 + 1)
+    begin = _begin_payload(lease, content, "first.txt")
+    response = app.post(
+        f"/worker/leases/{lease['id']}/artifact-uploads",
+        headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "large-begin"},
+        json=begin,
+    )
+    assert response.status_code == 201
+    upload_id = response.json()["id"]
+    for offset in range(0, len(content), 256 * 1024):
+        piece = content[offset : offset + 256 * 1024]
+        response = app.post(
+            f"/worker/leases/{lease['id']}/artifact-uploads/{upload_id}/chunks",
+            headers={"Authorization": "Bearer worker-token", "Idempotency-Key": f"large-{offset}"},
+            json={"offset": offset, "content_base64": base64.b64encode(piece).decode()},
+        )
+        assert response.status_code == 200
+    complete = app.post(
+        f"/worker/leases/{lease['id']}/artifact-uploads/{upload_id}/complete",
+        headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "large-complete"},
+        json={},
+    )
+    assert complete.status_code == 201 and complete.json()["size"] == len(content)
+    assert worker["id"] == complete.json()["worker_principal_id"]
+
+
+def test_pending_upload_reservation_blocks_direct_upload_and_bad_complete_keeps_quarantine_empty(
+    tmp_path: Path,
+) -> None:
+    state, worker, lease = _two_path_delivery(tmp_path)
+    store = ArtifactStore(state)
+    pending = b"a" * 600
+    begin = _begin_payload(lease, pending, "first.txt")
+    begin["sha256"] = "0" * 64
+    _, upload = store.begin_upload(worker, lease["id"], "reserve", canonical_digest(begin), begin)
+    direct = _payload(lease, b"b" * 500)
+    direct["relative_path"] = "second.txt"
+    with pytest.raises(Conflict, match="budget"):
+        store.upload_artifact(worker, lease["id"], "direct", canonical_digest(direct), direct)
+
+    chunk = {"offset": 0, "content_base64": base64.b64encode(pending).decode()}
+    store.append_chunk(
+        worker, lease["id"], upload["id"], "pending-bytes", canonical_digest(chunk), chunk
+    )
+    with pytest.raises(Conflict, match="size or checksum"):
+        store.complete_upload(
+            worker, lease["id"], upload["id"], "bad-complete", canonical_digest({})
+        )
+    with _connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
+        assert tuple(
+            connection.execute(
+                "SELECT status, received_bytes FROM artifact_uploads WHERE id=?", (upload["id"],)
+            ).fetchone()
+        ) == ("uploading", len(pending))
+
+
+def test_upload_reservations_allow_exact_limit_in_either_order(tmp_path: Path) -> None:
+    state, worker, lease = _two_path_delivery(tmp_path)
+    store = ArtifactStore(state)
+    staged = _begin_payload(lease, b"a" * 600, "first.txt")
+    store.begin_upload(worker, lease["id"], "staged-first", canonical_digest(staged), staged)
+    direct = _payload(lease, b"b" * 424)
+    direct["relative_path"] = "second.txt"
+    assert (
+        store.upload_artifact(
+            worker, lease["id"], "direct-second", canonical_digest(direct), direct
+        )[0]
+        == 201
+    )
+
+    reverse = tmp_path / "reverse"
+    reverse.mkdir()
+    state, worker, lease = _two_path_delivery(reverse)
+    store = ArtifactStore(state)
+    direct = _payload(lease, b"b" * 600)
+    direct["relative_path"] = "second.txt"
+    assert (
+        store.upload_artifact(
+            worker, lease["id"], "direct-first", canonical_digest(direct), direct
+        )[0]
+        == 201
+    )
+    staged = _begin_payload(lease, b"a" * 424, "first.txt")
+    assert (
+        store.begin_upload(worker, lease["id"], "staged-second", canonical_digest(staged), staged)[
+            0
+        ]
+        == 201
+    )
+
+
+def test_resumable_commands_fence_foreign_worker_and_revoked_replays(tmp_path: Path) -> None:
+    state, _, owner, worker, grant, lease = _delivery(tmp_path)
+    store = ArtifactStore(state)
+    content = b"test"
+    begin = _begin_payload(lease, content)
+    _, upload = store.begin_upload(worker, lease["id"], "begin", canonical_digest(begin), begin)
+    other = _worker(state, owner, grant["project_id"], "other-upload-worker")
+    chunk = {"offset": 0, "content_base64": base64.b64encode(content).decode()}
+    with pytest.raises(NotFound):
+        store.append_chunk(
+            other, lease["id"], upload["id"], "foreign", canonical_digest(chunk), chunk
+        )
+    with pytest.raises(NotFound):
+        store.upload_status(
+            other, lease["id"], upload["id"], "foreign-status", canonical_digest({})
+        )
+    with _connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE credentials SET revoked_at='2026-01-01T00:00:00Z' WHERE principal_id=?",
+            (worker["id"],),
+        )
+    with pytest.raises(Forbidden):
+        store.begin_upload(worker, lease["id"], "begin", canonical_digest(begin), begin)
+    with pytest.raises(Forbidden):
+        store.upload_status(worker, lease["id"], upload["id"], "status", canonical_digest({}))
+
+
+def test_resumable_metadata_commands_do_not_read_staged_bytes(tmp_path: Path, monkeypatch) -> None:
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    store = ArtifactStore(state)
+    content = b"metadata"
+    begin = _begin_payload(lease, content)
+    _, upload = store.begin_upload(worker, lease["id"], "begin", canonical_digest(begin), begin)
+
+    def metadata_connection(path):
+        connection = _connect(path)
+        connection.set_authorizer(
+            lambda action, table, column, *_: (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_READ
+                and table == "artifact_uploads"
+                and column == "staged_content"
+                else sqlite3.SQLITE_OK
+            )
+        )
+        return connection
+
+    monkeypatch.setattr("tessera_control.store._connect", metadata_connection)
+    monkeypatch.setattr("tessera_control.artifacts._connect", metadata_connection)
+    assert (
+        store.begin_upload(worker, lease["id"], "new-key", canonical_digest(begin), begin)[0] == 200
+    )
+    assert (
+        store.upload_status(worker, lease["id"], upload["id"], "status", canonical_digest({}))[0]
+        == 200
     )
