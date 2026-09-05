@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Verified evidence
 
-- 342 Python tests pass natively and in isolated Linux CI.
+- 344 Python tests pass natively; Linux CI passes through the evidence UI checkpoint.
 - Ruff lint and format checks pass.
 - Fifty-six desktop connection/IPC and renderer tests pass using Node 22.12.
 - Explicit migrations through schema v11 preserve historical records, input bytes,
@@ -127,6 +127,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `b1c4adc`: native complete study JSON export.
 - `f90eda8`: desktop study creation and variant registration.
 - `878a01a`: recorded outcomes and accounted study closure.
+- `ddae748`: evidence review, explicit acceptance and source correction.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -145,7 +146,7 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed through `878a01a`. No force push or authentication reconfiguration was used.
+CI passed through `ddae748`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
 A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's

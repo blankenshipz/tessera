@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -52,10 +53,18 @@ def main() -> int:
         print(migrate_state(arguments.state_dir))
         return 0
     if arguments.command == "backup":
-        print(backup_state(arguments.state_dir, arguments.output)["backup_id"])
+        try:
+            print(backup_state(arguments.state_dir, arguments.output)["backup_id"])
+        except (StoreError, sqlite3.Error, OSError) as error:
+            print(f"backup failed: {error}", file=sys.stderr)
+            return 1
         return 0
     if arguments.command == "restore":
-        database_path, header_path = restore_state(arguments.backup, arguments.state_dir)
+        try:
+            database_path, header_path = restore_state(arguments.backup, arguments.state_dir)
+        except (StoreError, sqlite3.Error, OSError) as error:
+            print(f"restore failed: {error}", file=sys.stderr)
+            return 1
         print(database_path)
         print(header_path)
         return 0
