@@ -82,6 +82,7 @@ const handlers = {
   correctSource: (id, body, key) => connection.correctSource(id, body, key),
   createFinding: (id, body, key) => connection.createFinding(id, body, key),
   acceptFinding: (id, body, key) => connection.acceptFinding(id, body, key),
+  reaffirmFinding: (id, body, key) => connection.reaffirmFinding(id, body, key),
   studySelection: (studyId, selection, projectId) => {
     if (!Number.isSafeInteger(selection) || selection < 0) throw new Error('Invalid study selection.');
     selectedStudy = studyId === null ? null : { id: connection.status()?.id, studyId, selection, projectId };

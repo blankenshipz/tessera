@@ -649,3 +649,46 @@ test('source corrections bind the displayed revision and cannot cross a pending 
   assert.equal(calls, 0); assert.equal(ui.get('correction-dialog').open, false);
   assert.equal(ui.get('correction-original').children.length, 0);
 });
+
+test('reaffirmation requires an explicit reason, retains retry key and displayed revision', async () => {
+  const data = evidenceLedger(); data.findings = [{ ...evidenceFinding, status: 'needs_review' }];
+  const calls = []; let generated = 0;
+  const ui = fixture({ study: async () => data, commandId: async () => `review-${++generated}`,
+    reaffirmFinding: async (_connection, id, body, key) => {
+      calls.push({ id, body, key }); if (calls.length === 1) throw new Error('Unknown response'); return {};
+    } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.reaffirmFindingId).listeners.click(); await flush();
+  assert.equal(ui.get('finding-reaffirmation').hidden, false);
+  assert.equal(ui.get('finding-reaffirmation-reason').required, true);
+  assert.equal(calls.length, 0);
+  ui.submit('finding-accept-form'); await flush(); assert.equal(calls.length, 0);
+  assert.match(ui.get('notice').textContent, /requires a reason/);
+  ui.get('finding-accept-form').fields = { reason: '  Reviewed unchanged evidence  ' };
+  ui.submit('finding-accept-form'); await flush(); ui.submit('finding-accept-form'); await flush();
+  assert.equal(JSON.stringify(calls), JSON.stringify([1, 2].map(() => ({ id: 'finding1',
+    body: { expected_revision: 4, reason: 'Reviewed unchanged evidence' }, key: 'review-1' }))));
+});
+
+test('reaffirmation rejects superseded citations and held or stale authority', async () => {
+  const data = evidenceLedger(); data.findings = [{ ...evidenceFinding, status: 'needs_review' }];
+  data.sources[0].superseded_at = '2026-01-01';
+  data.sources.push(evidenceSource({ id: 'replacement' }));
+  const key = deferred(); let calls = 0;
+  const ui = fixture({ study: async () => data, commandId: async () => key.promise,
+    reaffirmFinding: async () => { calls++; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  assert.equal(find(ui.get('study-detail'), node => node.dataset?.reaffirmFindingId).disabled, true);
+  data.sources[0].superseded_at = null; await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.reaffirmFindingId).listeners.click(); await flush();
+  ui.get('finding-accept-form').fields = { reason: 'Reviewed' };
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  ui.submit('finding-accept-form'); await flush(); assert.equal(calls, 0);
+  ui.applyRecoveryStatus({ state: 'active', recovery_hold: false });
+  await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.reaffirmFindingId).listeners.click(); await flush();
+  ui.get('finding-accept-form').fields = { reason: 'Reviewed' };
+  ui.submit('finding-accept-form'); await flush();
+  await ui.selectProject(project('p2')); key.resolve('stale-key'); await flush();
+  assert.equal(calls, 0);
+});

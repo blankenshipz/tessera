@@ -162,6 +162,7 @@ export class ControlConnection {
   correctSource(sourceId, body, key) { return this.#request(`/sources/${resourceId(sourceId)}/correct`, body, key); }
   createFinding(studyId, body, key) { return this.#request(`/studies/${resourceId(studyId)}/findings`, body, key); }
   acceptFinding(findingId, body, key) { return this.#request(`/findings/${resourceId(findingId)}/accept`, body, key); }
+  reaffirmFinding(findingId, body, key) { return this.#request(`/findings/${resourceId(findingId)}/reaffirm`, body, key); }
   revisions(taskId, page) { return this.#request(`/tasks/${resourceId(taskId)}/revisions?${pageQuery(page)}`); }
   labbook(projectId, after = 0) {
     if (!Number.isSafeInteger(after) || after < 0) throw new ConnectionError('Invalid event cursor.');

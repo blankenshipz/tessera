@@ -97,6 +97,12 @@ representative investigation have not passed end-to-end acceptance.
     restored 80-variant ledger with writes disabled. This does not fence the original
     control service or reconcile its providers; see [recovery](recovery.md).
 
+13. **Finding reaffirmation:** humans can explicitly reaffirm unchanged findings
+    after their existing citations regain support. Reasons and review actors enter
+    the durable ledger; superseded citations block reaffirmation. API, desktop,
+    export, and held-restore fixtures cover the transition. Finding revision,
+    narrowing, supersession, and retraction remain pending.
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -163,7 +169,7 @@ representative research question/dataset remain open configuration inputs.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, finding revision/reaffirmation, broader reproduction exports, telemetry and
+4. Desktop adoption, skills, finding revision/supersession/retraction, broader reproduction exports, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
 5. Operational restore fencing/resumption, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.

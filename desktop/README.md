@@ -37,7 +37,10 @@ finding proposals from explicitly selected source/variant records, and source
 corrections. Acceptance shows the exact cited passages and requires an explicit
 human action; unsupported or superseded citations block it. Confirmatory studies
 must be closed and accounted for. Corrections preserve source versions and mark
-dependent findings for review. The UI records judgment; it does not automatically
+dependent findings for review. A finding needing review can be explicitly
+reaffirmed with a reason after its existing citations are supported again.
+Reaffirmation preserves the statement, references, and original acceptance
+attribution; superseded citations still block it. The UI records judgment; it does not automatically
 verify scientific claims or fetch cited URLs.
 
 The panel lists a project's studies and renders

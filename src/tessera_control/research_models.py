@@ -121,6 +121,11 @@ class AcceptFinding(StrictResearchRequest):
     expected_revision: Revision
 
 
+class ReaffirmFinding(StrictResearchRequest):
+    expected_revision: Revision
+    reason: NonBlank4000
+
+
 class CorrectSource(StrictResearchRequest):
     expected_revision: Revision
     uri: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]

@@ -140,6 +140,21 @@ async function main() {
       if (!document.querySelector('#finding-review').textContent.includes('Synthetic evidence about retained')) throw new Error('Review omits cited passage.');
       document.querySelector('#finding-accept-form').requestSubmit();
       await waitFor(() => document.querySelector('[data-finding-id] .tag')?.textContent.startsWith('accepted'));
+      document.querySelector('[data-assessment-source-id]').click();
+      assessmentForm.elements.verdict.value = 'unsupported';
+      assessmentForm.elements.reason.value = 'Synthetic review reopened.';
+      assessmentForm.requestSubmit();
+      await waitFor(() => document.querySelector('[data-reaffirm-finding-id]'));
+      if (!document.querySelector('[data-reaffirm-finding-id]').disabled) throw new Error('Unsupported evidence permits reaffirmation.');
+      document.querySelector('[data-assessment-source-id]').click();
+      assessmentForm.elements.verdict.value = 'supported';
+      assessmentForm.elements.reason.value = 'Synthetic review resolved.';
+      assessmentForm.requestSubmit();
+      await waitFor(() => document.querySelector('[data-reaffirm-finding-id]') && !document.querySelector('[data-reaffirm-finding-id]').disabled);
+      document.querySelector('[data-reaffirm-finding-id]').click();
+      document.querySelector('#finding-reaffirmation-reason').value = 'Synthetic reaffirmation of unchanged evidence.';
+      document.querySelector('#finding-accept-form').requestSubmit();
+      await waitFor(() => document.querySelector('[data-finding-id] .tag')?.textContent.startsWith('accepted'));
       document.querySelector('[data-correction-source-id]').click();
       const correctionForm = document.querySelector('#correction-form');
       correctionForm.elements.uri.value = 'urn:tessera:synthetic:authored-corrected';
@@ -149,6 +164,7 @@ async function main() {
       correctionForm.requestSubmit();
       await waitFor(() => document.querySelectorAll('#study-detail [data-source-id]').length === 2 &&
         document.querySelector('[data-finding-id] .tag')?.textContent.startsWith('needs_review'));
+      if (!document.querySelector('[data-reaffirm-finding-id]').disabled) throw new Error('Superseded citation permits reaffirmation.');
       document.querySelector('#study-close').click();
       document.querySelector('#study-close-form').requestSubmit();
       await waitFor(() => document.querySelector('#study-detail').textContent.includes('closed · revision 2'));

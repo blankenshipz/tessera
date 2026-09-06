@@ -22,6 +22,7 @@ from .research_models import (
     CreateSource,
     CreateStudy,
     ExportStudy,
+    ReaffirmFinding,
     RecordVariantStatus,
     RegisterVariant,
 )
@@ -143,12 +144,11 @@ class ResearchStore(Store):
     ) -> dict[str, Any]:
         row = connection.execute(
             """SELECT v.* FROM research_variants v JOIN research_studies s ON s.id = v.study_id
-            JOIN projects p ON p.id = s.project_id WHERE v.id = ? AND p.org_id = ?""",
-            (variant_id, actor["org_id"]),
+            JOIN projects p ON p.id = s.project_id WHERE v.id = ? AND p.org_id = ?
+            AND (? IS NULL OR s.project_id = ?)""",
+            (variant_id, actor["org_id"], actor["project_id"], actor["project_id"]),
         ).fetchone()
-        if row is None or (
-            actor["project_id"] is not None and actor["project_id"] != row["project_id"]
-        ):
+        if row is None:
             raise NotFound("Variant was not found.")
         return dict(row)
 
@@ -158,12 +158,11 @@ class ResearchStore(Store):
     ) -> dict[str, Any]:
         row = connection.execute(
             """SELECT so.* FROM research_sources so JOIN research_studies s ON s.id = so.study_id
-            JOIN projects p ON p.id = s.project_id WHERE so.id = ? AND p.org_id = ?""",
-            (source_id, actor["org_id"]),
+            JOIN projects p ON p.id = s.project_id WHERE so.id = ? AND p.org_id = ?
+            AND (? IS NULL OR s.project_id = ?)""",
+            (source_id, actor["org_id"], actor["project_id"], actor["project_id"]),
         ).fetchone()
-        if row is None or (
-            actor["project_id"] is not None and actor["project_id"] != row["project_id"]
-        ):
+        if row is None:
             raise NotFound("Source was not found.")
         return dict(row)
 
@@ -173,12 +172,11 @@ class ResearchStore(Store):
     ) -> dict[str, Any]:
         row = connection.execute(
             """SELECT f.* FROM research_findings f JOIN research_studies s ON s.id = f.study_id
-            JOIN projects p ON p.id = s.project_id WHERE f.id = ? AND p.org_id = ?""",
-            (finding_id, actor["org_id"]),
+            JOIN projects p ON p.id = s.project_id WHERE f.id = ? AND p.org_id = ?
+            AND (? IS NULL OR s.project_id = ?)""",
+            (finding_id, actor["org_id"], actor["project_id"], actor["project_id"]),
         ).fetchone()
-        if row is None or (
-            actor["project_id"] is not None and actor["project_id"] != row["project_id"]
-        ):
+        if row is None:
             raise NotFound("Finding was not found.")
         return dict(row)
 
@@ -738,6 +736,84 @@ class ResearchStore(Store):
 
         return self._mutate(
             principal, key, "POST", f"/findings/{finding_id}/accept", digest, command
+        )
+
+    def reaffirm_finding(
+        self,
+        principal: dict[str, Any],
+        finding_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | ReaffirmFinding,
+    ) -> tuple[int, dict[str, Any]]:
+        body = self._payload(ReaffirmFinding, payload)
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor, "reaffirm a finding")
+            finding = self._finding(connection, actor, finding_id)
+            study = self._study(connection, actor, finding["study_id"])
+            if finding["revision"] != body["expected_revision"]:
+                raise Conflict("Finding revision is no longer reaffirmable.")
+            if finding["status"] != "needs_review":
+                raise Conflict("Only findings needing review can be reaffirmed.")
+            sources = connection.execute(
+                """SELECT so.verdict, so.superseded_at FROM research_sources so
+                JOIN research_finding_sources fs ON fs.source_id=so.id
+                WHERE fs.finding_id=?""",
+                (finding_id,),
+            ).fetchall()
+            if not sources or any(
+                row["verdict"] != "supported" or row["superseded_at"] is not None for row in sources
+            ):
+                raise Conflict(
+                    "Reaffirmed findings require currently supported, unsuperseded cited sources."
+                )
+            unresolved = connection.execute(
+                "SELECT 1 FROM research_variants WHERE study_id=? AND status='registered' LIMIT 1",
+                (study["id"],),
+            ).fetchone()
+            if study["mode"] == "confirmatory" and (
+                study["status"] != "closed" or unresolved is not None
+            ):
+                raise Conflict(
+                    "Confirmatory reaffirmation requires a closed, reconciled study ledger."
+                )
+            prior_revision, prior_status = finding["revision"], finding["status"]
+            now, revision = utc_now(), prior_revision + 1
+            connection.execute(
+                "UPDATE research_findings SET status='accepted',revision=?,updated_at=? "
+                "WHERE id=? AND revision=? AND status='needs_review'",
+                (revision, now, finding_id, body["expected_revision"]),
+            )
+            result = self._finding_response(
+                connection,
+                {
+                    **finding,
+                    "status": "accepted",
+                    "revision": revision,
+                    "updated_at": now,
+                },
+            )
+            self._event_for(
+                connection,
+                actor,
+                study,
+                "research.finding_reaffirmed",
+                revision,
+                {
+                    "study_id": study["id"],
+                    "finding_id": finding_id,
+                    "prior_revision": prior_revision,
+                    "reason": body["reason"],
+                    "prior_status": prior_status,
+                },
+            )
+            return 200, result
+
+        return self._mutate(
+            principal, key, "POST", f"/findings/{finding_id}/reaffirm", digest, command
         )
 
     def close_study(

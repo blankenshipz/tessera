@@ -19,6 +19,7 @@ should be retried with the same key and body on the same connection.
 | `POST /sources/{id}/assess` | Human records supported/unsupported/unverified assessment |
 | `POST /studies/{id}/findings` | Propose statement linked to source and variant IDs |
 | `POST /findings/{id}/accept` | Human accepts only after evidence checks |
+| `POST /findings/{id}/reaffirm` | Human reaffirms unchanged evidence with a reason |
 | `POST /sources/{id}/correct` | Preserve old source; add replacement and flag dependent findings |
 | `POST /studies/{id}/close` | Close only when all registered variants are accounted for |
 | `GET /studies/{id}/export` | Export all in-scope variants, sources, findings, corrections and events |
@@ -65,3 +66,11 @@ Resolution supplies `decision_id`, `expected_revision`, `decision` (approve/reje
 and optional rationale. Stale task basis and expired requests cannot be resolved.
 Approval changes only the inbox record; task approval is a separate command.
 Lists accept offset (0–100,000) and limit (1–100, default 50).
+
+Reaffirmation requires `needs_review`, `expected_revision`, and a nonblank `reason`
+(up to 4,000 characters). Every existing citation must be supported and
+unsuperseded; confirmatory studies must be closed and accounted for. It preserves
+the statement, citations, variant links, and original acceptance attribution.
+The new human decision and reason are recorded in `research.finding_reaffirmed`.
+A correction that supersedes a citation cannot be resolved by reaffirmation:
+versioned finding edits, narrowing, supersession, and retraction remain pending.

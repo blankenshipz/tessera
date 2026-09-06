@@ -96,8 +96,11 @@
   </dialog>
   <dialog id="finding-accept-dialog">
     <form id="finding-accept-form">
-      <h2>Accept this finding</h2>
+      <h2 id="finding-review-title">Accept this finding</h2>
       <div id="finding-review"></div>
+      <label id="finding-reaffirmation" hidden>Reason for reaffirmation (statement and citations stay unchanged)
+        <textarea id="finding-reaffirmation-reason" name="reason" maxlength="4000"></textarea>
+      </label>
       <p class="muted">This is attributed human judgment. No automated scientific validation is performed.</p>
       <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Accept this finding</button></div>
     </form>

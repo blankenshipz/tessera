@@ -446,8 +446,10 @@ function renderStudyLedger(ledger) {
     card.append(element('p', `Source IDs: ${finding.source_ids.join(', ') || 'none'}`, 'muted'));
     card.append(element('p', `Variant IDs: ${finding.variant_ids.join(', ') || 'none'}`, 'muted'));
     if (finding.status === 'needs_review') card.append(element('p', 'Needs review. Consult the linked sources and ledger history.', 'muted'));
-    if (finding.status === 'candidate') {
-      const accept = element('button', 'Review acceptance'); accept.dataset.acceptFindingId = finding.id;
+    if (['candidate', 'needs_review'].includes(finding.status)) {
+      const reaffirm = finding.status === 'needs_review';
+      const accept = element('button', reaffirm ? 'Review reaffirmation' : 'Review acceptance');
+      accept.dataset[reaffirm ? 'reaffirmFindingId' : 'acceptFindingId'] = finding.id;
       accept.disabled = recoveryHeld || !findingIsAcceptable(ledger, finding);
       if (!findingIsAcceptable(ledger, finding)) {
         card.append(element('p', 'Acceptance needs currently supported cited sources. Confirmatory studies must also be closed and fully accounted for.', 'muted'));
@@ -455,6 +457,11 @@ function renderStudyLedger(ledger) {
       accept.addEventListener('click', () => guarded(async () => {
         if (!findingIsAcceptable(ledger, finding)) throw new Error('Review the cited sources and study accounting first.');
         openEvidenceForm('finding-accept', ledger, { finding });
+        const action = reaffirm ? 'Reaffirm this finding' : 'Accept this finding';
+        $('finding-review-title').textContent = action;
+        $('finding-accept-form').querySelector('button[type="submit"]').textContent = action;
+        $('finding-reaffirmation').hidden = !reaffirm;
+        $('finding-reaffirmation-reason').required = reaffirm;
         const review = $('finding-review'); review.replaceChildren(element('p', finding.statement));
         for (const id of finding.source_ids) {
           const source = ledger.sources.find(item => item.id === id);
@@ -632,7 +639,7 @@ $('study-close-form').addEventListener('submit', event => {
   });
 });
 function findingIsAcceptable(ledger, finding) {
-  return finding.status === 'candidate' && finding.source_ids.length > 0 &&
+  return ['candidate', 'needs_review'].includes(finding.status) && finding.source_ids.length > 0 &&
     finding.source_ids.every(id => ledger.sources.some(source => source.id === id &&
       source.verdict === 'supported' && !source.superseded_at)) &&
     (ledger.study.mode !== 'confirmatory' || (ledger.study.status === 'closed' &&
@@ -697,6 +704,11 @@ for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-ac
       } else {
         if (!findingIsAcceptable(context.ledger, context.finding)) throw new Error('Review the cited sources and study accounting first.');
         body = { expected_revision: context.finding.revision }; target = context.finding.id; method = 'acceptFinding';
+        if (context.finding.status === 'needs_review') {
+          const reason = fields.get('reason')?.trim();
+          if (!reason) throw new Error('Reaffirmation requires a reason.');
+          body.reason = reason; method = 'reaffirmFinding';
+        }
       }
       await submitResearchRecord(event.target, context, `${kind}:${target}`, body,
         (id, key) => api[method](id, target, body, key));

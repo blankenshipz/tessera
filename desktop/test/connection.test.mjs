@@ -172,17 +172,22 @@ test('source and finding routes preserve typed POST bodies and reject unsafe IDs
   const correction = { expected_revision: 2, uri: 'https://example.test/correction', quoted_passage: 'Replacement passage', content_digest: 'd'.repeat(64), reason: 'The original passage was superseded.', locator: null };
   const finding = { statement: 'The result is associated with the cited source.', source_ids: ['source_1'], variant_ids: ['variant_1'] };
   const acceptance = { expected_revision: 1 };
+  const reaffirmation = { expected_revision: 3, reason: 'Reviewed again' };
   await connection.createSource('study_1', source, 'source-command');
   await connection.assessSource('source_1', assessment, 'assessment-command');
   await connection.correctSource('source_1', correction, 'correction-command');
   await connection.createFinding('study_1', finding, 'finding-command');
   await connection.acceptFinding('finding_1', acceptance, 'acceptance-command');
+  await connection.reaffirmFinding('finding_1', reaffirmation, 'reaffirm-command');
+  assert.match(calls[6].url, /\/findings\/finding_1\/reaffirm$/);
+  assert.deepEqual(JSON.parse(calls[6].options.body), reaffirmation);
+  assert.throws(() => connection.reaffirmFinding('../finding', reaffirmation, 'key'));
   assert.match(calls[1].url, /\/studies\/study_1\/sources$/);
   assert.match(calls[2].url, /\/sources\/source_1\/assess$/);
   assert.match(calls[3].url, /\/sources\/source_1\/correct$/);
   assert.match(calls[4].url, /\/studies\/study_1\/findings$/);
   assert.match(calls[5].url, /\/findings\/finding_1\/accept$/);
-  for (const [index, key] of [[1, 'source-command'], [2, 'assessment-command'], [3, 'correction-command'], [4, 'finding-command'], [5, 'acceptance-command']]) {
+  for (const [index, key] of [[1, 'source-command'], [2, 'assessment-command'], [3, 'correction-command'], [4, 'finding-command'], [5, 'acceptance-command'], [6, 'reaffirm-command']]) {
     assert.equal(calls[index].options.method, 'POST');
     assert.equal(calls[index].options.headers['Idempotency-Key'], key);
   }

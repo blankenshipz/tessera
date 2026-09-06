@@ -15,6 +15,7 @@ from .research_models import (
     CreateFinding,
     CreateSource,
     CreateStudy,
+    ReaffirmFinding,
     RecordVariantStatus,
     RegisterVariant,
 )
@@ -102,6 +103,17 @@ def accept_finding(
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
     status, response = store.accept_finding(
+        actor, finding_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/findings/{finding_id}/reaffirm")
+def reaffirm_finding(
+    finding_id: str, body: ReaffirmFinding, actor: Actor, key: Key, store: Ledger
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    status, response = store.reaffirm_finding(
         actor, finding_id, key, canonical_digest(payload), payload
     )
     return JSONResponse(status_code=status, content=response)
