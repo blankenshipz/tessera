@@ -114,6 +114,19 @@
       <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Retract this finding</button></div>
     </form>
   </dialog>
+  <dialog id="finding-revise-dialog">
+    <form id="finding-revise-form">
+      <h2>Review revision</h2>
+      <div id="finding-revise-original"></div>
+      <p class="muted">The original stays in history as superseded. The replacement is a candidate requiring separate acceptance.</p>
+      <label>Revision kind<select name="kind"><option value="narrow">Narrow this finding</option><option value="supersede">Supersede this finding</option></select></label>
+      <label>New statement<textarea name="statement" required maxlength="4000" rows="5"></textarea></label>
+      <label>Reason for revision<textarea name="reason" required maxlength="4000" rows="4"></textarea></label>
+      <fieldset><legend>Sources for the revised finding</legend><div id="finding-revise-sources"></div></fieldset>
+      <fieldset><legend>Variants for the revised finding</legend><div id="finding-revise-variants"></div></fieldset>
+      <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Revise this finding</button></div>
+    </form>
+  </dialog>
   <script type="module" src="renderer.mjs"></script>
 </body>
 </html>

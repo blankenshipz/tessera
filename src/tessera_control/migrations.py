@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 13
 LOCAL_ORG_ID = "org_local"
 
 
@@ -263,8 +263,8 @@ def migrate_v10_to_v11(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 11 WHERE singleton = 1")
 
 
-def migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
-    """Extend finding status without losing citations or disabling foreign keys."""
+def _rebuild_findings(connection: sqlite3.Connection) -> None:
+    """Preserve existing finding columns while installing the current schema."""
     from .research import create_research_schema
 
     tables = ("research_findings", "research_finding_sources", "research_finding_variants")
@@ -276,11 +276,28 @@ def migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
         connection.execute(f"DROP TABLE {table}")
     create_research_schema(connection)
     for table in tables:
-        connection.execute(f"INSERT INTO {table} SELECT * FROM migration_12_{table}")
+        columns = ",".join(
+            '"' + row[1].replace('"', '""') + '"'
+            for row in connection.execute(f"PRAGMA table_info(migration_12_{table})")
+        )
+        connection.execute(
+            f"INSERT INTO {table} ({columns}) SELECT {columns} FROM migration_12_{table}"
+        )
         connection.execute(f"DROP TABLE migration_12_{table}")
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise ValueError("Finding migration would leave invalid references.")
+
+
+def migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
+    """Extend finding status without losing citations or disabling foreign keys."""
+    _rebuild_findings(connection)
     connection.execute("UPDATE schema_meta SET schema_version = 12 WHERE singleton = 1")
+
+
+def migrate_v12_to_v13(connection: sqlite3.Connection) -> None:
+    """Add durable finding replacement links and superseded terminal status."""
+    _rebuild_findings(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 13 WHERE singleton = 1")
 
 
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
@@ -295,6 +312,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     9: migrate_v9_to_v10,
     10: migrate_v10_to_v11,
     11: migrate_v11_to_v12,
+    12: migrate_v12_to_v13,
 }
 
 

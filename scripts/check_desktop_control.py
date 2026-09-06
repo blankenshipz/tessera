@@ -182,8 +182,18 @@ def main() -> None:
             assert json.loads((root / "authored-study.json").read_text()) == authored_snapshot
             registered = authored_snapshot["variants"][0]
             assert len(authored_snapshot["sources"]) == 2
-            assert len(authored_snapshot["findings"]) == 1
-            assert authored_snapshot["findings"][0]["status"] == "retracted"
+            assert len(authored_snapshot["findings"]) == 2
+            assert authored_snapshot["findings"][0]["status"] == "superseded"
+            replacement_finding = authored_snapshot["findings"][1]
+            assert replacement_finding["status"] == "retracted"
+            assert (
+                replacement_finding["supersedes_finding_id"]
+                == authored_snapshot["findings"][0]["id"]
+            )
+            assert replacement_finding["source_ids"] == [authored_snapshot["sources"][1]["id"]]
+            assert replacement_finding["revision_reason"] == (
+                "Synthetic revision preserves the original claim."
+            )
             assert authored_snapshot["findings"][0]["accepted_by_principal_id"] == owner["id"]
             assert len(authored_snapshot["corrections"]) == 1
             reaffirmations = [
@@ -202,9 +212,18 @@ def main() -> None:
                 for event in authored_snapshot["events"]
                 if event["event_type"] == "research.finding_retracted"
             ]
+            revisions = [
+                event
+                for event in authored_snapshot["events"]
+                if event["event_type"] == "research.finding_revised"
+            ]
+            assert len(revisions) == 1
+            assert revisions[0]["actor_principal_id"] == owner["id"]
+            assert revisions[0]["payload"]["prior_revision"] == 5
+            assert revisions[0]["payload"]["replacement_finding_id"] == replacement_finding["id"]
             assert len(retractions) == 1
             assert retractions[0]["actor_principal_id"] == owner["id"]
-            assert retractions[0]["payload"]["prior_revision"] == 5
+            assert retractions[0]["payload"]["prior_revision"] == 2
             assert retractions[0]["payload"]["reason"] == (
                 "Synthetic retraction after corrected evidence."
             )
@@ -265,6 +284,7 @@ def main() -> None:
                         "evidence_review_and_correction": True,
                         "finding_reaffirmation": True,
                         "finding_retraction": True,
+                        "finding_revision": True,
                         "held_restore_pass": True,
                         "research_variants_displayed": 80,
                         "research_history_unchanged": True,

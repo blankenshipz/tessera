@@ -45,7 +45,7 @@ function applyRecoveryStatus(status) {
   $('recovery-banner').textContent = recoveryHeld ?
     'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
   for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close', 'source-new', 'finding-new']) $(id).disabled = recoveryHeld;
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
   $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
 }
 function element(tag, text, className) {
@@ -56,10 +56,10 @@ function element(tag, text, className) {
 }
 function resetAuthoringForms() {
   outcomeContext = closeContext = null; evidenceContexts.clear();
-  for (const id of ['assessment-source', 'correction-original', 'finding-review', 'finding-sources', 'finding-variants', 'finding-retract-review']) {
+  for (const id of ['assessment-source', 'correction-original', 'finding-review', 'finding-sources', 'finding-variants', 'finding-retract-review', 'finding-revise-original', 'finding-revise-sources', 'finding-revise-variants']) {
     $(id).replaceChildren();
   }
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form']) {
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) {
     const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
     form.querySelector('button[type="submit"]').disabled = recoveryHeld;
   }
@@ -445,6 +445,9 @@ function renderStudyLedger(ledger) {
     card.append(element('p', finding.statement));
     card.append(element('p', `Source IDs: ${finding.source_ids.join(', ') || 'none'}`, 'muted'));
     card.append(element('p', `Variant IDs: ${finding.variant_ids.join(', ') || 'none'}`, 'muted'));
+    if (finding.supersedes_finding_id) card.append(element('p', `Supersedes finding: ${finding.supersedes_finding_id}`, 'muted'));
+    if (finding.revision_kind) card.append(element('p', `Revision kind: ${finding.revision_kind}`, 'muted'));
+    if (finding.revision_reason) card.append(element('p', `Revision reason: ${finding.revision_reason}`, 'muted'));
     if (finding.status === 'needs_review') card.append(element('p', 'Needs review. Consult the linked sources and ledger history.', 'muted'));
     if (['candidate', 'needs_review'].includes(finding.status)) {
       const reaffirm = finding.status === 'needs_review';
@@ -483,6 +486,30 @@ function renderStudyLedger(ledger) {
           element('p', `Source IDs: ${finding.source_ids.join(', ') || 'none'}`, 'muted'));
       }));
       card.append(retract);
+    }
+    if (['candidate', 'accepted', 'needs_review'].includes(finding.status)) {
+      const revise = element('button', 'Review revision');
+      revise.dataset.reviseFindingId = finding.id;
+      revise.disabled = recoveryHeld;
+      revise.addEventListener('click', () => guarded(async () => {
+        const context = openEvidenceForm('finding-revise', ledger, { finding });
+        $('finding-revise-original').replaceChildren(
+          element('p', finding.statement),
+          element('p', `Source IDs: ${finding.source_ids.join(', ') || 'none'}`, 'muted'),
+          element('p', `Variant IDs: ${finding.variant_ids.join(', ') || 'none'}`, 'muted'));
+        for (const section of ['sources', 'variants']) {
+          const container = $('finding-revise-' + section); container.replaceChildren();
+          context['revision' + section[0].toUpperCase() + section.slice(1)] = ledger[section].map(record => {
+            const label = element('label'); const input = element('input'); input.type = 'checkbox';
+            input.dataset[section === 'sources' ? 'revisedSourceChoiceId' : 'revisedVariantChoiceId'] = record.id;
+            label.append(input, element('span', section === 'sources' ?
+              `${record.id} · ${record.verdict} · ${record.uri}\n${record.quoted_passage}` :
+              `${record.id} · ${record.status} · ${record.name}`));
+            container.append(label); return { input, record };
+          });
+        }
+      }));
+      card.append(revise);
     }
     return card;
   });
@@ -686,7 +713,7 @@ function sourceFields(form) {
   return { uri: fields.get('uri'), quoted_passage: fields.get('quoted_passage'),
     content_digest: fields.get('content_digest'), locator: fields.get('locator')?.trim() || null };
 }
-for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-accept', 'finding-retract']) {
+for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-accept', 'finding-retract', 'finding-revise']) {
   $(kind + '-form').addEventListener('submit', event => {
     event.preventDefault();
     guarded(async () => {
@@ -721,11 +748,26 @@ for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-ac
           if (!reason) throw new Error('Reaffirmation requires a reason.');
           body.reason = reason; method = 'reaffirmFinding';
         }
-      } else {
+      } else if (kind === 'finding-retract') {
         const reason = fields.get('reason')?.trim();
         if (!reason) throw new Error('Retraction requires a reason.');
         body = { expected_revision: context.finding.revision, reason };
         target = context.finding.id; method = 'retractFinding';
+      } else {
+        const kindValue = fields.get('kind');
+        const statement = fields.get('statement')?.trim();
+        const reason = fields.get('reason')?.trim();
+        if (!['narrow', 'supersede'].includes(kindValue)) throw new Error('Choose a revision kind.');
+        if (!statement) throw new Error('A revised finding requires a statement.');
+        if (!reason) throw new Error('Revision requires a reason.');
+        const sourceIds = context.revisionSources.filter(choice => choice.input.checked).map(choice => choice.record.id);
+        const variantIds = context.revisionVariants.filter(choice => choice.input.checked).map(choice => choice.record.id);
+        if (![sourceIds, variantIds].every(ids => ids.length >= 1 && ids.length <= 200)) {
+          throw new Error('Select between 1 and 200 sources and variants for the revised finding.');
+        }
+        body = { expected_revision: context.finding.revision, kind: kindValue, reason, statement,
+          source_ids: sourceIds, variant_ids: variantIds };
+        target = context.finding.id; method = 'reviseFinding';
       }
       await submitResearchRecord(event.target, context, `${kind}:${target}`, body,
         (id, key) => api[method](id, target, body, key));

@@ -738,3 +738,50 @@ test('retraction is blocked by held or stale authority and retracted findings ha
   assert.equal(find(ui.get('study-detail'), node => node.dataset?.acceptFindingId), null);
   assert.equal(find(ui.get('study-detail'), node => node.dataset?.reaffirmFindingId), null);
 });
+
+test('finding revision sends explicit selected records, permits closed studies, and retains retry key', async () => {
+  const data = evidenceLedger(); data.study.status = 'closed';
+  const calls = []; let generated = 0;
+  const ui = fixture({ study: async () => data, commandId: async () => `revise-${++generated}`,
+    reviseFinding: async (_connection, id, body, key) => {
+      calls.push({ id, body, key }); if (calls.length === 1) throw new Error('Unknown response'); return {};
+    } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  const button = find(ui.get('study-detail'), node => node.dataset?.reviseFindingId);
+  assert.equal(button.textContent, 'Review revision'); button.listeners.click(); await flush();
+  assert.ok(find(ui.get('finding-revise-original'), node => node.textContent === evidenceFinding.statement));
+  assert.equal(!!find(ui.get('finding-revise-sources'), node => node.dataset?.revisedSourceChoiceId).checked, false);
+  assert.equal(!!find(ui.get('finding-revise-variants'), node => node.dataset?.revisedVariantChoiceId).checked, false);
+  ui.get('finding-revise-form').fields = { kind: 'narrow', statement: '  Narrowed result  ', reason: '  Scope clarified  ' };
+  ui.submit('finding-revise-form'); await flush(); assert.equal(calls.length, 0);
+  assert.match(ui.get('notice').textContent, /between 1 and 200/);
+  find(ui.get('finding-revise-sources'), node => node.dataset?.revisedSourceChoiceId).checked = true;
+  find(ui.get('finding-revise-variants'), node => node.dataset?.revisedVariantChoiceId).checked = true;
+  ui.submit('finding-revise-form'); await flush(); ui.submit('finding-revise-form'); await flush();
+  assert.equal(JSON.stringify(calls), JSON.stringify([1, 2].map(() => ({ id: 'finding1',
+    body: { expected_revision: 4, kind: 'narrow', reason: 'Scope clarified', statement: 'Narrowed result', source_ids: ['source1'], variant_ids: ['v1'] }, key: 'revise-1' }))));
+});
+
+test('finding revision is blocked by held or stale authority and superseded findings have no actions', async () => {
+  const data = evidenceLedger(); const key = deferred(); let calls = 0;
+  const ui = fixture({ study: async () => data, commandId: async () => key.promise,
+    reviseFinding: async () => { calls++; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.reviseFindingId).listeners.click(); await flush();
+  ui.get('finding-revise-form').fields = { kind: 'supersede', statement: 'Replacement', reason: 'Updated' };
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  ui.submit('finding-revise-form'); await flush(); assert.equal(calls, 0);
+  ui.applyRecoveryStatus({ state: 'active', recovery_hold: false }); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.reviseFindingId).listeners.click(); await flush();
+  find(ui.get('finding-revise-sources'), node => node.dataset?.revisedSourceChoiceId).checked = true;
+  find(ui.get('finding-revise-variants'), node => node.dataset?.revisedVariantChoiceId).checked = true;
+  ui.get('finding-revise-form').fields = { kind: 'supersede', statement: 'Replacement', reason: 'Updated' };
+  ui.submit('finding-revise-form'); await flush(); await ui.selectProject(project('p2')); key.resolve('stale-revise-key'); await flush();
+  assert.equal(calls, 0);
+  data.findings = [{ ...evidenceFinding, status: 'superseded', supersedes_finding_id: 'older', revision_kind: 'supersede', revision_reason: 'Updated' }];
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  assert.ok(find(ui.get('study-detail'), node => node.textContent === 'Supersedes finding: older'));
+  assert.ok(find(ui.get('study-detail'), node => node.textContent === 'Revision kind: supersede'));
+  assert.ok(find(ui.get('study-detail'), node => node.textContent === 'Revision reason: Updated'));
+  assert.equal(find(ui.get('study-detail'), node => node.dataset?.reviseFindingId), null);
+});

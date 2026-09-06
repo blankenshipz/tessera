@@ -100,13 +100,18 @@ representative investigation have not passed end-to-end acceptance.
 13. **Finding reaffirmation:** humans can explicitly reaffirm unchanged findings
     after their existing citations regain support. Reasons and review actors enter
     the durable ledger; superseded citations block reaffirmation. API, desktop,
-    export, and held-restore fixtures cover the transition. Finding revision,
-    narrowing and supersession remain pending.
+    export, and held-restore fixtures cover the transition. Revision and retraction
+    support are described below.
 
 14. **Finding retraction:** revision-bound human retraction preserves statements,
     references, original acceptance attribution, and review history. Terminal
     findings cannot be reactivated by later source corrections. Schema 12 upgrades
     preserve citation tables transactionally; migrated records survive held restore.
+
+15. **Linked finding revisions:** narrowing and supersession retain the original
+    finding and create an explicitly cited candidate, including for closed studies.
+    Replacement acceptance is a separate review. Schema 13 preserves linked versions,
+    reasons, attribution, and original evidence through export and held restore.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
@@ -139,6 +144,8 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `f90eda8`: desktop study creation and variant registration.
 - `878a01a`: recorded outcomes and accounted study closure.
 - `ddae748`: evidence review, explicit acceptance and source correction.
+- `f674603`: reasoned finding reaffirmation and project-scoped record access.
+- `47383a4`: terminal finding retraction and preserving schema 12 migration.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -157,7 +164,7 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed through `f674603`. No force push or authentication reconfiguration was used.
+CI passed through `47383a4`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
 A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's
@@ -174,7 +181,7 @@ representative research question/dataset remain open configuration inputs.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, finding revision/supersession, broader reproduction exports, telemetry and
+4. Desktop adoption, skills, broader reproduction exports, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
 5. Operational restore fencing/resumption, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.

@@ -117,6 +117,15 @@ class CreateFinding(StrictResearchRequest):
     variant_ids: Annotated[list[str], Field(min_length=1, max_length=200)]
 
 
+class ReviseFinding(StrictResearchRequest):
+    expected_revision: Revision
+    kind: Literal["narrow", "supersede"]
+    reason: NonBlank4000
+    statement: NonBlank4000
+    source_ids: Annotated[list[str], Field(min_length=1, max_length=200)]
+    variant_ids: Annotated[list[str], Field(min_length=1, max_length=200)]
+
+
 class AcceptFinding(StrictResearchRequest):
     expected_revision: Revision
 

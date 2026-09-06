@@ -19,6 +19,7 @@ from .research_models import (
     RecordVariantStatus,
     RegisterVariant,
     RetractFinding,
+    ReviseFinding,
 )
 from .store import canonical_digest
 
@@ -94,6 +95,17 @@ def create_finding(
     payload = body.model_dump(mode="json")
     status, response = store.create_finding(
         actor, study_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/findings/{finding_id}/revise")
+def revise_finding(
+    finding_id: str, body: ReviseFinding, actor: Actor, key: Key, store: Ledger
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    status, response = store.revise_finding(
+        actor, finding_id, key, canonical_digest(payload), payload
     )
     return JSONResponse(status_code=status, content=response)
 

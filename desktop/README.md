@@ -42,7 +42,11 @@ reaffirmed with a reason after its existing citations are supported again.
 Reaffirmation preserves the statement, references, and original acceptance
 attribution; superseded citations still block it. Explicit reasoned retraction
 preserves a finding and its history in a terminal state, including when its
-citations are no longer supported. The UI records judgment; it does not automatically
+citations are no longer supported. Revision lets the reviewer narrow or supersede
+a claim, explicitly selecting replacement evidence. It retains the original and
+creates a linked candidate requiring separate acceptance, including in closed
+studies. Superseded and retracted findings offer no further review actions.
+The UI records judgment; it does not automatically
 verify scientific claims or fetch cited URLs.
 
 The panel lists a project's studies and renders

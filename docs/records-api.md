@@ -21,6 +21,7 @@ should be retried with the same key and body on the same connection.
 | `POST /findings/{id}/accept` | Human accepts only after evidence checks |
 | `POST /findings/{id}/reaffirm` | Human reaffirms unchanged evidence with a reason |
 | `POST /findings/{id}/retract` | Human retracts a finding while retaining its history |
+| `POST /findings/{id}/revise` | Human narrows or supersedes a finding with a linked candidate |
 | `POST /sources/{id}/correct` | Preserve old source; add replacement and flag dependent findings |
 | `POST /studies/{id}/close` | Close only when all registered variants are accounted for |
 | `GET /studies/{id}/export` | Export all in-scope variants, sources, findings, corrections and events |
@@ -73,8 +74,8 @@ Reaffirmation requires `needs_review`, `expected_revision`, and a nonblank `reas
 unsuperseded; confirmatory studies must be closed and accounted for. It preserves
 the statement, citations, variant links, and original acceptance attribution.
 The new human decision and reason are recorded in `research.finding_reaffirmed`.
-A correction that supersedes a citation cannot be resolved by reaffirmation:
-versioned finding edits, narrowing, and supersession remain pending.
+A correction that supersedes a citation cannot be resolved by reaffirmation.
+Use explicit revision to choose the replacement evidence.
 
 Retraction requires a human, `expected_revision`, and a nonblank `reason` (up to
 4,000 characters). Candidate, accepted, and needs-review findings can be
@@ -82,3 +83,19 @@ retracted regardless of support or study closure. Retraction is terminal: later
 source assessments or corrections cannot reactivate the finding. Statements,
 citations, variants, and prior acceptance attribution stay intact; the reason,
 actor, and previous status/revision enter `research.finding_retracted` history.
+
+Revision requires `expected_revision`, `kind` (`narrow` or `supersede`), `reason`,
+`statement`, and explicit `source_ids`/`variant_ids` from the same study. It marks
+the original finding `superseded`, retaining its statement, links, creator, and
+original acceptance attribution, and creates a new **candidate**. The response
+contains `original` and `replacement`. The replacement stores
+`supersedes_finding_id`, `revision_kind`, and `revision_reason`; ordinary findings
+have null values. The event records the review actor, reason, prior status and
+revision, and both IDs. Narrowing describes the human's decision; Tessera does
+not automatically establish semantic implication or scientific validity.
+
+Revision is allowed in closed studies to review existing evidence without adding
+unaccounted variants. Replacement acceptance remains a separate human action with
+current source support and confirmatory closure checks. Superseded and retracted
+findings are terminal; subsequent versions form a linked chain. Exports retain
+every version and its original citations, including negative or withdrawn claims.

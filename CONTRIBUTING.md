@@ -145,3 +145,8 @@ rebuilds findings and their citation tables in one transaction, retaining IDs,
 revisions, attribution, and links. Backups retain their schema version; restore
 requires a backup matching the running control schema. Restore older backups
 using the matching Tessera release before explicitly migrating the held state.
+
+Schema 13 adds linked finding versions for narrowing/supersession. Its explicit
+migration preserves existing finding columns, supplies null version metadata for
+older findings, and retains citation links. New replacement candidates link to
+historical findings; acceptance and scientific review are separate actions.

@@ -26,6 +26,7 @@ from .research_models import (
     RecordVariantStatus,
     RegisterVariant,
     RetractFinding,
+    ReviseFinding,
 )
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, utc_now
 
@@ -81,10 +82,18 @@ def create_research_schema(connection: sqlite3.Connection) -> None:
         """CREATE TABLE IF NOT EXISTS research_findings (
             id TEXT PRIMARY KEY, study_id TEXT NOT NULL REFERENCES research_studies(id),
             statement TEXT NOT NULL, status TEXT NOT NULL CHECK
-            (status IN ('candidate','accepted','needs_review','retracted')),
+            (status IN ('candidate','accepted','needs_review','retracted','superseded')),
             revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
-            accepted_by_principal_id TEXT REFERENCES principals(id))""",
+            accepted_by_principal_id TEXT REFERENCES principals(id),
+            supersedes_finding_id TEXT UNIQUE REFERENCES research_findings(id),
+            revision_kind TEXT CHECK (revision_kind IN ('narrow','supersede')),
+            revision_reason TEXT,
+            CHECK ((supersedes_finding_id IS NULL AND revision_kind IS NULL
+                    AND revision_reason IS NULL)
+                OR (supersedes_finding_id IS NOT NULL AND revision_kind IS NOT NULL
+                    AND revision_reason IS NOT NULL)),
+            CHECK (supersedes_finding_id IS NULL OR supersedes_finding_id != id))""",
         "CREATE INDEX IF NOT EXISTS research_findings_study "
         "ON research_findings(study_id, created_at, id)",
         """CREATE TABLE IF NOT EXISTS research_finding_sources (
@@ -599,10 +608,7 @@ class ResearchStore(Store):
         payload: dict[str, Any] | CreateFinding,
     ) -> tuple[int, dict[str, Any]]:
         body = self._payload(CreateFinding, payload)
-        if len(set(body["source_ids"])) != len(body["source_ids"]) or len(
-            set(body["variant_ids"])
-        ) != len(body["variant_ids"]):
-            raise StoreError("Finding references must be unique.")
+        self._validate_finding_reference_ids(body)
 
         def command(
             connection: sqlite3.Connection, actor: dict[str, Any]
@@ -610,63 +616,171 @@ class ResearchStore(Store):
             study = self._study(connection, actor, study_id)
             if study["status"] != "open":
                 raise Conflict("Closed studies cannot add findings.")
-            for source_id in body["source_ids"]:
-                if self._source(connection, actor, source_id)["study_id"] != study_id:
-                    raise NotFound("Source was not found.")
-            for variant_id in body["variant_ids"]:
-                if self._variant(connection, actor, variant_id)["study_id"] != study_id:
-                    raise NotFound("Variant was not found.")
-            now, finding_id = utc_now(), "finding_" + uuid.uuid4().hex
-            result = {
-                "id": finding_id,
-                "study_id": study_id,
-                "statement": body["statement"],
-                "status": "candidate",
-                "revision": 1,
-                "created_at": now,
-                "updated_at": now,
-                "created_by_principal_id": actor["id"],
-                "accepted_by_principal_id": None,
-                "source_ids": body["source_ids"],
-                "variant_ids": body["variant_ids"],
-            }
-            connection.execute(
-                """INSERT INTO research_findings
-                (id,study_id,statement,status,revision,created_at,updated_at,
-                 created_by_principal_id,accepted_by_principal_id)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (
-                    finding_id,
-                    study_id,
-                    body["statement"],
-                    "candidate",
-                    1,
-                    now,
-                    now,
-                    actor["id"],
-                    None,
-                ),
-            )
-            connection.executemany(
-                "INSERT INTO research_finding_sources (finding_id,source_id) VALUES (?,?)",
-                [(finding_id, item) for item in body["source_ids"]],
-            )
-            connection.executemany(
-                "INSERT INTO research_finding_variants (finding_id,variant_id) VALUES (?,?)",
-                [(finding_id, item) for item in body["variant_ids"]],
-            )
+            self._validate_finding_references(connection, actor, study_id, body)
+            result = self._insert_finding(connection, actor, study_id, body)
             self._event_for(
                 connection,
                 actor,
                 study,
                 "research.finding_created",
                 1,
-                {"study_id": study_id, "finding_id": finding_id, "status": "candidate"},
+                {"study_id": study_id, "finding_id": result["id"], "status": "candidate"},
             )
             return 201, result
 
         return self._mutate(
             principal, key, "POST", f"/studies/{study_id}/findings", digest, command
+        )
+
+    @staticmethod
+    def _validate_finding_reference_ids(body: dict[str, Any]) -> None:
+        if len(set(body["source_ids"])) != len(body["source_ids"]) or len(
+            set(body["variant_ids"])
+        ) != len(body["variant_ids"]):
+            raise StoreError("Finding references must be unique.")
+
+    def _validate_finding_references(
+        self,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        study_id: str,
+        body: dict[str, Any],
+    ) -> None:
+        for source_id in body["source_ids"]:
+            if self._source(connection, actor, source_id)["study_id"] != study_id:
+                raise NotFound("Source was not found.")
+        for variant_id in body["variant_ids"]:
+            if self._variant(connection, actor, variant_id)["study_id"] != study_id:
+                raise NotFound("Variant was not found.")
+
+    @staticmethod
+    def _insert_finding(
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        study_id: str,
+        body: dict[str, Any],
+        *,
+        supersedes_finding_id: str | None = None,
+        revision_kind: str | None = None,
+        revision_reason: str | None = None,
+    ) -> dict[str, Any]:
+        now, finding_id = utc_now(), "finding_" + uuid.uuid4().hex
+        result = {
+            "id": finding_id,
+            "study_id": study_id,
+            "statement": body["statement"],
+            "status": "candidate",
+            "revision": 1,
+            "created_at": now,
+            "updated_at": now,
+            "created_by_principal_id": actor["id"],
+            "accepted_by_principal_id": None,
+            "supersedes_finding_id": supersedes_finding_id,
+            "revision_kind": revision_kind,
+            "revision_reason": revision_reason,
+            "source_ids": body["source_ids"],
+            "variant_ids": body["variant_ids"],
+        }
+        connection.execute(
+            """INSERT INTO research_findings
+            (id,study_id,statement,status,revision,created_at,updated_at,
+             created_by_principal_id,accepted_by_principal_id,supersedes_finding_id,
+             revision_kind,revision_reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                finding_id,
+                study_id,
+                body["statement"],
+                "candidate",
+                1,
+                now,
+                now,
+                actor["id"],
+                None,
+                supersedes_finding_id,
+                revision_kind,
+                revision_reason,
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO research_finding_sources (finding_id,source_id) VALUES (?,?)",
+            [(finding_id, item) for item in body["source_ids"]],
+        )
+        connection.executemany(
+            "INSERT INTO research_finding_variants (finding_id,variant_id) VALUES (?,?)",
+            [(finding_id, item) for item in body["variant_ids"]],
+        )
+        return result
+
+    def revise_finding(
+        self,
+        principal: dict[str, Any],
+        finding_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | ReviseFinding,
+    ) -> tuple[int, dict[str, Any]]:
+        body = self._payload(ReviseFinding, payload)
+        self._validate_finding_reference_ids(body)
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor, "revise a finding")
+            finding = self._finding(connection, actor, finding_id)
+            study = self._study(connection, actor, finding["study_id"])
+            if finding["revision"] != body["expected_revision"]:
+                raise Conflict("Finding revision is no longer revisable.")
+            if finding["status"] not in {"candidate", "accepted", "needs_review"}:
+                raise Conflict("Only nonterminal findings can be revised.")
+            self._validate_finding_references(connection, actor, study["id"], body)
+            prior_revision, prior_status = finding["revision"], finding["status"]
+            now, revision = utc_now(), prior_revision + 1
+            updated = connection.execute(
+                """UPDATE research_findings SET status='superseded',revision=?,updated_at=?
+                WHERE id=? AND revision=? AND status IN ('candidate','accepted','needs_review')""",
+                (revision, now, finding_id, body["expected_revision"]),
+            )
+            if updated.rowcount != 1:
+                raise Conflict("Finding revision is no longer revisable.")
+            original = self._finding_response(
+                connection,
+                {
+                    **finding,
+                    "status": "superseded",
+                    "revision": revision,
+                    "updated_at": now,
+                },
+            )
+            replacement = self._insert_finding(
+                connection,
+                actor,
+                study["id"],
+                body,
+                supersedes_finding_id=finding_id,
+                revision_kind=body["kind"],
+                revision_reason=body["reason"],
+            )
+            self._event_for(
+                connection,
+                actor,
+                study,
+                "research.finding_revised",
+                revision,
+                {
+                    "study_id": study["id"],
+                    "finding_id": finding_id,
+                    "replacement_finding_id": replacement["id"],
+                    "prior_revision": prior_revision,
+                    "prior_status": prior_status,
+                    "kind": body["kind"],
+                    "reason": body["reason"],
+                },
+            )
+            return 201, {"original": original, "replacement": replacement}
+
+        return self._mutate(
+            principal, key, "POST", f"/findings/{finding_id}/revise", digest, command
         )
 
     def accept_finding(
@@ -835,15 +949,17 @@ class ResearchStore(Store):
             study = self._study(connection, actor, finding["study_id"])
             if finding["revision"] != body["expected_revision"]:
                 raise Conflict("Finding revision is no longer retractable.")
-            if finding["status"] == "retracted":
-                raise Conflict("Retracted findings cannot be changed.")
+            if finding["status"] not in {"candidate", "accepted", "needs_review"}:
+                raise Conflict("Only nonterminal findings can be retracted.")
             prior_revision, prior_status = finding["revision"], finding["status"]
             now, revision = utc_now(), prior_revision + 1
-            connection.execute(
+            updated = connection.execute(
                 "UPDATE research_findings SET status='retracted',revision=?,updated_at=? "
                 "WHERE id=? AND revision=? AND status IN ('candidate','accepted','needs_review')",
                 (revision, now, finding_id, body["expected_revision"]),
             )
+            if updated.rowcount != 1:
+                raise Conflict("Finding revision is no longer retractable.")
             result = self._finding_response(
                 connection,
                 {
