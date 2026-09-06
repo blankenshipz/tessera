@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 11
+LATEST_SCHEMA_VERSION = 12
 LOCAL_ORG_ID = "org_local"
 
 
@@ -263,6 +263,26 @@ def migrate_v10_to_v11(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 11 WHERE singleton = 1")
 
 
+def migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
+    """Extend finding status without losing citations or disabling foreign keys."""
+    from .research import create_research_schema
+
+    tables = ("research_findings", "research_finding_sources", "research_finding_variants")
+    # Remove dependent tables first. Dropping a referenced parent with deferred
+    # foreign keys can leave a deferred violation even after its replacement.
+    for table in tables:
+        connection.execute(f"CREATE TEMP TABLE migration_12_{table} AS SELECT * FROM {table}")
+    for table in reversed(tables):
+        connection.execute(f"DROP TABLE {table}")
+    create_research_schema(connection)
+    for table in tables:
+        connection.execute(f"INSERT INTO {table} SELECT * FROM migration_12_{table}")
+        connection.execute(f"DROP TABLE migration_12_{table}")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("Finding migration would leave invalid references.")
+    connection.execute("UPDATE schema_meta SET schema_version = 12 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -274,6 +294,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: migrate_v8_to_v9,
     9: migrate_v9_to_v10,
     10: migrate_v10_to_v11,
+    11: migrate_v11_to_v12,
 }
 
 

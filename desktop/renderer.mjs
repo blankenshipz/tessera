@@ -45,7 +45,7 @@ function applyRecoveryStatus(status) {
   $('recovery-banner').textContent = recoveryHeld ?
     'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
   for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close', 'source-new', 'finding-new']) $(id).disabled = recoveryHeld;
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
   $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
 }
 function element(tag, text, className) {
@@ -56,10 +56,10 @@ function element(tag, text, className) {
 }
 function resetAuthoringForms() {
   outcomeContext = closeContext = null; evidenceContexts.clear();
-  for (const id of ['assessment-source', 'correction-original', 'finding-review', 'finding-sources', 'finding-variants']) {
+  for (const id of ['assessment-source', 'correction-original', 'finding-review', 'finding-sources', 'finding-variants', 'finding-retract-review']) {
     $(id).replaceChildren();
   }
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form']) {
+  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form']) {
     const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
     form.querySelector('button[type="submit"]').disabled = recoveryHeld;
   }
@@ -472,6 +472,18 @@ function renderStudyLedger(ledger) {
       }));
       card.append(accept);
     }
+    if (['candidate', 'accepted', 'needs_review'].includes(finding.status)) {
+      const retract = element('button', 'Review retraction');
+      retract.dataset.retractFindingId = finding.id;
+      retract.disabled = recoveryHeld;
+      retract.addEventListener('click', () => guarded(async () => {
+        const context = openEvidenceForm('finding-retract', ledger, { finding });
+        const review = $('finding-retract-review');
+        review.replaceChildren(element('p', finding.statement),
+          element('p', `Source IDs: ${finding.source_ids.join(', ') || 'none'}`, 'muted'));
+      }));
+      card.append(retract);
+    }
     return card;
   });
   appendSection('Corrections', corrections, correction => {
@@ -674,7 +686,7 @@ function sourceFields(form) {
   return { uri: fields.get('uri'), quoted_passage: fields.get('quoted_passage'),
     content_digest: fields.get('content_digest'), locator: fields.get('locator')?.trim() || null };
 }
-for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-accept']) {
+for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-accept', 'finding-retract']) {
   $(kind + '-form').addEventListener('submit', event => {
     event.preventDefault();
     guarded(async () => {
@@ -701,7 +713,7 @@ for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-ac
           throw new Error('Select between 1 and 200 sources and variants.');
         }
         target = context.study.id; method = 'createFinding';
-      } else {
+      } else if (kind === 'finding-accept') {
         if (!findingIsAcceptable(context.ledger, context.finding)) throw new Error('Review the cited sources and study accounting first.');
         body = { expected_revision: context.finding.revision }; target = context.finding.id; method = 'acceptFinding';
         if (context.finding.status === 'needs_review') {
@@ -709,6 +721,11 @@ for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-ac
           if (!reason) throw new Error('Reaffirmation requires a reason.');
           body.reason = reason; method = 'reaffirmFinding';
         }
+      } else {
+        const reason = fields.get('reason')?.trim();
+        if (!reason) throw new Error('Retraction requires a reason.');
+        body = { expected_revision: context.finding.revision, reason };
+        target = context.finding.id; method = 'retractFinding';
       }
       await submitResearchRecord(event.target, context, `${kind}:${target}`, body,
         (id, key) => api[method](id, target, body, key));

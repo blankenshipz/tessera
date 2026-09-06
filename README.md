@@ -68,10 +68,13 @@ credentials in its main process. It supports projects, draft plans, approval
 records, labbook reading, attributed conversation threads, and a pending decision
 inbox with explicit revision-bound human approval/rejection. Read-only study views
 show complete variant, source, finding, correction and ledger histories, including
-failed and excluded variants. Browsing never starts work or accepts findings.
+failed and excluded variants. Explicit authoring supports studies, accounted
+variant outcomes, source assessments/corrections, finding acceptance, reasoned
+reaffirmation, and terminal retraction. These record human judgment and preserve
+history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v11
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v12
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest

@@ -105,6 +105,15 @@
       <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Accept this finding</button></div>
     </form>
   </dialog>
+  <dialog id="finding-retract-dialog">
+    <form id="finding-retract-form">
+      <h2>Review retraction</h2>
+      <div id="finding-retract-review"></div>
+      <label>Reason for retraction<textarea id="finding-retract-reason" name="reason" required maxlength="4000" rows="5"></textarea></label>
+      <p class="muted">Retraction preserves this finding and its history.</p>
+      <div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Retract this finding</button></div>
+    </form>
+  </dialog>
   <script type="module" src="renderer.mjs"></script>
 </body>
 </html>

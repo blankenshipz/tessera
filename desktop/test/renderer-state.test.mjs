@@ -692,3 +692,49 @@ test('reaffirmation rejects superseded citations and held or stale authority', a
   await ui.selectProject(project('p2')); key.resolve('stale-key'); await flush();
   assert.equal(calls, 0);
 });
+
+test('retraction requires a reason, binds the displayed revision, and retains its retry key', async () => {
+  const data = evidenceLedger();
+  data.sources[0].verdict = 'unsupported';
+  const calls = []; let generated = 0;
+  const ui = fixture({ study: async () => data, commandId: async () => `retract-${++generated}`,
+    retractFinding: async (_connection, id, body, key) => {
+      calls.push({ id, body, key }); if (calls.length === 1) throw new Error('Unknown response'); return {};
+    } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  const button = find(ui.get('study-detail'), node => node.dataset?.retractFindingId);
+  assert.equal(button.textContent, 'Review retraction');
+  button.listeners.click(); await flush();
+  assert.equal(ui.get('finding-retract-form').querySelector('button[type="submit"]').disabled, false);
+  assert.ok(find(ui.get('finding-retract-review'), node => node.textContent === 'Source IDs: source1'));
+  ui.submit('finding-retract-form'); await flush();
+  assert.equal(calls.length, 0);
+  assert.match(ui.get('notice').textContent, /requires a reason/);
+  ui.get('finding-retract-form').fields = { reason: '  Source withdrawn  ' };
+  ui.submit('finding-retract-form'); await flush(); ui.submit('finding-retract-form'); await flush();
+  assert.equal(JSON.stringify(calls), JSON.stringify([1, 2].map(() => ({ id: 'finding1',
+    body: { expected_revision: 4, reason: 'Source withdrawn' }, key: 'retract-1' }))));
+});
+
+test('retraction is blocked by held or stale authority and retracted findings have no action', async () => {
+  const data = evidenceLedger(); let calls = 0; const key = deferred();
+  const ui = fixture({ study: async () => data, commandId: async () => key.promise,
+    retractFinding: async () => { calls++; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.retractFindingId).listeners.click(); await flush();
+  ui.get('finding-retract-form').fields = { reason: 'Withdrawn' };
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  ui.submit('finding-retract-form'); await flush(); assert.equal(calls, 0);
+  ui.applyRecoveryStatus({ state: 'active', recovery_hold: false });
+  await ui.selectStudy({ id: 's1' });
+  find(ui.get('study-detail'), node => node.dataset?.retractFindingId).listeners.click(); await flush();
+  ui.get('finding-retract-form').fields = { reason: 'Withdrawn after review' };
+  ui.submit('finding-retract-form'); await flush();
+  await ui.selectProject(project('p2')); key.resolve('stale-retract-key'); await flush();
+  assert.equal(calls, 0);
+  data.findings = [{ ...evidenceFinding, status: 'retracted' }];
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
+  assert.equal(find(ui.get('study-detail'), node => node.dataset?.retractFindingId), null);
+  assert.equal(find(ui.get('study-detail'), node => node.dataset?.acceptFindingId), null);
+  assert.equal(find(ui.get('study-detail'), node => node.dataset?.reaffirmFindingId), null);
+});

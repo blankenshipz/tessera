@@ -138,3 +138,10 @@ new permanently read-only held history copy with a fresh owner header. Read [the
 recovery runbook](docs/recovery.md) before using either command. It explains the
 1 GiB/30-second cooperative limits and why restore does not stop the original
 control service, workers, or provider jobs.
+
+Schema 12 adds terminal finding retraction. Run `tessera migrate --state-dir STATE`
+explicitly after taking a backup; startup refuses older schemas. The migration
+rebuilds findings and their citation tables in one transaction, retaining IDs,
+revisions, attribution, and links. Backups retain their schema version; restore
+requires a backup matching the running control schema. Restore older backups
+using the matching Tessera release before explicitly migrating the held state.

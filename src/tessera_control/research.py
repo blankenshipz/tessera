@@ -25,6 +25,7 @@ from .research_models import (
     ReaffirmFinding,
     RecordVariantStatus,
     RegisterVariant,
+    RetractFinding,
 )
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, utc_now
 
@@ -80,7 +81,7 @@ def create_research_schema(connection: sqlite3.Connection) -> None:
         """CREATE TABLE IF NOT EXISTS research_findings (
             id TEXT PRIMARY KEY, study_id TEXT NOT NULL REFERENCES research_studies(id),
             statement TEXT NOT NULL, status TEXT NOT NULL CHECK
-            (status IN ('candidate','accepted','needs_review')),
+            (status IN ('candidate','accepted','needs_review','retracted')),
             revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
             accepted_by_principal_id TEXT REFERENCES principals(id))""",
@@ -816,6 +817,62 @@ class ResearchStore(Store):
             principal, key, "POST", f"/findings/{finding_id}/reaffirm", digest, command
         )
 
+    def retract_finding(
+        self,
+        principal: dict[str, Any],
+        finding_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | RetractFinding,
+    ) -> tuple[int, dict[str, Any]]:
+        body = self._payload(RetractFinding, payload)
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor, "retract a finding")
+            finding = self._finding(connection, actor, finding_id)
+            study = self._study(connection, actor, finding["study_id"])
+            if finding["revision"] != body["expected_revision"]:
+                raise Conflict("Finding revision is no longer retractable.")
+            if finding["status"] == "retracted":
+                raise Conflict("Retracted findings cannot be changed.")
+            prior_revision, prior_status = finding["revision"], finding["status"]
+            now, revision = utc_now(), prior_revision + 1
+            connection.execute(
+                "UPDATE research_findings SET status='retracted',revision=?,updated_at=? "
+                "WHERE id=? AND revision=? AND status IN ('candidate','accepted','needs_review')",
+                (revision, now, finding_id, body["expected_revision"]),
+            )
+            result = self._finding_response(
+                connection,
+                {
+                    **finding,
+                    "status": "retracted",
+                    "revision": revision,
+                    "updated_at": now,
+                },
+            )
+            self._event_for(
+                connection,
+                actor,
+                study,
+                "research.finding_retracted",
+                revision,
+                {
+                    "study_id": study["id"],
+                    "finding_id": finding_id,
+                    "prior_revision": prior_revision,
+                    "prior_status": prior_status,
+                    "reason": body["reason"],
+                },
+            )
+            return 200, result
+
+        return self._mutate(
+            principal, key, "POST", f"/findings/{finding_id}/retract", digest, command
+        )
+
     def close_study(
         self,
         principal: dict[str, Any],
@@ -921,7 +978,7 @@ class ResearchStore(Store):
                 """UPDATE research_findings SET status='needs_review',revision=revision+1,
                 updated_at=? WHERE id IN (
                     SELECT finding_id FROM research_finding_sources WHERE source_id=?
-                ) AND status != 'needs_review'""",
+                ) AND status IN ('candidate','accepted')""",
                 (now, source_id),
             )
             replacement = {

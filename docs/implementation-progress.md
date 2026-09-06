@@ -101,7 +101,12 @@ representative investigation have not passed end-to-end acceptance.
     after their existing citations regain support. Reasons and review actors enter
     the durable ledger; superseded citations block reaffirmation. API, desktop,
     export, and held-restore fixtures cover the transition. Finding revision,
-    narrowing, supersession, and retraction remain pending.
+    narrowing and supersession remain pending.
+
+14. **Finding retraction:** revision-bound human retraction preserves statements,
+    references, original acceptance attribution, and review history. Terminal
+    findings cannot be reactivated by later source corrections. Schema 12 upgrades
+    preserve citation tables transactionally; migrated records survive held restore.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
@@ -152,7 +157,7 @@ Node access, and absence of renderer errors are checked. Visual QA and signed
 packaging remain unvalidated.
 
 Git publication works again. The previous nine pending commits were pushed and
-CI passed through `ddae748`. No force push or authentication reconfiguration was used.
+CI passed through `f674603`. No force push or authentication reconfiguration was used.
 
 Persistent container output quotas are not verified on this Mac's Docker Desktop.
 A fixed-size HFS+ disk-image probe failed the execution restriction: Docker's
@@ -169,7 +174,7 @@ representative research question/dataset remain open configuration inputs.
 2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
    credential brokering and operational spend/incident reconciliation.
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, finding revision/supersession/retraction, broader reproduction exports, telemetry and
+4. Desktop adoption, skills, finding revision/supersession, broader reproduction exports, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.
 5. Operational restore fencing/resumption, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.

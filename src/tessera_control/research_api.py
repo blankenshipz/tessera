@@ -18,6 +18,7 @@ from .research_models import (
     ReaffirmFinding,
     RecordVariantStatus,
     RegisterVariant,
+    RetractFinding,
 )
 from .store import canonical_digest
 
@@ -114,6 +115,17 @@ def reaffirm_finding(
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
     status, response = store.reaffirm_finding(
+        actor, finding_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/findings/{finding_id}/retract")
+def retract_finding(
+    finding_id: str, body: RetractFinding, actor: Actor, key: Key, store: Ledger
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    status, response = store.retract_finding(
         actor, finding_id, key, canonical_digest(payload), payload
     )
     return JSONResponse(status_code=status, content=response)

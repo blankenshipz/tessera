@@ -183,7 +183,7 @@ def main() -> None:
             registered = authored_snapshot["variants"][0]
             assert len(authored_snapshot["sources"]) == 2
             assert len(authored_snapshot["findings"]) == 1
-            assert authored_snapshot["findings"][0]["status"] == "needs_review"
+            assert authored_snapshot["findings"][0]["status"] == "retracted"
             assert authored_snapshot["findings"][0]["accepted_by_principal_id"] == owner["id"]
             assert len(authored_snapshot["corrections"]) == 1
             reaffirmations = [
@@ -196,6 +196,17 @@ def main() -> None:
             assert reaffirmations[0]["payload"]["prior_revision"] == 3
             assert reaffirmations[0]["payload"]["reason"] == (
                 "Synthetic reaffirmation of unchanged evidence."
+            )
+            retractions = [
+                event
+                for event in authored_snapshot["events"]
+                if event["event_type"] == "research.finding_retracted"
+            ]
+            assert len(retractions) == 1
+            assert retractions[0]["actor_principal_id"] == owner["id"]
+            assert retractions[0]["payload"]["prior_revision"] == 5
+            assert retractions[0]["payload"]["reason"] == (
+                "Synthetic retraction after corrected evidence."
             )
             assert authored_snapshot["study"]["status"] == "closed"
             assert {variant["status"] for variant in authored_snapshot["variants"]} == {
@@ -253,6 +264,7 @@ def main() -> None:
                         "desktop_study_and_variant": "accounted_and_closed",
                         "evidence_review_and_correction": True,
                         "finding_reaffirmation": True,
+                        "finding_retraction": True,
                         "held_restore_pass": True,
                         "research_variants_displayed": 80,
                         "research_history_unchanged": True,

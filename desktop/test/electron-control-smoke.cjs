@@ -165,6 +165,12 @@ async function main() {
       await waitFor(() => document.querySelectorAll('#study-detail [data-source-id]').length === 2 &&
         document.querySelector('[data-finding-id] .tag')?.textContent.startsWith('needs_review'));
       if (!document.querySelector('[data-reaffirm-finding-id]').disabled) throw new Error('Superseded citation permits reaffirmation.');
+      document.querySelector('[data-retract-finding-id]').click();
+      const retractForm = document.querySelector('#finding-retract-form');
+      retractForm.elements.reason.value = 'Synthetic retraction after corrected evidence.';
+      retractForm.requestSubmit();
+      await waitFor(() => document.querySelector('[data-finding-id] .tag')?.textContent.startsWith('retracted'));
+      if (document.querySelector('[data-retract-finding-id], [data-reaffirm-finding-id], [data-accept-finding-id]')) throw new Error('Terminal finding still offers review commands.');
       document.querySelector('#study-close').click();
       document.querySelector('#study-close-form').requestSubmit();
       await waitFor(() => document.querySelector('#study-detail').textContent.includes('closed · revision 2'));

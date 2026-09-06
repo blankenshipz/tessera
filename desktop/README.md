@@ -40,7 +40,9 @@ must be closed and accounted for. Corrections preserve source versions and mark
 dependent findings for review. A finding needing review can be explicitly
 reaffirmed with a reason after its existing citations are supported again.
 Reaffirmation preserves the statement, references, and original acceptance
-attribution; superseded citations still block it. The UI records judgment; it does not automatically
+attribution; superseded citations still block it. Explicit reasoned retraction
+preserves a finding and its history in a terminal state, including when its
+citations are no longer supported. The UI records judgment; it does not automatically
 verify scientific claims or fetch cited URLs.
 
 The panel lists a project's studies and renders
