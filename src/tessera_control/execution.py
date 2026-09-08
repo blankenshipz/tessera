@@ -504,6 +504,14 @@ class ExecutionStore(Store):
                 (task["id"],),
             ).fetchone():
                 raise Conflict("Task already has unresolved execution authority.")
+            if connection.execute(
+                """SELECT 1 FROM workspace_handoffs WHERE task_id = ?
+                AND status = 'stopped_confirmed'""",
+                (task["id"],),
+            ).fetchone():
+                raise Conflict(
+                    "A human-owned workspace handoff must be handed back before new authority."
+                )
             now, ident = utc_now(), "grant_" + uuid.uuid4().hex
             epoch = self._next_epoch(connection, task["id"])
             row = {
@@ -961,6 +969,12 @@ class ExecutionStore(Store):
             if lease is None or lease["worker_principal_id"] != worker["id"]:
                 raise NotFound("Execution lease was not found.")
             grant = self._grant(connection, worker, lease["grant_id"])
+            if connection.execute(
+                """SELECT 1 FROM workspace_handoffs WHERE grant_id = ?
+                AND status = 'stopped_confirmed'""",
+                (grant["id"],),
+            ).fetchone():
+                raise Conflict("Human workspace ownership fences further worker observations.")
             if (
                 grant["worker_principal_id"] != worker["id"]
                 or lease["epoch"] != payload["expected_epoch"]

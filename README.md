@@ -74,7 +74,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v16
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v17
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -98,6 +98,11 @@ Schema v16 adds immutable metadata-only project skill snapshots and human-only,
 worker-targeted expiring releases. Pinned plans require matching live releases at
 admission, but local CPU packages and runtime reject pins until materialization
 and verification are implemented. See [skill lifecycle](docs/skill-lifecycle.md).
+
+Schema v17 also records a bounded [confirmed workspace handoff](docs/workspace-handoff.md):
+human stop request, matching worker-confirmed exit, captured human diff, and a fresh
+handback context epoch. It accepts no arbitrary filesystem path or bytes, dispatches
+nothing, and does not yet mediate arbitrary writers or provide full desktop adoption.
 
 Local [workspace adoption](docs/workspace-adoption.md) now preserves reviewed input
 bytes and their manifest, verifies them after restart, and records adoption in the

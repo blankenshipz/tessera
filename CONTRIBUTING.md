@@ -161,3 +161,6 @@ quarantined and unclassified.
 
 Schema 16 adds metadata-only skill snapshots and worker-targeted release records.
 It adds no inferred releases; local CPU skill materialization remains unavailable.
+
+Schema 17 adds tenant-scoped confirmed workspace handoff records. It adds no
+inferred handoffs, filesystem writes, provider dispatch, or result acceptance.

@@ -66,6 +66,8 @@ def create_app(state_dir: Path) -> FastAPI:
     from .artifact_disposition_api import router as artifact_disposition_router
     from .execution import ExecutionStore
     from .execution_api import router as execution_router
+    from .handoff_api import router as handoff_router
+    from .handoffs import WorkspaceHandoffStore
     from .interaction import InteractionStore
     from .interaction_api import router as interaction_router
     from .research import ResearchStore
@@ -81,6 +83,7 @@ def create_app(state_dir: Path) -> FastAPI:
     app.state.execution = ExecutionStore(state_dir)
     app.state.snapshot_releases = SnapshotReleaseStore(state_dir)
     app.state.skills = SkillStore(state_dir)
+    app.state.handoffs = WorkspaceHandoffStore(state_dir)
     app.include_router(execution_router)
     app.include_router(skill_router)
     app.include_router(artifact_router)
@@ -90,6 +93,7 @@ def create_app(state_dir: Path) -> FastAPI:
     snapshots = SnapshotStore(state_dir)
     app.include_router(research_router)
     app.include_router(interaction_router)
+    app.include_router(handoff_router)
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],

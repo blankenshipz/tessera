@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 16
+LATEST_SCHEMA_VERSION = 17
 LOCAL_ORG_ID = "org_local"
 
 
@@ -324,6 +324,14 @@ def migrate_v15_to_v16(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 16 WHERE singleton = 1")
 
 
+def migrate_v16_to_v17(connection: sqlite3.Connection) -> None:
+    """Add bounded confirmed-stop workspace handoff records without changing snapshots."""
+    from .handoffs import create_handoff_schema
+
+    create_handoff_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 17 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -340,6 +348,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     13: migrate_v13_to_v14,
     14: migrate_v14_to_v15,
     15: migrate_v15_to_v16,
+    16: migrate_v16_to_v17,
 }
 
 

@@ -544,6 +544,14 @@ unresolved/unknown, and worker-confirmed termination from immutable attributed
 observations. It does not infer provider termination, writer quiescence, charges,
 or scientific success from a local terminal state.
 
+Schema v17 additionally records a bounded confirmed-stop workspace handoff: a human
+can bind one selected captured local baseline to a current grant/lease, request its
+cancellation/fence, and become recorded owner only after the matching attributed
+worker reports stable-provider, confirmed exit with no newer unknown observation.
+Human handback compares separately captured immutable snapshots and creates a fresh
+context epoch; it does not mediate arbitrary filesystem writers or imply provider
+quiescence beyond that observation.
+
 Operational claims in chat attach timestamped control/supervisor/provider
 observations and freshness limits. Authoritative status wins over conflicting
 agent prose. Checkpoint/resume needs compatible inputs/environment, saved method

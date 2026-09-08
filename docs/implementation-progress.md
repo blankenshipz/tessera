@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v16 bounded skill lifecycle and bounded
+Reviewed 2026-09-08 against the schema v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
 OpenCode harness adapter POC, and bounded capability-probe slice. These are
 informational evidence only, not live integration, cryptographic trust,
@@ -22,7 +22,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
 | §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, synthetic durable output sealing/recovery, and human-only synthetic byte/metadata result checkpoints | Backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
-| §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry | Full telemetry milestones, writer quiescence, edit ownership, fresh-context handback |
+| §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
 | §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, owner-managed worker registration/lifecycle, documented optional pinned-harness boundary, synthetic OpenCode session/event/cancellation adapter POC, and a read-only informational capability probe | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust and capability attestation, credential broker, dispatch, and broader operational identity lifecycle |
@@ -47,7 +47,7 @@ full workflow and its required adverse cases pass on the supported target.
 - At `ee6c36d`: 363 Python tests pass natively; Linux CI passed for that commit.
 - Ruff lint and format checks pass.
 - 62 desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v16 preserve historical records, input bytes,
+- Explicit migrations through schema v17 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -201,6 +201,13 @@ representative investigation have not passed end-to-end acceptance.
     pinned OpenCode version. Callback failures fail closed. Reports cannot
     attest builds, grant authority, update the registry, or enable dispatch.
 
+21. **Confirmed workspace handoff:** schema v17 binds a human stop request to one
+    current task/grant/lease and captured baseline, fences the grant, and requires
+    a matching stable-provider worker-confirmed exit before recording human ownership.
+    Handback records immutable result capture digests, path diff/exclusions and a
+    new context epoch; it cannot dispatch, accept results, or mediate arbitrary
+    writers. See [workspace handoff](workspace-handoff.md).
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -237,6 +244,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `ee6c36d`: linked narrowing/supersession, schema 13 and native export/restore integration.
 - `175a5b3`: schema v14 worker registration, liveness admission and retirement revocation.
 - Pending commit: schema v16 bounded skill lifecycle.
+- Pending commit: schema v17 bounded confirmed workspace handoff.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -276,7 +284,7 @@ representative research question/dataset remain open configuration inputs.
    [worker lifecycle](worker-lifecycle.md).
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
 4. Desktop adoption, skills, broader reproduction exports, full telemetry and
-   stop/edit/handback with writer quiescence and edit ownership; portable artifact bundles.
+   arbitrary writer mediation/full stop-edit-handback adoption; portable artifact bundles.
 5. Operational restore fencing/resumption, lifecycle recovery, cleanup/retention, packaging and
    the remaining adversarial acceptance fixtures in DESIGN.md section 8.
 6. A maintainer-selected real investigation and measured pilot, including trusted
