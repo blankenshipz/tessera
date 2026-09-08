@@ -614,6 +614,9 @@ class ExecutionStore(Store):
         grant = self._grant(connection, worker, grant_id)
         if grant["worker_principal_id"] != worker["id"] or worker["kind"] != "worker":
             raise Forbidden("Worker is not assigned to this execution grant.")
+        from .workers import WorkerRegistryStore
+
+        WorkerRegistryStore.require_ready_worker(connection, worker, grant["project_id"])
         if grant["status"] != "active":
             raise Conflict("Execution grant is not active for lease authority.")
         now = self._now()

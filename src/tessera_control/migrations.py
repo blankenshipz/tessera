@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 13
+LATEST_SCHEMA_VERSION = 14
 LOCAL_ORG_ID = "org_local"
 
 
@@ -300,6 +300,14 @@ def migrate_v12_to_v13(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 13 WHERE singleton = 1")
 
 
+def migrate_v13_to_v14(connection: sqlite3.Connection) -> None:
+    """Add worker registration records without altering existing v13 authority."""
+    from .workers import create_worker_schema
+
+    create_worker_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 14 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -313,6 +321,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     10: migrate_v10_to_v11,
     11: migrate_v11_to_v12,
     12: migrate_v12_to_v13,
+    13: migrate_v13_to_v14,
 }
 
 

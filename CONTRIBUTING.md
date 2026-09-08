@@ -150,3 +150,7 @@ Schema 13 adds linked finding versions for narrowing/supersession. Its explicit
 migration preserves existing finding columns, supplies null version metadata for
 older findings, and retains citation links. New replacement candidates link to
 historical findings; acceptance and scientific review are separate actions.
+
+Schema 14 adds the worker registry. Its explicit migration preserves v13 records
+and adds no inferred registrations; existing workers must be registered by the
+local owner before they can acquire or renew leases.

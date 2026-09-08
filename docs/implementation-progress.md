@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against implementation commit `ee6c36d` (schema 13).
+Reviewed 2026-09-08 against the schema v14 worker-lifecycle slice.
 **Implemented** means the named bounded behavior has executable evidence;
 **partial** means the design workflow still has missing requirements; **blocked**
 identifies an unmet prerequisite; **deferred** is intentionally outside the pilot.
@@ -21,7 +21,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation and duration enforcement | Writer quiescence, edit ownership, fresh-context handback |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
-| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials and data access, isolated renderer, immutable input delivery | Worker enrollment/build trust, credential broker, full runtime capability probes, operational identity lifecycle |
+| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, and owner-managed worker registration/lifecycle | Cryptographic build trust, credential broker, runtime capability probes, and broader operational identity lifecycle |
 | §6 Execution/recovery | Partial | Journals, stable operations, conservative exposure, quarantine, resumable transfer, read-only held restore | Provider fencing/resumption after restore, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
 | §8 E2E acceptance | Blocked for real pilot; component work continues | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Admissible execution storage/host, selected investigation/dataset, remaining failure drills and measured pilot |
@@ -43,7 +43,7 @@ full workflow and its required adverse cases pass on the supported target.
 - At `ee6c36d`: 363 Python tests pass natively; Linux CI passed for that commit.
 - Ruff lint and format checks pass.
 - 62 desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v13 preserve historical records, input bytes,
+- Explicit migrations through schema v14 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -155,6 +155,13 @@ representative investigation have not passed end-to-end acceptance.
     Replacement acceptance is a separate review. Schema 13 preserves linked versions,
     reasons, attribution, and original evidence through export and held restore.
 
+16. **Worker lifecycle:** schema v14 binds one existing scoped worker credential
+    to approved metadata, a project, lifecycle state, and heartbeat metadata.
+    Only fresh `ready` workers can acquire or renew leases; drain/quarantine
+    blocks new authority and retirement revokes the workload credential while
+    retaining exposure and observations. This is not build attestation or a
+    capability claim. See [worker lifecycle](worker-lifecycle.md).
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -189,6 +196,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `f674603`: reasoned finding reaffirmation and project-scoped record access.
 - `47383a4`: terminal finding retraction and preserving schema 12 migration.
 - `ee6c36d`: linked narrowing/supersession, schema 13 and native export/restore integration.
+- Pending commit: schema v14 worker registration, liveness admission and retirement revocation.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -221,8 +229,10 @@ representative research question/dataset remain open configuration inputs.
 
 1. Verified persistent output storage, durable sealing and runtime collection,
    quarantine release policy, and fenced authoritative result acceptance.
-2. Worker trust/build enrollment, capability probes, registration/drain/retirement,
-   credential brokering and operational spend/incident reconciliation.
+2. Cryptographic worker build trust, capability probes, credential brokering and
+   operational spend/incident reconciliation. Registration/drain/quarantine/
+   retirement and bounded heartbeat admission are implemented; see
+   [worker lifecycle](worker-lifecycle.md).
 3. Pinned runtime skill authoring/test/release and mediated harness integration.
 4. Desktop adoption, skills, broader reproduction exports, telemetry and
    stop/edit/handback with writer quiescence; portable artifact bundles.

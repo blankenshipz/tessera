@@ -57,6 +57,25 @@ def _worker(
                 owner["id"],
             ),
         )
+        connection.execute(
+            """INSERT INTO worker_registry
+            (id, org_id, project_id, worker_principal_id, credential_id, approved_build_identifier,
+             approved_build_digest, trust_class, region, lifecycle_state, revision, registered_at,
+             heartbeat_at, last_seen_at, retired_at, retired_by_principal_id)
+            VALUES (?, ?, ?, ?, ?, 'synthetic-test-worker', ?, 'test', 'local', 'ready', 1,
+                    ?, ?, ?, NULL, NULL)""",
+            (
+                f"registered-{token}",
+                owner["org_id"],
+                project_id,
+                f"worker-{token}",
+                f"credential-{token}",
+                "a" * 64,
+                created,
+                created,
+                created,
+            ),
+        )
     return Store(state).authenticate_worker(token)
 
 

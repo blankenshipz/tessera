@@ -21,6 +21,8 @@ from .input_delivery import DeliverInputs, InputDeliveryStore
 from .runtime_packages import RuntimePackageStore
 from .snapshot_releases import ReleaseSnapshot, RevokeSnapshotRelease, SnapshotReleaseStore
 from .store import canonical_digest
+from .worker_models import RegisterWorker, WorkerHeartbeat, WorkerLifecycle
+from .workers import WorkerRegistryStore
 
 router = APIRouter()
 Actor = Annotated[dict[str, Any], Depends(principal)]
@@ -32,6 +34,10 @@ def execution(request: Request) -> ExecutionStore:
     return request.app.state.execution
 
 
+def workers(request: Request) -> WorkerRegistryStore:
+    return WorkerRegistryStore(request.app.state.execution.database_path.parent)
+
+
 def input_delivery(request: Request) -> InputDeliveryStore:
     return InputDeliveryStore(request.app.state.execution.database_path.parent)
 
@@ -41,6 +47,7 @@ def releases(request: Request) -> SnapshotReleaseStore:
 
 
 Authority = Annotated[ExecutionStore, Depends(execution)]
+Workers = Annotated[WorkerRegistryStore, Depends(workers)]
 Delivery = Annotated[InputDeliveryStore, Depends(input_delivery)]
 Releases = Annotated[SnapshotReleaseStore, Depends(releases)]
 
@@ -115,6 +122,27 @@ def reconcile_grant(
     )
 
 
+@router.post("/projects/{project_id}/workers")
+def register_worker(
+    project_id: str, body: RegisterWorker, actor: Actor, key: Key, store: Workers
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(store.register_worker(actor, project_id, key, canonical_digest(payload), payload))
+
+
+@router.post("/workers/{worker_id}/drain")
+@router.post("/workers/{worker_id}/quarantine")
+@router.post("/workers/{worker_id}/retire")
+def lifecycle_worker(
+    worker_id: str, body: WorkerLifecycle, actor: Actor, key: Key, store: Workers, request: Request
+) -> JSONResponse:
+    action = request.url.path.rsplit("/", 1)[1]
+    payload = body.model_dump(mode="json")
+    return result(
+        store.lifecycle_worker(actor, worker_id, action, key, canonical_digest(payload), payload)
+    )
+
+
 @router.post("/worker/leases")
 def acquire_lease(
     body: AcquireExecutionLease, worker: Worker, key: Key, store: Authority
@@ -147,6 +175,17 @@ def report_observation(
             worker, body.lease_id, key, canonical_digest(payload), payload
         )
     )
+
+
+@router.post("/worker/heartbeat")
+def heartbeat(body: WorkerHeartbeat, worker: Worker, key: Key, store: Workers) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(store.heartbeat(worker, key, canonical_digest(payload), payload))
+
+
+@router.get("/worker/status")
+def worker_status(worker: Worker, store: Workers) -> dict[str, Any]:
+    return store.worker_status(worker)
 
 
 @router.post("/worker/leases/{lease_id}/inputs")

@@ -51,6 +51,19 @@ def test_admission_cancellation_and_retained_exposure_through_http(tmp_path):
         },
         201,
     )
+    registered = call(
+        "POST",
+        f"/projects/{project['id']}/workers",
+        {
+            "worker_principal_id": credential["principal_id"],
+            "approved_build_identifier": "synthetic-worker",
+            "approved_build_digest": "a" * 64,
+            "trust_class": "test",
+            "region": "local",
+        },
+        201,
+    )
+    assert registered["approved_metadata_only"] is True
     task = call(
         "POST",
         f"/projects/{project['id']}/tasks",
