@@ -252,16 +252,17 @@ backend shutdown must warn about active work and offer drain/stop; it cannot rep
 unknown provider jobs as terminated. Offline edits are drafts, never approvals or
 assumed cancellations. Reconnect uses snapshots/cursors and reconciles state.
 
-### 3.1 Configurable execution
+### 3.1 Configurable execution and harness contract
 
 Keep assistant host, harness, model/account, compute target, workload engine,
 environment, and artifact destination separate in a versioned execution profile.
 Spark can run on Kubernetes; Minikube is a local Kubernetes target, not an agent
 harness. Capability checks must reject incompatible combinations before dispatch.
 
-The first intended personal harness is Codex CLI through a documented structured
-interface, subject to the feasibility gate. Other harnesses use the same contract.
-Personal account authentication stays owner-bound; do not pool it for team workers.
+OpenCode is an optional, pinned harness implementation behind Tessera's harness
+contract. It is not a required Tessera service and its sessions/jobs remain
+independently managed by OpenCode. Other harnesses use the same contract. Personal
+account authentication stays owner-bound; do not pool it for team workers.
 Subscription usage, API charges, and compute costs are separate. Unknown allowance
 is displayed as unknown; quota exhaustion never silently switches billing mode.
 
@@ -271,7 +272,47 @@ submit/status/logs/cancel/accounting, with provider IDs and checkpoint limitatio
 Provisioning infrastructure is a separate approval from attaching a target.
 Pin tested versions; use conformance tests to grow the support matrix.
 
-### 3.2 Control-plane deployment and connections
+The adapter translates Tessera's plan, approved inputs, lease/epoch, capability
+limits, and cancellation request into the pinned harness interface, and translates
+responses into attributed observations and events. Every translated event carries
+the Tessera organization/project/task, operation, lease epoch, harness instance,
+and upstream session/job identifiers; unknown or unauthenticated events are
+quarantined. Tessera remains authoritative for plans, approvals, budgets,
+leases/epochs, credentials/access, artifacts, provider operations, result
+acceptance, and the labbook. OpenCode permission prompts, tools, MCP, skills,
+session events, provider authentication, and UI are not Tessera authority
+boundaries. A harness acknowledgement never proves provider termination, artifact
+acceptance, budget settlement, or scientific result acceptance.
+
+OpenCode's current external capabilities include a headless HTTP server with an
+[OpenAPI endpoint](https://opencode.ai/docs/server/), a typed [JavaScript/TypeScript
+SDK](https://opencode.ai/docs/sdk/), [SSE events](https://opencode.ai/docs/server/#events),
+session/message/abort/permission APIs, and documented [skills](https://opencode.ai/docs/skills/)
+and [MCP servers](https://opencode.ai/docs/mcp-servers/). It also documents
+[ACP support](https://opencode.ai/docs/acp/) and is released under the [MIT
+license](https://github.com/anomalyco/opencode/blob/dev/LICENSE). These are current
+upstream capabilities, not Tessera guarantees; the pinned adapter must pass
+compatibility and security tests before any capability is enabled.
+
+### 3.2 Node setup and enrollment
+
+Node setup is infrastructure administration, separate from research control. An
+operator installs the approved worker supervisor, harness build, experiment
+adapter, isolation profile, and pinned OpenCode build on a node. Enrollment
+records node identity, owner/tenant, endpoint, trust class, versions, capabilities,
+credential references, and recovery policy. It issues a scoped workload identity
+and binds it to the control plane; it does not copy a human login or grant a
+research plan. Re-enrollment after restore, replacement, or suspected compromise
+requires fresh credentials and invalidates the old node epoch.
+
+Node health, upgrades, drain, quarantine, and retirement are independently
+managed lifecycle operations. Research control may admit or revoke a lease, but
+must not infer node trust from OpenCode's UI, session state, permission prompt,
+MCP response, or provider login. Conversely, node enrollment does not approve a
+plan, reserve a budget, authorize data access, accept an artifact, or accept a
+result.
+
+### 3.3 Control-plane deployment and connections
 
 | Mode | Operator and responsibility | Identity and secrets |
 |---|---|---|
@@ -303,7 +344,7 @@ workflow with worker, credential and operation reconciliation. Selecting another
 connection is not migration. Cross-control-plane synchronization/federation is
 out of pilot scope; do not clone active grants into a second authority.
 
-### 3.3 Authentication contract
+### 3.4 Authentication contract
 
 Authenticate local and network deployments alike. Personal setup uses a one-time
 enrollment flow and owner-scoped session credentials stored outside the renderer;
@@ -587,6 +628,31 @@ operational note. No paid or sensitive run precedes its required enforcement.
 | 5. Labbook and evidence | Timeline/findings, complete in-scope ledger, source support, method labels, corrections and export | All variants visible; incomplete history disclosed; source support and replication labels checked; corrections trace downstream; history browsing executes nothing |
 | 6. Recovery and pilot | Fault tests, signed packaging/update path, backup/restore, runbooks, measured real investigation | Restore fences old grants; unknown jobs/spend alert; compare quality and total human effort with existing workflow |
 
+### Harness proof of concept (synthetic, not pilot completion)
+
+Before integrating OpenCode into a pilot workflow, run a small synthetic POC with
+one pinned OpenCode server, one enrolled node, one Tessera task, and no real
+provider call or sensitive data. The adapter must prove that it can create and
+attribute a session, translate a bounded message and event stream, reconnect from
+a cursor, and request cancellation while Tessera retains authority. OpenCode
+session/job state may continue independently; Tessera records the uncertainty and
+reconciles it rather than inventing termination.
+
+Acceptance cases: (1) a plan revision or expired lease prevents session/job
+start; (2) a permission, tool, MCP, or provider-auth event is recorded as an
+upstream observation and cannot widen access or budget; (3) duplicate/reordered
+SSE events are idempotently attributed; (4) disconnect and reconnect preserve
+the same operation and cursor; and (5) cancellation records requested,
+confirmed, or unresolved status without accepting output or result.
+
+Failure cases: reject an unpinned or incompatible OpenCode version; quarantine an
+event with the wrong tenant, operation, epoch, or unknown session; reject a
+redirected/unauthenticated endpoint; deny a prompt that exceeds the Tessera
+grant; and leave provider termination and costs unresolved when abort has no
+authoritative confirmation. Passing this POC demonstrates adapter conformance
+only; it does not complete execution, artifact release, result acceptance, or
+the pilot.
+
 Required adversarial fixtures:
 
 - Close Electron while the backend remains running, then separately stop the
@@ -679,9 +745,12 @@ implementation. Research results are bounded, not universal scientific validatio
 - [Vault leases](https://developer.hashicorp.com/vault/docs/concepts/lease) and
   [SPIFFE](https://spiffe.io/docs/latest/spiffe-about/overview/): examples of
   credential lifecycle and workload identity, not selected vendors.
+- [OpenCode server](https://opencode.ai/docs/server/), [OpenCode SDK](https://opencode.ai/docs/sdk/),
+  [OpenCode ACP](https://opencode.ai/docs/acp/), and [OpenCode license](https://github.com/anomalyco/opencode/blob/dev/LICENSE):
+  current external capabilities for the optional harness, subject to compatibility testing.
 - [Skills](https://learn.chatgpt.com/docs/build-skills),
   [Codex App Server](https://learn.chatgpt.com/docs/app-server), and
-  [authentication](https://learn.chatgpt.com/docs/auth): candidate first-harness interfaces.
+  [authentication](https://learn.chatgpt.com/docs/auth): other candidate harness interfaces.
 - [MAST](https://arxiv.org/abs/2503.13657) and
   [AgentDojo](https://arxiv.org/abs/2406.13352): coordination/verification failures
   and adversarial tool inputs motivate external enforcement and evaluation.

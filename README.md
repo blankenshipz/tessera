@@ -15,7 +15,7 @@ separate machines and clusters.
 **Status:** The local API supports scoped credentials, versioned task plans,
 human approval records, durable conversations and decisions, and a research
 ledger with complete study exports and source corrections. Approval records intent
-only; they do not grant execution. A desktop shell, safe file inventory, Codex
+only; they do not grant execution. A desktop shell, safe file inventory, structured
 transport, and CPU supervisor have component tests. Native desktop runtime and
 CPU isolation fixtures pass. Live experiment dispatch and the full pilot remain
 incomplete. See
@@ -168,6 +168,15 @@ Three deployment modes use the same authenticated API:
 Each project has one authoritative control plane. Organization isolation covers
 data, credentials, and operations; a Kubernetes namespace alone is not sufficient.
 Switching desktop connections does not move projects or transfer credentials.
+
+OpenCode is an optional, pinned harness behind Tessera's harness contract; its
+sessions and jobs remain independently managed. Tessera—not OpenCode—authorizes
+plans, approvals, budgets, leases/epochs, credentials/access, artifacts, provider
+operations, result acceptance, and labbook records. OpenCode permission prompts,
+tools, MCP, skills, session events, provider auth, and UI are not Tessera
+authority boundaries. Node setup/enrollment is separate from research control.
+The adapter POC and compatibility testing remain unimplemented; the pilot is not
+complete.
 
 Closing Electron does not stop the separately running control plane. If its
 machine sleeps or becomes unreachable, workers follow their disconnect and
