@@ -56,10 +56,16 @@ and `scripts/check_control_runtime.py` with the native environment and the pinne
 image already available. The latter uses a temporary loopback HTTP service and
 records actual provider observations; it does not collect outputs or settle costs.
 
-Worker trust/build enrollment, capability probes, persistent output storage and
+Worker trust/build enrollment, persistent output storage and
 collection/validation, pinned skill execution, accounting feeds and restore
 fencing remain required before enabling unattended research execution. A private
 test fixture and a successful simulated stop are not proof of those guarantees.
+
+The worker capability probe is only synthetic informational evidence. It reads
+caller-supplied facts and local root metadata, and may canonicalize a declared
+storage description as declared/unverified. It performs no cryptographic build
+verification, capability attestation, control-plane write, mount, credential,
+provider, or dispatch action; even a passing report remains non-authoritative.
 
 See [the persistent output-storage decision](decisions/0003-persistent-output-storage.md)
 for the quota and custody gates before collection can be enabled.

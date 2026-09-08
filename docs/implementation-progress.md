@@ -6,9 +6,10 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v16 bounded skill lifecycle and the
-synthetic OpenCode harness adapter POC. The POC is adapter conformance evidence,
-not a live integration, compatibility result, or pilot completion.
+Reviewed 2026-09-08 against the schema v16 bounded skill lifecycle, synthetic
+OpenCode harness adapter POC, and bounded capability-probe slice. These are
+informational evidence only, not live integration, cryptographic trust,
+capability attestation, dispatch, or pilot completion.
 **Implemented** means the named bounded behavior has executable evidence;
 **partial** means the design workflow still has missing requirements; **blocked**
 identifies an unmet prerequisite; **deferred** is intentionally outside the pilot.
@@ -23,7 +24,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation and duration enforcement | Writer quiescence, edit ownership, fresh-context handback |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
-| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, owner-managed worker registration/lifecycle, documented optional pinned-harness boundary, and synthetic OpenCode session/event/cancellation adapter POC | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust, credential broker, runtime capability probes, and broader operational identity lifecycle |
+| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, owner-managed worker registration/lifecycle, documented optional pinned-harness boundary, synthetic OpenCode session/event/cancellation adapter POC, and a read-only informational capability probe | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust and capability attestation, credential broker, dispatch, and broader operational identity lifecycle |
 | §6 Execution/recovery | Partial | Journals, stable operations, conservative exposure, quarantine, resumable transfer, read-only held restore | Provider fencing/resumption after restore, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
 | §8 E2E acceptance | Blocked for real pilot; component work continues | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Admissible execution storage/host, selected investigation/dataset, remaining failure drills and measured pilot |
@@ -192,6 +193,12 @@ representative investigation have not passed end-to-end acceptance.
     worker releases with expiry/revocation. Pin admission freezes and rechecks the
     release; local CPU package/runtime loading remains explicitly rejected. See
     [skill lifecycle](skill-lifecycle.md).
+
+20. **Synthetic capability probe:** bounded immutable reports compare exact
+    supplied runtime/schema versions, inspect private 0700 roots, validate an
+    optional declared storage description as unverified, and observe an optional
+    pinned OpenCode version. Callback failures fail closed. Reports cannot
+    attest builds, grant authority, update the registry, or enable dispatch.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
