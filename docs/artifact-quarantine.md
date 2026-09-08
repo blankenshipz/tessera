@@ -103,6 +103,14 @@ quarantine, accept a result, dispatch a provider, use credentials, or establish
 scientific success. The existing service continues to reject undeclared manifest
 paths and stale epochs, and retains attributable late bytes as quarantine only.
 
+For explicit local development retention, `tessera_worker.development_storage`
+provides `DevelopmentArtifactStorage` and a marked `SyntheticStoppedWorkspace`.
+It uses a fixed `development-only-artifact-seals` child path and the journal
+above, requires the same fresh termination evidence, and returns the existing
+quarantined/unclassified manifest. This is fixture tooling only: its label is
+not backend activation, package admission, runtime mounting, quarantine release,
+result acceptance, or scientific evidence.
+
 ## Human manifest dispositions
 
 Completed worker outputs remain quarantined after a manifest is admitted. A

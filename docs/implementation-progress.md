@@ -96,7 +96,10 @@ representative investigation have not passed end-to-end acceptance.
     now requires a fresh matching termination observation before descriptor-relative
     collection, retains immutable bytes/digests and its manifest before transfer,
     and resumes a lost upload/manifest response after worker restart. It is not
-    connected to a real CPU runtime or storage backend. See
+    connected to a real CPU runtime or storage backend. Explicit local
+    development retention now has a separate marked-workspace helper, which
+    remains quarantine-only and does not satisfy backend activation or scientific
+    acceptance. See
     [artifact quarantine](artifact-quarantine.md).
 9. **Desktop shell:** isolated renderer, sender-checked IPC, named connections,
    project/draft/approval/labbook views, attributed conversations and explicit

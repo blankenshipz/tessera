@@ -62,6 +62,10 @@ private synthetic runtime root. It requires a fresh matching control-acknowledge
 termination observation, seals immutable bytes/digests and a local manifest before
 the existing resumable transfer, and resumes lost upload/manifest responses after a
 worker restart. It is not wired to the CPU runtime or an output-storage backend.
+The explicit `tessera_worker.development_storage` helper is available for local
+synthetic retention through a fixed development-only path and marked stopped
+workspace input. It is test/recovery tooling only and does not satisfy backend
+activation, runtime admission, or scientific acceptance.
 Next real integration steps remain verified reserved staging capacity, recovery,
 and resumable transfer outside the cancellation loop. Missing or unsafe outputs
 remain collection failures; neither file integrity nor provider exit establishes

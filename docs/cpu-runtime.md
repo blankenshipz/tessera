@@ -78,3 +78,9 @@ that new package and digest; a changed declaration cannot replay it.
 This is only a synthetic, fail-closed capability contract. Tessera does not yet
 activate a storage backend, create a writable mount, reserve/reclaim a slot,
 automatically collect outputs, release quarantine, or accept results.
+
+Local development may explicitly retain synthetic stopped-workspace outputs with
+`DevelopmentArtifactStorage` in the isolated `development_storage` module. It
+uses durable sealing and the existing quarantine upload path, but does not
+satisfy this backend contract, enable `CpuRuntime`, admit packages, mount output
+storage, dispatch pilot/real work, release quarantine, or accept results.
