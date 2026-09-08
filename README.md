@@ -74,7 +74,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v14
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v15
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -87,6 +87,12 @@ Schema v14 also records owner-approved worker registration metadata and bounded
 lifecycle/heartbeat admission. It does not attest builds or capabilities, broker
 credentials, dispatch providers, accept results, or fence restores; see
 [worker lifecycle](docs/worker-lifecycle.md).
+
+Schema v15 adds a human-only, immutable synthetic result checkpoint for a
+reconciled, worker-confirmed operation and a complete exact quarantined manifest.
+It rechecks retained bytes and declared metadata, preserves quarantine and labels
+the validation/receipt limitations. It does not attest provider success, release
+bytes, accept scientific findings, or activate collection/dispatch.
 
 Local [workspace adoption](docs/workspace-adoption.md) now preserves reviewed input
 bytes and their manifest, verifies them after restart, and records adoption in the

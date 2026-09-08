@@ -289,6 +289,7 @@ def test_schema8_manifest_migration_preserves_artifacts_and_uploads(
     with _connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE artifact_manifests")
         connection.execute("DROP TABLE artifact_dispositions")
+        connection.execute("DROP TABLE execution_result_checkpoints")
         connection.execute("UPDATE schema_meta SET schema_version=8")
 
     def fail(connection):
@@ -311,5 +312,5 @@ def test_schema8_manifest_migration_preserves_artifacts_and_uploads(
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 14
-    assert migrate_state(state) == 14
+    assert migrate_state(state) == 15
+    assert migrate_state(state) == 15

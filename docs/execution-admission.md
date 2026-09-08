@@ -114,3 +114,29 @@ Then test real container cancellation, crash recovery, control-plane disconnects
 credential expiry and restore fencing. Worker trust/build registration, secret
 brokering and invoice/usage reconciliation also remain incomplete. Do not treat
 these control-record tests as end-to-end execution acceptance.
+
+## Synthetic result checkpoints (schema v15)
+
+`POST /execution-grants/{id}/result-checkpoint` is a human-only, idempotent
+control command. It records one immutable `committed_quarantined` checkpoint for
+an exact reconciled grant/lease/derived operation and an existing quarantined
+manifest. The request supplies the current reconciled grant revision and epoch,
+lease and operation identities, manifest ID/digest, and the complete declared
+artifact metadata/total under `synthetic-declared-output-v1`. Reusing a command
+key with changed content conflicts; an equivalent commit with another key returns
+the original immutable checkpoint. `GET /projects/{id}/result-checkpoints` lists
+these records under normal project scope.
+
+The commit transaction rechecks current grant/lease epoch, latest confirmed
+`exited` worker observation, reconciliation, manifest ownership/identity,
+non-late quarantine state, exact approved output paths, retained BLOB type/size
+and SHA-256 for every entry. It writes the validation record, audit event and
+idempotency response atomically. Stale, incomplete, corrupt, late, foreign, or
+changed validation inputs are rejected; neither the manifest nor its bytes are
+released or relabeled.
+
+This is deterministic synthetic validation of declared bytes and metadata only.
+The stored record explicitly says `scientific_validity=not_assessed` and
+`execution_receipt=trusted_worker_termination_observation_only`: it does not
+attest provider success, settle previously unresolved exposure, accept a finding,
+or enable runtime collection/provider dispatch.

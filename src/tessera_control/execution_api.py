@@ -18,6 +18,7 @@ from .execution_models import (
     RevokeExecutionGrant,
 )
 from .input_delivery import DeliverInputs, InputDeliveryStore
+from .result_checkpoints import CommitExecutionResultCheckpoint, ResultCheckpointStore
 from .runtime_packages import RuntimePackageStore
 from .snapshot_releases import ReleaseSnapshot, RevokeSnapshotRelease, SnapshotReleaseStore
 from .store import canonical_digest
@@ -50,6 +51,13 @@ Authority = Annotated[ExecutionStore, Depends(execution)]
 Workers = Annotated[WorkerRegistryStore, Depends(workers)]
 Delivery = Annotated[InputDeliveryStore, Depends(input_delivery)]
 Releases = Annotated[SnapshotReleaseStore, Depends(releases)]
+
+
+def result_checkpoints(request: Request) -> ResultCheckpointStore:
+    return ResultCheckpointStore(request.app.state.execution.database_path.parent)
+
+
+Checkpoints = Annotated[ResultCheckpointStore, Depends(result_checkpoints)]
 
 
 def result(value) -> JSONResponse:
@@ -120,6 +128,29 @@ def reconcile_grant(
     return result(
         store.reconcile_execution_grant(actor, grant_id, key, canonical_digest(payload), payload)
     )
+
+
+@router.post("/execution-grants/{grant_id}/result-checkpoint")
+def commit_result_checkpoint(
+    grant_id: str,
+    body: CommitExecutionResultCheckpoint,
+    actor: Actor,
+    key: Key,
+    store: Checkpoints,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(store.commit(actor, grant_id, key, canonical_digest(payload), payload))
+
+
+@router.get("/projects/{project_id}/result-checkpoints")
+def list_result_checkpoints(
+    project_id: str,
+    actor: Actor,
+    store: Checkpoints,
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    return {"result_checkpoints": store.list_checkpoints(actor, project_id, offset, limit)}
 
 
 @router.post("/projects/{project_id}/workers")

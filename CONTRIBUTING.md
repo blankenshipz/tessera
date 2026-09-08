@@ -154,3 +154,7 @@ historical findings; acceptance and scientific review are separate actions.
 Schema 14 adds the worker registry. Its explicit migration preserves v13 records
 and adds no inferred registrations; existing workers must be registered by the
 local owner before they can acquire or renew leases.
+
+Schema 15 adds immutable synthetic result checkpoints. Its explicit migration
+preserves v14 records and adds no inferred checkpoints; retained manifests remain
+quarantined and unclassified.

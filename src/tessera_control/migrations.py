@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 14
+LATEST_SCHEMA_VERSION = 15
 LOCAL_ORG_ID = "org_local"
 
 
@@ -308,6 +308,14 @@ def migrate_v13_to_v14(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 14 WHERE singleton = 1")
 
 
+def migrate_v14_to_v15(connection: sqlite3.Connection) -> None:
+    """Add immutable synthetic result checkpoint records without touching v14 evidence."""
+    from .result_checkpoints import create_result_checkpoint_schema
+
+    create_result_checkpoint_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 15 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -322,6 +330,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     11: migrate_v11_to_v12,
     12: migrate_v12_to_v13,
     13: migrate_v13_to_v14,
+    14: migrate_v14_to_v15,
 }
 
 

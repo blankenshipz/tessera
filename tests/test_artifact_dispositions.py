@@ -109,6 +109,7 @@ def test_v9_to_v10_migration_is_transactional_and_preserves_manifest(tmp_path: P
     header = (state / "owner.header").read_bytes()
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE artifact_dispositions")
+        connection.execute("DROP TABLE execution_result_checkpoints")
         connection.execute("UPDATE schema_meta SET schema_version=9")
 
     def fail(connection):
@@ -132,8 +133,8 @@ def test_v9_to_v10_migration_is_transactional_and_preserves_manifest(tmp_path: P
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 14
-    assert migrate_state(state) == 14
+    assert migrate_state(state) == 15
+    assert migrate_state(state) == 15
     assert _retained_records(state) == retained
     assert (state / "owner.header").read_bytes() == header
 

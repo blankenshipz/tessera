@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v14 worker-lifecycle slice and the
+Reviewed 2026-09-08 against the schema v15 synthetic result-checkpoint slice and the
 synthetic OpenCode harness adapter POC. The POC is adapter conformance evidence,
 not a live integration, compatibility result, or pilot completion.
 **Implemented** means the named bounded behavior has executable evidence;
@@ -18,7 +18,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Structured harness transport and frozen execution packages | Skill author/editor, tests, trusted release, pinned mediated loading; OpenCode skills/MCP remain upstream capabilities behind an unimplemented adapter; development agent skills are not runtime skills |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, and synthetic durable output sealing/recovery | Backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, synthetic durable output sealing/recovery, and human-only synthetic byte/metadata result checkpoints | Backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation and duration enforcement | Writer quiescence, edit ownership, fresh-context handback |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
@@ -45,7 +45,7 @@ full workflow and its required adverse cases pass on the supported target.
 - At `ee6c36d`: 363 Python tests pass natively; Linux CI passed for that commit.
 - Ruff lint and format checks pass.
 - 62 desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v14 preserve historical records, input bytes,
+- Explicit migrations through schema v15 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -180,6 +180,13 @@ representative investigation have not passed end-to-end acceptance.
     artifact/result acceptance, credential path, compatibility result, or pilot
     completion. See [the adapter note](opencode-harness.md).
 
+18. **Synthetic result checkpoint:** schema v15 records a human-only immutable
+    checkpoint after a reconciled, worker-confirmed exit, exact operation/epoch,
+    complete non-late quarantined manifest, and deterministic retained-byte/metadata
+    validation. It preserves quarantine and labels both synthetic validation and
+    trusted-worker receipt limitations; it does not accept findings or provider
+    success. See [execution admission](execution-admission.md).
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -215,6 +222,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `47383a4`: terminal finding retraction and preserving schema 12 migration.
 - `ee6c36d`: linked narrowing/supersession, schema 13 and native export/restore integration.
 - `175a5b3`: schema v14 worker registration, liveness admission and retirement revocation.
+- Pending commit: schema v15 synthetic quarantined result checkpoint.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
@@ -247,7 +255,7 @@ representative research question/dataset remain open configuration inputs.
 
 1. Verified persistent output storage and real runtime collection, quarantine
    release policy, and fenced authoritative result acceptance. Synthetic sealing
-   evidence is not backend activation or real pilot acceptance.
+   and result-checkpoint evidence are not backend activation or real pilot acceptance.
 2. Cryptographic worker build trust, capability probes, credential brokering and
    operational spend/incident reconciliation. Registration/drain/quarantine/
    retirement and bounded heartbeat admission are implemented; see

@@ -11,6 +11,7 @@ from tessera_control.store import Store, migrate_state
 def _v6(tmp_path):
     state, _, _, _, grant, lease = _delivery(tmp_path)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DROP TABLE execution_result_checkpoints")
         connection.execute("DROP TABLE artifact_dispositions")
         connection.execute("DROP TABLE artifact_manifests")
         connection.execute("DROP TABLE artifact_uploads")
@@ -40,8 +41,8 @@ def test_schema6_migration_preserves_live_authority_and_exposure(tmp_path):
     state, grant, lease = _v6(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 14
-    assert migrate_state(state) == 14
+    assert migrate_state(state) == 15
+    assert migrate_state(state) == 15
     _assert_authority_preserved(state, grant, lease)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
@@ -65,4 +66,4 @@ def test_artifact_migration_failure_rolls_back_ddl_and_preserves_authority(tmp_p
             connection.execute("SELECT 1 FROM sqlite_master WHERE name='artifacts'").fetchone()
             is None
         )
-    assert migrate_state(state) == 14
+    assert migrate_state(state) == 15

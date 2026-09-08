@@ -123,8 +123,9 @@ def test_schema7_migration_preserves_existing_artifact_bytes_and_replay(tmp_path
         connection.execute("DROP TABLE artifact_dispositions")
         connection.execute("DROP TABLE artifact_manifests")
         connection.execute("DROP TABLE artifact_uploads")
+        connection.execute("DROP TABLE execution_result_checkpoints")
         connection.execute("UPDATE schema_meta SET schema_version=7")
-    assert migrate_state(state) == 14
+    assert migrate_state(state) == 15
     assert ArtifactStore(state).upload_artifact(*args) == original
     with _connect(store.database_path) as connection:
         assert (
