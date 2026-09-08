@@ -196,7 +196,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `f674603`: reasoned finding reaffirmation and project-scoped record access.
 - `47383a4`: terminal finding retraction and preserving schema 12 migration.
 - `ee6c36d`: linked narrowing/supersession, schema 13 and native export/restore integration.
-- Pending commit: schema v14 worker registration, liveness admission and retirement revocation.
+- `175a5b3`: schema v14 worker registration, liveness admission and retirement revocation.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.
