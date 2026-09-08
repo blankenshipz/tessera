@@ -1,7 +1,11 @@
 # Tessera design
 
-Status: implementation contract and roadmap. The local control-plane foundation
-is implemented; README.md lists the runnable scope.
+Status: implementation contract and roadmap; the full pilot is not implemented.
+The control plane, bounded CPU execution components, desktop research records,
+and reasoned finding review are implemented in slices. See the
+[implementation status matrix](docs/implementation-progress.md#design-status-matrix)
+for what is implemented, partial, blocked, or deferred, with remaining acceptance
+work. README.md describes the runnable scope.
 This document defines the pilot, the contracts it must satisfy, and the order of
 implementation. “Required” describes intended behavior, not a verified guarantee.
 
@@ -563,6 +567,12 @@ instrument/calibration where applicable, and review state. Low-risk annotations
 use lighter schemas; required missing checks hold dependent confirmatory work.
 
 ## 8. Implementation sequence and acceptance
+
+The table below is the target sequence, not a completion checklist. Current
+completion evidence and outstanding work live in the
+[status matrix](docs/implementation-progress.md#design-status-matrix).
+A component passing synthetic tests does not complete a workflow or the pilot.
+Update that tracker with every behavior-changing implementation checkpoint.
 
 Implement vertical slices through the modules, not complete horizontal platforms.
 These are the pilot's engineering tasks; each produces code, tests and a short
