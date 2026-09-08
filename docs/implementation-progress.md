@@ -18,7 +18,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Structured harness transport and frozen execution packages | Skill author/editor, tests, trusted release, pinned mediated loading; OpenCode skills/MCP remain upstream capabilities behind an unimplemented adapter; development agent skills are not runtime skills |
-| §2.3 Plan/approve/execute | Partial; output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, and fail-closed persistent-output-storage package contract | Backend-enforced persistent storage, sealing/collection, authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, and synthetic durable output sealing/recovery | Backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation and duration enforcement | Writer quiescence, edit ownership, fresh-context handback |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
@@ -90,9 +90,14 @@ representative investigation have not passed end-to-end acceptance.
    declared bytes and recover committed progress after lost replies; binary chunks
    remain quarantined after checksum verification. Review corrected restart field
    matching, SQLite binary concatenation and metadata queries. Complete output
-   manifests now require the exact approved path set and recheck bounded retained
-   bytes before recording immutable quarantine metadata. Worker transfer resumes
-   after lost manifest responses. See [artifact quarantine](artifact-quarantine.md).
+    manifests now require the exact approved path set and recheck bounded retained
+    bytes before recording immutable quarantine metadata. Worker transfer resumes
+    after lost manifest responses. A synthetic-only private SQLite seal journal
+    now requires a fresh matching termination observation before descriptor-relative
+    collection, retains immutable bytes/digests and its manifest before transfer,
+    and resumes a lost upload/manifest response after worker restart. It is not
+    connected to a real CPU runtime or storage backend. See
+    [artifact quarantine](artifact-quarantine.md).
 9. **Desktop shell:** isolated renderer, sender-checked IPC, named connections,
    project/draft/approval/labbook views, attributed conversations and explicit
    revision-bound human decision resolution. Review corrected draft carryover, delayed thread
@@ -237,8 +242,9 @@ representative research question/dataset remain open configuration inputs.
 
 ## Remaining milestones
 
-1. Verified persistent output storage, durable sealing and runtime collection,
-   quarantine release policy, and fenced authoritative result acceptance.
+1. Verified persistent output storage and real runtime collection, quarantine
+   release policy, and fenced authoritative result acceptance. Synthetic sealing
+   evidence is not backend activation or real pilot acceptance.
 2. Cryptographic worker build trust, capability probes, credential brokering and
    operational spend/incident reconciliation. Registration/drain/quarantine/
    retirement and bounded heartbeat admission are implemented; see

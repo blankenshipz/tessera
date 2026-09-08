@@ -57,11 +57,15 @@ rejects links, aliases, special files, cross-device traversal, and oversized fil
 and returns immutable bytes only when the entire read succeeds. It neither
 establishes provider termination nor attests storage enforcement.
 
-Next integration steps are durable sealed manifests, reserved staging capacity,
-restart recovery, and resumable transfer outside the cancellation loop. Missing
-or unsafe outputs remain collection failures; neither file integrity nor provider
-exit establishes scientific success. The control plane retains attributable
-late output in quarantine.
+Synthetic fixture coverage now has a local SQLite sealed-output journal under a
+private synthetic runtime root. It requires a fresh matching control-acknowledged
+termination observation, seals immutable bytes/digests and a local manifest before
+the existing resumable transfer, and resumes lost upload/manifest responses after a
+worker restart. It is not wired to the CPU runtime or an output-storage backend.
+Next real integration steps remain verified reserved staging capacity, recovery,
+and resumable transfer outside the cancellation loop. Missing or unsafe outputs
+remain collection failures; neither file integrity nor provider exit establishes
+scientific success. The control plane retains attributable late output in quarantine.
 
 ## Activation evidence required
 

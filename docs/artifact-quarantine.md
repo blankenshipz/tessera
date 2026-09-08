@@ -84,6 +84,25 @@ provider termination, enforces a filesystem quota, or durably seals source bytes
 Automatic runtime collection remains disabled until the
 [persistent output-storage gates](decisions/0003-persistent-output-storage.md) pass.
 
+`tessera_worker.sealed_outputs.SealedOutputJournal` adds synthetic fixture-only
+evidence for the missing local custody step. Under a private `0700` synthetic
+runtime root it requires a fresh, matching control-acknowledged exited/termination
+observation before calling `collect_outputs`, then atomically stores the immutable
+bytes, digests, exact local seal manifest, and termination-observation identity in
+SQLite. A restart resumes those sealed bytes through `upload_output_set`; a lost
+upload or manifest response therefore retains the same operation and seal identity
+without rereading a changed workspace. Recalling `seal` detects changed bytes or a
+conflicting declaration. This local journal is not control authority and does not
+make the worker observation more authoritative than its existing operational-only
+meaning.
+
+The journal is deliberately not wired to `CpuRuntime`'s post-exit path. In
+particular, it does not activate a macOS Docker Desktop output backend, reserve or
+reclaim a storage slot, collect real runtime output automatically, release
+quarantine, accept a result, dispatch a provider, use credentials, or establish
+scientific success. The existing service continues to reject undeclared manifest
+paths and stale epochs, and retains attributable late bytes as quarantine only.
+
 ## Human manifest dispositions
 
 Completed worker outputs remain quarantined after a manifest is admitted. A
