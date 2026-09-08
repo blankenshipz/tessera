@@ -11,6 +11,7 @@ from .execution_models import (
     AcquireExecutionLease,
     ConfigureProjectExecution,
     IssueExecutionGrant,
+    PrepareExecutionPackage,
     ReconcileExecutionGrant,
     RenewExecutionLease,
     ReportExecutionObservation,
@@ -160,12 +161,18 @@ def deliver_inputs(
 
 @router.post("/worker/leases/{lease_id}/package")
 def execution_package(
-    lease_id: str, body: DeliverInputs, worker: Worker, key: Key, store: Authority
+    lease_id: str, body: PrepareExecutionPackage, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
     return result(
         RuntimePackageStore(store.database_path.parent).execution_package(
-            worker, lease_id, key, canonical_digest(payload), body.expected_epoch
+            worker,
+            lease_id,
+            key,
+            canonical_digest(payload),
+            body.expected_epoch,
+            body.persistent_output_collection is True,
+            body.persistent_output_storage,
         )
     )
 

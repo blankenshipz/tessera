@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
@@ -99,6 +99,12 @@ class AcquireExecutionLease(ExecutionRequest):
 class RenewExecutionLease(ExecutionRequest):
     lease_id: Identifier
     expected_epoch: Revision
+
+
+class PrepareExecutionPackage(ExecutionRequest):
+    expected_epoch: Revision
+    persistent_output_collection: Literal[True] | None = None
+    persistent_output_storage: dict[str, Any] | None = None
 
 
 class ReportExecutionObservation(ExecutionRequest):

@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from tessera_control.persistent_output_storage import validate_persistent_output_storage
+
 from .cpu import CpuOperation
 from .inputs import materialize_snapshot
 from .supervisor import CpuSupervisor, DriverResult, Lease, SupervisorError
@@ -45,6 +47,8 @@ class CpuRuntime:
         adapter: Any,
         *,
         worker_id: str,
+        persistent_output_collection: bool = False,
+        persistent_output_storage: dict[str, Any] | None = None,
     ):
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -56,6 +60,8 @@ class CpuRuntime:
         self.channel = channel
         self.adapter = adapter
         self.worker_id = worker_id
+        self.persistent_output_collection = persistent_output_collection
+        self.persistent_output_storage = persistent_output_storage
         self.descriptor: dict[str, Any] | None = None
         self.operation: CpuOperation | None = None
         self.lease: Lease | None = None
@@ -71,9 +77,13 @@ class CpuRuntime:
         self.close()
 
     def _request_package(self, lease_id: str, epoch: int) -> dict[str, Any]:
+        body: dict[str, Any] = {"expected_epoch": epoch}
+        if self.persistent_output_collection:
+            body["persistent_output_collection"] = True
+            body["persistent_output_storage"] = self.persistent_output_storage
         return self.channel.post(
             f"/worker/leases/{lease_id}/package",
-            {"expected_epoch": epoch},
+            body,
             f"runtime-package-{lease_id}",
         )
 
@@ -104,6 +114,20 @@ class CpuRuntime:
                 != hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
             ):
                 raise SupervisorError("Control package does not match runtime authority.")
+            capability = package.get("persistent_output_storage")
+            if self.persistent_output_collection:
+                if capability is None:
+                    raise SupervisorError("Control package lacks persistent output storage.")
+                if validate_persistent_output_storage(capability) != self.persistent_output_storage:
+                    raise SupervisorError("Control package persistent output storage changed.")
+                if spec["max_output_bytes"] > capability["capacity_bytes"]:
+                    raise SupervisorError(
+                        "Control package output storage capacity is insufficient."
+                    )
+            elif capability is not None:
+                raise SupervisorError(
+                    "Control package unexpectedly enables persistent output storage."
+                )
             expiry = datetime.fromisoformat(lease["expires_at"])
             hard_expiry = datetime.fromisoformat(lease["hard_expires_at"])
             if expiry.tzinfo is None or hard_expiry.tzinfo is None or expiry > hard_expiry:

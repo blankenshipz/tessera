@@ -16,7 +16,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Structured harness transport and frozen execution packages | Skill author/editor, tests, trusted release, pinned mediated loading; development agent skills are not runtime skills |
-| §2.3 Plan/approve/execute | Partial; output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor and live HTTP/input fixtures | Verified persistent output storage, sealing/collection, authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, and fail-closed persistent-output-storage package contract | Backend-enforced persistent storage, sealing/collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation and duration enforcement | Writer quiescence, edit ownership, fresh-context handback |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
@@ -117,6 +117,14 @@ representative investigation have not passed end-to-end acceptance.
     Independent review found and fixed a hardlink race between preflight and open.
     The low-level reader returns immutable bytes; automatic runtime collection
     remains gated on verified persistent storage and durable sealing.
+
+    **Persistent output-storage contract:** a new package can explicitly request
+    version 1 capability evidence for fixed byte/inode capacity, mount/filesystem
+    identity, execution restrictions, UID 65532 write access, custody, and no
+    nested mounts. Synthetic contract tests fail closed and freeze validated
+    identity/capacity into the package digest. This does not activate a backend,
+    mount storage, reserve a slot, collect automatically, release quarantine, or
+    accept a result.
 
 11. **Human quarantine review:** digest-bound, revision-checked dispositions append
     attributed history. Rejection retains evidence; continued quarantine releases

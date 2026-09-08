@@ -13,6 +13,25 @@ from tessera_control.store import Conflict, _connect, canonical_digest
 from tessera_worker.runtime import CpuRuntime
 
 
+def _persistent_storage(**changes):
+    capability = {
+        "contract_version": 1,
+        "allocation_id": "slot-fixture-1",
+        "filesystem_id": "filesystem-fixture-1",
+        "mount_id": "mount-fixture-1",
+        "capacity_bytes": 16 * 1024 * 1024,
+        "capacity_inodes": 128,
+        "noexec": True,
+        "nosuid": True,
+        "nodev": True,
+        "write_uid": 65532,
+        "write_access_verified": True,
+        "supervisor_custody_verified": True,
+        "no_nested_mounts_verified": True,
+    }
+    return capability | changes
+
+
 class ApiChannel:
     def __init__(self, state):
         self.client = TestClient(create_app(state))
@@ -42,6 +61,7 @@ def test_package_identity_is_stable_and_replay_checks_current_authority(tmp_path
     first = store.execution_package(*request)[1]
     assert first["package"]["plan_digest"] == grant["plan_digest"]
     assert first["package"]["pinned_image"] == grant["pinned_image"]
+    assert "persistent_output_storage" not in first["package"]
     assert first["execution_dispatched"] is False
     assert store.execution_package(*request)[1] == first
     renewed = execution.renew_execution_lease(
@@ -63,6 +83,61 @@ def test_corrupt_plan_does_not_produce_a_package(tmp_path):
         )
     with pytest.raises(Conflict, match="checksum"):
         RuntimePackageStore(state).execution_package(worker, lease["id"], "p", "p", lease["epoch"])
+
+
+@pytest.mark.parametrize(
+    ("capability", "message"),
+    [
+        (None, "capability is required"),
+        (_persistent_storage(noexec=False), "requires noexec"),
+        (_persistent_storage(no_nested_mounts_verified=False), "no_nested_mounts_verified"),
+    ],
+)
+def test_persistent_output_storage_admission_fails_closed(tmp_path, capability, message):
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    with pytest.raises(Conflict, match=message):
+        RuntimePackageStore(state).execution_package(
+            worker, lease["id"], "persistent", "persistent", lease["epoch"], True, capability
+        )
+
+
+def test_persistent_output_storage_is_frozen_and_changed_capacity_rejects_replay(tmp_path):
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    store = RuntimePackageStore(state)
+    capability = _persistent_storage()
+    response = store.execution_package(
+        worker, lease["id"], "persistent", "persistent", lease["epoch"], True, capability
+    )[1]
+    assert response["package"]["persistent_output_storage"] == capability
+    assert response["package_digest"] == canonical_digest(response["package"])
+    with pytest.raises(Conflict, match="package changed"):
+        store.execution_package(
+            worker,
+            lease["id"],
+            "persistent",
+            "persistent",
+            lease["epoch"],
+            True,
+            _persistent_storage(capacity_bytes=32 * 1024 * 1024),
+        )
+
+
+def test_persistent_output_storage_failure_precedes_supervisor_effects(tmp_path):
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    root = tmp_path / "inputs"
+    root.mkdir(mode=0o700)
+    adapter = FakeAdapter()
+    with CpuRuntime(
+        tmp_path / "runtime",
+        root,
+        ApiChannel(state),
+        adapter,
+        worker_id=worker["id"],
+        persistent_output_collection=True,
+    ) as runtime:
+        with pytest.raises(ConnectionError, match="409"):
+            runtime.start(lease["id"], lease["epoch"])
+    assert adapter.calls == []
 
 
 @pytest.mark.parametrize("failure", ["revoke", "disconnect"])

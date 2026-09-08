@@ -9,11 +9,12 @@ from typing import Any
 from .execution import ExecutionStore
 from .migrations import plan_payload
 from .models import ExecutionSpec
+from .persistent_output_storage import validate_persistent_output_storage
 from .store import Conflict, NotFound, StoreError, _parse_utc, canonical_digest
 
 
 class RuntimePackageStore(ExecutionStore):
-    def _package(self, connection, worker, lease_id, epoch):
+    def _package(self, connection, worker, lease_id, epoch, persistent_output_storage):
         lease = connection.execute(
             "SELECT * FROM execution_leases WHERE id = ?", (lease_id,)
         ).fetchone()
@@ -75,12 +76,23 @@ class RuntimePackageStore(ExecutionStore):
             "pinned_image": grant["pinned_image"],
             "hard_expires_at": lease["hard_expires_at"],
         }
+        if persistent_output_storage is not None:
+            if spec["max_output_bytes"] > persistent_output_storage["capacity_bytes"]:
+                raise Conflict("Persistent output storage byte capacity is below declared outputs.")
+            package["persistent_output_storage"] = persistent_output_storage
         if expiry <= self._now():
             raise Conflict("Execution lease expired while preparing its package.")
         return {"package": package, "package_digest": canonical_digest(package)}, dict(lease)
 
     def execution_package(
-        self, worker: dict[str, Any], lease_id: str, key: str, digest: str, expected_epoch: int
+        self,
+        worker: dict[str, Any],
+        lease_id: str,
+        key: str,
+        digest: str,
+        expected_epoch: int,
+        persistent_output_collection: bool = False,
+        persistent_output_storage: Any = None,
     ) -> tuple[int, dict[str, Any]]:
         if (
             not isinstance(lease_id, str)
@@ -89,10 +101,22 @@ class RuntimePackageStore(ExecutionStore):
             or not 1 <= expected_epoch <= 2**63 - 1
         ):
             raise StoreError("Invalid package request.")
+        if persistent_output_collection:
+            if persistent_output_storage is None:
+                raise Conflict("Persistent output storage capability is required.")
+            persistent_output_storage = validate_persistent_output_storage(
+                persistent_output_storage
+            )
+        elif persistent_output_storage is not None:
+            raise Conflict(
+                "Persistent output storage capability requires persistent output collection."
+            )
         live_lease: dict[str, Any] = {}
 
         def command(connection, live):
-            metadata, lease = self._package(connection, live, lease_id, expected_epoch)
+            metadata, lease = self._package(
+                connection, live, lease_id, expected_epoch, persistent_output_storage
+            )
             live_lease.update(lease)
             package = metadata["package"]
             self._event(
@@ -112,7 +136,9 @@ class RuntimePackageStore(ExecutionStore):
             return 201, metadata
 
         def replay_guard(connection, live, cached):
-            metadata, lease = self._package(connection, live, lease_id, expected_epoch)
+            metadata, lease = self._package(
+                connection, live, lease_id, expected_epoch, persistent_output_storage
+            )
             if cached != metadata:
                 raise Conflict("Execution package changed since admission.")
             live_lease.update(lease)

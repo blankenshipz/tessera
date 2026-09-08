@@ -63,3 +63,18 @@ test fixture and a successful simulated stop are not proof of those guarantees.
 
 See [the persistent output-storage decision](decisions/0003-persistent-output-storage.md)
 for the quota and custody gates before collection can be enabled.
+
+## Persistent output-storage admission contract
+
+A package request can explicitly request persistent output collection only with
+the `persistent-output-storage` contract version 1. The trusted supervisor's
+capability declaration must name the allocation, filesystem and mount and prove
+fixed byte and inode capacity, `noexec`/`nosuid`/`nodev`, UID 65532 write access,
+supervisor custody, and no nested mounts. Missing, malformed, unverified, or
+undersized declarations fail package admission before input staging or any
+supervisor/provider call. The validated identity and capacities are frozen into
+that new package and digest; a changed declaration cannot replay it.
+
+This is only a synthetic, fail-closed capability contract. Tessera does not yet
+activate a storage backend, create a writable mount, reserve/reclaim a slot,
+automatically collect outputs, release quarantine, or accept results.
