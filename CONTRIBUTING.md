@@ -158,3 +158,6 @@ local owner before they can acquire or renew leases.
 Schema 15 adds immutable synthetic result checkpoints. Its explicit migration
 preserves v14 records and adds no inferred checkpoints; retained manifests remain
 quarantined and unclassified.
+
+Schema 16 adds metadata-only skill snapshots and worker-targeted release records.
+It adds no inferred releases; local CPU skill materialization remains unavailable.

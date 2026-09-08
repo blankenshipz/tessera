@@ -70,6 +70,8 @@ def create_app(state_dir: Path) -> FastAPI:
     from .interaction_api import router as interaction_router
     from .research import ResearchStore
     from .research_api import router as research_router
+    from .skill_api import router as skill_router
+    from .skills import SkillStore
     from .snapshot_releases import SnapshotReleaseStore
     from .snapshots import SnapshotStore
 
@@ -78,7 +80,9 @@ def create_app(state_dir: Path) -> FastAPI:
     app.state.store = store
     app.state.execution = ExecutionStore(state_dir)
     app.state.snapshot_releases = SnapshotReleaseStore(state_dir)
+    app.state.skills = SkillStore(state_dir)
     app.include_router(execution_router)
+    app.include_router(skill_router)
     app.include_router(artifact_router)
     app.include_router(artifact_disposition_router)
     app.state.research = ResearchStore(state_dir)

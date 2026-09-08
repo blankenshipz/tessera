@@ -407,8 +407,6 @@ class ExecutionStore(Store):
                 spec = json.loads(spec_row["execution_spec_json"])
             except (TypeError, json.JSONDecodeError) as error:
                 raise Conflict("Task execution specification is invalid.") from error
-            if spec.get("pinned_skill_digests"):
-                raise Conflict("Pinned skills are not supported by the local CPU pilot.")
             if spec.get("profile") != "local-cpu" or spec.get("network_enabled") is not False:
                 raise Conflict("Task execution profile is not supported by the local CPU pilot.")
             expected_digest = spec.get("input_snapshot_digest")
@@ -417,6 +415,12 @@ class ExecutionStore(Store):
             worker = self._worker(
                 connection, actor["org_id"], payload["worker_principal_id"], project_id
             )
+            from .skills import authorize_skill_release
+
+            skill_releases = [
+                authorize_skill_release(connection, actor, project_id, skill_digest, worker["id"])
+                for skill_digest in spec["pinned_skill_digests"]
+            ]
             release = self._authorize_snapshot(
                 connection, actor, payload["snapshot_id"], worker["id"], expected_digest
             )
@@ -498,6 +502,16 @@ class ExecutionStore(Store):
                 :expires_at, :created_at, :updated_at, :created_by_principal_id)""",
                 row,
             )
+            connection.executemany(
+                """INSERT INTO execution_grant_skills (grant_id,digest,skill_release_id,expires_at)
+                VALUES (?,?,?,?)""",
+                (
+                    (ident, skill_digest, release["id"], release["expires_at"])
+                    for skill_digest, release in zip(
+                        spec["pinned_skill_digests"], skill_releases, strict=True
+                    )
+                ),
+            )
             connection.execute(
                 """UPDATE execution_project_limits SET held_cents = held_cents + ?,
                 updated_at = ? WHERE project_id = ?""",
@@ -515,6 +529,7 @@ class ExecutionStore(Store):
                     "epoch": epoch,
                     "worker_principal_id": worker["id"],
                     "snapshot_release_id": release["id"],
+                    "pinned_skill_digests": spec["pinned_skill_digests"],
                     "max_exposure_cents": payload["max_exposure_cents"],
                     "currency": limits["currency"],
                     "operational_only": True,
@@ -666,6 +681,41 @@ class ExecutionStore(Store):
             raise Conflict("Snapshot release expiry is invalid.") from error
         if release_expiry < expiry or release["id"] != grant["snapshot_release_id"]:
             raise Forbidden("Snapshot release no longer covers this grant.")
+        from .skills import authorize_skill_release
+
+        skill_rows = connection.execute(
+            """SELECT digest, skill_release_id, expires_at FROM execution_grant_skills
+            WHERE grant_id=?""",
+            (grant["id"],),
+        ).fetchall()
+        revision = connection.execute(
+            """SELECT execution_spec_json FROM task_revisions WHERE task_id=? AND revision=?
+            AND plan_digest=?""",
+            (grant["task_id"], grant["task_revision"] - 1, grant["plan_digest"]),
+        ).fetchone()
+        try:
+            pinned = json.loads(revision["execution_spec_json"])["pinned_skill_digests"]
+        except (TypeError, KeyError, json.JSONDecodeError) as error:
+            raise Conflict("Execution grant skill basis is invalid.") from error
+        if len(skill_rows) != len(pinned):
+            raise Conflict("Execution grant skill release basis is incomplete.")
+        by_digest = {row["digest"]: row for row in skill_rows}
+        if len(by_digest) != len(skill_rows) or set(by_digest) != set(pinned):
+            raise Conflict("Execution grant skill release basis is invalid.")
+        for skill_digest in pinned:
+            frozen = by_digest[skill_digest]
+            if _parse_utc(frozen["expires_at"]) < expiry:
+                raise Forbidden("Skill release no longer covers this grant.")
+            current = authorize_skill_release(
+                connection,
+                worker,
+                grant["project_id"],
+                skill_digest,
+                worker["id"],
+                frozen["skill_release_id"],
+            )
+            if _parse_utc(current["expires_at"]) < expiry:
+                raise Forbidden("Skill release no longer covers this grant.")
         return grant
 
     def _guard_lease_replay(

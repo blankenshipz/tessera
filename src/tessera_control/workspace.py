@@ -389,6 +389,14 @@ def _skill_metadata(payload: bytes) -> tuple[str, str]:
     return name, description
 
 
+def skill_manifest_digest(manifest: tuple[tuple[str, str, int], ...]) -> str:
+    """Return the stable content digest used by an instruction-only skill snapshot."""
+    encoded = "".join(
+        f"{path}\0{digest}\0{size}\n" for path, digest, size in sorted(manifest)
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def snapshot_skill(
     root: str | os.PathLike[str],
     *,
@@ -467,11 +475,10 @@ def snapshot_skill(
         if metadata is None:
             raise WorkspaceError("skill requires a regular SKILL.md")
         manifest.sort(key=lambda item: item[0])
-        encoded = "".join(f"{path}\0{digest}\0{size}\n" for path, digest, size in manifest).encode()
         return SkillSnapshot(
             qualified_name or metadata[0],
             metadata[1],
-            hashlib.sha256(encoded).hexdigest(),
+            skill_manifest_digest(tuple(manifest)),
             tuple(manifest),
         )
     finally:

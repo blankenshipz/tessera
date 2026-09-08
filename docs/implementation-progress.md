@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v15 synthetic result-checkpoint slice and the
+Reviewed 2026-09-08 against the schema v16 bounded skill lifecycle and the
 synthetic OpenCode harness adapter POC. The POC is adapter conformance evidence,
 not a live integration, compatibility result, or pilot completion.
 **Implemented** means the named bounded behavior has executable evidence;
@@ -17,7 +17,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | Design contract | Status | Implemented evidence/scope | Remaining acceptance work |
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
-| §2.2 Runtime skills | Partial | Structured harness transport and frozen execution packages | Skill author/editor, tests, trusted release, pinned mediated loading; OpenCode skills/MCP remain upstream capabilities behind an unimplemented adapter; development agent skills are not runtime skills |
+| §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
 | §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, synthetic durable output sealing/recovery, and human-only synthetic byte/metadata result checkpoints | Backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation and duration enforcement | Writer quiescence, edit ownership, fresh-context handback |
@@ -45,7 +45,7 @@ full workflow and its required adverse cases pass on the supported target.
 - At `ee6c36d`: 363 Python tests pass natively; Linux CI passed for that commit.
 - Ruff lint and format checks pass.
 - 62 desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v15 preserve historical records, input bytes,
+- Explicit migrations through schema v16 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -187,6 +187,12 @@ representative investigation have not passed end-to-end acceptance.
     trusted-worker receipt limitations; it does not accept findings or provider
     success. See [execution admission](execution-admission.md).
 
+19. **Bounded skill lifecycle:** schema v16 persists deterministic manifest,
+    metadata and digest snapshots from non-executing validation, then human-only
+    worker releases with expiry/revocation. Pin admission freezes and rechecks the
+    release; local CPU package/runtime loading remains explicitly rejected. See
+    [skill lifecycle](skill-lifecycle.md).
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -222,7 +228,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `47383a4`: terminal finding retraction and preserving schema 12 migration.
 - `ee6c36d`: linked narrowing/supersession, schema 13 and native export/restore integration.
 - `175a5b3`: schema v14 worker registration, liveness admission and retirement revocation.
-- Pending commit: schema v15 synthetic quarantined result checkpoint.
+- Pending commit: schema v16 bounded skill lifecycle.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.

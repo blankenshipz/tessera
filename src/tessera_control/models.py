@@ -73,6 +73,13 @@ class ExecutionSpec(StrictRequest):
             raise ValueError("output paths must be unique")
         return paths
 
+    @field_validator("pinned_skill_digests")
+    @classmethod
+    def pinned_skills_are_unique(cls, digests: list[str]) -> list[str]:
+        if len(digests) != len(set(digests)):
+            raise ValueError("pinned skill digests must be unique")
+        return digests
+
 
 class ReviseTaskPlan(StrictRequest):
     expected_revision: StrictRevision

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 15
+LATEST_SCHEMA_VERSION = 16
 LOCAL_ORG_ID = "org_local"
 
 
@@ -316,6 +316,14 @@ def migrate_v14_to_v15(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 15 WHERE singleton = 1")
 
 
+def migrate_v15_to_v16(connection: sqlite3.Connection) -> None:
+    """Add metadata-only skill snapshots, worker releases and grant release bindings."""
+    from .skills import create_skill_schema
+
+    create_skill_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 16 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -331,6 +339,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     12: migrate_v12_to_v13,
     13: migrate_v13_to_v14,
     14: migrate_v14_to_v15,
+    15: migrate_v15_to_v16,
 }
 
 

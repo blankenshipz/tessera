@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 15);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 16);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -191,6 +191,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .recovery import create_recovery_schema
     from .research import create_research_schema
     from .result_checkpoints import create_result_checkpoint_schema
+    from .skills import create_skill_schema
     from .snapshot_releases import create_release_schema
     from .snapshots import create_snapshot_schema
     from .workers import create_worker_schema
@@ -207,6 +208,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_recovery_schema(connection)
     create_worker_schema(connection)
     create_result_checkpoint_schema(connection)
+    create_skill_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

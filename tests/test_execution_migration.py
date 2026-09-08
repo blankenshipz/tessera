@@ -21,6 +21,9 @@ AUTHORITY_TABLES = (
     "execution_project_limits",
     "execution_result_checkpoints",
     "snapshot_releases",
+    "execution_grant_skills",
+    "skill_releases",
+    "skill_snapshots",
 )
 
 
@@ -49,10 +52,10 @@ def test_schema5_requires_migration_and_preserves_snapshot_bytes(tmp_path):
     state, actor, snapshot = old_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 15
+    assert migrate_state(state) == 16
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
     assert verified["integrity"] == "verified" and verified["digest"] == snapshot["digest"]
-    assert migrate_state(state) == 15
+    assert migrate_state(state) == 16
 
 
 def test_v13_worker_registry_migration_preserves_existing_records(tmp_path):
@@ -69,7 +72,7 @@ def test_v13_worker_registry_migration_preserves_existing_records(tmp_path):
         create_artifact_manifest_schema(connection)
         create_artifact_disposition_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=13")
-    assert migrate_state(state) == 15
+    assert migrate_state(state) == 16
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM worker_registry").fetchone()[0] == 0
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
@@ -100,7 +103,7 @@ def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
             ).fetchone()[0]
             == b"Retain exact bytes"
         )
-    assert migrate_state(state) == 15
+    assert migrate_state(state) == 16
 
 
 def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monkeypatch):
@@ -111,6 +114,9 @@ def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monk
         connection.execute("DROP TABLE artifact_manifests")
         connection.execute("DROP TABLE artifact_uploads")
         connection.execute("DROP TABLE execution_result_checkpoints")
+        connection.execute("DROP TABLE execution_grant_skills")
+        connection.execute("DROP TABLE skill_releases")
+        connection.execute("DROP TABLE skill_snapshots")
         connection.execute("UPDATE schema_meta SET schema_version=7")
 
     def fail(connection):
@@ -131,5 +137,5 @@ def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monk
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 15
-    assert migrate_state(state) == 15
+    assert migrate_state(state) == 16
+    assert migrate_state(state) == 16
