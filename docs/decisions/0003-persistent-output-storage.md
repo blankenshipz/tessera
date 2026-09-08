@@ -30,6 +30,15 @@ container cannot exceed the slot's bounds. A configuration boolean, free-space
 check, or quota measured only on a Docker Desktop host is insufficient: bind
 mounts are interpreted on the [Docker daemon's host](https://docs.docker.com/engine/storage/bind-mounts/).
 
+The worker now has a read-only Linux inspection probe for an already-provisioned
+dedicated output mount. It returns the existing version 1 contract only after
+non-following path/replacement, ownership/mode, mount identity/options, nested
+mount, capacity, and UID 65532 access checks pass. It never mounts, resizes,
+changes custody, writes a test file, or invokes a privileged helper. macOS
+Docker Desktop and every non-Linux platform are non-admissible from host facts.
+This is not the backend enforcement probe: decisive Linux Docker-host byte/inode
+exhaustion, container exit, and worker-restart evidence remains required.
+
 Freeze the allocation identity and capacity in a new versioned runtime contract
 before provider submission. Preserve existing operation IDs and journals; do not
 retrofit old operations with new writable mounts.

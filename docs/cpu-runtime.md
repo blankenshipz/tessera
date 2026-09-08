@@ -76,6 +76,15 @@ storage description as declared/unverified. It performs no cryptographic build
 verification, capability attestation, control-plane write, mount, credential,
 provider, or dispatch action; even a passing report remains non-authoritative.
 
+Separately, `tessera_worker.persistent_output_probe` read-only inspects an
+already-provisioned dedicated Linux output mount and returns the existing
+version-1 storage contract only for complete safe observations. It has no
+`CpuRuntime` wiring and rejects macOS Docker Desktop/non-Linux hosts rather than
+inferring daemon behavior from host facts. Run
+`.venv/bin/python scripts/check_persistent_output_storage.py PATH` only to
+inspect a Linux slot; it does not create files or supply the still-required
+Docker-host exhaustion, exit, or restart evidence.
+
 See [the persistent output-storage decision](decisions/0003-persistent-output-storage.md)
 for the quota and custody gates before collection can be enabled.
 

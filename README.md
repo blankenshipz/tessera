@@ -130,6 +130,13 @@ Complete artifact manifests verify the declared output set and retained bytes;
 they remain quarantined. Automatic container output collection still requires
 verified persistent storage limits, and full research E2E acceptance remains pending.
 
+A read-only worker probe can inspect an already-provisioned dedicated Linux
+output mount and return the existing storage contract only when its path,
+custody, mount restrictions, capacity, and UID 65532 access observations pass.
+It is not wired to runtime admission or collection and rejects macOS Docker
+Desktop/non-Linux host facts; decisive Linux Docker-host exhaustion and restart
+evidence remains required.
+
 ## The first workflow (target)
 
 1. Connect to a personal, organization-managed, or Tessera-hosted control plane.

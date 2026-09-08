@@ -63,6 +63,11 @@ released input bytes over HTTP, and records actual Docker observations. They do
 not exercise automatic artifact collection or a research investigation. Unknown
 cleanup is reported with the fixture container name for reconciliation.
 
+On a provisioned Linux output-slot mount, the read-only inspection command is
+`.venv/bin/python scripts/check_persistent_output_storage.py PATH`. It does not
+mount, write, or invoke Docker; a passing host inspection is not the required
+Docker byte/inode exhaustion or restart evidence for automatic collection.
+
 After installing the locked desktop dependencies, run
 `.venv/bin/python scripts/check_desktop_control.py` on a native graphical host
 for the synthetic desktop-to-control fixture. It starts a temporary loopback

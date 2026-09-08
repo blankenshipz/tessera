@@ -20,7 +20,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, synthetic durable output sealing/recovery, and human-only synthetic byte/metadata result checkpoints | Backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, read-only Linux slot inspection, synthetic durable output sealing/recovery, and human-only synthetic byte/metadata result checkpoints | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
@@ -137,6 +137,14 @@ representative investigation have not passed end-to-end acceptance.
     identity/capacity into the package digest. This does not activate a backend,
     mount storage, reserve a slot, collect automatically, release quarantine, or
     accept a result.
+
+    **Read-only backend inspection:** a separate worker probe inspects an
+    already-provisioned dedicated Linux mount without mutation or subprocesses.
+    It rejects missing, linked/replaced, unsafe-custody, unidentifiable,
+    unrestricted, nested, invalid-capacity, or UID 65532-inaccessible paths and
+    returns the existing canonical contract only on success. macOS Docker Desktop
+    and unknown platforms remain non-admissible; Linux Docker-host exhaustion and
+    restart fixtures are still required before backend activation.
 
 11. **Human quarantine review:** digest-bound, revision-checked dispositions append
     attributed history. Rejection retains evidence; continued quarantine releases
