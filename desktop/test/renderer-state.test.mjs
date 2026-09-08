@@ -39,7 +39,7 @@ function fixture(overrides = {}) {
     FormData: class { constructor(form) { this.fields = { ...form.fields }; } get(name) { return this.fields[name]; } },
   });
   const source = readFileSync(new URL('../renderer.mjs', import.meta.url), 'utf8');
-  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadStudies, selectStudy, clearContext, state: () => ({ activeProject, activeThread, activeStudy }) };', context);
+  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadStudies, selectStudy, loadEvents, clearContext, state: () => ({ activeProject, activeThread, activeStudy }) };', context);
   return { ...context.hooks, get, api, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
 }
 const thread = id => ({ id, title: id });
@@ -101,6 +101,22 @@ test('renderer ignores thread and message replies from a previous context and cl
   assert.equal(ui.get('messages').children[0].textContent, 'No messages yet.');
   ui.get('message-form').fields.body = 'Another draft'; ui.clearContext();
   assert.equal(ui.get('message-form').fields.body, undefined);
+});
+
+test('cancellation telemetry never renders unresolved termination as stopped or successful', async () => {
+  const ui = fixture({ labbook: async () => ({ events: [
+    { cursor: 1, event_type: 'execution.grant_cancel_requested', resource_revision: 2, created_at: '2026-01-01T00:00:00Z', payload: { cancellation: { state: 'requested' } } },
+    { cursor: 2, event_type: 'execution.observation_reported', resource_revision: 2, created_at: '2026-01-01T00:00:01Z', payload: { cancellation: { state: 'unresolved' } } },
+    { cursor: 3, event_type: 'execution.observation_reported', resource_revision: 2, created_at: '2026-01-01T00:00:02Z', payload: { cancellation: { state: 'confirmed_termination' } } },
+  ] }) });
+  await ui.selectProject(project('p1'));
+  const labels = ui.get('events').children.map(entry => entry.children[0].textContent);
+  assert.deepEqual(labels, [
+    'Cancellation requested — termination remains unresolved',
+    'Cancellation unresolved or unknown — exposure retained',
+    'Cancellation termination confirmed — operational observation only',
+  ]);
+  assert.ok(labels.every(label => !/stopped|successful/i.test(label)));
 });
 
 test('switching thread while a command key is pending prevents message dispatch', async () => {

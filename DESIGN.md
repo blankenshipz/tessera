@@ -539,6 +539,11 @@ expired, workspace disposition, and charges reconciled. Graceful deadlines
 escalate to termination where supported. Unknown termination remains an incident
 with retained exposure, not a green “stopped” badge.
 
+The current bounded control projection records only cancellation requested,
+unresolved/unknown, and worker-confirmed termination from immutable attributed
+observations. It does not infer provider termination, writer quiescence, charges,
+or scientific success from a local terminal state.
+
 Operational claims in chat attach timestamped control/supervisor/provider
 observations and freshness limits. Authoritative status wins over conflicting
 agent prose. Checkpoint/resume needs compatible inputs/environment, saved method

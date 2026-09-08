@@ -41,6 +41,15 @@ unknown termination remain distinct. Lease renewal does not reset operation
 duration. Reports contain attributed provider observations; they never infer
 scientific success or infrastructure charges.
 
+Control grant reads and labbook events project bounded cancellation telemetry from
+the immutable cancellation request and latest authenticated worker observation:
+`requested`, `unresolved`, or `confirmed_termination` (with `not_requested`
+before revocation). A confirmed local supervisor result is reported only as a
+worker observation; it is not provider proof. A later unknown observation restores
+unresolved status, and repeated cancellation cannot erase that uncertainty or
+restart authority. Full milestone telemetry, writer quiescence, edit ownership,
+and handback remain unimplemented.
+
 `HttpControlChannel` uses normal HTTPS verification, or HTTP to literal loopback
 addresses only. It binds a worker credential to one origin, rejects redirects,
 disables environment proxies and cookies, and bounds requests to 1 MiB and

@@ -795,13 +795,26 @@ const eventLabels = {
   'project.created': 'Project created', 'task.created': 'Research plan drafted',
   'task.approved': 'Plan approved by a human', 'task.plan_revised': 'Plan revised; new review required',
 };
+function cancellationEventLabel(event) {
+  const state = event?.payload?.cancellation?.state;
+  if (event.event_type === 'execution.grant_cancel_requested') {
+    return 'Cancellation requested — termination remains unresolved';
+  }
+  if (event.event_type === 'execution.observation_reported' && state === 'confirmed_termination') {
+    return 'Cancellation termination confirmed — operational observation only';
+  }
+  if (event.event_type === 'execution.observation_reported' && state === 'unresolved') {
+    return 'Cancellation unresolved or unknown — exposure retained';
+  }
+  return eventLabels[event.event_type] ?? event.event_type;
+}
 async function loadEvents() {
   const version = epoch;
   const response = await api.labbook(connectionId, activeProject.id, eventCursor);
   if (version !== epoch) return;
   for (const event of response.events) {
     const entry = element('li');
-    entry.append(element('span', eventLabels[event.event_type] ?? event.event_type));
+    entry.append(element('span', cancellationEventLabel(event)));
     entry.append(element('time', `${new Date(event.created_at).toLocaleString()} · revision ${event.resource_revision}`));
     $('events').append(entry);
     eventCursor = event.cursor;

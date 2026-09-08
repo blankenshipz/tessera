@@ -153,8 +153,48 @@ class ExecutionStore(Store):
         value["operational_only"] = True
         return value
 
-    @staticmethod
-    def _grant_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    def _cancellation_payload(
+        self, connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
+    ) -> dict[str, Any]:
+        """Project the immutable request/observation record without inventing a stop.
+
+        This is deliberately derived from the durable grant and attributed worker
+        observations rather than stored as a mutable status projection.  The latest
+        observation wins: a later unknown observation must restore uncertainty.
+        """
+        requested_at = row["updated_at"] if row["status"] == "cancel_requested" else None
+        if requested_at is None:
+            request = connection.execute(
+                """SELECT created_at FROM events
+                WHERE event_type = 'execution.grant_cancel_requested'
+                AND instr(payload_json, ?) > 0 ORDER BY cursor DESC LIMIT 1""",
+                (f'"grant_id":"{row["id"]}"',),
+            ).fetchone()
+            if request is None:
+                return {"state": "not_requested"}
+            requested_at = request["created_at"]
+        observation = connection.execute(
+            """SELECT id, lease_id, worker_principal_id, epoch, observed_state, observed_at,
+            provider_id, termination_confirmed, recorded_at FROM execution_observations
+            WHERE grant_id = ? ORDER BY rowid DESC LIMIT 1""",
+            (row["id"],),
+        ).fetchone()
+        result: dict[str, Any] = {"state": "requested", "requested_at": requested_at}
+        if observation is None:
+            return result
+        observed = dict(observation)
+        observed["termination_confirmed"] = bool(observed["termination_confirmed"])
+        result["observation"] = observed
+        result["state"] = (
+            "confirmed_termination"
+            if observed["observed_state"] == "exited" and observed["termination_confirmed"]
+            else "unresolved"
+        )
+        return result
+
+    def _grant_response(
+        self, connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
+    ) -> dict[str, Any]:
         value = dict(row)
         value["acknowledges_unmeasured_infrastructure"] = bool(
             value["acknowledges_unmeasured_infrastructure"]
@@ -166,6 +206,7 @@ class ExecutionStore(Store):
         }[value["status"]]
         value["execution_dispatched"] = False
         value["operational_only"] = True
+        value["cancellation"] = self._cancellation_payload(connection, row)
         return value
 
     @staticmethod
@@ -535,7 +576,7 @@ class ExecutionStore(Store):
                     "operational_only": True,
                 },
             )
-            return 201, self._grant_response(row)
+            return 201, self._grant_response(connection, row)
 
         return self._mutate(principal, key, "POST", path, digest, command)
 
@@ -551,7 +592,7 @@ class ExecutionStore(Store):
         connection = _connect(self.database_path)
         try:
             actor = self._live_principal(connection, principal)
-            return self._grant_response(self._grant(connection, actor, grant_id))
+            return self._grant_response(connection, self._grant(connection, actor, grant_id))
         finally:
             connection.close()
 
@@ -569,7 +610,7 @@ class ExecutionStore(Store):
                 ORDER BY created_at, id LIMIT ? OFFSET ?""",
                 (project_id, limit, offset),
             ).fetchall()
-            return [self._grant_response(row) for row in rows]
+            return [self._grant_response(connection, row) for row in rows]
         finally:
             connection.close()
 
@@ -596,7 +637,7 @@ class ExecutionStore(Store):
             if grant["status"] == "reconciled":
                 raise Conflict("Reconciled execution authority cannot be revoked.")
             if grant["status"] == "cancel_requested":
-                return 200, self._grant_response(grant)
+                return 200, self._grant_response(connection, grant)
             epoch, now = self._next_epoch(connection, grant["task_id"]), utc_now()
             connection.execute(
                 """UPDATE execution_grants SET status = 'cancel_requested', revision = revision + 1,
@@ -617,9 +658,14 @@ class ExecutionStore(Store):
                 grant["task_id"],
                 "execution.grant_cancel_requested",
                 updated["revision"],
-                {"grant_id": grant_id, "epoch": epoch, "operational_only": True},
+                {
+                    "grant_id": grant_id,
+                    "epoch": epoch,
+                    "cancellation": self._cancellation_payload(connection, updated),
+                    "operational_only": True,
+                },
             )
-            return 200, self._grant_response(updated)
+            return 200, self._grant_response(connection, updated)
 
         return self._mutate(principal, key, "POST", path, digest, command)
 
@@ -988,6 +1034,7 @@ class ExecutionStore(Store):
                     "desired_state": row["desired_state"],
                     "observed_state": row["observed_state"],
                     "termination_confirmed": bool(row["termination_confirmed"]),
+                    "cancellation": self._cancellation_payload(connection, grant),
                     "observation_proof": "trusted_worker_assertion",
                     "operational_only": True,
                 },
@@ -996,6 +1043,7 @@ class ExecutionStore(Store):
                 **row,
                 "termination_confirmed": bool(row["termination_confirmed"]),
                 "observation_proof": "trusted_worker_assertion",
+                "cancellation": self._cancellation_payload(connection, grant),
                 "operational_only": True,
             }
 
@@ -1020,7 +1068,7 @@ class ExecutionStore(Store):
             if grant["revision"] != payload["expected_revision"]:
                 raise Conflict("Execution grant revision is no longer current.")
             if grant["status"] == "reconciled":
-                return 200, self._grant_response(grant)
+                return 200, self._grant_response(connection, grant)
             leases = connection.execute(
                 "SELECT count(*) FROM execution_leases WHERE grant_id = ?", (grant_id,)
             ).fetchone()[0]
@@ -1092,6 +1140,6 @@ class ExecutionStore(Store):
                     "operational_only": True,
                 },
             )
-            return 200, self._grant_response(updated)
+            return 200, self._grant_response(connection, updated)
 
         return self._mutate(principal, key, "POST", path, digest, command)

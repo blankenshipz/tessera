@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -387,6 +388,77 @@ def test_cancel_observation_reconciliation_and_real_overage(tmp_path: Path) -> N
         execution.issue_execution_grant(
             owner, project["id"], "blocked", canonical_digest(payload), payload
         )
+
+
+def test_cancellation_telemetry_is_derived_fenced_and_does_not_clear_unknown(
+    tmp_path: Path,
+) -> None:
+    state, execution, owner, worker, project, task = _setup(tmp_path)
+    with _connect(execution.database_path) as connection:
+        snapshot_id = connection.execute("SELECT snapshot_id FROM snapshot_releases").fetchone()[0]
+    payload = _grant_payload(task, worker, {"id": snapshot_id})
+    _, grant = execution.issue_execution_grant(
+        owner, project["id"], "grant", canonical_digest(payload), payload
+    )
+    assert grant["cancellation"] == {"state": "not_requested"}
+    _, lease = execution.acquire_execution_lease(worker, grant["id"], "lease", "lease")
+    _, requested = execution.revoke_execution_grant(owner, grant["id"], "cancel", "cancel", 1)
+    assert requested["cancellation"]["state"] == "requested"
+    unknown = {
+        "expected_epoch": lease["epoch"],
+        "observed_state": "unknown",
+        "observed_at": datetime.now(UTC).isoformat(),
+        "provider_id": "synthetic-local",
+        "termination_confirmed": False,
+    }
+    _, reported = execution.report_execution_observation(
+        worker, lease["id"], "unknown", canonical_digest(unknown), unknown
+    )
+    assert reported["cancellation"]["state"] == "unresolved"
+    repeated = execution.revoke_execution_grant(
+        owner, grant["id"], "cancel-again", "cancel-again", requested["revision"]
+    )
+    assert repeated[1]["cancellation"]["state"] == "unresolved"
+    with pytest.raises(Conflict, match="epoch"):
+        execution.report_execution_observation(
+            worker, lease["id"], "stale", "stale", unknown | {"expected_epoch": lease["epoch"] + 1}
+        )
+    same_project_wrong_worker = _worker(state, owner, project["id"], "wrong-worker-token")
+    with pytest.raises(NotFound):
+        execution.report_execution_observation(
+            same_project_wrong_worker, lease["id"], "wrong-worker", "wrong-worker", unknown
+        )
+    exited = unknown | {
+        "observed_state": "exited",
+        "termination_confirmed": True,
+        "observed_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat(),
+    }
+    _, confirmed = execution.report_execution_observation(
+        worker, lease["id"], "exited", canonical_digest(exited), exited
+    )
+    assert confirmed["cancellation"]["state"] == "confirmed_termination"
+    assert (
+        execution.get_execution_grant(owner, grant["id"])["cancellation"]["state"]
+        == "confirmed_termination"
+    )
+    with _connect(execution.database_path) as connection:
+        event = connection.execute(
+            "SELECT payload_json FROM events WHERE "
+            "event_type='execution.observation_reported' ORDER BY cursor DESC LIMIT 1"
+        ).fetchone()[0]
+    assert json.loads(event)["cancellation"]["state"] == "confirmed_termination"
+    _, reconciled = execution.reconcile_execution_grant(
+        owner,
+        grant["id"],
+        "reconcile",
+        "reconcile",
+        {
+            "expected_revision": requested["revision"],
+            "settlement_cents": 0,
+            "provider_terminated": True,
+        },
+    )
+    assert reconciled["cancellation"]["state"] == "confirmed_termination"
 
 
 def test_unleased_cancel_reconciles_zero_and_event_failure_rolls_back(

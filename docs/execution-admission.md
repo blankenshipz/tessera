@@ -96,6 +96,16 @@ actions. The previously assigned worker may still report observations for its
 lease to account for an outstanding job, provided its workload credential remains
 valid. Such reports cannot renew authority or commit scientific results.
 
+Grant responses and the corresponding cancellation/observation labbook events
+include a bounded `cancellation` projection. Its state is `requested` until an
+observation arrives, `unresolved` for running, unknown, or unconfirmed exit, and
+`confirmed_termination` only for that worker's exited observation with explicit
+termination confirmation. It includes only the immutable request time and latest
+attributed observation identity/facts. It is not a provider receipt or a stopped,
+successful, quiescent, settled, or scientifically accepted result. Repeating a
+cancellation returns the existing state and cannot clear uncertainty or create a
+lease.
+
 Reconciliation uses the latest worker observation. A later `unknown` or `running`
 observation blocks settlement even if an earlier record reported exit. The human
 request's `provider_terminated` flag cannot substitute for worker confirmation.
