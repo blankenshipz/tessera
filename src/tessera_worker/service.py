@@ -237,7 +237,18 @@ class DevelopmentWorkerService:
                 return {"state": "unknown", "quarantined": False, "reason": result.reason}
             self._report(runtime, result)
             if tick == self.config.max_ticks:
-                return {"state": "running", "quarantined": False}
+                # Do not abandon Docker merely because this foreground loop has
+                # exhausted its own budget. Request cancellation and retain the
+                # workspace for reconciliation rather than claiming it stopped.
+                cancelled = runtime.cancel(reason="worker_tick_limit")
+                if runtime.operation is not None:
+                    runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
+                self._report(runtime, cancelled)
+                return {
+                    "state": "unknown",
+                    "quarantined": False,
+                    "reason": "tick_limit_cancellation_requested",
+                }
             if tick and tick % self.config.renew_every_ticks == 0:
                 self._renew(runtime)
             self.sleep(self.config.poll_seconds)

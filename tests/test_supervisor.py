@@ -152,6 +152,23 @@ def test_terminal_exit_is_persisted_and_not_restarted(tmp_path: Path) -> None:
     assert adapter.calls.count("start") == 1
 
 
+def test_terminal_recovery_uses_a_fresh_read_only_observation_without_restart(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    adapter = FakeAdapter()
+    with supervisor(tmp_path, adapter, clock) as driver:
+        assert driver.drive_once(OPERATION, lease(clock)).phase == "running"
+        adapter.state = "exited"
+        assert driver.tick(OPERATION, lease(clock)).phase == "terminal"
+    observed_before = adapter.calls.count("observe")
+    with supervisor(tmp_path, adapter, clock) as recovered:
+        result = recovered.drive_once(OPERATION, lease(clock))
+    assert result.phase == "terminal"
+    assert adapter.calls.count("observe") == observed_before + 1
+    assert adapter.calls.count("start") == 1
+
+
 def test_journal_is_exclusive_and_payload_or_authority_changes_are_denied(tmp_path: Path) -> None:
     clock = Clock()
     adapter = FakeAdapter()

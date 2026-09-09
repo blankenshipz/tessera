@@ -568,6 +568,14 @@ Human handback compares separately captured immutable snapshots and creates a fr
 context epoch; it does not mediate arbitrary filesystem writers or imply provider
 quiescence beyond that observation.
 
+Schema v18 records a durable external-operation intent before returning a
+development-local CPU package. It binds the tenant/authority chain, deterministic
+operation and Docker lookup identities, frozen package/request digests,
+adapter/profile versions, manual-reconciliation retry class, and independent
+desired/observed states. Revocation changes desired cancellation transactionally;
+it does not dispatch or prove termination. v17 lease/observation history remains
+unbackfilled legacy/null rather than receiving invented provider receipts.
+
 Operational claims in chat attach timestamped control/supervisor/provider
 observations and freshness limits. Authoritative status wins over conflicting
 agent prose. Checkpoint/resume needs compatible inputs/environment, saved method

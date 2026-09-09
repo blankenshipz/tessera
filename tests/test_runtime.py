@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from test_execution import _worker
 from test_input_delivery import _delivery
 from test_supervisor import FakeAdapter
 
 from tessera_control.api import create_app
 from tessera_control.runtime_packages import RuntimePackageStore
-from tessera_control.store import Conflict, _connect, canonical_digest
+from tessera_control.store import Conflict, NotFound, _connect, canonical_digest
 from tessera_worker.runtime import CpuRuntime
 
 
@@ -63,7 +65,23 @@ def test_package_identity_is_stable_and_replay_checks_current_authority(tmp_path
     assert first["package"]["pinned_image"] == grant["pinned_image"]
     assert "persistent_output_storage" not in first["package"]
     assert first["execution_dispatched"] is False
+    operation = first["operation"]
+    assert operation["operation_id"] == first["package"]["operation_id"]
+    assert operation["lease_id"] == lease["id"]
+    assert operation["package_digest"] == first["package_digest"]
+    assert operation["retry_class"] == "manual_reconciliation"
+    assert operation["desired_state"] == "admitted"
+    assert operation["observed_state"] == "unknown"
+    assert operation["docker_lookup_key"] == f"tessera-op-{operation['operation_id']}"
     assert store.execution_package(*request)[1] == first
+    with _connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM external_operations").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_type='execution.package_prepared'"
+            ).fetchone()[0]
+            == 1
+        )
     renewed = execution.renew_execution_lease(
         worker, lease["id"], "renew", "renew", lease["epoch"]
     )[1]
@@ -73,6 +91,77 @@ def test_package_identity_is_stable_and_replay_checks_current_authority(tmp_path
     execution.revoke_execution_grant(owner, grant["id"], "revoke", "revoke", 1)
     with pytest.raises(Conflict):
         store.execution_package(*request)
+
+
+def test_journaled_observations_fence_operation_bindings_and_provider_identity(tmp_path):
+    state, execution, owner, worker, grant, lease = _delivery(tmp_path)
+    package = RuntimePackageStore(state).execution_package(
+        worker,
+        lease["id"],
+        "package",
+        canonical_digest({"expected_epoch": lease["epoch"]}),
+        lease["epoch"],
+    )[1]
+    operation = package["operation"]
+    report = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": operation["operation_id"],
+        "observed_state": "running",
+        "observed_at": datetime.now(UTC).isoformat(),
+        "provider_id": "container-one",
+        "termination_confirmed": False,
+    }
+    with pytest.raises(Conflict, match="external operation"):
+        execution.report_execution_observation(
+            worker,
+            lease["id"],
+            "wrong-operation",
+            canonical_digest(report | {"operation_id": "a" * 32}),
+            report | {"operation_id": "a" * 32},
+        )
+    with pytest.raises(Conflict, match="epoch"):
+        execution.report_execution_observation(
+            worker,
+            lease["id"],
+            "wrong-epoch",
+            canonical_digest(report | {"expected_epoch": lease["epoch"] + 1}),
+            report | {"expected_epoch": lease["epoch"] + 1},
+        )
+    wrong_worker = _worker(state, owner, grant["project_id"], "journal-wrong-worker")
+    with pytest.raises(NotFound):
+        execution.report_execution_observation(
+            wrong_worker,
+            lease["id"],
+            "wrong-worker",
+            canonical_digest(report),
+            report,
+        )
+    _, observed = execution.report_execution_observation(
+        worker, lease["id"], "running", canonical_digest(report), report
+    )
+    assert observed["operation_id"] == operation["operation_id"]
+    with pytest.raises(Conflict, match="external operation"):
+        execution.report_execution_observation(
+            worker,
+            lease["id"],
+            "missing-operation",
+            canonical_digest(report | {"operation_id": None}),
+            report | {"operation_id": None},
+        )
+    with pytest.raises(Conflict, match="Provider identity"):
+        execution.report_execution_observation(
+            worker,
+            lease["id"],
+            "changed-provider",
+            canonical_digest(report | {"provider_id": "container-two"}),
+            report | {"provider_id": "container-two"},
+        )
+    execution.revoke_execution_grant(owner, package["package"]["grant_id"], "revoke", "revoke", 1)
+    with _connect(state / "tessera.sqlite3") as connection:
+        row = connection.execute("SELECT * FROM external_operations").fetchone()
+    assert row["desired_state"] == "cancel_requested"
+    assert row["observed_state"] == "running"
+    assert row["provider_id"] == "container-one"
 
 
 def test_corrupt_plan_does_not_produce_a_package(tmp_path):
@@ -110,7 +199,7 @@ def test_persistent_output_storage_is_frozen_and_changed_capacity_rejects_replay
     )[1]
     assert response["package"]["persistent_output_storage"] == capability
     assert response["package_digest"] == canonical_digest(response["package"])
-    with pytest.raises(Conflict, match="package changed"):
+    with pytest.raises(Conflict, match="package digest conflicts"):
         store.execution_package(
             worker,
             lease["id"],

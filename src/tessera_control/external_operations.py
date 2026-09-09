@@ -1,0 +1,56 @@
+"""Schema for durable, provider-facing operation intent records.
+
+The control plane records one operation before returning an executable package.
+This table is a journal of intent and attributed observations, not a provider
+receipt or result-acceptance record.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+
+def create_external_operation_schema(connection: sqlite3.Connection) -> None:
+    """Install v18 operation intent records without fabricating legacy history."""
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS external_operations (
+        operation_id TEXT PRIMARY KEY CHECK (
+            length(operation_id) = 32 AND operation_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        grant_id TEXT NOT NULL REFERENCES execution_grants(id),
+        lease_id TEXT NOT NULL UNIQUE REFERENCES execution_leases(id),
+        worker_principal_id TEXT NOT NULL REFERENCES principals(id),
+        epoch INTEGER NOT NULL CHECK (epoch >= 1),
+        package_digest TEXT NOT NULL CHECK (
+            length(package_digest) = 64 AND package_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        adapter_version TEXT NOT NULL,
+        profile_version TEXT NOT NULL,
+        docker_lookup_key TEXT NOT NULL UNIQUE,
+        request_digest TEXT NOT NULL CHECK (
+            length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        retry_class TEXT NOT NULL CHECK (retry_class = 'manual_reconciliation'),
+        desired_state TEXT NOT NULL CHECK (desired_state IN ('admitted', 'cancel_requested')),
+        observed_state TEXT NOT NULL CHECK (observed_state IN ('unknown', 'running', 'exited')),
+        provider_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS external_operations_by_project
+        ON external_operations(project_id, created_at, operation_id)"""
+    )
+    # Existing v17 observations have no operation receipt.  Keep that explicit
+    # null boundary rather than attributing them to an invented operation.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(execution_observations)")}
+    if "operation_id" not in columns:
+        connection.execute("ALTER TABLE execution_observations ADD COLUMN operation_id TEXT")
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS execution_observations_by_operation
+        ON execution_observations(operation_id, recorded_at, id)"""
+    )

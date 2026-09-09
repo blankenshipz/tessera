@@ -174,8 +174,8 @@ class ExecutionStore(Store):
                 return {"state": "not_requested"}
             requested_at = request["created_at"]
         observation = connection.execute(
-            """SELECT id, lease_id, worker_principal_id, epoch, observed_state, observed_at,
-            provider_id, termination_confirmed, recorded_at FROM execution_observations
+            """SELECT id, operation_id, lease_id, worker_principal_id, epoch, observed_state,
+            observed_at, provider_id, termination_confirmed, recorded_at FROM execution_observations
             WHERE grant_id = ? ORDER BY rowid DESC LIMIT 1""",
             (row["id"],),
         ).fetchone()
@@ -652,6 +652,13 @@ class ExecutionStore(Store):
                 epoch = ?, updated_at = ? WHERE id = ? AND revision = ? AND status = 'active'""",
                 (epoch, now, grant_id, expected_revision),
             )
+            # An operation intent may not exist for a v17 legacy lease.  Do not
+            # manufacture one during revocation; update only a real v18 journal.
+            connection.execute(
+                """UPDATE external_operations SET desired_state='cancel_requested', updated_at=?
+                WHERE grant_id=? AND desired_state='admitted'""",
+                (now, grant_id),
+            )
             updated = dict(grant)
             updated.update(
                 status="cancel_requested",
@@ -980,6 +987,32 @@ class ExecutionStore(Store):
                 or lease["epoch"] != payload["expected_epoch"]
             ):
                 raise Conflict("Execution observation epoch is no longer current.")
+            operation = connection.execute(
+                "SELECT * FROM external_operations WHERE lease_id=?", (lease_id,)
+            ).fetchone()
+            if operation is not None:
+                expected_binding = {
+                    "operation_id": payload.get("operation_id"),
+                    "org_id": worker["org_id"],
+                    "project_id": grant["project_id"],
+                    "task_id": grant["task_id"],
+                    "grant_id": grant["id"],
+                    "lease_id": lease_id,
+                    "worker_principal_id": worker["id"],
+                    "epoch": lease["epoch"],
+                }
+                if any(operation[field] != value for field, value in expected_binding.items()):
+                    raise Conflict("Execution observation does not match the external operation.")
+                if (
+                    operation["provider_id"] is not None
+                    and payload.get("provider_id") is not None
+                    and operation["provider_id"] != payload["provider_id"]
+                ):
+                    raise Conflict("Provider identity cannot change within an external operation.")
+            elif payload.get("operation_id") is not None:
+                raise Conflict(
+                    "Execution observation operation is not journaled for this legacy lease."
+                )
             if grant["status"] not in UNRESOLVED_GRANT_STATUSES:
                 raise Conflict("Execution authority has already been reconciled.")
             if payload["termination_confirmed"] and payload["observed_state"] != "exited":
@@ -1016,6 +1049,7 @@ class ExecutionStore(Store):
                 "lease_id": lease_id,
                 "worker_principal_id": worker["id"],
                 "epoch": lease["epoch"],
+                "operation_id": operation["operation_id"] if operation is not None else None,
                 "desired_state": "cancel_requested"
                 if grant["status"] == "cancel_requested"
                 else "admitted",
@@ -1027,13 +1061,24 @@ class ExecutionStore(Store):
             }
             connection.execute(
                 """INSERT INTO execution_observations
-                (id, grant_id, lease_id, worker_principal_id, epoch, desired_state, observed_state,
-                 observed_at, provider_id, termination_confirmed, recorded_at)
-                VALUES (:id, :grant_id, :lease_id, :worker_principal_id, :epoch, :desired_state,
-                :observed_state, :observed_at, :provider_id, :termination_confirmed,
-                :recorded_at)""",
+                (id, grant_id, lease_id, worker_principal_id, epoch, operation_id, desired_state,
+                 observed_state, observed_at, provider_id, termination_confirmed, recorded_at)
+                VALUES (:id, :grant_id, :lease_id, :worker_principal_id, :epoch, :operation_id,
+                :desired_state, :observed_state, :observed_at, :provider_id,
+                :termination_confirmed, :recorded_at)""",
                 row,
             )
+            if operation is not None:
+                connection.execute(
+                    """UPDATE external_operations SET observed_state=?,
+                    provider_id=coalesce(provider_id, ?), updated_at=? WHERE operation_id=?""",
+                    (
+                        row["observed_state"],
+                        row["provider_id"],
+                        row["recorded_at"],
+                        operation["operation_id"],
+                    ),
+                )
             self._event(
                 connection,
                 worker,
@@ -1044,6 +1089,7 @@ class ExecutionStore(Store):
                 {
                     "grant_id": grant["id"],
                     "lease_id": lease_id,
+                    "operation_id": row["operation_id"],
                     "epoch": lease["epoch"],
                     "desired_state": row["desired_state"],
                     "observed_state": row["observed_state"],

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -96,7 +97,24 @@ def main() -> None:
             raise RuntimeError("Development worker output left quarantine.")
         if list(outputs.glob("development-only-cpu-outputs/workspaces/*")):
             raise RuntimeError("Development workspace was not reclaimed after quarantine transfer.")
-        print(json.dumps({"fixture": "development-e2e", "quarantined": True}, sort_keys=True))
+        with sqlite3.connect(state / "tessera.sqlite3") as connection:
+            operations = connection.execute(
+                "SELECT operation_id, observed_state FROM external_operations"
+            ).fetchall()
+        if operations != [(receipt["operation_id"], "exited")]:
+            raise RuntimeError(
+                "Development fixture did not retain one resolved operation identity."
+            )
+        print(
+            json.dumps(
+                {
+                    "fixture": "development-e2e",
+                    "operation_id": receipt["operation_id"],
+                    "quarantined": True,
+                },
+                sort_keys=True,
+            )
+        )
     finally:
         if receipt is not None:
             docker("rm", "--force", f"tessera-op-{receipt['operation_id']}")

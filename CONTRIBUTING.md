@@ -176,3 +176,8 @@ It adds no inferred releases; local CPU skill materialization remains unavailabl
 
 Schema 17 adds tenant-scoped confirmed workspace handoff records. It adds no
 inferred handoffs, filesystem writes, provider dispatch, or result acceptance.
+
+Schema 18 adds durable external-operation intent/lifecycle records for returned
+development-local CPU packages. The migration creates no inferred operations or
+provider receipts for v17 leases/observations; read the external-operation journal
+note before relying on recovery or reconciliation behavior.

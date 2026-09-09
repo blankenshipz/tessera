@@ -110,6 +110,7 @@ class PrepareExecutionPackage(ExecutionRequest):
 class ReportExecutionObservation(ExecutionRequest):
     lease_id: Identifier
     expected_epoch: Revision
+    operation_id: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")] | None = None
     observed_state: Literal["running", "exited", "unknown"]
     observed_at: datetime
     provider_id: Identifier | None = None

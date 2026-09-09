@@ -70,7 +70,7 @@ amounts; incurred/estimated-unbilled/disputed usage feeds remain unimplemented.
 |---|---|
 | `POST /worker/leases` | grant_id |
 | `POST /worker/leases/renew` | lease_id, expected_epoch |
-| `POST /worker/observations` | lease_id, expected_epoch, observed_state, observed_at, optional provider_id, termination_confirmed |
+| `POST /worker/observations` | lease_id, expected_epoch, operation_id for journaled leases, observed_state, observed_at, optional provider_id, termination_confirmed |
 
 A lease lasts at most 30 seconds. Its fixed hard deadline is the earliest of grant
 expiry, worker credential expiry, and initial lease time plus approved task duration.
@@ -90,6 +90,15 @@ not predate the lease or prior observations; future skew is limited to five seco
 A known provider ID cannot change during the lease. Confirmed exit requires a
 provider ID. These are trusted-worker assertions, not independent provider proof
 or scientific execution receipts.
+
+Schema v18 creates one external-operation intent atomically before returning an
+executable package. It freezes the authority binding, package/request digests,
+adapter/profile, deterministic Docker lookup key and `manual_reconciliation`
+retry class. Journaled observations must match that operation, lease, worker and
+epoch; their first provider ID is immutable. Revocation changes desired state to
+`cancel_requested` in the same transaction, without a provider call. v17
+lease/observation rows remain unbackfilled/null; artifact, manifest and synthetic
+checkpoint compatibility stays at the existing derived-operation boundary.
 
 Revocation marks `cancel_requested`, advances the grant epoch and blocks new
 actions. The previously assigned worker may still report observations for its

@@ -89,12 +89,17 @@ class CpuRuntime:
 
     def _validate_package(self, response: dict[str, Any], lease_id: str, epoch: int) -> None:
         try:
-            package, lease = response["package"], response["lease"]
+            package, lease, operation = (
+                response["package"],
+                response["lease"],
+                response["operation"],
+            )
             plan = package["plan"]
             spec = plan["execution_spec"]
             if (
                 package["version"] != 1
                 or package["profile_version"] != "local-cpu-v1"
+                or package["adapter_version"] != "docker-local-cpu-v1"
                 or _digest(package) != response["package_digest"]
                 or _digest(plan) != package["plan_digest"]
                 or package["lease_id"] != lease_id
@@ -112,6 +117,21 @@ class CpuRuntime:
                 or spec["input_snapshot_digest"] != package["snapshot_digest"]
                 or package["operation_id"]
                 != hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
+                or package["docker_lookup_key"] != f"tessera-op-{package['operation_id']}"
+                or operation["operation_id"] != package["operation_id"]
+                or operation["lease_id"] != lease_id
+                or operation["grant_id"] != package["grant_id"]
+                or operation["worker_principal_id"] != self.worker_id
+                or operation["project_id"] != package["project_id"]
+                or operation["task_id"] != package["task_id"]
+                or operation["epoch"] != epoch
+                or operation["package_digest"] != response["package_digest"]
+                or operation["adapter_version"] != package["adapter_version"]
+                or operation["profile_version"] != package["profile_version"]
+                or operation["docker_lookup_key"] != package["docker_lookup_key"]
+                or operation["retry_class"] != "manual_reconciliation"
+                or operation["desired_state"] not in {"admitted", "cancel_requested"}
+                or operation["observed_state"] not in {"unknown", "running", "exited"}
             ):
                 raise SupervisorError("Control package does not match runtime authority.")
             capability = package.get("persistent_output_storage")
@@ -319,6 +339,7 @@ class CpuRuntime:
             {
                 "lease_id": self.lease.id,
                 "expected_epoch": self.lease.epoch,
+                "operation_id": self.operation.operation_id,
                 "observed_state": state,
                 "observed_at": datetime.now(UTC).isoformat(),
                 "provider_id": observation.container_id,

@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
+Reviewed 2026-09-08 against the schema v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
 OpenCode harness adapter POC, and bounded capability-probe slice. These are
 informational evidence only, not live integration, cryptographic trust,
@@ -20,13 +20,13 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v18 durable package operation intents, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
 | §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, owner-managed worker registration/lifecycle, documented optional pinned-harness boundary, synthetic OpenCode session/event/cancellation adapter POC, and a read-only informational capability probe | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust and capability attestation, credential broker, dispatch, and broader operational identity lifecycle |
-| §6 Execution/recovery | Partial | Journals, stable operations, conservative exposure, quarantine, resumable transfer, read-only held restore | Provider fencing/resumption after restore, release/result policy, spend and incident reconciliation |
+| §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, read-only held restore | Provider fencing/resumption after restore, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
 | §8 E2E acceptance | Blocked for real pilot; component work continues | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Admissible execution storage/host, selected investigation/dataset, remaining failure drills and measured pilot |
 | §9 Operations/product | Partial | Pinned development dependencies, CI, explicit migrations, backup/held-restore runbook | Signed packaging, update/drain/rollback, retention, monitoring, operational recovery and pilot measurements |
@@ -47,7 +47,7 @@ full workflow and its required adverse cases pass on the supported target.
 - At `ee6c36d`: 363 Python tests pass natively; Linux CI passed for that commit.
 - Ruff lint and format checks pass.
 - 62 desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v17 preserve historical records, input bytes,
+- Explicit migrations through schema v18 preserve historical records, input bytes,
   active grants, leases and held exposure; injected migration faults roll back.
 - No tests were skipped. Dependency deprecation warnings remain.
 
@@ -232,7 +232,16 @@ representative investigation have not passed end-to-end acceptance.
     self-register, issue/reconcile human authority, release artifacts, commit a
     result checkpoint, or claim provider/scientific success. The loopback Docker
     fixture is development evidence only; Linux hard quota/restart and Minikube
-    evidence remain open. See [decision 0005](decisions/0005-execution-backend-profiles.md).
+     evidence remain open. See [decision 0005](decisions/0005-execution-backend-profiles.md).
+
+23. **External-operation journal:** schema v18 atomically records the one
+    development-local CPU operation before returning its executable package,
+    fences package/observation identity and immutable provider ID, and updates
+    desired cancellation with grant revocation. Tick exhaustion requests
+    cancellation instead of abandoning Docker; terminal restart recovery reads
+    provider state without restart. v17 leases remain null/unbackfilled legacy
+    records. It is not dispatch, a provider receipt, release, result acceptance,
+    or scientific success. See [the journal note](external-operation-journal.md).
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
@@ -269,8 +278,9 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `47383a4`: terminal finding retraction and preserving schema 12 migration.
 - `ee6c36d`: linked narrowing/supersession, schema 13 and native export/restore integration.
 - `175a5b3`: schema v14 worker registration, liveness admission and retirement revocation.
-- Pending commit: schema v16 bounded skill lifecycle.
-- Pending commit: schema v17 bounded confirmed workspace handoff.
+- `9967b50`: schema v16 bounded skill lifecycle.
+- `b70772b`: schema v17 bounded confirmed workspace handoff.
+- Pending commit: schema v18 development-local external-operation journal.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.

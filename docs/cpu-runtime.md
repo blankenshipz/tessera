@@ -9,8 +9,10 @@ is enabled, and this is not end-to-end research acceptance.
 key. It rechecks live worker/grant/release authority and reconstructs the approved
 plan from immutable history, verifying the plan checksum. The package freezes
 the image, input digest, command, output limits, task revision, lease epoch and
-hard deadline. Its operation ID is deterministic for the lease. The preparation
-event does not claim provider submission.
+hard deadline. Schema v18 atomically records an external-operation intent with
+that deterministic ID, package digest, adapter/profile, stable Docker lookup key
+and `manual_reconciliation` retry class before returning the package. The
+preparation event does not claim provider submission.
 
 Retries preserve the package digest while returning current lease expiry.
 Expired, revoked or changed authority cannot recover a package through a cached
@@ -134,6 +136,9 @@ registers itself or creates human commands. Renewal keys are durably recorded
 before calls and reused after a lost response. On a fresh confirmed exit it
 uses the declared-output seal/manifest path and cleans its development workspace
 only after a quarantined/unclassified receipt. Revocation, disconnect, output
-failure and cleanup uncertainty retain the workspace. Run the synthetic local
+failure and cleanup uncertainty retain the workspace. Foreground tick exhaustion
+requests cancellation and keeps unresolved state/workspace; it never returns
+while Docker may still run. Restarted terminal journals use a fresh read-only
+provider observation where possible and never restart an operation. Run the synthetic local
 Docker proof with `scripts/check_development_e2e.py` when Docker and the pinned
 image are available. Linux quota/restart and Minikube evidence remain open.

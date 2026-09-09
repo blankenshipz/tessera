@@ -88,8 +88,12 @@ def test_worker_service_heartbeats_before_lease_and_never_issues_human_commands(
     state, _, _, _, grant = _unleased_delivery(tmp_path)
     channel = ApiChannel(state)
     service = _service(tmp_path, state, grant, channel=channel)
+    service.adapter.cancel_unknown = True
 
-    assert service.run()["state"] == "running"
+    result = service.run()
+    assert result["state"] == "unknown"
+    assert result["reason"] == "tick_limit_cancellation_requested"
+    assert service.adapter.calls.count("cancel") == 1
     assert channel.paths[:2] == ["/worker/heartbeat", "/worker/leases"]
     assert all(path.startswith("/worker/") for path in channel.paths)
     assert "/projects/" not in channel.paths

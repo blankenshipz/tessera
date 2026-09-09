@@ -60,6 +60,7 @@ class RuntimePackageStore(ExecutionStore):
             raise Conflict("Execution plan exceeds the supported CPU package capabilities.")
         package = {
             "version": 1,
+            "adapter_version": "docker-local-cpu-v1",
             "profile_version": "local-cpu-v1",
             "operation_id": hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32],
             "lease_id": lease_id,
@@ -76,6 +77,7 @@ class RuntimePackageStore(ExecutionStore):
             "pinned_image": grant["pinned_image"],
             "hard_expires_at": lease["hard_expires_at"],
         }
+        package["docker_lookup_key"] = f"tessera-op-{package['operation_id']}"
         if persistent_output_storage is not None:
             if spec["max_output_bytes"] > persistent_output_storage["capacity_bytes"]:
                 raise Conflict("Persistent output storage byte capacity is below declared outputs.")
@@ -83,6 +85,64 @@ class RuntimePackageStore(ExecutionStore):
         if expiry <= self._now():
             raise Conflict("Execution lease expired while preparing its package.")
         return {"package": package, "package_digest": canonical_digest(package)}, dict(lease)
+
+    @staticmethod
+    def _operation_response(row: Any) -> dict[str, Any]:
+        return dict(row)
+
+    def _record_operation_intent(
+        self,
+        connection: Any,
+        worker: dict[str, Any],
+        package: dict[str, Any],
+        package_digest: str,
+        request_digest: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create one immutable provider-operation identity before package return."""
+        existing = connection.execute(
+            "SELECT * FROM external_operations WHERE lease_id=?", (package["lease_id"],)
+        ).fetchone()
+        expected = {
+            "operation_id": package["operation_id"],
+            "org_id": worker["org_id"],
+            "project_id": package["project_id"],
+            "task_id": package["task_id"],
+            "grant_id": package["grant_id"],
+            "lease_id": package["lease_id"],
+            "worker_principal_id": package["worker_principal_id"],
+            "epoch": package["epoch"],
+            "package_digest": package_digest,
+            "adapter_version": package["adapter_version"],
+            "profile_version": package["profile_version"],
+            "docker_lookup_key": package["docker_lookup_key"],
+            "request_digest": request_digest,
+            "retry_class": "manual_reconciliation",
+        }
+        if existing is not None:
+            if any(existing[field] != value for field, value in expected.items()):
+                raise Conflict("External operation identity or package digest conflicts.")
+            return self._operation_response(existing), False
+        now = self._now().isoformat()
+        row = expected | {
+            "desired_state": "admitted",
+            "observed_state": "unknown",
+            "provider_id": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        connection.execute(
+            """INSERT INTO external_operations
+            (operation_id, org_id, project_id, task_id, grant_id, lease_id, worker_principal_id,
+             epoch, package_digest, adapter_version, profile_version, docker_lookup_key,
+             request_digest, retry_class, desired_state, observed_state, provider_id, created_at,
+             updated_at)
+            VALUES (:operation_id,:org_id,:project_id,:task_id,:grant_id,:lease_id,
+            :worker_principal_id,:epoch,:package_digest,:adapter_version,:profile_version,
+            :docker_lookup_key,:request_digest,:retry_class,:desired_state,:observed_state,
+            :provider_id,:created_at,:updated_at)""",
+            row,
+        )
+        return row, True
 
     def execution_package(
         self,
@@ -112,6 +172,11 @@ class RuntimePackageStore(ExecutionStore):
                 "Persistent output storage capability requires persistent output collection."
             )
         live_lease: dict[str, Any] = {}
+        operation_request = {"expected_epoch": expected_epoch}
+        if persistent_output_collection:
+            operation_request["persistent_output_collection"] = True
+            operation_request["persistent_output_storage"] = persistent_output_storage
+        operation_request_digest = canonical_digest(operation_request)
 
         def command(connection, live):
             metadata, lease = self._package(
@@ -119,6 +184,10 @@ class RuntimePackageStore(ExecutionStore):
             )
             live_lease.update(lease)
             package = metadata["package"]
+            operation, created = self._record_operation_intent(
+                connection, live, package, metadata["package_digest"], operation_request_digest
+            )
+            metadata["operation"] = operation
             self._event(
                 connection,
                 live,
@@ -130,6 +199,8 @@ class RuntimePackageStore(ExecutionStore):
                     "operation_id": package["operation_id"],
                     "lease_id": lease_id,
                     "package_digest": metadata["package_digest"],
+                    "external_operation_intent": created,
+                    "retry_class": "manual_reconciliation",
                     "execution_dispatched": False,
                 },
             )
@@ -139,7 +210,19 @@ class RuntimePackageStore(ExecutionStore):
             metadata, lease = self._package(
                 connection, live, lease_id, expected_epoch, persistent_output_storage
             )
-            if cached != metadata:
+            operation, _ = self._record_operation_intent(
+                connection,
+                live,
+                metadata["package"],
+                metadata["package_digest"],
+                operation_request_digest,
+            )
+            metadata["operation"] = operation
+            if (
+                cached.get("package") != metadata["package"]
+                or cached.get("package_digest") != metadata["package_digest"]
+                or cached.get("operation", {}).get("operation_id") != operation["operation_id"]
+            ):
                 raise Conflict("Execution package changed since admission.")
             live_lease.update(lease)
 

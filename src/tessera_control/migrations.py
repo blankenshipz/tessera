@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 17
+LATEST_SCHEMA_VERSION = 18
 LOCAL_ORG_ID = "org_local"
 
 
@@ -332,6 +332,14 @@ def migrate_v16_to_v17(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 17 WHERE singleton = 1")
 
 
+def migrate_v17_to_v18(connection: sqlite3.Connection) -> None:
+    """Add empty operation intent records; v17 leases/observations stay legacy-null."""
+    from .external_operations import create_external_operation_schema
+
+    create_external_operation_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 18 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -349,6 +357,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: migrate_v14_to_v15,
     15: migrate_v15_to_v16,
     16: migrate_v16_to_v17,
+    17: migrate_v17_to_v18,
 }
 
 

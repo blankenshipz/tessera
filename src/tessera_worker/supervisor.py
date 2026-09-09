@@ -135,7 +135,7 @@ class CpuSupervisor:
             self._require_open()
             row = self._bind(operation, lease)
             if row["phase"] == "terminal":
-                return self._result(row)
+                return self._recover_terminal(operation, row)
             stopped = self._enforce_bounds_and_authority(operation, lease, row)
             if stopped is not None:
                 return stopped
@@ -170,7 +170,7 @@ class CpuSupervisor:
             self._require_open()
             row = self._bind(operation, lease)
             if row["phase"] == "terminal":
-                return self._result(row)
+                return self._recover_terminal(operation, row)
             stopped = self._enforce_bounds_and_authority(operation, lease, row)
             if stopped is not None:
                 return stopped
@@ -190,13 +190,29 @@ class CpuSupervisor:
         # It is deliberately a hold, rather than an invitation to retry start.
         return self._uncertain(operation, f"reconcile_{observation.state}", observation)
 
+    def _recover_terminal(self, operation: CpuOperation, row: sqlite3.Row) -> DriverResult:
+        """Read terminal provider state after restart; never issue another start."""
+        if operation.operation_id not in self._recovered_operations:
+            return self._result(row)
+        try:
+            observation = self._adapter.observe(operation)
+        except CpuError:
+            return DriverResult(
+                "uncertain", CpuObservation("unknown"), "terminal_observation_unconfirmed"
+            )
+        if observation.state == "exited" and observation.termination_confirmed:
+            return DriverResult("terminal", observation, row["terminal_reason"])
+        # Preserve the durable terminal journal but expose an absent or
+        # contradictory fresh provider read as unresolved.
+        return DriverResult("uncertain", observation, "terminal_observation_unresolved")
+
     def tick(self, operation: CpuOperation, lease: Lease) -> DriverResult:
         """Recheck live authority and bounded duration for an existing operation."""
         with self._guard:
             self._require_open()
             row = self._bind(operation, lease)
             if row["phase"] == "terminal":
-                return self._result(row)
+                return self._recover_terminal(operation, row)
             stopped = self._enforce_bounds_and_authority(operation, lease, row)
             if stopped is not None:
                 return stopped
