@@ -398,9 +398,9 @@ def migrate_v22_to_v23(connection: sqlite3.Connection) -> None:
 
 def migrate_v23_to_v24(connection: sqlite3.Connection) -> None:
     """Add explicit retention/recovery metadata without changing object custody."""
-    from .project_artifact_store import create_project_artifact_storage_schema
+    from .project_artifact_retention import create_project_artifact_retention_schema
 
-    create_project_artifact_storage_schema(connection)
+    create_project_artifact_retention_schema(connection)
     connection.execute(
         """INSERT OR IGNORE INTO project_artifact_retention
         (artifact_id,project_id,retention_class,state,created_at,activity_at,

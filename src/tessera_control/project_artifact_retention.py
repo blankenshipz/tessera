@@ -65,7 +65,12 @@ class ProjectArtifactRetentionStore(Store):
         # bounded rows instead of relying on optional SQLite JSON extensions.
         for row in connection.execute("SELECT artifacts_json FROM artifact_manifests"):
             try:
-                if any(item.get("id") == artifact_id for item in json.loads(row[0])):
+                manifest = json.loads(row[0])
+                if not isinstance(manifest, list) or any(
+                    not isinstance(item, dict) for item in manifest
+                ):
+                    return True
+                if any(item.get("id") == artifact_id for item in manifest):
                     return True
             except (TypeError, ValueError):
                 return True  # malformed authoritative metadata fails closed
@@ -208,16 +213,31 @@ class ProjectArtifactRetentionStore(Store):
         except ProjectArtifactStorageError as error:
             failure = str(error)
         if failure is None:
-            return {"state": row["state"], "activity_at": row["activity_at"]}
+            connection = _connect(self.database_path)
+            try:
+                live = self._live_principal(connection, actor)
+                current = self._object(connection, live, project_id, artifact_id)
+                return {"state": current["state"], "activity_at": current["activity_at"]}
+            finally:
+                connection.close()
         connection = _connect(self.database_path)
         try:
             now = utc_now()
             connection.execute("BEGIN IMMEDIATE")
+            live = self._live_principal(connection, actor)
+            current = self._object(connection, live, project_id, artifact_id)
+            if current["state"] == "deleted":
+                connection.execute("COMMIT")
+                return {"state": "deleted", "activity_at": current["activity_at"]}
             connection.execute(
                 "UPDATE project_artifact_retention SET state='degraded',incident_at=?,incident_reason=?,activity_at=? WHERE artifact_id=?",
                 (now, failure[:500], now, artifact_id),
             )
             connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
         return {"state": "degraded", "incident_reason": failure}

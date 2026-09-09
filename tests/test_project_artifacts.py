@@ -383,6 +383,7 @@ def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
     )
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         for table in (
+            "project_artifact_retention",
             "project_artifact_storage_operations",
             "project_artifact_placements",
             "project_storage_bindings",
@@ -409,6 +410,16 @@ def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
             ).fetchone()
             is None
         )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("BEGIN")
+        MIGRATIONS[21](connection)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='project_artifact_retention'"
+            ).fetchone()
+            is None
+        )
+        connection.execute("ROLLBACK")
     assert migrate_state(state) == 24
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
@@ -480,6 +491,44 @@ def test_retention_delete_intent_is_retry_safe_and_missing_is_degraded(tmp_path:
     assert retention.inspect(owner, grant["project_id"], artifact["id"])["state"] == "deleted"
 
 
+def test_retention_inspection_does_not_overwrite_concurrent_deleted_state(tmp_path: Path) -> None:
+    state, _, owner, worker, grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"inspection-race")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+
+    class ConcurrentDeleteBackend(FakeProjectArtifactBackend):
+        def inspect(self, tenant_id, project_id, artifact_id, sha256, size):
+            with sqlite3.connect(state / "tessera.sqlite3") as connection:
+                connection.execute(
+                    "UPDATE project_artifact_retention SET state='deleted' WHERE artifact_id=?",
+                    (artifact_id,),
+                )
+            return None
+
+    backend = ConcurrentDeleteBackend()
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(request), request
+    )
+    result = ProjectArtifactRetentionStore(state, backend).inspect(
+        owner, grant["project_id"], artifact["id"]
+    )
+    assert result["state"] == "deleted"
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT state,incident_reason FROM project_artifact_retention WHERE artifact_id=?",
+            (artifact["id"],),
+        ).fetchone() == ("deleted", None)
+
+
 def test_v24_retention_migration_preserves_placement_and_rolls_back(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -512,8 +561,8 @@ def test_v24_retention_migration_preserves_placement_and_rolls_back(
         connection.execute("UPDATE schema_meta SET schema_version=23")
 
     def fail(connection):
-        from tessera_control.project_artifact_store import create_project_artifact_storage_schema
-        create_project_artifact_storage_schema(connection)
+        from tessera_control.project_artifact_retention import create_project_artifact_retention_schema
+        create_project_artifact_retention_schema(connection)
         raise RuntimeError("v24 fault")
     with monkeypatch.context() as patch:
         patch.setitem(MIGRATIONS, 23, fail)

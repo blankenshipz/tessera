@@ -365,12 +365,17 @@ class FilesystemProjectArtifactBackend:
         target = namespace / placement.object_key
         if not self._read(target, placement.sha256, placement.size):
             raise ProjectArtifactStorageError("Project artifact deletion identity conflicts.")
-        target.unlink()
-        descriptor = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            target.unlink()
+            descriptor = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise ProjectArtifactStorageError(
+                "Project artifact deletion outcome is uncertain."
+            ) from error
         return True
 
 

@@ -285,7 +285,48 @@ def test_revocation_during_setup_blocks_message_after_durable_session(tmp_path: 
             live.start(binding(), context())
         assert seen == ["inspect", "create", "message"]
         assert live.active_binding("operation-1").session_id == "session-1"
+        assert live.effect_outcome("operation-1", "message") == "blocked"
         assert value.messages == []
+
+
+@pytest.mark.parametrize("boundary", ["events", "abort"])
+def test_revocation_during_contract_recheck_blocks_privileged_call(
+    tmp_path: Path, boundary: str
+) -> None:
+    with fixture() as value:
+        counts = {"events": 0, "abort": 0}
+
+        def authority(_binding: TesseraBinding, action: str) -> bool:
+            if action == boundary:
+                counts[action] += 1
+                return counts[action] == 1
+            return True
+
+        live = adapter(value, tmp_path / "journal", authority_is_current=authority)
+        live.start(binding(), context())
+        if boundary == "events":
+            with pytest.raises(AuthorityRejectedError):
+                live.poll("operation-1")
+            assert not any(item[1] == "/event" for item in value.requests)
+        else:
+            status = live.cancel("operation-1")
+            assert status.requested is True and status.unresolved is True
+            assert live.effect_outcome("operation-1", "abort") == "blocked"
+            assert value.aborts == []
+
+
+def test_duplicate_upstream_session_cannot_bind_two_operations(tmp_path: Path) -> None:
+    with fixture() as value:
+        live = adapter(value, tmp_path / "journal")
+        first = live.start(binding(), context())
+        assert first.session_id == "session-1"
+        value.sessions.clear()
+        second = TesseraBinding("org-1", "project-1", "task-2", "operation-2", 5, "harness-1")
+        with pytest.raises(OpenCodeHarnessError, match="session identity conflicts"):
+            live.start(second, BoundedPlanMessage("plan-8", "Another bounded message"))
+        assert live.effect_outcome("operation-2", "create") == "uncertain"
+        assert live.active_binding("operation-2").session_id is None
+        assert len(value.messages) == 1
 
 
 def test_sse_reconnect_preserves_gap_dedup_cursor_and_attribution_after_restart(

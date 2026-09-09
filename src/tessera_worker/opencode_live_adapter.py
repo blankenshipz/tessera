@@ -89,7 +89,11 @@ class LiveOpenCodeHarnessAdapter:
             ) from error
         bound = replace(binding, session_id=session_id)
         self._set_created(bound)
-        self._require_authority(bound, "message")
+        try:
+            self._require_authority(bound, "message")
+        except AuthorityRejectedError:
+            self._set_effect(bound.operation_id, "message", "blocked")
+            raise
         self._set_effect(bound.operation_id, "message", "pending")
         try:
             self._client.send_message(session_id, context.message, bound.operation_id)
@@ -116,6 +120,7 @@ class LiveOpenCodeHarnessAdapter:
             self._client.verify_contract()
         except OpenCodeHttpError as error:
             raise OpenCodeHarnessError("Pinned OpenCode contract verification failed.") from error
+        self._require_authority(binding, "events")
         after_cursor = self._required_operation(operation_id)[10]
         try:
             events = self._client.events(after_cursor)
@@ -145,6 +150,11 @@ class LiveOpenCodeHarnessAdapter:
             self._client.verify_contract()
         except OpenCodeHttpError:
             self._set_effect(operation_id, "abort", "uncertain")
+            return self.cancellation_status(operation_id)
+        try:
+            self._require_authority(binding, "abort")
+        except AuthorityRejectedError:
+            self._set_effect(operation_id, "abort", "blocked")
             return self.cancellation_status(operation_id)
         self._set_effect(operation_id, "abort", "pending")
         try:
@@ -296,12 +306,19 @@ class LiveOpenCodeHarnessAdapter:
         self._connection.commit()
 
     def _set_created(self, binding: TesseraBinding) -> None:
-        self._connection.execute(
-            """UPDATE operations SET session_id=?, create_outcome='acknowledged'
-            WHERE operation_id=?""",
-            (binding.session_id, binding.operation_id),
-        )
-        self._connection.commit()
+        try:
+            self._connection.execute(
+                """UPDATE operations SET session_id=?, create_outcome='acknowledged'
+                WHERE operation_id=?""",
+                (binding.session_id, binding.operation_id),
+            )
+            self._connection.commit()
+        except sqlite3.IntegrityError as error:
+            self._connection.rollback()
+            self._set_effect(binding.operation_id, "create", "uncertain")
+            raise OpenCodeHarnessError(
+                "OpenCode session identity conflicts with another operation; reconcile it."
+            ) from error
 
     def _set_effect(self, operation_id: str, boundary: str, outcome: str) -> None:
         try:
@@ -357,7 +374,9 @@ class LiveOpenCodeHarnessAdapter:
                 session_id TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (operation_id, cursor),
-                UNIQUE (operation_id, fingerprint));"""
+                UNIQUE (operation_id, fingerprint));
+            CREATE UNIQUE INDEX IF NOT EXISTS operations_by_session
+                ON operations(session_id) WHERE session_id IS NOT NULL;"""
         )
         self._connection.commit()
 
