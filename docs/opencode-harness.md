@@ -1,4 +1,4 @@
-# Synthetic OpenCode harness adapter POC
+# OpenCode harness adapters
 
 `tessera_worker.opencode_harness` is a synthetic, in-process adapter POC. It has
 no HTTP implementation, provider call, credential path, control-plane write,
@@ -47,3 +47,36 @@ selected compatible upstream version, conformance/security testing, enrolled-nod
 controls, and the existing Tessera authority, dispatch, artifact, cost, and result
 acceptance gates. Passing these fixture tests is adapter evidence only, not pilot
 completion.
+
+## Live pinned HTTP/SSE seam
+
+`tessera_worker.opencode_http` and `tessera_worker.opencode_live_adapter` add a
+separate live transport seam, exercised only against an in-process fixture so far. It accepts exactly one configured
+authenticated endpoint, an exact semantic server-version pin, and the SHA-256 of
+the canonical pinned `/doc` OpenAPI response. It verifies both before session
+mutation and before each independently opened event stream. The endpoint must use
+TLS, unless it is a literal `127.0.0.1` or `[::1]` HTTP origin; endpoint paths,
+credentials in URLs, redirects, proxy environment settings, cookies, and general
+OpenCode routes are rejected or unavailable. The endpoint authorization value is
+an endpoint-only Bearer header, never a message part, journal value, or provider
+credential.
+
+The client exposes only `POST /session`, `POST /session/{id}/message`, `POST
+/session/{id}/abort`, and `GET /event` after the pinned `/doc` inspection. It
+sets bounded request/response/event sizes and a 30-second maximum request/stream
+deadline. The adapter only emits known typed `/event` envelopes for its already
+attributed session; unknown, foreign, malformed, secret-bearing, oversized, and
+out-of-order events are quarantined. Numeric SSE IDs are exclusive replay cursors;
+gaps are retained, duplicate/reused IDs are deduplicated or quarantined, and a
+reopened local journal resumes with `Last-Event-ID` at the contiguous cursor.
+
+The private `0700` local journal stores operation binding, session identity,
+effect intent/outcome, cancellation state, and safe pending event metadata. It
+persists create/message/abort intent before the outbound call and leaves a lost
+reply `uncertain`; a restart cannot create a second operation identity. A
+supervisor authority callback fails closed before contract inspection, create,
+message, abort, and event-stream calls. Abort acknowledgement remains only an
+OpenCode acknowledgement: provider termination, costs, output acceptance, and
+scientific success remain unresolved. The fixture prohibits provider routes and
+does not enable OpenCode shell, MCP, skills, permissions, provider authentication,
+or model calls.

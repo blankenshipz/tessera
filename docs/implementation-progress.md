@@ -10,7 +10,7 @@ Reviewed 2026-09-09 against schema v23 reconciled private project-artifact persi
 the schema v21 metadata-only credential-access lease,
 v20 bounded human result-bookkeeping ledger, v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
-OpenCode harness adapter POC, and bounded capability-probe slice. These are
+OpenCode harness adapter POC, local pinned OpenCode HTTP/SSE seam, and bounded capability-probe slice. These are
 informational evidence only, not live integration, cryptographic trust,
 capability attestation, dispatch, or pilot completion.
 **Implemented** means the named bounded behavior has executable evidence;
@@ -210,6 +210,18 @@ representative investigation have not passed end-to-end acceptance.
     It has no live OpenCode/provider call, control write, dispatch,
     artifact/result acceptance, credential path, compatibility result, or pilot
     completion. See [the adapter note](opencode-harness.md).
+
+    **Local HTTP/SSE seam:** a second narrow client only reaches one authenticated
+    configured endpoint after exact version and canonical `/doc` digest pinning.
+    It rejects non-TLS non-literal-loopback origins, redirects, proxies, cookies,
+    unbounded bodies/events, and all routes except session create/message/abort and
+    events. A private local journal preserves uncertain create/message/abort
+    effects, operation/session binding, contiguous SSE cursors, gaps and dedup
+    across restart. In-process HTTP fixtures cover authentication/version/schema,
+    redirects, revocation during setup, lost replies, reconnect/gaps, unknown and
+    bounded events, and provider-route non-use. It has no selected real OpenCode
+    server compatibility result, enrolled-node integration, provider/model call,
+    credential handoff, dispatch, artifact/result acceptance, or pilot completion.
 
 18. **Synthetic result checkpoint:** schema v15 records a human-only immutable
     checkpoint after a reconciled, worker-confirmed exit, exact operation/epoch,
