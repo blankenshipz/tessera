@@ -6,6 +6,12 @@ running harness, or authorize access/spending/publication. Every mutation requir
 `Idempotency-Key`. Authorization is rechecked before replay. Unknown outcomes
 should be retried with the same key and body on the same connection.
 
+Schema v22 additionally records project storage bindings, immutable placement
+metadata, and stage/commit/reconcile operation timestamps for validated worker
+artifacts. These records intentionally expose no credential, URL, or worker path.
+They retain quarantine/classification/result/finding/cost/provider dimensions: a
+committed placement is durable custody only, not a release or scientific claim.
+
 ## Research ledger
 
 | Route | Behavior |

@@ -132,6 +132,14 @@ responses, events, receipts, or diagnostics. The in-memory fake backend is test
 only: production secret backends and real provider credential integration remain
 unimplemented.
 
+Schema v22 separates development worker output-slot custody from durable private
+project artifact storage. Quarantine remains intake; validated development bytes
+are stage/commit/reconciled to default project persistence before workspace cleanup.
+Placement is not release, classification, finding/result acceptance, cost settlement,
+or provider/scientific success. Legacy SQLite BLOBs receive no invented placement.
+S3/IAM/KMS, public URLs, external export/move, deletion, and pilot activation remain
+unimplemented; see [project artifact storage](docs/project-artifact-storage.md).
+
 Local [workspace adoption](docs/workspace-adoption.md) now preserves reviewed input
 bytes and their manifest, verifies them after restart, and records adoption in the
 labbook. Original snapshots retain their unclassified, imported/unverified labels;

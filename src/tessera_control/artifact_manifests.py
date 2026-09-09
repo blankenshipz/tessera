@@ -161,6 +161,26 @@ class ArtifactManifestStore(ArtifactStore):
                         "size": row["size"],
                     }
                 )
+            # v22 only requires durable placement after a project binding exists.
+            # Older SQLite-only artifacts intentionally remain legacy/unplaced.
+            binding = connection.execute(
+                "SELECT 1 FROM project_storage_bindings WHERE project_id=?", (grant["project_id"],)
+            ).fetchone()
+            if binding is not None:
+                for entry in verified:
+                    placement = connection.execute(
+                        """SELECT sha256,size FROM project_artifact_placements
+                        WHERE artifact_id=? AND project_id=?""",
+                        (entry["id"], grant["project_id"]),
+                    ).fetchone()
+                    if (
+                        placement is None
+                        or placement["sha256"] != entry["sha256"]
+                        or placement["size"] != entry["size"]
+                    ):
+                        raise Conflict(
+                            "Artifact manifest requires committed project artifact placement."
+                        )
             canonical = self._canonical_payload(lease, grant, actor, verified)
             manifest_digest = canonical_digest(canonical)
             existing = connection.execute(

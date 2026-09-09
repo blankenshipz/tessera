@@ -213,6 +213,9 @@ class ResultCheckpointStore(Store):
         ):
             raise Conflict("Artifact manifest is incomplete for the declared execution outputs.")
         verified: list[dict[str, Any]] = []
+        binding = connection.execute(
+            "SELECT 1 FROM project_storage_bindings WHERE project_id=?", (grant["project_id"],)
+        ).fetchone()
         for entry in expected:
             artifact = connection.execute(
                 """SELECT id, relative_path, sha256, size, content,
@@ -248,6 +251,20 @@ class ResultCheckpointStore(Store):
                 raise Conflict(
                     "Quarantined artifact integrity check failed during synthetic validation."
                 )
+            if binding is not None:
+                placement = connection.execute(
+                    "SELECT sha256,size FROM project_artifact_placements "
+                    "WHERE artifact_id=? AND project_id=?",
+                    (artifact["id"], grant["project_id"]),
+                ).fetchone()
+                if (
+                    placement is None
+                    or placement["sha256"] != artifact["sha256"]
+                    or placement["size"] != artifact["size"]
+                ):
+                    raise Conflict(
+                        "Execution result checkpoint requires committed project artifact placement."
+                    )
             verified.append(entry)
         return ResultCheckpointStore._validation(manifest, verified, body["expected_total_bytes"])
 

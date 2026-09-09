@@ -323,5 +323,5 @@ def test_schema17_handoff_migration_is_explicit_transactional_and_repeatable(tmp
             is None
         )
     monkeypatch.undo()
-    assert migrate_state(state) == 21
-    assert migrate_state(state) == 21
+    assert migrate_state(state) == 22
+    assert migrate_state(state) == 22

@@ -193,3 +193,8 @@ acceptance from v19 checkpoints, manifests, receipts, or reconciled grants.
 Schema 21 adds empty metadata-only credential-access leases. It does not infer a
 lease from existing Tessera authentication credentials, workers, grants, or v20
 operations, and it never migrates or stores a secret value.
+
+Schema 22 adds empty project-storage bindings, placement, and storage-operation
+metadata. Existing SQLite artifact BLOBs remain legacy with no invented location.
+Back up before migration; v22 backup fails closed when committed project objects
+would be omitted, until object-bundle recovery is implemented.

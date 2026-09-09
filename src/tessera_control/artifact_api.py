@@ -14,6 +14,7 @@ from .artifacts import (
     UploadArtifact,
     UploadChunk,
 )
+from .project_artifact_store import CommitProjectArtifacts, ProjectArtifactStore
 from .store import canonical_digest
 
 router = APIRouter()
@@ -42,6 +43,17 @@ def manifests(request: Request) -> ArtifactManifestStore:
 
 
 ManifestStoreDependency = Annotated[ArtifactManifestStore, Depends(manifests)]
+
+
+def project_artifacts(request: Request) -> ProjectArtifactStore:
+    return getattr(
+        request.app.state,
+        "project_artifacts",
+        ProjectArtifactStore(request.app.state.store.database_path.parent),
+    )
+
+
+ProjectArtifactStoreDependency = Annotated[ProjectArtifactStore, Depends(project_artifacts)]
 
 
 @router.post("/worker/leases/{lease_id}/artifacts")
@@ -120,6 +132,21 @@ def create_manifest(
 ):
     payload = body.model_dump(mode="json")
     status, response = store.create_manifest(
+        worker, lease_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.post("/worker/leases/{lease_id}/project-artifacts")
+def commit_project_artifacts(
+    lease_id: str,
+    body: CommitProjectArtifacts,
+    worker: Worker,
+    key: Key,
+    store: ProjectArtifactStoreDependency,
+):
+    payload = body.model_dump(mode="json")
+    status, response = store.commit_project_artifacts(
         worker, lease_id, key, canonical_digest(payload), payload
     )
     return JSONResponse(status_code=status, content=response)

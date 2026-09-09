@@ -2,6 +2,11 @@
 
 Schema v7 adds immutable artifact quarantine; v8 adds resumable upload sessions.
 Schema v9 adds immutable complete output manifests; v10 adds human disposition history.
+Schema v22 keeps quarantine as bounded intake but separates durable project
+placement. After checksum/size validation, development-worker bytes stage/commit/
+reconcile into private project storage before workspace cleanup. This does not
+classify or release bytes, accept a finding/result, settle cost, or establish
+provider/scientific success; historical SQLite BLOBs have no inferred placement.
 Upgrade existing state explicitly
 with `tessera migrate` after stopping the service and backing up its private state.
 The migration preserves grants, leases, reservations and retained inputs; failure

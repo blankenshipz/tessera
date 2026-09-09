@@ -187,6 +187,26 @@ def upload_output_set(
             }
         )
     operation_id = hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
+    placement_body = {
+        "expected_epoch": expected_epoch,
+        "operation_id": operation_id,
+        "artifacts": [{name: item[name] for name in ("id", "sha256", "size")} for item in entries],
+    }
+    placement_path = f"/worker/leases/{lease_id}/project-artifacts"
+    placement = channel.post(placement_path, placement_body, _key(placement_path, placement_body))
+    receipts = placement.get("placements")
+    if (
+        not isinstance(receipts, list)
+        or len(receipts) != len(entries)
+        or {
+            (item.get("artifact_id"), item.get("sha256"), item.get("size"), item.get("state"))
+            for item in receipts
+        }
+        != {(item["id"], item["sha256"], item["size"], "committed") for item in entries}
+    ):
+        raise ArtifactTransferError(
+            "Project artifact placement receipt does not match retained bytes."
+        )
     body = {"expected_epoch": expected_epoch, "operation_id": operation_id, "artifacts": entries}
     path = f"/worker/leases/{lease_id}/artifact-manifest"
     receipt = channel.post(path, body, _key(path, body))
@@ -225,4 +245,4 @@ def upload_output_set(
     ).hexdigest()
     if digest != receipt.get("manifest_digest"):
         raise ArtifactTransferError("Output manifest checksum is invalid.")
-    return receipt
+    return {**receipt, "project_placements_committed": True}

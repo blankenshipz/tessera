@@ -6,7 +6,8 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v21 metadata-only credential-access lease,
+Reviewed 2026-09-09 against schema v22 private project-artifact persistence and
+the schema v21 metadata-only credential-access lease,
 v20 bounded human result-bookkeeping ledger, v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
 OpenCode harness adapter POC, and bounded capability-probe slice. These are
@@ -267,6 +268,15 @@ representative investigation have not passed end-to-end acceptance.
     backend rechecks authority at resolve and records no values in SQLite, events,
     API responses or diagnostics. It is not a production secret backend or real
     provider credential integration; see [decision 0007](decisions/0007-credential-access-lease-boundary.md).
+
+27. **Project artifact storage:** schema v22 separates development worker output
+    slots from default private project persistence. Quarantine bytes are
+    checksum/size validated, stage/commit/reconciled with deterministic local
+    tenant/project namespaces before workspace cleanup; binding/placement/operation
+    records carry retention/timestamps only. Placement stays quarantined and has
+    no finding, classification, cost, provider, or scientific effect. Legacy BLOBs
+    remain unplaced. S3/IAM/KMS, Linux worker-slot enforcement, export/release,
+    object-bundle restore/deletion, and pilot acceptance remain open.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have

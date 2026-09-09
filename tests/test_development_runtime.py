@@ -117,7 +117,11 @@ def test_development_workspace_reclaims_only_after_quarantine_transfer(
     monkeypatch.setattr(
         backend.seals,
         "resume",
-        lambda channel, seal: {"id": seal, "status": "quarantined"},
+        lambda channel, seal: {
+            "id": seal,
+            "status": "quarantined",
+            "project_placements_committed": True,
+        },
     )
     backend.upload(OPERATION_ID, object(), seal_id)
     backend.cleanup(OPERATION_ID)

@@ -276,11 +276,17 @@ class DevelopmentOutputBackend:
             "unclassified",
         }:
             raise DevelopmentRuntimeError("Development output transfer did not remain quarantined.")
+        if receipt.get("project_placements_committed") is not True:
+            raise DevelopmentRuntimeError(
+                "Development output lacks committed project artifact placement."
+            )
+        # The transfer helper has also received exact committed placement receipts;
+        # quarantine alone is intentionally insufficient to permit reclamation.
         self._transition(operation_id, {"sealed", "uploaded"}, "uploaded")
         return {**receipt, "output_label": self.label, "development_profile": self.profile.profile}
 
     def cleanup(self, operation_id: str) -> None:
-        """Explicitly reclaim only a transfer-confirmed workspace, never uncertainty."""
+        """Reclaim only after exact durable project placement, never quarantine alone."""
         row = self._reservation(operation_id)
         if row["status"] != "uploaded":
             raise DevelopmentRuntimeError("Refusing cleanup for unresolved development output.")

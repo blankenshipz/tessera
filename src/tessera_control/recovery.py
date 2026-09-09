@@ -243,6 +243,12 @@ def backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
         _defensive(source, start)
         source.execute("BEGIN")
         source.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+        # v22 local project objects are intentionally outside SQLite.  Until a
+        # bundle format atomically captures and verifies them, a backup with any
+        # committed placement fails closed instead of advertising incomplete
+        # recovery evidence.
+        if source.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0]:
+            raise StoreError("Backup cannot omit committed project artifact objects.")
         page_size = source.execute("PRAGMA page_size").fetchone()[0]
         if source.execute("PRAGMA page_count").fetchone()[0] * page_size > MAX_BACKUP_BYTES:
             raise StoreError("Backup exceeds its size limit.")

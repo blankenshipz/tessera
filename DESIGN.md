@@ -418,7 +418,10 @@ Return command IDs; expose desired and observed state separately.
 Read APIs cover projects, threads, tasks, operations, skills, labbook, ledger
 snapshots, findings, artifacts, and correction impacts. Historical queries are
 read-only. Object uploads are resumable and quarantined until size/checksum and
-manifest validation pass. Missing or corrupted artifacts cannot support accepted
+manifest validation pass. Schema v22 persists validated development output to
+private project storage through stage/commit/reconcile; worker slots are not
+project storage. Placement is not classification, release, result/finding
+acceptance, cost settlement, or provider/scientific success. Missing or corrupted artifacts cannot support accepted
 claims. Short-lived object URLs are scoped bearer access; use an authenticated
 proxy where immediate revocation is required.
 
