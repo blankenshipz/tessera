@@ -166,3 +166,27 @@ The stored record explicitly says `scientific_validity=not_assessed` and
 `execution_receipt=trusted_worker_termination_observation_only`: it does not
 attest provider success, settle previously unresolved exposure, accept a finding,
 or enable runtime collection/provider dispatch.
+
+## Bounded human result bookkeeping (schema v20)
+
+`POST /result-checkpoints/{id}/acceptances` appends one human-only `accept`,
+`reject`, or terminal `retract` record. The request has a nonblank rationale,
+expected ledger revision, checkpoint/manifest/validation/receipt digests, and
+the matching reconciled grant revision, lease, operation, and epoch. The first
+decision uses revision 0; only a current accept/reject can be retracted, and a
+retracted ledger cannot be reopened. `GET /result-checkpoints/{id}/acceptances`
+returns bounded immutable history under the same tenant/project scope.
+
+The transaction rechecks live human credentials, reconciliation, exact receipt
+identity and confirmed fake-provider exit, non-late quarantined/unclassified
+manifest state, complete declared paths, and every retained BLOB's type, size and
+digest. Stale, missing, foreign, mutated, incomplete, released, or changed inputs
+fail closed. Idempotent same-content replay returns its original record; changed
+content conflicts. v19 migration creates no records.
+
+This is only Tessera authoritative bookkeeping/ownership of development-synthetic
+evidence. Each record permanently labels `scientific_validity=not_assessed`,
+`provider_success=not_established`, `artifact_release=not_performed`, and fake
+provider/development evidence. It does not release/download/publish artifacts,
+settle costs, accept/create findings, infer scientific truth, or change the
+checkpoint, manifest, artifact, receipt, grant, or existing findings.

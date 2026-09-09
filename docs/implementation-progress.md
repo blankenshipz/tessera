@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
+Reviewed 2026-09-08 against the schema v20 bounded human result-bookkeeping ledger, v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
 OpenCode harness adapter POC, and bounded capability-probe slice. These are
 informational evidence only, not live integration, cryptographic trust,
@@ -20,7 +20,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v19 fake-provider receipt evidence over v18 durable package intents, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, real provider dispatch/accounting and authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v20 human bookkeeping over v19 fake-provider receipt evidence and v18 durable package intents, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, real provider dispatch/accounting and broader authoritative result policy; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
@@ -45,6 +45,10 @@ full workflow and its required adverse cases pass on the supported target.
 ## Verified evidence
 
 - At `ee6c36d`: 363 Python tests pass natively; Linux CI passed for that commit.
+- Schema v20 result-bookkeeping evidence: 507 Python tests pass natively,
+  including acceptance/retraction revision fencing, receipt/manifest/byte
+  integrity conflicts, tenant isolation, migration rollback and evidence
+  preservation. This remains development/synthetic evidence only.
 - Ruff lint and format checks pass.
 - 62 desktop connection/IPC and renderer tests pass using Node 22.12.
 - Explicit migrations through schema v18 preserve historical records, input bytes,
@@ -250,6 +254,12 @@ representative investigation have not passed end-to-end acceptance.
     quarantine-only output, but is not real provider dispatch/accounting, pilot
     acceptance, artifact release, result acceptance, or scientific success.
 
+25. **Bounded human result bookkeeping:** schema v20 appends a revision-fenced
+    human accept/reject/retract ledger over exact reconciled synthetic checkpoint,
+    fake receipt, operation, lease/epoch, manifest and retained bytes. It preserves
+    quarantine, findings, costs, and explicit not-assessed/not-established/not-
+    performed labels; it is not real provider/scientific acceptance or release.
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -319,8 +329,9 @@ representative research question/dataset remain open configuration inputs.
 ## Remaining milestones
 
 1. Verified persistent output storage and real runtime collection, quarantine
-   release policy, and fenced authoritative result acceptance. Synthetic sealing
-   and result-checkpoint evidence are not backend activation or real pilot acceptance.
+    release policy, and broader real-provider/method result acceptance. Synthetic
+    sealing, checkpoints, fake receipts and bookkeeping are not backend activation
+    or real pilot acceptance.
 2. Cryptographic worker build trust, capability probes, credential brokering and
    operational spend/incident reconciliation. Registration/drain/quarantine/
    retirement and bounded heartbeat admission are implemented; see

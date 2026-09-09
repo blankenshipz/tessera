@@ -11,6 +11,11 @@ Schema v19 fake-provider receipt evidence is separate from these artifact record
 It neither releases quarantined bytes nor makes a manifest, provider observation,
 or synthetic output a result-acceptance or scientific-success record.
 
+Schema v20's human result-bookkeeping ledger may reference an exact checkpoint
+only after it rechecks these bytes and their still-`quarantined`/
+`unclassified`, complete, non-late manifest. That append-only record does not
+change artifact bytes, status, classification, disposition, download or release.
+
 `POST /worker/leases/{lease_id}/artifacts` requires a live worker credential and an
 idempotency key. The strict JSON body contains `expected_epoch`, `operation_id`,
 `relative_path`, `sha256` and `content_base64`. The operation ID must match the

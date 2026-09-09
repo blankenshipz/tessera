@@ -74,7 +74,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v19
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v20
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -115,6 +115,13 @@ deterministic development-worker dispatch. Lost replies reconcile by stable
 lookup key and retain uncertainty; receipt evidence is not real provider
 dispatch, accounting, Docker execution proof, artifact release, or pilot/result
 acceptance.
+
+Schema v20 adds a human-only, append-only result-bookkeeping ledger over exact
+reconciled synthetic checkpoints, manifests, retained bytes, operation receipts,
+grant revisions, and epochs. It records only Tessera ownership/bookkeeping:
+scientific validity remains `not_assessed`, provider success `not_established`,
+and artifact release `not_performed`. It neither releases/downloads/publishes
+bytes, settles cost, creates findings, nor establishes scientific truth.
 
 Local [workspace adoption](docs/workspace-adoption.md) now preserves reviewed input
 bytes and their manifest, verifies them after restart, and records adoption in the

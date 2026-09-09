@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 19
+LATEST_SCHEMA_VERSION = 20
 LOCAL_ORG_ID = "org_local"
 
 
@@ -348,6 +348,14 @@ def migrate_v18_to_v19(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 19 WHERE singleton = 1")
 
 
+def migrate_v19_to_v20(connection: sqlite3.Connection) -> None:
+    """Add an empty human result-bookkeeping ledger without inventing acceptances."""
+    from .result_acceptances import create_result_acceptance_schema
+
+    create_result_acceptance_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 20 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -367,6 +375,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     16: migrate_v16_to_v17,
     17: migrate_v17_to_v18,
     18: migrate_v18_to_v19,
+    19: migrate_v19_to_v20,
 }
 
 

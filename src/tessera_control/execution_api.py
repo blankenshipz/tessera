@@ -19,6 +19,7 @@ from .execution_models import (
     RevokeExecutionGrant,
 )
 from .input_delivery import DeliverInputs, InputDeliveryStore
+from .result_acceptances import ResultAcceptanceRequest, ResultAcceptanceStore
 from .result_checkpoints import CommitExecutionResultCheckpoint, ResultCheckpointStore
 from .runtime_packages import RuntimePackageStore
 from .snapshot_releases import ReleaseSnapshot, RevokeSnapshotRelease, SnapshotReleaseStore
@@ -59,6 +60,13 @@ def result_checkpoints(request: Request) -> ResultCheckpointStore:
 
 
 Checkpoints = Annotated[ResultCheckpointStore, Depends(result_checkpoints)]
+
+
+def result_acceptances(request: Request) -> ResultAcceptanceStore:
+    return ResultAcceptanceStore(request.app.state.execution.database_path.parent)
+
+
+Acceptances = Annotated[ResultAcceptanceStore, Depends(result_acceptances)]
 
 
 def result(value) -> JSONResponse:
@@ -152,6 +160,29 @@ def list_result_checkpoints(
     limit: int = Query(default=100, ge=1, le=200),
 ) -> dict[str, Any]:
     return {"result_checkpoints": store.list_checkpoints(actor, project_id, offset, limit)}
+
+
+@router.post("/result-checkpoints/{checkpoint_id}/acceptances")
+def record_result_acceptance(
+    checkpoint_id: str,
+    body: ResultAcceptanceRequest,
+    actor: Actor,
+    key: Key,
+    store: Acceptances,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(store.record(actor, checkpoint_id, key, canonical_digest(payload), payload))
+
+
+@router.get("/result-checkpoints/{checkpoint_id}/acceptances")
+def list_result_acceptances(
+    checkpoint_id: str,
+    actor: Actor,
+    store: Acceptances,
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    return {"result_acceptances": store.list_records(actor, checkpoint_id, offset, limit)}
 
 
 @router.post("/projects/{project_id}/workers")

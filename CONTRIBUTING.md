@@ -186,3 +186,6 @@ Schema 19 adds empty-by-default fake-provider receipt records. The development
 E2E injects its deterministic fake provider before the existing Docker adapter;
 its receipt is operational test evidence, not Docker/provider accounting or
 pilot acceptance. Migration never backfills v18 operations with receipts.
+
+Schema 20 adds an empty human result-bookkeeping ledger. It never infers an
+acceptance from v19 checkpoints, manifests, receipts, or reconciled grants.

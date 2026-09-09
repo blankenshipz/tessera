@@ -584,6 +584,14 @@ unknown observations, and cancel uncertainty remain unresolved. This records
 fake-provider operational evidence, not real dispatch, accounting, Docker truth,
 artifact release, result acceptance, or scientific success.
 
+Schema v20 adds an append-only, revision-fenced human bookkeeping ledger over a
+previously committed quarantined checkpoint. It rechecks the live reconciled
+grant, receipt, operation, lease/epoch, manifest digest and retained bytes, but
+does not turn fake/development evidence into provider success or scientific
+validity. Acceptance means only authoritative Tessera result ownership; retained
+records explicitly preserve `scientific_validity=not_assessed`,
+`provider_success=not_established`, and `artifact_release=not_performed`.
+
 Operational claims in chat attach timestamped control/supervisor/provider
 observations and freshness limits. Authoritative status wins over conflicting
 agent prose. Checkpoint/resume needs compatible inputs/environment, saved method
