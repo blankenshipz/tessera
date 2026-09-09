@@ -14,6 +14,13 @@ fences tenant, worker, lease, epoch and immutable provider identity. It updates
 only the receipt's observed state and cannot settle cost, accept a result, or
 release an artifact. v18 operations and legacy leases migrate with no receipts.
 
+Schema v21 adds human-created, metadata-only credential-access leases. They are
+separate from Tessera authentication credentials and bind one opaque `secret_ref`
+to the current grant, execution lease, worker and epoch. The lease is provider
+neutral (`audience`, `purpose`, unique `scope` entries), may not outlive its parent
+execution lease, and is not attached to an external-operation receipt. The control
+plane never receives, stores, logs, returns, or records the secret value.
+
 ## Human admission sequence
 
 1. Adopt a snapshot and review its exact digest and contents.
@@ -36,6 +43,10 @@ release an artifact. v18 operations and legacy leases migrate with no receipts.
 | `GET /execution-grants/{id}` | Current grant record |
 | `POST /execution-grants/{id}/revoke` | expected_revision |
 | `POST /execution-grants/{id}/reconcile` | expected_revision, settlement_cents, provider_terminated=`true` |
+| `POST /execution-grants/{id}/credential-access-leases` | execution_lease_id, expected_epoch, opaque secret_ref, audience, purpose, scope, expires_at |
+| `GET /projects/{id}/credential-access-leases` | Human-only bounded metadata list |
+| `POST /credential-access-leases/{id}/renew` | expected_revision, expires_at within the current parent lease |
+| `POST /credential-access-leases/{id}/revoke` | expected_revision |
 
 All mutations require `Idempotency-Key`. Control routes reject worker credentials;
 worker routes reject human/control credentials. Lists use limit 1–200 and offset.
@@ -91,6 +102,15 @@ advance on admission ownership changes and revocation; renewal of the same lease
 preserves its epoch. This lets the supervisor retain a stable operation identity
 while extending only the permitted expiry.
 
+`POST /worker/credential-access-leases/{id}/access` is worker-audience only. It
+derives the worker from the authenticated workload credential and rechecks tenant,
+project, task, grant status/expiry, execution lease, worker registration, and
+epoch on every call. It returns only a short-lived opaque development handle, never
+a reference or raw value. Credential-access lease renewal is human-only and fails
+after access-lease revocation, parent expiry/cancellation, worker retirement, or
+epoch fencing. The private test fake backend rechecks those bindings again when a
+trusted local worker resolves its handle; it is not a production secrets backend.
+
 Observed states are `running`, `exited` and `unknown`. Observations are attributed
 to the enrolled worker, with both observation and recording timestamps. They must
 not predate the lease or prior observations; future skew is limited to five seconds.
@@ -138,7 +158,8 @@ mount the verified inputs,
 journal actual operation submission, and collect/quarantine bounded artifacts.
 Then test real container cancellation, crash recovery, control-plane disconnects,
 credential expiry and restore fencing. Worker trust/build registration, secret
-brokering and invoice/usage reconciliation also remain incomplete. Do not treat
+brokering beyond the in-memory fake handle seam, real provider credential
+integration, and invoice/usage reconciliation also remain incomplete. Do not treat
 these control-record tests as end-to-end execution acceptance.
 
 ## Synthetic result checkpoints (schema v15)

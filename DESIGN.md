@@ -456,6 +456,15 @@ Record lease metadata, parent grant, audience, expiry, renewal and revocation st
 Renew only under current authority. Revocation, expiry, cancellation, and incidents
 stop renewal and invoke backend revocation where supported.
 
+Credential-access leases are distinct from Tessera human, agent, and worker
+authentication credentials. A human binds each one to the current organization,
+project, task, grant, execution lease, worker, and epoch; its opaque secret
+reference, provider-neutral audience/purpose/scope, and expiry cannot widen or
+outlive that parent lease. A worker derives its identity from its workload
+credential and rechecks every binding before receiving only a short-lived handle
+or resolving locally inside a trusted boundary. Raw secret values do not enter
+control records, events, API responses, receipts, diagnostics, prompts, or clients.
+
 Static keys and persistent personal logins do not become short-lived credentials
 because they are in a secret store. Keep them in trusted owner-bound custody.
 If raw credentials must enter an authorized process, disclose and isolate the
@@ -490,6 +499,11 @@ Use ready/draining/disconnected/quarantined/retired states. Drain blocks new lea
 retirement revokes identity and reconciles jobs and cleanup. A personal worker
 cannot protect secrets from its own administrator; sensitive tasks need a suitable
 trust boundary.
+
+Credential-access handles are fenced by the same live worker, execution lease and
+epoch checks. Grant cancellation, expiry, worker retirement, execution epoch
+change, or access-lease revocation blocks access and renewal; backend revocation is
+requested where it is supported.
 
 Electron disables renderer Node access and uses sandboxing, context isolation,
 CSP, restricted navigation, and sender-validated typed IPC. Untrusted artifact

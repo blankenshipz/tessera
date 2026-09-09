@@ -6,7 +6,8 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v20 bounded human result-bookkeeping ledger, v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
+Reviewed 2026-09-08 against the schema v21 metadata-only credential-access lease,
+v20 bounded human result-bookkeeping ledger, v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
 OpenCode harness adapter POC, and bounded capability-probe slice. These are
 informational evidence only, not live integration, cryptographic trust,
@@ -25,7 +26,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
-| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, owner-managed worker registration/lifecycle, documented optional pinned-harness boundary, synthetic OpenCode session/event/cancellation adapter POC, and a read-only informational capability probe | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust and capability attestation, credential broker, dispatch, and broader operational identity lifecycle |
+| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode session/event/cancellation adapter POC, and a read-only informational capability probe | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
 | §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, read-only held restore | Provider fencing/resumption after restore, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
 | §8 E2E acceptance | Blocked for real pilot; component work continues | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Admissible execution storage/host, selected investigation/dataset, remaining failure drills and measured pilot |
@@ -259,6 +260,13 @@ representative investigation have not passed end-to-end acceptance.
     fake receipt, operation, lease/epoch, manifest and retained bytes. It preserves
     quarantine, findings, costs, and explicit not-assessed/not-established/not-
     performed labels; it is not real provider/scientific acceptance or release.
+
+26. **Credential-access leases:** schema v21 records human-only opaque-reference
+    leases bound to the current task/grant/execution lease/worker/epoch and returns
+    only short-lived handles to authenticated workers. The private in-memory fake
+    backend rechecks authority at resolve and records no values in SQLite, events,
+    API responses or diagnostics. It is not a production secret backend or real
+    provider credential integration; see [decision 0007](decisions/0007-credential-access-lease-boundary.md).
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have

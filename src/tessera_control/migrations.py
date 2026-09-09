@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 20
+LATEST_SCHEMA_VERSION = 21
 LOCAL_ORG_ID = "org_local"
 
 
@@ -356,6 +356,14 @@ def migrate_v19_to_v20(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 20 WHERE singleton = 1")
 
 
+def migrate_v20_to_v21(connection: sqlite3.Connection) -> None:
+    """Add empty metadata-only credential access leases without inferring secrets."""
+    from .credential_leases import create_credential_access_lease_schema
+
+    create_credential_access_lease_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 21 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -376,6 +384,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     17: migrate_v17_to_v18,
     18: migrate_v18_to_v19,
     19: migrate_v19_to_v20,
+    20: migrate_v20_to_v21,
 }
 
 

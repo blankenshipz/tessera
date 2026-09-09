@@ -74,7 +74,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v20
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v21
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -122,6 +122,15 @@ grant revisions, and epochs. It records only Tessera ownership/bookkeeping:
 scientific validity remains `not_assessed`, provider success `not_established`,
 and artifact release `not_performed`. It neither releases/downloads/publishes
 bytes, settles cost, creates findings, nor establishes scientific truth.
+
+Schema v21 adds human-only, metadata-only credential-access leases distinct from
+Tessera authentication credentials. Each binds an opaque secret reference and
+provider-neutral audience/purpose/scope to one current grant, task, worker
+execution lease, and epoch. The worker access route returns only a short-lived
+fake-backend handle and rechecks live authority; values never enter SQLite, API
+responses, events, receipts, or diagnostics. The in-memory fake backend is test
+only: production secret backends and real provider credential integration remain
+unimplemented.
 
 Local [workspace adoption](docs/workspace-adoption.md) now preserves reviewed input
 bytes and their manifest, verifies them after restart, and records adoption in the

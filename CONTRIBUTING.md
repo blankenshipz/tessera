@@ -189,3 +189,7 @@ pilot acceptance. Migration never backfills v18 operations with receipts.
 
 Schema 20 adds an empty human result-bookkeeping ledger. It never infers an
 acceptance from v19 checkpoints, manifests, receipts, or reconciled grants.
+
+Schema 21 adds empty metadata-only credential-access leases. It does not infer a
+lease from existing Tessera authentication credentials, workers, grants, or v20
+operations, and it never migrates or stores a secret value.

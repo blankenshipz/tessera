@@ -38,3 +38,8 @@ payload and idempotency identity. Provider IDs and receipt identity conflict
 rather than overwrite. Unknown, stale authority, and uncertain cancellation
 remain visible. The receipt is bounded operational evidence only, not proof of
 Docker execution, cost/accounting, artifacts, results, or scientific success.
+
+Credential-access leases are not provider receipts or operation inputs. If a later
+adapter needs to associate one with an operation, it may retain only the opaque
+credential-access lease ID; neither its secret reference nor its value belongs in
+operation metadata, receipt payloads, journals, events, or diagnostics.

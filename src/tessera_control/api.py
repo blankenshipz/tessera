@@ -64,6 +64,8 @@ def create_app(state_dir: Path) -> FastAPI:
 
     from .artifact_api import router as artifact_router
     from .artifact_disposition_api import router as artifact_disposition_router
+    from .credential_lease_api import router as credential_lease_router
+    from .credential_leases import _FakeSecretBackend
     from .execution import ExecutionStore
     from .execution_api import router as execution_router
     from .handoff_api import router as handoff_router
@@ -80,11 +82,15 @@ def create_app(state_dir: Path) -> FastAPI:
     store = Store(state_dir)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
+    # Private in-memory development/test seam.  It has no persisted values or API
+    # for inserting/resolving secret values.
+    app.state.fake_secret_backend = _FakeSecretBackend()
     app.state.execution = ExecutionStore(state_dir)
     app.state.snapshot_releases = SnapshotReleaseStore(state_dir)
     app.state.skills = SkillStore(state_dir)
     app.state.handoffs = WorkspaceHandoffStore(state_dir)
     app.include_router(execution_router)
+    app.include_router(credential_lease_router)
     app.include_router(skill_router)
     app.include_router(artifact_router)
     app.include_router(artifact_disposition_router)

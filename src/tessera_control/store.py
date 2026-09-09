@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 20);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 21);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -186,6 +186,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .artifact_dispositions import create_artifact_disposition_schema
     from .artifact_manifests import create_artifact_manifest_schema
     from .artifacts import create_artifact_schema, create_artifact_upload_schema
+    from .credential_leases import create_credential_access_lease_schema
     from .execution import create_execution_schema
     from .external_operations import (
         create_external_operation_receipt_schema,
@@ -219,6 +220,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_external_operation_schema(connection)
     create_external_operation_receipt_schema(connection)
     create_result_acceptance_schema(connection)
+    create_credential_access_lease_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

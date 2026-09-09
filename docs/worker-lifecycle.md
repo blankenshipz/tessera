@@ -17,14 +17,19 @@ cannot. Existing observations remain attributable while their current worker
 credential remains valid; draining and quarantine do not erase history.
 Retirement revokes the registered workload credential in the same transaction,
 but preserves grants, leases, observations, and exposure for reconciliation.
+It also fences every credential-access lease bound to that worker: handle issuance,
+local fake-backend resolution, and access-lease renewal recheck the retired
+credential/registry state and fail closed.
 
 The registry is metadata admission only. `capability_probe` is a bounded,
 read-only synthetic informational probe: it can compare supplied versions,
 inspect private roots, canonicalize a declared storage description, and observe
 an optional pinned OpenCode version. A passing report explicitly has no
 authority, does not verify a cryptographic build or capability attestation, and
-does not enable dispatch. Credential brokering, provider dispatch, result
-acceptance, and restore fencing remain unimplemented.
+does not enable dispatch. Only schema v21's metadata-only credential-access lease
+and private in-memory test handle seam are implemented. Production secret backends,
+real provider credential integration, provider dispatch, result acceptance, and
+restore fencing remain unimplemented.
 
 The Stage 1 native development runner does not enroll itself: it sends this
 heartbeat before requesting its one supplied grant lease. A missing, stale,
