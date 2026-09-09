@@ -6,6 +6,8 @@
 !src/**
 !tests/
 !tests/**
+!scripts/
+!scripts/**
 !dev/
 !dev/**
 !AGENTS.md
