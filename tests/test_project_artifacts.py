@@ -491,6 +491,120 @@ def test_retention_delete_intent_is_retry_safe_and_missing_is_degraded(tmp_path:
     assert retention.inspect(owner, grant["project_id"], artifact["id"])["state"] == "deleted"
 
 
+def test_delete_intent_rejects_manifest_admission_and_republication(tmp_path: Path) -> None:
+    state, _, owner, worker, grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"delete-intent")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    placement = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    manifest = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{
+            "id": artifact["id"], "relative_path": "result.txt",
+            "sha256": artifact["sha256"], "size": artifact["size"],
+        }],
+    }
+
+    class AdmissionDuringDeleteBackend(FakeProjectArtifactBackend):
+        def delete(self, tenant_id, project_id, artifact_id, object_placement):
+            with pytest.raises(Conflict, match="reserved for deletion"):
+                ArtifactManifestStore(state, self).create_manifest(
+                    worker, lease["id"], "manifest", canonical_digest(manifest), manifest
+                )
+            with pytest.raises(Conflict, match="reserved for deletion"):
+                ProjectArtifactStore(state, self).commit_project_artifacts(
+                    worker, lease["id"], "republication", canonical_digest(placement), placement
+                )
+            return super().delete(tenant_id, project_id, artifact_id, object_placement)
+
+    backend = AdmissionDuringDeleteBackend()
+    ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(placement), placement
+    )
+    retention = ProjectArtifactRetentionStore(state, backend)
+    retention.tombstone(owner, grant["project_id"], artifact["id"], "tomb", "tomb")
+    assert retention.reconcile_delete(
+        owner, grant["project_id"], artifact["id"], "delete", "delete"
+    )[1]["state"] == "deleted"
+
+
+def test_reference_before_deletion_reservation_prevents_delete(tmp_path: Path) -> None:
+    state, _, owner, worker, grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"reference-first")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    backend = FakeProjectArtifactBackend()
+    placement = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(placement), placement
+    )
+    manifest = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{
+            "id": artifact["id"], "relative_path": "result.txt",
+            "sha256": artifact["sha256"], "size": artifact["size"],
+        }],
+    }
+    ArtifactManifestStore(state, backend).create_manifest(
+        worker, lease["id"], "manifest", canonical_digest(manifest), manifest
+    )
+    with pytest.raises(Conflict, match="Referenced"):
+        ProjectArtifactRetentionStore(state, backend).tombstone(
+            owner, grant["project_id"], artifact["id"], "tomb", "tomb"
+        )
+
+
+def test_delete_retry_rechecks_intent_reference_state(tmp_path: Path) -> None:
+    state, _, owner, worker, grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"retry-reference")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    class InterruptedDeleteBackend(FakeProjectArtifactBackend):
+        def delete(self, tenant_id, project_id, artifact_id, object_placement):
+            raise RuntimeError("interrupted after delete intent")
+
+    backend = InterruptedDeleteBackend()
+    placement = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(placement), placement
+    )
+    retention = ProjectArtifactRetentionStore(state, backend)
+    retention.tombstone(owner, grant["project_id"], artifact["id"], "tomb", "tomb")
+    with pytest.raises(RuntimeError, match="interrupted"):
+        retention.reconcile_delete(owner, grant["project_id"], artifact["id"], "retry", "retry")
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "INSERT INTO artifact_manifests (id,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,operation_id,plan_digest,artifacts_json,total_bytes,manifest_digest,created_at,status,classification,late) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("retry-reference", grant["project_id"], grant["task_id"], grant["id"], lease["id"], worker["id"], lease["epoch"], payload["operation_id"], "0" * 64, '[{"id":"' + artifact["id"] + '"}]', artifact["size"], "1" * 64, "now", "quarantined", "unclassified", 0),
+        )
+    with pytest.raises(Conflict, match="Referenced"):
+        retention.reconcile_delete(owner, grant["project_id"], artifact["id"], "retry", "retry")
+    assert backend.objects
+
+
 def test_retention_inspection_does_not_overwrite_concurrent_deleted_state(tmp_path: Path) -> None:
     state, _, owner, worker, grant, lease = _delivery(tmp_path)
     payload = _payload(lease, b"inspection-race")

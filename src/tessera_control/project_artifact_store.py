@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .artifact_manifests import ArtifactManifestStore
+from .project_artifact_retention import require_project_artifact_reference_admissible
 from .project_artifacts import (
     FilesystemProjectArtifactBackend,
     ProjectArtifactBackend,
@@ -149,6 +150,15 @@ class ProjectArtifactStore(ArtifactManifestStore):
                 artifact_id = None if artifact is None else artifact["id"]
                 sha256 = entry["sha256"] if artifact is None else artifact["sha256"]
                 size = entry["size"] if artifact is None else artifact["size"]
+                if artifact_id is not None:
+                    retention_record = connection.execute(
+                        "SELECT state FROM project_artifact_retention WHERE artifact_id=?",
+                        (artifact_id,),
+                    ).fetchone()
+                    if retention_record is not None:
+                        require_project_artifact_reference_admissible(
+                            connection, grant["project_id"], artifact_id
+                        )
                 operation_key = self._operation_key(
                     grant["project_id"], artifact_id or f"zero:{lease_id}", sha256
                 )
@@ -369,6 +379,9 @@ class ProjectArtifactStore(ArtifactManifestStore):
                             "Project artifact placement conflicts with committed identity."
                         )
                     else:
+                        require_project_artifact_reference_admissible(
+                            connection, grant["project_id"], artifact_id
+                        )
                         connection.execute(
                             "UPDATE project_artifact_placements SET reconciled_at=? "
                             "WHERE artifact_id=?",

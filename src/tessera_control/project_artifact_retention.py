@@ -33,6 +33,20 @@ def create_project_artifact_retention_schema(connection: sqlite3.Connection) -> 
     )
 
 
+def require_project_artifact_reference_admissible(
+    connection: sqlite3.Connection, project_id: str, artifact_id: str
+) -> None:
+    """Reject new custody references once an object leaves active retention."""
+    row = connection.execute(
+        "SELECT project_id,state FROM project_artifact_retention WHERE artifact_id=?",
+        (artifact_id,),
+    ).fetchone()
+    if row is None or row["project_id"] != project_id:
+        raise Conflict("Project artifact retention metadata is unavailable.")
+    if row["state"] != "active":
+        raise Conflict("Project artifact is reserved for deletion and cannot be referenced.")
+
+
 class ProjectArtifactRetentionStore(Store):
     """Manual tombstone/delete commands; uncertainty becomes durable degraded state."""
 
@@ -89,6 +103,11 @@ class ProjectArtifactRetentionStore(Store):
         if checkpoint is not None:
             raise Conflict("Checkpoint project artifacts cannot be deleted.")
 
+    def _delete_ready(self, connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+        if row["state"] != "delete_intent":
+            raise Conflict("Project artifact deletion is no longer reserved.")
+        self._delete_allowed(connection, row)
+
     def tombstone(
         self, actor: dict[str, Any], project_id: str, artifact_id: str, key: str, digest: str
     ):
@@ -120,8 +139,10 @@ class ProjectArtifactRetentionStore(Store):
             self._delete_allowed(connection, row)
             if row["state"] == "deleted":
                 return 200, dict(row)
-            if row["state"] != "tombstoned":
+            if row["state"] not in ("tombstoned", "delete_intent"):
                 raise Conflict("Project artifact must be tombstoned before deletion.")
+            if row["state"] == "delete_intent":
+                return 202, dict(row)
             now = utc_now()
             connection.execute(
                 """UPDATE project_artifact_retention SET state='delete_intent',
@@ -131,7 +152,15 @@ class ProjectArtifactRetentionStore(Store):
             return 202, dict(row)
 
         status, row = self._mutate(
-            actor, "delete-intent:" + key, "POST", path + "/intent", digest, intent
+            actor,
+            "delete-intent:" + key,
+            "POST",
+            path + "/intent",
+            digest,
+            intent,
+            replay_guard=lambda connection, live, _: self._delete_ready(
+                connection, self._object(connection, live, project_id, artifact_id)
+            ),
         )
         if status == 200 and row["state"] == "deleted":
             return status, {"state": "deleted"}
@@ -144,11 +173,18 @@ class ProjectArtifactRetentionStore(Store):
         )
         connection = _connect(self.database_path)
         try:
+            connection.execute("BEGIN IMMEDIATE")
             live = self._live_principal(connection, actor)
-            self._object(connection, live, project_id, artifact_id)
+            current = self._object(connection, live, project_id, artifact_id)
+            self._delete_ready(connection, current)
             tenant_id = connection.execute(
                 "SELECT org_id FROM projects WHERE id=?", (project_id,)
             ).fetchone()[0]
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
         try:

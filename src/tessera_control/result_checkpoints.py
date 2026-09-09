@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 
 from .artifact_manifests import MAX_MANIFEST_ENTRIES, ArtifactManifestStore, ManifestArtifact
 from .artifacts import ArtifactStore
+from .project_artifact_retention import require_project_artifact_reference_admissible
 from .project_artifacts import (
     FilesystemProjectArtifactBackend,
     ProjectArtifactBackend,
@@ -311,6 +312,9 @@ class ResultCheckpointStore(Store):
                     artifact["sha256"],
                     artifact["size"],
                     inspect_object=inspect_objects,
+                )
+                require_project_artifact_reference_admissible(
+                    connection, grant["project_id"], artifact["id"]
                 )
             verified.append(entry)
         return ResultCheckpointStore._validation(manifest, verified, body["expected_total_bytes"])

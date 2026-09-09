@@ -10,6 +10,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from .artifacts import MAX_ARTIFACT_BYTES, ArtifactStore
+from .project_artifact_retention import require_project_artifact_reference_admissible
 from .project_artifacts import (
     FilesystemProjectArtifactBackend,
     ProjectArtifactBackend,
@@ -248,6 +249,9 @@ class ArtifactManifestStore(ArtifactStore):
                 for entry in verified:
                     self._verify_placement(
                         connection, grant, entry["id"], entry["sha256"], entry["size"]
+                    )
+                    require_project_artifact_reference_admissible(
+                        connection, grant["project_id"], entry["id"]
                     )
             canonical = self._canonical_payload(lease, grant, actor, verified)
             manifest_digest = canonical_digest(canonical)
