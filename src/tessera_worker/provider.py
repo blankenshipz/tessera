@@ -1,4 +1,4 @@
-"""Narrow fake-provider dispatch seam used by the development worker only.
+"""Narrow injected-provider dispatch seam used by the development worker only.
 
 This deliberately models a bounded provider receipt, not execution success,
 accounting, artifact acceptance, or a real provider integration.  The fake is
@@ -19,6 +19,7 @@ from .cpu import CpuOperation
 from .supervisor import Lease, SupervisorError
 
 ProviderState = Literal["unknown", "running", "exited"]
+ExposureState = Literal["unknown", "reported"]
 
 
 class ProviderError(SupervisorError):
@@ -39,6 +40,7 @@ class ProviderReceipt:
     provider_id: str
     lookup_key: str
     payload: dict[str, Any]
+    idempotency_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,14 +51,29 @@ class ProviderObservation:
     termination_confirmed: bool = False
 
 
+@dataclass(frozen=True)
+class ProviderAccountingObservation:
+    """A provider accounting observation, never a settlement or charge proof."""
+
+    exposure_state: ExposureState
+    provider_id: str | None
+    usage: dict[str, Any] | None = None
+
+
 class Provider(Protocol):
     """The only provider contract admitted in this vertical slice."""
 
-    def submit(self, operation_id: str, lookup_key: str) -> ProviderReceipt: ...
+    def submit(
+        self, operation_id: str, lookup_key: str, idempotency_key: str
+    ) -> ProviderReceipt: ...
 
     def observe(self, lookup_key: str, provider_id: str | None = None) -> ProviderObservation: ...
 
     def cancel(self, lookup_key: str, provider_id: str | None = None) -> ProviderObservation: ...
+
+    def accounting(
+        self, lookup_key: str, provider_id: str | None = None
+    ) -> ProviderAccountingObservation: ...
 
 
 class FakeProvider:
@@ -76,12 +93,14 @@ class FakeProvider:
         self.submit_calls: list[str] = []
         self.observe_calls: list[str] = []
         self.cancel_calls: list[str] = []
+        self.accounting_calls: list[str] = []
         self.lose_submit_reply = False
         self.lose_observe_reply = False
         self.lose_cancel_reply = False
         self.cancel_delayed = False
+        self.accounting_unknown = True
 
-    def submit(self, operation_id: str, lookup_key: str) -> ProviderReceipt:
+    def submit(self, operation_id: str, lookup_key: str, idempotency_key: str) -> ProviderReceipt:
         self.submit_calls.append(operation_id)
         receipt = self.operations.get(lookup_key)
         if receipt is None:
@@ -94,7 +113,13 @@ class FakeProvider:
                 "provider_version": self.version,
             }
             receipt = ProviderReceipt(
-                self.kind, self.version, operation_id, provider_id, lookup_key, payload
+                self.kind,
+                self.version,
+                operation_id,
+                provider_id,
+                lookup_key,
+                payload,
+                idempotency_key,
             )
             self.operations[lookup_key] = receipt
             self.states[lookup_key] = "running"
@@ -122,6 +147,20 @@ class FakeProvider:
         if not self.cancel_delayed:
             self.states[lookup_key] = "exited"
         return self.observe(lookup_key, receipt.provider_id)
+
+    def accounting(
+        self, lookup_key: str, provider_id: str | None = None
+    ) -> ProviderAccountingObservation:
+        self.accounting_calls.append(lookup_key)
+        receipt = self.operations.get(lookup_key)
+        if receipt is None or (provider_id is not None and provider_id != receipt.provider_id):
+            return ProviderAccountingObservation("unknown", None)
+        # The deterministic fixture deliberately has no billable usage path.
+        return ProviderAccountingObservation(
+            "unknown" if self.accounting_unknown else "reported",
+            receipt.provider_id,
+            None if self.accounting_unknown else {"synthetic_units": 0},
+        )
 
     def complete(self, lookup_key: str) -> None:
         """Test-only deterministic completion; it does not execute user work."""
@@ -159,7 +198,11 @@ class ProviderDispatch:
                 receipt = observation.receipt
             else:
                 self._mark_submit_intent(operation.operation_id)
-                receipt = self.provider.submit(operation.operation_id, row["lookup_key"])
+                receipt = self.provider.submit(
+                    operation.operation_id,
+                    row["lookup_key"],
+                    self._submit_key(operation.operation_id),
+                )
             self._store_receipt(operation.operation_id, receipt)
         self._deliver(operation.operation_id, receipt, "running", False)
 
@@ -245,6 +288,20 @@ class ProviderDispatch:
     def provider_id(self, operation: CpuOperation) -> str | None:
         receipt = self._receipt(self._row(operation.operation_id))
         return receipt.provider_id if receipt is not None else None
+
+    def accounting_stable(self, operation: CpuOperation) -> ProviderAccountingObservation:
+        """Read accounting without converting unknown exposure into zero or settlement."""
+        row = self._row(operation.operation_id)
+        receipt = self._receipt(row)
+        return self.provider.accounting(row["lookup_key"], receipt.provider_id if receipt else None)
+
+    @staticmethod
+    def _submit_key(operation_id: str) -> str:
+        """Stable key survives a lost submit reply without creating a new effect."""
+        return (
+            "provider-submit-"
+            + hashlib.sha256(f"local-provider-v1:{operation_id}".encode()).hexdigest()
+        )
 
     def _bind(self, operation: CpuOperation, lease: Lease) -> sqlite3.Row:
         lookup_key = operation.container_name
@@ -378,6 +435,7 @@ class ProviderDispatch:
 __all__ = [
     "FakeProvider",
     "Provider",
+    "ProviderAccountingObservation",
     "ProviderDispatch",
     "ProviderError",
     "ProviderReportError",
