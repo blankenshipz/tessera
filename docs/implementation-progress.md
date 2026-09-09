@@ -13,8 +13,9 @@ an injected loopback-only `local-provider-v1` HTTP fixture, v18
 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill
 lifecycle and bounded cancellation telemetry projection, synthetic OpenCode
 harness adapter POC, local pinned OpenCode HTTP/SSE seam, an opt-in
-provider-disabled real OpenCode compatibility fixture, and bounded capability-probe
-slice. These are
+provider-disabled real OpenCode compatibility fixture, bounded capability-probe
+slice, and pure Kubernetes contract modules (`kubernetes_provider.py` and
+`kubernetes_contracts.py`). These are
 informational evidence only, not live integration, cryptographic trust,
 capability attestation, dispatch, or pilot completion.
 **Implemented** means the named bounded behavior has executable evidence;
@@ -31,7 +32,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, cancellation attempts independent of provider/control report failures, restart-safe development heartbeats, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
-| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, a local authenticated exact-schema-pinned OpenCode HTTP/SSE fixture seam with durable uncertainty/cursor handling, an opt-in provider-disabled real-server compatibility fixture, and a read-only informational capability probe | Record a real selected-server fixture result (unconfigured/version-unavailable is explicitly not evidence), enrolled-node integration, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
+| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, a local authenticated exact-schema-pinned OpenCode HTTP/SSE fixture seam with durable uncertainty/cursor handling, an opt-in provider-disabled real-server compatibility fixture, a pure explicit-identity Minikube Job conformance contract, and a read-only informational capability probe | Record a real selected-server fixture result (unconfigured/version-unavailable is explicitly not evidence), enrolled-node integration, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
 | §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, schema-v24 project-object intent/reconciliation and manual retention incident metadata, and read-only held restore | Provider fencing/resumption after restore, portable object-bundle recovery, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
 | §8 E2E acceptance | Blocked for real pilot; component work continues | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Admissible execution storage/host, selected investigation/dataset, remaining failure drills and measured pilot |
@@ -55,7 +56,7 @@ full workflow and its required adverse cases pass on the supported target.
 
 ## Verified evidence
 
-- Current local schema-v24/OpenCode collection: 573 Python tests passed
+- Current local schema-v24/OpenCode/Minikube-contract collection: 586 Python tests passed
   natively (2026-09-09); the focused OpenCode suites and combined synthetic
   runner pass. Coverage includes cancellation/report-failure handling, restart/heartbeat replay,
   v22 `staged_at` and v24 retention migration sequencing, project-object integrity,
@@ -64,6 +65,10 @@ full workflow and its required adverse cases pass on the supported target.
   migration rollback/evidence preservation. This remains development/synthetic
   evidence only.
 - Ruff lint and format checks pass.
+- The pure Kubernetes contract modules `kubernetes_provider.py` and
+  `kubernetes_contracts.py` have 8 focused tests passing. This is unit-contract
+  evidence only; Minikube cluster execution, the OpenCode sidecar, PVC quota
+  enforcement, provider calls, and pilot acceptance are unimplemented.
 - 65 desktop connection/IPC and renderer tests pass using the locked desktop
   dependencies.
 - Explicit migrations through schema v24 preserve historical records, input bytes,
@@ -337,6 +342,18 @@ representative investigation have not passed end-to-end acceptance.
     intent after tenant/project, hold/reference/checkpoint/acceptance checks. Exact
     backend identity is rechecked before deletion; missing/corrupt/uncertain objects
     become degraded incidents rather than cleanup success. No deletion is scheduled.
+
+28. **Kubernetes Job conformance:** the pure worker modules
+     `kubernetes_provider.py` and `kubernetes_contracts.py` define a
+     dependency-free contract requiring an explicit profile,
+     kubeconfig/context/server/CA/namespace identity, create only a canonical
+     digest-pinned non-root Job through injected callbacks, and parse immutable
+     Job/owned-Pod observations. Eight focused tests pass. A local create fence
+     reconciles a lost reply only by deterministic name; delete acknowledgement
+     remains unresolved until fresh Job and owned-Pod absence. Unit fixtures do
+     not start or mutate Minikube. Minikube cluster execution, the OpenCode
+     sidecar, PVC quota enforcement, provider calls, and pilot acceptance remain
+     unimplemented. See [decision 0009](decisions/0009-minikube-job-conformance.md).
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
