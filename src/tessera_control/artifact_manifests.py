@@ -10,6 +10,13 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from .artifacts import MAX_ARTIFACT_BYTES, ArtifactStore
+from .project_artifacts import (
+    FilesystemProjectArtifactBackend,
+    ProjectArtifactBackend,
+    ProjectArtifactPlacement,
+    ProjectArtifactStorageError,
+    verify_project_artifact_placement,
+)
 from .store import Conflict, NotFound, StoreError, _connect, canonical_digest, utc_now
 
 MAX_MANIFEST_ENTRIES = 128
@@ -74,6 +81,76 @@ def _metadata(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 class ArtifactManifestStore(ArtifactStore):
     """Worker manifest admission and tenant-scoped metadata listing."""
 
+    def __init__(self, state_dir, backend: ProjectArtifactBackend | None = None) -> None:
+        super().__init__(state_dir)
+        self.project_artifact_backend = backend or FilesystemProjectArtifactBackend(
+            self.database_path.parent / "project-artifacts"
+        )
+
+    def _verify_placement(
+        self,
+        connection: sqlite3.Connection,
+        grant: sqlite3.Row,
+        artifact_id: str,
+        sha256: str,
+        size: int,
+        *,
+        inspect_object: bool = False,
+    ) -> None:
+        row = connection.execute(
+            """SELECT tenant_namespace,project_namespace,object_key,sha256,size
+            FROM project_artifact_placements
+            WHERE artifact_id=? AND project_id=? AND backend_kind=?""",
+            (artifact_id, grant["project_id"], self.project_artifact_backend.kind),
+        ).fetchone()
+        if row is None or row["sha256"] != sha256 or row["size"] != size:
+            raise Conflict("Artifact manifest requires committed project artifact placement.")
+        if inspect_object:
+            try:
+                verify_project_artifact_placement(
+                    self.project_artifact_backend,
+                    connection.execute(
+                        "SELECT org_id FROM projects WHERE id=?", (grant["project_id"],)
+                    ).fetchone()["org_id"],
+                    grant["project_id"],
+                    artifact_id,
+                    ProjectArtifactPlacement(**dict(row)),
+                )
+            except ProjectArtifactStorageError as error:
+                raise Conflict(
+                    "Artifact manifest project storage integrity check failed."
+                ) from error
+
+    def _inspect_requested_placements(
+        self, worker: dict[str, Any], lease_id: str, body: dict[str, Any]
+    ) -> None:
+        """Inspect project objects without holding a SQLite authority transaction."""
+        connection = _connect(self.database_path)
+        try:
+            actor = self._live_principal(connection, worker, audience="worker")
+            lease, grant = self._grant_for_upload(connection, actor, lease_id)
+            if (
+                body["expected_epoch"] != lease["epoch"]
+                or body["operation_id"] != self._expected_operation(lease_id)
+                or connection.execute(
+                    "SELECT 1 FROM project_storage_bindings WHERE project_id=?",
+                    (grant["project_id"],),
+                ).fetchone()
+                is None
+            ):
+                return
+            for entry in body["artifacts"]:
+                self._verify_placement(
+                    connection,
+                    grant,
+                    entry["id"],
+                    entry["sha256"],
+                    entry["size"],
+                    inspect_object=True,
+                )
+        finally:
+            connection.close()
+
     @staticmethod
     def _manifest_id(lease_id: str) -> str:
         return "artifact_manifest_" + hashlib.sha256(lease_id.encode()).hexdigest()[:32]
@@ -102,6 +179,7 @@ class ArtifactManifestStore(ArtifactStore):
             body = CreateArtifactManifest.model_validate(payload).model_dump(mode="json")
         except ValidationError as error:
             raise StoreError("Invalid artifact manifest request.") from error
+        self._inspect_requested_placements(worker, lease_id, body)
         path = f"/worker/leases/{lease_id}/artifact-manifest"
 
         def command(connection: sqlite3.Connection, actor: dict[str, Any]):
@@ -168,19 +246,9 @@ class ArtifactManifestStore(ArtifactStore):
             ).fetchone()
             if binding is not None:
                 for entry in verified:
-                    placement = connection.execute(
-                        """SELECT sha256,size FROM project_artifact_placements
-                        WHERE artifact_id=? AND project_id=?""",
-                        (entry["id"], grant["project_id"]),
-                    ).fetchone()
-                    if (
-                        placement is None
-                        or placement["sha256"] != entry["sha256"]
-                        or placement["size"] != entry["size"]
-                    ):
-                        raise Conflict(
-                            "Artifact manifest requires committed project artifact placement."
-                        )
+                    self._verify_placement(
+                        connection, grant, entry["id"], entry["sha256"], entry["size"]
+                    )
             canonical = self._canonical_payload(lease, grant, actor, verified)
             manifest_digest = canonical_digest(canonical)
             existing = connection.execute(

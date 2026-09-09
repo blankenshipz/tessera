@@ -13,6 +13,7 @@ from test_artifact_disposition_authority import _other_tenant_headers
 from test_result_checkpoints import _checkpoint_request, _reconciled_manifest
 
 from tessera_control.api import create_app
+from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.result_acceptances import ResultAcceptanceStore
 from tessera_control.result_checkpoints import ResultCheckpointStore
 from tessera_control.store import (
@@ -256,6 +257,62 @@ def test_result_acceptance_rechecks_quarantine_manifest_and_retained_bytes(
         )
 
 
+def test_result_acceptance_rechecks_corrupt_committed_project_object(tmp_path: Path) -> None:
+    state, owner, worker, _grant, lease, _manifest, first, checkpoint, receipt_digest = (
+        _checkpoint_with_receipt(tmp_path)
+    )
+    placement = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": checkpoint["operation_id"],
+        "artifacts": [{"id": first["id"], "sha256": first["sha256"], "size": first["size"]}],
+    }
+    ProjectArtifactStore(state).commit_project_artifacts(
+        worker, lease["id"], "placement", canonical_digest(placement), placement
+    )
+    with closing(_connect(state / "tessera.sqlite3")) as connection:
+        row = connection.execute(
+            "SELECT tenant_namespace,project_namespace,object_key FROM project_artifact_placements"
+        ).fetchone()
+    (state / "project-artifacts" / row[0] / row[1] / row[2]).write_bytes(b"corrupt")
+    with pytest.raises(Conflict, match="project storage integrity"):
+        ResultAcceptanceStore(state).record(
+            owner,
+            checkpoint["id"],
+            "accept",
+            canonical_digest(_request(checkpoint, receipt_digest)),
+            _request(checkpoint, receipt_digest),
+        )
+
+
+def test_result_acceptance_can_be_retracted_after_project_object_corruption(tmp_path: Path) -> None:
+    state, owner, worker, _grant, lease, _manifest, first, checkpoint, receipt_digest = (
+        _checkpoint_with_receipt(tmp_path)
+    )
+    store = ResultAcceptanceStore(state)
+    accepted = _request(checkpoint, receipt_digest)
+    store.record(owner, checkpoint["id"], "accept", canonical_digest(accepted), accepted)
+    placement = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": checkpoint["operation_id"],
+        "artifacts": [{"id": first["id"], "sha256": first["sha256"], "size": first["size"]}],
+    }
+    ProjectArtifactStore(state).commit_project_artifacts(
+        worker, lease["id"], "placement", canonical_digest(placement), placement
+    )
+    with closing(_connect(state / "tessera.sqlite3")) as connection:
+        row = connection.execute(
+            "SELECT tenant_namespace,project_namespace,object_key FROM project_artifact_placements"
+        ).fetchone()
+    (state / "project-artifacts" / row[0] / row[1] / row[2]).write_bytes(b"corrupt")
+
+    retract = _request(checkpoint, receipt_digest, action="retract", revision=1)
+    _, retracted = store.record(
+        owner, checkpoint["id"], "retract", canonical_digest(retract), retract
+    )
+    assert retracted["revision"] == 2
+    assert retracted["action"] == "retract"
+
+
 def test_result_acceptance_replays_conflicts_and_retracts_once(tmp_path: Path) -> None:
     state, owner, _, _, _, _, _, checkpoint, receipt_digest = _checkpoint_with_receipt(tmp_path)
     store = ResultAcceptanceStore(state)
@@ -317,7 +374,7 @@ def test_v19_to_v20_result_acceptance_migration_is_empty_and_rolls_back(
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE execution_result_acceptances")
         connection.execute("UPDATE schema_meta SET schema_version=19")
-    assert migrate_state(state) == 22
+    assert migrate_state(state) == 23
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM execution_result_acceptances").fetchone()[0]

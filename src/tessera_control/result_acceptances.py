@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from .artifacts import ArtifactStore
+from .project_artifacts import ProjectArtifactBackend
 from .result_checkpoints import ResultCheckpointStore
 from .store import (
     Conflict,
@@ -89,6 +90,10 @@ def _response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 class ResultAcceptanceStore(Store):
     """Append bounded human result bookkeeping without altering result evidence."""
 
+    def __init__(self, state_dir, backend: ProjectArtifactBackend | None = None) -> None:
+        super().__init__(state_dir)
+        self.project_artifact_backend = backend
+
     @staticmethod
     def _require_human(actor: dict[str, Any]) -> None:
         if actor["role"] != "human":
@@ -119,6 +124,8 @@ class ResultAcceptanceStore(Store):
         actor: dict[str, Any],
         checkpoint: sqlite3.Row,
         body: dict[str, Any],
+        *,
+        inspect_objects: bool = False,
     ) -> None:
         if checkpoint["state"] != "committed_quarantined" or checkpoint[
             "operation_id"
@@ -194,7 +201,9 @@ class ResultAcceptanceStore(Store):
             False,
         ):
             raise Conflict("Result acceptance requires a non-late quarantined manifest.")
-        ResultCheckpointStore._validate_manifest(
+        ResultCheckpointStore(
+            self.database_path.parent, self.project_artifact_backend
+        )._validate_manifest(
             connection,
             grant,
             lease,
@@ -203,6 +212,7 @@ class ResultAcceptanceStore(Store):
                 "expected_artifacts": validation["artifacts"],
                 "expected_total_bytes": validation["total_bytes"],
             },
+            inspect_objects=inspect_objects,
         )
         receipt = connection.execute(
             """SELECT o.org_id, o.project_id, o.task_id, o.grant_id, o.lease_id,
@@ -264,14 +274,24 @@ class ResultAcceptanceStore(Store):
             raise StoreError("Invalid result acceptance request.") from error
         if not body["rationale"].strip():
             raise StoreError("Result acceptance rationale must not be blank.")
+        if body["action"] != "retract":
+            connection = _connect(self.database_path)
+            try:
+                live = self._live_principal(connection, actor)
+                self._require_human(live)
+                checkpoint = self._checkpoint_for_actor(connection, live, checkpoint_id)
+                self._verify_current_evidence(
+                    connection, live, checkpoint, body, inspect_objects=True
+                )
+            finally:
+                connection.close()
         path = f"/result-checkpoints/{checkpoint_id}/acceptances"
 
         def command(connection: sqlite3.Connection, live: dict[str, Any]):
             self._require_human(live)
             checkpoint = self._checkpoint_for_actor(connection, live, checkpoint_id)
-            self._verify_current_evidence(connection, live, checkpoint, body)
             current = connection.execute(
-                """SELECT revision, action FROM execution_result_acceptances
+                """SELECT * FROM execution_result_acceptances
                 WHERE checkpoint_id=? ORDER BY revision DESC LIMIT 1""",
                 (checkpoint_id,),
             ).fetchone()
@@ -286,6 +306,27 @@ class ResultAcceptanceStore(Store):
                 body["action"] != "retract" or current["action"] == "retract"
             ):
                 raise Conflict("Result acceptance already has a conflicting terminal state.")
+            if body["action"] == "retract":
+                # Retraction reduces authority and must remain possible when the
+                # previously accepted object is later missing or corrupt. Fence it
+                # to the exact durable decision rather than requiring that damaged
+                # evidence to pass acceptance checks again.
+                if any(
+                    body[name] != current[column]
+                    for name, column in (
+                        ("expected_checkpoint_digest", "checkpoint_digest"),
+                        ("expected_manifest_digest", "manifest_digest"),
+                        ("expected_validation_digest", "validation_digest"),
+                        ("expected_receipt_digest", "receipt_digest"),
+                        ("expected_grant_revision", "grant_revision"),
+                        ("lease_id", "lease_id"),
+                        ("operation_id", "operation_id"),
+                        ("expected_epoch", "epoch"),
+                    )
+                ):
+                    raise Conflict("Result retraction does not match the current decision.")
+            else:
+                self._verify_current_evidence(connection, live, checkpoint, body)
             revision = current_revision + 1
             row = {
                 "id": self._record_id(checkpoint_id, revision),

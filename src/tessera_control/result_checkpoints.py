@@ -11,6 +11,13 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 
 from .artifact_manifests import MAX_MANIFEST_ENTRIES, ArtifactManifestStore, ManifestArtifact
 from .artifacts import ArtifactStore
+from .project_artifacts import (
+    FilesystemProjectArtifactBackend,
+    ProjectArtifactBackend,
+    ProjectArtifactPlacement,
+    ProjectArtifactStorageError,
+    verify_project_artifact_placement,
+)
 from .store import (
     Conflict,
     Forbidden,
@@ -93,6 +100,49 @@ def _response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 
 class ResultCheckpointStore(Store):
     """Human checkpoint commits over already reconciled synthetic execution records."""
+
+    def __init__(self, state_dir, backend: ProjectArtifactBackend | None = None) -> None:
+        super().__init__(state_dir)
+        self.project_artifact_backend = backend or FilesystemProjectArtifactBackend(
+            self.database_path.parent / "project-artifacts"
+        )
+
+    def _verify_placement(
+        self,
+        connection: sqlite3.Connection,
+        grant: sqlite3.Row,
+        artifact_id: str,
+        sha256: str,
+        size: int,
+        *,
+        inspect_object: bool = False,
+    ) -> None:
+        row = connection.execute(
+            """SELECT tenant_namespace,project_namespace,object_key,sha256,size
+            FROM project_artifact_placements
+            WHERE artifact_id=? AND project_id=? AND backend_kind=?""",
+            (artifact_id, grant["project_id"], self.project_artifact_backend.kind),
+        ).fetchone()
+        if row is None or row["sha256"] != sha256 or row["size"] != size:
+            raise Conflict(
+                "Execution result checkpoint requires committed project artifact placement."
+            )
+        if inspect_object:
+            try:
+                tenant_id = connection.execute(
+                    "SELECT org_id FROM projects WHERE id=?", (grant["project_id"],)
+                ).fetchone()["org_id"]
+                verify_project_artifact_placement(
+                    self.project_artifact_backend,
+                    tenant_id,
+                    grant["project_id"],
+                    artifact_id,
+                    ProjectArtifactPlacement(**dict(row)),
+                )
+            except ProjectArtifactStorageError as error:
+                raise Conflict(
+                    "Execution result checkpoint project storage integrity check failed."
+                ) from error
 
     @staticmethod
     def _require_human(principal: dict[str, Any]) -> None:
@@ -177,13 +227,15 @@ class ResultCheckpointStore(Store):
             raise Conflict("Late artifact manifests cannot be committed as execution results.")
         return grant, lease, manifest
 
-    @staticmethod
     def _validate_manifest(
+        self,
         connection: sqlite3.Connection,
         grant: sqlite3.Row,
         lease: sqlite3.Row,
         manifest: sqlite3.Row,
         body: dict[str, Any],
+        *,
+        inspect_objects: bool = False,
     ) -> dict[str, Any]:
         try:
             manifest_entries = json.loads(manifest["artifacts_json"])
@@ -252,19 +304,14 @@ class ResultCheckpointStore(Store):
                     "Quarantined artifact integrity check failed during synthetic validation."
                 )
             if binding is not None:
-                placement = connection.execute(
-                    "SELECT sha256,size FROM project_artifact_placements "
-                    "WHERE artifact_id=? AND project_id=?",
-                    (artifact["id"], grant["project_id"]),
-                ).fetchone()
-                if (
-                    placement is None
-                    or placement["sha256"] != artifact["sha256"]
-                    or placement["size"] != artifact["size"]
-                ):
-                    raise Conflict(
-                        "Execution result checkpoint requires committed project artifact placement."
-                    )
+                self._verify_placement(
+                    connection,
+                    grant,
+                    artifact["id"],
+                    artifact["sha256"],
+                    artifact["size"],
+                    inspect_object=inspect_objects,
+                )
             verified.append(entry)
         return ResultCheckpointStore._validation(manifest, verified, body["expected_total_bytes"])
 
@@ -280,6 +327,16 @@ class ResultCheckpointStore(Store):
             body = CommitExecutionResultCheckpoint.model_validate(payload).model_dump(mode="json")
         except ValidationError as error:
             raise StoreError("Invalid execution result checkpoint request.") from error
+        connection = _connect(self.database_path)
+        try:
+            principal = self._live_principal(connection, actor)
+            self._require_human(principal)
+            grant, lease, manifest = self._manifest_for_commit(
+                connection, principal, grant_id, body
+            )
+            self._validate_manifest(connection, grant, lease, manifest, body, inspect_objects=True)
+        finally:
+            connection.close()
         path = f"/execution-grants/{grant_id}/result-checkpoint"
 
         def command(connection: sqlite3.Connection, principal: dict[str, Any]):

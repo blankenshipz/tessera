@@ -53,6 +53,25 @@ class ProjectArtifactBackend(Protocol):
         self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
     ) -> ProjectArtifactPlacement | None: ...
 
+    def inspect(
+        self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
+    ) -> ProjectArtifactPlacement | None: ...
+
+
+def verify_project_artifact_placement(
+    backend: ProjectArtifactBackend,
+    tenant_id: str,
+    project_id: str,
+    artifact_id: str,
+    placement: ProjectArtifactPlacement,
+) -> None:
+    """Read and checksum a committed object against its authoritative receipt."""
+    # Integrity admission is read-only. Publication reconciliation may repair
+    # backend state and therefore belongs outside an authority transaction.
+    observed = backend.inspect(tenant_id, project_id, artifact_id, placement.sha256, placement.size)
+    if observed != placement:
+        raise ProjectArtifactStorageError("Project artifact placement is missing or conflicts.")
+
 
 def _valid(value: str) -> bool:
     return isinstance(value, str) and 1 <= len(value) <= 200 and "\x00" not in value
@@ -126,6 +145,25 @@ class FilesystemProjectArtifactBackend:
             current = child
         return current
 
+    def _existing_namespace(self, tenant: str, project: str) -> Path | None:
+        """Resolve an existing namespace without creating or repairing anything."""
+        self._root()
+        current = self.root
+        for name in (tenant, project):
+            child = current / name
+            try:
+                info = child.lstat()
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise ProjectArtifactStorageError(
+                    "Project artifact namespace is unavailable."
+                ) from error
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ProjectArtifactStorageError("Project artifact namespace is unsafe.")
+            current = child
+        return current
+
     @staticmethod
     def _check(sha256: str, content: bytes) -> None:
         if (
@@ -162,6 +200,38 @@ class FilesystemProjectArtifactBackend:
         except OSError:
             return False
 
+    @staticmethod
+    def _recover_published_stage(namespace: Path, target: Path) -> bool:
+        """Finish a link publication interrupted before its stage unlink.
+
+        ``link`` makes publication visible before the stage name can be removed.
+        A process crash in that gap leaves two links to the same valid inode.  Do
+        not treat that recoverable state as corruption, and never remove a stage
+        belonging to a different object or an active publisher.
+        """
+        try:
+            target_info = target.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(target_info.st_mode) or not stat.S_ISREG(target_info.st_mode):
+            return False
+        recovered = False
+        for candidate in namespace.iterdir():
+            if not candidate.name.startswith(".stage-"):
+                continue
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISLNK(info.st_mode)
+                and stat.S_ISREG(info.st_mode)
+                and (info.st_dev, info.st_ino) == (target_info.st_dev, target_info.st_ino)
+            ):
+                candidate.unlink()
+                recovered = True
+        return recovered
+
     def stage(
         self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, content: bytes
     ) -> ProjectArtifactStage:
@@ -169,6 +239,7 @@ class FilesystemProjectArtifactBackend:
         tenant, project, object_key = self._names(tenant_id, project_id, artifact_id)
         namespace = self._namespace(tenant, project)
         target = namespace / object_key
+        self._recover_published_stage(namespace, target)
         if target.exists() or target.is_symlink():
             if not self._read(target, sha256, len(content)):
                 raise ProjectArtifactStorageError(
@@ -199,6 +270,7 @@ class FilesystemProjectArtifactBackend:
         )
         namespace = self._namespace(tenant, project)
         target = namespace / object_key
+        self._recover_published_stage(namespace, target)
         if stage.token != "committed":
             temporary = namespace / stage.token
             if (
@@ -235,7 +307,31 @@ class FilesystemProjectArtifactBackend:
         if type(size) is not int or size < 0:
             raise ProjectArtifactStorageError("Project artifact size is invalid.")
         tenant, project, object_key = self._names(tenant_id, project_id, artifact_id)
-        target = self._namespace(tenant, project) / object_key
+        namespace = self._namespace(tenant, project)
+        target = namespace / object_key
+        recovered = self._recover_published_stage(namespace, target)
+        if not target.exists() and not target.is_symlink():
+            return None
+        if not self._read(target, sha256, size):
+            raise ProjectArtifactStorageError("Project artifact placement is corrupt or conflicts.")
+        if recovered:
+            descriptor = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return ProjectArtifactPlacement(tenant, project, object_key, sha256, size)
+
+    def inspect(
+        self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
+    ) -> ProjectArtifactPlacement | None:
+        if type(size) is not int or size < 0:
+            raise ProjectArtifactStorageError("Project artifact size is invalid.")
+        tenant, project, object_key = self._names(tenant_id, project_id, artifact_id)
+        namespace = self._existing_namespace(tenant, project)
+        if namespace is None:
+            return None
+        target = namespace / object_key
         if not target.exists() and not target.is_symlink():
             return None
         if not self._read(target, sha256, size):
@@ -319,3 +415,8 @@ class FakeProjectArtifactBackend:
             sha256,
             size,
         )
+
+    def inspect(
+        self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
+    ) -> ProjectArtifactPlacement | None:
+        return self.reconcile(tenant_id, project_id, artifact_id, sha256, size)

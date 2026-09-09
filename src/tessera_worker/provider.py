@@ -25,6 +25,12 @@ class ProviderError(SupervisorError):
     """A provider result is unavailable and must be reconciled, not replayed."""
 
 
+class ProviderReportError(ProviderError):
+    """A durable provider receipt could not be delivered to control."""
+
+    reporting_failure = True
+
+
 @dataclass(frozen=True)
 class ProviderReceipt:
     provider_kind: Literal["fake"]
@@ -342,7 +348,7 @@ class ProviderDispatch:
                 f"/worker/external-operations/{operation_id}/receipt", payload, row["receipt_key"]
             )
         except Exception as error:
-            raise ProviderError("Fake provider receipt report is unresolved.") from error
+            raise ProviderReportError("Fake provider receipt report is unresolved.") from error
         with self._connect() as connection:
             connection.execute(
                 "UPDATE dispatches SET receipt_delivered=1 WHERE operation_id=?", (operation_id,)
@@ -374,6 +380,7 @@ __all__ = [
     "Provider",
     "ProviderDispatch",
     "ProviderError",
+    "ProviderReportError",
     "ProviderObservation",
     "ProviderReceipt",
 ]

@@ -159,6 +159,44 @@ class RenewalIntentJournal:
         return connection
 
 
+class HeartbeatIntentJournal:
+    """Persist heartbeat keys so retries are safe and successful beats are distinct."""
+
+    def __init__(self, root: Path) -> None:
+        self.path = root / "heartbeats.sqlite3"
+        with self._connect() as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS heartbeat_intents (
+                sequence INTEGER PRIMARY KEY, key TEXT NOT NULL,
+                completed INTEGER NOT NULL CHECK (completed IN (0, 1)))"""
+            )
+        os.chmod(self.path, 0o600)
+
+    def key(self) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT key FROM heartbeat_intents WHERE completed=0 ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                return row[0]
+            sequence = connection.execute(
+                "SELECT coalesce(max(sequence), 0) + 1 FROM heartbeat_intents"
+            ).fetchone()[0]
+            key = "development-heartbeat-" + hashlib.sha256(f"v1:{sequence}".encode()).hexdigest()
+            connection.execute(
+                "INSERT INTO heartbeat_intents (sequence, key, completed) VALUES (?, ?, 0)",
+                (sequence, key),
+            )
+            return key
+
+    def complete(self) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE heartbeat_intents SET completed=1 WHERE completed=0")
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path)
+
+
 class DevelopmentWorkerService:
     """Run exactly one existing grant with development-only output custody."""
 
@@ -180,13 +218,14 @@ class DevelopmentWorkerService:
         self.provider = provider
         self.sleep = sleep
         self.renewals = RenewalIntentJournal(self.root)
+        self.heartbeats = HeartbeatIntentJournal(self.root)
 
     def run(self) -> dict[str, Any]:
         """Heartbeat, lease, execute, and quarantine only a single grant attempt."""
 
         # Registration is an owner-only, prior human command.  A heartbeat is the
         # first worker mutation and deliberately precedes lease acquisition.
-        self.channel.post("/worker/heartbeat", {}, self._key("heartbeat"))
+        self._heartbeat()
         lease = self.channel.post(
             "/worker/leases", {"grant_id": self.config.grant_id}, self._key("lease")
         )
@@ -226,7 +265,11 @@ class DevelopmentWorkerService:
             if result.phase == "terminal" and result.observation.termination_confirmed:
                 # collect reports a fresh confirmed exit before touching outputs.
                 try:
-                    receipt = runtime.collect(result)
+                    observation = runtime.report(result)
+                except Exception:
+                    return self._cancel_unresolved(runtime, "observation_report_failure")
+                try:
+                    receipt = runtime.collect(result, reported_observation=observation)
                 except SupervisorError:
                     # A confirmed provider exit does not make missing, unsafe, or
                     # untransferable output safe to reclaim.  Keep its workspace.
@@ -237,9 +280,19 @@ class DevelopmentWorkerService:
             if result.phase in {"terminal", "denied", "uncertain"}:
                 if runtime.operation is not None:
                     runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
-                self._report(runtime, result)
+                if self._is_report_failure(result):
+                    return self._cancel_unresolved(runtime, "receipt_report_failure")
+                try:
+                    self._report(runtime, result)
+                except Exception:
+                    return self._cancel_unresolved(runtime, "observation_report_failure")
                 return {"state": "unknown", "quarantined": False, "reason": result.reason}
-            self._report(runtime, result)
+            if self._is_report_failure(result):
+                return self._cancel_unresolved(runtime, "receipt_report_failure")
+            try:
+                self._report(runtime, result)
+            except Exception:
+                return self._cancel_unresolved(runtime, "observation_report_failure")
             if tick == self.config.max_ticks:
                 # Do not abandon Docker merely because this foreground loop has
                 # exhausted its own budget. Request cancellation and retain the
@@ -247,14 +300,23 @@ class DevelopmentWorkerService:
                 cancelled = runtime.cancel(reason="worker_tick_limit")
                 if runtime.operation is not None:
                     runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
-                self._report(runtime, cancelled)
+                try:
+                    self._report(runtime, cancelled)
+                except Exception:
+                    # The cancellation was already attempted.  Keep the durable
+                    # report intent and workspace for a later reconciliation.
+                    pass
                 return {
                     "state": "unknown",
                     "quarantined": False,
                     "reason": "tick_limit_cancellation_requested",
                 }
             if tick and tick % self.config.renew_every_ticks == 0:
-                self._renew(runtime)
+                try:
+                    self._heartbeat()
+                    self._renew(runtime)
+                except Exception:
+                    return self._cancel_unresolved(runtime, "heartbeat_or_renewal_failure")
             self.sleep(self.config.poll_seconds)
             result = runtime.tick()
         raise AssertionError("bounded worker loop did not return")
@@ -272,6 +334,29 @@ class DevelopmentWorkerService:
         self.renewals.complete(lease.id, lease.epoch)
         # Re-read frozen authority; renewal never changes operation identity.
         runtime._refresh_lease()
+
+    def _heartbeat(self) -> None:
+        key = self.heartbeats.key()  # durable before the control mutation
+        self.channel.post("/worker/heartbeat", {}, key)
+        self.heartbeats.complete()
+
+    @staticmethod
+    def _is_report_failure(result: DriverResult) -> bool:
+        return result.reason is not None and result.reason.endswith("report_unconfirmed")
+
+    @staticmethod
+    def _cancel_unresolved(runtime: DevelopmentCpuRuntime, reason: str) -> dict[str, Any]:
+        """Cancellation must not depend on a control/reporting round trip succeeding."""
+
+        try:
+            runtime.cancel(reason=reason)
+        except Exception:
+            # Both the local supervisor journal and any provider-dispatch intent
+            # remain durable; do not convert this uncertain state into success.
+            pass
+        if runtime.operation is not None:
+            runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
+        return {"state": "unknown", "quarantined": False, "reason": reason}
 
     @staticmethod
     def _report(runtime: DevelopmentCpuRuntime, result: DriverResult) -> None:
@@ -305,6 +390,7 @@ __all__ = [
     "DevelopmentWorkerConfig",
     "DevelopmentWorkerError",
     "DevelopmentWorkerService",
+    "HeartbeatIntentJournal",
     "RenewalIntentJournal",
     "read_private_credential",
 ]

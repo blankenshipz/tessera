@@ -198,3 +198,7 @@ Schema 22 adds empty project-storage bindings, placement, and storage-operation
 metadata. Existing SQLite artifact BLOBs remain legacy with no invented location.
 Back up before migration; v22 backup fails closed when committed project objects
 would be omitted, until object-bundle recovery is implemented.
+
+Schema 23 records project-object intent and reconciliation separately from SQLite
+authority commits. It preserves v22 placements and does not infer locations for
+legacy BLOBs.

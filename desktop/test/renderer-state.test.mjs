@@ -103,6 +103,47 @@ test('renderer ignores thread and message replies from a previous context and cl
   assert.equal(ui.get('message-form').fields.body, undefined);
 });
 
+test('project and connection context changes close and clear task and thread drafts', async () => {
+  const ui = fixture();
+  await ui.selectProject(project('p1'));
+  for (const id of ['task', 'thread']) {
+    ui.get(`${id}-dialog`).showModal();
+    ui.get(`${id}-form`).fields = { title: `Draft for p1 ${id}` };
+  }
+  await ui.selectProject(project('p2'));
+  for (const id of ['task', 'thread']) {
+    assert.equal(ui.get(`${id}-dialog`).open, false);
+    assert.deepEqual(ui.get(`${id}-form`).fields, {});
+    assert.equal(ui.get(`${id}-form`).querySelector('button[type="submit"]').disabled, false);
+  }
+
+  ui.get('task-dialog').showModal();
+  ui.get('task-form').fields = { title: 'Draft before disconnect' };
+  ui.get('thread-dialog').showModal();
+  ui.get('thread-form').fields = { title: 'Thread before disconnect' };
+  ui.get('connection-dialog').showModal();
+  ui.get('connection-form').fields = { name: 'Old identity', endpoint: 'https://old.example' };
+  ui.clearContext();
+  for (const id of ['task', 'thread', 'connection']) {
+    assert.equal(ui.get(`${id}-dialog`).open, false);
+    assert.deepEqual(ui.get(`${id}-form`).fields, {});
+  }
+});
+
+test('pending task and thread drafts cannot dispatch after a project switch', async () => {
+  const key = deferred(); let tasks = 0; let threads = 0;
+  const ui = fixture({ commandId: () => key.promise,
+    createTask: async () => { tasks++; }, createThread: async () => { threads++; } });
+  await ui.selectProject(project('p1'));
+  ui.get('task-form').fields = { title: 'Old plan', purpose: 'Old purpose', budget: '0', duration: '120' };
+  ui.get('thread-form').fields = { title: 'Old question' };
+  ui.submit('task-form'); ui.submit('thread-form'); await flush();
+  await ui.selectProject(project('p2'));
+  key.resolve('old-command'); await flush();
+  assert.equal(tasks, 0);
+  assert.equal(threads, 0);
+});
+
 test('cancellation telemetry never renders unresolved termination as stopped or successful', async () => {
   const ui = fixture({ labbook: async () => ({ events: [
     { cursor: 1, event_type: 'execution.grant_cancel_requested', resource_revision: 2, created_at: '2026-01-01T00:00:00Z', payload: { cancellation: { state: 'requested' } } },

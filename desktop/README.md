@@ -100,7 +100,8 @@ the desktop's identity-field mismatch with the real `/me` response. It remains a
 platform fixture, not a research investigation or visual acceptance test.
 
 Renderer tests execute the application code with synthetic DOM nodes and deferred
-API replies. They verify pagination, draft clearing on context switches, delayed
+API replies. They verify pagination, task/thread and research-record draft/dialog
+clearing on project, connection, and authentication context switches, delayed
 thread selection, overlapping refreshes, and retry keys after uncertain message
 or decision-resolution responses. They also verify that stale decision actions do
 not cross a project switch. They do not establish visual or Electron runtime

@@ -203,7 +203,9 @@ class DevelopmentOutputBackend:
         self._transition(operation_id, {"reserved", "running", "terminated", "unknown"}, "unknown")
 
     def mark_running(self, operation_id: str) -> None:
-        self._transition(operation_id, {"reserved"}, "running")
+        # Restart recovery can observe an already-running operation whose
+        # reservation was marked before the prior worker process stopped.
+        self._transition(operation_id, {"reserved", "running"}, "running")
 
     def seal(self, operation_id: str, termination_observation: dict[str, Any]) -> str:
         row = self._reservation(operation_id)
@@ -401,7 +403,9 @@ class DevelopmentCpuRuntime(CpuRuntime):
             self.development_outputs.mark_unknown(self.operation.operation_id)
         return result
 
-    def collect(self, result: DriverResult) -> dict[str, Any]:
+    def collect(
+        self, result: DriverResult, *, reported_observation: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Report a fresh confirmed exit, then seal and upload quarantined bytes."""
         if (
             self.operation is None
@@ -411,7 +415,7 @@ class DevelopmentCpuRuntime(CpuRuntime):
             if self.operation is not None:
                 self.development_outputs.mark_unknown(self.operation.operation_id)
             raise DevelopmentRuntimeError("Collection requires a fresh confirmed termination.")
-        observation = self.report(result)
+        observation = reported_observation or self.report(result)
         seal_id = self.development_outputs.seal(self.operation.operation_id, observation)
         return self.development_outputs.upload(self.operation.operation_id, self.channel, seal_id)
 

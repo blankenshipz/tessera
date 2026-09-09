@@ -5,7 +5,10 @@ The control plane, bounded CPU execution components, desktop research records,
 and reasoned finding review are implemented in slices. See the
 [implementation status matrix](docs/implementation-progress.md#design-status-matrix)
 for what is implemented, partial, blocked, or deferred, with remaining acceptance
-work. README.md describes the runnable scope.
+work. The current remediation checkpoint hardens development-worker cancellation
+and restart behavior, schema-v23 project-object reconciliation, synthetic OpenCode
+authority/replay boundaries, and desktop draft fencing; none of those component
+guarantees constitutes pilot completion. README.md describes the runnable scope.
 This document defines the pilot, the contracts it must satisfy, and the order of
 implementation. “Required” describes intended behavior, not a verified guarantee.
 

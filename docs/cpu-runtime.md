@@ -5,7 +5,7 @@ verified read-only mounts and the durable supervisor. Integration tests use the
 real authenticated API and a simulated provider. No unattended dispatch command
 is enabled, and this is not end-to-end research acceptance.
 
-Schema v22 requires committed durable project-artifact placement before
+Schema v23 requires reconciled, integrity-checked durable project-artifact placement before
 development output-slot cleanup, rather than merely a quarantine receipt. It does
 not relax ADR 0003: Linux-enforced worker-slot storage and restart evidence remain
 required before automatic/pilot collection.

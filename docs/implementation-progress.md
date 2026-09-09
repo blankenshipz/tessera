@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-09 against schema v22 private project-artifact persistence and
+Reviewed 2026-09-09 against schema v23 reconciled private project-artifact persistence and
 the schema v21 metadata-only credential-access lease,
 v20 bounded human result-bookkeeping ledger, v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
@@ -22,13 +22,13 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v20 human bookkeeping over v19 fake-provider receipt evidence and v18 durable package intents, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, real provider dispatch/accounting and broader authoritative result policy; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v20 human bookkeeping over v19 fake-provider receipt evidence and v18 durable package intents, CPU supervisor, live HTTP/input fixtures, an explicit development-only native one-shot worker, and v23 explicit project-object placement after quarantine | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced worker-slot storage and automatic production collection, real provider dispatch/accounting and broader authoritative result policy; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
-| §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
+| §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, cancellation attempts independent of provider/control report failures, restart-safe development heartbeats, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
-| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode session/event/cancellation adapter POC, and a read-only informational capability probe | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
-| §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, read-only held restore | Provider fencing/resumption after restore, release/result policy, spend and incident reconciliation |
+| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, and a read-only informational capability probe | Live OpenCode compatibility/security testing, enrolled-node integration, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
+| §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, schema-v23 project-object intent/reconciliation, and read-only held restore | Provider fencing/resumption after restore, portable object-bundle recovery, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
 | §8 E2E acceptance | Blocked for real pilot; component work continues | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Admissible execution storage/host, selected investigation/dataset, remaining failure drills and measured pilot |
 | §9 Operations/product | Partial | Pinned development dependencies, CI, explicit migrations, backup/held-restore runbook | Signed packaging, update/drain/rollback, retention, monitoring, operational recovery and pilot measurements |
@@ -46,15 +46,21 @@ full workflow and its required adverse cases pass on the supported target.
 
 ## Verified evidence
 
-- At `ee6c36d`: 363 Python tests pass natively; Linux CI passed for that commit.
-- Schema v20 result-bookkeeping evidence: 507 Python tests pass natively,
-  including acceptance/retraction revision fencing, receipt/manifest/byte
-  integrity conflicts, tenant isolation, migration rollback and evidence
-  preservation. This remains development/synthetic evidence only.
+- Current schema-v23 remediation checkpoint: 538 Python tests pass natively,
+  including cancellation/report-failure handling, restart/heartbeat replay,
+  v22 `staged_at` migration, project-object integrity and zero-output handling,
+  acceptance retraction after object corruption, OpenCode authority/replay fencing,
+  and migration rollback/evidence preservation. This remains development/synthetic
+  evidence only.
 - Ruff lint and format checks pass.
-- 62 desktop connection/IPC and renderer tests pass using Node 22.12.
-- Explicit migrations through schema v18 preserve historical records, input bytes,
-  active grants, leases and held exposure; injected migration faults roll back.
+- 65 desktop connection/IPC and renderer tests pass using the locked desktop
+  dependencies.
+- Explicit migrations through schema v23 preserve historical records, input bytes,
+  active grants, leases, v22 project placements and held exposure; injected
+  migration faults roll back.
+- Native CPU, HTTP/control and development-worker Docker fixtures pass. The
+  development fixture persists declared output to project storage after quarantine;
+  it remains synthetic and does not establish pilot storage or result acceptance.
 - No tests were skipped. Dependency deprecation warnings remain.
 
 These include component tests and synthetic live acceptance of container
@@ -117,7 +123,8 @@ representative investigation have not passed end-to-end acceptance.
     [artifact quarantine](artifact-quarantine.md).
 9. **Desktop shell:** isolated renderer, sender-checked IPC, named connections,
    project/draft/approval/labbook views, attributed conversations and explicit
-   revision-bound human decision resolution. Review corrected draft carryover, delayed thread
+   revision-bound human decision resolution. Review corrected project/task/thread,
+   connection, and research-record draft carryover, delayed thread
    selection, pagination replacement and overlapping refreshes. Tests execute the
    actual renderer with deferred replies to verify context fences and stable
    message retry keys. Decision tests cover uncertain responses through Refresh,
@@ -195,10 +202,12 @@ representative investigation have not passed end-to-end acceptance.
     capability claim. See [worker lifecycle](worker-lifecycle.md).
 
 17. **Optional OpenCode harness adapter POC:** an injected in-process client
-    proves exact-version rejection, current-authority gating, bounded synthetic
-    session/message translation, full event attribution/quarantine, per-operation
-    deduplication, cursor reconnect, prompt observation, and unresolved-to-confirmed
-    cancellation. It has no live OpenCode/provider call, control write, dispatch,
+    proves exact-version rejection, authority rechecks at each privileged boundary,
+    bounded synthetic session/message translation, full event attribution/quarantine,
+    contiguous per-operation deduplication, restartable exclusive-cursor replay,
+    prompt observation, and unresolved-to-confirmed cancellation. Uncertain upstream
+    effects retain one operation identity instead of creating a dishonest replay.
+    It has no live OpenCode/provider call, control write, dispatch,
     artifact/result acceptance, credential path, compatibility result, or pilot
     completion. See [the adapter note](opencode-harness.md).
 
@@ -230,9 +239,11 @@ representative investigation have not passed end-to-end acceptance.
 
 22. **Stage 1 development native worker:** `tessera-worker development-run`
     consumes only an already issued grant and a private project-scoped worker
-    credential file. It heartbeats before lease acquisition, verifies the frozen
-    CPU package and local development output marker, reuses persisted renewal
-    keys after lost responses, and reuses the supervisor start journal on restart.
+    credential file. It uses distinct durable heartbeat intents, heartbeats before
+    lease acquisition and renewal, verifies the frozen CPU package and local
+    development output marker, reuses persisted renewal/package-read keys after
+    lost responses, and reuses the supervisor start journal on restart. Provider,
+    observation, heartbeat, or renewal report failure still attempts cancellation.
     It reports observations, seals/uploads declared confirmed-exit output into
     quarantine only, and removes its workspace only after transfer. It cannot
     self-register, issue/reconcile human authority, release artifacts, commit a
@@ -260,7 +271,9 @@ representative investigation have not passed end-to-end acceptance.
     human accept/reject/retract ledger over exact reconciled synthetic checkpoint,
     fake receipt, operation, lease/epoch, manifest and retained bytes. It preserves
     quarantine, findings, costs, and explicit not-assessed/not-established/not-
-    performed labels; it is not real provider/scientific acceptance or release.
+    performed labels. Retraction remains fenced to the prior decision but possible
+    after accepted project bytes are later missing or corrupt; it is not real
+    provider/scientific acceptance or release.
 
 26. **Credential-access leases:** schema v21 records human-only opaque-reference
     leases bound to the current task/grant/execution lease/worker/epoch and returns
@@ -269,14 +282,17 @@ representative investigation have not passed end-to-end acceptance.
     API responses or diagnostics. It is not a production secret backend or real
     provider credential integration; see [decision 0007](decisions/0007-credential-access-lease-boundary.md).
 
-27. **Project artifact storage:** schema v22 separates development worker output
-    slots from default private project persistence. Quarantine bytes are
-    checksum/size validated, stage/commit/reconciled with deterministic local
-    tenant/project namespaces before workspace cleanup; binding/placement/operation
-    records carry retention/timestamps only. Placement stays quarantined and has
-    no finding, classification, cost, provider, or scientific effect. Legacy BLOBs
-    remain unplaced. S3/IAM/KMS, Linux worker-slot enforcement, export/release,
-    object-bundle restore/deletion, and pilot acceptance remain open.
+27. **Project artifact storage:** schema v23 records durable intent before backend
+    stage/commit/reconciliation and commits SQLite placement authority only after
+    backend integrity verification. Recoverable stale publication hard links are
+    repaired outside authority transactions; manifest/checkpoint/acceptance
+    integrity inspection does not repair backend state. Schema-v22 `staged_at`
+    operations and placements migrate without invented legacy locations. Explicit
+    zero-output placement is recorded without an invented object.
+    Placement stays quarantined and has no finding, classification, cost, provider,
+    or scientific effect. Legacy BLOBs remain unplaced. S3/IAM/KMS, Linux
+    worker-slot enforcement, export/release, object-bundle restore/deletion, and
+    pilot acceptance remain open.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
@@ -315,7 +331,14 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `175a5b3`: schema v14 worker registration, liveness admission and retirement revocation.
 - `9967b50`: schema v16 bounded skill lifecycle.
 - `b70772b`: schema v17 bounded confirmed workspace handoff.
-- Pending commit: schema v18 development-local external-operation journal.
+- `0a00661`: Stage 1 development worker E2E.
+- `6b59112`: schema v18 development-local external-operation journal.
+- `3f43fe2`: schema v19 fake-provider receipt dispatch.
+- `0756150`: schema v20 bounded result-acceptance ledger.
+- `b7e304c`: schema v21 credential-access leases.
+- `b67807a`: schema v22 project-artifact storage.
+- Current checkpoint: integrated lifecycle, schema-v23 storage, OpenCode replay,
+  and desktop draft-fencing remediations.
 
 The shared control schema/API changes are one atomic commit so startup and
 migration dependencies remain coherent. No license was added.

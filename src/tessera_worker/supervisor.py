@@ -168,8 +168,13 @@ class CpuSupervisor:
                 if self._before_start is not None:
                     self._before_start(operation, lease)
                 observation = self._adapter.start(operation)
-            except (CpuError, SupervisorError):
-                return self._uncertain(operation, "start_unconfirmed")
+            except (CpuError, SupervisorError) as error:
+                reason = (
+                    "start_report_unconfirmed"
+                    if getattr(error, "reporting_failure", False)
+                    else "start_unconfirmed"
+                )
+                return self._uncertain(operation, reason)
             return self._after_start(operation, observation)
 
     def reconcile(self, operation: CpuOperation, lease: Lease) -> DriverResult:
@@ -189,8 +194,13 @@ class CpuSupervisor:
             if self._before_reconcile is not None:
                 self._before_reconcile(operation)
             observation = self._adapter.observe(operation)
-        except (CpuError, SupervisorError):
-            return self._uncertain(operation, "observe_unconfirmed")
+        except (CpuError, SupervisorError) as error:
+            reason = (
+                "reconcile_report_unconfirmed"
+                if getattr(error, "reporting_failure", False)
+                else "observe_unconfirmed"
+            )
+            return self._uncertain(operation, reason)
         if observation.state == "exited":
             return self._terminal(operation, observation, "observed_exited")
         if observation.state == "running":
@@ -281,11 +291,20 @@ class CpuSupervisor:
         if row is None:
             raise SupervisorError("Operation is not present in this journal.")
         self._verify_operation(row, operation)
+        callback_failed = False
         try:
             if self._before_cancel is not None:
                 self._before_cancel(operation)
+        except (CpuError, SupervisorError):
+            # Provider cancellation/reporting and local adapter termination are
+            # independent compensating effects.  Still attempt the latter, but
+            # retain uncertainty if the former cannot be confirmed.
+            callback_failed = True
+        try:
             observation = self._adapter.cancel(operation)
         except (CpuError, SupervisorError):
+            return self._uncertain(operation, f"cancel_{reason}_unconfirmed")
+        if callback_failed:
             return self._uncertain(operation, f"cancel_{reason}_unconfirmed")
         if observation.termination_confirmed:
             return self._terminal(operation, observation, f"cancelled_{reason}")

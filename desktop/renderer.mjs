@@ -45,7 +45,7 @@ function applyRecoveryStatus(status) {
   $('recovery-banner').textContent = recoveryHeld ?
     'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
   for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close', 'source-new', 'finding-new']) $(id).disabled = recoveryHeld;
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
+  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
   $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
 }
 function element(tag, text, className) {
@@ -59,10 +59,13 @@ function resetAuthoringForms() {
   for (const id of ['assessment-source', 'correction-original', 'finding-review', 'finding-sources', 'finding-variants', 'finding-retract-review', 'finding-revise-original', 'finding-revise-sources', 'finding-revise-variants']) {
     $(id).replaceChildren();
   }
-  for (const id of ['study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) {
+  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) {
     const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
     form.querySelector('button[type="submit"]').disabled = recoveryHeld;
   }
+}
+function resetConnectionForm() {
+  const form = $('connection-form'); form.reset(); $('connection-dialog').close();
 }
 function clearContext() {
   epoch++;
@@ -83,6 +86,7 @@ function clearContext() {
   for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
   $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
+  resetConnectionForm();
   $('study-export').hidden = true;
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   loading.clear();
@@ -836,10 +840,11 @@ $('disconnect').addEventListener('click', () => guarded(async () => {
 $('connection-form').addEventListener('submit', event => {
   event.preventDefault();
   guarded(async () => {
-    clearContext(); $('connection-dialog').close();
-    const version = epoch;
     const fields = new FormData(event.target);
-    const state = await api.connect({ name: fields.get('name'), endpoint: fields.get('endpoint') });
+    const settings = { name: fields.get('name'), endpoint: fields.get('endpoint') };
+    clearContext();
+    const version = epoch;
+    const state = await api.connect(settings);
     if (version !== epoch) return;
     if (!state) { $('connection-status').textContent = 'Not connected'; return; }
     connectionId = state.id;

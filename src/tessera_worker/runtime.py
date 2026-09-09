@@ -72,6 +72,7 @@ class CpuRuntime:
             ProviderDispatch(self.directory, channel, provider) if provider is not None else None
         )
         self._initialize_observation_journal()
+        self._initialize_package_refresh_journal()
         self.supervisor = CpuSupervisor(
             self.directory / "journal",
             adapter,
@@ -93,15 +94,35 @@ class CpuRuntime:
         self.close()
 
     def _request_package(self, lease_id: str, epoch: int) -> dict[str, Any]:
-        body: dict[str, Any] = {"expected_epoch": epoch}
-        if self.persistent_output_collection:
-            body["persistent_output_collection"] = True
-            body["persistent_output_storage"] = self.persistent_output_storage
+        body = self._package_body(epoch)
         return self.channel.post(
             f"/worker/leases/{lease_id}/package",
             body,
             f"runtime-package-{lease_id}",
         )
+
+    def _package_body(self, epoch: int) -> dict[str, Any]:
+        body: dict[str, Any] = {"expected_epoch": epoch}
+        if self.persistent_output_collection:
+            body["persistent_output_collection"] = True
+            body["persistent_output_storage"] = self.persistent_output_storage
+        return body
+
+    def _current_package(self, lease_id: str, epoch: int) -> dict[str, Any]:
+        """Read current authority with a durable fresh key, not a cached package reply."""
+
+        key = self._package_refresh_key(lease_id, epoch)
+        try:
+            response = self.channel.post(
+                f"/worker/leases/{lease_id}/package", self._package_body(epoch), key
+            )
+            self._validate_package(response, lease_id, epoch)
+        except Exception:
+            # A lost response keeps this exact read intent pending, so a restart
+            # replays it rather than silently treating a stale cached reply as live.
+            raise
+        self._complete_package_refresh(lease_id, epoch)
+        return response
 
     def _validate_package(self, response: dict[str, Any], lease_id: str, epoch: int) -> None:
         try:
@@ -207,8 +228,7 @@ class CpuRuntime:
         if self.descriptor is None:
             return False
         try:
-            response = self._request_package(lease.id, lease.epoch)
-            self._validate_package(response, lease.id, lease.epoch)
+            response = self._current_package(lease.id, lease.epoch)
             return response["package_digest"] == self.descriptor["control"][
                 "package_digest"
             ] and datetime.fromisoformat(response["lease"]["expires_at"]) > datetime.now(UTC)
@@ -316,8 +336,7 @@ class CpuRuntime:
         if self.lease is None or self.descriptor is None:
             raise SupervisorError("Runtime has no bound operation.")
         try:
-            current = self._request_package(self.lease.id, self.lease.epoch)
-            self._validate_package(current, self.lease.id, self.lease.epoch)
+            current = self._current_package(self.lease.id, self.lease.epoch)
             if current["package_digest"] == self.descriptor["control"]["package_digest"]:
                 self.lease = self._lease(current)
         except Exception:
@@ -326,6 +345,7 @@ class CpuRuntime:
             pass
 
     def renew(self) -> None:
+        """Compatibility seam; the development service uses its durable renewal journal."""
         if self.lease is None:
             raise SupervisorError("Runtime has no bound operation.")
         self.channel.post(
@@ -375,8 +395,53 @@ class CpuRuntime:
                 completed INTEGER NOT NULL CHECK (completed IN (0, 1)))"""
             )
 
+    def _initialize_package_refresh_journal(self) -> None:
+        with self._package_refresh_connection() as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS package_refreshes (
+                lease_id TEXT NOT NULL, epoch INTEGER NOT NULL, sequence INTEGER NOT NULL,
+                key TEXT NOT NULL, completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
+                PRIMARY KEY (lease_id, epoch, sequence))"""
+            )
+
+    def _package_refresh_key(self, lease_id: str, epoch: int) -> str:
+        with self._package_refresh_connection() as connection:
+            row = connection.execute(
+                """SELECT key FROM package_refreshes WHERE lease_id=? AND epoch=? AND completed=0
+                ORDER BY sequence DESC LIMIT 1""",
+                (lease_id, epoch),
+            ).fetchone()
+            if row is not None:
+                return row[0]
+            sequence = connection.execute(
+                "SELECT coalesce(max(sequence), 0) + 1 FROM package_refreshes "
+                "WHERE lease_id=? AND epoch=?",
+                (lease_id, epoch),
+            ).fetchone()[0]
+            key = (
+                "runtime-package-refresh-"
+                + hashlib.sha256(f"v1:{lease_id}:{epoch}:{sequence}".encode()).hexdigest()
+            )
+            connection.execute(
+                """INSERT INTO package_refreshes (lease_id, epoch, sequence, key, completed)
+                VALUES (?, ?, ?, ?, 0)""",
+                (lease_id, epoch, sequence, key),
+            )
+            return key
+
+    def _complete_package_refresh(self, lease_id: str, epoch: int) -> None:
+        with self._package_refresh_connection() as connection:
+            connection.execute(
+                """UPDATE package_refreshes SET completed=1
+                WHERE lease_id=? AND epoch=? AND completed=0""",
+                (lease_id, epoch),
+            )
+
     def _observation_connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.directory / "runtime-observations.sqlite3")
+
+    def _package_refresh_connection(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.directory / "runtime-package-refreshes.sqlite3")
 
     def _observation_intent(
         self, state: str, provider_id: str | None, termination_confirmed: bool

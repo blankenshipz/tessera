@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -94,6 +95,21 @@ def test_namespaces_isolate_tenants_and_projects(tmp_path: Path) -> None:
     assert backend.reconcile("tenant-a", "project-b", "same", digest, len(content)) is None
 
 
+def test_filesystem_backend_recovers_a_stale_publication_hard_link(tmp_path: Path) -> None:
+    backend = _backend(tmp_path)
+    content = b"crash between link and unlink"
+    digest = hashlib.sha256(content).hexdigest()
+    stage = backend.stage("tenant", "project", "artifact", digest, content)
+    tenant, project, object_key = backend._names("tenant", "project", "artifact")
+    namespace = backend._namespace(tenant, project)
+    os.link(namespace / stage.token, namespace / object_key)
+    assert (namespace / object_key).stat().st_nlink == 2
+    placement = backend.reconcile("tenant", "project", "artifact", digest, len(content))
+    assert placement is not None
+    assert (namespace / object_key).stat().st_nlink == 1
+    assert not (namespace / stage.token).exists()
+
+
 def test_fake_fault_reconciles_and_manifest_waits_for_placement(tmp_path: Path) -> None:
     state, _, _owner, worker, _grant, lease = _delivery(tmp_path)
     payload = _payload(lease, b"first")
@@ -136,13 +152,220 @@ def test_fake_fault_reconciles_and_manifest_waits_for_placement(tmp_path: Path) 
         ],
     }
     assert (
-        ArtifactManifestStore(state).create_manifest(
+        ArtifactManifestStore(state, fake).create_manifest(
             worker, lease["id"], "manifest", canonical_digest(manifest), manifest
         )[0]
         == 201
     )
     with pytest.raises(StoreError, match="cannot omit"):
         backup_state(state, tmp_path / "backup")
+
+
+def test_placement_recovers_lost_backend_response_and_records_reconcile_state(
+    tmp_path: Path,
+) -> None:
+    state, _, _owner, worker, _grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"recover")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+
+    class LostResponseBackend(FakeProjectArtifactBackend):
+        lose_response = True
+
+        def commit(self, stage):
+            placement = super().commit(stage)
+            if self.lose_response:
+                self.lose_response = False
+                raise ProjectArtifactStorageError("lost response after publication")
+            return placement
+
+    backend = LostResponseBackend()
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [
+            {"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}
+        ],
+    }
+    store = ProjectArtifactStore(state, backend)
+    with pytest.raises(Conflict, match="could not commit"):
+        store.commit_project_artifacts(
+            worker, lease["id"], "lost", canonical_digest(request), request
+        )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert (
+            connection.execute("SELECT state FROM project_artifact_storage_operations").fetchone()[
+                0
+            ]
+            == "reconciling"
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0]
+            == 0
+        )
+    result = store.commit_project_artifacts(
+        worker, lease["id"], "lost", canonical_digest(request), request
+    )
+    assert result[0] == 201
+
+
+def test_placement_concurrency_and_explicit_zero_outputs(tmp_path: Path) -> None:
+    state, _, _owner, worker, _grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"concurrent")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    backend = FakeProjectArtifactBackend()
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [
+            {"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}
+        ],
+    }
+    results: list[int] = []
+
+    def place(key: str) -> None:
+        results.append(
+            ProjectArtifactStore(state, backend).commit_project_artifacts(
+                worker, lease["id"], key, canonical_digest(request), request
+            )[0]
+        )
+
+    threads = [threading.Thread(target=place, args=(f"race-{number}",)) for number in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(results) == [200, 201]
+    zero = request | {"artifacts": []}
+    status, response = ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "zero", canonical_digest(zero), zero
+    )
+    assert status == 201 and response["placements"][0]["artifact_id"] is None
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT state,artifact_id,size FROM project_artifact_storage_operations "
+            "WHERE artifact_id IS NULL"
+        ).fetchone() == ("committed", None, 0)
+
+
+def test_manifest_rechecks_filesystem_placement_integrity(tmp_path: Path) -> None:
+    state, _, _owner, worker, _grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"integrity")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [
+            {"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}
+        ],
+    }
+    ProjectArtifactStore(state).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(request), request
+    )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT tenant_namespace,project_namespace,object_key FROM project_artifact_placements"
+        ).fetchone()
+    (state / "project-artifacts" / row[0] / row[1] / row[2]).write_bytes(b"corrupt")
+    manifest = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [
+            {
+                "id": artifact["id"],
+                "relative_path": "result.txt",
+                "sha256": artifact["sha256"],
+                "size": artifact["size"],
+            }
+        ],
+    }
+    with pytest.raises(Conflict, match="storage integrity"):
+        ArtifactManifestStore(state).create_manifest(
+            worker, lease["id"], "manifest", canonical_digest(manifest), manifest
+        )
+
+
+def test_v23_migration_preserves_v22_staged_at_operations_and_placements(tmp_path: Path) -> None:
+    state, _, _owner, worker, _grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"v22 placement")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [
+            {"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}
+        ],
+    }
+    ProjectArtifactStore(state).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(request), request
+    )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        old = connection.execute(
+            """SELECT artifact_id,intent_at,committed_at,reconciled_at
+            FROM project_artifact_storage_operations"""
+        ).fetchone()
+        connection.execute(
+            "ALTER TABLE project_artifact_storage_operations RENAME TO v23_operations"
+        )
+        connection.execute(
+            """CREATE TABLE project_artifact_storage_operations (
+            id TEXT PRIMARY KEY,
+            artifact_id TEXT NOT NULL UNIQUE REFERENCES artifacts(id),
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            backend_kind TEXT NOT NULL,
+            operation_key TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL CHECK (state IN ('staged', 'committed')),
+            sha256 TEXT NOT NULL,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            retention_class TEXT NOT NULL CHECK (retention_class IN ('project_default', 'held')),
+            staged_at TEXT NOT NULL,
+            committed_at TEXT,
+            reconciled_at TEXT
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO project_artifact_storage_operations
+            (id,artifact_id,project_id,backend_kind,operation_key,state,sha256,size,
+             retention_class,staged_at,committed_at,reconciled_at)
+            SELECT id,artifact_id,project_id,backend_kind,operation_key,'committed',sha256,size,
+            retention_class,intent_at,committed_at,reconciled_at FROM v23_operations"""
+        )
+        connection.execute("DROP TABLE v23_operations")
+        connection.execute("UPDATE schema_meta SET schema_version=22")
+
+    assert migrate_state(state) == 23
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        migrated = connection.execute(
+            """SELECT artifact_id,state,intent_at,reconcile_started_at,committed_at,reconciled_at
+            FROM project_artifact_storage_operations"""
+        ).fetchone()
+        assert migrated == (
+            old[0],
+            "committed",
+            old[1],
+            old[1],
+            old[2],
+            old[3],
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0]
+            == 1
+        )
 
 
 def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
@@ -183,7 +406,7 @@ def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 22
+    assert migrate_state(state) == 23
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0]

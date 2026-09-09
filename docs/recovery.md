@@ -3,7 +3,7 @@
 Schema 11 supports consistent local SQLite control-state backups. This recovery
 slice preserves history for inspection; it does not provide operational failover.
 
-Schema-v22 project objects are outside SQLite. Until backup/restore bundles and
+Schema-v23 project objects are outside SQLite. Until backup/restore bundles and
 verifies them, backup fails closed when committed project placements exist; restore
 never invents placement and held/referenced retention never triggers deletion.
 

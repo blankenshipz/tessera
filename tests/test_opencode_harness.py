@@ -29,6 +29,8 @@ class FakeOpenCodeClient:
         self.event_cursors: list[int | None] = []
         self.stream: list[OpenCodeEvent] = []
         self.abort_error = False
+        self.create_error = False
+        self.message_error = False
 
     def version(self) -> str | None:
         self.calls.append("version")
@@ -37,11 +39,15 @@ class FakeOpenCodeClient:
     def create_session(self, request: dict[str, object]) -> str:
         self.calls.append("create_session")
         self.created.append(request)
+        if self.create_error:
+            raise RuntimeError("synthetic lost create reply")
         return "synthetic-session-1"
 
     def send_message(self, session_id: str, request: dict[str, object]) -> None:
         self.calls.append("send_message")
         self.messages.append((session_id, request))
+        if self.message_error:
+            raise RuntimeError("synthetic lost message reply")
 
     def abort(self, session_id: str) -> bool:
         self.calls.append("abort")
@@ -53,7 +59,7 @@ class FakeOpenCodeClient:
     def events(self, after_cursor: int | None) -> list[OpenCodeEvent]:
         self.calls.append("events")
         self.event_cursors.append(after_cursor)
-        return list(self.stream)
+        return [item for item in self.stream if after_cursor is None or item.cursor > after_cursor]
 
 
 def binding() -> TesseraBinding:
@@ -67,7 +73,7 @@ def context() -> BoundedPlanMessage:
 def event(
     binding_value: TesseraBinding,
     *,
-    cursor: int = 1,
+    cursor: int = 0,
     event_id: str = "event-1",
     kind: str = "status",
     payload: dict[str, object] | None = None,
@@ -170,6 +176,48 @@ def test_expired_or_revised_authority_blocks_start_without_client_calls(authorit
     assert client.calls == []
 
 
+def test_authority_is_rechecked_before_version_session_and_message() -> None:
+    client = FakeOpenCodeClient()
+    checks: list[str] = []
+
+    def authority(_binding: TesseraBinding, _context: BoundedPlanMessage) -> bool:
+        checks.append("check")
+        return len(checks) < 3
+
+    adapter = OpenCodeHarnessAdapter(client, pinned_version="1.2.3", authority_is_current=authority)
+    with pytest.raises(AuthorityRejectedError):
+        adapter.start(binding(), context())
+
+    assert checks == ["check", "check", "check"]
+    assert client.calls == ["version", "create_session"]
+    assert adapter.active_binding("operation-1").session_id == "synthetic-session-1"
+    assert [(entry.boundary, entry.outcome) for entry in adapter.journal] == [
+        ("session", "acknowledged"),
+        ("message", "blocked"),
+    ]
+
+
+@pytest.mark.parametrize("boundary", ["create", "message"])
+def test_uncertain_session_or_message_effect_is_journaled_and_never_retried(boundary: str) -> None:
+    client = FakeOpenCodeClient()
+    if boundary == "create":
+        client.create_error = True
+    else:
+        client.message_error = True
+    adapter = OpenCodeHarnessAdapter(
+        client, pinned_version="1.2.3", authority_is_current=lambda _a, _b: True
+    )
+
+    with pytest.raises(OpenCodeHarnessError, match="uncertain"):
+        adapter.start(binding(), context())
+    with pytest.raises(OpenCodeHarnessError, match="already has"):
+        adapter.start(binding(), context())
+
+    assert [entry.outcome for entry in adapter.journal] == (
+        ["uncertain"] if boundary == "create" else ["acknowledged", "uncertain"]
+    )
+
+
 @pytest.mark.parametrize(
     "field,bad_value",
     [
@@ -224,18 +272,53 @@ def test_unknown_session_is_quarantined_and_cannot_confirm_cancellation() -> Non
     assert adapter.cancellation_status("operation-1").unresolved is True
 
 
-def test_deduplicates_reordered_events_and_reconnects_from_high_water_without_new_session() -> None:
+def test_unknown_event_kind_is_quarantined_without_advancing_replay() -> None:
+    client = FakeOpenCodeClient()
+    adapter, bound = start(client)
+    client.stream = [event(bound, kind="upstream-new-event")]
+
+    assert adapter.poll("operation-1") == []
+    assert adapter.quarantine[-1].reason == "unknown event kind"
+    assert client.event_cursors == [None]
+
+
+def test_orders_delayed_events_and_reconnects_from_contiguous_cursor_without_new_session() -> None:
     client = FakeOpenCodeClient()
     adapter, bound = start(client)
     newer = event(bound, cursor=9, event_id="event-9")
     older = event(bound, cursor=4, event_id="event-4")
     client.stream = [newer, older, replace(newer, event_id="duplicate-id"), newer]
 
-    received = adapter.poll("operation-1")
-    assert [item.cursor for item in received] == [9, 4]
-    assert adapter.reconnect("operation-1") == []
-    assert client.event_cursors == [None, 9]
+    assert adapter.poll("operation-1") == []
+    assert client.event_cursors == [None]
+    client.stream.extend(
+        [event(bound, cursor=0, event_id="event-0"), event(bound, cursor=1, event_id="event-1")]
+    )
+    assert [item.cursor for item in adapter.reconnect("operation-1")] == [0, 1]
+    assert client.event_cursors == [None, None]
     assert client.created == [{"fixture": SYNTHETIC_SESSION_FIXTURE, "operation_id": "operation-1"}]
+
+
+def test_replay_state_restarts_at_exclusive_contiguous_cursor_and_handles_gap() -> None:
+    client = FakeOpenCodeClient()
+    adapter, bound = start(client)
+    client.stream = [
+        event(bound, cursor=0, event_id="event-0"),
+        event(bound, cursor=2, event_id="event-2"),
+    ]
+    assert [item.cursor for item in adapter.poll("operation-1")] == [0]
+
+    restarted = OpenCodeHarnessAdapter(
+        client,
+        pinned_version="1.2.3",
+        authority_is_current=lambda _a, _b: True,
+        replay_states=[adapter.replay_state("operation-1")],
+    )
+    assert restarted.reconnect("operation-1") == []
+    assert client.event_cursors[-1] == 0
+    client.stream.append(event(bound, cursor=1, event_id="event-1"))
+    assert [item.cursor for item in restarted.reconnect("operation-1")] == [1, 2]
+    assert client.event_cursors[-1] == 0
 
 
 def test_prompt_is_a_scoped_observation_not_an_authority_grant() -> None:
@@ -284,7 +367,7 @@ def test_abort_acknowledgement_is_unresolved_until_matching_authoritative_termin
     client.stream = [
         event(
             bound,
-            cursor=2,
+            cursor=1,
             event_id="event-2",
             kind="session.terminal",
             payload={"state": "cancelled", "authoritative": True},
@@ -305,3 +388,18 @@ def test_abort_delivery_failure_stays_requested_and_unresolved() -> None:
     assert status.requested is True
     assert status.abort_acknowledged is False
     assert status.unresolved is True
+
+
+def test_authority_invalidation_blocks_abort_and_journals_unresolved_cancellation() -> None:
+    client = FakeOpenCodeClient()
+    allowed = True
+    adapter, _bound = start(client, authority_is_current=lambda _a, _b: allowed)
+    allowed = False
+
+    status = adapter.cancel("operation-1")
+
+    assert status.requested is True
+    assert status.unresolved is True
+    assert client.aborts == []
+    assert adapter.journal[-1].boundary == "abort"
+    assert adapter.journal[-1].outcome == "blocked"

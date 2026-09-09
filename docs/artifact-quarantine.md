@@ -2,9 +2,9 @@
 
 Schema v7 adds immutable artifact quarantine; v8 adds resumable upload sessions.
 Schema v9 adds immutable complete output manifests; v10 adds human disposition history.
-Schema v22 keeps quarantine as bounded intake but separates durable project
-placement. After checksum/size validation, development-worker bytes stage/commit/
-reconcile into private project storage before workspace cleanup. This does not
+Schema v23 keeps quarantine as bounded intake but separates durable project
+placement. After checksum/size validation, a durable intent precedes backend
+stage/commit/reconciliation into private project storage before workspace cleanup. This does not
 classify or release bytes, accept a finding/result, settle cost, or establish
 provider/scientific success; historical SQLite BLOBs have no inferred placement.
 Upgrade existing state explicitly

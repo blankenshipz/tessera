@@ -39,6 +39,14 @@ rather than overwrite. Unknown, stale authority, and uncertain cancellation
 remain visible. The receipt is bounded operational evidence only, not proof of
 Docker execution, cost/accounting, artifacts, results, or scientific success.
 
+If a receipt/observation report, heartbeat, or renewal cannot be confirmed, the
+development worker keeps its durable intent and output reservation unresolved
+and attempts cancellation without waiting for that control-plane report. Local
+adapter termination and fake-provider cancellation are independent attempts;
+failure to confirm either remains unknown and is never reclaimed or reported as
+provider termination. Restart reads a fresh, durably keyed package response so
+an already-running reservation can retain a renewed lease without resubmission.
+
 Credential-access leases are not provider receipts or operation inputs. If a later
 adapter needs to associate one with an operation, it may retain only the opaque
 credential-access lease ID; neither its secret reference nor its value belongs in

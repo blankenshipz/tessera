@@ -1,12 +1,18 @@
 # 0008: Project artifact storage is durable custody, not release
 
-Status: accepted for local schema-v22 development storage.
+Status: accepted for local schema-v23 development storage.
 
 Worker output slots are temporary execution-plane custody. After quarantine
 checksum/size validation, development-worker output is staged, conditionally
 committed, and reconciled into a private project artifact backend. The initial
 backend uses deterministic hashed tenant/project namespaces, atomic no-overwrite
 publication, and no worker-supplied filesystem path, URL, or credential.
+
+SQLite records an intent before any backend call and commits placement authority
+only after backend reconciliation. A failed process can replay an intent; the
+filesystem backend repairs a stale temporary hard link only when it names the
+published object's exact inode. Manifests, checkpoints, and bookkeeping acceptance
+read/checksum the backend object again.
 
 SQLite BLOB artifacts created before v22 remain explicitly legacy and receive no
 invented placement. A binding makes new manifests/checkpoints require committed,

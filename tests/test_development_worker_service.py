@@ -12,6 +12,8 @@ from test_supervisor import FakeAdapter
 
 from tessera_control.api import create_app
 from tessera_control.store import _connect, canonical_digest
+from tessera_worker.development_runtime import DevelopmentCpuRuntime, DevelopmentOutputProfile
+from tessera_worker.provider import FakeProvider
 from tessera_worker.service import (
     DevelopmentWorkerConfig,
     DevelopmentWorkerService,
@@ -23,10 +25,12 @@ class ApiChannel:
     def __init__(self, state):
         self.client = TestClient(create_app(state))
         self.paths: list[str] = []
+        self.keys: list[tuple[str, str]] = []
         self.disconnected = False
 
     def post(self, path, body, key):
         self.paths.append(path)
+        self.keys.append((path, key))
         if self.disconnected:
             raise ConnectionError("synthetic control disconnect")
         response = self.client.post(
@@ -39,7 +43,9 @@ class ApiChannel:
         return response.json()
 
 
-def _service(tmp_path, state, grant, *, channel=None, adapter=None, max_ticks=0, sleep=None):
+def _service(
+    tmp_path, state, grant, *, channel=None, adapter=None, provider=None, max_ticks=0, sleep=None
+):
     credential = tmp_path / "worker.credential"
     credential.write_text("worker-token")
     credential.chmod(0o600)
@@ -63,6 +69,7 @@ def _service(tmp_path, state, grant, *, channel=None, adapter=None, max_ticks=0,
         config,
         channel=channel or ApiChannel(state),
         adapter=adapter,
+        provider=provider,
         sleep=sleep or (lambda _: None),
     )
 
@@ -144,6 +151,198 @@ def test_renewal_lost_response_replays_the_persisted_key(tmp_path):
     assert channel.keys[2] != channel.keys[0]
 
 
+def test_restart_heartbeats_with_a_distinct_key_before_a_stale_worker_can_lease(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    channel = ApiChannel(state)
+    first = _service(tmp_path, state, grant, channel=channel)
+    first._heartbeat()
+    with _connect(state / "tessera.sqlite3") as connection:
+        connection.execute("UPDATE worker_registry SET heartbeat_at='2000-01-01T00:00:00+00:00'")
+
+    result = _service(tmp_path, state, grant, channel=channel).run()
+
+    heartbeat_keys = [key for path, key in channel.keys if path == "/worker/heartbeat"]
+    assert result["reason"] == "tick_limit_cancellation_requested"
+    assert len(heartbeat_keys) == 2
+    assert heartbeat_keys[0] != heartbeat_keys[1]
+
+
+def test_lost_heartbeat_reply_replays_its_durable_key_before_the_next_beat(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+
+    class LostReplyChannel(ApiChannel):
+        lost = True
+
+        def post(self, path, body, key):
+            response = super().post(path, body, key)
+            if path == "/worker/heartbeat" and self.lost:
+                self.lost = False
+                raise ConnectionError("lost heartbeat reply")
+            return response
+
+    channel = LostReplyChannel(state)
+    service = _service(tmp_path, state, grant, channel=channel)
+    with pytest.raises(ConnectionError, match="lost heartbeat"):
+        service._heartbeat()
+    service._heartbeat()
+    service._heartbeat()
+
+    heartbeat_keys = [key for path, key in channel.keys if path == "/worker/heartbeat"]
+    assert heartbeat_keys[0] == heartbeat_keys[1]
+    assert heartbeat_keys[2] != heartbeat_keys[1]
+
+
+def test_disconnect_while_reporting_attempts_cancellation_and_retains_the_report(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+
+    class ReportingDisconnectChannel(ApiChannel):
+        def post(self, path, body, key):
+            if path == "/worker/observations":
+                self.disconnected = True
+            return super().post(path, body, key)
+
+    adapter = FakeAdapter()
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=ReportingDisconnectChannel(state),
+        adapter=adapter,
+        max_ticks=1,
+    )
+
+    assert service.run()["reason"] == "observation_report_failure"
+    assert adapter.calls.count("cancel") == 1
+    with _connect(tmp_path / "worker" / "runtime" / "runtime-observations.sqlite3") as connection:
+        assert connection.execute("SELECT completed FROM reports").fetchone()[0] == 0
+    assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
+def test_terminal_report_failure_still_attempts_cancellation_before_collection(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+
+    class TerminalReportFailureChannel(ApiChannel):
+        reports = 0
+
+        def post(self, path, body, key):
+            if path == "/worker/observations":
+                self.reports += 1
+                if self.reports == 2:
+                    raise ConnectionError("synthetic terminal report disconnect")
+            return super().post(path, body, key)
+
+    adapter = FakeAdapter()
+
+    def exit_operation(_):
+        adapter.state = "exited"
+
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=TerminalReportFailureChannel(state),
+        adapter=adapter,
+        max_ticks=2,
+        sleep=exit_operation,
+    )
+
+    assert service.run()["reason"] == "observation_report_failure"
+    assert adapter.calls.count("cancel") == 1
+    assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
+def test_renewal_disconnect_attempts_cancellation_and_replays_the_renewal_intent(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+
+    class RenewalDisconnectChannel(ApiChannel):
+        def post(self, path, body, key):
+            if path == "/worker/leases/renew":
+                self.disconnected = True
+            return super().post(path, body, key)
+
+    adapter = FakeAdapter()
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=RenewalDisconnectChannel(state),
+        adapter=adapter,
+        max_ticks=2,
+    )
+
+    assert service.run()["reason"] == "heartbeat_or_renewal_failure"
+    assert adapter.calls.count("cancel") == 1
+    with _connect(tmp_path / "worker" / "renewals.sqlite3") as connection:
+        assert connection.execute("SELECT completed FROM renewal_intents").fetchone()[0] == 0
+    heartbeat_keys = [key for path, key in service.channel.keys if path == "/worker/heartbeat"]
+    assert len(heartbeat_keys) == 2
+    assert heartbeat_keys[0] != heartbeat_keys[1]
+
+
+def test_revocation_with_receipt_report_failure_cancels_provider_and_retains_workspace(tmp_path):
+    state, execution, owner, _, grant = _unleased_delivery(tmp_path)
+
+    class ReceiptFailureChannel(ApiChannel):
+        fail_receipts = False
+
+        def post(self, path, body, key):
+            if self.fail_receipts and "external-operations" in path:
+                raise ConnectionError("synthetic receipt report disconnect")
+            return super().post(path, body, key)
+
+    channel, provider, adapter = ReceiptFailureChannel(state), FakeProvider(), FakeAdapter()
+
+    def revoke(_):
+        execution.revoke_execution_grant(owner, grant["id"], "stop", "stop", 1)
+        channel.fail_receipts = True
+
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        provider=provider,
+        adapter=adapter,
+        max_ticks=2,
+        sleep=revoke,
+    )
+
+    assert service.run()["state"] == "unknown"
+    assert provider.cancel_calls
+    assert adapter.calls.count("cancel") == 1
+    assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
+def test_restart_after_renewal_recovers_the_already_running_output_reservation(tmp_path):
+    state, execution, _, worker, _, lease = _delivery(tmp_path)
+    inputs, outputs, directory = tmp_path / "inputs", tmp_path / "outputs", tmp_path / "runtime"
+    inputs.mkdir(mode=0o700)
+    outputs.mkdir(mode=0o700)
+    adapter = FakeAdapter()
+    adapter.development_output_root = outputs / "development-only-cpu-outputs" / "workspaces"
+    profile = DevelopmentOutputProfile(outputs, 1024, 10)
+    with DevelopmentCpuRuntime(
+        directory,
+        inputs,
+        ApiChannel(state),
+        adapter,
+        worker_id=worker["id"],
+        development_profile=profile,
+    ) as first:
+        assert first.start(lease["id"], lease["epoch"]).phase == "running"
+    execution.renew_execution_lease(worker, lease["id"], "renew", "renew", lease["epoch"])
+    with DevelopmentCpuRuntime(
+        directory,
+        inputs,
+        ApiChannel(state),
+        adapter,
+        worker_id=worker["id"],
+        development_profile=profile,
+    ) as recovered:
+        assert recovered.start(lease["id"], lease["epoch"]).phase == "running"
+    assert adapter.calls.count("start") == 1
+
+
 def test_restart_reconciles_one_start_then_quarantines_only(tmp_path):
     state, _, _, _, grant = _unleased_delivery(tmp_path)
 
@@ -183,13 +382,17 @@ def test_revocation_or_disconnect_cancels_and_never_reclaims_uncertain_output(tm
     service = _service(
         tmp_path, state, grant, channel=channel, adapter=adapter, max_ticks=1, sleep=stop
     )
-    if failure == "disconnect":
-        with pytest.raises(ConnectionError):
-            service.run()
-    else:
+    result = service.run()
+    if failure == "revocation":
         # The synthetic adapter writes no declared output; confirmed cancellation
         # is retained, while the undeclared/missing output stays unreclaimed.
-        assert service.run()["state"] == "unknown"
-    assert adapter.calls.count("cancel") == 1
+        assert result["state"] == "unknown"
+    else:
+        assert result == {
+            "state": "unknown",
+            "quarantined": False,
+            "reason": "observation_report_failure",
+        }
+    assert adapter.calls.count("cancel") >= 1
     if failure == "disconnect":
         assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))

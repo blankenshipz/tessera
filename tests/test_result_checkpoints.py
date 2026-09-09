@@ -14,6 +14,7 @@ from tessera_control.api import create_app
 from tessera_control.artifact_manifests import ArtifactManifestStore
 from tessera_control.execution import ExecutionStore
 from tessera_control.migrations import MIGRATIONS
+from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.result_checkpoints import ResultCheckpointStore
 from tessera_control.store import (
     Conflict,
@@ -215,6 +216,28 @@ def test_result_checkpoint_rechecks_termination_and_quarantined_bytes(
         )
 
 
+def test_result_checkpoint_rechecks_corrupt_committed_project_object(tmp_path: Path) -> None:
+    state, owner, worker, grant, lease, manifest, first = _reconciled_manifest(tmp_path)
+    placement = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": _operation(lease),
+        "artifacts": [{"id": first["id"], "sha256": first["sha256"], "size": first["size"]}],
+    }
+    ProjectArtifactStore(state).commit_project_artifacts(
+        worker, lease["id"], "placement", canonical_digest(placement), placement
+    )
+    with closing(_connect(state / "tessera.sqlite3")) as connection:
+        row = connection.execute(
+            "SELECT tenant_namespace,project_namespace,object_key FROM project_artifact_placements"
+        ).fetchone()
+    (state / "project-artifacts" / row[0] / row[1] / row[2]).write_bytes(b"corrupt")
+    body = _checkpoint_request(grant, lease, manifest)
+    with pytest.raises(Conflict, match="project storage integrity"):
+        ResultCheckpointStore(state).commit(
+            owner, grant["id"], "checkpoint", canonical_digest(body), body
+        )
+
+
 def test_result_checkpoint_conflicts_on_changed_replay_and_rolls_back_event_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -276,5 +299,5 @@ def test_v14_to_v15_checkpoint_migration_preserves_v14_evidence_and_rolls_back(
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
         ).fetchone()
-    assert migrate_state(state) == 22
-    assert migrate_state(state) == 22
+    assert migrate_state(state) == 23
+    assert migrate_state(state) == 23
