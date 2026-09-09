@@ -122,3 +122,18 @@ Normal `CpuRuntime` does not create this marker or output mount. This is
 development plumbing, not persistent-output-storage validation, package
 admission, provider dispatch, artifact release, result acceptance, or a
 scientific claim.
+
+## Stage 1 native development worker
+
+`tessera-worker development-run` is an explicit one-shot wrapper around
+`DevelopmentCpuRuntime`, not unattended dispatch. It requires an existing
+private `0600` project worker-credential file, an already owner-registered
+worker, an already issued grant, private `0700` worker/output roots, and an
+allowlisted pinned image. It heartbeats before acquiring the lease; it never
+registers itself or creates human commands. Renewal keys are durably recorded
+before calls and reused after a lost response. On a fresh confirmed exit it
+uses the declared-output seal/manifest path and cleans its development workspace
+only after a quarantined/unclassified receipt. Revocation, disconnect, output
+failure and cleanup uncertainty retain the workspace. Run the synthetic local
+Docker proof with `scripts/check_development_e2e.py` when Docker and the pinned
+image are available. Linux quota/restart and Minikube evidence remain open.

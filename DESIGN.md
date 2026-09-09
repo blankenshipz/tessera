@@ -305,6 +305,22 @@ and binds it to the control plane; it does not copy a human login or grant a
 research plan. Re-enrollment after restore, replacement, or suspected compromise
 requires fresh credentials and invalidates the old node epoch.
 
+#### Stage 1 development backend profile
+
+The first executable backend profile is explicitly opt-in
+`development-local-cpu-v1`: one native, one-shot worker consumes an already
+human-issued grant with a private project-scoped worker credential file. It
+heartbeats a previously owner-registered worker before lease acquisition,
+verifies the frozen `local-cpu-v1` package and local pinned Docker identity,
+and uses the existing supervisor/journal. It persists renewal intent keys
+before calls and replays them after uncertain responses. It can report running,
+unknown, or worker-confirmed exited observations, then seal/upload only declared
+outputs into quarantine before reclaiming its marked development workspace.
+It cannot self-register, grant/approve/reconcile, release artifacts, commit a
+result checkpoint, or claim provider/scientific success. This is not Minikube,
+persistent-output admission, or a pilot profile; Linux hard quota and restart
+evidence remain required.
+
 Node health, upgrades, drain, quarantine, and retirement are independently
 managed lifecycle operations. Research control may admit or revoke a lease, but
 must not infer node trust from OpenCode's UI, session state, permission prompt,

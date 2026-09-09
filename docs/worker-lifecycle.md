@@ -25,3 +25,9 @@ an optional pinned OpenCode version. A passing report explicitly has no
 authority, does not verify a cryptographic build or capability attestation, and
 does not enable dispatch. Credential brokering, provider dispatch, result
 acceptance, and restore fencing remain unimplemented.
+
+The Stage 1 native development runner does not enroll itself: it sends this
+heartbeat before requesting its one supplied grant lease. A missing, stale,
+drained, quarantined, or retired registration therefore blocks it before Docker
+start. Its credential is read only from a private file and is never accepted on
+its command line.

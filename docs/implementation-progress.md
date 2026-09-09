@@ -20,7 +20,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, fail-closed persistent-output-storage package contract, read-only Linux slot inspection, synthetic durable output sealing/recovery, and human-only synthetic byte/metadata result checkpoints | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
@@ -221,6 +221,18 @@ representative investigation have not passed end-to-end acceptance.
     Handback records immutable result capture digests, path diff/exclusions and a
     new context epoch; it cannot dispatch, accept results, or mediate arbitrary
     writers. See [workspace handoff](workspace-handoff.md).
+
+22. **Stage 1 development native worker:** `tessera-worker development-run`
+    consumes only an already issued grant and a private project-scoped worker
+    credential file. It heartbeats before lease acquisition, verifies the frozen
+    CPU package and local development output marker, reuses persisted renewal
+    keys after lost responses, and reuses the supervisor start journal on restart.
+    It reports observations, seals/uploads declared confirmed-exit output into
+    quarantine only, and removes its workspace only after transfer. It cannot
+    self-register, issue/reconcile human authority, release artifacts, commit a
+    result checkpoint, or claim provider/scientific success. The loopback Docker
+    fixture is development evidence only; Linux hard quota/restart and Minikube
+    evidence remain open. See [decision 0005](decisions/0005-execution-backend-profiles.md).
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have

@@ -20,6 +20,7 @@ dev = ["httpx>=0.27,<1", "pytest>=8,<10", "ruff>=0.9,<1"]
 
 [project.scripts]
 tessera = "tessera_control.cli:main"
+tessera-worker = "tessera_worker.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

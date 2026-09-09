@@ -200,7 +200,7 @@ class DevelopmentOutputBackend:
         return workspace
 
     def mark_unknown(self, operation_id: str) -> None:
-        self._transition(operation_id, {"reserved", "running", "terminated"}, "unknown")
+        self._transition(operation_id, {"reserved", "running", "terminated", "unknown"}, "unknown")
 
     def mark_running(self, operation_id: str) -> None:
         self._transition(operation_id, {"reserved"}, "running")

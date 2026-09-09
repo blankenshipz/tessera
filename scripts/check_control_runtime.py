@@ -25,6 +25,7 @@ from tessera_control.execution import ExecutionStore
 from tessera_control.snapshot_releases import SnapshotReleaseStore
 from tessera_control.snapshots import SnapshotStore
 from tessera_control.store import Store, canonical_digest, initialize_state
+from tessera_control.workers import WorkerRegistryStore
 from tessera_control.workspace import capture_workspace, inventory_digest
 from tessera_worker.control_channel import HttpControlChannel
 from tessera_worker.cpu import DockerCpuAdapter
@@ -66,7 +67,9 @@ def serve(state: Path):
             raise RuntimeError("Synthetic control service did not stop.")
 
 
-def prepare(root: Path, code: str):
+def prepare(
+    root: Path, code: str, *, output_paths: list[str] | None = None, max_output_bytes: int = 1
+):
     state = root / "control"
     initialize_state(state)
     store = Store(state)
@@ -85,6 +88,16 @@ def prepare(root: Path, code: str):
     }
     store.issue_credential(owner, "credential", canonical_digest(credential), credential, token)
     worker = store.authenticate_worker(token)
+    registration = {
+        "worker_principal_id": worker["id"],
+        "approved_build_identifier": "synthetic-runtime-fixture-v1",
+        "approved_build_digest": "f" * 64,
+        "trust_class": "test",
+        "region": "local",
+    }
+    WorkerRegistryStore(state).register_worker(
+        owner, project["id"], "register-worker", canonical_digest(registration), registration
+    )
     workspace = root / "workspace"
     workspace.mkdir()
     (workspace / "input.txt").write_bytes(b"public synthetic input")
@@ -118,10 +131,10 @@ def prepare(root: Path, code: str):
             "argv": ["python", "-c", code],
             "input_snapshot_digest": digest,
             "pinned_skill_digests": [],
-            "output_paths": [],
+            "output_paths": output_paths or [],
             "profile": "local-cpu",
             "network_enabled": False,
-            "max_output_bytes": 1,
+            "max_output_bytes": max_output_bytes,
         },
     }
     _, task = store.revise_task_plan(
@@ -180,6 +193,7 @@ def run_fixture(*, revoke: bool) -> dict:
         try:
             with serve(state) as origin:
                 channel = HttpControlChannel(origin, token, timeout_seconds=2)
+                channel.post("/worker/heartbeat", {}, "fixture-heartbeat")
                 lease = channel.post("/worker/leases", {"grant_id": grant["id"]}, "lease")
                 with CpuRuntime(
                     root / "runtime", inputs, channel, adapter, worker_id=worker["id"]

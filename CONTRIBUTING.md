@@ -53,6 +53,7 @@ development Python image, then run the script against your local Docker daemon:
 docker pull python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
 .venv/bin/python scripts/check_cpu_runtime.py
 .venv/bin/python scripts/check_control_runtime.py
+.venv/bin/python scripts/check_development_e2e.py
 ```
 
 The scripts run synthetic probes in networkless, non-root containers and clean
@@ -62,6 +63,12 @@ control service, creates fixture-only authority through storage commands, transf
 released input bytes over HTTP, and records actual Docker observations. They do
 not exercise automatic artifact collection or a research investigation. Unknown
 cleanup is reported with the fixture container name for reconciliation.
+
+`check_development_e2e.py` additionally runs the explicitly opt-in native
+development worker against temporary loopback control state. It uses a fixture
+worker registration and grant created directly by the fixture, writes a declared
+synthetic output, and verifies quarantine-only transfer before workspace cleanup.
+It is not a pilot storage, provider, or result-acceptance check.
 
 On a provisioned Linux output-slot mount, the read-only inspection command is
 `.venv/bin/python scripts/check_persistent_output_storage.py PATH`. It does not

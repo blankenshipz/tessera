@@ -142,3 +142,11 @@ cleanup. The CPU runtime still needs a bounded output-storage contract: Docker
 so the current `/work` mount cannot provide post-exit artifact collection.
 Synthetic API/storage fixtures are not evidence of a
 completed research run.
+
+The opt-in Stage 1 native development worker is the only automatic caller of
+the marked `DevelopmentCpuRuntime` collection seam. It reports a fresh confirmed
+exit, seals declared files, transfers the existing manifest, and checks that the
+receipt remains quarantined/unclassified before cleanup. It never releases a
+manifest, commits a result checkpoint, or treats a container exit as provider
+or scientific success. Any transfer or cleanup uncertainty leaves the local
+workspace for explicit inspection/retry.

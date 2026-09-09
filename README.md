@@ -130,6 +130,13 @@ Complete artifact manifests verify the declared output set and retained bytes;
 they remain quarantined. Automatic container output collection still requires
 verified persistent storage limits, and full research E2E acceptance remains pending.
 
+An explicit `tessera-worker development-run` native one-shot fixture can consume
+an already issued grant with a private worker credential file, heartbeat before
+lease acquisition, and use the development-only output mount. Confirmed declared
+outputs transfer only into quarantine before local cleanup. It cannot issue or
+reconcile human authority, release artifacts, accept results, or claim success;
+see [CPU runtime](docs/cpu-runtime.md).
+
 A read-only worker probe can inspect an already-provisioned dedicated Linux
 output mount and return the existing storage contract only when its path,
 custody, mount restrictions, capacity, and UID 65532 access observations pass.
