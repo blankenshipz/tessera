@@ -190,13 +190,14 @@ class WorkspaceHandoffStore(Store):
                 raise Conflict("Task already has an unresolved workspace handoff.")
             from .execution import ExecutionStore
 
-            stop_epoch = ExecutionStore._next_epoch(self, connection, task["id"])
-            now, ident = utc_now(), "handoff_" + uuid.uuid4().hex
-            connection.execute(
-                """UPDATE execution_grants SET status='cancel_requested', revision=revision+1,
-                epoch=?, updated_at=? WHERE id=? AND revision=? AND status='active'""",
-                (stop_epoch, now, grant["id"], grant["revision"]),
+            # Order is intentional and transactional: fence the grant and every
+            # journaled operation first, record the handoff second, then append
+            # cancellation and handoff events.  A retry returns the one durable
+            # handoff response through the enclosing idempotency command.
+            cancelled, operation_ids = ExecutionStore._request_grant_cancellation(
+                self, connection, grant, grant["revision"]
             )
+            stop_epoch, now, ident = cancelled["epoch"], utc_now(), "handoff_" + uuid.uuid4().hex
             row = {
                 "id": ident,
                 "org_id": live["org_id"],
@@ -238,6 +239,24 @@ class WorkspaceHandoffStore(Store):
                 live,
                 project_id,
                 task["id"],
+                "execution.grant_cancel_requested",
+                cancelled["revision"],
+                {
+                    "grant_id": grant["id"],
+                    "epoch": stop_epoch,
+                    "operation_ids": operation_ids,
+                    "requested_by": "workspace_handoff",
+                    "cancellation": ExecutionStore._cancellation_payload(
+                        self, connection, cancelled
+                    ),
+                    "operational_only": True,
+                },
+            )
+            self._event(
+                connection,
+                live,
+                project_id,
+                task["id"],
                 "workspace.handoff_stop_requested",
                 1,
                 {
@@ -245,6 +264,7 @@ class WorkspaceHandoffStore(Store):
                     "grant_id": grant["id"],
                     "lease_id": lease["id"],
                     "stop_epoch": stop_epoch,
+                    "operation_ids": operation_ids,
                     "baseline_digest": baseline["digest"],
                     "operational_only": True,
                 },
@@ -273,7 +293,7 @@ class WorkspaceHandoffStore(Store):
             if (
                 grant is None
                 or lease is None
-                or grant["status"] != "cancel_requested"
+                or grant["status"] not in {"cancel_requested", "reconciled"}
                 or grant["epoch"] != handoff["stop_epoch"]
             ):
                 raise Conflict("Workspace handoff authority fence is no longer current.")

@@ -8,11 +8,22 @@ from itertools import count
 
 import pytest
 from fastapi.testclient import TestClient
+from test_input_delivery import _delivery
 
 from tessera_control.api import create_app
+from tessera_control.execution import ExecutionStore
+from tessera_control.handoffs import WorkspaceHandoffStore
 from tessera_control.migrations import MIGRATIONS
+from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.snapshots import SnapshotStore
-from tessera_control.store import Store, initialize_state, migrate_state
+from tessera_control.store import (
+    Conflict,
+    Store,
+    _connect,
+    canonical_digest,
+    initialize_state,
+    migrate_state,
+)
 from tessera_control.workspace import capture_workspace, inventory_digest
 
 
@@ -278,6 +289,182 @@ def test_confirmed_stop_fences_worker_then_records_human_diff_and_handback(tmp_p
     restarted = TestClient(create_app(state))
     listed = restarted.get(f"/projects/{project['id']}/workspace-handoffs", headers=owner).json()
     assert listed["workspace_handoffs"] == [handed_back]
+
+
+def _journaled_handoff(tmp_path):
+    state, execution, owner, worker, grant, lease = _delivery(tmp_path)
+    package = RuntimePackageStore(state).execution_package(
+        worker,
+        lease["id"],
+        "package",
+        canonical_digest({"expected_epoch": lease["epoch"]}),
+        lease["epoch"],
+    )[1]
+    payload = {
+        "task_id": grant["task_id"],
+        "grant_id": grant["id"],
+        "expected_task_revision": grant["task_revision"],
+        "expected_grant_revision": grant["revision"],
+        "baseline_snapshot_id": grant["snapshot_id"],
+        "expected_baseline_digest": grant["snapshot_digest"],
+        "workspace_label": "journaled fixture root",
+    }
+    handoffs = WorkspaceHandoffStore(state)
+    with pytest.raises(Conflict, match="expected revision"):
+        handoffs.request_handoff(
+            owner,
+            grant["project_id"],
+            "handoff-stale",
+            canonical_digest(payload | {"expected_grant_revision": grant["revision"] + 1}),
+            payload | {"expected_grant_revision": grant["revision"] + 1},
+        )
+    _, handoff = handoffs.request_handoff(
+        owner, grant["project_id"], "handoff", canonical_digest(payload), payload
+    )
+    return state, execution, owner, worker, grant, lease, package["operation"], handoff, payload
+
+
+@pytest.mark.parametrize("reconcile_first", [False, True])
+def test_journaled_handoff_fences_cancellation_and_orders_confirmation(tmp_path, reconcile_first):
+    state, execution, owner, worker, grant, lease, operation, handoff, payload = _journaled_handoff(
+        tmp_path
+    )
+    assert handoff["human_owner"] is False
+    assert (
+        WorkspaceHandoffStore(state).request_handoff(
+            owner, grant["project_id"], "handoff", canonical_digest(payload), payload
+        )[1]
+        == handoff
+    )
+    with _connect(state / "tessera.sqlite3") as connection:
+        cancelled = connection.execute(
+            "SELECT status, revision, epoch FROM execution_grants WHERE id=?", (grant["id"],)
+        ).fetchone()
+        journal = connection.execute(
+            "SELECT desired_state FROM external_operations WHERE operation_id=?",
+            (operation["operation_id"],),
+        ).fetchone()
+        events = [
+            row[0]
+            for row in connection.execute(
+                """SELECT event_type FROM events WHERE task_id=?
+                AND event_type IN ('execution.grant_cancel_requested',
+                'workspace.handoff_stop_requested') ORDER BY cursor""",
+                (grant["task_id"],),
+            )
+        ]
+    assert cancelled["status"] == "cancel_requested"
+    assert cancelled["epoch"] == handoff["stop_epoch"]
+    assert journal["desired_state"] == "cancel_requested"
+    assert events == ["execution.grant_cancel_requested", "workspace.handoff_stop_requested"]
+    with pytest.raises(Conflict, match="not active"):
+        execution.renew_execution_lease(worker, lease["id"], "renew", "renew", lease["epoch"])
+    with pytest.raises(Conflict, match="not active"):
+        RuntimePackageStore(state).execution_package(
+            worker,
+            lease["id"],
+            "package-after-handoff",
+            canonical_digest({"expected_epoch": lease["epoch"]}),
+            lease["epoch"],
+        )
+
+    def report(key, observed_state, confirmed, seconds):
+        body = {
+            "expected_epoch": lease["epoch"],
+            "operation_id": operation["operation_id"],
+            "observed_state": observed_state,
+            "termination_confirmed": confirmed,
+            "observed_at": (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat(),
+            "provider_id": "handoff-fake-provider",
+        }
+        return execution.report_execution_observation(
+            worker, lease["id"], key, canonical_digest(body), body
+        )
+
+    report("unknown", "unknown", False, 0)
+    with pytest.raises(Conflict, match="matching worker-confirmed"):
+        WorkspaceHandoffStore(state).confirm_stop(
+            owner, handoff["id"], "confirm-unknown", "confirm-unknown", handoff["revision"]
+        )
+    assert WorkspaceHandoffStore(state).get_handoff(owner, handoff["id"])["human_owner"] is False
+    report("exited", "exited", True, 1)
+    report("unknown-after-exit", "unknown", False, 2)
+    with pytest.raises(Conflict, match="matching worker-confirmed"):
+        WorkspaceHandoffStore(state).confirm_stop(
+            owner,
+            handoff["id"],
+            "confirm-after-unknown",
+            "confirm-after-unknown",
+            handoff["revision"],
+        )
+    report("exited-final", "exited", True, 3)
+    with pytest.raises(Conflict, match="no longer awaiting"):
+        WorkspaceHandoffStore(state).confirm_stop(
+            owner, handoff["id"], "confirm-stale", "confirm-stale", handoff["revision"] + 1
+        )
+
+    reconciliation = {
+        "expected_revision": cancelled["revision"],
+        "settlement_cents": 0,
+        "provider_terminated": True,
+    }
+    if reconcile_first:
+        execution.reconcile_execution_grant(
+            owner, grant["id"], "reconcile", canonical_digest(reconciliation), reconciliation
+        )
+        replacement = {
+            "task_id": grant["task_id"],
+            "expected_task_revision": grant["task_revision"],
+            "expected_plan_digest": grant["plan_digest"],
+            "worker_principal_id": worker["id"],
+            "snapshot_id": grant["snapshot_id"],
+            "pinned_image": grant["pinned_image"],
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
+            "max_exposure_cents": grant["max_exposure_cents"],
+            "currency": grant["currency"],
+            "acknowledges_unmeasured_infrastructure": True,
+        }
+        with pytest.raises(Conflict, match="open workspace handoff"):
+            execution.issue_execution_grant(
+                owner,
+                grant["project_id"],
+                "replacement-before-confirm",
+                canonical_digest(replacement),
+                replacement,
+            )
+    # A fresh store models process restart; the durable handoff remains confirmable
+    # after reconciliation because its final attributed exit is retained.
+    confirmed = WorkspaceHandoffStore(state).confirm_stop(
+        owner, handoff["id"], "confirm", "confirm", handoff["revision"]
+    )[1]
+    assert confirmed["human_owner"] is True
+    if not reconcile_first:
+        execution.reconcile_execution_grant(
+            owner, grant["id"], "reconcile", canonical_digest(reconciliation), reconciliation
+        )
+    assert ExecutionStore(state).get_execution_grant(owner, grant["id"])["status"] == "reconciled"
+
+
+def test_open_handoff_survives_restart_and_repeatable_migration(tmp_path):
+    state, _, owner, _, grant, _, operation, handoff, _ = _journaled_handoff(tmp_path)
+    assert migrate_state(state) == 23
+    assert migrate_state(state) == 23
+    restarted = WorkspaceHandoffStore(state).get_handoff(owner, handoff["id"])
+    assert restarted["status"] == "stop_requested" and restarted["human_owner"] is False
+    with _connect(state / "tessera.sqlite3") as connection:
+        assert (
+            connection.execute(
+                "SELECT desired_state FROM external_operations WHERE operation_id=?",
+                (operation["operation_id"],),
+            ).fetchone()[0]
+            == "cancel_requested"
+        )
+        assert (
+            connection.execute(
+                "SELECT status FROM execution_grants WHERE id=?", (grant["id"],)
+            ).fetchone()[0]
+            == "cancel_requested"
+        )
 
 
 def test_handoff_cross_tenant_is_not_disclosed(tmp_path):

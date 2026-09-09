@@ -254,6 +254,52 @@ class ExecutionStore(Store):
         )
         return epoch
 
+    def _request_grant_cancellation(
+        self,
+        connection: sqlite3.Connection,
+        grant: sqlite3.Row | dict[str, Any],
+        expected_revision: int,
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Atomically fence a grant and request cancellation of its real operations.
+
+        This is deliberately a desired-state transition only.  It does not infer a
+        provider stop from changing the grant or operation fence.  Callers append
+        their command events after this transition, in the same transaction.
+        """
+        if grant["status"] != "active" or grant["revision"] != expected_revision:
+            raise Conflict("Execution grant is no longer active at the expected revision.")
+        epoch, now = ExecutionStore._next_epoch(self, connection, grant["task_id"]), utc_now()
+        updated_count = connection.execute(
+            """UPDATE execution_grants SET status='cancel_requested', revision=revision+1,
+            epoch=?, updated_at=? WHERE id=? AND revision=? AND status='active'""",
+            (epoch, now, grant["id"], expected_revision),
+        ).rowcount
+        if updated_count != 1:
+            raise Conflict("Execution grant is no longer active at the expected revision.")
+        operation_ids = [
+            row["operation_id"]
+            for row in connection.execute(
+                """SELECT operation_id FROM external_operations
+                WHERE grant_id=? ORDER BY operation_id""",
+                (grant["id"],),
+            ).fetchall()
+        ]
+        # A v17 lease can have no operation journal.  Do not create one here;
+        # fence every existing journaled operation without claiming delivery.
+        connection.execute(
+            """UPDATE external_operations SET desired_state='cancel_requested', updated_at=?
+            WHERE grant_id=? AND desired_state='admitted'""",
+            (now, grant["id"]),
+        )
+        updated = dict(grant)
+        updated.update(
+            status="cancel_requested",
+            revision=expected_revision + 1,
+            epoch=epoch,
+            updated_at=now,
+        )
+        return updated, operation_ids
+
     @staticmethod
     def _parse_future(value: str, maximum: timedelta, label: str) -> datetime:
         try:
@@ -507,12 +553,10 @@ class ExecutionStore(Store):
                 raise Conflict("Task already has unresolved execution authority.")
             if connection.execute(
                 """SELECT 1 FROM workspace_handoffs WHERE task_id = ?
-                AND status = 'stopped_confirmed'""",
+                AND status IN ('stop_requested', 'stopped_confirmed')""",
                 (task["id"],),
             ).fetchone():
-                raise Conflict(
-                    "A human-owned workspace handoff must be handed back before new authority."
-                )
+                raise Conflict("An open workspace handoff blocks new execution authority.")
             now, ident = utc_now(), "grant_" + uuid.uuid4().hex
             epoch = self._next_epoch(connection, task["id"])
             row = {
@@ -647,25 +691,8 @@ class ExecutionStore(Store):
                 raise Conflict("Reconciled execution authority cannot be revoked.")
             if grant["status"] == "cancel_requested":
                 return 200, self._grant_response(connection, grant)
-            epoch, now = self._next_epoch(connection, grant["task_id"]), utc_now()
-            connection.execute(
-                """UPDATE execution_grants SET status = 'cancel_requested', revision = revision + 1,
-                epoch = ?, updated_at = ? WHERE id = ? AND revision = ? AND status = 'active'""",
-                (epoch, now, grant_id, expected_revision),
-            )
-            # An operation intent may not exist for a v17 legacy lease.  Do not
-            # manufacture one during revocation; update only a real v18 journal.
-            connection.execute(
-                """UPDATE external_operations SET desired_state='cancel_requested', updated_at=?
-                WHERE grant_id=? AND desired_state='admitted'""",
-                (now, grant_id),
-            )
-            updated = dict(grant)
-            updated.update(
-                status="cancel_requested",
-                revision=expected_revision + 1,
-                epoch=epoch,
-                updated_at=now,
+            updated, operation_ids = self._request_grant_cancellation(
+                connection, grant, expected_revision
             )
             self._event(
                 connection,
@@ -676,7 +703,8 @@ class ExecutionStore(Store):
                 updated["revision"],
                 {
                     "grant_id": grant_id,
-                    "epoch": epoch,
+                    "epoch": updated["epoch"],
+                    "operation_ids": operation_ids,
                     "cancellation": self._cancellation_payload(connection, updated),
                     "operational_only": True,
                 },

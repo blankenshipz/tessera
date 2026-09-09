@@ -79,7 +79,9 @@ class _FakeSecretBackend:
     def __init__(self) -> None:
         self._values: dict[str, str] = {}
         self._handles: dict[str, tuple[str, str, datetime, Callable[[], bool]]] = {}
-        self._revoked: set[str] = set()
+        # Handle invalidation is deliberately narrower than lease authority. A
+        # handle can expire or be discarded while its durable lease remains current.
+        self._revoked_handles: set[str] = set()
         self.access_log: list[dict[str, str]] = []
 
     def put(self, secret_ref: str, value: str) -> None:
@@ -99,8 +101,8 @@ class _FakeSecretBackend:
             self.access_log.append({"action": "denied", "handle": handle})
             raise Forbidden("Credential access handle is unavailable.")
         lease_id, secret_ref, expires_at, valid = record
-        if lease_id in self._revoked or expires_at <= datetime.now(UTC) or not valid():
-            self._revoked.add(lease_id)
+        if handle in self._revoked_handles or expires_at <= datetime.now(UTC) or not valid():
+            self._revoked_handles.add(handle)
             self.access_log.append({"action": "denied", "lease_id": lease_id, "handle": handle})
             raise Forbidden("Credential access handle is no longer current.")
         if secret_ref not in self._values:
@@ -110,7 +112,12 @@ class _FakeSecretBackend:
         return self._values[secret_ref]
 
     def revoke(self, lease_id: str) -> None:
-        self._revoked.add(lease_id)
+        # This is cache cleanup after the authoritative durable lease revoke.
+        # Invalidate every extant handle without recording a process-local lease
+        # revocation that could outlive a later authority decision.
+        self._revoked_handles.update(
+            handle for handle, record in self._handles.items() if record[0] == lease_id
+        )
         self.access_log.append({"action": "revoked", "lease_id": lease_id})
 
 

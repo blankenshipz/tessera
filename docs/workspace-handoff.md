@@ -2,7 +2,9 @@
 
 Schema v17 records a bounded local workflow: a human requests a stop for one
 current project/task/grant/lease and selected, already captured baseline snapshot;
-the request cancels the grant and advances its authority epoch. The record contains
+the request atomically cancels/fences the grant, advances its authority epoch, and
+marks every already-journaled associated operation `cancel_requested`. This is a
+desired-state request, not proof of provider delivery or termination. The record contains
 only a human label and captured snapshot metadata. It accepts neither a filesystem
 path nor workspace bytes, and exposes no generic desktop IPC or privileged write.
 
@@ -10,7 +12,11 @@ A human may confirm takeover only after the latest matching authenticated worker
 observation is `exited` with `termination_confirmed`, its bound worker/lease/
 epoch and a stable provider identity. Unknown, stale, mismatched, unconfirmed, or
 continuing writer authority blocks confirmation. Confirmation fences later worker
-observations and leaves the human as the recorded workspace owner.
+observations and leaves the human as the recorded workspace owner. Reconciliation
+may occur before or after this confirmation: a reconciled grant does not erase its
+matching final confirmation, but an unknown or unconfirmed latest observation still
+blocks ownership. An open handoff blocks replacement execution authority until
+handback.
 
 For handback, the owner supplies a separately captured immutable result snapshot and
 the baseline/result digests. The control plane verifies snapshot/project/digest

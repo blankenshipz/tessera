@@ -10,8 +10,11 @@ The control API returns a short-lived opaque fake-backend handle to the bound wo
 after live tenant, credential, registry, grant, lease and epoch checks. The private
 in-memory backend is a test/development seam only; its `put`, `resolve`, and
 `revoke` operations retain values only in process memory and its access log has no
-values. Resolve rechecks current authority, so grant cancellation, expiry,
-retirement, epoch fencing, and explicit revocation deny stale handles.
+values. Each handle expires and is invalidated independently: expiry or disposal
+of one handle does not revoke the durable lease or sibling handles. Resolve
+rechecks current authority, so grant cancellation, access-lease expiry, worker
+retirement, epoch fencing, and explicit lease revocation deny every affected
+handle and block future issuance.
 
 No production secrets backend, provider credential injection, command-line
 credential path, or real provider operation integration is authorized by this

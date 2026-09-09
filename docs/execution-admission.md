@@ -109,7 +109,9 @@ epoch on every call. It returns only a short-lived opaque development handle, ne
 a reference or raw value. Credential-access lease renewal is human-only and fails
 after access-lease revocation, parent expiry/cancellation, worker retirement, or
 epoch fencing. The private test fake backend rechecks those bindings again when a
-trusted local worker resolves its handle; it is not a production secrets backend.
+trusted local worker resolves its handle. Individual handle expiry or invalidation
+affects only that handle; authoritative lease/grant/worker/epoch changes fence all
+handles and future issuance. It is not a production secrets backend.
 
 Observed states are `running`, `exited` and `unknown`. Observations are attributed
 to the enrolled worker, with both observation and recording timestamps. They must
