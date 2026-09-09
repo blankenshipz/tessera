@@ -576,6 +576,14 @@ desired/observed states. Revocation changes desired cancellation transactionally
 it does not dispatch or prove termination. v17 lease/observation history remains
 unbackfilled legacy/null rather than receiving invented provider receipts.
 
+Schema v19 adds a one-to-one bounded receipt only for an injected deterministic
+fake provider in the development worker. The supervisor persists local submit
+intent, rechecks authority, and recovers lost submits by stable lookup rather
+than resubmitting. Receipt/provider identity is immutable; stale authority,
+unknown observations, and cancel uncertainty remain unresolved. This records
+fake-provider operational evidence, not real dispatch, accounting, Docker truth,
+artifact release, result acceptance, or scientific success.
+
 Operational claims in chat attach timestamped control/supervisor/provider
 observations and freshness limits. Authoritative status wins over conflicting
 agent prose. Checkpoint/resume needs compatible inputs/environment, saved method

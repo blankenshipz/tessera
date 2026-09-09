@@ -74,7 +74,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v18
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v19
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -109,6 +109,12 @@ before an executable CPU package is returned. It records one deterministic
 operation identity and manual-reconciliation intent, binds observations to it,
 and records revocation as desired cancellation. It does not dispatch Docker from
 control, accept results, release artifacts, or prove provider termination.
+
+Schema v19 adds a separate fake-provider receipt record after an injected,
+deterministic development-worker dispatch. Lost replies reconcile by stable
+lookup key and retain uncertainty; receipt evidence is not real provider
+dispatch, accounting, Docker execution proof, artifact release, or pilot/result
+acceptance.
 
 Local [workspace adoption](docs/workspace-adoption.md) now preserves reviewed input
 bytes and their manifest, verifies them after restart, and records adoption in the

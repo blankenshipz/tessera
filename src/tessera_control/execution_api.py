@@ -15,6 +15,7 @@ from .execution_models import (
     ReconcileExecutionGrant,
     RenewExecutionLease,
     ReportExecutionObservation,
+    ReportExternalOperationReceipt,
     RevokeExecutionGrant,
 )
 from .input_delivery import DeliverInputs, InputDeliveryStore
@@ -204,6 +205,22 @@ def report_observation(
     return result(
         store.report_execution_observation(
             worker, body.lease_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/worker/external-operations/{operation_id}/receipt")
+def report_provider_receipt(
+    operation_id: str,
+    body: ReportExternalOperationReceipt,
+    worker: Worker,
+    key: Key,
+    store: Authority,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.report_external_operation_receipt(
+            worker, operation_id, key, canonical_digest(payload), payload
         )
     )
 

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from check_control_runtime import IMAGE, docker, prepare, serve
 
+from tessera_worker.provider import FakeProvider
 from tessera_worker.service import DevelopmentWorkerConfig, DevelopmentWorkerService
 
 OUTPUT_PROBE = """
@@ -85,7 +86,8 @@ def main() -> None:
                     IMAGE,
                     poll_seconds=0.1,
                     max_ticks=100,
-                )
+                ),
+                provider=FakeProvider(),
             ).run()
         if result.get("state") != "exited" or result.get("quarantined") is not True:
             raise RuntimeError("Development worker did not reach confirmed quarantined exit.")
@@ -101,10 +103,16 @@ def main() -> None:
             operations = connection.execute(
                 "SELECT operation_id, observed_state FROM external_operations"
             ).fetchall()
+            receipts = connection.execute(
+                "SELECT operation_id, provider_kind, observed_state "
+                "FROM external_operation_receipts"
+            ).fetchall()
         if operations != [(receipt["operation_id"], "exited")]:
             raise RuntimeError(
                 "Development fixture did not retain one resolved operation identity."
             )
+        if receipts != [(receipt["operation_id"], "fake", "exited")]:
+            raise RuntimeError("Development fixture did not retain fake-provider receipt evidence.")
         print(
             json.dumps(
                 {

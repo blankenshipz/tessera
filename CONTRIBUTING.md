@@ -181,3 +181,8 @@ Schema 18 adds durable external-operation intent/lifecycle records for returned
 development-local CPU packages. The migration creates no inferred operations or
 provider receipts for v17 leases/observations; read the external-operation journal
 note before relying on recovery or reconciliation behavior.
+
+Schema 19 adds empty-by-default fake-provider receipt records. The development
+E2E injects its deterministic fake provider before the existing Docker adapter;
+its receipt is operational test evidence, not Docker/provider accounting or
+pilot acceptance. Migration never backfills v18 operations with receipts.

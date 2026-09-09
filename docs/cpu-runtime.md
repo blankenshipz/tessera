@@ -27,6 +27,14 @@ same local operation. Workers must retain that root and binding on restart.
 Deleting local journals or cloning worker identity onto independent state roots
 is outside this guarantee and requires enrollment/recovery fencing.
 
+For the explicitly injected development fake only, the existing supervisor seam
+persists its local start intent, rechecks authority, then records one fake submit
+intent before calling `submit`. A lost submit is reconciled through the stable
+operation lookup key and is never resubmitted. Its bounded receipt/report and
+ordinary observation reports retain durable idempotency identities across lost
+responses. Docker adapter behavior remains unchanged; the fake receipt does not
+prove Docker execution, a real provider operation, accounting, or success.
+
 The Docker adapter accepts only allowlisted digest-pinned images. The only
 permitted host mount is the exact verified snapshot directory at `/inputs`,
 read-only, beneath an explicitly configured `0700` supervisor root. It rechecks

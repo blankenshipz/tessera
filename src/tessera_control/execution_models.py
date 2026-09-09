@@ -138,6 +138,35 @@ class ReportExecutionObservation(ExecutionRequest):
         return value
 
 
+class ReportExternalOperationReceipt(ExecutionRequest):
+    """Bounded evidence returned by the injected fake provider only."""
+
+    lease_id: Identifier
+    expected_epoch: Revision
+    provider_kind: Literal["fake"]
+    provider_version: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)
+    ]
+    provider_id: Identifier
+    receipt_payload: dict[str, Any]
+    receipt_digest: Digest
+    observed_state: Literal["unknown", "running", "exited"]
+    observed_at: datetime
+    termination_confirmed: bool = False
+
+    @field_validator("observed_at", mode="before")
+    @classmethod
+    def receipt_observed_at_has_offset(cls, value: object) -> datetime:
+        return ReportExecutionObservation.observed_at_has_offset(value)
+
+    @field_validator("termination_confirmed")
+    @classmethod
+    def receipt_confirmation_requires_exit(cls, value: bool, info) -> bool:
+        if value and info.data.get("observed_state") != "exited":
+            raise ValueError("termination confirmation requires an exited observation")
+        return value
+
+
 class ReconcileExecutionGrant(ExecutionRequest):
     expected_revision: Revision
     settlement_cents: Cents

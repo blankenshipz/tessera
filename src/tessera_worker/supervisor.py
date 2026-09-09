@@ -86,6 +86,9 @@ class CpuSupervisor:
         adapter: object,
         validate_lease: ValidateLease,
         *,
+        before_start: Callable[[CpuOperation, Lease], None] | None = None,
+        before_reconcile: Callable[[CpuOperation], None] | None = None,
+        before_cancel: Callable[[CpuOperation], None] | None = None,
         now: Clock | None = None,
         monotonic: MonotonicClock | None = None,
     ) -> None:
@@ -97,6 +100,9 @@ class CpuSupervisor:
         self._database = self._journal_dir / "supervisor.sqlite3"
         self._adapter = adapter
         self._validate_lease = validate_lease
+        self._before_start = before_start
+        self._before_reconcile = before_reconcile
+        self._before_cancel = before_cancel
         self._now = now or (lambda: datetime.now(UTC))
         self._monotonic = monotonic or time.monotonic
         # This process-local anchor prevents a backwards wall clock from extending
@@ -159,8 +165,10 @@ class CpuSupervisor:
             if not self._start_intent(operation):
                 return self._reconcile_observation(operation)
             try:
+                if self._before_start is not None:
+                    self._before_start(operation, lease)
                 observation = self._adapter.start(operation)
-            except CpuError:
+            except (CpuError, SupervisorError):
                 return self._uncertain(operation, "start_unconfirmed")
             return self._after_start(operation, observation)
 
@@ -178,8 +186,10 @@ class CpuSupervisor:
 
     def _reconcile_observation(self, operation: CpuOperation) -> DriverResult:
         try:
+            if self._before_reconcile is not None:
+                self._before_reconcile(operation)
             observation = self._adapter.observe(operation)
-        except CpuError:
+        except (CpuError, SupervisorError):
             return self._uncertain(operation, "observe_unconfirmed")
         if observation.state == "exited":
             return self._terminal(operation, observation, "observed_exited")
@@ -272,8 +282,10 @@ class CpuSupervisor:
             raise SupervisorError("Operation is not present in this journal.")
         self._verify_operation(row, operation)
         try:
+            if self._before_cancel is not None:
+                self._before_cancel(operation)
             observation = self._adapter.cancel(operation)
-        except CpuError:
+        except (CpuError, SupervisorError):
             return self._uncertain(operation, f"cancel_{reason}_unconfirmed")
         if observation.termination_confirmed:
             return self._terminal(operation, observation, f"cancelled_{reason}")

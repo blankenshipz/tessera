@@ -7,6 +7,10 @@ with `tessera migrate` after stopping the service and backing up its private sta
 The migration preserves grants, leases, reservations and retained inputs; failure
 rolls back the new table and schema version together.
 
+Schema v19 fake-provider receipt evidence is separate from these artifact records.
+It neither releases quarantined bytes nor makes a manifest, provider observation,
+or synthetic output a result-acceptance or scientific-success record.
+
 `POST /worker/leases/{lease_id}/artifacts` requires a live worker credential and an
 idempotency key. The strict JSON body contains `expected_epoch`, `operation_id`,
 `relative_path`, `sha256` and `content_base64`. The operation ID must match the

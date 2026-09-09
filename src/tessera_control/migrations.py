@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 18
+LATEST_SCHEMA_VERSION = 19
 LOCAL_ORG_ID = "org_local"
 
 
@@ -340,6 +340,14 @@ def migrate_v17_to_v18(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 18 WHERE singleton = 1")
 
 
+def migrate_v18_to_v19(connection: sqlite3.Connection) -> None:
+    """Add empty one-to-one provider receipts; no v18 intent gains invented evidence."""
+    from .external_operations import create_external_operation_receipt_schema
+
+    create_external_operation_receipt_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 19 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -358,6 +366,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     15: migrate_v15_to_v16,
     16: migrate_v16_to_v17,
     17: migrate_v17_to_v18,
+    18: migrate_v18_to_v19,
 }
 
 

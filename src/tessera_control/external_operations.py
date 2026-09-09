@@ -1,8 +1,8 @@
-"""Schema for durable, provider-facing operation intent records.
+"""Schema for durable, provider-facing operation intent and receipt records.
 
 The control plane records one operation before returning an executable package.
-This table is a journal of intent and attributed observations, not a provider
-receipt or result-acceptance record.
+Intent and provider receipt evidence are deliberately separate: an operation
+may have no provider receipt, especially after a lost submit reply.
 """
 
 from __future__ import annotations
@@ -40,6 +40,32 @@ def create_external_operation_schema(connection: sqlite3.Connection) -> None:
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
         )"""
+    )
+
+
+def create_external_operation_receipt_schema(connection: sqlite3.Connection) -> None:
+    """Install v19 receipt records without assigning evidence to v18 rows."""
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS external_operation_receipts (
+        operation_id TEXT PRIMARY KEY REFERENCES external_operations(operation_id),
+        provider_kind TEXT NOT NULL CHECK (provider_kind = 'fake'),
+        provider_version TEXT NOT NULL CHECK (length(provider_version) BETWEEN 1 AND 100),
+        provider_id TEXT NOT NULL CHECK (length(provider_id) BETWEEN 1 AND 200),
+        receipt_payload_json TEXT NOT NULL CHECK (length(receipt_payload_json) <= 65536),
+        receipt_digest TEXT NOT NULL CHECK (
+            length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        observed_state TEXT NOT NULL CHECK (observed_state IN ('unknown', 'running', 'exited')),
+        observed_at TEXT NOT NULL,
+        termination_confirmed INTEGER NOT NULL CHECK (termination_confirmed IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(provider_kind, provider_version, provider_id)
+        )"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS external_operation_receipts_by_provider
+        ON external_operation_receipts(provider_kind, provider_id)"""
     )
     connection.execute(
         """CREATE INDEX IF NOT EXISTS external_operations_by_project

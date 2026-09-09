@@ -7,6 +7,13 @@ released bytes under a live lease. Container submission, harness startup and
 artifact collection are not connected; the CPU supervisor remains separate.
 No paid or real research jobs were used to validate this slice.
 
+Schema v19's authenticated worker-only
+`POST /worker/external-operations/{operation_id}/receipt` accepts bounded,
+canonical, digest-checked evidence from the injected `fake` provider only. It
+fences tenant, worker, lease, epoch and immutable provider identity. It updates
+only the receipt's observed state and cannot settle cost, accept a result, or
+release an artifact. v18 operations and legacy leases migrate with no receipts.
+
 ## Human admission sequence
 
 1. Adopt a snapshot and review its exact digest and contents.

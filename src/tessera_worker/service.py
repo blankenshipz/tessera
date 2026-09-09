@@ -20,6 +20,7 @@ from typing import Any
 from .control_channel import HttpControlChannel
 from .cpu import DEVELOPMENT_OUTPUT_PROFILE, DockerCpuAdapter
 from .development_runtime import DevelopmentCpuRuntime, DevelopmentOutputProfile
+from .provider import Provider
 from .supervisor import DriverResult, SupervisorError
 
 
@@ -167,6 +168,7 @@ class DevelopmentWorkerService:
         *,
         channel: Any | None = None,
         adapter: Any | None = None,
+        provider: Provider | None = None,
         sleep: Any = time.sleep,
     ) -> None:
         self.config = config
@@ -175,6 +177,7 @@ class DevelopmentWorkerService:
         self.token = read_private_credential(config.credential_file)
         self.channel = channel or HttpControlChannel(config.control_url, self.token)
         self.adapter = adapter
+        self.provider = provider
         self.sleep = sleep
         self.renewals = RenewalIntentJournal(self.root)
 
@@ -213,6 +216,7 @@ class DevelopmentWorkerService:
             adapter,
             worker_id=worker_id,
             development_profile=profile,
+            provider=self.provider,
         ) as runtime:
             result = runtime.start(lease_id, epoch)
             return self._drive(runtime, result)

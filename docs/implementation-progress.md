@@ -6,7 +6,7 @@ pilot are not complete.
 
 ## Design status matrix
 
-Reviewed 2026-09-08 against the schema v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
+Reviewed 2026-09-08 against the schema v19 fake-provider receipt slice, v18 external-operation journal, v17 bounded confirmed workspace handoff, v16 skill lifecycle and bounded
 cancellation telemetry projection, synthetic
 OpenCode harness adapter POC, and bounded capability-probe slice. These are
 informational evidence only, not live integration, cryptographic trust,
@@ -20,7 +20,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and a harness adapter remain unimplemented |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v18 durable package operation intents, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, authoritative result acceptance; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v19 fake-provider receipt evidence over v18 durable package intents, CPU supervisor, live HTTP/input fixtures, and an explicit development-only native one-shot worker that quarantines declared outputs after confirmed exit | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced persistent storage and automatic collection, real provider dispatch/accounting and authoritative result acceptance; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
@@ -241,7 +241,14 @@ representative investigation have not passed end-to-end acceptance.
     cancellation instead of abandoning Docker; terminal restart recovery reads
     provider state without restart. v17 leases remain null/unbackfilled legacy
     records. It is not dispatch, a provider receipt, release, result acceptance,
-    or scientific success. See [the journal note](external-operation-journal.md).
+     or scientific success. See [the journal note](external-operation-journal.md).
+
+24. **Fake-provider receipt slice:** schema v19 stores a separate immutable
+    fake-provider receipt after local start intent/authority recheck, uses stable
+    lookup reconciliation after lost submits, and retries receipt/observation
+    reports with durable identities. It preserves Docker adapter behavior and
+    quarantine-only output, but is not real provider dispatch/accounting, pilot
+    acceptance, artifact release, result acceptance, or scientific success.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have

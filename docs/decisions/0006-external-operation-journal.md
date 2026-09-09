@@ -1,6 +1,6 @@
 # 0006: Durable external-operation journal
 
-Status: accepted for the development-local CPU profile only.
+Status: accepted for the development-local CPU profile and injected fake provider only.
 
 ## Decision
 
@@ -27,5 +27,16 @@ worker, epoch and provider binding. Existing artifacts, manifests, and synthetic
 checkpoints retain their prior derived-operation compatibility boundary rather
 than being retroactively bound to invented v18 operations.
 
-This journal is not provider dispatch, a credential path, a provider receipt,
+Schema v19 adds a separate one-to-one `external_operation_receipts` row only
+after the worker's injected `fake` provider has accepted/reconciled the stable
+operation lookup key.  The worker persists local submit intent before the fake
+side effect, rechecks authority, retains the same receipt-report idempotency
+identity after a lost response, and observes a lost submit by its lookup key;
+it never submits that identity again. Provider kind/version, provider ID and
+canonical bounded payload/digest are immutable. Later observations may update
+the bounded provider state. Cancellation is still desired state at revocation;
+only a worker dispatches a fake cancel, and confirmation requires its matching
+fake-provider observation.
+
+This is not real provider dispatch, a credential path, provider accounting,
 artifact release, result acceptance, cost settlement, or scientific success.

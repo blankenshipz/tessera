@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import tempfile
 import uuid
@@ -21,6 +22,7 @@ from tessera_control.persistent_output_storage import validate_persistent_output
 
 from .cpu import CpuOperation
 from .inputs import materialize_snapshot
+from .provider import Provider, ProviderDispatch
 from .supervisor import CpuSupervisor, DriverResult, Lease, SupervisorError
 
 MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
@@ -49,6 +51,7 @@ class CpuRuntime:
         worker_id: str,
         persistent_output_collection: bool = False,
         persistent_output_storage: dict[str, Any] | None = None,
+        provider: Provider | None = None,
     ):
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -65,7 +68,20 @@ class CpuRuntime:
         self.descriptor: dict[str, Any] | None = None
         self.operation: CpuOperation | None = None
         self.lease: Lease | None = None
-        self.supervisor = CpuSupervisor(self.directory / "journal", adapter, self._validate)
+        self.provider_dispatch = (
+            ProviderDispatch(self.directory, channel, provider) if provider is not None else None
+        )
+        self._initialize_observation_journal()
+        self.supervisor = CpuSupervisor(
+            self.directory / "journal",
+            adapter,
+            self._validate,
+            before_start=self.provider_dispatch.before_start if self.provider_dispatch else None,
+            before_reconcile=(
+                self.provider_dispatch.reconcile_stable if self.provider_dispatch else None
+            ),
+            before_cancel=self.provider_dispatch.cancel_stable if self.provider_dispatch else None,
+        )
 
     def close(self) -> None:
         self.supervisor.close()
@@ -334,16 +350,73 @@ class CpuRuntime:
             raise SupervisorError("Runtime has no bound operation.")
         observation = result.observation
         state = observation.state if observation.state in {"running", "exited"} else "unknown"
-        return self.channel.post(
-            "/worker/observations",
-            {
+        provider_id = observation.container_id
+        if self.provider_dispatch is not None:
+            if state == "exited" and observation.termination_confirmed:
+                self.provider_dispatch.complete_stable(self.operation)
+            provider_id = self.provider_dispatch.provider_id(self.operation)
+        payload, key, intent_id = self._observation_intent(
+            state,
+            provider_id,
+            state == "exited" and observation.termination_confirmed,
+        )
+        response = self.channel.post("/worker/observations", payload, key)
+        with self._observation_connection() as connection:
+            connection.execute("UPDATE reports SET completed=1 WHERE id=?", (intent_id,))
+        return response
+
+    def _initialize_observation_journal(self) -> None:
+        with self._observation_connection() as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY, operation_id TEXT NOT NULL, observed_state TEXT NOT NULL,
+                provider_id TEXT, termination_confirmed INTEGER NOT NULL,
+                payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+                completed INTEGER NOT NULL CHECK (completed IN (0, 1)))"""
+            )
+
+    def _observation_connection(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.directory / "runtime-observations.sqlite3")
+
+    def _observation_intent(
+        self, state: str, provider_id: str | None, termination_confirmed: bool
+    ) -> tuple[dict[str, Any], str, int]:
+        if self.lease is None or self.operation is None:
+            raise SupervisorError("Runtime has no bound operation.")
+        with self._observation_connection() as connection:
+            row = connection.execute(
+                """SELECT id, payload_json, idempotency_key FROM reports
+                WHERE operation_id=? AND observed_state=? AND provider_id IS ?
+                AND termination_confirmed=? AND completed=0 ORDER BY id DESC LIMIT 1""",
+                (self.operation.operation_id, state, provider_id, int(termination_confirmed)),
+            ).fetchone()
+            if row is not None:
+                return json.loads(row[1]), row[2], row[0]
+            payload = {
                 "lease_id": self.lease.id,
                 "expected_epoch": self.lease.epoch,
                 "operation_id": self.operation.operation_id,
                 "observed_state": state,
                 "observed_at": datetime.now(UTC).isoformat(),
-                "provider_id": observation.container_id,
-                "termination_confirmed": state == "exited" and observation.termination_confirmed,
-            },
-            f"runtime-observation-{uuid.uuid4().hex}",
-        )
+                "provider_id": provider_id,
+                "termination_confirmed": termination_confirmed,
+            }
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            key = (
+                "runtime-observation-"
+                + hashlib.sha256(f"{self.operation.operation_id}:{encoded}".encode()).hexdigest()
+            )
+            cursor = connection.execute(
+                """INSERT INTO reports
+                (operation_id, observed_state, provider_id, termination_confirmed, payload_json,
+                 idempotency_key, completed) VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                (
+                    self.operation.operation_id,
+                    state,
+                    provider_id,
+                    int(termination_confirmed),
+                    encoded,
+                    key,
+                ),
+            )
+            return payload, key, cursor.lastrowid

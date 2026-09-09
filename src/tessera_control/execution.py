@@ -17,6 +17,7 @@ from .execution_models import (
     ReconcileExecutionGrant,
     RenewExecutionLease,
     ReportExecutionObservation,
+    ReportExternalOperationReceipt,
     RevokeExecutionGrant,
 )
 from .store import (
@@ -1019,6 +1020,19 @@ class ExecutionStore(Store):
                 raise Conflict("Termination confirmation requires an exited observation.")
             if payload["termination_confirmed"] and payload.get("provider_id") is None:
                 raise Conflict("Termination confirmation requires a provider identity.")
+            if payload["termination_confirmed"] and operation is not None:
+                receipt = connection.execute(
+                    "SELECT * FROM external_operation_receipts WHERE operation_id=?",
+                    (operation["operation_id"],),
+                ).fetchone()
+                if receipt is not None and (
+                    receipt["provider_id"] != payload["provider_id"]
+                    or receipt["observed_state"] != "exited"
+                    or not receipt["termination_confirmed"]
+                ):
+                    raise Conflict(
+                        "Termination confirmation requires a matching provider receipt observation."
+                    )
             observed_at = _parse_utc(payload["observed_at"])
             issued_at = _parse_utc(lease["issued_at"])
             now_datetime = self._now()
@@ -1106,6 +1120,151 @@ class ExecutionStore(Store):
                 "cancellation": self._cancellation_payload(connection, grant),
                 "operational_only": True,
             }
+
+        return self._mutate(principal, key, "POST", path, digest, command, audience="worker")
+
+    def report_external_operation_receipt(
+        self,
+        principal: dict[str, Any],
+        operation_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Persist fake-provider evidence after fresh worker/lease fencing.
+
+        The receipt's provider identity and canonical payload are immutable.  A
+        later lookup may advance only its attributed observed state; it cannot
+        turn a worker assertion into cost, artifact, result, or scientific truth.
+        """
+        payload = self._body(
+            ReportExternalOperationReceipt, payload | {"lease_id": payload.get("lease_id")}
+        )
+        path = f"/external-operations/{operation_id}/receipt"
+        canonical_payload = json.dumps(
+            payload["receipt_payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        if len(canonical_payload.encode()) > 65536:
+            raise StoreError("Provider receipt payload exceeds its bound.")
+        import hashlib
+
+        if hashlib.sha256(canonical_payload.encode()).hexdigest() != payload["receipt_digest"]:
+            raise Conflict("Provider receipt digest does not match its canonical payload.")
+
+        def command(
+            connection: sqlite3.Connection, worker: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            operation = connection.execute(
+                "SELECT * FROM external_operations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if operation is None or operation["worker_principal_id"] != worker["id"]:
+                raise NotFound("External operation was not found.")
+            if (
+                operation["org_id"] != worker["org_id"]
+                or operation["lease_id"] != payload["lease_id"]
+            ):
+                raise Conflict("Provider receipt does not match the external operation.")
+            lease = connection.execute(
+                "SELECT * FROM execution_leases WHERE id=?", (operation["lease_id"],)
+            ).fetchone()
+            if lease is None or lease["epoch"] != payload["expected_epoch"]:
+                raise Conflict("Provider receipt epoch is no longer current.")
+            grant = self._grant(connection, worker, operation["grant_id"])
+            if (
+                grant["project_id"] != operation["project_id"]
+                or grant["task_id"] != operation["task_id"]
+                or grant["worker_principal_id"] != worker["id"]
+                or operation["epoch"] != lease["epoch"]
+                or grant["epoch"] != lease["epoch"]
+                or grant["status"] not in UNRESOLVED_GRANT_STATUSES
+            ):
+                raise Conflict("Provider receipt authority is no longer current.")
+            observed_at = _parse_utc(payload["observed_at"])
+            if (
+                observed_at < _parse_utc(lease["issued_at"])
+                or observed_at > self._now() + MAX_OBSERVATION_FUTURE_SKEW
+            ):
+                raise Conflict("Provider receipt timestamp is outside the lease window.")
+            existing = connection.execute(
+                "SELECT * FROM external_operation_receipts WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            identity = {
+                "provider_kind": payload["provider_kind"],
+                "provider_version": payload["provider_version"],
+                "provider_id": payload["provider_id"],
+                "receipt_payload_json": canonical_payload,
+                "receipt_digest": payload["receipt_digest"],
+            }
+            now = utc_now()
+            if existing is None:
+                row = identity | {
+                    "operation_id": operation_id,
+                    "observed_state": payload["observed_state"],
+                    "observed_at": _utc_string(observed_at),
+                    "termination_confirmed": int(payload["termination_confirmed"]),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                connection.execute(
+                    """INSERT INTO external_operation_receipts
+                    (operation_id, provider_kind, provider_version, provider_id,
+                     receipt_payload_json, receipt_digest, observed_state, observed_at,
+                     termination_confirmed, created_at, updated_at)
+                    VALUES (:operation_id,:provider_kind,:provider_version,:provider_id,
+                    :receipt_payload_json,:receipt_digest,:observed_state,:observed_at,
+                    :termination_confirmed,:created_at,:updated_at)""",
+                    row,
+                )
+            else:
+                if any(existing[field] != value for field, value in identity.items()):
+                    raise Conflict("Provider receipt immutable identity conflicts.")
+                if observed_at < _parse_utc(existing["observed_at"]):
+                    raise Conflict("Provider receipt observations cannot be reported out of order.")
+                connection.execute(
+                    """UPDATE external_operation_receipts SET observed_state=?, observed_at=?,
+                    termination_confirmed=?, updated_at=? WHERE operation_id=?""",
+                    (
+                        payload["observed_state"],
+                        _utc_string(observed_at),
+                        int(payload["termination_confirmed"]),
+                        now,
+                        operation_id,
+                    ),
+                )
+                row = dict(existing) | {
+                    "observed_state": payload["observed_state"],
+                    "observed_at": _utc_string(observed_at),
+                    "termination_confirmed": int(payload["termination_confirmed"]),
+                    "updated_at": now,
+                }
+            if operation["provider_id"] not in {None, payload["provider_id"]}:
+                raise Conflict("Provider identity cannot change within an external operation.")
+            connection.execute(
+                """UPDATE external_operations SET provider_id=coalesce(provider_id, ?),
+                observed_state=?, updated_at=? WHERE operation_id=?""",
+                (payload["provider_id"], payload["observed_state"], now, operation_id),
+            )
+            result = dict(row)
+            result["termination_confirmed"] = bool(result["termination_confirmed"])
+            result["receipt_evidence"] = "fake_provider_only"
+            result["operational_only"] = True
+            self._event(
+                connection,
+                worker,
+                operation["project_id"],
+                operation["task_id"],
+                "execution.provider_receipt_reported",
+                operation["epoch"],
+                {
+                    "operation_id": operation_id,
+                    "provider_kind": "fake",
+                    "observed_state": payload["observed_state"],
+                    "termination_confirmed": bool(payload["termination_confirmed"]),
+                    "receipt_evidence": "fake_provider_only",
+                    "operational_only": True,
+                },
+            )
+            return 201, result
 
         return self._mutate(principal, key, "POST", path, digest, command, audience="worker")
 
