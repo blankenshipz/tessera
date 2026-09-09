@@ -3,6 +3,7 @@
 The filesystem backend receives already quarantined bytes from the control plane;
 workers never supply a filesystem path or storage credential.
 """
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -56,6 +57,10 @@ class ProjectArtifactBackend(Protocol):
     def inspect(
         self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
     ) -> ProjectArtifactPlacement | None: ...
+
+    def delete(
+        self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
+    ) -> bool: ...
 
 
 def verify_project_artifact_placement(
@@ -338,6 +343,36 @@ class FilesystemProjectArtifactBackend:
             raise ProjectArtifactStorageError("Project artifact placement is corrupt or conflicts.")
         return ProjectArtifactPlacement(tenant, project, object_key, sha256, size)
 
+    def delete(
+        self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
+    ) -> bool:
+        """Remove only the exact committed object; absence is replay-safe.
+
+        The caller must have persisted deletion intent already.  Re-inspection is
+        deliberately part of deletion, rather than trusting a stale receipt.
+        """
+        expected = self.inspect(
+            tenant_id, project_id, artifact_id, placement.sha256, placement.size
+        )
+        if expected is None:
+            return False
+        if expected != placement:
+            raise ProjectArtifactStorageError("Project artifact deletion identity conflicts.")
+        # Resolve the known private namespace directly after root verification.
+        self._root()
+        namespace = self.root / placement.tenant_namespace / placement.project_namespace
+        self._directory(namespace)
+        target = namespace / placement.object_key
+        if not self._read(target, placement.sha256, placement.size):
+            raise ProjectArtifactStorageError("Project artifact deletion identity conflicts.")
+        target.unlink()
+        descriptor = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return True
+
 
 class FakeProjectArtifactBackend:
     """Injectable deterministic backend with one-shot stage/commit fault seams."""
@@ -420,3 +455,16 @@ class FakeProjectArtifactBackend:
         self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
     ) -> ProjectArtifactPlacement | None:
         return self.reconcile(tenant_id, project_id, artifact_id, sha256, size)
+
+    def delete(
+        self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
+    ) -> bool:
+        observed = self.inspect(
+            tenant_id, project_id, artifact_id, placement.sha256, placement.size
+        )
+        if observed is None:
+            return False
+        if observed != placement:
+            raise ProjectArtifactStorageError("Project artifact deletion identity conflicts.")
+        del self.objects[(tenant_id, project_id, artifact_id)]
+        return True

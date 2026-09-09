@@ -1,6 +1,6 @@
 # 0008: Project artifact storage is durable custody, not release
 
-Status: accepted for local schema-v23 development storage.
+Status: accepted for local schema-v24 development storage.
 
 Worker output slots are temporary execution-plane custody. After quarantine
 checksum/size validation, development-worker output is staged, conditionally
@@ -20,10 +20,13 @@ integrity-matching placement. Placement retains unclassified quarantined bytes:
 it does not release data, accept findings/results, settle costs, or claim
 provider/scientific success. Cleanup requires the committed placement receipt.
 
-The default is project persistence; quarantine is intake. External export/move
-is a separate policy-gated operation. Automatic deletion is unavailable and
-referenced/held retention must refuse deletion. Backup currently fails closed
-when committed external objects exist rather than producing an incomplete bundle.
+The default is project persistence; quarantine is intake. Schema v24 adds explicit
+project-default, held, and short-lived retention metadata with activity timestamps.
+Deletion remains a manual tombstone followed by durable deletion intent and exact
+backend identity verification. Referenced, checkpointed, accepted, and held objects
+refuse deletion. Missing, corrupt, or uncertain delete outcomes remain degraded
+incidents, never a successful cleanup. Backup currently fails closed when committed
+external objects exist rather than producing an incomplete bundle.
 
 S3/IAM/KMS, public URLs, external movement/export/release, production activation,
 and a pilot storage acceptance are not implemented. ADR 0003's worker-slot gate

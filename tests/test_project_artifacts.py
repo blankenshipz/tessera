@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E501, I001
+
 import hashlib
 import os
 import sqlite3
@@ -12,6 +14,7 @@ from test_input_delivery import _delivery
 
 from tessera_control.artifact_manifests import ArtifactManifestStore
 from tessera_control.migrations import MIGRATIONS
+from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
 from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.project_artifacts import (
     FakeProjectArtifactBackend,
@@ -348,7 +351,7 @@ def test_v23_migration_preserves_v22_staged_at_operations_and_placements(tmp_pat
         connection.execute("DROP TABLE v23_operations")
         connection.execute("UPDATE schema_meta SET schema_version=22")
 
-    assert migrate_state(state) == 23
+    assert migrate_state(state) == 24
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         migrated = connection.execute(
             """SELECT artifact_id,state,intent_at,reconcile_started_at,committed_at,reconciled_at
@@ -406,9 +409,117 @@ def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 23
+    assert migrate_state(state) == 24
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0]
             == 0
         )
+
+
+# fmt: off
+def test_retention_tombstone_refuses_held_and_referenced_objects(tmp_path: Path) -> None:
+    state, _, owner, worker, _grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"retention")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    backend = FakeProjectArtifactBackend()
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(request), request
+    )
+    retention = ProjectArtifactRetentionStore(state, backend)
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("UPDATE project_artifact_retention SET retention_class='held'")
+    with pytest.raises(Conflict, match="Held"):
+        retention.tombstone(owner, _grant["project_id"], artifact["id"], "held", "held")
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("UPDATE project_artifact_retention SET retention_class='project_default'")
+        connection.execute(
+            "INSERT INTO artifact_manifests (id,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,operation_id,plan_digest,artifacts_json,total_bytes,manifest_digest,created_at,status,classification,late) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("manifest-reference", _grant["project_id"], _grant["task_id"], _grant["id"], lease["id"], worker["id"], lease["epoch"], payload["operation_id"], "0" * 64, '[{"id":"' + artifact["id"] + '"}]', artifact["size"], "1" * 64, "now", "quarantined", "unclassified", 0),
+        )
+    with pytest.raises(Conflict, match="Referenced"):
+        retention.tombstone(owner, _grant["project_id"], artifact["id"], "ref", "ref")
+
+
+def test_retention_delete_intent_is_retry_safe_and_missing_is_degraded(tmp_path: Path) -> None:
+    state, _, owner, worker, grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"deletion")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    backend = FakeProjectArtifactBackend()
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(request), request
+    )
+    retention = ProjectArtifactRetentionStore(state, backend)
+    assert retention.tombstone(owner, grant["project_id"], artifact["id"], "tomb", "tomb")[1][
+        "state"
+    ] == "tombstoned"
+    assert retention.reconcile_delete(owner, grant["project_id"], artifact["id"], "delete", "delete")[1][
+        "state"
+    ] == "deleted"
+    assert retention.reconcile_delete(owner, grant["project_id"], artifact["id"], "retry", "retry")[1][
+        "state"
+    ] == "deleted"
+    assert retention.inspect(owner, grant["project_id"], artifact["id"])["state"] == "deleted"
+
+
+def test_v24_retention_migration_preserves_placement_and_rolls_back(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state, _, _owner, worker, _grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"v24")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    request = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    ProjectArtifactStore(state).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(request), request
+    )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DROP TABLE project_artifact_retention")
+        connection.execute("UPDATE schema_meta SET schema_version=23")
+    assert migrate_state(state) == 24
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT retention_class,state FROM project_artifact_retention"
+        ).fetchone() == ("project_default", "active")
+
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DROP TABLE project_artifact_retention")
+        connection.execute("UPDATE schema_meta SET schema_version=23")
+
+    def fail(connection):
+        from tessera_control.project_artifact_store import create_project_artifact_storage_schema
+        create_project_artifact_storage_schema(connection)
+        raise RuntimeError("v24 fault")
+    with monkeypatch.context() as patch:
+        patch.setitem(MIGRATIONS, 23, fail)
+        with pytest.raises(RuntimeError, match="v24 fault"):
+            migrate_state(state)
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 23
+        assert connection.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0] == 1
+# fmt: on

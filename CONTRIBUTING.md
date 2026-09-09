@@ -202,3 +202,8 @@ would be omitted, until object-bundle recovery is implemented.
 Schema 23 records project-object intent and reconciliation separately from SQLite
 authority commits. It preserves v22 placements and does not infer locations for
 legacy BLOBs.
+
+Schema 24 adds project-object retention and recovery metadata. It preserves v23
+placements, defaults every migrated object to active project retention, and does
+not schedule deletion. Explicit tombstone/delete intent remains fail-closed for
+held, referenced, checkpointed, or accepted object custody.

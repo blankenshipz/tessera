@@ -776,10 +776,14 @@ and provider IDs. Logs are bounded, redacted and access-controlled; do not colle
 prompts/source text by default. Track human effort through disclosed measurement.
 
 Retention covers inputs, artifacts, conversations, notes, audit metadata, indexes
-and backups separately. Deletion invalidates future retrieval and caches subject
-to disclosed holds/backup expiry; minimal audit tombstones preserve history without
-retaining unnecessary sensitive payloads. Published Git/model/provider copies have
-separate retention boundaries disclosed before export. Runbooks cover compromised
+and backups separately. Project-object deletion requires a durable manual tombstone
+and deletion intent, tenant/project binding, an exact backend identity check, and
+visible degraded incident state for missing/corrupt/uncertain outcomes; no automatic
+deletion is enabled by default. Held, referenced, checkpointed, or accepted objects
+cannot delete. Deletion invalidates future retrieval and caches subject to disclosed
+holds/backup expiry; minimal audit tombstones preserve history without retaining
+unnecessary sensitive payloads. Published Git/model/provider copies have separate
+retention boundaries disclosed before export. Runbooks cover compromised
 credentials, runaway spend, orphan jobs, provider outage and claim correction.
 
 Before coding, record these decisions: backend language/framework; control-service

@@ -1,4 +1,5 @@
 """Control-plane placement of validated quarantine bytes into project storage."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -27,6 +28,25 @@ def create_project_artifact_storage_schema(connection: sqlite3.Connection) -> No
         retention_class TEXT NOT NULL CHECK (retention_class IN ('project_default', 'held')),
         bound_at TEXT NOT NULL
         )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS project_artifact_retention (
+        artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        retention_class TEXT NOT NULL CHECK (retention_class IN ('project_default', 'held', 'short_lived')),
+        state TEXT NOT NULL CHECK (state IN ('active', 'tombstoned', 'delete_intent', 'degraded', 'deleted')),
+        created_at TEXT NOT NULL,
+        activity_at TEXT NOT NULL,
+        tombstoned_at TEXT,
+        delete_intent_at TEXT,
+        deleted_at TEXT,
+        incident_at TEXT,
+        incident_reason TEXT
+        )"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS project_artifact_retention_by_project "
+        "ON project_artifact_retention(project_id, state, activity_at, artifact_id)"
     )
     connection.execute(
         """CREATE TABLE IF NOT EXISTS project_artifact_placements (
@@ -335,6 +355,19 @@ class ProjectArtifactStore(ArtifactManifestStore):
                                 placement.object_key,
                                 placement.sha256,
                                 placement.size,
+                                operation["retention_class"],
+                                now,
+                                now,
+                            ),
+                        )
+                        connection.execute(
+                            """INSERT INTO project_artifact_retention
+                            (artifact_id,project_id,retention_class,state,created_at,activity_at,
+                             tombstoned_at,delete_intent_at,deleted_at,incident_at,incident_reason)
+                            VALUES (?,? ,?,'active',?,?,NULL,NULL,NULL,NULL,NULL)""",
+                            (
+                                artifact_id,
+                                grant["project_id"],
                                 operation["retention_class"],
                                 now,
                                 now,

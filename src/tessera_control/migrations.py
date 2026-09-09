@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 23
+LATEST_SCHEMA_VERSION = 24
 LOCAL_ORG_ID = "org_local"
 
 
@@ -396,6 +396,21 @@ def migrate_v22_to_v23(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 23 WHERE singleton = 1")
 
 
+def migrate_v23_to_v24(connection: sqlite3.Connection) -> None:
+    """Add explicit retention/recovery metadata without changing object custody."""
+    from .project_artifact_store import create_project_artifact_storage_schema
+
+    create_project_artifact_storage_schema(connection)
+    connection.execute(
+        """INSERT OR IGNORE INTO project_artifact_retention
+        (artifact_id,project_id,retention_class,state,created_at,activity_at,
+         tombstoned_at,delete_intent_at,deleted_at,incident_at,incident_reason)
+        SELECT artifact_id,project_id,retention_class,'active',committed_at,reconciled_at,
+        NULL,NULL,NULL,NULL,NULL FROM project_artifact_placements"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version = 24 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -419,6 +434,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     20: migrate_v20_to_v21,
     21: migrate_v21_to_v22,
     22: migrate_v22_to_v23,
+    23: migrate_v23_to_v24,
 }
 
 

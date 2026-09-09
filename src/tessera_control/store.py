@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 23);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 24);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -194,6 +194,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     from .handoffs import create_handoff_schema
     from .interaction import create_interaction_schema
+    from .project_artifact_retention import create_project_artifact_retention_schema
     from .project_artifact_store import create_project_artifact_storage_schema
     from .recovery import create_recovery_schema
     from .research import create_research_schema
@@ -223,6 +224,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_result_acceptance_schema(connection)
     create_credential_access_lease_schema(connection)
     create_project_artifact_storage_schema(connection)
+    create_project_artifact_retention_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

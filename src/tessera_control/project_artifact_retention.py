@@ -1,0 +1,223 @@
+"""Explicit, manual project-object retention and conservative deletion recovery."""
+# ruff: noqa: E501
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from typing import Any
+
+from .project_artifacts import (
+    ProjectArtifactBackend,
+    ProjectArtifactPlacement,
+    ProjectArtifactStorageError,
+)
+from .store import Conflict, NotFound, Store, _connect, utc_now
+
+
+def create_project_artifact_retention_schema(connection: sqlite3.Connection) -> None:
+    """Install recovery metadata; it neither schedules nor performs deletion."""
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS project_artifact_retention (
+        artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        retention_class TEXT NOT NULL CHECK (retention_class IN ('project_default', 'held', 'short_lived')),
+        state TEXT NOT NULL CHECK (state IN ('active', 'tombstoned', 'delete_intent', 'degraded', 'deleted')),
+        created_at TEXT NOT NULL, activity_at TEXT NOT NULL, tombstoned_at TEXT,
+        delete_intent_at TEXT, deleted_at TEXT, incident_at TEXT, incident_reason TEXT
+        )"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS project_artifact_retention_by_project "
+        "ON project_artifact_retention(project_id, state, activity_at, artifact_id)"
+    )
+
+
+class ProjectArtifactRetentionStore(Store):
+    """Manual tombstone/delete commands; uncertainty becomes durable degraded state."""
+
+    def __init__(self, state_dir, backend: ProjectArtifactBackend) -> None:
+        super().__init__(state_dir)
+        self.backend = backend
+
+    def _object(
+        self,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        project_id: str,
+        artifact_id: str,
+    ):
+        self._project(connection, actor, project_id)
+        row = connection.execute(
+            """SELECT p.*, r.retention_class AS retention_metadata_class, r.state, r.activity_at
+            FROM project_artifact_placements p
+            JOIN project_artifact_retention r ON r.artifact_id=p.artifact_id
+            WHERE p.artifact_id=? AND p.project_id=? AND p.backend_kind=?""",
+            (artifact_id, project_id, self.backend.kind),
+        ).fetchone()
+        if row is None:
+            raise NotFound("Project artifact retention object was not found.")
+        return row
+
+    @staticmethod
+    def _referenced(connection: sqlite3.Connection, artifact_id: str) -> bool:
+        # IDs are generated without quotes and manifests are canonical JSON. Parse
+        # bounded rows instead of relying on optional SQLite JSON extensions.
+        for row in connection.execute("SELECT artifacts_json FROM artifact_manifests"):
+            try:
+                if any(item.get("id") == artifact_id for item in json.loads(row[0])):
+                    return True
+            except (TypeError, ValueError):
+                return True  # malformed authoritative metadata fails closed
+        return False
+
+    def _delete_allowed(self, connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+        if row["retention_metadata_class"] == "held":
+            raise Conflict("Held project artifacts cannot be deleted.")
+        if self._referenced(connection, row["artifact_id"]):
+            raise Conflict("Referenced project artifacts cannot be deleted.")
+        checkpoint = connection.execute(
+            """SELECT 1 FROM execution_result_checkpoints c JOIN artifact_manifests m ON m.id=c.manifest_id
+            WHERE m.project_id=? AND instr(m.artifacts_json, ?) > 0 LIMIT 1""",
+            (row["project_id"], row["artifact_id"]),
+        ).fetchone()
+        if checkpoint is not None:
+            raise Conflict("Checkpoint project artifacts cannot be deleted.")
+
+    def tombstone(
+        self, actor: dict[str, Any], project_id: str, artifact_id: str, key: str, digest: str
+    ):
+        path = f"/projects/{project_id}/artifacts/{artifact_id}/retention/tombstone"
+
+        def command(connection: sqlite3.Connection, live: dict[str, Any]):
+            row = self._object(connection, live, project_id, artifact_id)
+            self._delete_allowed(connection, row)
+            if row["state"] == "deleted":
+                return 200, {"state": "deleted"}
+            now = utc_now()
+            connection.execute(
+                """UPDATE project_artifact_retention SET state='tombstoned',
+                tombstoned_at=COALESCE(tombstoned_at, ?), activity_at=? WHERE artifact_id=?""",
+                (now, now, artifact_id),
+            )
+            return 200, {"state": "tombstoned", "tombstoned_at": now}
+
+        return self._mutate(actor, key, "POST", path, digest, command)
+
+    def reconcile_delete(
+        self, actor: dict[str, Any], project_id: str, artifact_id: str, key: str, digest: str
+    ):
+        """Perform one explicitly requested delete after durable intent, never automatically."""
+        path = f"/projects/{project_id}/artifacts/{artifact_id}/retention/delete"
+
+        def intent(connection: sqlite3.Connection, live: dict[str, Any]):
+            row = self._object(connection, live, project_id, artifact_id)
+            self._delete_allowed(connection, row)
+            if row["state"] == "deleted":
+                return 200, dict(row)
+            if row["state"] != "tombstoned":
+                raise Conflict("Project artifact must be tombstoned before deletion.")
+            now = utc_now()
+            connection.execute(
+                """UPDATE project_artifact_retention SET state='delete_intent',
+                delete_intent_at=COALESCE(delete_intent_at, ?), activity_at=? WHERE artifact_id=?""",
+                (now, now, artifact_id),
+            )
+            return 202, dict(row)
+
+        status, row = self._mutate(
+            actor, "delete-intent:" + key, "POST", path + "/intent", digest, intent
+        )
+        if status == 200 and row["state"] == "deleted":
+            return status, {"state": "deleted"}
+        placement = ProjectArtifactPlacement(
+            row["tenant_namespace"],
+            row["project_namespace"],
+            row["object_key"],
+            row["sha256"],
+            row["size"],
+        )
+        connection = _connect(self.database_path)
+        try:
+            live = self._live_principal(connection, actor)
+            self._object(connection, live, project_id, artifact_id)
+            tenant_id = connection.execute(
+                "SELECT org_id FROM projects WHERE id=?", (project_id,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        try:
+            deleted = self.backend.delete(tenant_id, project_id, artifact_id, placement)
+        except ProjectArtifactStorageError as error:
+            deleted = False
+            failure = str(error)
+        else:
+            failure = "Project artifact object is missing during deletion." if not deleted else None
+
+        def finish(connection: sqlite3.Connection, live: dict[str, Any]):
+            self._object(connection, live, project_id, artifact_id)
+            now = utc_now()
+            if failure is None:
+                connection.execute(
+                    "UPDATE project_artifact_retention SET state='deleted', deleted_at=?, activity_at=? WHERE artifact_id=?",
+                    (now, now, artifact_id),
+                )
+                return 200, {"state": "deleted", "deleted_at": now}
+            connection.execute(
+                """UPDATE project_artifact_retention SET state='degraded', incident_at=?,
+                incident_reason=?, activity_at=? WHERE artifact_id=?""",
+                (now, failure[:500], now, artifact_id),
+            )
+            return 202, {"state": "degraded", "incident_reason": failure}
+
+        return self._mutate(actor, key, "POST", path, digest, finish)
+
+    def inspect(self, actor: dict[str, Any], project_id: str, artifact_id: str) -> dict[str, Any]:
+        connection = _connect(self.database_path)
+        try:
+            live = self._live_principal(connection, actor)
+            row = self._object(connection, live, project_id, artifact_id)
+            if row["state"] == "deleted":
+                return {"state": "deleted", "activity_at": row["activity_at"]}
+            placement = ProjectArtifactPlacement(
+                *[
+                    row[name]
+                    for name in (
+                        "tenant_namespace",
+                        "project_namespace",
+                        "object_key",
+                        "sha256",
+                        "size",
+                    )
+                ]
+            )
+            tenant_id = connection.execute(
+                "SELECT org_id FROM projects WHERE id=?", (project_id,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        try:
+            observed = self.backend.inspect(
+                tenant_id, project_id, artifact_id, placement.sha256, placement.size
+            )
+            failure = (
+                None
+                if observed == placement
+                else "Project artifact object is missing or conflicts."
+            )
+        except ProjectArtifactStorageError as error:
+            failure = str(error)
+        if failure is None:
+            return {"state": row["state"], "activity_at": row["activity_at"]}
+        connection = _connect(self.database_path)
+        try:
+            now = utc_now()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE project_artifact_retention SET state='degraded',incident_at=?,incident_reason=?,activity_at=? WHERE artifact_id=?",
+                (now, failure[:500], now, artifact_id),
+            )
+            connection.execute("COMMIT")
+        finally:
+            connection.close()
+        return {"state": "degraded", "incident_reason": failure}
