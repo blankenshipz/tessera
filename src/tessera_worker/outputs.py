@@ -40,7 +40,7 @@ def _failure(reason: str) -> OutputCollectionError:
     return OutputCollectionError(f"Output collection failed: {reason}.")
 
 
-def _validate_paths(output_paths: Sequence[str]) -> tuple[str, ...]:
+def validate_output_paths(output_paths: Sequence[str]) -> tuple[str, ...]:
     if not isinstance(output_paths, Sequence) or isinstance(output_paths, (str, bytes, bytearray)):
         raise _failure("invalid output path list")
     if len(output_paths) > MAX_OUTPUT_PATHS:
@@ -224,7 +224,7 @@ def collect_outputs(
         raise _failure("invalid output byte limit")
     if not 0 <= max_output_bytes <= MAX_OUTPUT_BYTES:
         raise _failure("invalid output byte limit")
-    paths = _validate_paths(output_paths)
+    paths = validate_output_paths(output_paths)
     root_fd, root_info = _open_root(root)
     outputs: list[CollectedOutput] = []
     consumed = 0
@@ -251,4 +251,4 @@ def collect_outputs(
         os.close(root_fd)
 
 
-__all__ = ["CollectedOutput", "OutputCollectionError", "collect_outputs"]
+__all__ = ["CollectedOutput", "OutputCollectionError", "collect_outputs", "validate_output_paths"]

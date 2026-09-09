@@ -485,6 +485,14 @@ class CpuSupervisor:
         if operation.input_directory is not None:
             payload["input_directory"] = operation.input_directory
             payload["input_manifest_json"] = operation.input_manifest_json
+        if operation.development_output is not None:
+            # The mount identity is part of the durable operation fence.  A
+            # recovered operation cannot be redirected to another workspace.
+            payload["development_output"] = {
+                "directory": operation.development_output.directory,
+                "profile": operation.development_output.profile,
+                "fixture_marker": operation.development_output.fixture_marker,
+            }
         return json.dumps(
             payload,
             separators=(",", ":"),

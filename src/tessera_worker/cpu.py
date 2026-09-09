@@ -18,7 +18,7 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 _IMAGE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9./:_-]*@sha256:[a-f0-9]{64}\Z")
 _OPERATION = re.compile(r"[a-f0-9]{32}\Z")
@@ -33,6 +33,32 @@ class CpuError(Exception):
     """A provider operation could not be confirmed."""
 
 
+DEVELOPMENT_OUTPUT_PROFILE = "development-local-cpu-v1"
+DEVELOPMENT_FIXTURE_MARKER = "development-local-fixture-v1"
+
+
+@dataclass(frozen=True)
+class DevelopmentOutputMount:
+    """An explicit, non-pilot output mount identity.
+
+    This marker is deliberately a typed development profile, not a feature flag.
+    Normal CPU operations cannot acquire an output bind mount.
+    """
+
+    directory: str
+    profile: Literal["development-local-cpu-v1"] = DEVELOPMENT_OUTPUT_PROFILE
+    fixture_marker: Literal["development-local-fixture-v1"] = DEVELOPMENT_FIXTURE_MARKER
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.directory, str)
+            or not self.directory
+            or self.profile != DEVELOPMENT_OUTPUT_PROFILE
+            or self.fixture_marker != DEVELOPMENT_FIXTURE_MARKER
+        ):
+            raise ValueError("Development output mount requires the explicit fixture profile.")
+
+
 @dataclass(frozen=True)
 class CpuOperation:
     operation_id: str
@@ -44,6 +70,7 @@ class CpuOperation:
     scratch_bytes: int = 16 * 1024 * 1024
     input_directory: str | None = None
     input_manifest_json: str | None = None
+    development_output: DevelopmentOutputMount | None = None
 
     def __post_init__(self) -> None:
         if not _OPERATION.fullmatch(self.operation_id) or not _IMAGE.fullmatch(self.image):
@@ -123,12 +150,18 @@ class DockerCpuAdapter:
         allowed_images: frozenset[str],
         run: RunCommand = _docker,
         input_root: Path | None = None,
+        development_output_root: Path | None = None,
     ):
         if not allowed_images or any(not _IMAGE.fullmatch(image) for image in allowed_images):
             raise ValueError("At least one pinned trusted image is required.")
         self.allowed_images = allowed_images
         self.run = run
         self.input_root = self._private_input_root(input_root) if input_root is not None else None
+        self.development_output_root = (
+            self._private_input_root(development_output_root)
+            if development_output_root is not None
+            else None
+        )
 
     @staticmethod
     def _private_input_root(root: Path) -> Path:
@@ -348,6 +381,35 @@ class DockerCpuAdapter:
             raise CpuError("Input snapshot file set is incomplete or has extra files.")
         return ["--mount", f"type=bind,src={directory},dst=/inputs,readonly"]
 
+    def _development_output_mount(self, operation: CpuOperation) -> list[str]:
+        mount = operation.development_output
+        if mount is None:
+            return []
+        if self.development_output_root is None:
+            raise CpuError("Development output profile is not configured on this adapter.")
+        root = self.development_output_root
+        directory = Path(mount.directory)
+        try:
+            if not directory.is_absolute() or directory == root:
+                raise ValueError
+            relative = directory.relative_to(root)
+            current = root
+            for part in relative.parts:
+                current /= part
+                if stat.S_ISLNK(current.lstat().st_mode):
+                    raise ValueError
+            info = directory.stat()
+            resolved = directory.resolve(strict=True)
+        except (OSError, ValueError) as error:
+            raise CpuError("Development output workspace escapes supervisor custody.") from error
+        if (
+            resolved != directory
+            or not stat.S_ISDIR(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise CpuError("Development output workspace is not isolated private custody.")
+        return ["--mount", f"type=bind,src={directory},dst=/outputs"]
+
     def create_arguments(self, operation: CpuOperation) -> list[str]:
         if operation.image not in self.allowed_images:
             raise CpuError("Image is outside the admitted execution profile.")
@@ -384,6 +446,7 @@ class DockerCpuAdapter:
             "--workdir",
             "/work",
             *self._input_mount(operation),
+            *self._development_output_mount(operation),
             "--tmpfs",
             f"/work:rw,noexec,nosuid,nodev,size={operation.scratch_bytes},mode=1777",
             "--log-driver",

@@ -101,7 +101,13 @@ representative investigation have not passed end-to-end acceptance.
     connected to a real CPU runtime or storage backend. Explicit local
     development retention now has a separate marked-workspace helper, which
     remains quarantine-only and does not satisfy backend activation or scientific
-    acceptance. See
+    acceptance. An opt-in test-facing local CPU seam now reserves an
+    operation-specific private development workspace with userspace byte/inode
+    accounting, refuses unsafe or undeclared post-stop nodes, requires a fresh
+    matching confirmed termination before sealing, and reclaims only after
+    quarantine transfer. It is not wired into normal `CpuRuntime`, package
+    admission, persistent storage validation, dispatch, release, acceptance, or
+    scientific claims. See
     [artifact quarantine](artifact-quarantine.md).
 9. **Desktop shell:** isolated renderer, sender-checked IPC, named connections,
    project/draft/approval/labbook views, attributed conversations and explicit

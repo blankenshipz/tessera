@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tessera_worker.cpu import CpuError, CpuOperation, DockerCpuAdapter
+from tessera_worker.cpu import CpuError, CpuOperation, DevelopmentOutputMount, DockerCpuAdapter
 from tessera_worker.inputs import materialize_snapshot
 from tessera_worker.supervisor import CpuSupervisor
 
@@ -304,3 +304,27 @@ def test_input_identity_is_journaled_without_changing_legacy_no_input_payload(
     mounted_payload = json.loads(CpuSupervisor._payload(staged_operation(tmp_path)))
     assert mounted_payload["input_directory"].startswith(str(tmp_path))
     assert mounted_payload["input_manifest_json"]
+
+
+def test_explicit_development_mount_is_fenced_and_normal_cpu_has_none(tmp_path: Path) -> None:
+    root = tmp_path / "development-workspaces"
+    root.mkdir(mode=0o700)
+    workspace = root / operation().operation_id
+    workspace.mkdir(mode=0o700)
+    mounted = CpuOperation(
+        operation().operation_id,
+        IMAGE,
+        operation().argv,
+        operation().plan_digest,
+        operation().max_duration_seconds,
+        development_output=DevelopmentOutputMount(str(workspace)),
+    )
+    adapter = DockerCpuAdapter(frozenset({IMAGE}), FakeDocker(), development_output_root=root)
+
+    assert "--mount" not in adapter.create_arguments(operation())
+    assert f"type=bind,src={workspace},dst=/outputs" in adapter.create_arguments(mounted)
+    assert CpuSupervisor._payload(mounted) != CpuSupervisor._payload(operation())
+    workspace.rmdir()
+    workspace.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(CpuError, match="escapes"):
+        adapter.create_arguments(mounted)

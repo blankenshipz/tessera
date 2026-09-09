@@ -108,3 +108,17 @@ Local development may explicitly retain synthetic stopped-workspace outputs with
 uses durable sealing and the existing quarantine upload path, but does not
 satisfy this backend contract, enable `CpuRuntime`, admit packages, mount output
 storage, dispatch pilot/real work, release quarantine, or accept results.
+
+`DevelopmentOutputBackend` and the opt-in `DevelopmentCpuRuntime` test seam add
+an even narrower local fixture lifecycle. A caller must supply an existing,
+private absolute development root; it receives one `0700`, operation-named
+workspace after userspace byte and inode reservation. The marked operation can
+only bind that exact workspace through an adapter separately configured with the
+same root. Sealing rejects escapes, links, special nodes, and undeclared files,
+requires a fresh matching confirmed termination observation, and keeps upload
+quarantined. Cleanup refuses unresolved or merely sealed workspaces and releases
+the reservation only after the existing quarantine transfer reports success.
+Normal `CpuRuntime` does not create this marker or output mount. This is
+development plumbing, not persistent-output-storage validation, package
+admission, provider dispatch, artifact release, result acceptance, or a
+scientific claim.
