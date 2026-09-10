@@ -58,10 +58,19 @@ fetch external content. If the server cannot
 produce its bounded complete ledger, the desktop shows an error rather than a
 partial view labeled complete.
 
-The goal-to-decision panel separately lists a project's schema-v25 experiments
-and renders only a complete current chain: goal, success criterion, registered
-baseline/intervention digests, attempts, linked retained artifacts/measurements,
-and draft or reviewed human conclusions. It is read-only: it cannot approve,
+The goal-to-decision panel separately lists a project's experiments and renders
+only a complete historical chain. Every immutable design revision retains its
+goal, success criterion, protocol, baseline/intervention snapshots, registered
+execution references, and unattempted variants. Attempts identify their design
+membership and typed provenance; operation-backed attempts display desired and
+observed states separately, including unresolved termination, while
+human-reported observations explicitly say that no operation was observed.
+Explicit `legacy_operation_unverified` history remains visible as unverified;
+the desktop does not invent its missing package, plan, or termination details.
+Artifacts, measurements, and conclusions remain linked to their recorded
+revision snapshots. The response is rejected unless its collections, identifiers,
+unique records, digests, revision membership, duplicate variant snapshots, and
+all evidence/operation cross-links agree. It is read-only: it cannot approve,
 dispatch, or edit a conclusion. Attempt `succeeded` and a reviewed conclusion
 remain explicitly labeled operational/human records with scientific validity
 `not_assessed`; they never display scientific success. Project or connection

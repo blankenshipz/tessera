@@ -590,7 +590,8 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
             "expected_variant_revision": baseline_one["revision"],
             "provenance_kind": "admitted_operation",
             "operation_id": manifest["operation_id"],
-            "outcome": "succeeded",
+            "outcome": "failed",
+            "reason": "The original bounded operation failed before the revision.",
         },
     )
     linked_one = _command(
@@ -716,6 +717,15 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         ("e" * 64, "f" * 64),
         ("1" * 64, "2" * 64),
     ]
+    assert {item["id"] for item in exported["variants"]} == {
+        variant["id"] for design in designs.values() for variant in design["variants"]
+    }
+    assert exported["attempts"][0]["outcome"] == "failed"
+    assert exported["attempts"][0]["operation_id"] == manifest["operation_id"]
+    assert exported["attempts"][1]["provenance_kind"] == "human_reported_observation"
+    assert not any(
+        attempt["variant_id"] == designs[2]["variants"][1]["id"] for attempt in exported["attempts"]
+    )
     snapshots = {
         item["design_revision"]: item["design_snapshot"] for item in exported["conclusions"]
     }

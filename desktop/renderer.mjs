@@ -421,28 +421,130 @@ function ledgerCard(title, id, value) {
 }
 function ledgerText(value) { return JSON.stringify(value); }
 function isDigest(value) { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value); }
+function isIdentifier(value) { return typeof value === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(value); }
+function isOperationId(value) { return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value); }
+function isPositiveInteger(value) { return Number.isSafeInteger(value) && value >= 1; }
+function isText(value) { return typeof value === 'string' && value.trim().length > 0; }
+function sameValue(left, right) {
+  if (left === right) return true;
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+  const leftKeys = Object.keys(left).sort(); const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length && leftKeys.every((key, index) => key === rightKeys[index] && sameValue(left[key], right[key]));
+}
+function uniqueRecords(records, field = 'id', valid = isIdentifier) {
+  const values = records.map(record => record?.[field]);
+  return values.every(valid) && new Set(values).size === values.length;
+}
+function sameRecordSets(left, right, field = 'id') {
+  if (left.length !== right.length || !uniqueRecords(left, field) || !uniqueRecords(right, field)) return false;
+  const byId = new Map(right.map(record => [record[field], record]));
+  return left.every(record => sameValue(record, byId.get(record[field])));
+}
+function validRegisteredVariant(variant, experimentId, designRevision) {
+  return variant && isIdentifier(variant.id) && variant.experiment_id === experimentId &&
+    variant.design_revision === designRevision && ['baseline', 'intervention'].includes(variant.kind) &&
+    isText(variant.name) && isDigest(variant.method_digest) && isDigest(variant.input_digest) &&
+    variant.metadata && typeof variant.metadata === 'object' && !Array.isArray(variant.metadata) &&
+    ((variant.execution_task_id === null && variant.execution_plan_digest === null) ||
+      (isIdentifier(variant.execution_task_id) && isDigest(variant.execution_plan_digest)));
+}
+function validDesign(design, experimentId) {
+  return design && design.experiment_id === experimentId && isPositiveInteger(design.revision) &&
+    isText(design.goal) && isText(design.success_criterion) && isText(design.protocol) &&
+    Array.isArray(design.variants) && design.variants.length === 2 && uniqueRecords(design.variants) &&
+    new Set(design.variants.map(variant => variant.kind)).size === 2 &&
+    design.variants.every(variant => validRegisteredVariant(variant, experimentId, design.revision));
+}
 function completeExperimentLedger(ledger, experiment, project) {
   if (!ledger || ledger.completeness !== 'complete_in_scope_goal_to_decision_chain' ||
       !ledger.experiment || ledger.experiment.id !== experiment.id ||
       ledger.experiment.project_id !== project.id || !ledger.experiment.design ||
       ledger.experiment.current_design_revision !== experiment.current_design_revision ||
-      ledger.experiment.design.revision !== ledger.experiment.current_design_revision ||
-      !Array.isArray(ledger.experiment.design.variants) ||
+      !isPositiveInteger(ledger.experiment.current_design_revision) ||
       !['designs', 'variants', 'attempts', 'operations', 'artifact_links', 'artifacts', 'measurements', 'conclusions'].every(name => Array.isArray(ledger[name]))) return false;
-  const variants = ledger.experiment.design.variants;
-  return variants.length === 2 && new Set(variants.map(item => item.kind)).size === 2 &&
-    variants.every(item => ['baseline', 'intervention'].includes(item.kind) && isDigest(item.method_digest) && isDigest(item.input_digest)) &&
-    ledger.attempts.every(item => ['succeeded', 'failed', 'cancelled', 'inconclusive'].includes(item.outcome) && item.scientific_validity === 'not_assessed') &&
-    ledger.conclusions.every(item => ['draft', 'reviewed'].includes(item.status) && item.scientific_validity === 'not_assessed');
+  const experimentId = ledger.experiment.id;
+  if (!isIdentifier(experimentId) || !isText(ledger.experiment.goal) || !isText(ledger.experiment.success_criterion) ||
+      !ledger.designs.length || !uniqueRecords(ledger.designs, 'revision', isPositiveInteger) ||
+      !ledger.designs.every(design => validDesign(design, experimentId))) return false;
+  const designs = new Map(ledger.designs.map(design => [design.revision, design]));
+  const current = designs.get(ledger.experiment.current_design_revision);
+  if (!current || !sameValue(ledger.experiment.design, current)) return false;
+  const registeredVariants = ledger.designs.flatMap(design => design.variants);
+  if (!sameRecordSets(ledger.variants, registeredVariants) || !ledger.variants.every(variant =>
+    validRegisteredVariant(variant, experimentId, variant.design_revision) && designs.has(variant.design_revision))) return false;
+  const variants = new Map(ledger.variants.map(variant => [variant.id, variant]));
+  if (!uniqueRecords(ledger.attempts) || !uniqueRecords(ledger.operations, 'operation_id', isOperationId) ||
+      !uniqueRecords(ledger.artifacts) || !uniqueRecords(ledger.measurements) || !uniqueRecords(ledger.conclusions)) return false;
+  const operations = new Map(ledger.operations.map(operation => [operation.operation_id, operation]));
+  const attempts = new Map(ledger.attempts.map(attempt => [attempt.id, attempt]));
+  for (const attempt of ledger.attempts) {
+    const variant = variants.get(attempt.variant_id);
+    if (!variant || attempt.design_revision !== variant.design_revision ||
+        !['succeeded', 'failed', 'cancelled', 'inconclusive'].includes(attempt.outcome) ||
+        attempt.scientific_validity !== 'not_assessed' ||
+        !['admitted_operation', 'human_reported_observation', 'legacy_operation_unverified'].includes(attempt.provenance_kind)) return false;
+    if (attempt.provenance_kind === 'human_reported_observation') {
+      if (attempt.operation_id !== null || attempt.execution_plan_digest !== null || attempt.package_digest !== null ||
+          attempt.operation_desired_state !== null || attempt.operation_observed_state !== 'not_observed' ||
+          attempt.termination_status !== 'not_applicable' || !isText(attempt.human_observation)) return false;
+    } else {
+      const operation = operations.get(attempt.operation_id);
+      if (!isOperationId(attempt.operation_id) || !operation || operation.operation_id !== attempt.operation_id ||
+          operation.project_id !== project.id || attempt.human_observation !== null) return false;
+      if (attempt.provenance_kind === 'admitted_operation' &&
+          (!['admitted', 'cancel_requested'].includes(attempt.operation_desired_state) || !isDigest(attempt.package_digest) ||
+           !isDigest(attempt.execution_plan_digest) || attempt.execution_plan_digest !== variant.execution_plan_digest ||
+           attempt.operation_observed_state !== 'exited' ||
+           !['confirmed', 'observed_exited_unconfirmed'].includes(attempt.termination_status) ||
+           operation.desired_state !== attempt.operation_desired_state || operation.observed_state !== attempt.operation_observed_state)) return false;
+      if (attempt.provenance_kind === 'legacy_operation_unverified' &&
+          (attempt.operation_observed_state !== 'legacy_unverified' || attempt.termination_status !== 'legacy_unknown' ||
+           ![null, 'admitted', 'cancel_requested'].includes(attempt.operation_desired_state) ||
+           !(attempt.execution_plan_digest === null || isDigest(attempt.execution_plan_digest)) ||
+           !(attempt.package_digest === null || isDigest(attempt.package_digest)))) return false;
+    }
+  }
+  if (!ledger.operations.every(operation => isOperationId(operation.operation_id) && operation.project_id === project.id &&
+      ['admitted', 'cancel_requested'].includes(operation.desired_state) &&
+      ['unknown', 'running', 'exited'].includes(operation.observed_state) &&
+      ledger.attempts.some(attempt => attempt.operation_id === operation.operation_id))) return false;
+  const artifacts = new Map(ledger.artifacts.map(artifact => [artifact.id, artifact]));
+  if (!ledger.artifacts.every(artifact => artifact.project_id === project.id && isDigest(artifact.sha256))) return false;
+  const links = new Set();
+  for (const link of ledger.artifact_links) {
+    const key = `${link?.attempt_id}:${link?.artifact_id}`;
+    if (!attempts.has(link?.attempt_id) || !artifacts.has(link?.artifact_id) || links.has(key)) return false;
+    links.add(key);
+  }
+  if (!ledger.artifacts.every(artifact => [...links].some(link => link.endsWith(`:${artifact.id}`)))) return false;
+  const measurements = new Map(ledger.measurements.map(measurement => [measurement.id, measurement]));
+  if (!ledger.measurements.every(measurement => attempts.has(measurement.attempt_id) &&
+      measurement.value && typeof measurement.value === 'object' && !Array.isArray(measurement.value) &&
+      (measurement.artifact_id === null || (artifacts.has(measurement.artifact_id) && links.has(`${measurement.attempt_id}:${measurement.artifact_id}`))))) return false;
+  for (const conclusion of ledger.conclusions) {
+    const snapshot = designs.get(conclusion.design_revision);
+    if (conclusion.experiment_id !== experimentId || !snapshot || !sameValue(conclusion.design_snapshot, snapshot) ||
+        !['draft', 'reviewed'].includes(conclusion.status) || conclusion.scientific_validity !== 'not_assessed' ||
+        !Array.isArray(conclusion.evidence) || !conclusion.evidence.length) return false;
+    const evidence = new Set();
+    for (const item of conclusion.evidence) {
+      const key = `${item?.attempt_id}:${item?.artifact_id ?? item?.measurement_id}`;
+      if (!attempts.has(item?.attempt_id) || evidence.has(key) ||
+          ((item?.artifact_id === null) === (item?.measurement_id === null)) ||
+          (item.artifact_id !== null && !links.has(`${item.attempt_id}:${item.artifact_id}`)) ||
+          (item.measurement_id !== null && measurements.get(item.measurement_id)?.attempt_id !== item.attempt_id)) return false;
+      evidence.add(key);
+    }
+  }
+  return true;
 }
 function renderExperimentLedger(ledger) {
   const detail = $('experiment-detail'); detail.replaceChildren();
   const experiment = ledger.experiment;
   const summary = element('article', undefined, 'card');
-  summary.append(element('span', `Design revision ${experiment.current_design_revision}`, 'tag'));
-  summary.append(element('p', `Goal: ${experiment.goal}`));
-  summary.append(element('p', `Success criterion: ${experiment.success_criterion}`));
-  summary.append(element('p', `Protocol: ${experiment.design.protocol}`));
+  summary.append(element('span', `Current design revision ${experiment.current_design_revision}`, 'tag'));
+  summary.append(element('p', `Current goal: ${experiment.goal}`));
+  summary.append(element('p', `Current success criterion: ${experiment.success_criterion}`));
   summary.append(element('p', 'Completeness: complete in-scope goal-to-decision chain. This projection cannot approve, dispatch, or edit conclusions.', 'muted'));
   detail.append(summary);
   const section = (title, records, render) => {
@@ -450,18 +552,48 @@ function renderExperimentLedger(ledger) {
     if (!records.length) detail.append(element('p', `No ${title.toLowerCase()} recorded.`, 'muted'));
     else for (const record of records) detail.append(render(record));
   };
-  section('Baseline and intervention variants', experiment.design.variants, variant => {
-    const card = ledgerCard(`${variant.kind}: ${variant.name}`, 'experimentVariantId', variant);
-    card.append(element('p', `Method digest: ${variant.method_digest}`));
-    card.append(element('p', `Input digest: ${variant.input_digest}`));
-    card.append(element('p', `Registered metadata: ${ledgerText(variant.metadata)}`));
+  const attemptsByVariant = new Map(ledger.variants.map(variant => [variant.id, []]));
+  for (const attempt of ledger.attempts) attemptsByVariant.get(attempt.variant_id).push(attempt);
+  section('Historical design revisions', ledger.designs, design => {
+    const card = element('article', undefined, 'card');
+    card.append(element('h5', `Design revision ${design.revision}`));
+    card.append(element('p', `Goal: ${design.goal}`));
+    card.append(element('p', `Success criterion: ${design.success_criterion}`));
+    card.append(element('p', `Protocol: ${design.protocol}`));
+    for (const variant of design.variants) {
+      card.append(element('p', `${variant.kind}: ${variant.name} · method ${variant.method_digest} · inputs ${variant.input_digest}`));
+      card.append(element('p', variant.execution_task_id === null ?
+        'Registered execution reference: none recorded.' :
+        `Registered execution reference: task ${variant.execution_task_id} · plan digest ${variant.execution_plan_digest}`, 'muted'));
+      card.append(element('p', `Registered metadata: ${ledgerText(variant.metadata)}`, 'muted'));
+      if (!attemptsByVariant.get(variant.id).length) card.append(element('p', 'No attempts recorded for this registered variant.', 'muted'));
+    }
+    return card;
+  });
+  section('External operations', ledger.operations, operation => {
+    const card = ledgerCard(`Operation ${operation.operation_id}`, 'experimentOperationId', { id: operation.operation_id });
+    card.append(element('p', `Desired operation state: ${operation.desired_state}`));
+    card.append(element('p', `Observed operation state: ${operation.observed_state}`));
+    card.append(element('p', 'Operation provenance is operational evidence only; it does not establish scientific success.', 'muted'));
     return card;
   });
   section('Attempts', ledger.attempts, attempt => {
     const card = ledgerCard(`Attempt ${attempt.id}`, 'experimentAttemptId', attempt);
     const outcome = ['succeeded', 'failed', 'cancelled', 'inconclusive'].includes(attempt.outcome) ? attempt.outcome : 'unrecognized';
     card.append(element('span', `Operational outcome: ${outcome}`, 'tag'));
-    card.append(element('p', `Variant: ${attempt.variant_id} · operation: ${attempt.operation_id}`));
+    card.append(element('p', `Variant: ${attempt.variant_id} · design revision ${attempt.design_revision}`));
+    if (attempt.provenance_kind === 'human_reported_observation') {
+      card.append(element('p', `Human-reported observation: ${attempt.human_observation}`));
+      card.append(element('p', 'Operation provenance: no operation observed (human-reported status).', 'muted'));
+    } else {
+      card.append(element('p', `Operation: ${attempt.operation_id} · desired ${attempt.operation_desired_state ?? 'not reconstructed'} · observed ${attempt.operation_observed_state}`));
+      if (attempt.provenance_kind === 'legacy_operation_unverified') {
+        card.append(element('p', 'Legacy operation provenance is unverified; package, plan, and termination details were not reconstructed.', 'muted'));
+      } else card.append(element('p', `Package digest: ${attempt.package_digest}`));
+      card.append(element('p', attempt.termination_status === 'confirmed' ?
+        'Termination status: confirmed by an attributed operational observation.' :
+        `Termination status: ${attempt.termination_status} — unresolved; exposure remains visible.`, 'muted'));
+    }
     if (attempt.reason) card.append(element('p', `Recorded reason: ${attempt.reason}`));
     card.append(element('p', 'Operational outcome is not scientific success. Scientific validity: not assessed.', 'muted'));
     const links = ledger.artifact_links.filter(link => link.attempt_id === attempt.id);
@@ -477,9 +609,17 @@ function renderExperimentLedger(ledger) {
     card.append(element('p', `Retention status: ${artifact.status} · classification: ${artifact.classification}`, 'muted'));
     return card;
   });
+  section('Measurements', ledger.measurements, measurement => {
+    const card = ledgerCard(`Measurement ${measurement.id}: ${measurement.name}`, 'experimentMeasurementId', measurement);
+    card.append(element('p', `Attempt: ${measurement.attempt_id}`));
+    card.append(element('p', `Recorded value: ${ledgerText(measurement.value)}`));
+    card.append(element('p', `Artifact reference: ${measurement.artifact_id ?? 'none recorded'}`, 'muted'));
+    return card;
+  });
   section('Human conclusions', ledger.conclusions, conclusion => {
     const card = ledgerCard(`${conclusion.status === 'reviewed' ? 'Reviewed human conclusion' : 'Draft conclusion'} ${conclusion.id}`, 'experimentConclusionId', conclusion);
     card.append(element('p', conclusion.statement));
+    card.append(element('p', `Design snapshot: revision ${conclusion.design_revision} · goal ${conclusion.design_snapshot.goal} · criterion ${conclusion.design_snapshot.success_criterion}`));
     card.append(element('p', `Evidence: ${conclusion.evidence.map(item => `${item.attempt_id} [artifacts: ${item.artifact_id ?? 'none'}; measurements: ${item.measurement_id ?? 'none'}]`).join('; ')}`));
     card.append(element('p', `Scientific validity: ${conclusion.scientific_validity}. Human review records an interpretation; it does not establish scientific success.`, 'muted'));
     return card;
@@ -521,6 +661,7 @@ async function selectExperiment(experiment) {
   const version = epoch; const project = activeProject; const requestVersion = ++readVersion.experiment;
   activeExperiment = experiment;
   $('experiment-title').textContent = `Experiment ${experiment.id}`;
+  $('experiment-detail').setAttribute('aria-busy', 'true');
   $('experiment-detail').replaceChildren(element('p', 'Loading complete goal-to-decision chain…', 'muted'));
   for (const button of $('experiments').children) {
     if (button.dataset.experimentId === experiment.id) button.setAttribute('aria-current', 'page');
@@ -532,9 +673,11 @@ async function selectExperiment(experiment) {
     if (!completeExperimentLedger(ledger, experiment, project)) throw new Error('The control plane did not return a complete current experiment ledger.');
     Object.assign(experiment, ledger.experiment);
     renderExperimentLedger(ledger);
+    $('experiment-detail').setAttribute('aria-busy', 'false');
   } catch (error) {
     if (version === epoch && project === activeProject && experiment === activeExperiment && requestVersion === readVersion.experiment) {
       $('experiment-detail').replaceChildren(element('p', 'Could not load a complete current experiment ledger. Partial, stale, or digest-inconsistent records are not shown; use Refresh to retry.', 'muted'));
+      $('experiment-detail').setAttribute('aria-busy', 'false');
       throw error;
     }
   }
