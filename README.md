@@ -270,7 +270,7 @@ machine. Prove adoption, skill authoring, bounded execution,
 human intervention, labbook review, and portable export. Security and evidence
 checks apply from the first real-data run.
 
-**Approved direction, not implementation:** local CPU remains the first target
+**Approved direction, with one narrow local bootstrap:** local CPU remains the first target
 while Kubernetes/Minikube preparation proceeds separately. Kubernetes target
 attachment requires explicit target identity rather than an ambient kube context;
 Minikube bootstrap and control-plane provisioning are distinct operator workflows.
@@ -278,7 +278,10 @@ Humans approve immutable provisioning and execution plans. Planned composable
 environment/execution adapters and credential store/delivery adapters may support
 an authorized local environment source and explicitly authorized Kubernetes Secret
 materialization; no skill can approve those actions or use raw `kubectl` or cloud
-credentials. Automatic destructive teardown is not authorized. See the
+credentials. The explicitly human-approved `tessera-dev` local bootstrap is
+documented in [Minikube provisioning](docs/minikube-provisioning.md); it does
+not attach a Kubernetes target or authorize execution. Automatic destructive
+teardown is not authorized. See the
 [compatibility matrix](docs/compatibility-matrix.md) for the current evidence.
 
 Cluster packaging, organization login/administration, paid hosting, additional

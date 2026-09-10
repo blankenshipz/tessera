@@ -23,7 +23,11 @@ decisions. Phase 1 now adds pure, in-memory, versioned environment-plan and
 fake-only provisioning contracts: an explicit target/revision and digest-bound
 human approval fence a deterministic intent reconciliation. They add no live
 target attachment, Kubernetes client, namespace/PVC/Secret, credential, teardown,
-persistence migration, or execution integration.
+persistence migration, or execution integration. A separate human-invoked local
+operator now reconciles only the fixed `tessera-dev` Docker profile, namespace,
+and PVC through profile-scoped Minikube commands after exact-digest
+acknowledgement; it retains resources and is not a target attachment or dispatch
+path.
 **Implemented** means the named bounded behavior has executable evidence;
 **partial** means the design workflow still has missing requirements; **blocked**
 identifies an unmet prerequisite; **deferred** is intentionally outside the pilot.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -16,10 +17,23 @@ from .workspace import WorkspaceError
 from .workspace_cli import add_workspace_commands, run_workspace
 
 
+def _add_minikube_provisioning_command(subcommands: argparse._SubParsersAction) -> None:
+    command = subcommands.add_parser("minikube-provision")
+    mode = command.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="mutate only after human approval")
+    mode.add_argument("--status", action="store_true", help="read explicit tessera-dev status")
+    mode.add_argument(
+        "--teardown", action="store_true", help="report retained-only teardown policy"
+    )
+    command.add_argument("--approved-plan", help="exact digest explicitly approved by a human")
+    command.add_argument("--journal", type=Path, help="local path for sanitized operation result")
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="tessera")
     subcommands = command.add_subparsers(dest="command", required=True)
     add_workspace_commands(subcommands)
+    _add_minikube_provisioning_command(subcommands)
     initialize = subcommands.add_parser("init")
     initialize.add_argument("--state-dir", required=True, type=Path)
     migrate = subcommands.add_parser("migrate")
@@ -36,8 +50,63 @@ def parser() -> argparse.ArgumentParser:
     return command
 
 
+def _run_minikube_provisioning(arguments: argparse.Namespace) -> int:
+    # Import here so every other control CLI path remains independent of Minikube.
+    from tessera_provisioner.minikube import (
+        MinikubePlan,
+        MinikubeProvisioner,
+        MinikubeProvisioningError,
+        record_result,
+        render_plan,
+    )
+
+    plan = MinikubePlan.default()
+    if not arguments.apply and not arguments.status and not arguments.teardown:
+        print(render_plan(plan))
+        return 0
+    if arguments.teardown:
+        result: dict[str, object] = {
+            "state": "retained",
+            "plan_digest": plan.digest,
+            "message": (
+                "Teardown is not authorized or implemented; tessera-dev resources were retained."
+            ),
+        }
+        if arguments.journal is not None:
+            record_result(arguments.journal, result)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if arguments.apply and (arguments.approved_plan != plan.digest or arguments.journal is None):
+        print(
+            "--apply requires a human-approved exact --approved-plan digest and --journal.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        provisioner = MinikubeProvisioner()
+        if arguments.status:
+            result = provisioner.status(plan)
+        else:
+            result = provisioner.apply(plan, arguments.approved_plan)
+        if arguments.journal is not None:
+            record_result(arguments.journal, result)
+    except MinikubeProvisioningError as error:
+        result = {"state": "failed", "plan_digest": plan.digest, "message": str(error)}
+        if arguments.journal is not None:
+            try:
+                record_result(arguments.journal, result)
+            except MinikubeProvisioningError:
+                pass
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     arguments = parser().parse_args()
+    if arguments.command == "minikube-provision":
+        return _run_minikube_provisioning(arguments)
     if arguments.command == "workspace":
         try:
             return run_workspace(arguments)
