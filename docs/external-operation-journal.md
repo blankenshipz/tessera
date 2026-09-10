@@ -30,14 +30,27 @@ They remain quarantine-only and are not new execution receipts.
 
 Schema v19 adds an empty-by-default, separate one-to-one receipt record. The
 only admitted provider kind is the deterministic injected `fake` implementation;
-there is no cloud, model, credential, or paid-provider path. Its local worker
-seam persists a submit intent after the supervisor's start intent and authority
-recheck. A lost submit reply is uncertain and recovery observes the stable
-lookup key rather than submitting again. Receipt/report retries reuse the stored
-payload and idempotency identity. Provider IDs and receipt identity conflict
-rather than overwrite. Unknown, stale authority, and uncertain cancellation
-remain visible. The receipt is bounded operational evidence only, not proof of
-Docker execution, cost/accounting, artifacts, results, or scientific success.
+there is no cloud, model, credential, paid-provider, or fallback path. Its
+version-pinned `local-provider-v1` adapter only accepts an injected literal-loopback
+HTTP fixture. It disables proxies and redirects, accepts bounded JSON requests and
+responses under a bounded deadline, and exposes only submit, lookup, cancel, and
+accounting-observation routes. The fixture token is test-only transport input, not
+a provider credential.
+
+The local worker seam persists a submit intent after the supervisor's start intent
+and authority recheck. It derives one stable provider-submit idempotency key from
+the operation ID and keeps the operation lookup key unchanged. A lost submit reply
+is uncertain and recovery observes that lookup key rather than submitting again.
+Lost lookup or cancel replies likewise leave uncertainty until a later lookup; a
+cancel reply is never treated as termination without a fresh exited observation.
+Receipt payload identity is bound to its operation, lookup, idempotency and provider
+IDs; receipt/report retries reuse the stored payload and idempotency identity.
+Provider IDs and receipt identity conflict rather than overwrite. Accounting observation
+can only report a bounded synthetic usage value or `unknown`; `unknown` is not
+zero, settlement, or permission to release the reservation. Unknown, stale
+authority, and uncertain cancellation remain visible. The receipt is bounded
+operational evidence only, not proof of Docker execution, cost/accounting,
+artifacts, results, or scientific success.
 
 If a receipt/observation report, heartbeat, or renewal cannot be confirmed, the
 development worker keeps its durable intent and output reservation unresolved
@@ -51,3 +64,10 @@ Credential-access leases are not provider receipts or operation inputs. If a lat
 adapter needs to associate one with an operation, it may retain only the opaque
 credential-access lease ID; neither its secret reference nor its value belongs in
 operation metadata, receipt payloads, journals, events, or diagnostics.
+
+The approved future delivery boundary is pluggable: a local environment source and
+Kubernetes Secret materialization are distinct delivery implementations, not
+provider receipts. Each requires explicit human authorization tied to the frozen
+plan, target, namespace where applicable, task, lease, and epoch. No journal entry,
+skill request, or agent output authorizes delivery or permits raw `kubectl`/cloud
+credentials.

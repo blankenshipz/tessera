@@ -38,3 +38,8 @@ recorded before sending; a lost reply replays that key, while a completed beat
 gets a new key. A missing, stale, drained, quarantined, or retired registration
 therefore blocks it before Docker start. Its credential is read only from a
 private file and is never accepted on its command line.
+
+A future Kubernetes worker/operator must attach only to an explicitly identified
+target; lifecycle registration cannot adopt an ambient kube context or authorize
+cluster bootstrap, provisioning, Secret materialization, or destructive teardown.
+Those actions remain separate planned workflows with human approvals.

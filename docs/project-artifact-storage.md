@@ -27,3 +27,7 @@ The default persistence boundary is the project store. Quarantine remains intake
 external export/move is a separately authorized future policy operation. There is
 no S3 SDK, cloud credential, public URL, deletion, or production/pilot activation.
 Backups fail closed if they would omit committed project objects.
+
+This storage boundary is independent of planned Kubernetes Secret delivery and
+control-plane provisioning. A Secret is not an artifact store or project object,
+and no automatic destructive teardown/deletion follows target detachment.

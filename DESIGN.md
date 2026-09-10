@@ -276,6 +276,38 @@ submit/status/logs/cancel/accounting, with provider IDs and checkpoint limitatio
 Provisioning infrastructure is a separate approval from attaching a target.
 Pin tested versions; use conformance tests to grow the support matrix.
 
+#### Approved execution-target direction (planned)
+
+`local-cpu` remains the primary first execution target. Kubernetes preparation
+may proceed in parallel, but does not promote a cluster profile to supported or
+live execution. A future execution profile composes an `EnvironmentAdapter`
+(target identity, preflight, provisioning/attachment boundary, and credential
+delivery) with an `ExecutionAdapter` (submit, observe, logs, cancel, and
+accounting). Both contracts must preserve the frozen package, operation identity,
+lease epoch, and explicit limitations; neither adapter may infer authority from a
+client, environment variable, or ambient Kubernetes context.
+
+Every Kubernetes action names and validates the target identity (kubeconfig
+reference and digest, context, HTTPS API server and CA identity, cluster and
+namespace identities). No current-context fallback is permitted. Minikube
+bootstrap is a separate local-administration workflow from attaching an already
+identified target to a Tessera execution profile. Control-plane provisioning is
+also separate: a scoped operator may reconcile only an approved immutable
+provisioning plan and its named resources. A human approves the exact plan digest
+before it is applied; a research-plan approval, worker, harness, or skill cannot
+approve it. No automatic destructive teardown is authorized; deletion requires a
+separate explicit human decision and remains planned.
+
+Credentials use pluggable store and delivery contracts. A local environment source
+is planned only for explicitly authorized local delivery. Kubernetes Secret
+materialization is planned only after an explicit human authorization bound to the
+target, namespace, task, lease, and epoch; it must not use ambient `kubectl` or
+cloud credentials. Skills may plan or request scoped access, but cannot approve a
+plan/provisioning/secret operation or use raw `kubectl` or cloud credentials. See
+[decisions 0010](docs/decisions/0010-execution-adapter-composition.md),
+[0011](docs/decisions/0011-control-plane-kubernetes-provisioning.md), and
+[0012](docs/decisions/0012-credential-delivery-boundary.md).
+
 The adapter translates Tessera's plan, approved inputs, lease/epoch, capability
 limits, and cancellation request into the pinned harness interface, and translates
 responses into attributed observations and events. Every translated event carries
@@ -598,10 +630,12 @@ it does not dispatch or prove termination. v17 lease/observation history remains
 unbackfilled legacy/null rather than receiving invented provider receipts.
 
 Schema v19 adds a one-to-one bounded receipt only for an injected deterministic
-fake provider in the development worker. The supervisor persists local submit
-intent, rechecks authority, and recovers lost submits by stable lookup rather
-than resubmitting. Receipt/provider identity is immutable; stale authority,
-unknown observations, and cancel uncertainty remain unresolved. This records
+fake provider in the development worker. Its `local-provider-v1` test adapter
+can reach only an injected literal-loopback HTTP fixture; it is not a real
+provider integration. The supervisor persists local submit intent, rechecks
+authority, and recovers lost submits by stable lookup rather than resubmitting.
+Receipt/provider identity is immutable; stale authority, unknown observations,
+unknown exposure, and cancel uncertainty remain unresolved. This records
 fake-provider operational evidence, not real dispatch, accounting, Docker truth,
 artifact release, result acceptance, or scientific success.
 
@@ -704,13 +738,17 @@ operational note. No paid or sensitive run precedes its required enforcement.
 
 ### Harness proof of concept (synthetic, not pilot completion)
 
-Before integrating OpenCode into a pilot workflow, run a small synthetic POC with
-one pinned OpenCode server, one enrolled node, one Tessera task, and no real
-provider call or sensitive data. The adapter must prove that it can create and
+The implemented synthetic POC uses an in-process OpenCode-shaped fixture, not an
+enrolled node or selected OpenCode server. It has no real provider call or
+sensitive data and proves that the adapter can create and
 attribute a session, translate a bounded message and event stream, reconnect from
 a cursor, and request cancellation while Tessera retains authority. OpenCode
 session/job state may continue independently; Tessera records the uncertainty and
 reconciles it rather than inventing termination.
+
+Before integrating OpenCode into a pilot workflow, repeat these cases against one
+selected pinned OpenCode server and one enrolled node, then meet the real
+OpenCode/provider activation gates in the [compatibility matrix](docs/compatibility-matrix.md).
 
 Acceptance cases: (1) a plan revision or expired lease prevents session/job
 start; (2) a permission, tool, MCP, or provider-auth event is recorded as an

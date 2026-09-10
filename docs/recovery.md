@@ -56,3 +56,8 @@ If restore fails, Tessera leaves its private incomplete destination in place rat
 than deleting a path that may contain evidence. Do not reuse it as a restore target.
 Expected CLI failures return status 1 with a concise stderr message and no success
 output. Successful restore prints only the database and credential-file paths.
+
+Recovery does not bootstrap or attach Kubernetes targets, reapply provisioning, or
+re-materialize credentials. Any future reconciliation uses the explicitly recorded
+target identity and fresh human authorization; it must not use an ambient context
+or automatically destroy resources.

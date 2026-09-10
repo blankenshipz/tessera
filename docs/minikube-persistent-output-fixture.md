@@ -15,3 +15,8 @@ It never installs, starts, switches, creates, or deletes a cluster. Missing
 `kubectl`, Minikube, or PVC prerequisites are reported as skipped without Job
 creation. This is not storage/quota proof, provider execution, artifact release,
 result acceptance, or pilot evidence.
+
+This fixture is not Minikube bootstrap or target attachment. Any future bootstrap
+and attachment workflow must be separately human-authorized and bind the explicit
+identity above; it must never select an ambient kube context. It performs no
+automatic destructive teardown.

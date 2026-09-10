@@ -74,7 +74,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v21
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v24
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -241,8 +241,9 @@ plans, approvals, budgets, leases/epochs, credentials/access, artifacts, provide
 operations, result acceptance, and labbook records. OpenCode permission prompts,
 tools, MCP, skills, session events, provider auth, and UI are not Tessera
 authority boundaries. Node setup/enrollment is separate from research control.
-The adapter POC and compatibility testing remain unimplemented; the pilot is not
-complete.
+Synthetic adapter POC and local HTTP/SSE seam fixtures are implemented, but no
+real OpenCode compatibility result or provider activation exists; the pilot is
+not complete. See the [compatibility matrix](docs/compatibility-matrix.md).
 
 Closing Electron does not stop the separately running control plane. If its
 machine sleeps or becomes unreachable, workers follow their disconnect and
@@ -268,6 +269,17 @@ integration. The desktop connects over an authenticated API even on the same
 machine. Prove adoption, skill authoring, bounded execution,
 human intervention, labbook review, and portable export. Security and evidence
 checks apply from the first real-data run.
+
+**Approved direction, not implementation:** local CPU remains the first target
+while Kubernetes/Minikube preparation proceeds separately. Kubernetes target
+attachment requires explicit target identity rather than an ambient kube context;
+Minikube bootstrap and control-plane provisioning are distinct operator workflows.
+Humans approve immutable provisioning and execution plans. Planned composable
+environment/execution adapters and credential store/delivery adapters may support
+an authorized local environment source and explicitly authorized Kubernetes Secret
+materialization; no skill can approve those actions or use raw `kubectl` or cloud
+credentials. Automatic destructive teardown is not authorized. See the
+[compatibility matrix](docs/compatibility-matrix.md) for the current evidence.
 
 Cluster packaging, organization login/administration, paid hosting, additional
 runtimes, GPUs, schedules, and automatic memory follow the pilot. Compare it with

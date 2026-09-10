@@ -13,6 +13,8 @@ calls, artifact release, result acceptance, or unattended research work.
 | OpenCode live adapter seam | Caller must supply one exact `OpenCodeServerPin(version, schema_sha256)` | Private journal, authority rechecks, fixed routes, redirect/proxy/cookie rejection, bounded events and unresolved abort semantics | No control-plane registration, worker enrollment, node activation, deployment configuration, or real provider dispatch |
 | Development native worker | `development-local-cpu-v1`; Docker image `python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84` | Opt-in loopback/Docker fixture with temporary state, a fixture worker credential, fake-provider receipt, and quarantine-only output | Not a persistent-output or pilot backend; no Linux quota/restart acceptance, real provider accounting, secret backend, artifact release, or result/scientific acceptance |
 | Provider protocol | `FakeProvider` / `fake-provider-v1`, injected only by tests and development fixtures | Stable submit lookup, lost-reply reconciliation, receipt attribution and visible cancellation uncertainty | No production provider implementation, cloud endpoint, model call, provider credential, spend settlement, or provider-success claim |
+| Minikube Job conformance contract | Explicit `development-minikube-opencode-v1` cluster/profile/namespace/CA/server identity and digest-pinned Job shape | Pure dictionary/callback unit tests for fixed security fields, immutable observation, deterministic create reconciliation, and fresh-absence cancellation | No Minikube call, enrollment, storage quota, OpenCode activation, provider dispatch, credential path, or pilot acceptance |
+| Planned adapter/provisioning/credential direction | Local CPU primary; future explicit-identity Kubernetes target; future scoped operator and authorized delivery adapters | Approved design only; existing pure Job contract remains unit evidence | No `EnvironmentAdapter`/`ExecutionAdapter`, target attachment, bootstrap, provisioning, local-env delivery, Kubernetes Secret materialization, raw credential use, or teardown implementation |
 
 ## Combined synthetic harness evidence
 
@@ -70,3 +72,8 @@ accepted evidence for the exact selected versions and target node:
 Until then, the only supported outcome is synthetic component/orchestration
 evidence with provider success, costs, artifact release, and scientific validity
 explicitly unestablished.
+
+Kubernetes preparation must not use an ambient current context. A future target
+must bind kubeconfig/context/server/CA and observed cluster/namespace identities.
+Bootstrap, target attachment, control-plane provisioning, and destructive cleanup
+are independent human-authorized workflows; automatic teardown is not enabled.

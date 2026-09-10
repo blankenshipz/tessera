@@ -164,6 +164,13 @@ brokering beyond the in-memory fake handle seam, real provider credential
 integration, and invoice/usage reconciliation also remain incomplete. Do not treat
 these control-record tests as end-to-end execution acceptance.
 
+Future Kubernetes admission must additionally bind an explicit target identity and
+an immutable human-approved execution plan; no ambient kube context is admissible.
+Provisioning is a separate scoped-operator workflow, not an effect of execution
+admission. Planned credential delivery (local environment source or Kubernetes
+Secret materialization) requires its own explicit authorization and is not
+implemented by schema v21's metadata-only lease.
+
 ## Synthetic result checkpoints (schema v15)
 
 `POST /execution-grants/{id}/result-checkpoint` is a human-only, idempotent

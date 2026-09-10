@@ -54,6 +54,7 @@ docker pull python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d6
 .venv/bin/python scripts/check_cpu_runtime.py
 .venv/bin/python scripts/check_control_runtime.py
 .venv/bin/python scripts/check_development_e2e.py
+TESSERA_RUN_SYNTHETIC_COMBINED_E2E=1 .venv/bin/python scripts/check_combined_synthetic_e2e.py
 ```
 
 The scripts run synthetic probes in networkless, non-root containers and clean
@@ -69,6 +70,12 @@ development worker against temporary loopback control state. It uses a fixture
 worker registration and grant created directly by the fixture, writes a declared
 synthetic output, and verifies quarantine-only transfer before workspace cleanup.
 It is not a pilot storage, provider, or result-acceptance check.
+
+`check_combined_synthetic_e2e.py` is an additional explicit opt-in. It runs the
+existing in-process OpenCode harness/HTTP-SSE fixtures followed by the native
+development-worker fake-provider Docker fixture. It has no real OpenCode server,
+provider/model call, or provider credential path; see the compatibility matrix
+for its exact scope and activation gates.
 
 On a provisioned Linux output-slot mount, the read-only inspection command is
 `.venv/bin/python scripts/check_persistent_output_storage.py PATH`. It does not
@@ -120,6 +127,10 @@ unauthorized access, and restart behavior when they touch your change.
 Avoid speculative adapters and abstractions. New infrastructure or billable
 providers need a separate proposal. Research runtime skills must never edit the
 platform, policy, or CI; repository-development skills have a different purpose.
+Kubernetes/Minikube bootstrap, target attachment, control-plane provisioning, and
+credential delivery are separate planned workflows: do not rely on the current
+kube context, raw `kubectl`/cloud credentials, or automatic teardown. Do not turn
+a human plan approval into authorization to provision or materialize a Secret.
 
 ## Security reports
 

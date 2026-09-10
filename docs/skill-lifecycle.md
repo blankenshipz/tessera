@@ -12,3 +12,8 @@ those releases, fencing stale plans and revoked or expired releases.
 
 `local-cpu-v1` package preparation and CPU runtime still reject nonempty pins:
 skill materialization and verification are not implemented.
+
+Skills may describe or request a target, provisioning change, or credential access,
+but are never approval principals. They cannot approve immutable execution or
+provisioning plans, materialize Kubernetes Secrets, or receive/use raw `kubectl`
+or cloud credentials. These are planned authority boundaries, not runtime support.
