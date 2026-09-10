@@ -2,7 +2,7 @@
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from .api import idempotency_key, principal
@@ -33,6 +33,17 @@ Experiments = Annotated[ExperimentStore, Depends(store)]
 
 def response(value: tuple[int, dict[str, Any]]) -> JSONResponse:
     return JSONResponse(status_code=value[0], content=value[1])
+
+
+@router.get("/projects/{project_id}/experiments")
+def list_experiments(
+    project_id: str,
+    actor: Actor,
+    records: Experiments,
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    return {"experiments": records.list_experiments(actor, project_id, offset, limit)}
 
 
 @router.post("/projects/{project_id}/experiments")

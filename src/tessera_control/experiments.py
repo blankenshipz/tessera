@@ -120,6 +120,27 @@ class ExperimentStore(Store):
             raise NotFound("Experiment was not found.")
         return dict(row)
 
+    def list_experiments(
+        self, principal: dict[str, Any], project_id: str, offset: int = 0, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """List one project's bounded goal-to-decision records for read-only clients."""
+        if type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= 200:
+            raise StoreError("Invalid experiment pagination.")
+        connection = _connect(self.database_path)
+        try:
+            actor = self._live_principal(connection, principal)
+            self._project(connection, actor, project_id)
+            return [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT * FROM research_experiments WHERE project_id=?
+                    ORDER BY created_at,id LIMIT ? OFFSET ?""",
+                    (project_id, limit, offset),
+                )
+            ]
+        finally:
+            connection.close()
+
     def _variant(
         self, connection: sqlite3.Connection, actor: dict[str, Any], ident: str
     ) -> dict[str, Any]:

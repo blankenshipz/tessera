@@ -150,6 +150,8 @@ export class ControlConnection {
   decisions(projectId, page) {
     return this.#request(`/interaction/projects/${resourceId(projectId)}/decisions?${interactionPageQuery(page)}&status=pending`);
   }
+  experiments(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/experiments?${pageQuery(page)}`); }
+  experiment(experimentId) { return this.#request(`/experiments/${resourceId(experimentId)}`); }
   studies(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/studies?${pageQuery(page)}`); }
   study(studyId) { return this.#request(`/studies/${resourceId(studyId)}`); }
   studyExport(studyId) { return this.#request(`/studies/${resourceId(studyId)}/export`); }

@@ -17,6 +17,7 @@ from tessera_control.store import (
     Forbidden,
     NotFound,
     Store,
+    StoreError,
     _token_hash,
     canonical_digest,
     migrate_state,
@@ -225,6 +226,11 @@ def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
             grant["project_id"],
             payload=_design(),
         )
+    assert [item["id"] for item in records.list_experiments(owner, grant["project_id"])] == [
+        experiment["id"]
+    ]
+    with pytest.raises(StoreError, match="pagination"):
+        records.list_experiments(owner, grant["project_id"], limit=201)
     other_token = "z" * 43
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("INSERT INTO organizations VALUES ('org_other','Other',?)", (utc_now(),))
@@ -243,6 +249,11 @@ def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
     client = TestClient(create_app(state))
     response = client.get(
         f"/experiments/{experiment['id']}",
+        headers={"Authorization": f"Bearer {other_token}"},
+    )
+    assert response.status_code == 404
+    response = client.get(
+        f"/projects/{grant['project_id']}/experiments?offset=0&limit=100",
         headers={"Authorization": f"Bearer {other_token}"},
     )
     assert response.status_code == 404

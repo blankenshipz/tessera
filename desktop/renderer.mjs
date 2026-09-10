@@ -13,6 +13,7 @@ let epoch = 0;
 let connectionId = null;
 let recoveryHeld = true;
 let activeProject = null;
+let activeExperiment = null;
 let activeLedger = null;
 let outcomeContext = null;
 let closeContext = null;
@@ -23,6 +24,7 @@ let eventCursor = 0;
 let threadOffset = 0;
 let decisionOffset = 0;
 let studyOffset = 0;
+let experimentOffset = 0;
 let messageOffset = 0;
 let activeThread = null;
 let threadEpoch = 0;
@@ -31,7 +33,7 @@ let studyEpoch = 0;
 const pendingKeys = new Map();
 const pendingDecisionResolutions = new Map();
 const loading = new Set();
-const readVersion = { threads: 0, messages: 0, decisions: 0, studies: 0, study: 0 };
+const readVersion = { threads: 0, messages: 0, decisions: 0, experiments: 0, experiment: 0, studies: 0, study: 0 };
 
 function notice(message = '') { $('notice').textContent = message; }
 function applyRecoveryStatus(status) {
@@ -73,17 +75,20 @@ function clearContext() {
   recoveryHeld = true;
   $('recovery-banner').hidden = true;
   activeProject = null;
-  projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
+  projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = studyOffset = messageOffset = 0;
   activeThread = null; threadEpoch++; activeStudy = null; activeLedger = null; studyEpoch++;
   pendingKeys.clear();
   pendingDecisionResolutions.clear();
-  for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions', 'studies', 'study-detail']) $(name).replaceChildren();
+  activeExperiment = null;
+  for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions', 'experiments', 'experiment-detail', 'studies', 'study-detail']) $(name).replaceChildren();
   $('project-title').textContent = 'Start with a question.';
   $('welcome').hidden = false;
   $('workspace').hidden = true;
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
   for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
+  $('experiments-more').hidden = true;
+  $('experiment-title').textContent = 'Select an experiment';
   $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
   resetConnectionForm();
@@ -139,13 +144,15 @@ async function selectProject(project) {
   epoch++;
   if (activeProject?.id !== project.id) pendingDecisionResolutions.clear();
   activeProject = project;
-  taskOffset = eventCursor = threadOffset = decisionOffset = studyOffset = messageOffset = 0;
+  taskOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = studyOffset = messageOffset = 0;
   activeThread = null; threadEpoch++; activeStudy = null; activeLedger = null; studyEpoch++;
   const selectionUpdate = api.studySelection(connectionId, null, studyEpoch, null);
-  for (const name of ['threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
-  $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
+  activeExperiment = null;
+  for (const name of ['threads-more', 'messages-more', 'decisions-more', 'experiments-more', 'studies-more']) $(name).hidden = true;
+  $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('experiments').replaceChildren(); $('experiment-detail').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
   $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
+  $('experiment-title').textContent = 'Select an experiment';
   $('study-export').hidden = true;
   $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
@@ -155,7 +162,7 @@ async function selectProject(project) {
     if (button.dataset.projectId === project.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   }
-  await Promise.all([selectionUpdate, loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true), loadStudies(true)]);
+  await Promise.all([selectionUpdate, loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true), loadExperiments(true), loadStudies(true)]);
 }
 async function loadTasks() {
   const version = epoch;
@@ -413,6 +420,125 @@ function ledgerCard(title, id, value) {
   return card;
 }
 function ledgerText(value) { return JSON.stringify(value); }
+function isDigest(value) { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value); }
+function completeExperimentLedger(ledger, experiment, project) {
+  if (!ledger || ledger.completeness !== 'complete_in_scope_goal_to_decision_chain' ||
+      !ledger.experiment || ledger.experiment.id !== experiment.id ||
+      ledger.experiment.project_id !== project.id || !ledger.experiment.design ||
+      ledger.experiment.current_design_revision !== experiment.current_design_revision ||
+      ledger.experiment.design.revision !== ledger.experiment.current_design_revision ||
+      !Array.isArray(ledger.experiment.design.variants) ||
+      !['designs', 'variants', 'attempts', 'operations', 'artifact_links', 'artifacts', 'measurements', 'conclusions'].every(name => Array.isArray(ledger[name]))) return false;
+  const variants = ledger.experiment.design.variants;
+  return variants.length === 2 && new Set(variants.map(item => item.kind)).size === 2 &&
+    variants.every(item => ['baseline', 'intervention'].includes(item.kind) && isDigest(item.method_digest) && isDigest(item.input_digest)) &&
+    ledger.attempts.every(item => ['succeeded', 'failed', 'cancelled', 'inconclusive'].includes(item.outcome) && item.scientific_validity === 'not_assessed') &&
+    ledger.conclusions.every(item => ['draft', 'reviewed'].includes(item.status) && item.scientific_validity === 'not_assessed');
+}
+function renderExperimentLedger(ledger) {
+  const detail = $('experiment-detail'); detail.replaceChildren();
+  const experiment = ledger.experiment;
+  const summary = element('article', undefined, 'card');
+  summary.append(element('span', `Design revision ${experiment.current_design_revision}`, 'tag'));
+  summary.append(element('p', `Goal: ${experiment.goal}`));
+  summary.append(element('p', `Success criterion: ${experiment.success_criterion}`));
+  summary.append(element('p', `Protocol: ${experiment.design.protocol}`));
+  summary.append(element('p', 'Completeness: complete in-scope goal-to-decision chain. This projection cannot approve, dispatch, or edit conclusions.', 'muted'));
+  detail.append(summary);
+  const section = (title, records, render) => {
+    detail.append(element('h4', `${title} (${records.length})`));
+    if (!records.length) detail.append(element('p', `No ${title.toLowerCase()} recorded.`, 'muted'));
+    else for (const record of records) detail.append(render(record));
+  };
+  section('Baseline and intervention variants', experiment.design.variants, variant => {
+    const card = ledgerCard(`${variant.kind}: ${variant.name}`, 'experimentVariantId', variant);
+    card.append(element('p', `Method digest: ${variant.method_digest}`));
+    card.append(element('p', `Input digest: ${variant.input_digest}`));
+    card.append(element('p', `Registered metadata: ${ledgerText(variant.metadata)}`));
+    return card;
+  });
+  section('Attempts', ledger.attempts, attempt => {
+    const card = ledgerCard(`Attempt ${attempt.id}`, 'experimentAttemptId', attempt);
+    const outcome = ['succeeded', 'failed', 'cancelled', 'inconclusive'].includes(attempt.outcome) ? attempt.outcome : 'unrecognized';
+    card.append(element('span', `Operational outcome: ${outcome}`, 'tag'));
+    card.append(element('p', `Variant: ${attempt.variant_id} · operation: ${attempt.operation_id}`));
+    if (attempt.reason) card.append(element('p', `Recorded reason: ${attempt.reason}`));
+    card.append(element('p', 'Operational outcome is not scientific success. Scientific validity: not assessed.', 'muted'));
+    const links = ledger.artifact_links.filter(link => link.attempt_id === attempt.id);
+    const measurements = ledger.measurements.filter(measurement => measurement.attempt_id === attempt.id);
+    card.append(element('p', `Linked artifacts: ${links.map(link => link.artifact_id).join(', ') || 'none'}`));
+    card.append(element('p', `Linked measurements: ${measurements.map(measurement => measurement.id).join(', ') || 'none'}`));
+    for (const measurement of measurements) card.append(element('p', `${measurement.name}: ${ledgerText(measurement.value)}${measurement.artifact_id ? ` · artifact ${measurement.artifact_id}` : ''}`));
+    return card;
+  });
+  section('Linked artifact records', ledger.artifacts, artifact => {
+    const card = ledgerCard(`Artifact ${artifact.id}`, 'experimentArtifactId', artifact);
+    card.append(element('p', `Path: ${artifact.relative_path} · digest: ${artifact.sha256}`));
+    card.append(element('p', `Retention status: ${artifact.status} · classification: ${artifact.classification}`, 'muted'));
+    return card;
+  });
+  section('Human conclusions', ledger.conclusions, conclusion => {
+    const card = ledgerCard(`${conclusion.status === 'reviewed' ? 'Reviewed human conclusion' : 'Draft conclusion'} ${conclusion.id}`, 'experimentConclusionId', conclusion);
+    card.append(element('p', conclusion.statement));
+    card.append(element('p', `Evidence: ${conclusion.evidence.map(item => `${item.attempt_id} [artifacts: ${item.artifact_id ?? 'none'}; measurements: ${item.measurement_id ?? 'none'}]`).join('; ')}`));
+    card.append(element('p', `Scientific validity: ${conclusion.scientific_validity}. Human review records an interpretation; it does not establish scientific success.`, 'muted'));
+    return card;
+  });
+}
+async function loadExperiments(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) readVersion.experiments++;
+  const requestVersion = readVersion.experiments;
+  const loadingKey = `experiments:${version}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('experiments-more').disabled = true;
+  if (reset) { experimentOffset = 0; $('experiments').replaceChildren(element('p', 'Loading experiments…', 'muted')); }
+  try {
+    const response = await api.experiments(connectionId, project.id, { offset: experimentOffset, limit: 100 });
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.experiments) return;
+    if (!response || !Array.isArray(response.experiments)) throw new Error('The control plane did not return an experiment list.');
+    if (reset) $('experiments').replaceChildren();
+    for (const experiment of response.experiments) {
+      const button = element('button', `${experiment.goal} · design revision ${experiment.current_design_revision}`);
+      button.dataset.experimentId = experiment.id;
+      button.addEventListener('click', () => guarded(() => selectExperiment(experiment)));
+      $('experiments').append(button);
+    }
+    experimentOffset += response.experiments.length;
+    $('experiments-more').hidden = response.experiments.length < 100 || experimentOffset > 100000;
+    if (!experimentOffset) $('experiments').append(element('p', 'No goal-to-decision experiments recorded.', 'muted'));
+  } catch (error) {
+    if (version === epoch && project === activeProject && requestVersion === readVersion.experiments) {
+      if (reset) $('experiments').replaceChildren(element('p', 'Could not load experiments. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey);
+    if (version === epoch && project === activeProject && requestVersion === readVersion.experiments) $('experiments-more').disabled = false;
+  }
+}
+async function selectExperiment(experiment) {
+  const version = epoch; const project = activeProject; const requestVersion = ++readVersion.experiment;
+  activeExperiment = experiment;
+  $('experiment-title').textContent = `Experiment ${experiment.id}`;
+  $('experiment-detail').replaceChildren(element('p', 'Loading complete goal-to-decision chain…', 'muted'));
+  for (const button of $('experiments').children) {
+    if (button.dataset.experimentId === experiment.id) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  try {
+    const ledger = await api.experiment(connectionId, experiment.id);
+    if (version !== epoch || project !== activeProject || experiment !== activeExperiment || requestVersion !== readVersion.experiment) return;
+    if (!completeExperimentLedger(ledger, experiment, project)) throw new Error('The control plane did not return a complete current experiment ledger.');
+    Object.assign(experiment, ledger.experiment);
+    renderExperimentLedger(ledger);
+  } catch (error) {
+    if (version === epoch && project === activeProject && experiment === activeExperiment && requestVersion === readVersion.experiment) {
+      $('experiment-detail').replaceChildren(element('p', 'Could not load a complete current experiment ledger. Partial, stale, or digest-inconsistent records are not shown; use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  }
+}
 function renderStudyLedger(ledger) {
   const { study, variants, sources, findings, corrections, events } = ledger;
   const detail = $('study-detail'); detail.replaceChildren();
@@ -1020,6 +1146,7 @@ $('events-more').addEventListener('click', () => guarded(() => loadEvents()));
 $('threads-more').addEventListener('click', () => guarded(() => loadThreads()));
 $('messages-more').addEventListener('click', () => guarded(() => loadMessages()));
 $('decisions-more').addEventListener('click', () => guarded(() => loadDecisions()));
+$('experiments-more').addEventListener('click', () => guarded(() => loadExperiments()));
 $('studies-more').addEventListener('click', () => guarded(() => loadStudies()));
 if (!api) {
   $('connection-open').disabled = true;

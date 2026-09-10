@@ -58,6 +58,16 @@ fetch external content. If the server cannot
 produce its bounded complete ledger, the desktop shows an error rather than a
 partial view labeled complete.
 
+The goal-to-decision panel separately lists a project's schema-v25 experiments
+and renders only a complete current chain: goal, success criterion, registered
+baseline/intervention digests, attempts, linked retained artifacts/measurements,
+and draft or reviewed human conclusions. It is read-only: it cannot approve,
+dispatch, or edit a conclusion. Attempt `succeeded` and a reviewed conclusion
+remain explicitly labeled operational/human records with scientific validity
+`not_assessed`; they never display scientific success. Project or connection
+switches discard pending experiment reads, and incomplete, stale-revision, or
+digest-inconsistent responses are not rendered.
+
 “Save study ledger JSON” fetches a fresh, complete selected-study snapshot and
 uses a native save dialog to create a private JSON file. Choose a new filename;
 existing files are never replaced. Connection or study changes before publication

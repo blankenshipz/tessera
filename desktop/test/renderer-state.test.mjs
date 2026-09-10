@@ -30,7 +30,7 @@ function fixture(overrides = {}) {
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
     studySelection: async () => {},
     recovery: async () => ({ state: 'active', recovery_hold: false }),
-    decisions: async () => ({ decisions: [] }), studies: async () => ({ studies: [] }),
+    decisions: async () => ({ decisions: [] }), experiments: async () => ({ experiments: [] }), studies: async () => ({ studies: [] }),
     createStudy: async () => ({ id: 's-created', purpose: 'Created', protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1, project_id: 'p1' }),
     registerVariant: async () => ({ id: 'v-created' }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
@@ -39,7 +39,7 @@ function fixture(overrides = {}) {
     FormData: class { constructor(form) { this.fields = { ...form.fields }; } get(name) { return this.fields[name]; } },
   });
   const source = readFileSync(new URL('../renderer.mjs', import.meta.url), 'utf8');
-  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadStudies, selectStudy, loadEvents, clearContext, state: () => ({ activeProject, activeThread, activeStudy }) };', context);
+  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadExperiments, selectExperiment, loadStudies, selectStudy, loadEvents, clearContext, state: () => ({ activeProject, activeThread, activeExperiment, activeStudy }) };', context);
   return { ...context.hooks, get, api, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
 }
 const thread = id => ({ id, title: id });
@@ -65,6 +65,25 @@ const ledger = (studyId = 's1', variants = []) => ({
   completeness: 'complete_in_scope_study_ledger',
   study: { id: studyId, project_id: 'p1', purpose: `Purpose ${studyId}`, protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1 },
   variants, sources: [], findings: [], corrections: [], events: [],
+});
+const experimentLedger = (id = 'e1', projectId = 'p1') => ({
+  completeness: 'complete_in_scope_goal_to_decision_chain',
+  experiment: { id, project_id: projectId, goal: 'Reduce synthetic processing time.',
+    success_criterion: 'A human compares retained measurements to the baseline.', current_design_revision: 2,
+    design: { revision: 2, protocol: 'Compare bounded variants.', variants: [
+      { id: 'baseline', kind: 'baseline', name: 'Baseline', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: { role: 'control' } },
+      { id: 'intervention', kind: 'intervention', name: 'Intervention', method_digest: 'c'.repeat(64), input_digest: 'd'.repeat(64), metadata: { role: 'change' } },
+    ] } },
+  designs: [], variants: [], operations: [],
+  attempts: ['failed', 'cancelled', 'inconclusive', 'succeeded'].map((outcome, index) => ({
+    id: `attempt-${outcome}`, variant_id: index === 3 ? 'intervention' : 'baseline', operation_id: `operation-${outcome}`,
+    outcome, reason: outcome === 'succeeded' ? null : `Recorded ${outcome} reason.`, scientific_validity: 'not_assessed',
+  })),
+  artifact_links: [{ attempt_id: 'attempt-succeeded', artifact_id: 'artifact-1' }],
+  artifacts: [{ id: 'artifact-1', relative_path: 'results/metric.json', sha256: 'e'.repeat(64), status: 'quarantined', classification: 'unclassified' }],
+  measurements: [{ id: 'measurement-1', attempt_id: 'attempt-succeeded', name: 'duration', value: { seconds: 1 }, artifact_id: 'artifact-1' }],
+  conclusions: [{ id: 'conclusion-1', status: 'reviewed', statement: 'The intervention merits follow-up.',
+    evidence: [{ attempt_id: 'attempt-succeeded', artifact_id: 'artifact-1', measurement_id: 'measurement-1' }], scientific_validity: 'not_assessed' }],
 });
 
 test('renderer keeps earlier pages, removes loading markers, and deduplicates concurrent More reads', async () => {
@@ -189,6 +208,53 @@ test('cancellation telemetry never renders unresolved termination as stopped or 
     'Cancellation termination confirmed — operational observation only',
   ]);
   assert.ok(labels.every(label => !/stopped|successful/i.test(label)));
+});
+
+test('experiment projection renders designs, terminal outcomes, linked evidence, and reviewed human conclusions without scientific success', async () => {
+  const data = experimentLedger();
+  const ui = fixture({ experiments: async () => ({ experiments: [{ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 }] }),
+    experiment: async () => data });
+  await ui.selectProject(project('p1'));
+  await ui.selectExperiment({ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 });
+  const detail = ui.get('experiment-detail');
+  for (const outcome of ['failed', 'cancelled', 'inconclusive', 'succeeded']) {
+    assert.ok(find(detail, node => node.textContent === `Operational outcome: ${outcome}`));
+  }
+  assert.ok(find(detail, node => node.textContent === 'Method digest: ' + 'a'.repeat(64)));
+  assert.ok(find(detail, node => node.textContent === 'Linked artifacts: artifact-1'));
+  assert.ok(find(detail, node => node.textContent === 'Linked measurements: measurement-1'));
+  assert.ok(find(detail, node => /Reviewed human conclusion/.test(node.textContent)));
+  const text = JSON.stringify(detail);
+  assert.match(text, /Operational outcome is not scientific success\. Scientific validity: not assessed\./);
+  assert.match(text, /Human review records an interpretation; it does not establish scientific success\./);
+  assert.equal(findAll(detail, node => node.tagName === 'a').length, 0);
+});
+
+test('experiment projection has an empty state and fences stale project, revision, and digest replies', async () => {
+  const late = deferred();
+  const ui = fixture({ experiments: async (_connection, projectId) => projectId === 'p1' ?
+    { experiments: [{ id: 'e1', goal: 'Old goal', current_design_revision: 2 }] } : { experiments: [] },
+  experiment: async (_connection, id) => id === 'e1' ? late.promise : experimentLedger('e2', 'p2') });
+  await ui.selectProject(project('p1'));
+  assert.equal(ui.get('experiments').children[0].textContent, 'Old goal · design revision 2');
+  const old = ui.selectExperiment({ id: 'e1', goal: 'Old goal', current_design_revision: 2 });
+  await ui.selectProject(project('p2'));
+  late.resolve(experimentLedger('e1', 'p1')); await old;
+  assert.equal(ui.state().activeProject.id, 'p2');
+  assert.equal(ui.get('experiment-title').textContent, 'Select an experiment');
+  assert.equal(ui.get('experiments').children[0].textContent, 'No goal-to-decision experiments recorded.');
+
+  await ui.selectProject(project('p1'));
+  const inconsistent = experimentLedger();
+  inconsistent.experiment.current_design_revision = 1;
+  inconsistent.experiment.design.revision = 1;
+  ui.api.experiment = async () => inconsistent;
+  await assert.rejects(ui.selectExperiment({ id: 'e1', goal: 'Old goal', current_design_revision: 2 }), /complete current experiment ledger/);
+  assert.match(ui.get('experiment-detail').children[0].textContent, /Partial, stale, or digest-inconsistent/);
+  ui.api.experiment = async () => {
+    const malformed = experimentLedger(); malformed.experiment.design.variants[0].method_digest = 'stale-digest'; return malformed;
+  };
+  await assert.rejects(ui.selectExperiment({ id: 'e1', goal: 'Old goal', current_design_revision: 2 }), /complete current experiment ledger/);
 });
 
 test('switching thread while a command key is pending prevents message dispatch', async () => {

@@ -73,6 +73,7 @@ const handlers = {
   recovery: () => connection.recovery(),
   threads: (id, page) => connection.threads(id, page), messages: (id, page) => connection.messages(id, page),
   decisions: (id, page) => connection.decisions(id, page),
+  experiments: (id, page) => connection.experiments(id, page), experiment: id => connection.experiment(id),
   studies: (id, page) => connection.studies(id, page), study: id => connection.study(id),
   createStudy: (id, body, key) => connection.createStudy(id, body, key),
   registerVariant: (id, body, key) => connection.registerVariant(id, body, key),

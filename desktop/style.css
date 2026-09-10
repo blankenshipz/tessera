@@ -30,7 +30,7 @@ p { line-height: 1.65; }
 .messages { min-height: 100px; max-height: 380px; overflow: auto; margin: 18px 0; }
 .message { border-bottom: 1px solid #d8ddcf; padding: 10px 0; }
 .message .tag { margin-right: 8px; }
-.inbox { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
+.inbox, .experiments { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
 .ledger { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
 .ledger-grid { display: grid; grid-template-columns: minmax(220px, .65fr) minmax(360px, 1.35fr); gap: 28px; }
 .ledger-detail { min-height: 160px; }

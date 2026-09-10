@@ -130,6 +130,27 @@ test('research ledger routes use bounded read-only study requests', async () => 
   assert.throws(() => connection.study('../study'));
 });
 
+test('goal-to-decision routes are scoped authenticated reads without command keys', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ experiments: [] });
+  });
+  await connection.connect(config());
+  await connection.experiments('project_1', { offset: 100, limit: 200 });
+  await connection.experiment('experiment_1');
+  assert.match(calls[1].url, /\/projects\/project_1\/experiments\?offset=100&limit=200$/);
+  assert.match(calls[2].url, /\/experiments\/experiment_1$/);
+  for (const call of calls.slice(1)) {
+    assert.equal(call.options.method, 'GET');
+    assert.equal(call.options.body, undefined);
+    assert.equal(call.options.headers['Idempotency-Key'], undefined);
+  }
+  assert.throws(() => connection.experiments('../project'));
+  assert.throws(() => connection.experiment('../experiment'));
+  assert.throws(() => connection.experiments('project_1', { limit: 201 }));
+});
+
 test('immutable task-plan detail is a digest-addressed authenticated read', async () => {
   const calls = [];
   const digest = 'a'.repeat(64);
