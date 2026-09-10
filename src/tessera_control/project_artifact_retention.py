@@ -108,6 +108,11 @@ class ProjectArtifactRetentionStore(Store):
             raise Conflict("Project artifact deletion is no longer reserved.")
         self._delete_allowed(connection, row)
 
+    def _delete_replay_ready(self, connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+        """Allow a completed same-key delete replay, but no earlier terminal state."""
+        if row["state"] != "deleted":
+            self._delete_ready(connection, row)
+
     def tombstone(
         self, actor: dict[str, Any], project_id: str, artifact_id: str, key: str, digest: str
     ):
@@ -158,12 +163,22 @@ class ProjectArtifactRetentionStore(Store):
             path + "/intent",
             digest,
             intent,
-            replay_guard=lambda connection, live, _: self._delete_ready(
+            replay_guard=lambda connection, live, _: self._delete_replay_ready(
                 connection, self._object(connection, live, project_id, artifact_id)
             ),
         )
         if status == 200 and row["state"] == "deleted":
             return status, {"state": "deleted"}
+        # The intent's cached response predates the backend call.  A same-key
+        # replay must observe the terminal state rather than trying deletion
+        # again because that cached response remains ``delete_intent``.
+        connection = _connect(self.database_path)
+        try:
+            live = self._live_principal(connection, actor)
+            if self._object(connection, live, project_id, artifact_id)["state"] == "deleted":
+                return 200, {"state": "deleted"}
+        finally:
+            connection.close()
         placement = ProjectArtifactPlacement(
             row["tenant_namespace"],
             row["project_namespace"],
@@ -196,7 +211,9 @@ class ProjectArtifactRetentionStore(Store):
             failure = "Project artifact object is missing during deletion." if not deleted else None
 
         def finish(connection: sqlite3.Connection, live: dict[str, Any]):
-            self._object(connection, live, project_id, artifact_id)
+            current = self._object(connection, live, project_id, artifact_id)
+            if current["state"] == "deleted":
+                return 200, {"state": "deleted"}
             now = utc_now()
             if failure is None:
                 connection.execute(

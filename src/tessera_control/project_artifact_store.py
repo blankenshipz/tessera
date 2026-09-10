@@ -116,12 +116,26 @@ class ProjectArtifactStore(ArtifactManifestStore):
         """Record authority intent only; no backend call may occur in this transaction."""
         path = f"/worker/leases/{lease_id}/project-artifacts/intents"
 
-        def command(connection: sqlite3.Connection, actor: dict[str, Any]):
+        def admissible(connection: sqlite3.Connection, actor: dict[str, Any]) -> None:
             lease, grant = self._grant_for_upload(connection, actor, lease_id)
             if body["expected_epoch"] != lease["epoch"] or body[
                 "operation_id"
             ] != self._expected_operation(lease_id):
                 raise Conflict("Project artifact placement does not match the lease.")
+            for entry in body["artifacts"]:
+                artifact = self._artifact(connection, lease_id, actor, entry)
+                retention_record = connection.execute(
+                    "SELECT state FROM project_artifact_retention WHERE artifact_id=?",
+                    (artifact["id"],),
+                ).fetchone()
+                if retention_record is not None:
+                    require_project_artifact_reference_admissible(
+                        connection, grant["project_id"], artifact["id"]
+                    )
+
+        def command(connection: sqlite3.Connection, actor: dict[str, Any]):
+            admissible(connection, actor)
+            _lease, grant = self._grant_for_upload(connection, actor, lease_id)
             now = utc_now()
             binding = connection.execute(
                 "SELECT * FROM project_storage_bindings WHERE project_id=?", (grant["project_id"],)
@@ -210,7 +224,16 @@ class ProjectArtifactStore(ArtifactManifestStore):
                 "operations": prepared,
             }
 
-        return self._mutate(worker, key, "POST", path, digest, command, audience="worker")
+        return self._mutate(
+            worker,
+            key,
+            "POST",
+            path,
+            digest,
+            command,
+            audience="worker",
+            replay_guard=lambda connection, actor, _: admissible(connection, actor),
+        )
 
     def _mark_reconciling(
         self, worker: dict[str, Any], lease_id: str, key: str, digest: str, operations: list[dict]
@@ -279,20 +302,41 @@ class ProjectArtifactStore(ArtifactManifestStore):
         # Backend calls deliberately happen after the intent transaction commits.
         # A crash at any point leaves an intent that this same request can reconcile.
         self._mark_reconciling(worker, lease_id, key, digest, prepared["operations"])
+        # Serialize a backend publication with deletion.  The database reservation
+        # is the existing cross-process coordination primitive: a deleter either
+        # observes this completed publication, or this publisher observes its
+        # tombstone before it can recreate the original object key.
         placements: dict[str, ProjectArtifactPlacement] = {}
-        for operation in prepared["operations"]:
-            if operation["artifact_id"] is None:
-                continue
-            connection = sqlite3.connect(self.database_path)
-            connection.row_factory = sqlite3.Row
-            try:
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            lease, grant = self._grant_for_upload(connection, worker, lease_id)
+            if body["expected_epoch"] != lease["epoch"] or body[
+                "operation_id"
+            ] != self._expected_operation(lease_id):
+                raise Conflict("Project artifact placement does not match the lease.")
+            tenant_id = connection.execute(
+                "SELECT org_id FROM projects WHERE id=?", (grant["project_id"],)
+            ).fetchone()[0]
+            for operation in prepared["operations"]:
+                if operation["artifact_id"] is None:
+                    continue
+                retention_record = connection.execute(
+                    "SELECT state FROM project_artifact_retention WHERE artifact_id=?",
+                    (operation["artifact_id"],),
+                ).fetchone()
+                if retention_record is not None:
+                    require_project_artifact_reference_admissible(
+                        connection, grant["project_id"], operation["artifact_id"]
+                    )
                 artifact = connection.execute(
                     "SELECT content FROM artifacts WHERE id=?", (operation["artifact_id"],)
                 ).fetchone()
                 if artifact is None or type(artifact["content"]) is not bytes:
                     raise Conflict("Quarantined artifact was not found.")
                 placement = self.backend.reconcile(
-                    worker["org_id"],
+                    tenant_id,
                     prepared["project_id"],
                     operation["artifact_id"],
                     operation["sha256"],
@@ -301,7 +345,7 @@ class ProjectArtifactStore(ArtifactManifestStore):
                 if placement is None:
                     placement = self.backend.commit(
                         self.backend.stage(
-                            worker["org_id"],
+                            tenant_id,
                             prepared["project_id"],
                             operation["artifact_id"],
                             operation["sha256"],
@@ -309,10 +353,17 @@ class ProjectArtifactStore(ArtifactManifestStore):
                         )
                     )
                 placements[operation["artifact_id"]] = placement
-            except ProjectArtifactStorageError as error:
-                raise Conflict("Project artifact storage could not commit bytes.") from error
-            finally:
-                connection.close()
+            connection.execute("COMMIT")
+        except ProjectArtifactStorageError as error:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise Conflict("Project artifact storage could not commit bytes.") from error
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
         path = f"/worker/leases/{lease_id}/project-artifacts"
 
         def command(connection: sqlite3.Connection, actor: dict[str, Any]):

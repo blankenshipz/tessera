@@ -535,6 +535,71 @@ def test_delete_intent_rejects_manifest_admission_and_republication(tmp_path: Pa
         owner, grant["project_id"], artifact["id"], "delete", "delete"
     )[1]["state"] == "deleted"
 
+    # The original placement command must not replay its cached intent into the
+    # deterministic object key after deletion either.
+    with pytest.raises(Conflict, match="reserved for deletion"):
+        ProjectArtifactStore(state, backend).commit_project_artifacts(
+            worker, lease["id"], "place", canonical_digest(placement), placement
+        )
+
+
+def test_same_key_delete_replay_is_terminal_and_concurrent_failure_cannot_regress(tmp_path: Path) -> None:
+    state, _, owner, worker, grant, lease = _delivery(tmp_path)
+    payload = _payload(lease, b"delete-replay")
+    from tessera_control.artifacts import ArtifactStore
+
+    artifact = ArtifactStore(state).upload_artifact(
+        worker, lease["id"], "upload", canonical_digest(payload), payload
+    )[1]
+    class RacingDeleteBackend(FakeProjectArtifactBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+            self.calls = 0
+
+        def delete(self, tenant_id, project_id, artifact_id, object_placement):
+            self.calls += 1
+            if self.calls == 1:
+                self.first_started.set()
+                assert self.release_first.wait(5)
+            return super().delete(tenant_id, project_id, artifact_id, object_placement)
+
+    backend = RacingDeleteBackend()
+    placement = {
+        "expected_epoch": lease["epoch"], "operation_id": payload["operation_id"],
+        "artifacts": [{"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}],
+    }
+    ProjectArtifactStore(state, backend).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(placement), placement
+    )
+    retention = ProjectArtifactRetentionStore(state, backend)
+    retention.tombstone(owner, grant["project_id"], artifact["id"], "tomb", "tomb")
+    results: list[tuple[int, dict]] = []
+    errors: list[Exception] = []
+
+    def delete(key: str) -> None:
+        try:
+            results.append(retention.reconcile_delete(owner, grant["project_id"], artifact["id"], key, key))
+        except Exception as error:  # pragma: no cover - assertion reports this deterministically
+            errors.append(error)
+
+    first = threading.Thread(target=delete, args=("delete",))
+    first.start()
+    assert backend.first_started.wait(5)
+    second = threading.Thread(target=delete, args=("concurrent",))
+    second.start()
+    second.join(5)
+    backend.release_first.set()
+    first.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    assert all(response[1]["state"] == "deleted" for response in results)
+    assert retention.reconcile_delete(
+        owner, grant["project_id"], artifact["id"], "delete", "delete"
+    ) == (200, {"state": "deleted"})
+    assert retention.inspect(owner, grant["project_id"], artifact["id"])["state"] == "deleted"
+
 
 def test_reference_before_deletion_reservation_prevents_delete(tmp_path: Path) -> None:
     state, _, owner, worker, grant, lease = _delivery(tmp_path)
