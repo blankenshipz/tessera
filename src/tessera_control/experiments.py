@@ -32,8 +32,20 @@ T = TypeVar("T", bound=BaseModel)
 EXPORT_RECORD_LIMIT = 1_000
 
 
-def create_experiment_schema(connection: sqlite3.Connection) -> None:
+def create_experiment_schema(
+    connection: sqlite3.Connection, *, with_design_context: bool = True
+) -> None:
     """Install empty additive goal-to-decision records without backfilling evidence."""
+    design_context = (
+        "goal TEXT NOT NULL, success_criterion TEXT NOT NULL," if with_design_context else ""
+    )
+    conclusion_context = "design_revision INTEGER," if with_design_context else ""
+    conclusion_snapshot_fk = (
+        ", FOREIGN KEY(experiment_id,design_revision) "
+        "REFERENCES research_experiment_designs(experiment_id,revision)"
+        if with_design_context
+        else ""
+    )
     statements = (
         """CREATE TABLE IF NOT EXISTS research_experiments (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
@@ -42,9 +54,9 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         created_by_principal_id TEXT NOT NULL REFERENCES principals(id))""",
         "CREATE INDEX IF NOT EXISTS research_experiments_by_project ON research_experiments(project_id,created_at,id)",
-        """CREATE TABLE IF NOT EXISTS research_experiment_designs (
+        f"""CREATE TABLE IF NOT EXISTS research_experiment_designs (
         experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
-        revision INTEGER NOT NULL CHECK (revision >= 1), protocol TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1), {design_context} protocol TEXT NOT NULL,
         created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
         PRIMARY KEY (experiment_id,revision))""",
         """CREATE TABLE IF NOT EXISTS research_experiment_variants (
@@ -73,12 +85,13 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
         name TEXT NOT NULL, value_json TEXT NOT NULL, artifact_id TEXT REFERENCES artifacts(id),
         created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id))""",
         "CREATE INDEX IF NOT EXISTS research_attempt_measurements_by_attempt ON research_attempt_measurements(attempt_id,created_at,id)",
-        """CREATE TABLE IF NOT EXISTS research_conclusions (
+        f"""CREATE TABLE IF NOT EXISTS research_conclusions (
         id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+        {conclusion_context}
         statement TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('draft','reviewed')),
         revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         created_by_principal_id TEXT NOT NULL REFERENCES principals(id), reviewed_at TEXT,
-        reviewed_by_principal_id TEXT REFERENCES principals(id))""",
+        reviewed_by_principal_id TEXT REFERENCES principals(id){conclusion_snapshot_fk})""",
         "CREATE INDEX IF NOT EXISTS research_conclusions_by_experiment ON research_conclusions(experiment_id,created_at,id)",
         """CREATE TABLE IF NOT EXISTS research_conclusion_evidence (
         conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
@@ -273,8 +286,18 @@ class ExperimentStore(Store):
         now: str,
     ) -> None:
         connection.execute(
-            "INSERT INTO research_experiment_designs (experiment_id,revision,protocol,created_at,created_by_principal_id) VALUES (?,?,?,?,?)",
-            (experiment["id"], revision, protocol, now, actor["id"]),
+            """INSERT INTO research_experiment_designs
+            (experiment_id,revision,goal,success_criterion,protocol,created_at,created_by_principal_id)
+            VALUES (?,?,?,?,?,?,?)""",
+            (
+                experiment["id"],
+                revision,
+                experiment["goal"],
+                experiment["success_criterion"],
+                protocol,
+                now,
+                actor["id"],
+            ),
         )
         for variant in variants:
             connection.execute(
@@ -640,6 +663,11 @@ class ExperimentStore(Store):
                 or conclusion["revision"] != body["expected_revision"]
             ):
                 raise Conflict("Reviewed or stale conclusions cannot be changed.")
+            if (
+                body["design_revision"] is not None
+                and body["design_revision"] != conclusion["design_revision"]
+            ):
+                raise Conflict("Conclusion design snapshot cannot change.")
             evidence = self._validate_evidence(
                 connection, conclusion["experiment_id"], body["evidence"]
             )
@@ -686,10 +714,20 @@ class ExperimentStore(Store):
             self._human(actor)
             experiment = self._experiment(connection, actor, experiment_id)
             evidence = self._validate_evidence(connection, experiment_id, body["evidence"])
+            design_revision = body["design_revision"] or experiment["current_design_revision"]
+            if (
+                connection.execute(
+                    "SELECT 1 FROM research_experiment_designs WHERE experiment_id=? AND revision=?",
+                    (experiment_id, design_revision),
+                ).fetchone()
+                is None
+            ):
+                raise Conflict("Experiment design snapshot was not found.")
             now, ident = utc_now(), "conclusion_" + uuid.uuid4().hex
             row = {
                 "id": ident,
                 "experiment_id": experiment_id,
+                "design_revision": design_revision,
                 "statement": body["statement"],
                 "status": "draft",
                 "revision": 1,
@@ -700,7 +738,11 @@ class ExperimentStore(Store):
                 "reviewed_by_principal_id": None,
             }
             connection.execute(
-                """INSERT INTO research_conclusions (id,experiment_id,statement,status,revision,created_at,updated_at,created_by_principal_id,reviewed_at,reviewed_by_principal_id) VALUES (:id,:experiment_id,:statement,:status,:revision,:created_at,:updated_at,:created_by_principal_id,:reviewed_at,:reviewed_by_principal_id)""",
+                """INSERT INTO research_conclusions
+                (id,experiment_id,design_revision,statement,status,revision,created_at,updated_at,
+                 created_by_principal_id,reviewed_at,reviewed_by_principal_id)
+                VALUES (:id,:experiment_id,:design_revision,:statement,:status,:revision,:created_at,
+                :updated_at,:created_by_principal_id,:reviewed_at,:reviewed_by_principal_id)""",
                 row,
             )
             connection.executemany(
@@ -716,6 +758,7 @@ class ExperimentStore(Store):
                 {
                     "experiment_id": experiment_id,
                     "conclusion_id": ident,
+                    "design_revision": design_revision,
                     "scientific_validity": "not_assessed",
                 },
             )
@@ -756,6 +799,11 @@ class ExperimentStore(Store):
                 or conclusion["revision"] != body["expected_revision"]
             ):
                 raise Conflict("Conclusion revision is no longer reviewable.")
+            if (
+                body["design_revision"] is not None
+                and body["design_revision"] != conclusion["design_revision"]
+            ):
+                raise Conflict("Conclusion design snapshot is no longer reviewable.")
             now, revision = utc_now(), conclusion["revision"] + 1
             connection.execute(
                 "UPDATE research_conclusions SET status='reviewed',revision=?,updated_at=?,reviewed_at=?,reviewed_by_principal_id=? WHERE id=? AND revision=? AND status='draft'",
@@ -778,6 +826,7 @@ class ExperimentStore(Store):
                 {
                     "experiment_id": experiment["id"],
                     "conclusion_id": conclusion_id,
+                    "design_revision": conclusion["design_revision"],
                     "scientific_validity": "not_assessed",
                 },
             )
@@ -799,24 +848,40 @@ class ExperimentStore(Store):
             )
         ]
         result["scientific_validity"] = "not_assessed"
+        result["design_snapshot"] = (
+            self._design_response(connection, row["experiment_id"], row["design_revision"])
+            if row["design_revision"] is not None
+            else None
+        )
+        return result
+
+    def _design_response(
+        self, connection: sqlite3.Connection, experiment_id: str, revision: int
+    ) -> dict[str, Any]:
+        design = connection.execute(
+            "SELECT * FROM research_experiment_designs WHERE experiment_id=? AND revision=?",
+            (experiment_id, revision),
+        ).fetchone()
+        if design is None:
+            raise Conflict("Experiment design snapshot is missing.")
+        result = dict(design)
+        result["variants"] = [
+            self._variant_response(dict(row))
+            for row in connection.execute(
+                """SELECT * FROM research_experiment_variants
+                WHERE experiment_id=? AND design_revision=? ORDER BY kind""",
+                (experiment_id, revision),
+            )
+        ]
         return result
 
     def _experiment_response(
         self, connection: sqlite3.Connection, experiment: dict[str, Any]
     ) -> dict[str, Any]:
         result = dict(experiment)
-        design = connection.execute(
-            "SELECT * FROM research_experiment_designs WHERE experiment_id=? AND revision=?",
-            (experiment["id"], experiment["current_design_revision"]),
-        ).fetchone()
-        result["design"] = dict(design)
-        result["design"]["variants"] = [
-            self._variant_response(dict(row))
-            for row in connection.execute(
-                "SELECT * FROM research_experiment_variants WHERE experiment_id=? AND design_revision=? ORDER BY kind",
-                (experiment["id"], experiment["current_design_revision"]),
-            )
-        ]
+        result["design"] = self._design_response(
+            connection, experiment["id"], experiment["current_design_revision"]
+        )
         return result
 
     @staticmethod
@@ -869,7 +934,9 @@ class ExperimentStore(Store):
                 "SELECT * FROM research_experiment_designs WHERE experiment_id=? ORDER BY revision",
                 (experiment_id,),
             ):
-                result["designs"].append(dict(row))
+                result["designs"].append(
+                    self._design_response(connection, experiment_id, row["revision"])
+                )
             for row in connection.execute(
                 "SELECT * FROM research_experiment_variants WHERE experiment_id=? ORDER BY design_revision,kind",
                 (experiment_id,),

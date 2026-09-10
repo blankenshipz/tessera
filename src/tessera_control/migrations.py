@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 26
+LATEST_SCHEMA_VERSION = 27
 LOCAL_ORG_ID = "org_local"
 
 
@@ -415,7 +415,7 @@ def migrate_v24_to_v25(connection: sqlite3.Connection) -> None:
     """Add empty goal-to-decision records without altering existing research/execution history."""
     from .experiments import create_experiment_schema
 
-    create_experiment_schema(connection)
+    create_experiment_schema(connection, with_design_context=False)
     connection.execute("UPDATE schema_meta SET schema_version = 25 WHERE singleton = 1")
 
 
@@ -448,6 +448,70 @@ def migrate_v25_to_v26(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 26 WHERE singleton = 1")
 
 
+def migrate_v26_to_v27(connection: sqlite3.Connection) -> None:
+    """Freeze known current design context and honestly retain unknown legacy history.
+
+    Before v27, goal and success criterion lived only on the mutable experiment
+    projection. The current revision can therefore be copied exactly; earlier
+    revisions cannot be reconstructed and remain NULL rather than being assigned
+    the current context. Conclusions with evidence from exactly one design revision
+    are linked to it; mixed legacy citations remain explicitly unbound.
+    """
+    connection.execute("ALTER TABLE research_experiment_designs ADD COLUMN goal TEXT")
+    connection.execute("ALTER TABLE research_experiment_designs ADD COLUMN success_criterion TEXT")
+    connection.execute(
+        """UPDATE research_experiment_designs AS d SET
+        goal=(SELECT e.goal FROM research_experiments e WHERE e.id=d.experiment_id),
+        success_criterion=(SELECT e.success_criterion FROM research_experiments e
+                           WHERE e.id=d.experiment_id)
+        WHERE d.revision=(SELECT e.current_design_revision FROM research_experiments e
+                          WHERE e.id=d.experiment_id)"""
+    )
+    connection.execute(
+        """CREATE TEMP TABLE migration_27_conclusions AS
+        SELECT c.*,
+        CASE WHEN (SELECT count(DISTINCT v.design_revision)
+                   FROM research_conclusion_evidence ce
+                   JOIN research_experiment_attempts a ON a.id=ce.attempt_id
+                   JOIN research_experiment_variants v ON v.id=a.variant_id
+                   WHERE ce.conclusion_id=c.id AND v.experiment_id=c.experiment_id)=1
+             THEN (SELECT min(v.design_revision)
+                   FROM research_conclusion_evidence ce
+                   JOIN research_experiment_attempts a ON a.id=ce.attempt_id
+                   JOIN research_experiment_variants v ON v.id=a.variant_id
+                   WHERE ce.conclusion_id=c.id AND v.experiment_id=c.experiment_id)
+        END AS design_revision
+        FROM research_conclusions c"""
+    )
+    connection.execute(
+        """CREATE TEMP TABLE migration_27_conclusion_evidence AS
+        SELECT * FROM research_conclusion_evidence"""
+    )
+    connection.execute("DROP TABLE research_conclusion_evidence")
+    connection.execute("DROP TABLE research_conclusions")
+    from .experiments import create_experiment_schema
+
+    create_experiment_schema(connection)
+    connection.execute(
+        """INSERT INTO research_conclusions
+        (id,experiment_id,design_revision,statement,status,revision,created_at,updated_at,
+         created_by_principal_id,reviewed_at,reviewed_by_principal_id)
+        SELECT id,experiment_id,design_revision,statement,status,revision,created_at,updated_at,
+        created_by_principal_id,reviewed_at,reviewed_by_principal_id
+        FROM migration_27_conclusions"""
+    )
+    connection.execute(
+        """INSERT INTO research_conclusion_evidence
+        SELECT conclusion_id,attempt_id,artifact_id,measurement_id
+        FROM migration_27_conclusion_evidence"""
+    )
+    connection.execute("DROP TABLE migration_27_conclusion_evidence")
+    connection.execute("DROP TABLE migration_27_conclusions")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("Design-context migration would leave invalid references.")
+    connection.execute("UPDATE schema_meta SET schema_version = 27 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -474,6 +538,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     23: migrate_v23_to_v24,
     24: migrate_v24_to_v25,
     25: migrate_v25_to_v26,
+    26: migrate_v26_to_v27,
 }
 
 

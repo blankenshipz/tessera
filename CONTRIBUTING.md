@@ -229,3 +229,9 @@ tenant-scoped retention references. New placed evidence links require active
 project-object retention; tombstoned, delete-intent, degraded, and deleted objects
 are rejected. Legacy SQLite-only artifacts remain explicitly `legacy_unplaced`
 evidence and are not assigned invented project-storage custody.
+
+Schema 27 stores goal and success criterion in each newly registered immutable
+experiment design revision. It binds each new conclusion and its review to one
+design snapshot. Migration copies the current projection only to its matching
+current design; earlier goal/criterion context that was never recorded remains
+explicitly unknown rather than inferred.

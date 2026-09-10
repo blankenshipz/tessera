@@ -45,6 +45,19 @@ records. `max_bytes` defaults to 1,000,000 and can be at most 10,000,000; each r
 type is bounded at 1,000 for export. Export is JSON, not a portable artifact-file
 bundle or publication action.
 
+## Goal-to-decision ledger
+
+`POST /projects/{id}/experiments` and `POST /experiments/{id}/designs` record a
+baseline-plus-intervention design. Every design revision includes its own immutable
+`goal`, `success_criterion`, `protocol`, and baseline/intervention digest snapshots.
+`POST /experiments/{id}/conclusions` accepts an optional `design_revision`; when
+omitted for compatibility it freezes the current design revision. A conclusion and
+its `POST /conclusions/{id}/review` response expose that `design_revision` and a
+complete `design_snapshot`. Supplying a different revision while reviewing or
+revising a conclusion is rejected. `GET /experiments/{id}/export` includes complete
+historical designs and every conclusion's snapshot, without dispatching work or
+establishing scientific validity.
+
 ## Conversations and decision inbox
 
 | Route | Behavior |

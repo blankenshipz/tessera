@@ -110,6 +110,9 @@ class EvidenceCitation(ExperimentRequest):
 class CreateConclusion(ExperimentRequest):
     statement: NonBlank4000
     evidence: Annotated[list[EvidenceCitation], Field(min_length=1, max_length=128)]
+    # Older clients can omit this while the store still freezes the current design.
+    # New clients should name the design context they reviewed explicitly.
+    design_revision: Revision | None = None
 
 
 class UpdateConclusion(CreateConclusion):
@@ -118,3 +121,4 @@ class UpdateConclusion(CreateConclusion):
 
 class ReviewConclusion(ExperimentRequest):
     expected_revision: Revision
+    design_revision: Revision | None = None

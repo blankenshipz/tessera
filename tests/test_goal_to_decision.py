@@ -12,7 +12,6 @@ from test_result_checkpoints import _reconciled_manifest
 
 from tessera_control.api import create_app
 from tessera_control.experiments import ExperimentStore
-from tessera_control.migrations import MIGRATIONS
 from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
 from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.store import (
@@ -188,39 +187,7 @@ def test_goal_design_attempt_evidence_conclusion_and_reopen_chain(tmp_path: Path
     assert reopened["artifacts"][0]["id"] == artifact["id"]
     assert reopened["measurements"][0]["id"] == measurement["id"]
     assert reopened["conclusions"][0]["status"] == "reviewed"
-    # v26 materializes only existing evidence relationships for retention lookup;
-    # a failed migration leaves v25 and its data untouched for an explicit retry.
-    with sqlite3.connect(state / "tessera.sqlite3") as connection:
-        connection.execute("DROP TABLE experiment_artifact_evidence_references")
-        connection.execute("UPDATE schema_meta SET schema_version=25")
-    assert migrate_state(state) == 26
-    with sqlite3.connect(state / "tessera.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT reference_kind FROM experiment_artifact_evidence_references "
-            "ORDER BY reference_kind"
-        ).fetchall() == [("attempt_artifact",), ("measurement_artifact",)]
-        connection.execute("DROP TABLE experiment_artifact_evidence_references")
-        connection.execute("UPDATE schema_meta SET schema_version=25")
-
-    def fail_migration(connection):
-        from tessera_control.experiments import create_experiment_evidence_retention_schema
-
-        create_experiment_evidence_retention_schema(connection)
-        raise RuntimeError("v26 fault")
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setitem(MIGRATIONS, 25, fail_migration)
-        with pytest.raises(RuntimeError, match="v26 fault"):
-            migrate_state(state)
-    with sqlite3.connect(state / "tessera.sqlite3") as connection:
-        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 25
-        assert (
-            connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE name='experiment_artifact_evidence_references'"
-            ).fetchone()
-            is None
-        )
-    assert migrate_state(state) == 26
+    assert reopened["conclusions"][0]["design_snapshot"]["revision"] == 2
 
 
 def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
@@ -465,7 +432,7 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 26
+    assert migrate_state(state) == 27
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -477,3 +444,224 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
             ).fetchone()[0]
             == 0
         )
+
+
+def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:
+    state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
+    _operation(state, owner, grant, lease, manifest["operation_id"])
+    records = ExperimentStore(state)
+    first = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    baseline_one = next(item for item in first["design"]["variants"] if item["kind"] == "baseline")
+    attempt_one = _command(
+        records.record_attempt,
+        owner,
+        baseline_one["id"],
+        payload={
+            "expected_variant_revision": baseline_one["revision"],
+            "operation_id": manifest["operation_id"],
+            "outcome": "succeeded",
+        },
+    )
+    linked_one = _command(
+        records.link_attempt_artifacts,
+        owner,
+        attempt_one["id"],
+        payload={"expected_revision": attempt_one["revision"], "artifact_ids": [artifact["id"]]},
+    )
+    measurement_one = _command(
+        records.record_measurement,
+        owner,
+        attempt_one["id"],
+        payload={
+            "expected_revision": linked_one["revision"],
+            "name": "first duration",
+            "value": {"seconds": 2},
+            "artifact_id": artifact["id"],
+        },
+    )
+    conclusion_one = _command(
+        records.create_conclusion,
+        owner,
+        first["id"],
+        payload={
+            "design_revision": 1,
+            "statement": "First design needs human review.",
+            "evidence": [
+                {"attempt_id": attempt_one["id"], "measurement_ids": [measurement_one["id"]]}
+            ],
+        },
+    )
+    _command(
+        records.review_conclusion,
+        owner,
+        conclusion_one["id"],
+        payload={"expected_revision": conclusion_one["revision"], "design_revision": 1},
+    )
+
+    second_design = _design(1)
+    second_design.update(
+        goal="Reduce synthetic processing time without increasing failures.",
+        success_criterion="A human confirms both duration and failure-rate measurements.",
+        protocol="Repeat the changed baseline and intervention under the revised method.",
+        variants=[
+            {
+                "kind": "baseline",
+                "name": "revised baseline",
+                "method_digest": "e" * 64,
+                "input_digest": "f" * 64,
+                "metadata": {"synthetic": "second"},
+            },
+            {
+                "kind": "intervention",
+                "name": "revised intervention",
+                "method_digest": "1" * 64,
+                "input_digest": "2" * 64,
+                "metadata": {"synthetic": "second"},
+            },
+        ],
+    )
+    second = _command(records.revise_design, owner, first["id"], payload=second_design)
+    baseline_two = next(item for item in second["design"]["variants"] if item["kind"] == "baseline")
+    attempt_two = _command(
+        records.record_attempt,
+        owner,
+        baseline_two["id"],
+        payload={
+            "expected_variant_revision": baseline_two["revision"],
+            "operation_id": manifest["operation_id"],
+            "outcome": "succeeded",
+        },
+    )
+    linked_two = _command(
+        records.link_attempt_artifacts,
+        owner,
+        attempt_two["id"],
+        payload={"expected_revision": attempt_two["revision"], "artifact_ids": [artifact["id"]]},
+    )
+    measurement_two = _command(
+        records.record_measurement,
+        owner,
+        attempt_two["id"],
+        payload={
+            "expected_revision": linked_two["revision"],
+            "name": "second duration",
+            "value": {"seconds": 1},
+            "artifact_id": artifact["id"],
+        },
+    )
+    conclusion_two = _command(
+        records.create_conclusion,
+        owner,
+        first["id"],
+        payload={
+            "design_revision": 2,
+            "statement": "Second design needs human review.",
+            "evidence": [
+                {"attempt_id": attempt_two["id"], "measurement_ids": [measurement_two["id"]]}
+            ],
+        },
+    )
+    _command(
+        records.review_conclusion,
+        owner,
+        conclusion_two["id"],
+        payload={"expected_revision": conclusion_two["revision"], "design_revision": 2},
+    )
+
+    exported = records.export_experiment(owner, first["id"])
+    reopened = ExperimentStore(state).get_experiment(owner, first["id"])
+    assert reopened == exported
+    designs = {item["revision"]: item for item in exported["designs"]}
+    assert designs[1]["goal"] == _design()["goal"]
+    assert designs[1]["success_criterion"] == _design()["success_criterion"]
+    assert designs[1]["protocol"] == _design()["protocol"]
+    assert [(item["method_digest"], item["input_digest"]) for item in designs[1]["variants"]] == [
+        ("a" * 64, "b" * 64),
+        ("c" * 64, "d" * 64),
+    ]
+    assert designs[2]["goal"] == second_design["goal"]
+    assert designs[2]["success_criterion"] == second_design["success_criterion"]
+    assert designs[2]["protocol"] == second_design["protocol"]
+    assert [(item["method_digest"], item["input_digest"]) for item in designs[2]["variants"]] == [
+        ("e" * 64, "f" * 64),
+        ("1" * 64, "2" * 64),
+    ]
+    snapshots = {
+        item["design_revision"]: item["design_snapshot"] for item in exported["conclusions"]
+    }
+    assert snapshots == designs
+
+    # Simulate the v26 table shapes after records already existed. Only the current
+    # projection held goal/criterion then, so migration must not invent them for v1.
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE migration_27_designs AS SELECT * FROM research_experiment_designs"
+        )
+        connection.execute("DROP TABLE research_experiment_designs")
+        connection.execute(
+            """CREATE TABLE research_experiment_designs (
+            experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+            revision INTEGER NOT NULL CHECK (revision >= 1), protocol TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+            PRIMARY KEY (experiment_id,revision))"""
+        )
+        connection.execute(
+            """INSERT INTO research_experiment_designs
+            (experiment_id,revision,protocol,created_at,created_by_principal_id)
+            SELECT experiment_id,revision,protocol,created_at,created_by_principal_id
+            FROM migration_27_designs"""
+        )
+        connection.execute("DROP TABLE migration_27_designs")
+        connection.execute(
+            "CREATE TABLE migration_27_conclusions AS SELECT * FROM research_conclusions"
+        )
+        connection.execute(
+            """CREATE TABLE migration_27_conclusion_evidence AS
+            SELECT * FROM research_conclusion_evidence"""
+        )
+        connection.execute("DROP TABLE research_conclusion_evidence")
+        connection.execute("DROP TABLE research_conclusions")
+        connection.execute(
+            """CREATE TABLE research_conclusions (
+            id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+            statement TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('draft','reviewed')),
+            revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+            reviewed_at TEXT, reviewed_by_principal_id TEXT REFERENCES principals(id))"""
+        )
+        connection.execute(
+            """INSERT INTO research_conclusions
+            (id,experiment_id,statement,status,revision,created_at,updated_at,
+             created_by_principal_id,reviewed_at,reviewed_by_principal_id)
+            SELECT id,experiment_id,statement,status,revision,created_at,updated_at,
+            created_by_principal_id,reviewed_at,reviewed_by_principal_id
+            FROM migration_27_conclusions"""
+        )
+        connection.execute(
+            """CREATE TABLE research_conclusion_evidence (
+            conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
+            attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
+            artifact_id TEXT REFERENCES artifacts(id),
+            measurement_id TEXT REFERENCES research_attempt_measurements(id),
+            PRIMARY KEY(conclusion_id,attempt_id,artifact_id,measurement_id),
+            CHECK ((artifact_id IS NOT NULL AND measurement_id IS NULL) OR
+                   (artifact_id IS NULL AND measurement_id IS NOT NULL)))"""
+        )
+        connection.execute(
+            """INSERT INTO research_conclusion_evidence
+            SELECT conclusion_id,attempt_id,artifact_id,measurement_id
+            FROM migration_27_conclusion_evidence"""
+        )
+        connection.execute("DROP TABLE migration_27_conclusion_evidence")
+        connection.execute("DROP TABLE migration_27_conclusions")
+        connection.execute("UPDATE schema_meta SET schema_version=26")
+    assert migrate_state(state) == 27
+    migrated = ExperimentStore(state).get_experiment(owner, first["id"])
+    migrated_designs = {item["revision"]: item for item in migrated["designs"]}
+    assert migrated_designs[1]["goal"] is None
+    assert migrated_designs[1]["success_criterion"] is None
+    assert migrated_designs[2]["goal"] == second_design["goal"]
+    assert migrated_designs[2]["success_criterion"] == second_design["success_criterion"]
+    assert {item["design_revision"] for item in migrated["conclusions"]} == {1, 2}

@@ -52,7 +52,7 @@ def test_restore_rejects_untrusted_schema_before_authority_updates(tmp_path: Pat
 
 def test_supported_legacy_migration_can_be_backed_up_and_restored(tmp_path: Path):
     source = _legacy_state(tmp_path)
-    assert migrate_state(source) == 26
+    assert migrate_state(source) == 27
     backup = tmp_path / "backup"
     recovery.backup_state(source, backup)
     restored = tmp_path / "restored"

@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 26);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 27);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,

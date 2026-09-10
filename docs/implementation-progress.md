@@ -30,7 +30,7 @@ relabeled as live validation.
 
 ## Design status matrix
 
-Reviewed 2026-09-10 against schema v26 goal-to-decision evidence-retention records and v24 manual project-artifact
+Reviewed 2026-09-10 against schema v27 goal-to-decision historical-design-context and v26 evidence-retention records and v24 manual project-artifact
 retention/recovery metadata, the schema v21 metadata-only credential-access lease,
 v20 bounded human result-bookkeeping ledger, v19 fake-provider receipt slice with
 an injected loopback-only `local-provider-v1` HTTP fixture, v18
@@ -65,7 +65,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, cancellation attempts independent of provider/control report failures, restart-safe development heartbeats, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
-| §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON; schema-v26 goal-to-decision export and read-only desktop projection of designs, linked attempts/operations/artifacts/measurements, actual evidence custody, and reviewed conclusions | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
+| §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON; schema-v27 goal-to-decision export with immutable historical design context and conclusion snapshots, plus a read-only desktop projection of designs, linked attempts/operations/artifacts/measurements, actual evidence custody, and reviewed conclusions | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
 | §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, a local authenticated exact-schema-pinned OpenCode HTTP/SSE fixture seam with durable uncertainty/cursor handling, an opt-in provider-disabled real-server compatibility fixture, a pure explicit-identity Minikube Job conformance contract, a read-only informational capability probe, and Phase 1 pure versioned environment plans plus human-approved fake-only intent reconciliation | Record a real selected-server fixture result (unconfigured/version-unavailable is explicitly not evidence), enrolled-node integration, durable/composable environment/execution adapters, scoped live provisioning operator, explicit Secret delivery authorization, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
 | §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, schema-v24 project-object intent/reconciliation and manual retention incident metadata, and read-only held restore | Provider fencing/resumption after restore, portable object-bundle recovery, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
@@ -405,6 +405,9 @@ representative investigation have not passed end-to-end acceptance.
     custody rather than treating quarantine as retention. Unplaced legacy SQLite
     artifacts remain supported evidence and are explicitly exported as
     `legacy_unplaced`; no placement is inferred.
+    Schema v27 additionally freezes goal and success criterion into each new design
+    revision and binds new conclusions/reviews to an explicit snapshot. Its migration
+    copies only the known current context and leaves unrecorded earlier context null.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
@@ -452,6 +455,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - `a6ca75c`: schema v24 manual project-artifact retention and recovery metadata.
 - Schema v25: goal-to-decision ledger and explicit evidence/conclusion fences.
 - Schema v26: transactional experiment-evidence retention references and custody export.
+- Schema v27: immutable design goal/criterion snapshots and conclusion context binding.
 - `e2543a5`: authenticated exact-schema-pinned OpenCode HTTP/SSE seam.
 - Current combined checkpoint: reconciled v24 migration sequencing and progress
   documentation, retention inspection/deletion races, and OpenCode authority and

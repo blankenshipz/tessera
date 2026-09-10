@@ -97,6 +97,11 @@ lifecycle/heartbeat admission. It does not attest builds or capabilities, broker
 credentials, dispatch providers, accept results, or fence restores; see
 [worker lifecycle](docs/worker-lifecycle.md).
 
+Schema v27 freezes goal and success criterion into each new immutable experiment
+design revision and attaches every new conclusion/review to one complete design
+snapshot. Migration preserves only the current legacy context that was actually
+recorded; earlier context remains unknown instead of being reconstructed.
+
 Schema v15 adds a human-only, immutable synthetic result checkpoint for a
 reconciled, worker-confirmed operation and a complete exact quarantined manifest.
 It rechecks retained bytes and declared metadata, preserves quarantine and labels
