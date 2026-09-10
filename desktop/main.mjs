@@ -69,6 +69,7 @@ const handlers = {
   status: () => connection.status(), connect: async settings => { selectedStudy = null; return connect(settings); },
   disconnect: () => { selectedStudy = null; return connection.disconnect(); },
   projects: page => connection.projects(page), tasks: (id, page) => connection.tasks(id, page),
+  taskPlan: (taskId, digest) => connection.taskPlan(taskId, digest),
   recovery: () => connection.recovery(),
   threads: (id, page) => connection.threads(id, page), messages: (id, page) => connection.messages(id, page),
   decisions: (id, page) => connection.decisions(id, page),

@@ -161,6 +161,70 @@ def test_message_and_decision_record_does_not_approve_or_execute_task(tmp_path):
     assert invalid.status_code == 422 and invalid.json() == {"detail": "Invalid request."}
 
 
+def test_current_task_plan_detail_is_tenant_scoped_and_digest_verified(tmp_path):
+    _, client, headers = setup(tmp_path)
+    project = client.post(
+        "/projects", json={"name": "Plan detail"}, headers=headers | {"Idempotency-Key": "project"}
+    ).json()
+    task = client.post(
+        f"/projects/{project['id']}/tasks",
+        json={
+            "title": "Draft",
+            "purpose": "Verify the displayed package",
+            "budget_cents": 75,
+            "max_duration_seconds": 90,
+        },
+        headers=headers | {"Idempotency-Key": "task"},
+    ).json()
+    revised = client.put(
+        f"/tasks/{task['id']}/plan",
+        json={
+            "expected_revision": task["revision"],
+            "title": "Pinned command",
+            "purpose": "Verify the displayed package",
+            "budget_cents": 75,
+            "max_duration_seconds": 90,
+            "execution_spec": {
+                "argv": ["python", "-c", "print('fixture')"],
+                "input_snapshot_digest": "a" * 64,
+                "pinned_skill_digests": ["b" * 64],
+                "output_paths": ["results/output.txt"],
+                "profile": "local-cpu",
+                "network_enabled": False,
+                "max_output_bytes": 1024,
+            },
+        },
+        headers=headers | {"Idempotency-Key": "revise"},
+    ).json()
+    detail = client.get(f"/tasks/{task['id']}/plans/{revised['plan_digest']}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    result = detail.json()
+    assert result | {"created_at": None, "actor_principal_id": None} == {
+        "task_id": task["id"],
+        "project_id": project["id"],
+        "revision": revised["revision"],
+        "title": "Pinned command",
+        "purpose": "Verify the displayed package",
+        "budget_cents": 75,
+        "max_duration_seconds": 90,
+        "execution_spec": {
+            "argv": ["python", "-c", "print('fixture')"],
+            "input_snapshot_digest": "a" * 64,
+            "pinned_skill_digests": ["b" * 64],
+            "output_paths": ["results/output.txt"],
+            "profile": "local-cpu",
+            "network_enabled": False,
+            "max_output_bytes": 1024,
+        },
+        "plan_digest": revised["plan_digest"],
+        "created_at": None,
+        "actor_principal_id": None,
+    }
+    assert isinstance(result["created_at"], str) and isinstance(result["actor_principal_id"], str)
+    assert client.get(f"/tasks/{task['id']}/plans/{'0' * 64}", headers=headers).status_code == 409
+    assert client.get(f"/tasks/{task['id']}/plans/{revised['plan_digest']}").status_code == 401
+
+
 def test_record_routes_enforce_project_scope_and_worker_audience(tmp_path):
     _, client, owner = setup(tmp_path)
 

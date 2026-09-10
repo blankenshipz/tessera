@@ -229,6 +229,14 @@ def create_app(state_dir: Path) -> FastAPI:
     ) -> dict[str, list[dict[str, Any]]]:
         return {"revisions": store.list_task_revisions(actor, task_id, offset, limit)}
 
+    @app.get("/tasks/{task_id}/plans/{plan_digest}")
+    def get_current_task_plan(
+        task_id: str,
+        plan_digest: str,
+        actor: Annotated[dict[str, str], Depends(principal)],
+    ) -> dict[str, Any]:
+        return store.get_current_task_plan(actor, task_id, plan_digest)
+
     @app.put("/tasks/{task_id}/plan")
     def revise_task_plan(
         task_id: str,

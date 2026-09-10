@@ -130,6 +130,22 @@ test('research ledger routes use bounded read-only study requests', async () => 
   assert.throws(() => connection.study('../study'));
 });
 
+test('immutable task-plan detail is a digest-addressed authenticated read', async () => {
+  const calls = [];
+  const digest = 'a'.repeat(64);
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org' } : { task_id: 'task_1', plan_digest: digest });
+  });
+  await connection.connect(config());
+  await connection.taskPlan('task_1', digest);
+  assert.match(calls[1].url, new RegExp(`/tasks/task_1/plans/${digest}$`));
+  assert.equal(calls[1].options.method, 'GET');
+  assert.equal(calls[1].options.headers['Idempotency-Key'], undefined);
+  assert.throws(() => connection.taskPlan('../task', digest));
+  assert.throws(() => connection.taskPlan('task_1', 'not-a-digest'));
+});
+
 test('study authoring routes are scoped, typed POST commands', async () => {
   const calls = [];
   const connection = new ControlConnection(async (url, options) => {

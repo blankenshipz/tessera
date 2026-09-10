@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 // Exercise the actual renderer without Electron. Deferred replies reproduce races.
 class Element {
-  constructor(tagName = '') { this.tagName = tagName; this.children = []; this.listeners = {}; this.dataset = {}; this.fields = {}; this.hidden = false; this.disabled = false; this.textContent = ''; this.value = ''; }
+  constructor(tagName = '') { this.tagName = tagName; this.children = []; this.listeners = {}; this.dataset = {}; this.fields = {}; this.hidden = false; this.disabled = false; this.textContent = ''; this.value = ''; this.isConnected = true; }
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   addEventListener(name, handler) { this.listeners[name] = handler; }
@@ -26,7 +26,7 @@ function fixture(overrides = {}) {
   const nodes = new Map();
   const get = id => { if (!nodes.has(id)) nodes.set(id, Object.assign(new Element(), { id })); return nodes.get(id); };
   const api = { status: async () => ({ id: 'connection' }), commandId: async () => 'command',
-    tasks: async () => ({ tasks: [] }), labbook: async () => ({ events: [] }),
+    tasks: async () => ({ tasks: [] }), taskPlan: async () => null, labbook: async () => ({ events: [] }),
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
     studySelection: async () => {},
     recovery: async () => ({ state: 'active', recovery_hold: false }),
@@ -82,6 +82,37 @@ test('renderer keeps earlier pages, removes loading markers, and deduplicates co
   assert.equal(ui.get('threads').children.length, 101);
   assert.equal(ui.get('threads-more').hidden, true);
   assert.equal(ui.get('decisions').children[0].textContent, 'No pending decisions.');
+});
+
+test('approval displays only the digest-verified immutable specification and binds that revision', async () => {
+  const calls = []; const digest = 'd'.repeat(64);
+  const task = { id: 'task-1', status: 'draft', revision: 3, plan_digest: digest,
+    title: 'Untrusted list title', purpose: 'Untrusted list purpose', budget_cents: 1, max_duration_seconds: 1 };
+  const plan = { task_id: 'task-1', project_id: 'p1', revision: 3, plan_digest: digest,
+    title: 'Verified package', purpose: 'Verified purpose', budget_cents: 120, max_duration_seconds: 300,
+    execution_spec: { argv: ['python', '-m', 'fixture'], input_snapshot_digest: 'a'.repeat(64),
+      pinned_skill_digests: ['b'.repeat(64)], output_paths: ['results/out.txt'], profile: 'local-cpu',
+      network_enabled: false, max_output_bytes: 4096 } };
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async (...args) => {
+    calls.push(args); return plan;
+  }, approve: async (_connection, _taskId, body) => { calls.push(body); return {}; } });
+  await ui.selectProject(project('p1')); await flush();
+  const card = ui.get('tasks').children[0];
+  assert.ok(find(card, node => node.textContent === 'Command / package identity: python -m fixture'));
+  assert.ok(find(card, node => node.textContent === `Verified immutable plan digest: ${digest}`));
+  assert.equal(find(card, node => node.textContent === 'Untrusted list title'), null);
+  find(card, node => node.textContent === 'Approve this plan').listeners.click(); await flush();
+  assert.deepEqual(calls[0].slice(1), ['task-1', digest]);
+  assert.equal(JSON.stringify(calls[1]), JSON.stringify({ expected_revision: 3, expected_plan_digest: digest }));
+});
+
+test('approval stays unavailable when plan detail does not match the requested digest', async () => {
+  const task = { id: 'task-1', status: 'draft', revision: 3, plan_digest: 'd'.repeat(64) };
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => ({
+    task_id: 'task-1', project_id: 'p1', revision: 3, plan_digest: 'e'.repeat(64), execution_spec: {},
+  }) });
+  await ui.selectProject(project('p1')); await flush();
+  assert.match(ui.get('tasks').children[0].children[0].textContent, /Approval is unavailable/);
 });
 
 test('renderer ignores thread and message replies from a previous context and clears drafts', async () => {

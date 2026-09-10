@@ -164,26 +164,62 @@ async function loadTasks() {
   if (version !== epoch) return;
   for (const task of response.tasks) {
     const card = element('article', undefined, 'card');
-    card.append(element('span', `${task.status} · revision ${task.revision}`, 'tag'));
-    card.append(element('h3', task.title), element('p', task.purpose));
-    card.append(element('p', `Recorded budget: ${task.budget_cents} cents · limit: ${task.max_duration_seconds} seconds`, 'muted'));
-    const button = element('button', task.status === 'approved' ? 'Plan approved' : 'Approve this plan');
-    button.disabled = recoveryHeld || task.status !== 'draft';
-    button.addEventListener('click', () => guarded(async () => {
-      button.disabled = true;
-      const body = { expected_revision: task.revision, expected_plan_digest: task.plan_digest };
-      try {
-        if (version !== epoch) return;
-        await command(`approve:${task.id}`, body, (id, key) => api.approve(id, task.id, body, key));
-        if (version === epoch) { await selectProject(project); notice('Plan approval recorded. No execution was started.'); }
-      } finally { if (button.isConnected) button.disabled = recoveryHeld || task.status !== 'draft'; }
-    }));
-    card.append(button);
+    card.append(element('p', 'Loading immutable execution specification…', 'muted'));
     $('tasks').append(card);
+    void loadTaskPlan(card, task, version, project);
   }
   taskOffset += response.tasks.length;
   $('tasks-more').hidden = response.tasks.length < 100;
   if (!taskOffset) $('tasks').append(element('p', 'No research plans yet. Create a draft to begin.', 'muted'));
+}
+function validTaskPlan(plan, task, project) {
+  return plan && plan.task_id === task.id && plan.project_id === project.id &&
+    plan.plan_digest === task.plan_digest && plan.revision === task.revision &&
+    plan.execution_spec && typeof plan.execution_spec === 'object' &&
+    Array.isArray(plan.execution_spec.argv) && Array.isArray(plan.execution_spec.pinned_skill_digests) &&
+    Array.isArray(plan.execution_spec.output_paths);
+}
+function specificationLines(plan) {
+  const spec = plan.execution_spec;
+  return [
+    ['Command / package identity', spec.argv.join(' ')],
+    ['Input snapshot', spec.input_snapshot_digest],
+    ['Pinned skills', spec.pinned_skill_digests.join(', ') || 'None'],
+    ['Execution destination', spec.profile],
+    ['Network restriction', spec.network_enabled === false ? 'Network disabled' : 'Not approved'],
+    ['Declared outputs', spec.output_paths.join(', ') || 'No output paths'],
+    ['Output restriction', `At most ${spec.max_output_bytes} bytes`],
+    ['Budget / duration', `${plan.budget_cents} cents / ${plan.max_duration_seconds} seconds`],
+  ];
+}
+async function loadTaskPlan(card, task, version, project) {
+  try {
+    const plan = await api.taskPlan(connectionId, task.id, task.plan_digest);
+    if (version !== epoch || project !== activeProject || !card.isConnected) return;
+    if (!validTaskPlan(plan, task, project)) throw new Error('The control plane returned an unverified plan.');
+    card.replaceChildren(element('span', `${task.status} · plan revision ${plan.revision}`, 'tag'),
+      element('h3', plan.title), element('p', plan.purpose));
+    for (const [label, value] of specificationLines(plan)) {
+      card.append(element('p', `${label}: ${value}`));
+    }
+    card.append(element('p', `Verified immutable plan digest: ${plan.plan_digest}`, 'muted'));
+    const button = element('button', task.status === 'approved' ? 'Plan approved' : 'Approve this plan');
+    button.disabled = recoveryHeld || task.status !== 'draft';
+    button.addEventListener('click', () => guarded(async () => {
+      button.disabled = true;
+      const body = { expected_revision: plan.revision, expected_plan_digest: plan.plan_digest };
+      try {
+        if (version !== epoch || project !== activeProject) return;
+        await command(`approve:${task.id}`, body, (id, key) => api.approve(id, task.id, body, key));
+        if (version === epoch && project === activeProject) { await selectProject(project); notice('Plan approval recorded. No execution was started.'); }
+      } finally { if (button.isConnected) button.disabled = recoveryHeld || task.status !== 'draft'; }
+    }));
+    card.append(button);
+  } catch (error) {
+    if (version === epoch && project === activeProject && card.isConnected) {
+      card.replaceChildren(element('p', 'Could not verify the immutable execution specification. Approval is unavailable; use Refresh to retry.', 'muted'));
+    }
+  }
 }
 async function loadThreads(reset = false) {
   const version = epoch; const project = activeProject;

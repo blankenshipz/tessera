@@ -166,6 +166,12 @@ export class ControlConnection {
   retractFinding(findingId, body, key) { return this.#request(`/findings/${resourceId(findingId)}/retract`, body, key); }
   reviseFinding(findingId, body, key) { return this.#request(`/findings/${resourceId(findingId)}/revise`, body, key); }
   revisions(taskId, page) { return this.#request(`/tasks/${resourceId(taskId)}/revisions?${pageQuery(page)}`); }
+  taskPlan(taskId, planDigest) {
+    if (typeof planDigest !== 'string' || !/^[0-9a-f]{64}$/.test(planDigest)) {
+      throw new ConnectionError('Invalid plan digest.');
+    }
+    return this.#request(`/tasks/${resourceId(taskId)}/plans/${planDigest}`);
+  }
   labbook(projectId, after = 0) {
     if (!Number.isSafeInteger(after) || after < 0) throw new ConnectionError('Invalid event cursor.');
     return this.#request(`/projects/${resourceId(projectId)}/labbook?after=${after}&limit=200`);

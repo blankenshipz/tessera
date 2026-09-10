@@ -515,6 +515,40 @@ class Store:
         finally:
             connection.close()
 
+    def get_current_task_plan(
+        self, principal: dict[str, str], task_id: str, expected_digest: str
+    ) -> dict[str, Any]:
+        """Return only the current, checksum-verified immutable plan revision."""
+        connection = _connect(self.database_path)
+        try:
+            principal = self._live_principal(connection, principal)
+            task = self._task(connection, principal, task_id)
+            if task["current_plan_digest"] != expected_digest:
+                raise Conflict("Task plan digest is no longer current.")
+            row = connection.execute(
+                """SELECT revision, title, purpose, budget_cents, max_duration_seconds,
+                execution_spec_json, plan_digest, created_at, actor_principal_id
+                FROM task_revisions WHERE task_id = ? AND plan_digest = ?""",
+                (task_id, expected_digest),
+            ).fetchone()
+            if row is None:
+                raise Conflict("Current task plan is missing.")
+            plan = self._revision_response(row)
+            if (
+                plan_digest(
+                    plan["title"],
+                    plan["purpose"],
+                    plan["budget_cents"],
+                    plan["max_duration_seconds"],
+                    plan["execution_spec"],
+                )
+                != expected_digest
+            ):
+                raise Conflict("Current task plan checksum is invalid.")
+            return {"task_id": task_id, "project_id": task["project_id"], **plan}
+        finally:
+            connection.close()
+
     def list_task_revisions(
         self, principal: dict[str, str], task_id: str, offset: int, limit: int
     ) -> list[dict[str, Any]]:
