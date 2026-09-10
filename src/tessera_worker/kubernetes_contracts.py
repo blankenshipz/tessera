@@ -23,6 +23,7 @@ _OPERATION = re.compile(r"[0-9a-f]{32}\Z")
 _NAME = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?\Z")
 _UID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}\Z")
+_MOUNT_PATH = re.compile(r"/[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 _PROFILE = "development-minikube-opencode-v1"
 
 
@@ -121,6 +122,8 @@ class KubernetesJobBinding:
     memory_mebibytes: int = 256
     ephemeral_storage_mebibytes: int = 64
     network_mode: Literal["none", "cluster"] = "none"
+    output_pvc: str | None = None
+    output_mount_path: str | None = None
 
     def __post_init__(self) -> None:
         _required_string(self.operation_id, "operation_id", _OPERATION)
@@ -152,6 +155,20 @@ class KubernetesJobBinding:
             raise ValueError("ephemeral_storage_mebibytes is outside the fixture bound.")
         if self.network_mode not in {"none", "cluster"}:
             raise ValueError("network_mode must be explicit.")
+        if self.output_pvc is None and self.output_mount_path is not None:
+            raise ValueError("output_mount_path requires output_pvc.")
+        if self.output_pvc is not None:
+            _kubernetes_name(self.output_pvc, "output_pvc")
+            if (
+                not isinstance(self.output_mount_path, str)
+                or not _MOUNT_PATH.fullmatch(self.output_mount_path)
+                or self.output_mount_path == "/"
+                or "//" in self.output_mount_path
+                or "/../" in f"{self.output_mount_path}/"
+                or "\0" in self.output_mount_path
+                or len(self.output_mount_path.encode("utf-8")) > 256
+            ):
+                raise ValueError("output_mount_path must be a bounded absolute non-root path.")
 
     @property
     def job_name(self) -> str:
@@ -308,6 +325,19 @@ def job_manifest(
             },
         },
     }
+    if binding.output_pvc is not None:
+        container = manifest["spec"]["template"]["spec"]["containers"][0]
+        volumes = manifest["spec"]["template"]["spec"]["volumes"]
+        assert isinstance(container, dict) and isinstance(volumes, list)
+        container["volumeMounts"].append(
+            {"mountPath": binding.output_mount_path, "name": "persistent-output"}
+        )
+        volumes.append(
+            {
+                "name": "persistent-output",
+                "persistentVolumeClaim": {"claimName": binding.output_pvc},
+            }
+        )
     annotations["tessera.dev/spec-sha256"] = job_manifest_digest(manifest)
     return manifest
 
