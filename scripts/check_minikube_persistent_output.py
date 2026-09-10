@@ -10,6 +10,7 @@ from tessera_worker.minikube_persistent_output_fixture import (
     PROFILE,
     FixtureResult,
     PersistentOutputTarget,
+    fixture_exit_code,
     fixture_manifest,
     hello_binding,
     run_fixture,
@@ -31,6 +32,8 @@ def main() -> int:
         "output-mount",
         "cluster-uid",
         "namespace-uid",
+        "pvc-uid",
+        "pvc-spec-sha256",
         "operation-id",
         "attempt-id",
         "lease-id",
@@ -53,6 +56,8 @@ def main() -> int:
         output_mount=args.output_mount,
         cluster_uid=args.cluster_uid,
         namespace_uid=args.namespace_uid,
+        pvc_uid=args.pvc_uid,
+        pvc_spec_sha256=args.pvc_spec_sha256,
     )
     if args.profile != PROFILE:
         parser.error(f"--profile must be {PROFILE}")
@@ -64,13 +69,16 @@ def main() -> int:
         image=args.image,
         output_pvc=args.pvc,
         output_mount=args.output_mount,
+        output_pvc_uid=args.pvc_uid,
+        output_pvc_spec_sha256=args.pvc_spec_sha256,
     )
     if not args.run:
         print(json.dumps(fixture_manifest(target, binding), sort_keys=True))
         return 0
     result: FixtureResult = run_fixture(target, binding, args.journal)
     print(json.dumps(result.__dict__, sort_keys=True))
-    return 0 if result.state in {"succeeded", "skipped"} else 1
+    # Exit zero is only a verified fixture result, never result acceptance.
+    return fixture_exit_code(result)
 
 
 if __name__ == "__main__":

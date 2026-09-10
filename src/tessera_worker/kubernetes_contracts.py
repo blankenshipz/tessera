@@ -124,6 +124,8 @@ class KubernetesJobBinding:
     network_mode: Literal["none", "cluster"] = "none"
     output_pvc: str | None = None
     output_mount_path: str | None = None
+    output_pvc_uid: str | None = None
+    output_pvc_spec_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _required_string(self.operation_id, "operation_id", _OPERATION)
@@ -157,6 +159,10 @@ class KubernetesJobBinding:
             raise ValueError("network_mode must be explicit.")
         if self.output_pvc is None and self.output_mount_path is not None:
             raise ValueError("output_mount_path requires output_pvc.")
+        if self.output_pvc is None and (
+            self.output_pvc_uid is not None or self.output_pvc_spec_sha256 is not None
+        ):
+            raise ValueError("output PVC identity requires output_pvc.")
         if self.output_pvc is not None:
             _kubernetes_name(self.output_pvc, "output_pvc")
             if (
@@ -169,6 +175,11 @@ class KubernetesJobBinding:
                 or len(self.output_mount_path.encode("utf-8")) > 256
             ):
                 raise ValueError("output_mount_path must be a bounded absolute non-root path.")
+        if (self.output_pvc_uid is None) != (self.output_pvc_spec_sha256 is None):
+            raise ValueError("output PVC UID and spec digest must be supplied together.")
+        if self.output_pvc_uid is not None:
+            _required_string(self.output_pvc_uid, "output_pvc_uid", _UID)
+            _digest(self.output_pvc_spec_sha256, "output_pvc_spec_sha256")
 
     @property
     def job_name(self) -> str:
@@ -263,6 +274,9 @@ def job_manifest(
         "tessera.dev/profile": cluster.profile,
         "tessera.dev/server-sha256": cluster.server_sha256,
     }
+    if binding.output_pvc_uid is not None:
+        annotations["tessera.dev/output-pvc-uid"] = binding.output_pvc_uid
+        annotations["tessera.dev/output-pvc-spec-sha256"] = binding.output_pvc_spec_sha256
     manifest: dict[str, object] = {
         "apiVersion": "batch/v1",
         "kind": "Job",
