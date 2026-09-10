@@ -4,6 +4,7 @@ import hashlib
 import json
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -184,6 +185,68 @@ def client(value: OpenCodeFixture) -> OpenCodeHttpClient:
     return OpenCodeHttpClient(value.endpoint, "Bearer fixture-token", value.pin, timeout_seconds=2)
 
 
+class _SseResponse:
+    headers = {"Content-Type": "text/event-stream"}
+
+    def getcode(self) -> int:
+        return 200
+
+    def read(self, amount: int = -1) -> bytes:  # noqa: ARG002
+        return b""
+
+    def close(self) -> None:
+        pass
+
+
+class _PersistentSseResponse(_SseResponse):
+    def __init__(self) -> None:
+        self.lines = [
+            b"id: 0\n",
+            b"event: message\n",
+            b'data: {"type":"session.status","properties":{"sessionID":"session-1"}}\n',
+            b"\n",
+        ]
+        self.closed = threading.Event()
+
+    def readline(self, amount: int = -1) -> bytes:  # noqa: ARG002
+        if self.lines:
+            return self.lines.pop(0)
+        self.closed.wait(1)
+        return b""
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class _SlowDripSseResponse(_SseResponse):
+    def __init__(self) -> None:
+        self.closed = threading.Event()
+
+    def readline(self, amount: int = -1) -> bytes:  # noqa: ARG002
+        # Model a peer that keeps a blocking line read alive with bytes but
+        # never finishes a line.  Closing the response releases the reader.
+        end = time.monotonic() + 0.8
+        while time.monotonic() < end:
+            if self.closed.wait(0.01):
+                return b""
+        return b": slow\n"
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+def _stream_client(response: _SseResponse, timeout_seconds: float = 0.1) -> OpenCodeHttpClient:
+    value = OpenCodeHttpClient(
+        "http://127.0.0.1:4096",
+        "Bearer fixture-token",
+        OpenCodeServerPin("1.2.3", "a" * 64),
+        timeout_seconds=timeout_seconds,
+        opener=lambda _request, _timeout: response,
+    )
+    value._verified = True  # type: ignore[attr-defined]  # Unit transport fixture; no server call.
+    return value
+
+
 def adapter(value: OpenCodeFixture, journal: Path, **kwargs: object) -> LiveOpenCodeHarnessAdapter:
     return LiveOpenCodeHarnessAdapter(
         client(value),
@@ -347,6 +410,7 @@ def test_sse_reconnect_preserves_gap_dedup_cursor_and_attribution_after_restart(
         ]
         assert live.poll("operation-1") == []
         assert [item.cursor for item in live.reconnect("operation-1")] == [0, 1, 2]
+        live.acknowledge_through("operation-1", 2)
         live.close()
 
         restarted = adapter(value, journal)
@@ -354,6 +418,80 @@ def test_sse_reconnect_preserves_gap_dedup_cursor_and_attribution_after_restart(
         assert [item.cursor for item in restarted.reconnect("operation-1")] == [3]
         event_requests = [item for item in value.requests if item[1] == "/event"]
         assert [item[2].get("Last-Event-Id") for item in event_requests] == [None, None, "2"]
+
+
+def test_persistent_sse_returns_a_complete_event_without_waiting_for_eof() -> None:
+    response = _PersistentSseResponse()
+    events = _stream_client(response).events(None)
+
+    assert [event.cursor for event in events] == [0]
+    assert response.closed.is_set()
+
+
+def test_slow_drip_cannot_extend_the_sse_deadline() -> None:
+    response = _SlowDripSseResponse()
+    started = time.monotonic()
+
+    with pytest.raises(OpenCodeHttpError, match="deadline exceeded"):
+        _stream_client(response, timeout_seconds=0.05).events(None)
+
+    assert time.monotonic() - started < 0.45
+    assert response.closed.is_set()
+
+
+def test_unacknowledged_events_redeliver_after_restart_before_cursor_progress(
+    tmp_path: Path,
+) -> None:
+    with fixture() as value:
+        journal = tmp_path / "journal"
+        live = adapter(value, journal)
+        bound = live.start(binding(), context())
+        assert bound.session_id is not None
+        value.event_batches = [[live_event(0, bound.session_id, state="running")]]
+        assert [item.cursor for item in live.poll("operation-1")] == [0]
+        live.close()
+
+        restarted = adapter(value, journal)
+        assert [item.cursor for item in restarted.reconnect("operation-1")] == [0]
+        restarted.acknowledge_through("operation-1", 0)
+        value.event_batches = [[live_event(1, bound.session_id, state="idle")]]
+        assert [item.cursor for item in restarted.reconnect("operation-1")] == [1]
+        event_requests = [item for item in value.requests if item[1] == "/event"]
+        assert [item[2].get("Last-Event-Id") for item in event_requests] == [None, "0"]
+
+
+@pytest.mark.parametrize(
+    ("first", "reason"),
+    [
+        (lambda session_id: live_event(0, "foreign-session"), "unknown or foreign session"),
+        (lambda session_id: live_event(0, session_id, "provider.auth"), "unknown event kind"),
+    ],
+)
+def test_foreign_or_unknown_cursor_cannot_advance_durable_replay(
+    tmp_path: Path,
+    first: object,
+    reason: str,
+) -> None:
+    with fixture() as value:
+        live = adapter(value, tmp_path / "journal")
+        bound = live.start(binding(), context())
+        assert bound.session_id is not None
+        assert callable(first)
+        value.event_batches = [
+            [
+                first(bound.session_id),
+                live_event(1, bound.session_id, state="running"),
+            ]
+        ]
+        assert live.poll("operation-1") == []
+        assert live.quarantine[-1].reason == reason
+        with pytest.raises(OpenCodeHarnessError, match="contiguous"):
+            live.acknowledge_through("operation-1", 1)
+
+        value.event_batches = [[live_event(2, bound.session_id, state="idle")]]
+        assert live.reconnect("operation-1") == []
+        event_requests = [item for item in value.requests if item[1] == "/event"]
+        assert [item[2].get("Last-Event-Id") for item in event_requests] == [None, None]
 
 
 def test_unknown_or_oversized_sse_events_are_quarantined_without_provider_effect(

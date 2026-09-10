@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -275,7 +276,12 @@ class OpenCodeHttpClient:
                 raise OpenCodeHttpError("OpenCode rejected event stream", status)
             if content_type != "text/event-stream":
                 raise OpenCodeHttpError("OpenCode event stream has an invalid content type", status)
-            return self._parse_sse(response)
+            # A response with a declared length is a finite replay response and
+            # can be consumed completely.  An ordinary SSE response has no such
+            # boundary: return after a complete event rather than waiting for an
+            # EOF that a healthy long-lived stream will not send.
+            content_length = response.headers.get("Content-Length")
+            return self._parse_sse(response, return_after_event=not bool(content_length))
         except OpenCodeHttpError:
             raise
         except (OSError, ValueError, AttributeError):
@@ -357,7 +363,9 @@ class OpenCodeHttpClient:
             raise OpenCodeHttpError("OpenCode response must be a JSON object", status)
         return decoded
 
-    def _parse_sse(self, response: OpenCodeHttpResponse) -> list[OpenCodeSseEvent]:
+    def _parse_sse(
+        self, response: OpenCodeHttpResponse, *, return_after_event: bool
+    ) -> list[OpenCodeSseEvent]:
         deadline = time.monotonic() + self.timeout_seconds
         total = 0
         fields: dict[str, list[str]] = {}
@@ -365,7 +373,7 @@ class OpenCodeHttpClient:
         while True:
             if time.monotonic() > deadline:
                 raise OpenCodeHttpError("OpenCode event stream deadline exceeded")
-            line = response.readline(MAX_SSE_FIELD_BYTES + 1)
+            line = self._readline_before_deadline(response, deadline)
             if not isinstance(line, bytes):
                 raise OpenCodeHttpError("OpenCode event stream is malformed")
             total += len(line)
@@ -381,6 +389,8 @@ class OpenCodeHttpClient:
                     if len(events) > MAX_SSE_EVENTS:
                         raise OpenCodeHttpError("OpenCode event stream has too many events")
                     fields = {}
+                    if return_after_event:
+                        return events
                 continue
             if line.startswith(b":"):
                 continue
@@ -397,6 +407,42 @@ class OpenCodeHttpClient:
         if fields:
             events.append(self._sse_event(fields))
         return events
+
+    @staticmethod
+    def _readline_before_deadline(response: OpenCodeHttpResponse, deadline: float) -> bytes:
+        """Read one SSE line without allowing slow bytes to extend the deadline.
+
+        Socket read timeouts commonly reset whenever another byte arrives, so a
+        peer can otherwise keep ``readline`` alive indefinitely with a slow
+        drip.  Keep the blocking read isolated and close the response when the
+        whole-stream deadline expires.  The thread only reads the response and
+        is bounded by that close; no parsed state can be changed after expiry.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OpenCodeHttpError("OpenCode event stream deadline exceeded")
+        result: list[bytes] = []
+        failure: list[Exception] = []
+
+        def read_line() -> None:
+            try:
+                result.append(response.readline(MAX_SSE_FIELD_BYTES + 1))
+            except Exception as error:  # The caller sanitizes transport failures.
+                failure.append(error)
+
+        reader = threading.Thread(target=read_line, daemon=True)
+        reader.start()
+        reader.join(remaining)
+        if reader.is_alive():
+            _close_quietly(response)
+            raise OpenCodeHttpError("OpenCode event stream deadline exceeded")
+        if time.monotonic() > deadline:
+            raise OpenCodeHttpError("OpenCode event stream deadline exceeded")
+        if failure:
+            raise failure[0]
+        if not result:
+            raise OpenCodeHttpError("OpenCode event stream is malformed")
+        return result[0]
 
     @staticmethod
     def _sse_event(fields: Mapping[str, list[str]]) -> OpenCodeSseEvent:

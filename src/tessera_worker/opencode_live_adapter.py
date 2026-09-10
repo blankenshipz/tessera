@@ -121,6 +121,13 @@ class LiveOpenCodeHarnessAdapter:
         except OpenCodeHttpError as error:
             raise OpenCodeHarnessError("Pinned OpenCode contract verification failed.") from error
         self._require_authority(binding, "events")
+        # Deliver durable, unacknowledged observations before opening another
+        # stream.  A consumer persists these observations before acknowledging
+        # their cursor, so a crash between delivery and that persistence only
+        # causes a deduplicable redelivery.
+        pending = self._drain_contiguous(binding)
+        if pending:
+            return pending
         after_cursor = self._required_operation(operation_id)[10]
         try:
             events = self._client.events(after_cursor)
@@ -132,6 +139,36 @@ class LiveOpenCodeHarnessAdapter:
 
     def reconnect(self, operation_id: str) -> list[AttributedEvent]:
         return self.poll(operation_id)
+
+    def acknowledge_through(self, operation_id: str, cursor: int) -> None:
+        """Advance replay only after downstream persistence has committed.
+
+        The local stream-event journal permits downstream consumers to
+        deduplicate a repeated delivery.  This acknowledgement is deliberately
+        separate from ``poll``: a process crash before it cannot make the
+        upstream cursor skip an observation that was not persisted downstream.
+        """
+        if type(cursor) is not int or cursor < 0:
+            raise ValueError("OpenCode acknowledgement cursor must be a non-negative integer.")
+        row = self._required_operation(operation_id)
+        high_water = row[10]
+        if high_water is not None and cursor <= high_water:
+            return
+        expected = 0 if high_water is None else high_water + 1
+        span = self._connection.execute(
+            """SELECT MIN(cursor), MAX(cursor), COUNT(*) FROM stream_events
+            WHERE operation_id=? AND cursor>=? AND cursor<=?""",
+            (operation_id, expected, cursor),
+        ).fetchone()
+        if span != (expected, cursor, cursor - expected + 1):
+            raise OpenCodeHarnessError(
+                "OpenCode replay acknowledgement must cover durable contiguous events."
+            )
+        self._connection.execute(
+            "UPDATE operations SET high_water_cursor=? WHERE operation_id=?",
+            (cursor, operation_id),
+        )
+        self._connection.commit()
 
     def cancel(self, operation_id: str) -> CancellationStatus:
         binding = self.active_binding(operation_id)
@@ -267,11 +304,6 @@ class LiveOpenCodeHarnessAdapter:
                     payload=payload,
                 )
             )
-            self._connection.execute(
-                "UPDATE operations SET high_water_cursor=? WHERE operation_id=?",
-                (expected, binding.operation_id),
-            )
-            self._connection.commit()
             expected += 1
         return translated
 
