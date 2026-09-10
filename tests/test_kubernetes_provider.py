@@ -149,9 +149,12 @@ def test_delete_ack_is_not_termination_confirmation(tmp_path) -> None:
     ]
     delete_calls = 0
 
-    def delete(_name: str) -> None:
+    deleted: list[tuple[str, str]] = []
+
+    def delete(name: str, uid: str) -> None:
         nonlocal delete_calls
         delete_calls += 1
+        deleted.append((name, uid))
         if delete_calls == 2:
             jobs.clear()
             pods.clear()
@@ -164,3 +167,4 @@ def test_delete_ack_is_not_termination_confirmation(tmp_path) -> None:
         journal, binding(), cluster(), jobs.get, delete, lambda _uid: pods
     )
     assert second.termination_confirmed is True
+    assert deleted == [(binding().job_name, "job-fixture")] * 2

@@ -349,6 +349,174 @@ def _matches_expected(expected: object, observed: object) -> bool:
     return expected == observed
 
 
+def _matches_expected_exactly(expected: object, observed: object) -> bool:
+    """Compare a normalized executable subtree without permitting extra fields."""
+    if isinstance(expected, Mapping):
+        return (
+            isinstance(observed, Mapping)
+            and set(expected) == set(observed)
+            and all(
+                _matches_expected_exactly(value, observed[key]) for key, value in expected.items()
+            )
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(observed, list)
+            and len(expected) == len(observed)
+            and all(
+                _matches_expected_exactly(item, candidate)
+                for item, candidate in zip(expected, observed, strict=True)
+            )
+        )
+    return expected == observed
+
+
+_JOB_SPEC_DEFAULTS: dict[str, object] = {
+    "completionMode": "NonIndexed",
+    "completions": 1,
+    "managedBy": "kubernetes.io/job-controller",
+    "manualSelector": False,
+    "parallelism": 1,
+    "podReplacementPolicy": "TerminatingOrFailed",
+    "suspend": False,
+}
+_POD_SPEC_DEFAULTS: dict[str, object] = {
+    "dnsPolicy": "ClusterFirst",
+    "preemptionPolicy": "PreemptLowerPriority",
+    "priority": 0,
+    "schedulerName": "default-scheduler",
+    "serviceAccount": "default",
+    "serviceAccountName": "default",
+}
+_CONTAINER_DEFAULTS: dict[str, object] = {
+    "terminationMessagePath": "/dev/termination-log",
+    "terminationMessagePolicy": "File",
+}
+
+
+def _reject_unallowlisted_fields(
+    observed: Mapping[str, object], allowed: set[str], field: str
+) -> None:
+    unexpected = sorted(set(observed) - allowed)
+    if unexpected:
+        raise KubernetesContractError(
+            f"Kubernetes {field} has unallowlisted executable fields: {', '.join(unexpected)}."
+        )
+
+
+def _validate_generated_selector(value: object, job_uid: str) -> None:
+    """Accept only the API-server's UID-bound Job selector default."""
+    selector = _mapping(value, "Job selector")
+    _reject_unallowlisted_fields(selector, {"matchLabels"}, "Job selector")
+    labels = _mapping(selector.get("matchLabels"), "Job selector matchLabels")
+    allowed = {"batch.kubernetes.io/controller-uid", "controller-uid"}
+    _reject_unallowlisted_fields(labels, allowed, "Job selector matchLabels")
+    if not labels or any(label_value != job_uid for label_value in labels.values()):
+        raise KubernetesContractError("Kubernetes Job selector is not the generated UID selector.")
+
+
+def _validate_pod_spec(
+    observed: object,
+    expected: object,
+    *,
+    field: str,
+    mismatch_message: str = "Kubernetes Pod spec conflicts with the operation binding.",
+) -> Mapping[str, object]:
+    observed_spec = _mapping(observed, field)
+    expected_spec = _mapping(expected, f"expected {field}")
+    _reject_unallowlisted_fields(
+        observed_spec,
+        set(expected_spec) | set(_POD_SPEC_DEFAULTS) | {"nodeName", "tolerations"},
+        field,
+    )
+    for name, value in _POD_SPEC_DEFAULTS.items():
+        if name in observed_spec and observed_spec[name] != value:
+            raise KubernetesContractError(f"Kubernetes {field} default {name} conflicts.")
+    if "nodeName" in observed_spec:
+        try:
+            _kubernetes_name(observed_spec["nodeName"], "nodeName")
+        except ValueError as error:
+            raise KubernetesContractError("Kubernetes Pod nodeName is malformed.") from error
+    if "tolerations" in observed_spec and observed_spec["tolerations"] != [
+        {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/not-ready",
+            "operator": "Exists",
+            "tolerationSeconds": 300,
+        },
+        {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/unreachable",
+            "operator": "Exists",
+            "tolerationSeconds": 300,
+        },
+    ]:
+        raise KubernetesContractError("Kubernetes Pod default tolerations conflict.")
+    containers = observed_spec.get("containers")
+    expected_containers = expected_spec.get("containers")
+    if not isinstance(containers, list) or not isinstance(expected_containers, list):
+        raise KubernetesContractError(f"Kubernetes {field} containers are malformed.")
+    if len(containers) != len(expected_containers):
+        raise KubernetesContractError(f"Kubernetes {field} containers conflict.")
+    for index, (container, expected_container) in enumerate(
+        zip(containers, expected_containers, strict=True)
+    ):
+        observed_container = _mapping(container, f"{field} container {index}")
+        expected_container_map = _mapping(expected_container, f"expected {field} container {index}")
+        _reject_unallowlisted_fields(
+            observed_container,
+            set(expected_container_map) | set(_CONTAINER_DEFAULTS),
+            f"{field} container {index}",
+        )
+        for name, value in _CONTAINER_DEFAULTS.items():
+            if name in observed_container and observed_container[name] != value:
+                raise KubernetesContractError(
+                    f"Kubernetes {field} container {index} default {name} conflicts."
+                )
+    normalized_spec = dict(observed_spec)
+    for name in _POD_SPEC_DEFAULTS:
+        normalized_spec.pop(name, None)
+    normalized_spec.pop("nodeName", None)
+    normalized_spec.pop("tolerations", None)
+    normalized_spec["containers"] = [
+        {
+            name: value
+            for name, value in _mapping(container, f"{field} container {index}").items()
+            if name not in _CONTAINER_DEFAULTS
+        }
+        for index, container in enumerate(containers)
+    ]
+    if not _matches_expected_exactly(expected_spec, normalized_spec):
+        raise KubernetesContractError(mismatch_message)
+    return observed_spec
+
+
+def _validate_job_spec(observed: object, expected: object, job_uid: str) -> None:
+    observed_spec = _mapping(observed, "Job spec")
+    expected_spec = _mapping(expected, "expected Job spec")
+    _reject_unallowlisted_fields(
+        observed_spec, set(expected_spec) | set(_JOB_SPEC_DEFAULTS) | {"selector"}, "Job spec"
+    )
+    for name, value in _JOB_SPEC_DEFAULTS.items():
+        if name in observed_spec and observed_spec[name] != value:
+            raise KubernetesContractError(f"Kubernetes Job default {name} conflicts.")
+    if "selector" in observed_spec:
+        _validate_generated_selector(observed_spec["selector"], job_uid)
+    template = _mapping(observed_spec.get("template"), "Job template")
+    expected_template = _mapping(expected_spec.get("template"), "expected Job template")
+    _reject_unallowlisted_fields(template, set(expected_template), "Job template")
+    _validate_pod_spec(
+        template.get("spec"),
+        expected_template.get("spec"),
+        field="Job Pod spec",
+        mismatch_message="Kubernetes Job immutable spec conflicts with the operation binding.",
+    )
+    if not _matches_expected(expected_spec, observed_spec):
+        raise KubernetesContractError(
+            "Kubernetes Job immutable spec conflicts with the operation binding."
+        )
+
+
 def parse_job(
     observed: Mapping[str, object], binding: KubernetesJobBinding, cluster: KubernetesClusterConfig
 ) -> KubernetesJobObservation:
@@ -366,17 +534,14 @@ def parse_job(
         raise KubernetesContractError(
             "Kubernetes Job name, namespace, labels, or annotations conflict."
         )
-    if not _matches_expected(expected["spec"], observed.get("spec")):
-        raise KubernetesContractError(
-            "Kubernetes Job immutable spec conflicts with the operation binding."
-        )
-    annotations = _mapping(metadata.get("annotations"), "metadata annotations")
-    if annotations.get("tessera.dev/spec-sha256") != job_manifest_digest(expected):
-        raise KubernetesContractError("Kubernetes Job canonical spec digest conflicts.")
     try:
         job_uid = _required_string(metadata["uid"], "job_uid", _UID)
     except (KeyError, ValueError) as error:
         raise KubernetesContractError("Kubernetes Job UID is unavailable or malformed.") from error
+    _validate_job_spec(observed.get("spec"), expected["spec"], job_uid)
+    annotations = _mapping(metadata.get("annotations"), "metadata annotations")
+    if annotations.get("tessera.dev/spec-sha256") != job_manifest_digest(expected):
+        raise KubernetesContractError("Kubernetes Job canonical spec digest conflicts.")
     status = observed.get("status", {})
     if not isinstance(status, Mapping):
         state: Literal["pending", "running", "succeeded", "failed", "unknown"] = "unknown"
@@ -433,8 +598,7 @@ def parse_pod(
         raise KubernetesContractError(
             "Kubernetes Pod metadata conflicts with the operation binding."
         )
-    if not _matches_expected(template["spec"], observed.get("spec")):
-        raise KubernetesContractError("Kubernetes Pod spec conflicts with the operation binding.")
+    _validate_pod_spec(observed.get("spec"), template["spec"], field="Pod spec")
     if not _pod_is_owned_by(observed, job_uid):
         raise KubernetesContractError("Kubernetes Pod is not owned by the attributed Job.")
     try:
@@ -463,7 +627,7 @@ class KubernetesCancellationObservation:
 
 InspectJob = Callable[[str], Mapping[str, object] | None]
 CreateJob = Callable[[Mapping[str, object]], Mapping[str, object] | None]
-DeleteJob = Callable[[str], object]
+DeleteJob = Callable[[str, str], object]
 ObservePods = Callable[[str], Sequence[Mapping[str, object]]]
 
 
@@ -530,10 +694,19 @@ class KubernetesJobJournal:
         self._bind(binding, job_manifest(binding, cluster))
         first = inspect(binding.job_name)
         if first is None:
-            return KubernetesCancellationObservation(True, False, False, False)
+            job_uid = self._recorded_job_uid(binding.operation_id)
+            if job_uid is None:
+                return KubernetesCancellationObservation(True, True, False, False)
+            try:
+                pods = observe_pods(job_uid)
+                for pod in pods:
+                    parse_pod(pod, binding, cluster, job_uid)
+            except Exception:
+                return KubernetesCancellationObservation(True, True, False, False)
+            return KubernetesCancellationObservation(True, True, True, not pods)
         initial = self._record_observation(parse_job(first, binding, cluster), binding.operation_id)
         try:
-            delete(binding.job_name)
+            delete(binding.job_name, initial.job_uid)
         except Exception:
             return KubernetesCancellationObservation(True, False, False, False)
         try:
@@ -607,6 +780,23 @@ class KubernetesJobJournal:
                 (observation.job_uid, operation_id),
             )
         return observation
+
+    def _recorded_job_uid(self, operation_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT job_uid FROM kubernetes_jobs WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+        if row is None:
+            raise KubernetesContractError("Kubernetes operation intent disappeared.")
+        job_uid = row["job_uid"]
+        if job_uid is None:
+            return None
+        try:
+            return _required_string(job_uid, "job_uid", _UID)
+        except ValueError as error:
+            raise KubernetesContractError(
+                "Kubernetes Job UID in durable intent is malformed."
+            ) from error
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)

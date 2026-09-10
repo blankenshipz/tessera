@@ -81,7 +81,7 @@ def reconcile_cancellation(
     binding: JobBinding,
     cluster: ClusterIdentity,
     inspect: Callable[[str], Mapping[str, object] | None],
-    delete: Callable[[str], object],
+    delete: Callable[[str, str], object],
     observe_pods: Callable[[str], Sequence[Mapping[str, object]]],
 ) -> CancellationObservation:
     """Request deletion; report confirmation only after fresh Job/Pod absence."""
