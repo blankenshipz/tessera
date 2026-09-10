@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 27
+LATEST_SCHEMA_VERSION = 28
 LOCAL_ORG_ID = "org_local"
 
 
@@ -457,6 +457,15 @@ def migrate_v26_to_v27(connection: sqlite3.Connection) -> None:
     the current context. Conclusions with evidence from exactly one design revision
     are linked to it; mixed legacy citations remain explicitly unbound.
     """
+    design_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(research_experiment_designs)")
+    }
+    if "goal" in design_columns:
+        # Fresh-schema helpers are intentionally current-version definitions. A
+        # test/recovery path replaying intermediate migration numbers can already
+        # have this additive shape without any historical rows to infer.
+        connection.execute("UPDATE schema_meta SET schema_version = 27 WHERE singleton = 1")
+        return
     connection.execute("ALTER TABLE research_experiment_designs ADD COLUMN goal TEXT")
     connection.execute("ALTER TABLE research_experiment_designs ADD COLUMN success_criterion TEXT")
     connection.execute(
@@ -512,6 +521,67 @@ def migrate_v26_to_v27(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 27 WHERE singleton = 1")
 
 
+def migrate_v27_to_v28(connection: sqlite3.Connection) -> None:
+    """Type new attempt provenance without inventing old execution evidence."""
+    variant_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(research_experiment_variants)")
+    }
+    if "execution_task_id" in variant_columns:
+        # New databases created by a newer binary can pass through intermediate
+        # migrations in tests; their records already have the v28 shape.
+        connection.execute("UPDATE schema_meta SET schema_version = 28 WHERE singleton = 1")
+        return
+    connection.execute("ALTER TABLE research_experiment_variants ADD COLUMN execution_task_id TEXT")
+    connection.execute(
+        "ALTER TABLE research_experiment_variants ADD COLUMN execution_plan_digest TEXT"
+    )
+    tables = (
+        "research_conclusion_evidence",
+        "experiment_artifact_evidence_references",
+        "research_attempt_measurements",
+        "research_attempt_artifacts",
+        "research_experiment_attempts",
+    )
+    for table in tables:
+        connection.execute(f"CREATE TEMP TABLE migration_28_{table} AS SELECT * FROM {table}")
+    for table in tables:
+        connection.execute(f"DROP TABLE {table}")
+    from .experiments import create_experiment_evidence_retention_schema, create_experiment_schema
+
+    create_experiment_schema(connection)
+    create_experiment_evidence_retention_schema(connection)
+    connection.execute(
+        """INSERT INTO research_experiment_attempts
+        (id,variant_id,design_revision,provenance_kind,operation_id,execution_plan_digest,
+         package_digest,operation_desired_state,operation_observed_state,termination_status,
+         human_observation,outcome,reason,revision,created_at,created_by_principal_id)
+        SELECT a.id,a.variant_id,v.design_revision,'legacy_operation_unverified',a.operation_id,
+        NULL,NULL,NULL,'legacy_unverified','legacy_unknown',NULL,a.outcome,a.reason,a.revision,
+        a.created_at,a.created_by_principal_id
+        FROM migration_28_research_experiment_attempts a
+        JOIN research_experiment_variants v ON v.id=a.variant_id"""
+    )
+    for table in ("research_attempt_artifacts", "research_attempt_measurements"):
+        columns = ",".join(
+            row[1] for row in connection.execute(f"PRAGMA table_info(migration_28_{table})")
+        )
+        connection.execute(
+            f"INSERT INTO {table} ({columns}) SELECT {columns} FROM migration_28_{table}"
+        )
+    for table in ("experiment_artifact_evidence_references", "research_conclusion_evidence"):
+        columns = ",".join(
+            row[1] for row in connection.execute(f"PRAGMA table_info(migration_28_{table})")
+        )
+        connection.execute(
+            f"INSERT INTO {table} ({columns}) SELECT {columns} FROM migration_28_{table}"
+        )
+    for table in tables:
+        connection.execute(f"DROP TABLE migration_28_{table}")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("Operation-provenance migration would leave invalid references.")
+    connection.execute("UPDATE schema_meta SET schema_version = 28 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -539,6 +609,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     24: migrate_v24_to_v25,
     25: migrate_v25_to_v26,
     26: migrate_v26_to_v27,
+    27: migrate_v27_to_v28,
 }
 
 

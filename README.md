@@ -102,6 +102,13 @@ design revision and attaches every new conclusion/review to one complete design
 snapshot. Migration preserves only the current legacy context that was actually
 recorded; earlier context remains unknown instead of being reconstructed.
 
+Schema v28 binds each new experiment attempt either to one immutable variant and
+matching admitted operation/package with an attributed terminal observation, or
+to an explicitly typed human-reported observation. It records cancellation desire,
+observed execution, and termination confirmation separately from the human outcome;
+none establishes scientific success. Earlier attempt links migrate as explicitly
+`legacy_operation_unverified`, with no invented plan/package or termination proof.
+
 Schema v15 adds a human-only, immutable synthetic result checkpoint for a
 reconciled, worker-confirmed operation and a complete exact quarantined manifest.
 It rechecks retained bytes and declared metadata, preserves quarantine and labels

@@ -63,19 +63,45 @@ def create_experiment_schema(
         id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
         design_revision INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('baseline','intervention')),
         name TEXT NOT NULL, method_digest TEXT NOT NULL, input_digest TEXT NOT NULL,
-        metadata_json TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision >= 1),
+        metadata_json TEXT NOT NULL, execution_task_id TEXT REFERENCES tasks(id),
+        execution_plan_digest TEXT, revision INTEGER NOT NULL CHECK (revision >= 1),
         created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
         UNIQUE(experiment_id,design_revision,kind),
+        CHECK ((execution_task_id IS NULL) = (execution_plan_digest IS NULL)),
         FOREIGN KEY(experiment_id,design_revision) REFERENCES research_experiment_designs(experiment_id,revision))""",
         "CREATE INDEX IF NOT EXISTS research_experiment_variants_by_experiment ON research_experiment_variants(experiment_id,design_revision,id)",
         """CREATE TABLE IF NOT EXISTS research_experiment_attempts (
         id TEXT PRIMARY KEY, variant_id TEXT NOT NULL REFERENCES research_experiment_variants(id),
-        operation_id TEXT NOT NULL REFERENCES external_operations(operation_id),
+        design_revision INTEGER NOT NULL CHECK (design_revision >= 1),
+        provenance_kind TEXT NOT NULL CHECK (provenance_kind IN
+            ('admitted_operation','human_reported_observation','legacy_operation_unverified')),
+        operation_id TEXT REFERENCES external_operations(operation_id),
+        execution_plan_digest TEXT, package_digest TEXT,
+        operation_desired_state TEXT CHECK (operation_desired_state IN ('admitted','cancel_requested')),
+        operation_observed_state TEXT NOT NULL CHECK (operation_observed_state IN
+            ('exited','not_observed','legacy_unverified')),
+        termination_status TEXT NOT NULL CHECK (termination_status IN
+            ('confirmed','observed_exited_unconfirmed','not_applicable','legacy_unknown')),
+        human_observation TEXT,
         outcome TEXT NOT NULL CHECK (outcome IN ('succeeded','failed','cancelled','inconclusive')),
         reason TEXT, revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL,
         created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
-        CHECK ((outcome = 'succeeded') OR reason IS NOT NULL))""",
+        CHECK ((outcome = 'succeeded') OR reason IS NOT NULL),
+        CHECK ((provenance_kind='admitted_operation' AND operation_id IS NOT NULL
+               AND execution_plan_digest IS NOT NULL AND package_digest IS NOT NULL
+               AND operation_desired_state IS NOT NULL AND operation_observed_state='exited'
+               AND termination_status IN ('confirmed','observed_exited_unconfirmed')
+               AND human_observation IS NULL)
+            OR (provenance_kind='human_reported_observation' AND operation_id IS NULL
+                AND execution_plan_digest IS NULL AND package_digest IS NULL
+                AND operation_desired_state IS NULL AND operation_observed_state='not_observed'
+                AND termination_status='not_applicable' AND human_observation IS NOT NULL)
+            OR (provenance_kind='legacy_operation_unverified' AND operation_id IS NOT NULL
+                AND operation_observed_state='legacy_unverified'
+                AND termination_status='legacy_unknown')))""",
         "CREATE INDEX IF NOT EXISTS research_experiment_attempts_by_variant ON research_experiment_attempts(variant_id,created_at,id)",
+        """CREATE UNIQUE INDEX IF NOT EXISTS research_experiment_admitted_operation_once
+        ON research_experiment_attempts(operation_id) WHERE provenance_kind='admitted_operation'""",
         """CREATE TABLE IF NOT EXISTS research_attempt_artifacts (
         attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
         artifact_id TEXT NOT NULL REFERENCES artifacts(id), created_at TEXT NOT NULL,
@@ -239,6 +265,7 @@ class ExperimentStore(Store):
         ) -> tuple[int, dict[str, Any]]:
             self._human(actor)
             self._project(connection, actor, project_id)
+            self._validate_variant_execution_plans(connection, actor, project_id, body["variants"])
             now, ident = utc_now(), "experiment_" + uuid.uuid4().hex
             experiment = {
                 "id": ident,
@@ -301,7 +328,10 @@ class ExperimentStore(Store):
         )
         for variant in variants:
             connection.execute(
-                """INSERT INTO research_experiment_variants (id,experiment_id,design_revision,kind,name,method_digest,input_digest,metadata_json,revision,created_at,created_by_principal_id) VALUES (?,?,?,?,?,?,?,?,1,?,?)""",
+                """INSERT INTO research_experiment_variants
+                (id,experiment_id,design_revision,kind,name,method_digest,input_digest,metadata_json,
+                 execution_task_id,execution_plan_digest,revision,created_at,created_by_principal_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)""",
                 (
                     "experiment_variant_" + uuid.uuid4().hex,
                     experiment["id"],
@@ -311,10 +341,41 @@ class ExperimentStore(Store):
                     variant["method_digest"],
                     variant["input_digest"],
                     json.dumps(variant["metadata"], sort_keys=True, separators=(",", ":")),
+                    variant["execution_task_id"],
+                    variant["execution_plan_digest"],
                     now,
                     actor["id"],
                 ),
             )
+
+    def _validate_variant_execution_plans(
+        self,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        project_id: str,
+        variants: list[dict[str, Any]],
+    ) -> None:
+        """Keep optional execution bases immutable, tenant-scoped, and real."""
+        for variant in variants:
+            task_id = variant["execution_task_id"]
+            if task_id is None:
+                continue
+            row = connection.execute(
+                """SELECT 1 FROM task_revisions r JOIN tasks t ON t.id=r.task_id
+                JOIN projects p ON p.id=t.project_id
+                WHERE r.task_id=? AND r.plan_digest=? AND t.project_id=? AND p.org_id=?
+                AND (? IS NULL OR t.project_id=?)""",
+                (
+                    task_id,
+                    variant["execution_plan_digest"],
+                    project_id,
+                    actor["org_id"],
+                    actor["project_id"],
+                    actor["project_id"],
+                ),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Experiment execution plan was not found.")
 
     def revise_design(
         self,
@@ -355,6 +416,9 @@ class ExperimentStore(Store):
                 "current_design_revision": revision,
                 "updated_at": now,
             }
+            self._validate_variant_execution_plans(
+                connection, actor, experiment["project_id"], body["variants"]
+            )
             self._insert_design(
                 connection, actor, updated, revision, body["protocol"], body["variants"], now
             )
@@ -390,17 +454,13 @@ class ExperimentStore(Store):
             if variant["revision"] != body["expected_variant_revision"]:
                 raise Conflict("Experiment variant revision is no longer current.")
             experiment = self._experiment(connection, actor, variant["experiment_id"])
-            operation = connection.execute(
-                "SELECT project_id FROM external_operations WHERE operation_id=?",
-                (body["operation_id"],),
-            ).fetchone()
-            if operation is None or operation["project_id"] != experiment["project_id"]:
-                raise NotFound("External operation was not found.")
+            provenance = self._attempt_provenance(connection, actor, experiment, variant, body)
             now, ident = utc_now(), "experiment_attempt_" + uuid.uuid4().hex
             row = {
                 "id": ident,
                 "variant_id": variant_id,
-                "operation_id": body["operation_id"],
+                "design_revision": variant["design_revision"],
+                **provenance,
                 "outcome": body["outcome"],
                 "reason": body["reason"],
                 "revision": 1,
@@ -409,7 +469,14 @@ class ExperimentStore(Store):
                 "scientific_validity": "not_assessed",
             }
             connection.execute(
-                """INSERT INTO research_experiment_attempts (id,variant_id,operation_id,outcome,reason,revision,created_at,created_by_principal_id) VALUES (:id,:variant_id,:operation_id,:outcome,:reason,:revision,:created_at,:created_by_principal_id)""",
+                """INSERT INTO research_experiment_attempts
+                (id,variant_id,design_revision,provenance_kind,operation_id,execution_plan_digest,
+                 package_digest,operation_desired_state,operation_observed_state,termination_status,
+                 human_observation,outcome,reason,revision,created_at,created_by_principal_id)
+                VALUES (:id,:variant_id,:design_revision,:provenance_kind,:operation_id,
+                :execution_plan_digest,:package_digest,:operation_desired_state,
+                :operation_observed_state,:termination_status,:human_observation,:outcome,:reason,
+                :revision,:created_at,:created_by_principal_id)""",
                 row,
             )
             self._event(
@@ -422,7 +489,13 @@ class ExperimentStore(Store):
                     "experiment_id": experiment["id"],
                     "variant_id": variant_id,
                     "attempt_id": ident,
-                    "operation_id": body["operation_id"],
+                    "provenance_kind": provenance["provenance_kind"],
+                    "operation_id": provenance["operation_id"],
+                    "execution_plan_digest": provenance["execution_plan_digest"],
+                    "package_digest": provenance["package_digest"],
+                    "operation_desired_state": provenance["operation_desired_state"],
+                    "operation_observed_state": provenance["operation_observed_state"],
+                    "termination_status": provenance["termination_status"],
                     "outcome": body["outcome"],
                     "scientific_validity": "not_assessed",
                 },
@@ -432,6 +505,78 @@ class ExperimentStore(Store):
         return self._mutate(
             principal, key, "POST", f"/experiment-variants/{variant_id}/attempts", digest, command
         )
+
+    def _attempt_provenance(
+        self,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        experiment: dict[str, Any],
+        variant: dict[str, Any],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        if body["provenance_kind"] == "human_reported_observation":
+            return {
+                "provenance_kind": "human_reported_observation",
+                "operation_id": None,
+                "execution_plan_digest": None,
+                "package_digest": None,
+                "operation_desired_state": None,
+                "operation_observed_state": "not_observed",
+                "termination_status": "not_applicable",
+                "human_observation": body["human_observation"],
+            }
+        if variant["execution_task_id"] is None:
+            raise Conflict("Experiment variant does not declare an immutable execution plan.")
+        operation = connection.execute(
+            """SELECT o.*,g.plan_digest AS grant_plan_digest FROM external_operations o
+            JOIN execution_grants g ON g.id=o.grant_id
+            WHERE o.operation_id=? AND o.org_id=? AND o.project_id=?""",
+            (body["operation_id"], actor["org_id"], experiment["project_id"]),
+        ).fetchone()
+        if operation is None:
+            raise NotFound("External operation was not found.")
+        if (
+            operation["task_id"] != variant["execution_task_id"]
+            or operation["grant_plan_digest"] != variant["execution_plan_digest"]
+            or operation["observed_state"] != "exited"
+        ):
+            raise Conflict(
+                "External operation is not admitted for this immutable experiment variant."
+            )
+        observation = connection.execute(
+            """SELECT observed_state,termination_confirmed FROM execution_observations
+            WHERE operation_id=? AND grant_id=? AND lease_id=? AND worker_principal_id=?
+            AND epoch=? ORDER BY rowid DESC LIMIT 1""",
+            (
+                operation["operation_id"],
+                operation["grant_id"],
+                operation["lease_id"],
+                operation["worker_principal_id"],
+                operation["epoch"],
+            ),
+        ).fetchone()
+        if observation is None or observation["observed_state"] != "exited":
+            raise Conflict("External operation has no attributed terminal execution observation.")
+        if connection.execute(
+            """SELECT 1 FROM research_experiment_attempts
+            WHERE operation_id=? AND provenance_kind='admitted_operation'""",
+            (operation["operation_id"],),
+        ).fetchone():
+            raise Conflict("External operation is already bound to an experiment variant.")
+        return {
+            "provenance_kind": "admitted_operation",
+            "operation_id": operation["operation_id"],
+            "execution_plan_digest": operation["grant_plan_digest"],
+            "package_digest": operation["package_digest"],
+            "operation_desired_state": operation["desired_state"],
+            "operation_observed_state": "exited",
+            "termination_status": (
+                "confirmed"
+                if observation["termination_confirmed"]
+                else "observed_exited_unconfirmed"
+            ),
+            "human_observation": None,
+        }
 
     def link_attempt_artifacts(
         self,
@@ -451,13 +596,19 @@ class ExperimentStore(Store):
             if attempt["revision"] != body["expected_revision"]:
                 raise Conflict("Experiment attempt revision is no longer current.")
             for artifact_id in body["artifact_ids"]:
-                linked = connection.execute(
-                    """SELECT 1 FROM artifacts a JOIN external_operations o ON o.lease_id=a.lease_id
-                WHERE a.id=? AND o.operation_id=? AND o.project_id=?""",
-                    (artifact_id, attempt["operation_id"], attempt["project_id"]),
-                ).fetchone()
+                if attempt["provenance_kind"] == "human_reported_observation":
+                    linked = connection.execute(
+                        "SELECT 1 FROM artifacts WHERE id=? AND project_id=?",
+                        (artifact_id, attempt["project_id"]),
+                    ).fetchone()
+                else:
+                    linked = connection.execute(
+                        """SELECT 1 FROM artifacts a JOIN external_operations o ON o.lease_id=a.lease_id
+                    WHERE a.id=? AND o.operation_id=? AND o.project_id=?""",
+                        (artifact_id, attempt["operation_id"], attempt["project_id"]),
+                    ).fetchone()
                 if linked is None:
-                    raise NotFound("Artifact is not linked to this attempt operation.")
+                    raise NotFound("Artifact is not linked to this attempt provenance.")
             now, revision = utc_now(), attempt["revision"] + 1
             for artifact_id in body["artifact_ids"]:
                 admit_experiment_artifact_evidence_reference(

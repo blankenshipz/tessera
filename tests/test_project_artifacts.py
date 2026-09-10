@@ -351,7 +351,7 @@ def test_v23_migration_preserves_v22_staged_at_operations_and_placements(tmp_pat
         connection.execute("DROP TABLE v23_operations")
         connection.execute("UPDATE schema_meta SET schema_version=22")
 
-    assert migrate_state(state) == 27
+    assert migrate_state(state) == 28
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         migrated = connection.execute(
             """SELECT artifact_id,state,intent_at,reconcile_started_at,committed_at,reconciled_at
@@ -420,7 +420,7 @@ def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
             is None
         )
         connection.execute("ROLLBACK")
-    assert migrate_state(state) == 27
+    assert migrate_state(state) == 28
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0]
@@ -729,7 +729,7 @@ def test_v24_retention_migration_preserves_placement_and_rolls_back(
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE project_artifact_retention")
         connection.execute("UPDATE schema_meta SET schema_version=23")
-    assert migrate_state(state) == 27
+    assert migrate_state(state) == 28
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT retention_class,state FROM project_artifact_retention"

@@ -235,3 +235,9 @@ experiment design revision. It binds each new conclusion and its review to one
 design snapshot. Migration copies the current projection only to its matching
 current design; earlier goal/criterion context that was never recorded remains
 explicitly unknown rather than inferred.
+
+Schema 28 adds typed experiment-attempt provenance. New operation-backed attempts
+must match an immutable variant's recorded task plan and an attributed terminal
+operation observation; human-reported observations are explicit and operationless.
+Migration preserves v27 attempt links as `legacy_operation_unverified` rather than
+inventing a package, terminal observation, cancellation outcome, or scientific success.

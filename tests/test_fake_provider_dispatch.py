@@ -111,7 +111,7 @@ def test_v18_to_v19_receipt_migration_does_not_invent_receipts(tmp_path):
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE external_operation_receipts")
         connection.execute("UPDATE schema_meta SET schema_version=18")
-    assert migrate_state(state) == 27
+    assert migrate_state(state) == 28
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM external_operation_receipts").fetchone()[0]

@@ -66,9 +66,13 @@ def _operation(state: Path, owner, grant, lease, operation_id: str) -> None:
                 now,
             ),
         )
+        connection.execute(
+            "UPDATE execution_observations SET operation_id=? WHERE lease_id=?",
+            (operation_id, lease["id"]),
+        )
 
 
-def _design(revision: int | None = None):
+def _design(revision: int | None = None, grant=None):
     body = {
         "goal": "Reduce synthetic processing time.",
         "success_criterion": "A human compares retained measurements to the baseline.",
@@ -92,6 +96,10 @@ def _design(revision: int | None = None):
     }
     if revision is not None:
         body["expected_revision"] = revision
+    if grant is not None:
+        for variant in body["variants"]:
+            variant["execution_task_id"] = grant["task_id"]
+            variant["execution_plan_digest"] = grant["plan_digest"]
     return body
 
 
@@ -99,12 +107,14 @@ def test_goal_design_attempt_evidence_conclusion_and_reopen_chain(tmp_path: Path
     state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
     _operation(state, owner, grant, lease, manifest["operation_id"])
     records = ExperimentStore(state)
-    created = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    created = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
     assert {item["kind"] for item in created["design"]["variants"]} == {
         "baseline",
         "intervention",
     }
-    revised = _command(records.revise_design, owner, created["id"], payload=_design(1))
+    revised = _command(records.revise_design, owner, created["id"], payload=_design(1, grant))
     assert revised["current_design_revision"] == 2
     baseline = next(item for item in revised["design"]["variants"] if item["kind"] == "baseline")
     attempt = _command(
@@ -113,6 +123,7 @@ def test_goal_design_attempt_evidence_conclusion_and_reopen_chain(tmp_path: Path
         baseline["id"],
         payload={
             "expected_variant_revision": baseline["revision"],
+            "provenance_kind": "admitted_operation",
             "operation_id": manifest["operation_id"],
             "outcome": "succeeded",
         },
@@ -194,7 +205,9 @@ def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
     state, owner, _worker, grant, lease, manifest, _artifact = _reconciled_manifest(tmp_path)
     _operation(state, owner, grant, lease, manifest["operation_id"])
     records = ExperimentStore(state)
-    experiment = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
     baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
     for outcome in ("failed", "cancelled", "inconclusive"):
         attempt = _command(
@@ -203,7 +216,8 @@ def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
             baseline["id"],
             payload={
                 "expected_variant_revision": baseline["revision"],
-                "operation_id": manifest["operation_id"],
+                "provenance_kind": "human_reported_observation",
+                "human_observation": f"Human recorded the synthetic {outcome} observation.",
                 "outcome": outcome,
                 "reason": f"Synthetic {outcome} outcome remains recorded.",
             },
@@ -211,7 +225,7 @@ def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
         assert attempt["outcome"] == outcome
         assert attempt["scientific_validity"] == "not_assessed"
     with pytest.raises(Conflict, match="revision"):
-        _command(records.revise_design, owner, experiment["id"], payload=_design(2))
+        _command(records.revise_design, owner, experiment["id"], payload=_design(2, grant))
     expires_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     credential = {
         "kind": "agent",
@@ -262,6 +276,113 @@ def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize("state", ("unknown", "running"))
+def test_attempt_rejects_nonterminal_or_unrelated_operations(tmp_path: Path, state: str) -> None:
+    state_dir, owner, _worker, grant, lease, manifest, _artifact = _reconciled_manifest(tmp_path)
+    _operation(state_dir, owner, grant, lease, manifest["operation_id"])
+    records = ExperimentStore(state_dir)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    with sqlite3.connect(state_dir / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE external_operations SET observed_state=? WHERE operation_id=?",
+            (state, manifest["operation_id"]),
+        )
+        connection.execute(
+            "UPDATE execution_observations SET observed_state=? WHERE operation_id=?",
+            (state, manifest["operation_id"]),
+        )
+    body = {
+        "expected_variant_revision": baseline["revision"],
+        "provenance_kind": "admitted_operation",
+        "operation_id": manifest["operation_id"],
+        "outcome": "succeeded",
+    }
+    with pytest.raises(Conflict, match="not admitted"):
+        _command(records.record_attempt, owner, baseline["id"], payload=body)
+    with sqlite3.connect(state_dir / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE external_operations SET observed_state='exited',task_id=? WHERE operation_id=?",
+            ("unrelated_task", manifest["operation_id"]),
+        )
+        connection.execute(
+            "UPDATE execution_observations SET observed_state='exited' WHERE operation_id=?",
+            (manifest["operation_id"],),
+        )
+    with pytest.raises(Conflict, match="not admitted"):
+        _command(records.record_attempt, owner, baseline["id"], payload=body)
+
+
+def test_attempt_provenance_admission_human_replay_reuse_and_cancellation(tmp_path: Path) -> None:
+    state, owner, _worker, grant, lease, manifest, _artifact = _reconciled_manifest(tmp_path)
+    _operation(state, owner, grant, lease, manifest["operation_id"])
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    intervention = next(
+        item for item in experiment["design"]["variants"] if item["kind"] == "intervention"
+    )
+    body = {
+        "expected_variant_revision": baseline["revision"],
+        "provenance_kind": "admitted_operation",
+        "operation_id": manifest["operation_id"],
+        "outcome": "succeeded",
+    }
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE external_operations SET desired_state='cancel_requested' WHERE operation_id=?",
+            (manifest["operation_id"],),
+        )
+    status, attempt = records.record_attempt(
+        owner, baseline["id"], "attempt-replay", canonical_digest(body), body
+    )
+    assert status == 201
+    assert attempt["provenance_kind"] == "admitted_operation"
+    assert attempt["design_revision"] == baseline["design_revision"]
+    assert attempt["operation_observed_state"] == "exited"
+    assert attempt["termination_status"] == "confirmed"
+    assert attempt["scientific_validity"] == "not_assessed"
+    assert records.record_attempt(
+        owner, baseline["id"], "attempt-replay", canonical_digest(body), body
+    ) == (status, attempt)
+    conflicting = body | {"outcome": "inconclusive", "reason": "Different retry payload."}
+    with pytest.raises(Conflict):
+        records.record_attempt(
+            owner, baseline["id"], "attempt-replay", canonical_digest(conflicting), conflicting
+        )
+    with pytest.raises(Conflict, match="already bound"):
+        _command(
+            records.record_attempt,
+            owner,
+            intervention["id"],
+            payload=body | {"expected_variant_revision": intervention["revision"]},
+        )
+    human = _command(
+        records.record_attempt,
+        owner,
+        intervention["id"],
+        payload={
+            "expected_variant_revision": intervention["revision"],
+            "provenance_kind": "human_reported_observation",
+            "human_observation": (
+                "A human recorded an instrument reading outside Tessera execution."
+            ),
+            "outcome": "inconclusive",
+            "reason": "No execution observation is claimed.",
+        },
+    )
+    assert human["operation_id"] is None
+    assert human["operation_observed_state"] == "not_observed"
+    assert human["termination_status"] == "not_applicable"
+    # The first operation stays consumed. A cancellation request never changes its
+    # recorded terminal observation into scientific or execution success.
+    assert attempt["operation_desired_state"] == "cancel_requested"
+
+
 def test_experiment_evidence_retention_admission_delete_fence_and_export(tmp_path: Path) -> None:
     state, owner, worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
     _operation(state, owner, grant, lease, manifest["operation_id"])
@@ -280,7 +401,9 @@ def test_experiment_evidence_retention_admission_delete_fence_and_export(tmp_pat
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DELETE FROM artifact_manifests WHERE id=?", (manifest["id"],))
     records = ExperimentStore(state)
-    experiment = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
     baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
     attempt = _command(
         records.record_attempt,
@@ -288,6 +411,7 @@ def test_experiment_evidence_retention_admission_delete_fence_and_export(tmp_pat
         baseline["id"],
         payload={
             "expected_variant_revision": baseline["revision"],
+            "provenance_kind": "admitted_operation",
             "operation_id": manifest["operation_id"],
             "outcome": "succeeded",
         },
@@ -322,7 +446,8 @@ def test_experiment_evidence_retention_admission_delete_fence_and_export(tmp_pat
         baseline["id"],
         payload={
             "expected_variant_revision": baseline["revision"],
-            "operation_id": manifest["operation_id"],
+            "provenance_kind": "human_reported_observation",
+            "human_observation": "Human recorded a second observation during deletion reservation.",
             "outcome": "inconclusive",
             "reason": "Deletion reservation blocks a new evidence link.",
         },
@@ -392,7 +517,9 @@ def test_nonplaced_experiment_evidence_remains_explicit_legacy_custody(tmp_path:
     state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
     _operation(state, owner, grant, lease, manifest["operation_id"])
     records = ExperimentStore(state)
-    experiment = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
     baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
     attempt = _command(
         records.record_attempt,
@@ -400,6 +527,7 @@ def test_nonplaced_experiment_evidence_remains_explicit_legacy_custody(tmp_path:
         baseline["id"],
         payload={
             "expected_variant_revision": baseline["revision"],
+            "provenance_kind": "admitted_operation",
             "operation_id": manifest["operation_id"],
             "outcome": "succeeded",
         },
@@ -432,7 +560,7 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 27
+    assert migrate_state(state) == 28
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -450,7 +578,9 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
     state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
     _operation(state, owner, grant, lease, manifest["operation_id"])
     records = ExperimentStore(state)
-    first = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    first = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
     baseline_one = next(item for item in first["design"]["variants"] if item["kind"] == "baseline")
     attempt_one = _command(
         records.record_attempt,
@@ -458,6 +588,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         baseline_one["id"],
         payload={
             "expected_variant_revision": baseline_one["revision"],
+            "provenance_kind": "admitted_operation",
             "operation_id": manifest["operation_id"],
             "outcome": "succeeded",
         },
@@ -498,7 +629,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         payload={"expected_revision": conclusion_one["revision"], "design_revision": 1},
     )
 
-    second_design = _design(1)
+    second_design = _design(1, grant)
     second_design.update(
         goal="Reduce synthetic processing time without increasing failures.",
         success_criterion="A human confirms both duration and failure-rate measurements.",
@@ -510,6 +641,8 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
                 "method_digest": "e" * 64,
                 "input_digest": "f" * 64,
                 "metadata": {"synthetic": "second"},
+                "execution_task_id": grant["task_id"],
+                "execution_plan_digest": grant["plan_digest"],
             },
             {
                 "kind": "intervention",
@@ -517,6 +650,8 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
                 "method_digest": "1" * 64,
                 "input_digest": "2" * 64,
                 "metadata": {"synthetic": "second"},
+                "execution_task_id": grant["task_id"],
+                "execution_plan_digest": grant["plan_digest"],
             },
         ],
     )
@@ -528,25 +663,20 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         baseline_two["id"],
         payload={
             "expected_variant_revision": baseline_two["revision"],
-            "operation_id": manifest["operation_id"],
+            "provenance_kind": "human_reported_observation",
+            "human_observation": "Human recorded the revised-baseline observation.",
             "outcome": "succeeded",
         },
-    )
-    linked_two = _command(
-        records.link_attempt_artifacts,
-        owner,
-        attempt_two["id"],
-        payload={"expected_revision": attempt_two["revision"], "artifact_ids": [artifact["id"]]},
     )
     measurement_two = _command(
         records.record_measurement,
         owner,
         attempt_two["id"],
         payload={
-            "expected_revision": linked_two["revision"],
+            "expected_revision": attempt_two["revision"],
             "name": "second duration",
             "value": {"seconds": 1},
-            "artifact_id": artifact["id"],
+            "artifact_id": None,
         },
     )
     conclusion_two = _command(
@@ -657,7 +787,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         connection.execute("DROP TABLE migration_27_conclusion_evidence")
         connection.execute("DROP TABLE migration_27_conclusions")
         connection.execute("UPDATE schema_meta SET schema_version=26")
-    assert migrate_state(state) == 27
+    assert migrate_state(state) == 28
     migrated = ExperimentStore(state).get_experiment(owner, first["id"])
     migrated_designs = {item["revision"]: item for item in migrated["designs"]}
     assert migrated_designs[1]["goal"] is None

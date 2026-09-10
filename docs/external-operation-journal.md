@@ -26,6 +26,25 @@ records, manifests, or synthetic checkpoints. Those legacy records retain null
 operation journal attribution or their existing derived deterministic identity.
 They remain quarantine-only and are not new execution receipts.
 
+## Goal-to-decision attempt provenance
+
+Schema v28 requires each new experiment attempt to name exactly one typed
+provenance source. An `admitted_operation` attempt is bound to its immutable
+variant/design and that variant's recorded task-plan digest. The operation must
+belong to the same tenant/project, match that task-plan basis, retain an admitted
+package digest, and have a matching attributed `exited` worker observation.
+`unknown`, `running`, missing, and plan-unrelated operations cannot be recorded
+as terminal experiment attempts. An operation can bind only one such variant.
+
+The attempt preserves the operation's desired cancellation state separately from
+its observed execution state and whether termination was confirmed. Its outcome
+is still a human-recorded research label; neither an exited operation nor a
+cancel request establishes scientific success. Non-computational work uses the
+explicit `human_reported_observation` source, with no operation ID and a required
+human observation. It may link project artifacts as human-reported evidence, not
+as execution proof. v27 rows migrate as `legacy_operation_unverified`: no plan,
+package, terminal observation, or scientific result is inferred from them.
+
 ## Fake-provider receipt slice
 
 Schema v19 adds an empty-by-default, separate one-to-one receipt record. The

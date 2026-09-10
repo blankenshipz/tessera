@@ -36,8 +36,16 @@ class DesignVariant(ExperimentRequest):
     method_digest: Digest
     input_digest: Digest
     metadata: dict[str, Any]
+    execution_task_id: Identifier | None = None
+    execution_plan_digest: Digest | None = None
 
     _metadata_is_bounded = field_validator("metadata")(_bounded_json)
+
+    @model_validator(mode="after")
+    def execution_plan_is_complete(self) -> DesignVariant:
+        if (self.execution_task_id is None) != (self.execution_plan_digest is None):
+            raise ValueError("execution task and plan digest must be supplied together")
+        return self
 
 
 class CreateExperiment(ExperimentRequest):
@@ -59,7 +67,9 @@ class ReviseExperimentDesign(CreateExperiment):
 
 class RecordAttempt(ExperimentRequest):
     expected_variant_revision: Revision
-    operation_id: OperationId
+    provenance_kind: Literal["admitted_operation", "human_reported_observation"]
+    operation_id: OperationId | None = None
+    human_observation: NonBlank4000 | None = None
     outcome: Literal["succeeded", "failed", "cancelled", "inconclusive"]
     reason: NonBlank4000 | None = None
 
@@ -67,6 +77,13 @@ class RecordAttempt(ExperimentRequest):
     def non_success_outcomes_need_a_reason(self) -> RecordAttempt:
         if self.outcome != "succeeded" and self.reason is None:
             raise ValueError("failed, cancelled, and inconclusive outcomes require a reason")
+        if self.provenance_kind == "admitted_operation":
+            if self.operation_id is None or self.human_observation is not None:
+                raise ValueError("an admitted operation requires only its operation id")
+        elif self.operation_id is not None or self.human_observation is None:
+            raise ValueError(
+                "a human-reported observation requires its observation and no operation id"
+            )
         return self
 
 
