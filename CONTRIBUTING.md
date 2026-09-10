@@ -218,3 +218,8 @@ Schema 24 adds project-object retention and recovery metadata. It preserves v23
 placements, defaults every migrated object to active project retention, and does
 not schedule deletion. Explicit tombstone/delete intent remains fail-closed for
 held, referenced, checkpointed, or accepted object custody.
+
+Schema 25 adds an empty, tenant-scoped goal-to-decision ledger: versioned baseline
+and intervention designs, attempts linked to existing operation/artifact evidence,
+manual measurements, and human-reviewed conclusions. It does not backfill prior
+studies, operations, artifacts, measurements, outcomes, or scientific validity.

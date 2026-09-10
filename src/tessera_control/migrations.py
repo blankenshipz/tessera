@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 24
+LATEST_SCHEMA_VERSION = 25
 LOCAL_ORG_ID = "org_local"
 
 
@@ -411,6 +411,14 @@ def migrate_v23_to_v24(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 24 WHERE singleton = 1")
 
 
+def migrate_v24_to_v25(connection: sqlite3.Connection) -> None:
+    """Add empty goal-to-decision records without altering existing research/execution history."""
+    from .experiments import create_experiment_schema
+
+    create_experiment_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 25 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -435,6 +443,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     21: migrate_v21_to_v22,
     22: migrate_v22_to_v23,
     23: migrate_v23_to_v24,
+    24: migrate_v24_to_v25,
 }
 
 

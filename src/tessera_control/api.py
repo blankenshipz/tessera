@@ -68,6 +68,8 @@ def create_app(state_dir: Path) -> FastAPI:
     from .credential_leases import _FakeSecretBackend
     from .execution import ExecutionStore
     from .execution_api import router as execution_router
+    from .experiments import ExperimentStore
+    from .experiments_api import router as experiments_router
     from .handoff_api import router as handoff_router
     from .handoffs import WorkspaceHandoffStore
     from .interaction import InteractionStore
@@ -95,9 +97,11 @@ def create_app(state_dir: Path) -> FastAPI:
     app.include_router(artifact_router)
     app.include_router(artifact_disposition_router)
     app.state.research = ResearchStore(state_dir)
+    app.state.experiments = ExperimentStore(state_dir)
     app.state.interactions = InteractionStore(store)
     snapshots = SnapshotStore(state_dir)
     app.include_router(research_router)
+    app.include_router(experiments_router)
     app.include_router(interaction_router)
     app.include_router(handoff_router)
     app.add_middleware(
