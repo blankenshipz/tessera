@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from .api import idempotency_key, principal
-from .experiments import ExperimentStore
+from .experiments import EXPORT_DEFAULT_BYTES, EXPORT_MAX_BYTES, ExperimentStore
 from .experiments_models import (
     CreateConclusion,
     CreateExperiment,
@@ -128,5 +128,10 @@ def review(
 
 @router.get("/experiments/{experiment_id}")
 @router.get("/experiments/{experiment_id}/export")
-def export(experiment_id: str, actor: Actor, records: Experiments) -> dict[str, Any]:
-    return records.export_experiment(actor, experiment_id)
+def export(
+    experiment_id: str,
+    actor: Actor,
+    records: Experiments,
+    max_bytes: int = Query(default=EXPORT_DEFAULT_BYTES, ge=256, le=EXPORT_MAX_BYTES),
+) -> dict[str, Any]:
+    return records.export_experiment(actor, experiment_id, {"max_bytes": max_bytes})

@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 from .experiments_models import (
     CreateConclusion,
     CreateExperiment,
+    ExportExperiment,
     LinkAttemptArtifacts,
     RecordAttempt,
     RecordMeasurement,
@@ -30,6 +31,10 @@ from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, u
 
 T = TypeVar("T", bound=BaseModel)
 EXPORT_RECORD_LIMIT = 1_000
+EXPORT_DEFAULT_BYTES = 1_000_000
+# The Electron connection refuses control responses larger than four MiB. Keep
+# complete experiment snapshots within that same transport boundary.
+EXPORT_MAX_BYTES = 4 * 1024 * 1024
 
 
 def create_experiment_schema(
@@ -1050,12 +1055,90 @@ class ExperimentStore(Store):
         result["custody_state"] = retention_state
         return result
 
-    def export_experiment(self, principal: dict[str, Any], experiment_id: str) -> dict[str, Any]:
+    def export_experiment(
+        self,
+        principal: dict[str, Any],
+        experiment_id: str,
+        payload: dict[str, Any] | ExportExperiment | None = None,
+    ) -> dict[str, Any]:
+        body = self._body(ExportExperiment, payload or {})
         connection = _connect(self.database_path)
         try:
+            # One deferred transaction fences authorization, revision context, all
+            # aggregate preflight checks, and the resulting snapshot together.
             connection.execute("BEGIN")
             actor = self._live_principal(connection, principal)
             experiment = self._experiment(connection, actor, experiment_id)
+            # Bound every exported collection before retaining rows. Nested
+            # conclusion evidence and the distinct artifact projection count too;
+            # otherwise a "complete" response could still grow without limit.
+            bounded_queries = (
+                (
+                    "designs",
+                    "SELECT count(*) FROM research_experiment_designs WHERE experiment_id=?",
+                    (experiment_id,),
+                ),
+                (
+                    "variants",
+                    "SELECT count(*) FROM research_experiment_variants WHERE experiment_id=?",
+                    (experiment_id,),
+                ),
+                (
+                    "artifacts",
+                    """SELECT count(DISTINCT aa.artifact_id) FROM research_attempt_artifacts aa
+                    JOIN research_experiment_attempts a ON a.id=aa.attempt_id
+                    JOIN research_experiment_variants v ON v.id=a.variant_id
+                    WHERE v.experiment_id=?""",
+                    (experiment_id,),
+                ),
+                (
+                    "artifact links",
+                    """SELECT count(*) FROM research_attempt_artifacts aa
+                    JOIN research_experiment_attempts a ON a.id=aa.attempt_id
+                    JOIN research_experiment_variants v ON v.id=a.variant_id
+                    WHERE v.experiment_id=?""",
+                    (experiment_id,),
+                ),
+                (
+                    "operations",
+                    """SELECT count(DISTINCT o.operation_id) FROM external_operations o
+                    JOIN research_experiment_attempts a ON a.operation_id=o.operation_id
+                    JOIN research_experiment_variants v ON v.id=a.variant_id
+                    WHERE v.experiment_id=?""",
+                    (experiment_id,),
+                ),
+                (
+                    "attempts",
+                    """SELECT count(*) FROM research_experiment_attempts a
+                    JOIN research_experiment_variants v ON v.id=a.variant_id
+                    WHERE v.experiment_id=?""",
+                    (experiment_id,),
+                ),
+                (
+                    "measurements",
+                    """SELECT count(*) FROM research_attempt_measurements m
+                    JOIN research_experiment_attempts a ON a.id=m.attempt_id
+                    JOIN research_experiment_variants v ON v.id=a.variant_id
+                    WHERE v.experiment_id=?""",
+                    (experiment_id,),
+                ),
+                (
+                    "conclusions",
+                    "SELECT count(*) FROM research_conclusions WHERE experiment_id=?",
+                    (experiment_id,),
+                ),
+                (
+                    "conclusion evidence",
+                    """SELECT count(*) FROM research_conclusion_evidence ce
+                    JOIN research_conclusions c ON c.id=ce.conclusion_id
+                    WHERE c.experiment_id=?""",
+                    (experiment_id,),
+                ),
+            )
+            for collection, query, parameters in bounded_queries:
+                if connection.execute(query, parameters).fetchone()[0] > EXPORT_RECORD_LIMIT:
+                    raise Conflict(f"Export exceeds the per-experiment {collection} record limit.")
+
             result: dict[str, Any] = {
                 "experiment": self._experiment_response(connection, experiment),
                 "designs": [],
@@ -1068,91 +1151,95 @@ class ExperimentStore(Store):
                 "conclusions": [],
                 "completeness": "complete_in_scope_goal_to_decision_chain",
             }
-            tables = (
-                "research_experiment_designs",
-                "research_experiment_variants",
-                "research_conclusions",
-            )
-            if any(
-                connection.execute(
-                    f"SELECT count(*) FROM {table} WHERE experiment_id=?", (experiment_id,)
-                ).fetchone()[0]
-                > EXPORT_RECORD_LIMIT
-                for table in tables
-            ):
-                raise Conflict("Export exceeds the per-experiment record limit.")
+
+            # This is Starlette JSONResponse's compact UTF-8 encoding. The exact
+            # final assertion is defense in depth; append rejects before retaining
+            # an over-limit aggregate and never drops rows.
+            def encoded_size(value: dict[str, Any]) -> int:
+                return len(
+                    json.dumps(
+                        value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                    ).encode()
+                )
+
+            used = encoded_size(result)
+            if used > body["max_bytes"]:
+                raise Conflict("Export exceeds the requested byte cap.")
+
+            def append(section: str, item: dict[str, Any]) -> None:
+                nonlocal used
+                used += encoded_size(item) + (1 if result[section] else 0)
+                if used > body["max_bytes"]:
+                    raise Conflict("Export exceeds the requested byte cap.")
+                result[section].append(item)
+
             for row in connection.execute(
                 "SELECT * FROM research_experiment_designs WHERE experiment_id=? ORDER BY revision",
                 (experiment_id,),
             ):
-                result["designs"].append(
-                    self._design_response(connection, experiment_id, row["revision"])
-                )
+                append("designs", self._design_response(connection, experiment_id, row["revision"]))
             for row in connection.execute(
                 "SELECT * FROM research_experiment_variants WHERE experiment_id=? ORDER BY design_revision,kind",
                 (experiment_id,),
             ):
-                result["variants"].append(self._variant_response(dict(row)))
+                append("variants", self._variant_response(dict(row)))
             for row in connection.execute(
-                """SELECT a.*,v.experiment_id FROM research_experiment_attempts a JOIN research_experiment_variants v ON v.id=a.variant_id WHERE v.experiment_id=? ORDER BY a.created_at,a.id""",
+                """SELECT a.*,v.experiment_id FROM research_experiment_attempts a
+                JOIN research_experiment_variants v ON v.id=a.variant_id
+                WHERE v.experiment_id=? ORDER BY a.created_at,a.id""",
                 (experiment_id,),
             ):
                 attempt = dict(row)
                 attempt.pop("experiment_id")
                 attempt["scientific_validity"] = "not_assessed"
-                result["attempts"].append(attempt)
-            attempt_ids = [item["id"] for item in result["attempts"]]
-            if attempt_ids:
-                placeholders = ",".join("?" for _ in attempt_ids)
-                operation_ids = [item["operation_id"] for item in result["attempts"]]
-                operation_placeholders = ",".join("?" for _ in operation_ids)
-                result["operations"] = [
-                    dict(row)
-                    for row in connection.execute(
-                        f"SELECT * FROM external_operations WHERE operation_id IN ({operation_placeholders}) "
-                        "ORDER BY created_at,operation_id",
-                        operation_ids,
-                    )
-                ]
-                result["artifact_links"] = [
-                    dict(row)
-                    for row in connection.execute(
-                        f"SELECT * FROM research_attempt_artifacts WHERE attempt_id IN ({placeholders}) ORDER BY attempt_id,artifact_id",
-                        attempt_ids,
-                    )
-                ]
-                artifact_ids = [item["artifact_id"] for item in result["artifact_links"]]
-                if artifact_ids:
-                    artifact_placeholders = ",".join("?" for _ in artifact_ids)
-                    result["artifacts"] = [
-                        self._artifact_evidence_response(row)
-                        for row in connection.execute(
-                            f"""SELECT a.id,a.project_id,a.task_id,a.grant_id,a.lease_id,a.worker_principal_id,
-                            a.epoch,a.operation_id,a.relative_path,a.sha256,a.size,a.created_at,a.status,
-                            classification,late,r.retention_class,r.state AS retention_state,
-                            CASE WHEN p.artifact_id IS NULL THEN 0 ELSE 1 END AS has_placement
-                            FROM artifacts a
-                            LEFT JOIN project_artifact_retention r
-                            ON r.artifact_id=a.id AND r.project_id=a.project_id
-                            LEFT JOIN project_artifact_placements p
-                            ON p.artifact_id=a.id AND p.project_id=a.project_id
-                            WHERE a.id IN ({artifact_placeholders})
-                            ORDER BY a.created_at,a.id""",
-                            artifact_ids,
-                        )
-                    ]
-                result["measurements"] = [
-                    self._measurement_response(row)
-                    for row in connection.execute(
-                        f"SELECT * FROM research_attempt_measurements WHERE attempt_id IN ({placeholders}) ORDER BY created_at,id",
-                        attempt_ids,
-                    )
-                ]
+                append("attempts", attempt)
+            for row in connection.execute(
+                """SELECT o.* FROM external_operations o WHERE o.org_id=? AND o.project_id=?
+                AND EXISTS (SELECT 1 FROM research_experiment_attempts a
+                JOIN research_experiment_variants v ON v.id=a.variant_id
+                WHERE a.operation_id=o.operation_id AND v.experiment_id=?)
+                ORDER BY o.created_at,o.operation_id""",
+                (actor["org_id"], experiment["project_id"], experiment_id),
+            ):
+                append("operations", dict(row))
+            for row in connection.execute(
+                """SELECT aa.* FROM research_attempt_artifacts aa
+                JOIN research_experiment_attempts a ON a.id=aa.attempt_id
+                JOIN research_experiment_variants v ON v.id=a.variant_id
+                WHERE v.experiment_id=? ORDER BY aa.attempt_id,aa.artifact_id""",
+                (experiment_id,),
+            ):
+                append("artifact_links", dict(row))
+            for row in connection.execute(
+                """SELECT a.id,a.project_id,a.task_id,a.grant_id,a.lease_id,a.worker_principal_id,
+                a.epoch,a.operation_id,a.relative_path,a.sha256,a.size,a.created_at,a.status,
+                classification,late,r.retention_class,r.state AS retention_state,
+                CASE WHEN p.artifact_id IS NULL THEN 0 ELSE 1 END AS has_placement
+                FROM artifacts a
+                LEFT JOIN project_artifact_retention r ON r.artifact_id=a.id AND r.project_id=a.project_id
+                LEFT JOIN project_artifact_placements p ON p.artifact_id=a.id AND p.project_id=a.project_id
+                WHERE a.project_id=? AND EXISTS (SELECT 1 FROM research_attempt_artifacts aa
+                JOIN research_experiment_attempts ea ON ea.id=aa.attempt_id
+                JOIN research_experiment_variants v ON v.id=ea.variant_id
+                WHERE aa.artifact_id=a.id AND v.experiment_id=?) ORDER BY a.created_at,a.id""",
+                (experiment["project_id"], experiment_id),
+            ):
+                append("artifacts", self._artifact_evidence_response(row))
+            for row in connection.execute(
+                """SELECT m.* FROM research_attempt_measurements m
+                JOIN research_experiment_attempts a ON a.id=m.attempt_id
+                JOIN research_experiment_variants v ON v.id=a.variant_id
+                WHERE v.experiment_id=? ORDER BY m.created_at,m.id""",
+                (experiment_id,),
+            ):
+                append("measurements", self._measurement_response(row))
             for row in connection.execute(
                 "SELECT * FROM research_conclusions WHERE experiment_id=? ORDER BY created_at,id",
                 (experiment_id,),
             ):
-                result["conclusions"].append(self._conclusion_response(connection, dict(row)))
+                append("conclusions", self._conclusion_response(connection, dict(row)))
+            if encoded_size(result) > body["max_bytes"]:
+                raise Conflict("Export exceeds the requested byte cap.")
             return result
         finally:
             connection.close()

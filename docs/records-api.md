@@ -56,7 +56,13 @@ its `POST /conclusions/{id}/review` response expose that `design_revision` and a
 complete `design_snapshot`. Supplying a different revision while reviewing or
 revising a conclusion is rejected. `GET /experiments/{id}/export` includes complete
 historical designs and every conclusion's snapshot, without dispatching work or
-establishing scientific validity.
+establishing scientific validity. It uses one read transaction and fails with `409`
+rather than truncating when any exported collection (including attempts, operations,
+evidence links, artifacts, measurements, nested conclusion evidence, designs,
+variants, or conclusions) exceeds 1,000 records, or when its complete JSON exceeds
+`max_bytes`. `max_bytes` defaults to 1,000,000 and is capped at 4 MiB, matching the
+desktop control-response limit; callers need a separate bounded snapshot mechanism
+for larger ledgers.
 
 ## Conversations and decision inbox
 

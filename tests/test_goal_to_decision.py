@@ -805,3 +805,310 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
     assert migrated_designs[2]["goal"] == second_design["goal"]
     assert migrated_designs[2]["success_criterion"] == second_design["success_criterion"]
     assert {item["design_revision"] for item in migrated["conclusions"]} == {1, 2}
+
+
+def test_experiment_export_rejects_large_measurement_aggregate_before_materializing(
+    tmp_path: Path,
+) -> None:
+    state, owner, _worker, grant, _lease, _manifest, _artifact = _reconciled_manifest(tmp_path)
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    attempt = _command(
+        records.record_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "provenance_kind": "human_reported_observation",
+            "human_observation": "Synthetic bounded export observation.",
+            "outcome": "inconclusive",
+            "reason": "Fixture records a measurement aggregate only.",
+        },
+    )
+    now = utc_now()
+    large_value = '{"payload":"' + "x" * 40_000 + '"}'
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.executemany(
+            """INSERT INTO research_attempt_measurements
+            (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id)
+            VALUES (?,?,?,?,?,?,?)""",
+            [
+                (
+                    f"measurement-limit-{index}",
+                    attempt["id"],
+                    f"large measurement {index}",
+                    large_value,
+                    None,
+                    now,
+                    owner["id"],
+                )
+                for index in range(1_001)
+            ],
+        )
+    with pytest.raises(Conflict, match=r"per-experiment .* record limit"):
+        records.export_experiment(owner, experiment["id"])
+
+
+def test_experiment_export_byte_cap_and_api_response_boundary(tmp_path: Path) -> None:
+    state, owner, _worker, grant, _lease, _manifest, _artifact = _reconciled_manifest(tmp_path)
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    attempt = _command(
+        records.record_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "provenance_kind": "human_reported_observation",
+            "human_observation": "Synthetic response-size observation.",
+            "outcome": "inconclusive",
+            "reason": "Fixture records a byte-bound aggregate only.",
+        },
+    )
+    now = utc_now()
+    large_value = '{"payload":"' + "x" * 40_000 + '"}'
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.executemany(
+            """INSERT INTO research_attempt_measurements
+            (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id)
+            VALUES (?,?,?,?,?,?,?)""",
+            [
+                (
+                    f"measurement-bytes-{index}",
+                    attempt["id"],
+                    f"large measurement {index}",
+                    large_value,
+                    None,
+                    now,
+                    owner["id"],
+                )
+                for index in range(30)
+            ],
+        )
+    with pytest.raises(Conflict, match="requested byte cap"):
+        records.export_experiment(owner, experiment["id"])
+
+    token = (state / "owner.header").read_text().split("Bearer ", 1)[1].strip()
+    client = TestClient(create_app(state))
+    rejected = client.get(
+        f"/experiments/{experiment['id']}/export",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert rejected.status_code == 409
+    assert rejected.json() == {"detail": "Export exceeds the requested byte cap."}
+    accepted = client.get(
+        f"/experiments/{experiment['id']}/export?max_bytes={4 * 1024 * 1024}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert accepted.status_code == 200
+    assert len(accepted.content) <= 4 * 1024 * 1024
+    assert (
+        client.get(
+            f"/experiments/{experiment['id']}/export?max_bytes={4 * 1024 * 1024 + 1}",
+            headers={"Authorization": f"Bearer {token}"},
+        ).status_code
+        == 422
+    )
+
+
+def _insert_human_attempts(connection, owner, variant_id: str, count: int) -> list[str]:
+    now = utc_now()
+    ids = [f"attempt-bound-{index}" for index in range(count)]
+    connection.executemany(
+        """INSERT INTO research_experiment_attempts
+        (id,variant_id,design_revision,provenance_kind,operation_id,execution_plan_digest,
+         package_digest,operation_desired_state,operation_observed_state,termination_status,
+         human_observation,outcome,reason,revision,created_at,created_by_principal_id)
+        VALUES (?,?,1,'human_reported_observation',NULL,NULL,NULL,NULL,'not_observed',
+        'not_applicable',?,'inconclusive',?,1,?,?)""",
+        [
+            (
+                ident,
+                variant_id,
+                f"Synthetic observation {index}.",
+                f"Reason {index}.",
+                now,
+                owner["id"],
+            )
+            for index, ident in enumerate(ids)
+        ],
+    )
+    return ids
+
+
+@pytest.mark.parametrize(
+    "collection",
+    (
+        "designs",
+        "variants",
+        "attempts",
+        "operations",
+        "artifact links",
+        "artifacts",
+        "measurements",
+        "conclusions",
+        "conclusion evidence",
+    ),
+)
+def test_experiment_export_preflights_every_collection_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collection: str
+) -> None:
+    state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    now = utc_now()
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        if collection == "designs":
+            for revision in (1, 2):
+                _command(
+                    records.revise_design, owner, experiment["id"], payload=_design(revision, grant)
+                )
+        elif collection == "variants":
+            _command(records.revise_design, owner, experiment["id"], payload=_design(1, grant))
+        elif collection == "operations":
+            operation_ids = []
+            for index in range(3):
+                operation_id = f"{index + 1:032x}"
+                lease_id = f"lease-bound-{index}"
+                connection.execute(
+                    """INSERT INTO execution_leases
+                    (id,grant_id,worker_principal_id,epoch,issued_at,expires_at,hard_expires_at,renewed_at)
+                    SELECT ?,grant_id,worker_principal_id,epoch,issued_at,expires_at,
+                    hard_expires_at,renewed_at
+                    FROM execution_leases WHERE id=?""",
+                    (lease_id, lease["id"]),
+                )
+                connection.execute(
+                    """INSERT INTO external_operations
+                    (operation_id,org_id,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,
+                     package_digest,adapter_version,profile_version,docker_lookup_key,request_digest,
+                     retry_class,desired_state,observed_state,provider_id,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,'development-local-cpu-v1','local-cpu-v1',?, ?,
+                    'manual_reconciliation','admitted','exited',?,?,?)""",
+                    (
+                        operation_id,
+                        owner["org_id"],
+                        grant["project_id"],
+                        grant["task_id"],
+                        grant["id"],
+                        lease_id,
+                        lease["worker_principal_id"],
+                        lease["epoch"],
+                        "a" * 64,
+                        f"lookup-{operation_id}",
+                        "b" * 64,
+                        f"fake-{operation_id}",
+                        now,
+                        now,
+                    ),
+                )
+                operation_ids.append(operation_id)
+            connection.executemany(
+                """INSERT INTO research_experiment_attempts
+                (id,variant_id,design_revision,provenance_kind,operation_id,execution_plan_digest,
+                 package_digest,operation_desired_state,operation_observed_state,termination_status,
+                 human_observation,outcome,reason,revision,created_at,created_by_principal_id)
+                VALUES (?,?,1,'admitted_operation',?,?,?,'admitted','exited','confirmed',NULL,
+                'succeeded',NULL,1,?,?)""",
+                [
+                    (
+                        f"attempt-operation-{index}",
+                        baseline["id"],
+                        operation_id,
+                        grant["plan_digest"],
+                        "a" * 64,
+                        now,
+                        owner["id"],
+                    )
+                    for index, operation_id in enumerate(operation_ids)
+                ],
+            )
+        elif collection == "artifacts":
+            for index in range(2):
+                connection.execute(
+                    """INSERT INTO artifacts
+                    (id,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,operation_id,
+                     relative_path,sha256,size,content,created_at,status,classification,late)
+                    SELECT ?,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,
+                    operation_id,?,sha256,size,content,created_at,status,classification,late
+                    FROM artifacts WHERE id=?""",
+                    (f"artifact-bound-{index}", f"bound-{index}.txt", artifact["id"]),
+                )
+            attempts = _insert_human_attempts(connection, owner, baseline["id"], 3)
+            connection.executemany(
+                """INSERT INTO research_attempt_artifacts (attempt_id,artifact_id,created_at)
+                VALUES (?,?,?)""",
+                [
+                    (attempt, artifact_id, now)
+                    for attempt, artifact_id in zip(
+                        attempts,
+                        [artifact["id"], "artifact-bound-0", "artifact-bound-1"],
+                        strict=True,
+                    )
+                ],
+            )
+        elif collection == "artifact links":
+            attempts = _insert_human_attempts(connection, owner, baseline["id"], 3)
+            connection.executemany(
+                """INSERT INTO research_attempt_artifacts (attempt_id,artifact_id,created_at)
+                VALUES (?,?,?)""",
+                [(attempt, artifact["id"], now) for attempt in attempts],
+            )
+        elif collection == "measurements":
+            attempt = _insert_human_attempts(connection, owner, baseline["id"], 1)[0]
+            connection.executemany(
+                """INSERT INTO research_attempt_measurements
+                (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id)
+                VALUES (?,?,?,?,NULL,?,?)""",
+                [
+                    (f"measurement-bound-{index}", attempt, str(index), "{}", now, owner["id"])
+                    for index in range(3)
+                ],
+            )
+        elif collection == "conclusions":
+            connection.executemany(
+                """INSERT INTO research_conclusions
+                (id,experiment_id,design_revision,statement,status,revision,created_at,updated_at,
+                 created_by_principal_id,reviewed_at,reviewed_by_principal_id)
+                VALUES (?,?,1,?,'draft',1,?,?,?,NULL,NULL)""",
+                [
+                    (
+                        f"conclusion-bound-{index}",
+                        experiment["id"],
+                        str(index),
+                        now,
+                        now,
+                        owner["id"],
+                    )
+                    for index in range(3)
+                ],
+            )
+        elif collection == "conclusion evidence":
+            attempt = _insert_human_attempts(connection, owner, baseline["id"], 1)[0]
+            connection.execute(
+                """INSERT INTO research_conclusions
+                (id,experiment_id,design_revision,statement,status,revision,created_at,updated_at,
+                 created_by_principal_id,reviewed_at,reviewed_by_principal_id)
+                VALUES ('conclusion-bound',?,1,'Fixture','draft',1,?,?,?,NULL,NULL)""",
+                (experiment["id"], now, now, owner["id"]),
+            )
+            connection.executemany(
+                """INSERT INTO research_conclusion_evidence
+                (conclusion_id,attempt_id,artifact_id,measurement_id)
+                VALUES ('conclusion-bound',?,?,NULL)""",
+                [(attempt, artifact["id"]) for _ in range(3)],
+            )
+        else:
+            _insert_human_attempts(connection, owner, baseline["id"], 3)
+    monkeypatch.setattr("tessera_control.experiments.EXPORT_RECORD_LIMIT", 2)
+    with pytest.raises(Conflict, match=f"{collection} record limit"):
+        records.export_experiment(owner, experiment["id"], {"max_bytes": 4 * 1024 * 1024})

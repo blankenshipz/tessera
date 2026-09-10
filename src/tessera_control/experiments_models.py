@@ -139,3 +139,9 @@ class UpdateConclusion(CreateConclusion):
 class ReviewConclusion(ExperimentRequest):
     expected_revision: Revision
     design_revision: Revision | None = None
+
+
+class ExportExperiment(ExperimentRequest):
+    """The complete snapshot must fit the control/desktop response boundary."""
+
+    max_bytes: Annotated[int, Field(strict=True, ge=256, le=4 * 1024 * 1024)] = 1_000_000
