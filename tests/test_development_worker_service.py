@@ -367,6 +367,83 @@ def test_restart_reconciles_one_start_then_quarantines_only(tmp_path):
     assert not list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
 
 
+class _SyntheticWorkerCrash(Exception):
+    pass
+
+
+def _crashed_running_service(tmp_path, state, grant, adapter):
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        adapter=adapter,
+        max_ticks=2,
+        sleep=lambda _: (_ for _ in ()).throw(_SyntheticWorkerCrash()),
+    )
+    with pytest.raises(_SyntheticWorkerCrash):
+        service.run()
+
+
+def test_restart_recovers_before_renewing_and_never_reacquires_or_restarts(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    _crashed_running_service(tmp_path, state, grant, adapter)
+
+    channel = ApiChannel(state)
+    result = _service(tmp_path, state, grant, channel=channel, adapter=adapter, max_ticks=2).run()
+
+    assert result["state"] == "unknown"
+    assert "/worker/leases/renew" in channel.paths
+    assert "/worker/leases" not in channel.paths
+    assert adapter.calls.count("start") == 1
+
+
+@pytest.mark.parametrize("authority", ["expired", "revoked"])
+def test_restart_reconciles_expired_or_revoked_grant_without_a_new_start(tmp_path, authority):
+    state, execution, owner, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    _crashed_running_service(tmp_path, state, grant, adapter)
+    if authority == "expired":
+        with _connect(state / "tessera.sqlite3") as connection:
+            connection.execute(
+                "UPDATE execution_grants SET expires_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+                (grant["id"],),
+            )
+    else:
+        execution.revoke_execution_grant(owner, grant["id"], "restart-revoke", "restart-revoke", 1)
+    adapter.cancel_unknown = True
+    channel = ApiChannel(state)
+
+    result = _service(tmp_path, state, grant, channel=channel, adapter=adapter).run()
+
+    assert result["state"] == "unknown"
+    assert result["quarantined"] is False
+    assert "/worker/leases" not in channel.paths
+    assert adapter.calls.count("start") == 1
+    assert adapter.calls.count("cancel") >= 1
+    assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
+def test_restart_control_outage_cancels_boundedly_without_new_authority(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    _crashed_running_service(tmp_path, state, grant, adapter)
+    channel = ApiChannel(state)
+    channel.disconnected = True
+
+    result = _service(tmp_path, state, grant, channel=channel, adapter=adapter).run()
+
+    assert result == {
+        "state": "unknown",
+        "quarantined": False,
+        "reason": "observation_report_failure",
+    }
+    assert "/worker/leases" not in channel.paths
+    assert adapter.calls.count("start") == 1
+    assert adapter.calls.count("cancel") >= 1
+    assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
 @pytest.mark.parametrize("failure", ["revocation", "disconnect"])
 def test_revocation_or_disconnect_cancels_and_never_reclaims_uncertain_output(tmp_path, failure):
     state, execution, owner, _, grant = _unleased_delivery(tmp_path)

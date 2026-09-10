@@ -395,6 +395,14 @@ class DevelopmentCpuRuntime(CpuRuntime):
             self.development_outputs.mark_running(self.operation.operation_id)
         return result
 
+    def recover(self, lease_id: str, epoch: int) -> DriverResult:
+        """Reconcile a prior descriptor without treating it as a new start."""
+
+        result = super().recover(lease_id, epoch)
+        if self.operation is not None and result.phase == "running":
+            self.development_outputs.mark_running(self.operation.operation_id)
+        return result
+
     def cancel(self, *, reason: str = "requested") -> DriverResult:
         if self.operation is None:
             raise DevelopmentRuntimeError("Runtime has no bound operation.")

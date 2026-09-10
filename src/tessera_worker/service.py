@@ -21,6 +21,7 @@ from .control_channel import HttpControlChannel
 from .cpu import DEVELOPMENT_OUTPUT_PROFILE, DockerCpuAdapter
 from .development_runtime import DevelopmentCpuRuntime, DevelopmentOutputProfile
 from .provider import Provider
+from .runtime import MAX_DESCRIPTOR_BYTES
 from .supervisor import DriverResult, SupervisorError
 
 
@@ -223,13 +224,6 @@ class DevelopmentWorkerService:
     def run(self) -> dict[str, Any]:
         """Heartbeat, lease, execute, and quarantine only a single grant attempt."""
 
-        # Registration is an owner-only, prior human command.  A heartbeat is the
-        # first worker mutation and deliberately precedes lease acquisition.
-        self._heartbeat()
-        lease = self.channel.post(
-            "/worker/leases", {"grant_id": self.config.grant_id}, self._key("lease")
-        )
-        lease_id, epoch, worker_id = self._lease_identity(lease)
         inputs = self.root / "inputs"
         runtime_dir = self.root / "runtime"
         inputs.mkdir(mode=0o700, exist_ok=True)
@@ -240,6 +234,7 @@ class DevelopmentWorkerService:
         output_workspace_root = output_base / "workspaces"
         output_workspace_root.mkdir(mode=0o700, exist_ok=True)
         _private_directory(output_workspace_root)
+        recovered = self._recovery_identity(runtime_dir)
         adapter = self.adapter or DockerCpuAdapter(
             frozenset({self.config.allowed_image}),
             input_root=inputs,
@@ -248,6 +243,30 @@ class DevelopmentWorkerService:
         profile = DevelopmentOutputProfile(
             self.output_root, self.config.output_capacity_bytes, self.config.output_capacity_inodes
         )
+        if recovered is not None:
+            # A persisted runtime descriptor represents an admitted operation.
+            # Reconcile it before any lease request: a restart must never turn an
+            # unknown prior start into authority for a second start.
+            lease_id, epoch, worker_id = recovered
+            with DevelopmentCpuRuntime(
+                runtime_dir,
+                inputs,
+                self.channel,
+                adapter,
+                worker_id=worker_id,
+                development_profile=profile,
+                provider=self.provider,
+            ) as runtime:
+                result = runtime.recover(lease_id, epoch)
+                return self._drive(runtime, result)
+
+        # Registration is an owner-only, prior human command.  A heartbeat is the
+        # first worker mutation and deliberately precedes a new lease acquisition.
+        self._heartbeat()
+        lease = self.channel.post(
+            "/worker/leases", {"grant_id": self.config.grant_id}, self._key("lease")
+        )
+        lease_id, epoch, worker_id = self._lease_identity(lease)
         with DevelopmentCpuRuntime(
             runtime_dir,
             inputs,
@@ -374,6 +393,56 @@ class DevelopmentWorkerService:
             or not isinstance(worker_id, str)
         ):
             raise DevelopmentWorkerError("Control returned an invalid lease.")
+        return lease_id, epoch, worker_id
+
+    def _recovery_identity(self, runtime_dir: Path) -> tuple[str, int, str] | None:
+        """Read only the identity needed to attach to a prior runtime descriptor.
+
+        A malformed durable descriptor is a recovery failure, not a reason to
+        acquire another lease.  ``DevelopmentCpuRuntime.recover`` revalidates the
+        full descriptor and current control authority before any observation.
+        """
+
+        path = runtime_dir / "runtime.json"
+        if not path.exists() and not path.is_symlink():
+            return None
+        try:
+            descriptor_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor_fd, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError
+                encoded = source.read(MAX_DESCRIPTOR_BYTES + 1)
+            if len(encoded) > MAX_DESCRIPTOR_BYTES:
+                raise ValueError
+            descriptor = json.loads(encoded)
+            package = descriptor["control"]["package"]
+            lease_id, epoch, worker_id = (
+                package["lease_id"],
+                package["epoch"],
+                package["worker_principal_id"],
+            )
+            if (
+                not isinstance(lease_id, str)
+                or not lease_id
+                or len(lease_id) > 200
+                or type(epoch) is not int
+                or epoch < 1
+                or not isinstance(worker_id, str)
+                or not worker_id
+                or len(worker_id) > 200
+            ):
+                raise ValueError
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            raise DevelopmentWorkerError(
+                "Existing runtime descriptor cannot be recovered."
+            ) from error
         return lease_id, epoch, worker_id
 
     def _key(self, action: str) -> str:

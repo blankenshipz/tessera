@@ -297,6 +297,35 @@ class CpuRuntime:
         self._refresh_lease()
         return self.supervisor.drive_once(self.operation, self.lease)
 
+    def recover(self, lease_id: str, epoch: int) -> DriverResult:
+        """Reconcile a durable runtime intent without issuing a start.
+
+        A descriptor can survive a worker crash after package admission but before
+        the supervisor recorded (or received) a start.  Recovery must observe
+        that stable identity rather than treating the descriptor as permission to
+        create or start it again.
+        """
+
+        path = self.directory / "runtime.json"
+        if not path.exists() and not path.is_symlink():
+            raise SupervisorError("Runtime has no durable descriptor to recover.")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise SupervisorError("Runtime descriptor must be a regular file.")
+            encoded = source.read(MAX_DESCRIPTOR_BYTES + 1)
+        if len(encoded) > MAX_DESCRIPTOR_BYTES:
+            raise SupervisorError("Runtime descriptor exceeds its bound.")
+        descriptor = json.loads(encoded)
+        response = descriptor["control"]
+        self._validate_package(response, lease_id, epoch)
+        self._bind_journal(lease_id, epoch)
+        self.descriptor = descriptor
+        self.operation = self._operation(descriptor)
+        self.lease = self._lease(response)
+        self._refresh_lease()
+        return self.supervisor.reconcile(self.operation, self.lease)
+
     def _bind_journal(self, lease_id: str, epoch: int) -> None:
         """Fence a second local journal for the same lease under this worker root."""
         if not isinstance(lease_id, str) or not 1 <= len(lease_id) <= 200:
