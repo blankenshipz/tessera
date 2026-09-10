@@ -4,6 +4,30 @@ This file tracks executable evidence against DESIGN.md. Initial development uses
 logical commits on main; PRs remain paused. The full design and real research
 pilot are not complete.
 
+## Redirected next milestone (planned)
+
+The next acceptance milestone is a thin vertical slice, not a claim that the
+existing component evidence is a live pilot. It will use one public or simple CPU
+workflow with a registered baseline and one intervention: goal → bounded
+experiment design → execution on an identified remote target → linked evidence →
+human decision. The control plane and execution must remain laptop-independent;
+the desktop may disconnect while approved work follows its bounded policy. Local
+CPU remains the primary development target and the remote target proceeds in
+parallel.
+
+The slice must account explicitly for succeeded, failed, cancelled, and
+inconclusive outcomes, with operation provenance, retained artifacts or
+measurements, and human evidence review. It will measure total researcher effort
+against the baseline. A proposed 25% effort reduction is a hypothesis, not
+implementation evidence, accepted validation, or a product result.
+
+MLflow, Databricks, Spark, and similar systems are potential integrations; they
+are not Tessera's authority for plans, attempts, operations, evidence, or
+conclusions. Broad provisioning/cloud work, skill-catalog expansion, and desktop
+expansion are frozen until this slice has accepted evidence. Existing synthetic,
+implemented, and historical evidence below remains unchanged and must not be
+relabeled as live validation.
+
 ## Design status matrix
 
 Reviewed 2026-09-09 against schema v24 manual project-artifact
@@ -45,7 +69,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, a local authenticated exact-schema-pinned OpenCode HTTP/SSE fixture seam with durable uncertainty/cursor handling, an opt-in provider-disabled real-server compatibility fixture, a pure explicit-identity Minikube Job conformance contract, a read-only informational capability probe, and Phase 1 pure versioned environment plans plus human-approved fake-only intent reconciliation | Record a real selected-server fixture result (unconfigured/version-unavailable is explicitly not evidence), enrolled-node integration, durable/composable environment/execution adapters, scoped live provisioning operator, explicit Secret delivery authorization, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
 | §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, schema-v24 project-object intent/reconciliation and manual retention incident metadata, and read-only held restore | Provider fencing/resumption after restore, portable object-bundle recovery, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
-| §8 E2E acceptance | Blocked for real pilot; component work continues | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Admissible execution storage/host, selected investigation/dataset, remaining failure drills and measured pilot |
+| §8 E2E acceptance | Blocked for real pilot; thin vertical slice planned | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Public/simple baseline-plus-intervention CPU workflow; laptop-independent remote control/execution; linked evidence, all four terminal outcome labels, human review, effort measurement, selected investigation/dataset, and remaining failure drills |
 | §9 Operations/product | Partial | Pinned development dependencies, CI, explicit migrations, backup/held-restore runbook, and manual project-object retention/deletion incident metadata | Signed packaging, update/drain/rollback, automatic retention policy, object-bundle recovery, monitoring, operational recovery and pilot measurements |
 | §1 post-pilot/later scope | Deferred | Contracts only where explicitly documented | Additional harnesses/runtimes, GPU/cluster, organization/hosted modes after prerequisite gates |
 
@@ -443,23 +467,28 @@ representative research question/dataset remain open configuration inputs.
 
 ## Remaining milestones
 
-1. Verified persistent output storage and real runtime collection, quarantine
+1. **Thin vertical slice (next):** public/simple CPU baseline plus one intervention
+   on an identified remote target, with desktop-disconnect behavior, linked
+   evidence, succeeded/failed/cancelled/inconclusive outcomes, human review, and
+   disclosed total-effort measurement. The proposed 25% threshold is a hypothesis,
+   not evidence.
+2. Verified persistent output storage and real runtime collection, quarantine
     release policy, and broader real-provider/method result acceptance. Synthetic
     sealing, checkpoints, fake receipts and bookkeeping are not backend activation
     or real pilot acceptance.
-2. Cryptographic worker build trust, capability probes, credential brokering and
+3. Cryptographic worker build trust, capability probes, credential brokering and
    operational spend/incident reconciliation. Registration/drain/quarantine/
    retirement and bounded heartbeat admission are implemented; see
    [worker lifecycle](worker-lifecycle.md).
-3. Pinned runtime skill authoring/test/release and mediated harness integration.
-4. Desktop adoption, skills, broader reproduction exports, full telemetry and
+4. Pinned runtime skill authoring/test/release and mediated harness integration.
+5. Desktop adoption, skills, broader reproduction exports, full telemetry and
    arbitrary writer mediation/full stop-edit-handback adoption; portable artifact bundles.
-5. Operational restore fencing/resumption, lifecycle recovery, automatic cleanup
+6. Operational restore fencing/resumption, lifecycle recovery, automatic cleanup
     policy/object-bundle recovery, packaging and the remaining adversarial
     acceptance fixtures in DESIGN.md section 8.
-6. A maintainer-selected real investigation and measured pilot, including trusted
+7. A maintainer-selected real investigation and measured pilot, including trusted
    signing, identity and infrastructure configuration where required.
-7. Additional runtimes, GPU/cluster targets, organization/hosted modes and other
+8. Additional runtimes, GPU/cluster targets, organization/hosted modes and other
    deferred design features after their prerequisite acceptance gates.
 
 Unattended research dispatch remains disabled pending its integration gates.

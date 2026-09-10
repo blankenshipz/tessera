@@ -15,8 +15,10 @@ implementation. “Required” describes intended behavior, not a verified guara
 
 ## 1. Product and scope
 
-Tessera lets a researcher direct local and remote agents, run bounded experiments,
-and follow the investigation in a labbook. The desktop agent helps plan work and
+Tessera's differentiator is a durable path from a research goal through bounded
+experiment design and remote execution to linked evidence and a human decision.
+It lets a researcher direct local and remote agents, run bounded experiments, and
+follow the investigation in a labbook. The desktop agent helps plan work and
 communicates with remote researchers or lab technicians. The researcher retains
 control of direction, access, cost, methodology, and publication.
 
@@ -26,9 +28,10 @@ placement does not change authorization requirements.
 
 The first user is a hands-on researcher or research engineer with an existing
 script/notebook investigation and an available execution host, local or elsewhere.
-The first workflow is:
-adopt that investigation, author a skill, run a bounded activity, intervene when
-needed, and review/export an honest record of the result.
+The first workflow is: state a goal, establish a baseline, design one bounded
+intervention, execute it on an approved target that need not be the laptop, link
+the resulting evidence, and make a human decision. Adoption and skills can support
+that path; they are not its substitute.
 
 This is a computational-research pilot with a domain-neutral evidence model.
 Literature, theory, observation, analysis, and experiments must not all be modeled
@@ -37,8 +40,8 @@ when its protocol, evidence checks, and acceptance fixture exist.
 
 | Pilot: build now | Next: after pilot validation | Later: demand-driven |
 |---|---|---|
-| One user, desktop partner, one supported harness and trusted remote supervisor | Second harness and compute adapter to test portability | Organization/team administration, shared registries, federation |
-| Local files/chat, skill authoring/testing, bounded remote CPU jobs | GPU target; Kubernetes adapter tested locally with Minikube and remotely | Spark and other workload engines, broader provider coverage |
+| One user, desktop partner, independently runnable remote control plane and trusted supervisor | Second harness and compute adapter to test portability | Organization/team administration, shared registries, federation |
+| Local CPU development target and one parallel remote CPU target | GPU target; Kubernetes adapter tested locally with Minikube and remotely | Spark and other workload engines, broader provider coverage |
 | Plan/access/cost approval, status, cancellation, stop/edit/handback | Bounded multi-agent task discovery/delegation | Schedules, automatic memory, broad connector/plugin catalogs |
 | Labbook, evidence review, existing-work adoption, portable export | Research branches/comparisons, richer method checks and tracker imports | Advanced graph editors, domain viewers, browser/computer automation |
 | Tenant-scoped records and permission checks from the start | Optional research-scoped GitHub publisher | Direct instrument/robot control, subject to separate safety design |
@@ -47,6 +50,14 @@ when its protocol, evidence checks, and acceptance fixture exist.
 No autonomous budget increases, public release, or policy relaxation. Do not build
 a scholarly index, general workflow engine, GPU scheduler, full experiment tracker,
 or a feature-for-feature replacement for existing desktop agents.
+
+MLflow, Databricks, Spark, and similar systems may be useful integrations for
+execution, tracking, or data processing. They are not Tessera's product authority:
+Tessera owns the goal-to-decision record, approvals, bounded attempts, evidence
+links, and human conclusions. Until the thin vertical slice in §8 has accepted
+evidence, freeze broad provisioning/cloud work, skill-catalog expansion, and
+desktop expansion; only work required to complete that slice or preserve existing
+evidence should proceed.
 
 The likely team buyer is a research lead or platform owner; the infrastructure
 approver may be someone else. Validate those roles and a recurring paid use case
@@ -287,6 +298,13 @@ accounting). Both contracts must preserve the frozen package, operation identity
 lease epoch, and explicit limitations; neither adapter may infer authority from a
 client, environment variable, or ambient Kubernetes context.
 
+Remote CPU execution and a remotely reachable control plane are first-class pilot
+requirements, not a later portability feature. Local CPU remains the primary
+development target, while one explicitly identified remote target proceeds in
+parallel. Neither target is promoted by a desktop-connected demonstration: the
+control plane and approved work must continue within their bounded disconnect
+policies when the desktop disconnects.
+
 Every Kubernetes action names and validates the target identity (kubeconfig
 reference and digest, context, HTTPS API server and CA identity, cluster and
 namespace identities). No current-context fallback is permitted. Minikube
@@ -417,6 +435,25 @@ revocation and expiry policy; logging out of the desktop is not implicitly a
 project-wide cancellation. Check authorization again on reconnect and renewal.
 
 ## 4. Data and API contracts
+
+### 4.1 Lifetime boundaries
+
+Do not collapse these lifetimes, even when a first slice represents them with a
+small number of records:
+
+| Lifetime | Meaning | Must not imply |
+|---|---|---|
+| Session | A human or harness interaction context; it can end on disconnect | Experiment completion, attempt termination, or a conclusion |
+| Experiment | The bounded goal, baseline/intervention design, and registered scope | A particular execution or a successful result |
+| Attempt | One admitted execution of an experiment revision | One external submission or accepted evidence |
+| External operation | A provider/worker side effect with its own identity and reconciliation | Attempt success, artifact validity, or provider settlement |
+| Artifact or measurement | Retained output or observation with provenance and validation state | Interpretation, scientific validity, or a conclusion |
+| Conclusion | A human-reviewed interpretation linked to evidence | A live session, rerunnable operation, or immutable truth |
+
+An experiment may have multiple attempts, an attempt may require multiple external
+operations, and artifacts/measurements may outlive both. Conclusions remain
+versioned review records: they can be narrowed, superseded, or retracted without
+rewriting the underlying evidence.
 
 | Record group | Required purpose |
 |---|---|
@@ -726,6 +763,24 @@ Update that tracker with every behavior-changing implementation checkpoint.
 Implement vertical slices through the modules, not complete horizontal platforms.
 These are the pilot's engineering tasks; each produces code, tests and a short
 operational note. No paid or sensitive run precedes its required enforcement.
+
+### Next milestone: thin goal-to-decision vertical slice
+
+Before broad provisioning/cloud, skills, or desktop expansion, complete one
+public or otherwise simple CPU workflow with a baseline and one registered
+intervention. The slice must demonstrate: a bounded experiment design; execution
+on the selected remote target while the desktop can disconnect; linked
+artifacts/measurements and operation provenance; explicit succeeded, failed,
+cancelled, and inconclusive outcomes; and human review of the resulting evidence
+and conclusion. Local CPU remains the primary development path; the remote target
+is a parallel acceptance target, not an excuse to defer laptop-independent
+execution.
+
+Compare total researcher effort (setup, intervention, review, verification, and
+recovery) with the baseline workflow. A proposed **25% effort reduction** is a
+testable product hypothesis, not evidence, a release criterion, or a claim until
+the selected workflow is measured. Record the measurement method and all outcomes,
+including inconclusive ones, before deciding whether to expand scope.
 
 | Step | Deliverable | Acceptance evidence |
 |---|---|---|

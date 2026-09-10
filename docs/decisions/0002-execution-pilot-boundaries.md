@@ -2,6 +2,21 @@
 
 Status: implementation decisions; acceptance remains in progress.
 
+Priority redirect: the next milestone is a thin, laptop-independent vertical
+slice—goal → bounded experiment design → remote execution → linked evidence →
+human decision—using a public/simple CPU baseline and one intervention. Local CPU
+remains the primary development target while one remote target is validated in
+parallel. Succeeded, failed, cancelled, and inconclusive outcomes must remain
+visible, and a proposed 25% total-effort reduction is a hypothesis to measure,
+not evidence. Freeze broad provisioning/cloud, skill, and desktop expansion until
+this slice has accepted evidence.
+
+MLflow, Databricks, Spark, and similar products are optional integrations, not
+the authority for Tessera's experiments, attempts, operations, evidence, or human
+conclusions. Sessions, experiments, attempts, external operations,
+artifacts/measurements, and conclusions have independent lifetimes; no shorter
+lifetime may imply completion or validity of a longer one.
+
 Keep Python/FastAPI and SQLite as the authoritative local control plane. Use
 explicit relational migrations and transactional operation journals rather than
 introducing a workflow engine. Native service lifecycle is independent of the

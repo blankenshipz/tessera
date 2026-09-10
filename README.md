@@ -1,9 +1,11 @@
 # Tessera
 
-Tessera is a desktop workspace for directing local and remote research agents.
-A researcher works with a desktop agent to plan an investigation, author reusable
-skills, run experiments on approved infrastructure, and review findings in a
-persistent labbook.
+Tessera is a workspace for turning a research goal into a bounded experiment
+design, remote execution, linked evidence, and a human decision. A researcher
+works with a desktop agent to plan an investigation, run experiments on approved
+infrastructure, and review findings in a persistent labbook. Skills and external
+tracking or compute systems support that workflow; they are not the product's
+authority.
 
 A tessera is a piece of a mosaic. The name reflects how observations, experiments,
 and different perspectives come together to form a research finding.
@@ -11,6 +13,13 @@ and different perspectives come together to form a research finding.
 The desktop, control plane, and execution workers run independently. Here,
 “remote” means outside Electron: all three can run on one machine or across
 separate machines and clusters.
+
+The control plane and laptop-independent execution are first-class. Closing the
+desktop must not erase the authoritative record or stop eligible remote work.
+Local CPU is the primary development target; one identified remote CPU target is
+being pursued in parallel. MLflow, Databricks, Spark, and similar systems are
+optional integrations, never the authority for Tessera plans, attempts, evidence,
+or human conclusions.
 
 **Status:** The local API supports scoped credentials, versioned task plans,
 human approval records, durable conversations and decisions, and a research
@@ -182,19 +191,21 @@ evidence remains required.
 
 ## The first workflow (target)
 
-1. Connect to a personal, organization-managed, or Tessera-hosted control plane.
-   Create a project or adopt an existing repository, notebook, or results folder;
-   imported work keeps its provenance gaps.
-2. Ask the desktop agent to investigate a question or help define the next
-   activity, including inputs, method, expected outputs, cost, and stop conditions.
-3. Author or select a skill, review the plan and access requested, and approve
-   bounded execution on one local or remote target.
-4. Ask the remote agent questions through the desktop agent. Inspect progress,
-   revise work, resolve decisions, or stop execution and take over editing.
-5. Follow the labbook: attempts, sources, findings, alternatives, decisions,
-   costs, and corrections. Revisit past conclusions without rerunning anything.
-6. Review and export the result, including negative or inconclusive outcomes.
-   A rerun or new branch is a separate authorized activity.
+1. Connect to an authoritative control plane, state a goal, and adopt inputs as
+   needed without inventing missing provenance.
+2. Register a simple CPU baseline and one bounded intervention, with inputs,
+   method, expected measurements, cost, stop conditions, and outcome criteria.
+3. Approve execution on an identified local or remote target. The remote path
+   continues under bounded policies if the desktop disconnects.
+4. Link operation provenance and retained artifacts/measurements to each attempt;
+   record succeeded, failed, cancelled, or inconclusive outcomes honestly.
+5. Have a human review the evidence and record a versioned conclusion. A rerun,
+   new intervention, or conclusion change is separate work.
+
+Sessions, experiments, attempts, external operations, artifacts/measurements, and
+conclusions have separate lifetimes. A session ending does not end an attempt; an
+operation receipt does not validate a measurement; and evidence does not become a
+conclusion without human review.
 
 ## What the workspace includes
 
@@ -263,12 +274,14 @@ platform code or policies.
 
 ## Build scope
 
-Start with one user, a separately runnable process-based control plane, one
-supported harness, one worker supervisor, one CPU target, and one credential
-integration. The desktop connects over an authenticated API even on the same
-machine. Prove adoption, skill authoring, bounded execution,
-human intervention, labbook review, and portable export. Security and evidence
-checks apply from the first real-data run.
+The next thin vertical slice is one public/simple CPU workflow: baseline plus one
+intervention, remote execution that survives desktop disconnection, linked
+evidence, succeeded/failed/cancelled/inconclusive outcomes, and human review.
+It will compare total researcher effort against the baseline; a proposed 25%
+effort reduction is a hypothesis to measure, not current evidence or a product
+claim. Freeze broad provisioning/cloud, skills, and desktop expansion until this
+slice has accepted evidence. Security and evidence checks apply from the first
+real-data run.
 
 **Approved direction, with one narrow local bootstrap:** local CPU remains the first target
 while Kubernetes/Minikube preparation proceeds separately. Kubernetes target
