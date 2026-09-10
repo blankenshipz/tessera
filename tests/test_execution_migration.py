@@ -54,10 +54,10 @@ def test_schema5_requires_migration_and_preserves_snapshot_bytes(tmp_path):
     state, actor, snapshot = old_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 25
+    assert migrate_state(state) == 26
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
     assert verified["integrity"] == "verified" and verified["digest"] == snapshot["digest"]
-    assert migrate_state(state) == 25
+    assert migrate_state(state) == 26
 
 
 def test_v13_worker_registry_migration_preserves_existing_records(tmp_path):
@@ -74,7 +74,7 @@ def test_v13_worker_registry_migration_preserves_existing_records(tmp_path):
         create_artifact_manifest_schema(connection)
         create_artifact_disposition_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=13")
-    assert migrate_state(state) == 25
+    assert migrate_state(state) == 26
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM worker_registry").fetchone()[0] == 0
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
@@ -105,7 +105,7 @@ def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
             ).fetchone()[0]
             == b"Retain exact bytes"
         )
-    assert migrate_state(state) == 25
+    assert migrate_state(state) == 26
 
 
 def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monkeypatch):
@@ -140,8 +140,8 @@ def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monk
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 25
-    assert migrate_state(state) == 25
+    assert migrate_state(state) == 26
+    assert migrate_state(state) == 26
 
 
 def test_v17_operation_migration_never_backfills_legacy_leases_or_observations(tmp_path):
@@ -149,7 +149,7 @@ def test_v17_operation_migration_never_backfills_legacy_leases_or_observations(t
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE external_operations")
         connection.execute("UPDATE schema_meta SET schema_version=17")
-    assert migrate_state(state) == 25
+    assert migrate_state(state) == 26
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM external_operations").fetchone()[0] == 0
         assert (

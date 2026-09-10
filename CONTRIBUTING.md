@@ -223,3 +223,9 @@ Schema 25 adds an empty, tenant-scoped goal-to-decision ledger: versioned baseli
 and intervention designs, attempts linked to existing operation/artifact evidence,
 manual measurements, and human-reviewed conclusions. It does not backfill prior
 studies, operations, artifacts, measurements, outcomes, or scientific validity.
+
+Schema 26 indexes existing attempt-artifact and measurement-artifact links as
+tenant-scoped retention references. New placed evidence links require active
+project-object retention; tombstoned, delete-intent, degraded, and deleted objects
+are rejected. Legacy SQLite-only artifacts remain explicitly `legacy_unplaced`
+evidence and are not assigned invented project-storage custody.

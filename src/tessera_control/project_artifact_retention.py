@@ -47,6 +47,57 @@ def require_project_artifact_reference_admissible(
         raise Conflict("Project artifact is reserved for deletion and cannot be referenced.")
 
 
+def admit_experiment_artifact_evidence_reference(
+    connection: sqlite3.Connection,
+    project_id: str,
+    artifact_id: str,
+    attempt_id: str,
+    reference_id: str,
+    reference_kind: str,
+    created_at: str,
+    measurement_id: str | None = None,
+) -> None:
+    """Atomically admit durable experiment evidence without inventing legacy custody.
+
+    Pre-v22 SQLite-only artifacts deliberately have neither a placement nor retention
+    metadata. They remain linkable as ``legacy_unplaced`` evidence. A placed object,
+    however, must have active retention metadata before it can acquire a new durable
+    experiment reference.
+    """
+    artifact = connection.execute(
+        "SELECT project_id FROM artifacts WHERE id=?", (artifact_id,)
+    ).fetchone()
+    if artifact is None or artifact["project_id"] != project_id:
+        raise Conflict("Experiment evidence artifact is not in this project.")
+    retention = connection.execute(
+        "SELECT project_id,state FROM project_artifact_retention WHERE artifact_id=?",
+        (artifact_id,),
+    ).fetchone()
+    if retention is None:
+        placement = connection.execute(
+            "SELECT 1 FROM project_artifact_placements WHERE artifact_id=? AND project_id=?",
+            (artifact_id, project_id),
+        ).fetchone()
+        if placement is not None:
+            raise Conflict("Project artifact retention metadata is unavailable.")
+    elif retention["project_id"] != project_id or retention["state"] != "active":
+        raise Conflict("Project artifact is reserved for deletion and cannot be referenced.")
+    connection.execute(
+        """INSERT OR IGNORE INTO experiment_artifact_evidence_references
+        (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
+        VALUES (?,?,?,?,?,?,?)""",
+        (
+            reference_id,
+            artifact_id,
+            project_id,
+            attempt_id,
+            measurement_id,
+            reference_kind,
+            created_at,
+        ),
+    )
+
+
 class ProjectArtifactRetentionStore(Store):
     """Manual tombstone/delete commands; uncertainty becomes durable degraded state."""
 
@@ -74,7 +125,7 @@ class ProjectArtifactRetentionStore(Store):
         return row
 
     @staticmethod
-    def _referenced(connection: sqlite3.Connection, artifact_id: str) -> bool:
+    def _referenced(connection: sqlite3.Connection, project_id: str, artifact_id: str) -> bool:
         # IDs are generated without quotes and manifests are canonical JSON. Parse
         # bounded rows instead of relying on optional SQLite JSON extensions.
         for row in connection.execute("SELECT artifacts_json FROM artifact_manifests"):
@@ -88,12 +139,21 @@ class ProjectArtifactRetentionStore(Store):
                     return True
             except (TypeError, ValueError):
                 return True  # malformed authoritative metadata fails closed
+        if (
+            connection.execute(
+                """SELECT 1 FROM experiment_artifact_evidence_references
+                WHERE artifact_id=? AND project_id=? LIMIT 1""",
+                (artifact_id, project_id),
+            ).fetchone()
+            is not None
+        ):
+            return True
         return False
 
     def _delete_allowed(self, connection: sqlite3.Connection, row: sqlite3.Row) -> None:
         if row["retention_metadata_class"] == "held":
             raise Conflict("Held project artifacts cannot be deleted.")
-        if self._referenced(connection, row["artifact_id"]):
+        if self._referenced(connection, row["project_id"], row["artifact_id"]):
             raise Conflict("Referenced project artifacts cannot be deleted.")
         checkpoint = connection.execute(
             """SELECT 1 FROM execution_result_checkpoints c JOIN artifact_manifests m ON m.id=c.manifest_id

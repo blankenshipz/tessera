@@ -12,6 +12,9 @@ from test_result_checkpoints import _reconciled_manifest
 
 from tessera_control.api import create_app
 from tessera_control.experiments import ExperimentStore
+from tessera_control.migrations import MIGRATIONS
+from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
+from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.store import (
     Conflict,
     Forbidden,
@@ -185,6 +188,39 @@ def test_goal_design_attempt_evidence_conclusion_and_reopen_chain(tmp_path: Path
     assert reopened["artifacts"][0]["id"] == artifact["id"]
     assert reopened["measurements"][0]["id"] == measurement["id"]
     assert reopened["conclusions"][0]["status"] == "reviewed"
+    # v26 materializes only existing evidence relationships for retention lookup;
+    # a failed migration leaves v25 and its data untouched for an explicit retry.
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DROP TABLE experiment_artifact_evidence_references")
+        connection.execute("UPDATE schema_meta SET schema_version=25")
+    assert migrate_state(state) == 26
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT reference_kind FROM experiment_artifact_evidence_references "
+            "ORDER BY reference_kind"
+        ).fetchall() == [("attempt_artifact",), ("measurement_artifact",)]
+        connection.execute("DROP TABLE experiment_artifact_evidence_references")
+        connection.execute("UPDATE schema_meta SET schema_version=25")
+
+    def fail_migration(connection):
+        from tessera_control.experiments import create_experiment_evidence_retention_schema
+
+        create_experiment_evidence_retention_schema(connection)
+        raise RuntimeError("v26 fault")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(MIGRATIONS, 25, fail_migration)
+        with pytest.raises(RuntimeError, match="v26 fault"):
+            migrate_state(state)
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 25
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='experiment_artifact_evidence_references'"
+            ).fetchone()
+            is None
+        )
+    assert migrate_state(state) == 26
 
 
 def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
@@ -259,6 +295,159 @@ def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
     assert response.status_code == 404
 
 
+def test_experiment_evidence_retention_admission_delete_fence_and_export(tmp_path: Path) -> None:
+    state, owner, worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
+    _operation(state, owner, grant, lease, manifest["operation_id"])
+    placement = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": manifest["operation_id"],
+        "artifacts": [
+            {"id": artifact["id"], "sha256": artifact["sha256"], "size": artifact["size"]}
+        ],
+    }
+    ProjectArtifactStore(state).commit_project_artifacts(
+        worker, lease["id"], "place", canonical_digest(placement), placement
+    )
+    # The manifest is separate retention evidence; remove it to prove the durable
+    # experiment reference itself prevents deletion.
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("DELETE FROM artifact_manifests WHERE id=?", (manifest["id"],))
+    records = ExperimentStore(state)
+    experiment = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    attempt = _command(
+        records.record_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "operation_id": manifest["operation_id"],
+            "outcome": "succeeded",
+        },
+    )
+    link_body = {"expected_revision": attempt["revision"], "artifact_ids": [artifact["id"]]}
+    status, linked = records.link_attempt_artifacts(
+        owner, attempt["id"], "evidence-link", canonical_digest(link_body), link_body
+    )
+    assert status == 200
+    # A same-key replay does not create another custody reference.
+    assert records.link_attempt_artifacts(
+        owner, attempt["id"], "evidence-link", canonical_digest(link_body), link_body
+    ) == (status, linked)
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT reference_kind,project_id FROM experiment_artifact_evidence_references"
+        ).fetchall() == [("attempt_artifact", grant["project_id"])]
+    retention = ProjectArtifactRetentionStore(state, ProjectArtifactStore(state).backend)
+    with pytest.raises(Conflict, match="Referenced"):
+        retention.tombstone(owner, grant["project_id"], artifact["id"], "tomb", "tomb")
+
+    # A deletion reservation rejects both kinds of new evidence reference and
+    # rolls each command back together.
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE project_artifact_retention SET state='delete_intent' WHERE artifact_id=?",
+            (artifact["id"],),
+        )
+    blocked_attempt = _command(
+        records.record_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "operation_id": manifest["operation_id"],
+            "outcome": "inconclusive",
+            "reason": "Deletion reservation blocks a new evidence link.",
+        },
+    )
+    blocked_link_body = {
+        "expected_revision": blocked_attempt["revision"],
+        "artifact_ids": [artifact["id"]],
+    }
+    with pytest.raises(Conflict, match="reserved for deletion"):
+        records.link_attempt_artifacts(
+            owner,
+            blocked_attempt["id"],
+            "link-during-delete",
+            canonical_digest(blocked_link_body),
+            blocked_link_body,
+        )
+    measurement_body = {
+        "expected_revision": linked["revision"],
+        "name": "blocked during delete",
+        "value": {"seconds": 1},
+        "artifact_id": artifact["id"],
+    }
+    with pytest.raises(Conflict, match="reserved for deletion"):
+        records.record_measurement(
+            owner,
+            attempt["id"],
+            "measurement-during-delete",
+            canonical_digest(measurement_body),
+            measurement_body,
+        )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM research_attempt_measurements").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM experiment_artifact_evidence_references"
+            ).fetchone()[0]
+            == 1
+        )
+        connection.execute(
+            "UPDATE project_artifact_retention SET state='deleted' WHERE artifact_id=?",
+            (artifact["id"],),
+        )
+    exported = records.get_experiment(owner, experiment["id"])
+    assert exported["artifacts"][0]["status"] == "quarantined"
+    assert exported["artifacts"][0]["custody_state"] == "deleted"
+    owner_token = (state / "owner.header").read_text().split("Bearer ", 1)[1].strip()
+    response = TestClient(create_app(state)).get(
+        f"/experiments/{experiment['id']}", headers={"Authorization": f"Bearer {owner_token}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["artifacts"][0]["retention_state"] == "deleted"
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE project_artifact_retention SET state='degraded' WHERE artifact_id=?",
+            (artifact["id"],),
+        )
+    assert (
+        records.get_experiment(owner, experiment["id"])["artifacts"][0]["retention_state"]
+        == "degraded"
+    )
+
+
+def test_nonplaced_experiment_evidence_remains_explicit_legacy_custody(tmp_path: Path) -> None:
+    state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
+    _operation(state, owner, grant, lease, manifest["operation_id"])
+    records = ExperimentStore(state)
+    experiment = _command(records.create_experiment, owner, grant["project_id"], payload=_design())
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    attempt = _command(
+        records.record_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "operation_id": manifest["operation_id"],
+            "outcome": "succeeded",
+        },
+    )
+    _command(
+        records.link_attempt_artifacts,
+        owner,
+        attempt["id"],
+        payload={"expected_revision": attempt["revision"], "artifact_ids": [artifact["id"]]},
+    )
+    assert records.get_experiment(owner, experiment["id"])["artifacts"][0]["custody_state"] == (
+        "legacy_unplaced"
+    )
+
+
 def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
     tmp_path: Path,
 ) -> None:
@@ -276,9 +465,15 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 25
+    assert migrate_state(state) == 26
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
         ).fetchone()
         assert connection.execute("SELECT count(*) FROM research_experiments").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM experiment_artifact_evidence_references"
+            ).fetchone()[0]
+            == 0
+        )

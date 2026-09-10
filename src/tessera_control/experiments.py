@@ -25,6 +25,7 @@ from .experiments_models import (
     ReviseExperimentDesign,
     UpdateConclusion,
 )
+from .project_artifact_retention import admit_experiment_artifact_evidence_reference
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, utc_now
 
 T = TypeVar("T", bound=BaseModel)
@@ -86,6 +87,25 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
         PRIMARY KEY(conclusion_id,attempt_id,artifact_id,measurement_id),
         CHECK ((artifact_id IS NOT NULL AND measurement_id IS NULL) OR
                (artifact_id IS NULL AND measurement_id IS NOT NULL)))""",
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
+def create_experiment_evidence_retention_schema(connection: sqlite3.Connection) -> None:
+    """Install retention indexes for already durable experiment evidence links."""
+    statements = (
+        """CREATE TABLE IF NOT EXISTS experiment_artifact_evidence_references (
+        id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
+        measurement_id TEXT REFERENCES research_attempt_measurements(id),
+        reference_kind TEXT NOT NULL CHECK (reference_kind IN ('attempt_artifact','measurement_artifact')),
+        created_at TEXT NOT NULL,
+        CHECK ((reference_kind='attempt_artifact' AND measurement_id IS NULL) OR
+               (reference_kind='measurement_artifact' AND measurement_id IS NOT NULL))
+        )""",
+        "CREATE INDEX IF NOT EXISTS experiment_artifact_evidence_references_by_artifact ON experiment_artifact_evidence_references(project_id,artifact_id,id)",
     )
     for statement in statements:
         connection.execute(statement)
@@ -416,6 +436,16 @@ class ExperimentStore(Store):
                 if linked is None:
                     raise NotFound("Artifact is not linked to this attempt operation.")
             now, revision = utc_now(), attempt["revision"] + 1
+            for artifact_id in body["artifact_ids"]:
+                admit_experiment_artifact_evidence_reference(
+                    connection,
+                    attempt["project_id"],
+                    artifact_id,
+                    attempt_id,
+                    f"experiment_evidence_attempt_{attempt_id}_{artifact_id}",
+                    "attempt_artifact",
+                    now,
+                )
             connection.executemany(
                 "INSERT OR IGNORE INTO research_attempt_artifacts (attempt_id,artifact_id,created_at) VALUES (?,?,?)",
                 [(attempt_id, artifact_id, now) for artifact_id in body["artifact_ids"]],
@@ -495,6 +525,17 @@ class ExperimentStore(Store):
                 """INSERT INTO research_attempt_measurements (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id)""",
                 row,
             )
+            if body["artifact_id"] is not None:
+                admit_experiment_artifact_evidence_reference(
+                    connection,
+                    attempt["project_id"],
+                    body["artifact_id"],
+                    attempt_id,
+                    f"experiment_evidence_measurement_{ident}",
+                    "measurement_artifact",
+                    now,
+                    ident,
+                )
             connection.execute(
                 "UPDATE research_experiment_attempts SET revision=? WHERE id=? AND revision=?",
                 (revision, attempt_id, body["expected_revision"]),
@@ -778,6 +819,21 @@ class ExperimentStore(Store):
         ]
         return result
 
+    @staticmethod
+    def _artifact_evidence_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        """Expose storage custody separately from immutable quarantine intake status."""
+        result = dict(row)
+        retention_state = result.get("retention_state")
+        if retention_state is None:
+            retention_state = (
+                "retention_metadata_missing" if result.pop("has_placement") else "legacy_unplaced"
+            )
+        else:
+            result.pop("has_placement")
+        result["retention_state"] = retention_state
+        result["custody_state"] = retention_state
+        return result
+
     def export_experiment(self, principal: dict[str, Any], experiment_id: str) -> dict[str, Any]:
         connection = _connect(self.database_path)
         try:
@@ -851,12 +907,19 @@ class ExperimentStore(Store):
                 if artifact_ids:
                     artifact_placeholders = ",".join("?" for _ in artifact_ids)
                     result["artifacts"] = [
-                        dict(row)
+                        self._artifact_evidence_response(row)
                         for row in connection.execute(
-                            f"""SELECT id,project_id,task_id,grant_id,lease_id,worker_principal_id,
-                            epoch,operation_id,relative_path,sha256,size,created_at,status,
-                            classification,late FROM artifacts WHERE id IN ({artifact_placeholders})
-                            ORDER BY created_at,id""",
+                            f"""SELECT a.id,a.project_id,a.task_id,a.grant_id,a.lease_id,a.worker_principal_id,
+                            a.epoch,a.operation_id,a.relative_path,a.sha256,a.size,a.created_at,a.status,
+                            classification,late,r.retention_class,r.state AS retention_state,
+                            CASE WHEN p.artifact_id IS NULL THEN 0 ELSE 1 END AS has_placement
+                            FROM artifacts a
+                            LEFT JOIN project_artifact_retention r
+                            ON r.artifact_id=a.id AND r.project_id=a.project_id
+                            LEFT JOIN project_artifact_placements p
+                            ON p.artifact_id=a.id AND p.project_id=a.project_id
+                            WHERE a.id IN ({artifact_placeholders})
+                            ORDER BY a.created_at,a.id""",
                             artifact_ids,
                         )
                     ]

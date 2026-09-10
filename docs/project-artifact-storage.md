@@ -1,6 +1,7 @@
 # Project artifact storage
 
-Schema v23 adds private local project persistence after artifact quarantine. The
+Schema v26 adds retention-aware experiment evidence to private local project
+persistence after artifact quarantine. The
 worker transfers declared output only to quarantine first. Control verifies the
 retained BLOB checksum/size, records durable intent, then asks the narrow backend
 to stage, commit, and reconcile an object keyed by tenant/project/artifact identity. Storage records
@@ -23,9 +24,20 @@ inventing an object. Placement
 does not classify/release bytes, accept a finding/result, change a cost, or
 establish provider/scientific success.
 
+Attempt-artifact and measurement-artifact evidence links use one transactional
+admission path. A placed object must have active retention metadata; tombstoned,
+delete-intent, degraded, and deleted objects cannot receive a new evidence link.
+Those durable evidence references block later tombstone/delete admission in the
+same tenant/project. Existing experiment links are indexed by the v26 migration
+without changing their evidence or storage state. For compatibility, an unplaced
+legacy SQLite artifact may still be linked as evidence: exports label it
+`legacy_unplaced`, not project-retained. Exports label placed evidence with its
+actual retention state, including `degraded` or `deleted`; artifact quarantine
+remains an intake classification and is not a custody claim.
+
 The default persistence boundary is the project store. Quarantine remains intake;
 external export/move is a separately authorized future policy operation. There is
-no S3 SDK, cloud credential, public URL, deletion, or production/pilot activation.
+no S3 SDK, cloud credential, public URL, or production/pilot activation.
 Backups fail closed if they would omit committed project objects.
 
 This storage boundary is independent of planned Kubernetes Secret delivery and

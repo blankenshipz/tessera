@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 25
+LATEST_SCHEMA_VERSION = 26
 LOCAL_ORG_ID = "org_local"
 
 
@@ -419,6 +419,35 @@ def migrate_v24_to_v25(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 25 WHERE singleton = 1")
 
 
+def migrate_v25_to_v26(connection: sqlite3.Connection) -> None:
+    """Index existing experiment evidence for retention without changing its custody."""
+    from .experiments import create_experiment_evidence_retention_schema
+
+    create_experiment_evidence_retention_schema(connection)
+    connection.execute(
+        """INSERT OR IGNORE INTO experiment_artifact_evidence_references
+        (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
+        SELECT 'experiment_evidence_attempt_' || aa.attempt_id || '_' || aa.artifact_id,
+        aa.artifact_id,e.project_id,aa.attempt_id,NULL,'attempt_artifact',aa.created_at
+        FROM research_attempt_artifacts aa
+        JOIN research_experiment_attempts a ON a.id=aa.attempt_id
+        JOIN research_experiment_variants v ON v.id=a.variant_id
+        JOIN research_experiments e ON e.id=v.experiment_id"""
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO experiment_artifact_evidence_references
+        (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
+        SELECT 'experiment_evidence_measurement_' || m.id,m.artifact_id,e.project_id,
+        m.attempt_id,m.id,'measurement_artifact',m.created_at
+        FROM research_attempt_measurements m
+        JOIN research_experiment_attempts a ON a.id=m.attempt_id
+        JOIN research_experiment_variants v ON v.id=a.variant_id
+        JOIN research_experiments e ON e.id=v.experiment_id
+        WHERE m.artifact_id IS NOT NULL"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version = 26 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -444,6 +473,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     22: migrate_v22_to_v23,
     23: migrate_v23_to_v24,
     24: migrate_v24_to_v25,
+    25: migrate_v25_to_v26,
 }
 
 

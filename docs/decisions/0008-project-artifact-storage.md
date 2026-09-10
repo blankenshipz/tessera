@@ -1,6 +1,6 @@
 # 0008: Project artifact storage is durable custody, not release
 
-Status: accepted for local schema-v24 development storage.
+Status: accepted for local schema-v26 development storage.
 
 Worker output slots are temporary execution-plane custody. After quarantine
 checksum/size validation, development-worker output is staged, conditionally
@@ -27,6 +27,12 @@ backend identity verification. Referenced, checkpointed, accepted, and held obje
 refuse deletion. Missing, corrupt, or uncertain delete outcomes remain degraded
 incidents, never a successful cleanup. Backup currently fails closed when committed
 external objects exist rather than producing an incomplete bundle.
+
+Schema v26 makes goal-to-decision attempt-artifact and measurement-artifact links
+durable retention references. New links to placed objects require active retention,
+and the delete check reads those tenant/project-scoped references. SQLite-only
+legacy artifacts remain linkable without an invented placement; exports identify
+them as `legacy_unplaced` rather than retained project objects.
 
 S3/IAM/KMS, public URLs, external movement/export/release, production activation,
 and a pilot storage acceptance are not implemented. ADR 0003's worker-slot gate
