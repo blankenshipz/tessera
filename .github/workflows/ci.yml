@@ -8,6 +8,7 @@ permissions:
 jobs:
   desktop-boundaries:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,6 +18,7 @@ jobs:
         run: npm test --prefix desktop
   control:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Build development image
