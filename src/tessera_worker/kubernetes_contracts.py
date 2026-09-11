@@ -24,7 +24,7 @@ _NAME = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?\Z")
 _UID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}\Z")
 _MOUNT_PATH = re.compile(r"/[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
-_PROFILE = "development-minikube-opencode-v1"
+_PROFILES = {"development-minikube-opencode-v1", "development-kubernetes-conformance-v1"}
 
 
 class KubernetesContractError(RuntimeError):
@@ -200,8 +200,8 @@ class KubernetesClusterConfig:
             raise ValueError("kubeconfig must be an explicit absolute path.")
         _digest(self.kubeconfig_sha256, "kubeconfig_sha256")
         _kubernetes_name(self.context, "context")
-        if self.profile != _PROFILE:
-            raise ValueError(f"profile must be {_PROFILE!r}.")
+        if self.profile not in _PROFILES:
+            raise ValueError(f"profile must be one of {sorted(_PROFILES)!r}.")
         _server(self.server)
         _digest(self.server_sha256, "server_sha256")
         _digest(self.ca_sha256, "ca_sha256")
@@ -561,6 +561,9 @@ _JOB_SPEC_DEFAULTS: dict[str, object] = {
 }
 _POD_SPEC_DEFAULTS: dict[str, object] = {
     "dnsPolicy": "ClusterFirst",
+    "hostIPC": False,
+    "hostNetwork": False,
+    "hostPID": False,
     "preemptionPolicy": "PreemptLowerPriority",
     "priority": 0,
     "schedulerName": "default-scheduler",
@@ -653,8 +656,10 @@ def _validate_pod_spec(
                     f"Kubernetes {field} container {index} default {name} conflicts."
                 )
     normalized_spec = dict(observed_spec)
+    normalized_expected = dict(expected_spec)
     for name in _POD_SPEC_DEFAULTS:
         normalized_spec.pop(name, None)
+        normalized_expected.pop(name, None)
     normalized_spec.pop("nodeName", None)
     normalized_spec.pop("tolerations", None)
     normalized_spec["containers"] = [
@@ -665,7 +670,7 @@ def _validate_pod_spec(
         }
         for index, container in enumerate(containers)
     ]
-    if not _matches_expected_exactly(expected_spec, normalized_spec):
+    if not _matches_expected_exactly(normalized_expected, normalized_spec):
         raise KubernetesContractError(mismatch_message)
     return observed_spec
 
@@ -690,7 +695,14 @@ def _validate_job_spec(observed: object, expected: object, job_uid: str) -> None
         field="Job Pod spec",
         mismatch_message="Kubernetes Job immutable spec conflicts with the operation binding.",
     )
-    if not _matches_expected(expected_spec, observed_spec):
+    normalized_expected = dict(expected_spec)
+    normalized_template = dict(expected_template)
+    normalized_pod_spec = dict(_mapping(expected_template.get("spec"), "expected Job Pod spec"))
+    for name in _POD_SPEC_DEFAULTS:
+        normalized_pod_spec.pop(name, None)
+    normalized_template["spec"] = normalized_pod_spec
+    normalized_expected["template"] = normalized_template
+    if not _matches_expected(normalized_expected, observed_spec):
         raise KubernetesContractError(
             "Kubernetes Job immutable spec conflicts with the operation binding."
         )

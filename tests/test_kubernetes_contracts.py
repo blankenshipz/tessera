@@ -250,6 +250,19 @@ def test_observations_allow_known_defaults_but_reject_unallowlisted_executable_f
         parse_pod(unsafe_pod, binding, _cluster(), "job-fixture")
 
 
+def test_observations_accept_omitted_false_host_defaults_but_reject_true() -> None:
+    binding = _binding()
+    observed_job = _job(binding)
+    pod_spec = observed_job["spec"]["template"]["spec"]
+    for field in ("hostIPC", "hostNetwork", "hostPID"):
+        pod_spec.pop(field)
+
+    assert parse_job(observed_job, binding, _cluster()).state == "running"
+    pod_spec["hostNetwork"] = True
+    with pytest.raises(KubernetesContractError, match="default hostNetwork conflicts"):
+        parse_job(observed_job, binding, _cluster())
+
+
 def test_malformed_or_unknown_observations_fail_closed() -> None:
     binding = _binding()
     malformed = _job(binding)
