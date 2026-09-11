@@ -1,13 +1,14 @@
 # Compatibility matrix
 
-This is the current, evidence-based compatibility record. A **fixture pin** is
+This is the current, evidence-based compatibility record for a source-only
+developer alpha. A **fixture pin** is
 only a deterministic test input; it is not an approved upstream deployment.
 Nothing in this matrix enables dispatch, credential handoff, provider/model
 calls, artifact release, result acceptance, or unattended research work.
 
 | Boundary/profile | Exact pin or identity | Available evidence | Unavailable / not enabled |
 |---|---|---|---|
-| Python development environment | Python `>=3.11`; dependencies resolved by committed `uv.lock` (`uv sync --locked`) | Native unit and synthetic integration tests | A supported production Python/OS matrix is not declared |
+| Python development environment | Python `>=3.11`; dependencies resolved by committed `uv.lock` (`uv sync --locked`) | Native locked workflow and Docker Compose/native synthetic fixtures | A supported production Python/OS matrix, remote control-plane deployment, and hosted-service support are not declared |
 | Synthetic OpenCode HTTP/SSE fixture | OpenCode-shaped server `1.2.3`; canonical fixture `/doc` SHA-256 `d71ee81f4a3909ebf4b05f9542b756d0b98e453cca0beb349c873674ac0abcf9` | Exact-version and canonical-schema pin enforcement; authenticated literal-loopback HTTP; session/message/abort and SSE replay fixtures | This is not an installed OpenCode build or a selected real-server pin; no real OpenCode compatibility result, TLS deployment test, skills/MCP/permission/provider-auth surface, provider/model call, or credentials |
 | Opt-in real OpenCode node fixture | Runtime-only absolute executable, exact semantic version, and canonical `/doc` SHA-256 supplied through `TESSERA_OPENCODE_*` | No selected executable or recorded real result. The script reports `skipped` when the required pin is unavailable; local HTTP-double tests only validate fixture behavior. | Not compatibility evidence until that exact real executable returns `passed`; no provider/model/MCP/shell/credential call, node enrollment, dispatch, artifact release, result acceptance, or provider-cost/termination claim |
 | OpenCode live adapter seam | Caller must supply one exact `OpenCodeServerPin(version, schema_sha256)` | Private journal, authority rechecks, fixed routes, redirect/proxy/cookie rejection, bounded events and unresolved abort semantics | No control-plane registration, worker enrollment, node activation, deployment configuration, or real provider dispatch |

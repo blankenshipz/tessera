@@ -1,8 +1,10 @@
 # Contributing to Tessera
 
-Tessera is in early development. The repository is intended for future open-source
-release, but no license has been selected yet. Do not assume redistribution rights
-or solicit outside contributions until the maintainer chooses release terms.
+Tessera is a source-only developer alpha. No license has been selected: do not
+assume redistribution rights, submit third-party material, or solicit outside
+contributions until the maintainer chooses release terms and reopens the policy.
+The maintainer has paused PRs; unsolicited contributions may be declined even
+when a technical change is useful.
 
 ## Setup
 
@@ -134,10 +136,11 @@ a human plan approval into authorization to provision or materialize a Secret.
 
 ## Security reports
 
-Do not put credentials or sensitive research data in issues or PRs. Contact the
-repository owner privately on GitHub to arrange a secure report. Automated tests
-must not target systems outside the assigned repository. A public security-reporting
-channel and license are release prerequisites, not implemented promises.
+Do not put credentials or sensitive research data in issues or PRs. Follow
+[SECURITY.md](SECURITY.md): maintainers must configure a private reporting channel
+before accepting sensitive reports. Automated tests must not target systems outside
+the assigned repository. A public security-reporting channel and license are
+release prerequisites, not implemented promises.
 
 ## Local schema upgrades
 

@@ -1,8 +1,10 @@
 # Implementation progress
 
-This file tracks executable evidence against DESIGN.md. Initial development uses
-logical commits on main; PRs remain paused. The full design and real research
-pilot are not complete.
+This file tracks executable evidence against DESIGN.md. Tessera is a source-only
+developer alpha: initial development uses logical commits on main and PRs remain
+paused. The full design and real research pilot are not complete. It has no
+production remote/provider/OpenCode/Kubernetes support claim; schema v33 is the
+current local schema.
 
 ## Redirected next milestone (planned)
 

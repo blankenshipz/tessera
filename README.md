@@ -21,7 +21,8 @@ being pursued in parallel. MLflow, Databricks, Spark, and similar systems are
 optional integrations, never the authority for Tessera plans, attempts, evidence,
 or human conclusions.
 
-**Status:** The local API supports scoped credentials, versioned task plans,
+**Status: source-only developer alpha.** This repository is for local developer
+evaluation, not a production release or hosted service. The local API supports scoped credentials, versioned task plans,
 human approval records, durable conversations and decisions, and a research
 ledger with complete study exports and source corrections. Approval records intent
 only; they do not grant execution. A desktop shell, safe file inventory, structured
@@ -83,7 +84,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v24
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v33
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -258,14 +259,13 @@ attempt to support every domain or infrastructure combination.
 | Control plane | Identity/access, tasks, budgets, research records and credential brokering | Local processes/cluster, organization infrastructure, or Tessera hosting |
 | Execution plane | Agent supervisors, harnesses, tools and experiment jobs | Same machine, other hosts, clusters or cloud compute |
 
-Three deployment modes use the same authenticated API:
+The design describes three future deployment modes; only the local developer
+workflow is currently supported:
 
-- **Personal:** a separately running local control plane, initially as processes;
-  a local cluster such as Minikube is another deployment option.
-- **Organization-managed:** the organization operates the control plane and
-  connects its identity, secrets, storage, and compute services.
-- **Tessera-hosted:** a planned paid service operates the control plane;
-  customers can retain their own workers, compute accounts, and secrets backend.
+- **Personal:** local developer processes are the only current scope. A local
+  cluster such as Minikube is not a supported execution or deployment claim.
+- **Organization-managed:** planned; no production remote control-plane claim.
+- **Tessera-hosted:** planned; no hosted offering exists.
 
 Each project has one authoritative control plane. Organization isolation covers
 data, credentials, and operations; a Kubernetes namespace alone is not sufficient.
@@ -329,3 +329,17 @@ cost—not just agent execution speed.
 
 See [DESIGN.md](./DESIGN.md) for the architecture, implementation sequence,
 failure handling, and release tests.
+
+## Developer-alpha boundaries
+
+Start with the [local ledger quickstart](docs/quickstart.md) and its synthetic
+example. Schema v33 is the current local schema, but the documented component and
+synthetic evidence does not make a production workflow. There is no supported
+remote control plane, real provider integration, OpenCode compatibility result,
+or Kubernetes execution path. The tested developer environments are locked Python
+3.11+ and Docker Compose/native fixtures; no production OS support matrix is
+declared. Backups and held restore are limited local recovery tools and do not
+provide retention automation, owner/account recovery, object-bundle recovery, or
+fencing of the original service/workers/jobs. See [privacy](docs/privacy.md),
+[support](docs/support.md), [release checklist](docs/release-checklist.md), and
+[SECURITY.md](SECURITY.md). No license has been selected.

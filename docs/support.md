@@ -1,0 +1,16 @@
+# Support
+
+Tessera is a source-only developer alpha, maintained without a support SLA,
+hosted service, account-recovery process, or production operations team.
+
+For non-sensitive development questions, first consult the README, the
+[quickstart](quickstart.md), [recovery runbook](recovery.md), implementation
+progress, and compatibility matrix. The contribution workflow is intentionally
+limited while the project is pre-release: see CONTRIBUTING.md. Maintainers may
+decline support requests, feature requests, or external contributions until
+release terms and review capacity are established.
+
+Do not submit vulnerabilities, credentials, private research data, or recovery
+tokens through public channels. See [SECURITY.md](../SECURITY.md); a maintainer
+must configure a private reporting channel before sensitive reports can be
+accepted.
