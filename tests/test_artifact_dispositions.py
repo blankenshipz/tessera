@@ -136,8 +136,8 @@ def test_v9_to_v10_migration_is_transactional_and_preserves_manifest(tmp_path: P
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 33
-    assert migrate_state(state) == 33
+    assert migrate_state(state) == 34
+    assert migrate_state(state) == 34
     assert _retained_records(state) == retained
     assert (state / "owner.header").read_bytes() == header
 

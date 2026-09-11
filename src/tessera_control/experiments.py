@@ -230,6 +230,29 @@ def create_admitted_attempt_resolution_schema(connection: sqlite3.Connection) ->
     )
 
 
+def create_admitted_attempt_observation_projection_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add the latest operational sample projection without growing history.
+
+    The opaque cursor identifies the latest worker observation or provider receipt
+    that advanced this projection.  It is deliberately not a pagination cursor:
+    detailed history remains the bounded semantic state-transition ledger.
+    """
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(research_experiment_admitted_attempts)")
+    }
+    for name, definition in (
+        ("operational_observation_cursor", "TEXT"),
+        ("operational_observed_at", "TEXT"),
+    ):
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE research_experiment_admitted_attempts ADD COLUMN {name} {definition}"
+            )
+
+
 def create_admitted_attempt_evidence_schema(connection: sqlite3.Connection) -> None:
     """Keep pre-execution attempt identity usable by the ordinary evidence APIs.
 
@@ -281,6 +304,8 @@ def _append_admitted_attempt_state(
     outcome: str | None = None,
     resolved: bool = False,
     termination_confirmed: bool | None = None,
+    observation_cursor: str | None = None,
+    observed_at: str | None = None,
 ) -> dict[str, Any]:
     """Append operational facts without allowing them to rewrite a human decision."""
     if (
@@ -307,6 +332,14 @@ def _append_admitted_attempt_state(
             if termination_confirmed is not None
             else attempt.get("operational_termination_confirmed")
         ),
+        operational_observation_cursor=(
+            observation_cursor
+            if observation_cursor is not None
+            else attempt.get("operational_observation_cursor")
+        ),
+        operational_observed_at=(
+            observed_at if observed_at is not None else attempt.get("operational_observed_at")
+        ),
         outcome=human_outcome,
         reason=human_reason,
         revision=revision,
@@ -319,6 +352,8 @@ def _append_admitted_attempt_state(
             operational_state=:operational_state,
             operational_observed_state=:operational_observed_state,
             operational_termination_confirmed=:operational_termination_confirmed,
+            operational_observation_cursor=:operational_observation_cursor,
+            operational_observed_at=:operational_observed_at,
             outcome=:outcome,reason=:reason,revision=:revision,updated_at=:updated_at,
             resolved_by_principal_id=:resolved_by_principal_id
             WHERE id=:id AND revision=:expected_revision""",
@@ -459,14 +494,18 @@ def record_admitted_attempt_observation(
     connection: sqlite3.Connection,
     operation: sqlite3.Row | dict[str, Any],
     worker: dict[str, Any],
-    observed_state: str,
-    desired_state: str,
-    termination_confirmed: bool = False,
-) -> None:
-    """Keep an admitted attempt visible through worker uncertainty and restart."""
+    observation: dict[str, Any],
+) -> bool:
+    """Project every sample while appending only a semantic state transition.
+
+    ``execution_observations`` and fake-provider receipts retain operational
+    samples.  This bounded experiment-facing ledger records only changed
+    operational state, observed state, or termination-confirmation semantics,
+    while always retaining the latest opaque sample cursor and observed time.
+    """
     attempt_id = operation["experiment_attempt_id"]
     if attempt_id is None:
-        return
+        return False
     row = connection.execute(
         "SELECT * FROM research_experiment_admitted_attempts WHERE id=?", (attempt_id,)
     ).fetchone()
@@ -483,6 +522,8 @@ def record_admitted_attempt_observation(
         or attempt["package_digest"] != operation["package_digest"]
     ):
         raise Conflict("External operation experiment admission binding conflicts.")
+    observed_state = observation["observed_state"]
+    termination_confirmed = bool(observation["termination_confirmed"])
     state = {
         "running": "running",
         "unknown": "unknown",
@@ -490,6 +531,25 @@ def record_admitted_attempt_observation(
         # cancelled outcome. Confirmation is retained in its separate field.
         "exited": "interrupted",
     }[observed_state]
+    prior_state = attempt.get("operational_state", attempt["state"])
+    prior_observed_state = attempt.get("operational_observed_state", "not_observed")
+    prior_confirmation = attempt.get("operational_termination_confirmed")
+    semantic_transition = (
+        prior_state != state
+        or prior_observed_state != observed_state
+        or prior_confirmation is None
+        or bool(prior_confirmation) != termination_confirmed
+    )
+    if not semantic_transition:
+        # A fresh sample changes operational freshness, not the research-facing
+        # semantic history or revision.  The enclosing observation command keeps
+        # this mutable projection and the raw sample in one transaction.
+        connection.execute(
+            """UPDATE research_experiment_admitted_attempts
+            SET operational_observation_cursor=?,operational_observed_at=? WHERE id=?""",
+            (observation["cursor"], observation["observed_at"], attempt["id"]),
+        )
+        return False
     _append_admitted_attempt_state(
         connection,
         attempt,
@@ -498,7 +558,10 @@ def record_admitted_attempt_observation(
         observed_state=observed_state,
         operation_id=operation["operation_id"],
         termination_confirmed=termination_confirmed,
+        observation_cursor=observation["cursor"],
+        observed_at=observation["observed_at"],
     )
+    return True
 
 
 def create_v25_experiment_schema(connection: sqlite3.Connection) -> None:
@@ -1003,6 +1066,8 @@ class ExperimentStore(Store):
                 "operational_state": "admitted",
                 "operational_observed_state": "not_observed",
                 "operational_termination_confirmed": None,
+                "operational_observation_cursor": None,
+                "operational_observed_at": None,
                 "outcome": None,
                 "reason": None,
                 "revision": 1,

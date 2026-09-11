@@ -92,7 +92,8 @@ const experimentLedger = (id = 'e1', projectId = 'p1') => {
     design_revision: 2, task_id: 'task_1', plan_digest: 'a'.repeat(64), grant_id: 'grant_1', operation_id: admittedOperationId,
     package_digest: '0'.repeat(64), state: 'unknown', outcome: null, reason: null, revision: 4,
     created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:03Z', created_by_principal_id: 'human', resolved_by_principal_id: null,
-    operational_state: 'unknown', operational_observed_state: 'unknown', operational_termination_confirmed: false, human_outcome: null, scientific_validity: 'not_assessed', state_history: [
+    operational_state: 'unknown', operational_observed_state: 'unknown', operational_termination_confirmed: false,
+    operational_observation_cursor: 'observation:fixture-4', operational_observed_at: '2026-01-01T00:00:03Z', human_outcome: null, scientific_validity: 'not_assessed', state_history: [
       { attempt_id: 'attempt-admitted-unknown', sequence: 1, state: 'admitted', observed_state: null, reason: null, operation_id: null, recorded_at: '2026-01-01T00:00:00Z', actor_principal_id: 'human' },
       { attempt_id: 'attempt-admitted-unknown', sequence: 2, state: 'preparing', observed_state: null, reason: null, operation_id: admittedOperationId, recorded_at: '2026-01-01T00:00:01Z', actor_principal_id: 'worker' },
       { attempt_id: 'attempt-admitted-unknown', sequence: 3, state: 'running', observed_state: 'running', reason: null, operation_id: admittedOperationId, recorded_at: '2026-01-01T00:00:02Z', actor_principal_id: 'worker' },
@@ -263,6 +264,7 @@ test('experiment projection renders migrated unknown context, attempt history, l
   assert.ok(find(detail, node => node.textContent === 'Admitted-attempt operational state: unknown'));
   assert.ok(find(detail, node => /Operation link: 99999999999999999999999999999999/.test(node.textContent)));
   assert.ok(find(detail, node => /State unknown is unresolved; external execution and exposure remain visible/.test(node.textContent)));
+  assert.ok(find(detail, node => /Latest admitted-attempt observation: unknown.*observed 2026-01-01T00:00:03Z.*cursor observation:fixture-4/.test(node.textContent)));
   assert.ok(find(detail, node => /#4: unknown · observed unknown · actor worker/.test(node.textContent)));
   assert.ok(find(detail, node => node.textContent === 'Goal: unknown (not recorded)'));
   assert.ok(find(detail, node => /Operation state recorded with attempt:.*desired admitted.*observed exited/.test(node.textContent)));
@@ -310,6 +312,8 @@ test('admitted outcomes, late observations, migrated labels, evidence and retrac
       operational_observed_state: operationalState === 'legacy_unverified' ? 'legacy_unverified' :
         operationalState === 'interrupted' ? 'exited' : late ? 'running' : 'not_observed',
       operational_termination_confirmed: operationalState === 'legacy_unverified' ? null : operationalState === 'interrupted',
+      operational_observation_cursor: operationalState === 'legacy_unverified' ? null : 'observation:fixture-latest',
+      operational_observed_at: operationalState === 'legacy_unverified' ? null : '2026-01-02T00:00:00Z',
       human_outcome: { outcome, reason: 'Human bookkeeping only.', expected_revision: 4,
         decided_at: '2026-01-02T00:00:00Z', decided_by_principal_id: 'human' } });
     attempt.state_history = attempt.state_history.slice(0, 2);

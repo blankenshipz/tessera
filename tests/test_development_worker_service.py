@@ -11,6 +11,7 @@ from test_input_delivery import _delivery
 from test_supervisor import FakeAdapter
 
 from tessera_control.api import create_app
+from tessera_control.experiments import ExperimentStore
 from tessera_control.store import _connect, canonical_digest
 from tessera_worker.development_runtime import DevelopmentCpuRuntime, DevelopmentOutputProfile
 from tessera_worker.provider import FakeProvider
@@ -81,6 +82,52 @@ def _unleased_delivery(tmp_path):
     return state, execution, owner, worker, grant
 
 
+def _admit_service_attempt(state, owner, grant):
+    records = ExperimentStore(state)
+    design = {
+        "goal": "Keep repeated worker polling readable.",
+        "success_criterion": "A human reviews the bounded transition history.",
+        "protocol": "Run one bounded synthetic baseline.",
+        "variants": [
+            {
+                "kind": "baseline",
+                "name": "baseline",
+                "method_digest": "a" * 64,
+                "input_digest": "b" * 64,
+                "metadata": {"synthetic": True},
+                "execution_task_id": grant["task_id"],
+                "execution_plan_digest": grant["plan_digest"],
+            },
+            {
+                "kind": "intervention",
+                "name": "intervention",
+                "method_digest": "c" * 64,
+                "input_digest": "d" * 64,
+                "metadata": {"synthetic": True},
+                "execution_task_id": grant["task_id"],
+                "execution_plan_digest": grant["plan_digest"],
+            },
+        ],
+    }
+    _, experiment = records.create_experiment(
+        owner, grant["project_id"], "service-admitted-experiment", canonical_digest(design), design
+    )
+    baseline = experiment["design"]["variants"][0]
+    admission = {
+        "expected_variant_revision": baseline["revision"],
+        "expected_design_revision": experiment["current_design_revision"],
+        "grant_id": grant["id"],
+    }
+    records.admit_attempt(
+        owner,
+        baseline["id"],
+        "service-admitted-attempt",
+        canonical_digest(admission),
+        admission,
+    )
+    return records, experiment
+
+
 def test_credential_file_is_private_and_never_accepts_a_link(tmp_path):
     credential = tmp_path / "credential"
     credential.write_text("worker-token")
@@ -104,6 +151,25 @@ def test_worker_service_heartbeats_before_lease_and_never_issues_human_commands(
     assert channel.paths[:2] == ["/worker/heartbeat", "/worker/leases"]
     assert all(path.startswith("/worker/") for path in channel.paths)
     assert "/projects/" not in channel.paths
+
+
+def test_worker_service_repeated_running_polls_keep_admitted_detail_semantic(tmp_path):
+    state, _, owner, _, grant = _unleased_delivery(tmp_path)
+    records, experiment = _admit_service_attempt(state, owner, grant)
+    service = _service(tmp_path, state, grant, max_ticks=8)
+
+    assert service.run()["reason"] == "tick_limit_cancellation_requested"
+
+    attempt = records.get_experiment(owner, experiment["id"])["admitted_attempts"][0]
+    assert [entry["state"] for entry in attempt["state_history"]] == [
+        "admitted",
+        "preparing",
+        "running",
+        "interrupted",
+    ]
+    assert attempt["operational_observed_state"] == "exited"
+    assert attempt["operational_observed_at"] is not None
+    assert attempt["operational_observation_cursor"].startswith("observation:")
 
 
 def test_worker_service_profile_mismatch_precedes_start(tmp_path):

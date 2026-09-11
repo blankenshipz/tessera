@@ -63,7 +63,8 @@ only a complete historical chain. Every immutable design revision retains its
 goal, success criterion, protocol, baseline/intervention snapshots, registered
 execution references, and unattempted variants. Legacy attempts and admitted
 execution attempts are separate, linked projections: admitted attempts retain their
-complete bounded state history and exact operation/package binding, while
+complete bounded semantic state history, latest operational sample state/cursor/time,
+and exact operation/package binding, while
 operation-backed legacy attempts display desired and observed states separately,
 including unresolved termination. Conclusion cards retain any explicit human
 supersession or retraction lineage with reason, actor, and recorded history, while

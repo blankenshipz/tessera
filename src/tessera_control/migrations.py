@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 33
+LATEST_SCHEMA_VERSION = 34
 LOCAL_ORG_ID = "org_local"
 
 
@@ -645,6 +645,28 @@ def migrate_v32_to_v33(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 33 WHERE singleton = 1")
 
 
+def migrate_v33_to_v34(connection: sqlite3.Connection) -> None:
+    """Keep latest operational sample freshness outside semantic state history."""
+    from .experiments import create_admitted_attempt_observation_projection_schema
+
+    create_admitted_attempt_observation_projection_schema(connection)
+    connection.execute(
+        """UPDATE research_experiment_admitted_attempts
+        SET operational_observation_cursor=(
+            SELECT 'observation:' || o.id FROM execution_observations o
+            WHERE o.operation_id=research_experiment_admitted_attempts.operation_id
+            ORDER BY rowid DESC LIMIT 1),
+            operational_observed_at=(
+            SELECT o.observed_at FROM execution_observations o
+            WHERE o.operation_id=research_experiment_admitted_attempts.operation_id
+            ORDER BY rowid DESC LIMIT 1)
+        WHERE operation_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM execution_observations o
+            WHERE o.operation_id=research_experiment_admitted_attempts.operation_id)"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version = 34 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -678,6 +700,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     30: migrate_v30_to_v31,
     31: migrate_v31_to_v32,
     32: migrate_v32_to_v33,
+    33: migrate_v33_to_v34,
 }
 
 

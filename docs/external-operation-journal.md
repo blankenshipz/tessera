@@ -87,6 +87,15 @@ projection, while worker and fake-provider reports update separate operational
 state/observation fields. Thus a late `running`, `unknown`, or `exited` report can
 be retained without replacing a human `unknown` or other outcome label.
 
+Schema v34 keeps high-frequency worker and fake-provider operational samples out
+of the bounded admitted-attempt semantic history. Each attempt exposes the latest
+observed state, opaque sample cursor, and observed timestamp, while state changes,
+observed-state changes, and termination-confirmation changes remain complete
+append-only semantic transitions. Repeated `running` polls remain in the
+operational journal and do not consume the 1,000-record experiment export/detail
+bound or create duplicate labbook events. This is not paging and does not discard
+semantic transitions.
+
 Execution `succeeded` and `cancelled` resolutions require the original bound
 package and operation plus an attributed, confirmed exited observation. A cancelled
 resolution additionally requires the durable cancellation request; an unconfirmed

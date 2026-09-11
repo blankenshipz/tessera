@@ -4,7 +4,7 @@ import sqlite3
 
 
 def drop_empty_experiment_schema(connection: sqlite3.Connection) -> None:
-    """Remove v25-v33 experiment tables before testing a pre-v25 migration.
+    """Remove v25-v34 experiment tables before testing a pre-v25 migration.
 
     These fixtures initialize current state to seed older authority/evidence. Just
     relabeling its schema version leaves future tables that a historical migration

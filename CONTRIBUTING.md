@@ -268,3 +268,8 @@ Schema 33 separates immutable human admitted-attempt outcomes from mutable worke
 and provider observations. It preserves every legacy outcome label, records no
 invented operational detail for migrated rows, and allows post-revocation
 reconciliation only for the original worker/lease/operation's confirmed exit.
+
+Schema 34 keeps high-frequency worker/provider samples in their operational
+journal. Admitted-attempt detail and export retain every semantic transition plus
+the latest observed state, opaque cursor, and timestamp without consuming their
+1,000-record semantic-history bound during routine polling.

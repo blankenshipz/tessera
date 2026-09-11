@@ -56,15 +56,22 @@ its `POST /conclusions/{id}/review` response expose that `design_revision` and a
 complete `design_snapshot`. Supplying a different revision while reviewing or
 revising a conclusion is rejected. `GET /experiments/{id}/export` includes complete
 historical designs, legacy attempts, admitted attempts with their complete append-only
-state histories, linked operations, and every conclusion's snapshot and correction
+semantic state-transition histories and latest operational sample
+state/cursor/timestamp, linked operations, and every conclusion's snapshot and correction
 lineage, without dispatching work or establishing scientific validity. It uses one
 read transaction and fails with `409` rather than truncating when any exported
-collection (including attempts, admitted-attempt state history, operations, evidence
+collection (including attempts, admitted-attempt semantic state history, operations, evidence
 links, artifacts, measurements, nested conclusion evidence, designs, variants,
 conclusions, or amendments) exceeds 1,000 records, or when its complete JSON exceeds
 `max_bytes`. `max_bytes` defaults to 1,000,000 and is capped at 4 MiB, matching the
 desktop control-response limit; callers need a separate bounded snapshot mechanism
 for larger ledgers.
+
+Routine worker polling remains in the operational observation journal and updates
+the admitted attempt's latest sample projection without appending a duplicate
+semantic transition or labbook event. State/observed-state/termination-confirmation
+changes still append complete semantic history; polling is neither silently dropped
+nor exposed through unbounded experiment detail or export paging.
 
 `POST /conclusions/{id}/amendments` is human-only and accepts
 `expected_revision`, `expected_design_revision`, `relation` (`supersedes` or

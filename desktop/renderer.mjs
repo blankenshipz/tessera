@@ -501,7 +501,11 @@ function validAdmittedAttempt(attempt, experimentId, variants, operations) {
       (attempt.operational_observed_state !== undefined &&
         !['not_observed', 'legacy_unverified', ...operationObservedStates].includes(attempt.operational_observed_state)) ||
       (attempt.operational_termination_confirmed !== undefined &&
-        attempt.operational_termination_confirmed !== null && typeof attempt.operational_termination_confirmed !== 'boolean')) return false;
+        attempt.operational_termination_confirmed !== null && typeof attempt.operational_termination_confirmed !== 'boolean') ||
+      (attempt.operational_observation_cursor !== undefined &&
+        attempt.operational_observation_cursor !== null && !isText(attempt.operational_observation_cursor)) ||
+      (attempt.operational_observed_at !== undefined &&
+        attempt.operational_observed_at !== null && !isText(attempt.operational_observed_at))) return false;
   const variant = variants.get(attempt.variant_id);
   if (!variant || variant.design_revision !== attempt.design_revision ||
       variant.execution_task_id !== attempt.task_id || variant.execution_plan_digest !== attempt.plan_digest ||
@@ -731,13 +735,15 @@ function renderExperimentLedger(ledger) {
     }
     if (operationalState === 'legacy_unverified') card.append(element('p', 'Legacy operational detail was not reconstructed; the historical labels below remain unchanged.', 'muted'));
     if (attempt.operational_observed_state !== undefined) {
-      card.append(element('p', `Latest admitted-attempt observation: ${attempt.operational_observed_state} · termination ${attempt.operational_termination_confirmed === true ? 'confirmed (operational evidence only)' : 'unconfirmed or not recorded'}`, 'muted'));
+      const cursor = attempt.operational_observation_cursor ?? 'not recorded';
+      const observedAt = attempt.operational_observed_at ?? 'not recorded';
+      card.append(element('p', `Latest admitted-attempt observation: ${attempt.operational_observed_state} · termination ${attempt.operational_termination_confirmed === true ? 'confirmed (operational evidence only)' : 'unconfirmed or not recorded'} · observed ${observedAt} · cursor ${cursor}`, 'muted'));
     }
     if (attempt.outcome !== null) {
       const decision = attempt.human_outcome;
       card.append(element('p', `Human-recorded outcome: ${attempt.outcome}${attempt.reason ? ` · reason: ${attempt.reason}` : ''}${decision ? ` · actor ${decision.decided_by_principal_id} · recorded ${decision.decided_at}` : ''}`));
     }
-    card.append(element('p', `State history (${attempt.state_history.length})`, 'muted'));
+    card.append(element('p', `Semantic state history (${attempt.state_history.length})`, 'muted'));
     for (const entry of attempt.state_history) {
       card.append(element('p', `#${entry.sequence}: ${entry.state} · observed ${entry.observed_state ?? 'not recorded'} · actor ${entry.actor_principal_id}${entry.reason ? ` · reason: ${entry.reason}` : ''}`, 'muted'));
     }

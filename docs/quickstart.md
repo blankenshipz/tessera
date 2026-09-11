@@ -36,7 +36,7 @@ uv run --locked tessera backup --state-dir .tessera --output /safe/place/tessera
 uv run --locked tessera migrate --state-dir .tessera
 ```
 
-Schema v33 is current. Startup refuses older schemas; older binaries refuse newer
+Schema v34 is current. Startup refuses older schemas; older binaries refuse newer
 state. Backup and held restore have important object-custody and original-service
 limits—read [recovery](recovery.md) before relying on either command.
 

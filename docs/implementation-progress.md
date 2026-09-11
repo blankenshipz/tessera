@@ -3,7 +3,7 @@
 This file tracks executable evidence against DESIGN.md. Tessera is a source-only
 developer alpha: initial development uses logical commits on main and PRs remain
 paused. The full design and real research pilot are not complete. It has no
-production remote/provider/OpenCode/Kubernetes support claim; schema v33 is the
+production remote/provider/OpenCode/Kubernetes support claim; schema v34 is the
 current local schema.
 
 ## Redirected next milestone (planned)
@@ -32,7 +32,7 @@ relabeled as live validation.
 
 ## Design status matrix
 
-Reviewed 2026-09-11 against schema v33 immutable human admitted-attempt outcomes,
+Reviewed 2026-09-11 against schema v34 immutable human admitted-attempt outcomes,
 late-observation and post-revocation confirmed-termination fences, and v32 admitted-attempt evidence identity,
 v29 append-only reviewed-conclusion correction lineage,
 v28 typed experiment-attempt operation provenance,
@@ -67,7 +67,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 |---|---|---|---|
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies, and a tenant-scoped goal/success-criterion record with versioned baseline/intervention design plus a read-only complete desktop projection | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and mediated harness execution remain unimplemented |
-| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v33 immutable human outcomes preserved beside late operational observation/restart history, confirmed-evidence success/cancellation, and original-operation-only revocation reconciliation; v32 human-admitted experiment identity automatically carried by normal worker packages; v20 human bookkeeping over v19 fake-provider receipt evidence and v18 durable package intents, CPU supervisor, live HTTP/input fixtures, an explicit development-only native one-shot worker, and v23 explicit project-object placement after quarantine | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced worker-slot storage and automatic production collection, real provider dispatch/accounting and broader authoritative result policy; approval does not launch a job |
+| §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v33 immutable human outcomes preserved beside late operational observation/restart history, and v34 bounded semantic transition history with latest operational sample state/cursor/timestamp; confirmed-evidence success/cancellation and original-operation-only revocation reconciliation; v32 human-admitted experiment identity automatically carried by normal worker packages; v20 human bookkeeping over v19 fake-provider receipt evidence and v18 durable package intents, CPU supervisor, live HTTP/input fixtures, an explicit development-only native one-shot worker, and v23 explicit project-object placement after quarantine | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced worker-slot storage and automatic production collection, real provider dispatch/accounting and broader authoritative result policy; approval does not launch a job |
 | §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, cancellation attempts independent of provider/control report failures, restart-safe development heartbeats, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |

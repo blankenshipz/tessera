@@ -1129,34 +1129,40 @@ class ExecutionStore(Store):
                 )
                 from .experiments import record_admitted_attempt_observation
 
-                record_admitted_attempt_observation(
+                semantic_transition = record_admitted_attempt_observation(
                     connection,
                     operation,
                     worker,
-                    row["observed_state"],
-                    row["desired_state"],
-                    bool(row["termination_confirmed"]),
+                    {
+                        "cursor": f"observation:{row['id']}",
+                        "observed_state": row["observed_state"],
+                        "observed_at": row["observed_at"],
+                        "termination_confirmed": bool(row["termination_confirmed"]),
+                    },
                 )
-            self._event(
-                connection,
-                worker,
-                grant["project_id"],
-                grant["task_id"],
-                "execution.observation_reported",
-                lease["epoch"],
-                {
-                    "grant_id": grant["id"],
-                    "lease_id": lease_id,
-                    "operation_id": row["operation_id"],
-                    "epoch": lease["epoch"],
-                    "desired_state": row["desired_state"],
-                    "observed_state": row["observed_state"],
-                    "termination_confirmed": bool(row["termination_confirmed"]),
-                    "cancellation": self._cancellation_payload(connection, grant),
-                    "observation_proof": "trusted_worker_assertion",
-                    "operational_only": True,
-                },
-            )
+            else:
+                semantic_transition = True
+            if semantic_transition:
+                self._event(
+                    connection,
+                    worker,
+                    grant["project_id"],
+                    grant["task_id"],
+                    "execution.observation_reported",
+                    lease["epoch"],
+                    {
+                        "grant_id": grant["id"],
+                        "lease_id": lease_id,
+                        "operation_id": row["operation_id"],
+                        "epoch": lease["epoch"],
+                        "desired_state": row["desired_state"],
+                        "observed_state": row["observed_state"],
+                        "termination_confirmed": bool(row["termination_confirmed"]),
+                        "cancellation": self._cancellation_payload(connection, grant),
+                        "observation_proof": "trusted_worker_assertion",
+                        "operational_only": True,
+                    },
+                )
             return 201, {
                 **row,
                 "termination_confirmed": bool(row["termination_confirmed"]),
@@ -1297,34 +1303,38 @@ class ExecutionStore(Store):
             )
             from .experiments import record_admitted_attempt_observation
 
-            record_admitted_attempt_observation(
+            semantic_transition = record_admitted_attempt_observation(
                 connection,
                 operation,
                 worker,
-                payload["observed_state"],
-                operation["desired_state"],
-                bool(payload["termination_confirmed"]),
+                {
+                    "cursor": f"receipt:{operation_id}:{_utc_string(observed_at)}",
+                    "observed_state": payload["observed_state"],
+                    "observed_at": _utc_string(observed_at),
+                    "termination_confirmed": bool(payload["termination_confirmed"]),
+                },
             )
             result = dict(row)
             result["termination_confirmed"] = bool(result["termination_confirmed"])
             result["receipt_evidence"] = "fake_provider_only"
             result["operational_only"] = True
-            self._event(
-                connection,
-                worker,
-                operation["project_id"],
-                operation["task_id"],
-                "execution.provider_receipt_reported",
-                operation["epoch"],
-                {
-                    "operation_id": operation_id,
-                    "provider_kind": "fake",
-                    "observed_state": payload["observed_state"],
-                    "termination_confirmed": bool(payload["termination_confirmed"]),
-                    "receipt_evidence": "fake_provider_only",
-                    "operational_only": True,
-                },
-            )
+            if semantic_transition:
+                self._event(
+                    connection,
+                    worker,
+                    operation["project_id"],
+                    operation["task_id"],
+                    "execution.provider_receipt_reported",
+                    operation["epoch"],
+                    {
+                        "operation_id": operation_id,
+                        "provider_kind": "fake",
+                        "observed_state": payload["observed_state"],
+                        "termination_confirmed": bool(payload["termination_confirmed"]),
+                        "receipt_evidence": "fake_provider_only",
+                        "operational_only": True,
+                    },
+                )
             return 201, result
 
         return self._mutate(principal, key, "POST", path, digest, command, audience="worker")
