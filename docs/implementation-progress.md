@@ -284,13 +284,17 @@ representative investigation have not passed end-to-end acceptance.
     version, and canonical `/doc` hash are supplied. It isolates HOME/config/
     workspace, removes inherited proxy/provider/OpenCode state, enables only
     generated Basic test authentication, denies tools and providers, checks
-    health/schema/auth/session/no-reply context/SSE reconnect/abort, and kills
-    its process group. Its full local HTTP-double test is fixture behavior only,
-    not a real-server result. Missing or mismatched pins return `skipped`; a
-    `provider_disabled` context result is an expected no-provider case. Synthetic
-    transport tests cover lost response/reconnect and cleanup, but no real pinned
-    executable has been selected or recorded in this repository, so this is not
-    yet real compatibility evidence or a provider-enabled case.
+    health/schema/auth/session/no-reply context/SSE reconnect/abort, and confirms
+    its process group has exited before reporting a pass. Its full local HTTP-double
+    test is fixture behavior only, not a real-server result. No opt-in is `skipped`;
+    incomplete or unusable pins are `unavailable`; protocol and cleanup uncertainty
+    are `failed`, all with nonzero exits except a clean `passed` result. Only the
+    fixture's exact validated `422` provider-disabled response is an expected
+    no-provider case; authentication, route, or schema failures are not. Synthetic
+    transport tests cover response classification, lost response/reconnect and
+    cleanup, but no real pinned executable has been selected or recorded in this
+    repository, so this is not yet real compatibility evidence or a provider-enabled
+    case.
 
 18. **Synthetic result checkpoint:** schema v15 records a human-only immutable
     checkpoint after a reconciled, worker-confirmed exit, exact operation/epoch,

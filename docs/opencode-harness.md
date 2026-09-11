@@ -82,3 +82,46 @@ OpenCode acknowledgement: provider termination, costs, output acceptance, and
 scientific success remain unresolved. The fixture prohibits provider routes and
 does not enable OpenCode shell, MCP, skills, permissions, provider authentication,
 or model calls.
+
+## Opt-in real-server compatibility fixture
+
+`scripts/check_opencode_compatibility.py` is a separate node fixture, not a
+replacement for the synthetic adapter or a dispatch path. It runs only when all
+three exact pins are configured: `TESSERA_OPENCODE_EXECUTABLE` (an absolute,
+non-symlink executable), `TESSERA_OPENCODE_VERSION`, and
+`TESSERA_OPENCODE_SCHEMA_SHA256` (the canonical JSON SHA-256 of that version's
+`/doc`). It never installs OpenCode or accepts provider credentials. No opt-in
+emits JSON `status: skipped`; an incomplete, unexecutable, or version-mismatched
+pin emits `status: unavailable`. Neither is compatibility evidence or a passing
+result, and both have nonzero CLI exits.
+
+The fixture creates one temporary loopback server with a private temporary HOME,
+config, and workspace. Its clean environment drops inherited OpenCode state,
+provider credential variables, and proxies. It writes a provider-empty config,
+disables updates/plugins/MCP/LSP/formatters/snapshots/sharing, and denies all
+permissions/tools. The generated server-only HTTP Basic credential is used only
+to test the upstream server's documented fixture authentication mechanism; no
+Tessera, provider, shell, MCP, OAuth, or credential API is used. It uses literal
+`127.0.0.1`, no DNS/proxy/redirect client, bounded startup/request/SSE deadlines,
+and starts no replacement or duplicate process.
+
+On a compatible server it verifies unauthenticated health is rejected, then
+checks `/global/health` and `/doc` against the exact version/schema pin, creates
+a session, attempts one `noReply` no-model/no-tool context message, reads an
+actual `/event` SSE event and reconnects with `Last-Event-ID`, aborts the
+session, and terminates its one process group before temporary cleanup. Each SSE
+read has a five-second deadline, no blocked socket read exceeds three seconds,
+and the stream has a 32 KiB total bound; failures report whether cleanup was
+confirmed. A message
+rejection is reported as `provider_disabled` only for the fixture's exact JSON
+`422 {"error":{"code":"provider_disabled","enabled_providers":[]}}`
+response. Authentication, route, request-schema, content-type, and every other
+response fail rather than being inferred as provider-disabled. It confirms that
+the server process group has exited, including ordinary descendants in that
+group, before it returns `passed`; failed or uncertain cleanup returns `failed`
+with a nonzero CLI exit. This does not detect descendants that deliberately leave
+the fixture process group. Synthetic tests cover response classification, lost
+SSE responses, explicit reconnect, and process-group cleanup; they are not real
+OpenCode evidence. A real `passed` result still proves only this narrow upstream
+server compatibility—not enrolled-node trust, provider termination, provider
+costs, dispatch, artifact acceptance, or pilot completion.

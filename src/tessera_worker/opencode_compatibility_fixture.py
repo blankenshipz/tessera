@@ -22,6 +22,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 
 _VERSION = re.compile(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?\Z")
@@ -31,10 +32,15 @@ _MAX_SSE_BYTES = 32 * 1024
 _REQUEST_TIMEOUT = 3.0
 _SSE_TIMEOUT = 5.0
 _START_TIMEOUT = 12.0
+_CLEANUP_TIMEOUT = 5.0
 
 
 class FixtureUnavailable(Exception):
     """The explicitly opt-in fixture cannot safely run on this node."""
+
+
+class FixtureSkipped(FixtureUnavailable):
+    """The fixture was not explicitly requested on this node."""
 
 
 class FixtureProtocolError(RuntimeError):
@@ -53,10 +59,12 @@ class FixtureSettings:
         executable = values.get("TESSERA_OPENCODE_EXECUTABLE")
         version = values.get("TESSERA_OPENCODE_VERSION")
         schema = values.get("TESSERA_OPENCODE_SCHEMA_SHA256")
+        if not executable and not version and not schema:
+            raise FixtureSkipped("fixture was not explicitly requested")
         if not executable or not version or not schema:
             raise FixtureUnavailable(
-                "set TESSERA_OPENCODE_EXECUTABLE, TESSERA_OPENCODE_VERSION, and "
-                "TESSERA_OPENCODE_SCHEMA_SHA256 to opt in"
+                "all of TESSERA_OPENCODE_EXECUTABLE, TESSERA_OPENCODE_VERSION, and "
+                "TESSERA_OPENCODE_SCHEMA_SHA256 are required"
             )
         path = Path(executable)
         if (
@@ -77,7 +85,7 @@ class FixtureSettings:
 
 @dataclass(frozen=True)
 class FixtureResult:
-    status: str
+    status: Literal["skipped", "unavailable", "passed", "failed"]
     reason: str
     version: str | None = None
     schema_sha256: str | None = None
@@ -92,6 +100,11 @@ class FixtureResult:
 
     def json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+
+
+def fixture_exit_code(result: FixtureResult) -> int:
+    """Reserve zero for a fully verified, cleaned-up fixture run."""
+    return {"passed": 0, "failed": 1, "skipped": 2, "unavailable": 3}[result.status]
 
 
 def _canonical_json(value: object) -> bytes:
@@ -143,6 +156,25 @@ def _fixture_config() -> dict[str, object]:
         "snapshot": False,
         "tools": {"bash": False, "edit": False, "webfetch": False, "websearch": False},
     }
+
+
+def _is_provider_disabled_response(status: int, headers: dict[str, str], body: bytes) -> bool:
+    """Recognize only the fixture's explicit no-provider response contract.
+
+    A generic client, route, authorization, or request-schema error is not
+    evidence that providers were disabled.  The exact 422 envelope is deliberately
+    narrow so upstream response drift fails this compatibility fixture.
+    """
+    if (
+        status != 422
+        or headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"
+    ):
+        return False
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return decoded == {"error": {"code": "provider_disabled", "enabled_providers": []}}
 
 
 class _LoopbackClient:
@@ -274,6 +306,7 @@ class _ServerProcess:
         self._environment = environment
         self._port = port
         self.process: subprocess.Popen[bytes] | None = None
+        self._process_group_id: int | None = None
         self.starts = 0
 
     def start(self) -> None:
@@ -296,18 +329,39 @@ class _ServerProcess:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        self._process_group_id = self.process.pid
+
+    def _group_is_alive(self) -> bool:
+        if self._process_group_id is None:
+            return False
+        try:
+            os.killpg(self._process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def _wait_for_group_exit(self) -> bool:
+        deadline = time.monotonic() + _CLEANUP_TIMEOUT
+        while self._group_is_alive():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
 
     def close(self) -> bool:
         if self.process is None:
             return True
-        if self.process.poll() is None:
-            os.killpg(self.process.pid, signal.SIGTERM)
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=5)
-        return self.process.poll() is not None
+        if self._group_is_alive():
+            os.killpg(self._process_group_id, signal.SIGTERM)
+        try:
+            self.process.wait(timeout=_CLEANUP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return False
+        if not self._wait_for_group_exit():
+            os.killpg(self._process_group_id, signal.SIGKILL)
+            if not self._wait_for_group_exit():
+                return False
+        return self.process.poll() is not None and not self._group_is_alive()
 
 
 def _reserve_port() -> int:
@@ -345,13 +399,18 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
         _observed_version(settings)
     except FixtureUnavailable as error:
         return FixtureResult(
-            "skipped", str(error), version=settings.version, schema_sha256=settings.schema_sha256
+            "unavailable",
+            str(error),
+            version=settings.version,
+            schema_sha256=settings.schema_sha256,
         )
     server: _ServerProcess | None = None
     cleanup = False
     result: FixtureResult | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix="tessera-opencode-fixture-") as root_text:
+        temporary = tempfile.TemporaryDirectory(prefix="tessera-opencode-fixture-")
+        try:
+            root_text = temporary.name
             root = Path(root_text)
             home, workspace = root / "home", root / "workspace"
             for directory in (
@@ -410,27 +469,27 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
                 raise FixtureProtocolError("OpenCode session response lacked an id")
             message_outcome = "accepted_no_provider_no_tools"
             message_path = f"/session/{quote(session_id, safe='')}/message"
-            try:
-                client.acknowledge(
-                    "POST",
-                    message_path,
-                    {
-                        "noReply": True,
-                        "parts": [
-                            {
-                                "type": "text",
-                                "text": "Fixture context only; no model, provider, or tool use.",
-                            }
-                        ],
-                        "tools": {},
-                    },
-                )
-            except FixtureProtocolError as error:
-                # With all providers disabled, rejection is expected for versions
-                # that validate a model before accepting a no-reply message.
-                message_outcome = "provider_disabled"
-                if "HTTP 4" not in str(error):
-                    raise
+            message_status, message_headers, message_body = client.request(
+                "POST",
+                message_path,
+                {
+                    "noReply": True,
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": "Fixture context only; no model, provider, or tool use.",
+                        }
+                    ],
+                    "tools": {},
+                },
+            )
+            if not 200 <= message_status < 300:
+                if _is_provider_disabled_response(message_status, message_headers, message_body):
+                    message_outcome = "provider_disabled"
+                else:
+                    raise FixtureProtocolError(
+                        f"OpenCode rejected POST {message_path} (HTTP {message_status})"
+                    )
             first_events, cursor = client.events()
             second_events, _ = client.events(cursor)
             client.acknowledge("POST", f"/session/{quote(session_id, safe='')}/abort", {})
@@ -447,6 +506,13 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
                 reconnected=True,
                 abort_acknowledged=True,
             )
+        finally:
+            if server is not None:
+                try:
+                    cleanup = server.close()
+                except (OSError, subprocess.SubprocessError):
+                    cleanup = False
+            temporary.cleanup()
     except (FixtureProtocolError, OSError) as error:
         result = FixtureResult(
             "failed",
@@ -454,14 +520,23 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
             settings.version,
             settings.schema_sha256,
         )
-    finally:
-        if server is not None:
-            try:
-                cleanup = server.close()
-            except (OSError, subprocess.SubprocessError):
-                cleanup = False
     if result is None:
         raise FixtureProtocolError("fixture did not produce a result")
+    if server is not None and not cleanup:
+        cleanup_reason = "OpenCode process-group cleanup was not confirmed"
+        result = FixtureResult(
+            "failed",
+            cleanup_reason if result.status == "passed" else f"{result.reason}; {cleanup_reason}",
+            result.version,
+            result.schema_sha256,
+            health_checked=result.health_checked,
+            auth_checked=result.auth_checked,
+            session_created=result.session_created,
+            message=result.message,
+            sse_events=result.sse_events,
+            reconnected=result.reconnected,
+            abort_acknowledged=result.abort_acknowledged,
+        )
     return FixtureResult(
         result.status,
         result.reason,
@@ -481,12 +556,15 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
 def main() -> int:
     try:
         settings = FixtureSettings.from_environment()
-    except FixtureUnavailable as error:
+    except FixtureSkipped as error:
         print(FixtureResult("skipped", str(error)).json())
-        return 0
+        return fixture_exit_code(FixtureResult("skipped", str(error)))
+    except FixtureUnavailable as error:
+        print(FixtureResult("unavailable", str(error)).json())
+        return fixture_exit_code(FixtureResult("unavailable", str(error)))
     result = run_fixture(settings)
     print(result.json())
-    return 0 if result.status in {"passed", "skipped"} else 1
+    return fixture_exit_code(result)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by the script entry point
