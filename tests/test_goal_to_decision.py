@@ -422,7 +422,6 @@ def test_pre_execution_admitted_attempt_binds_package_operation_and_restart_acco
 
     package_body = {
         "expected_epoch": lease["epoch"],
-        "admitted_attempt_id": admitted["id"],
     }
     package = RuntimePackageStore(state).execution_package(
         worker,
@@ -430,7 +429,6 @@ def test_pre_execution_admitted_attempt_binds_package_operation_and_restart_acco
         "admitted-package",
         canonical_digest(package_body),
         lease["epoch"],
-        admitted_attempt_id=admitted["id"],
     )[1]
     assert package["package"]["experiment"] == {
         "admitted_attempt_id": admitted["id"],
@@ -468,7 +466,6 @@ def test_pre_execution_admitted_attempt_binds_package_operation_and_restart_acco
         "admitted-package-restart",
         canonical_digest(package_body),
         lease["epoch"],
-        admitted_attempt_id=admitted["id"],
     )[1]
     assert replay["operation"]["operation_id"] == package["operation"]["operation_id"]
     exported = records.get_experiment(owner, experiment["id"])
@@ -544,6 +541,118 @@ def test_admitted_attempt_rejects_stale_design_and_grant_reuse(tmp_path: Path) -
             },
         )
     assert admitted["grant_id"] == grant["id"]
+
+
+def test_normal_package_and_evidence_apis_keep_the_admitted_attempt_identity(
+    tmp_path: Path,
+) -> None:
+    state, _execution, owner, worker, grant, lease = _delivery(tmp_path)
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    admitted = _command(
+        records.admit_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "expected_design_revision": experiment["current_design_revision"],
+            "grant_id": grant["id"],
+        },
+    )
+    body = {"expected_epoch": lease["epoch"]}
+    package = RuntimePackageStore(state).execution_package(
+        worker, lease["id"], "normal-package", canonical_digest(body), lease["epoch"]
+    )[1]
+    assert package["package"]["experiment"]["admitted_attempt_id"] == admitted["id"]
+    # Treat the first successful reply as lost; replaying its durable key cannot
+    # drop the automatic binding or create another package/operation identity.
+    assert (
+        RuntimePackageStore(state).execution_package(
+            worker, lease["id"], "normal-package", canonical_digest(body), lease["epoch"]
+        )[1]["package_digest"]
+        == package["package_digest"]
+    )
+    with pytest.raises(Conflict, match="does not match"):
+        RuntimePackageStore(state).execution_package(
+            worker,
+            lease["id"],
+            "wrong-bound-package",
+            canonical_digest(body | {"admitted_attempt_id": "wrong"}),
+            lease["epoch"],
+            admitted_attempt_id="wrong",
+        )
+    # A package intent is already durable, so a second admission cannot race in after it.
+    with pytest.raises(Conflict, match="operation or package intent"):
+        _command(
+            records.admit_attempt,
+            owner,
+            baseline["id"],
+            payload={
+                "expected_variant_revision": baseline["revision"],
+                "expected_design_revision": experiment["current_design_revision"],
+                "grant_id": grant["id"],
+            },
+        )
+    artifact_id = "artifact_admitted_identity"
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            """INSERT INTO artifacts
+            (id,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,operation_id,
+             relative_path,sha256,size,content,created_at,status,classification,late)
+            VALUES (?,?,?,?,?,?,?,?,?,?,1,x'78',?,'quarantined','unclassified',0)""",
+            (
+                artifact_id,
+                grant["project_id"],
+                grant["task_id"],
+                grant["id"],
+                lease["id"],
+                worker["id"],
+                lease["epoch"],
+                package["operation"]["operation_id"],
+                "result.txt",
+                "0" * 64,
+                utc_now(),
+            ),
+        )
+    admitted = records.get_experiment(owner, experiment["id"])["admitted_attempts"][0]
+    linked = _command(
+        records.link_attempt_artifacts,
+        owner,
+        admitted["id"],
+        payload={"expected_revision": admitted["revision"], "artifact_ids": [artifact_id]},
+    )
+    measurement = _command(
+        records.record_measurement,
+        owner,
+        admitted["id"],
+        payload={
+            "expected_revision": linked["revision"],
+            "name": "bound duration",
+            "value": {"seconds": 1},
+            "artifact_id": artifact_id,
+        },
+    )
+    conclusion = _command(
+        records.create_conclusion,
+        owner,
+        experiment["id"],
+        payload={
+            "statement": "Bound evidence is still pending human scientific review.",
+            "evidence": [{"attempt_id": admitted["id"], "measurement_ids": [measurement["id"]]}],
+        },
+    )
+    exported = records.get_experiment(owner, experiment["id"])
+    assert conclusion["evidence"][0]["attempt_id"] == admitted["id"]
+    assert exported["admitted_attempts"][0]["id"] == admitted["id"]
+    assert exported["measurements"][0]["attempt_id"] == admitted["id"]
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM research_experiment_attempts").fetchone()[0]
+            == 0
+        )
 
 
 def test_experiment_evidence_retention_admission_delete_fence_and_export(tmp_path: Path) -> None:
@@ -723,7 +832,7 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 31
+    assert migrate_state(state) == 32
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -950,12 +1059,12 @@ def test_v25_through_v29_experiment_ledgers_upgrade_backup_restore_and_repeat_wi
         tmp_path, source_version
     )
 
-    assert migrate_state(state) == 31
+    assert migrate_state(state) == 32
     records = ExperimentStore(state)
     exported = records.export_experiment(owner, experiment_id)
     reopened = ExperimentStore(state).get_experiment(owner, experiment_id)
     assert reopened == exported
-    assert migrate_state(state) == 31
+    assert migrate_state(state) == 32
     assert ExperimentStore(state).get_experiment(owner, experiment_id) == exported
 
     fresh = tmp_path / "fresh"
@@ -1037,7 +1146,7 @@ def test_v27_to_v28_experiment_provenance_migration_rolls_back_complete_legacy_l
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 31
+    assert migrate_state(state) == 32
 
 
 def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:
@@ -1263,7 +1372,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         connection.execute("DROP TABLE migration_27_conclusion_evidence")
         connection.execute("DROP TABLE migration_27_conclusions")
         connection.execute("UPDATE schema_meta SET schema_version=26")
-    assert migrate_state(state) == 31
+    assert migrate_state(state) == 32
     migrated = ExperimentStore(state).get_experiment(owner, first["id"])
     migrated_designs = {item["revision"]: item for item in migrated["designs"]}
     assert migrated_designs[1]["goal"] is None
@@ -1296,7 +1405,7 @@ def test_v30_to_v31_binding_repair_rolls_back_and_preserves_authentic_ledger(
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 31
+    assert migrate_state(state) == 32
 
 
 def test_experiment_export_rejects_large_measurement_aggregate_before_materializing(

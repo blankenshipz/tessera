@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 31
+LATEST_SCHEMA_VERSION = 32
 LOCAL_ORG_ID = "org_local"
 
 
@@ -613,6 +613,18 @@ def migrate_v30_to_v31(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 31 WHERE singleton = 1")
 
 
+def migrate_v31_to_v32(connection: sqlite3.Connection) -> None:
+    """Add empty evidence tables for the already-authoritative admission identity.
+
+    Existing operation-backed and human-reported attempts remain in their legacy
+    tables.  No historical attempt, conclusion, or custody link is inferred.
+    """
+    from .experiments import create_admitted_attempt_evidence_schema
+
+    create_admitted_attempt_evidence_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 32 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -644,6 +656,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     28: migrate_v28_to_v29,
     29: migrate_v29_to_v30,
     30: migrate_v30_to_v31,
+    31: migrate_v31_to_v32,
 }
 
 

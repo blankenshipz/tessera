@@ -47,15 +47,10 @@ def require_project_artifact_reference_admissible(
         raise Conflict("Project artifact is reserved for deletion and cannot be referenced.")
 
 
-def admit_experiment_artifact_evidence_reference(
+def validate_experiment_artifact_evidence_reference(
     connection: sqlite3.Connection,
     project_id: str,
     artifact_id: str,
-    attempt_id: str,
-    reference_id: str,
-    reference_kind: str,
-    created_at: str,
-    measurement_id: str | None = None,
 ) -> None:
     """Atomically admit durable experiment evidence without inventing legacy custody.
 
@@ -82,6 +77,20 @@ def admit_experiment_artifact_evidence_reference(
             raise Conflict("Project artifact retention metadata is unavailable.")
     elif retention["project_id"] != project_id or retention["state"] != "active":
         raise Conflict("Project artifact is reserved for deletion and cannot be referenced.")
+    return None
+
+
+def admit_experiment_artifact_evidence_reference(
+    connection: sqlite3.Connection,
+    project_id: str,
+    artifact_id: str,
+    attempt_id: str,
+    reference_id: str,
+    reference_kind: str,
+    created_at: str,
+    measurement_id: str | None = None,
+) -> None:
+    validate_experiment_artifact_evidence_reference(connection, project_id, artifact_id)
     connection.execute(
         """INSERT OR IGNORE INTO experiment_artifact_evidence_references
         (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
@@ -142,6 +151,15 @@ class ProjectArtifactRetentionStore(Store):
         if (
             connection.execute(
                 """SELECT 1 FROM experiment_artifact_evidence_references
+                WHERE artifact_id=? AND project_id=? LIMIT 1""",
+                (artifact_id, project_id),
+            ).fetchone()
+            is not None
+        ):
+            return True
+        if (
+            connection.execute(
+                """SELECT 1 FROM admitted_experiment_artifact_evidence_references
                 WHERE artifact_id=? AND project_id=? LIMIT 1""",
                 (artifact_id, project_id),
             ).fetchone()

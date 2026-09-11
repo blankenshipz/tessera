@@ -171,6 +171,38 @@ class CpuRuntime:
                 or operation["observed_state"] not in {"unknown", "running", "exited"}
             ):
                 raise SupervisorError("Control package does not match runtime authority.")
+            experiment = package.get("experiment")
+            operation_identity = {
+                "experiment_attempt_id": operation.get("experiment_attempt_id"),
+                "experiment_id": operation.get("experiment_id"),
+                "design_revision": operation.get("experiment_design_revision"),
+                "variant_id": operation.get("experiment_variant_id"),
+            }
+            if experiment is None:
+                if any(value is not None for value in operation_identity.values()):
+                    raise SupervisorError("Control operation has an unbound experiment identity.")
+            elif (
+                set(experiment)
+                != {
+                    "admitted_attempt_id",
+                    "experiment_id",
+                    "design_revision",
+                    "variant_id",
+                    "task_id",
+                    "plan_digest",
+                    "grant_id",
+                }
+                or experiment["task_id"] != package["task_id"]
+                or experiment["plan_digest"] != package["plan_digest"]
+                or experiment["grant_id"] != package["grant_id"]
+                or experiment["admitted_attempt_id"] != operation_identity["experiment_attempt_id"]
+                or experiment["experiment_id"] != operation_identity["experiment_id"]
+                or experiment["design_revision"] != operation_identity["design_revision"]
+                or experiment["variant_id"] != operation_identity["variant_id"]
+            ):
+                raise SupervisorError(
+                    "Control package experiment identity does not match its operation."
+                )
             capability = package.get("persistent_output_storage")
             if self.persistent_output_collection:
                 if capability is None:
@@ -249,6 +281,8 @@ class CpuRuntime:
             descriptor = json.loads(encoded)
             response = descriptor["control"]
             self._validate_package(response, lease_id, epoch)
+            if descriptor.get("experiment_identity") != response["package"].get("experiment"):
+                raise SupervisorError("Runtime descriptor experiment identity changed.")
             self._bind_journal(lease_id, epoch)
         else:
             response = self._request_package(lease_id, epoch)
@@ -270,6 +304,7 @@ class CpuRuntime:
             )
             descriptor = {
                 "control": response,
+                "experiment_identity": package.get("experiment"),
                 "input_directory": str(staged.directory),
                 "input_manifest_json": staged.manifest_json,
             }
@@ -319,6 +354,8 @@ class CpuRuntime:
         descriptor = json.loads(encoded)
         response = descriptor["control"]
         self._validate_package(response, lease_id, epoch)
+        if descriptor.get("experiment_identity") != response["package"].get("experiment"):
+            raise SupervisorError("Runtime descriptor experiment identity changed.")
         self._bind_journal(lease_id, epoch)
         self.descriptor = descriptor
         self.operation = self._operation(descriptor)

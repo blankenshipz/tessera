@@ -29,7 +29,10 @@ from .experiments_models import (
     ReviseExperimentDesign,
     UpdateConclusion,
 )
-from .project_artifact_retention import admit_experiment_artifact_evidence_reference
+from .project_artifact_retention import (
+    admit_experiment_artifact_evidence_reference,
+    validate_experiment_artifact_evidence_reference,
+)
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, utc_now
 
 T = TypeVar("T", bound=BaseModel)
@@ -191,6 +194,45 @@ def create_experiment_admission_schema(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def create_admitted_attempt_evidence_schema(connection: sqlite3.Connection) -> None:
+    """Keep pre-execution attempt identity usable by the ordinary evidence APIs.
+
+    These tables deliberately do not manufacture a terminal legacy attempt.  An
+    admitted attempt remains the same ID from admission through uncertainty,
+    evidence, conclusion review, and human resolution.
+    """
+    statements = (
+        """CREATE TABLE IF NOT EXISTS research_admitted_attempt_artifacts (
+        attempt_id TEXT NOT NULL REFERENCES research_experiment_admitted_attempts(id),
+        artifact_id TEXT NOT NULL REFERENCES artifacts(id), created_at TEXT NOT NULL,
+        PRIMARY KEY(attempt_id,artifact_id))""",
+        """CREATE TABLE IF NOT EXISTS research_admitted_attempt_measurements (
+        id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL
+        REFERENCES research_experiment_admitted_attempts(id), name TEXT NOT NULL,
+        value_json TEXT NOT NULL, artifact_id TEXT REFERENCES artifacts(id),
+        created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id))""",
+        "CREATE INDEX IF NOT EXISTS research_admitted_attempt_measurements_by_attempt ON research_admitted_attempt_measurements(attempt_id,created_at,id)",
+        """CREATE TABLE IF NOT EXISTS admitted_experiment_artifact_evidence_references (
+        id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+        project_id TEXT NOT NULL REFERENCES projects(id), attempt_id TEXT NOT NULL
+        REFERENCES research_experiment_admitted_attempts(id), measurement_id TEXT,
+        reference_kind TEXT NOT NULL CHECK (reference_kind IN ('attempt_artifact','measurement_artifact')),
+        created_at TEXT NOT NULL,
+        CHECK ((reference_kind='attempt_artifact' AND measurement_id IS NULL) OR
+               (reference_kind='measurement_artifact' AND measurement_id IS NOT NULL)))""",
+        "CREATE INDEX IF NOT EXISTS admitted_experiment_artifact_evidence_references_by_artifact ON admitted_experiment_artifact_evidence_references(project_id,artifact_id,id)",
+        """CREATE TABLE IF NOT EXISTS research_admitted_conclusion_evidence (
+        conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
+        attempt_id TEXT NOT NULL REFERENCES research_experiment_admitted_attempts(id),
+        artifact_id TEXT REFERENCES artifacts(id), measurement_id TEXT,
+        PRIMARY KEY(conclusion_id,attempt_id,artifact_id,measurement_id),
+        CHECK ((artifact_id IS NOT NULL AND measurement_id IS NULL) OR
+               (artifact_id IS NULL AND measurement_id IS NOT NULL)))""",
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
 def _append_admitted_attempt_state(
     connection: sqlite3.Connection,
     attempt: dict[str, Any],
@@ -247,6 +289,21 @@ def _append_admitted_attempt_state(
         ),
     )
     return result
+
+
+def _bump_admitted_attempt_revision(connection: sqlite3.Connection, attempt: dict[str, Any]) -> int:
+    """Fence evidence writes without inventing an operational state transition."""
+    revision = attempt["revision"] + 1
+    if (
+        connection.execute(
+            """UPDATE research_experiment_admitted_attempts SET revision=?,updated_at=?
+        WHERE id=? AND revision=?""",
+            (revision, utc_now(), attempt["id"], attempt["revision"]),
+        ).rowcount
+        != 1
+    ):
+        raise Conflict("Admitted experiment attempt revision is no longer current.")
+    return revision
 
 
 def admitted_attempt_package_identity(
@@ -361,6 +418,9 @@ def record_admitted_attempt_observation(
         or attempt["experiment_id"] != operation["experiment_id"]
         or attempt["design_revision"] != operation["experiment_design_revision"]
         or attempt["variant_id"] != operation["experiment_variant_id"]
+        or attempt["grant_id"] != operation["grant_id"]
+        or attempt["task_id"] != operation["task_id"]
+        or attempt["package_digest"] != operation["package_digest"]
     ):
         raise Conflict("External operation experiment admission binding conflicts.")
     state = {
@@ -565,6 +625,43 @@ class ExperimentStore(Store):
         if row is None:
             raise NotFound("Experiment attempt was not found.")
         return dict(row)
+
+    def _evidence_attempt(
+        self, connection: sqlite3.Connection, actor: dict[str, Any], ident: str
+    ) -> dict[str, Any]:
+        """Resolve the public attempt identity without converting admissions to legacy rows."""
+        try:
+            return self._attempt(connection, actor, ident) | {"attempt_kind": "legacy"}
+        except NotFound:
+            row = connection.execute(
+                """SELECT a.*,e.project_id FROM research_experiment_admitted_attempts a
+                JOIN research_experiments e ON e.id=a.experiment_id JOIN projects p ON p.id=e.project_id
+                WHERE a.id=? AND p.org_id=? AND (? IS NULL OR e.project_id=?)""",
+                (ident, actor["org_id"], actor["project_id"], actor["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Experiment attempt was not found.") from None
+            return dict(row) | {"attempt_kind": "admitted"}
+
+    @staticmethod
+    def _admit_bound_artifact_reference(
+        connection: sqlite3.Connection,
+        attempt: dict[str, Any],
+        artifact_id: str,
+        ident: str,
+        kind: str,
+        now: str,
+        measurement_id: str | None = None,
+    ) -> None:
+        validate_experiment_artifact_evidence_reference(
+            connection, attempt["project_id"], artifact_id
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO admitted_experiment_artifact_evidence_references
+            (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (ident, artifact_id, attempt["project_id"], attempt["id"], measurement_id, kind, now),
+        )
 
     def _event(
         self,
@@ -814,6 +911,12 @@ class ExperimentStore(Store):
             ):
                 raise Conflict(
                     "Execution grant does not match the immutable experiment variant plan."
+                )
+            if connection.execute(
+                "SELECT 1 FROM external_operations WHERE grant_id=?", (grant["id"],)
+            ).fetchone():
+                raise Conflict(
+                    "Execution grant already has an operation or package intent and cannot be admitted."
                 )
             if connection.execute(
                 "SELECT 1 FROM research_experiment_admitted_attempts WHERE grant_id=?",
@@ -1109,11 +1212,14 @@ class ExperimentStore(Store):
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             self._human(actor)
-            attempt = self._attempt(connection, actor, attempt_id)
+            attempt = self._evidence_attempt(connection, actor, attempt_id)
             if attempt["revision"] != body["expected_revision"]:
                 raise Conflict("Experiment attempt revision is no longer current.")
             for artifact_id in body["artifact_ids"]:
-                if attempt["provenance_kind"] == "human_reported_observation":
+                if (
+                    attempt["attempt_kind"] == "legacy"
+                    and attempt["provenance_kind"] == "human_reported_observation"
+                ):
                     linked = connection.execute(
                         "SELECT 1 FROM artifacts WHERE id=? AND project_id=?",
                         (artifact_id, attempt["project_id"]),
@@ -1128,27 +1234,44 @@ class ExperimentStore(Store):
                     raise NotFound("Artifact is not linked to this attempt provenance.")
             now, revision = utc_now(), attempt["revision"] + 1
             for artifact_id in body["artifact_ids"]:
-                admit_experiment_artifact_evidence_reference(
-                    connection,
-                    attempt["project_id"],
-                    artifact_id,
-                    attempt_id,
-                    f"experiment_evidence_attempt_{attempt_id}_{artifact_id}",
-                    "attempt_artifact",
-                    now,
+                if attempt["attempt_kind"] == "admitted":
+                    self._admit_bound_artifact_reference(
+                        connection,
+                        attempt,
+                        artifact_id,
+                        f"admitted_experiment_evidence_attempt_{attempt_id}_{artifact_id}",
+                        "attempt_artifact",
+                        now,
+                    )
+                else:
+                    admit_experiment_artifact_evidence_reference(
+                        connection,
+                        attempt["project_id"],
+                        artifact_id,
+                        attempt_id,
+                        f"experiment_evidence_attempt_{attempt_id}_{artifact_id}",
+                        "attempt_artifact",
+                        now,
+                    )
+            if attempt["attempt_kind"] == "admitted":
+                connection.executemany(
+                    "INSERT OR IGNORE INTO research_admitted_attempt_artifacts (attempt_id,artifact_id,created_at) VALUES (?,?,?)",
+                    [(attempt_id, artifact_id, now) for artifact_id in body["artifact_ids"]],
                 )
-            connection.executemany(
-                "INSERT OR IGNORE INTO research_attempt_artifacts (attempt_id,artifact_id,created_at) VALUES (?,?,?)",
-                [(attempt_id, artifact_id, now) for artifact_id in body["artifact_ids"]],
-            )
-            if (
-                connection.execute(
-                    "UPDATE research_experiment_attempts SET revision=? WHERE id=? AND revision=?",
-                    (revision, attempt_id, body["expected_revision"]),
-                ).rowcount
-                != 1
-            ):
-                raise Conflict("Experiment attempt revision is no longer current.")
+                revision = _bump_admitted_attempt_revision(connection, attempt)
+            else:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO research_attempt_artifacts (attempt_id,artifact_id,created_at) VALUES (?,?,?)",
+                    [(attempt_id, artifact_id, now) for artifact_id in body["artifact_ids"]],
+                )
+                if (
+                    connection.execute(
+                        "UPDATE research_experiment_attempts SET revision=? WHERE id=? AND revision=?",
+                        (revision, attempt_id, body["expected_revision"]),
+                    ).rowcount
+                    != 1
+                ):
+                    raise Conflict("Experiment attempt revision is no longer current.")
             experiment = self._experiment(connection, actor, attempt["experiment_id"])
             self._event(
                 connection,
@@ -1186,13 +1309,17 @@ class ExperimentStore(Store):
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             self._human(actor)
-            attempt = self._attempt(connection, actor, attempt_id)
+            attempt = self._evidence_attempt(connection, actor, attempt_id)
             if attempt["revision"] != body["expected_revision"]:
                 raise Conflict("Experiment attempt revision is no longer current.")
             if (
                 body["artifact_id"] is not None
                 and connection.execute(
-                    "SELECT 1 FROM research_attempt_artifacts WHERE attempt_id=? AND artifact_id=?",
+                    (
+                        "SELECT 1 FROM research_admitted_attempt_artifacts WHERE attempt_id=? AND artifact_id=?"
+                        if attempt["attempt_kind"] == "admitted"
+                        else "SELECT 1 FROM research_attempt_artifacts WHERE attempt_id=? AND artifact_id=?"
+                    ),
                     (attempt_id, body["artifact_id"]),
                 ).fetchone()
                 is None
@@ -1212,25 +1339,44 @@ class ExperimentStore(Store):
                 "created_at": now,
                 "created_by_principal_id": actor["id"],
             }
+            table = (
+                "research_admitted_attempt_measurements"
+                if attempt["attempt_kind"] == "admitted"
+                else "research_attempt_measurements"
+            )
             connection.execute(
-                """INSERT INTO research_attempt_measurements (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id)""",
+                f"INSERT INTO {table} (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id)",
                 row,
             )
             if body["artifact_id"] is not None:
-                admit_experiment_artifact_evidence_reference(
-                    connection,
-                    attempt["project_id"],
-                    body["artifact_id"],
-                    attempt_id,
-                    f"experiment_evidence_measurement_{ident}",
-                    "measurement_artifact",
-                    now,
-                    ident,
+                if attempt["attempt_kind"] == "admitted":
+                    self._admit_bound_artifact_reference(
+                        connection,
+                        attempt,
+                        body["artifact_id"],
+                        f"admitted_experiment_evidence_measurement_{ident}",
+                        "measurement_artifact",
+                        now,
+                        ident,
+                    )
+                else:
+                    admit_experiment_artifact_evidence_reference(
+                        connection,
+                        attempt["project_id"],
+                        body["artifact_id"],
+                        attempt_id,
+                        f"experiment_evidence_measurement_{ident}",
+                        "measurement_artifact",
+                        now,
+                        ident,
+                    )
+            if attempt["attempt_kind"] == "admitted":
+                revision = _bump_admitted_attempt_revision(connection, attempt)
+            else:
+                connection.execute(
+                    "UPDATE research_experiment_attempts SET revision=? WHERE id=? AND revision=?",
+                    (revision, attempt_id, body["expected_revision"]),
                 )
-            connection.execute(
-                "UPDATE research_experiment_attempts SET revision=? WHERE id=? AND revision=?",
-                (revision, attempt_id, body["expected_revision"]),
-            )
             experiment = self._experiment(connection, actor, attempt["experiment_id"])
             self._event(
                 connection,
@@ -1261,20 +1407,34 @@ class ExperimentStore(Store):
 
     def _validate_evidence(
         self, connection: sqlite3.Connection, experiment_id: str, evidence: list[dict[str, Any]]
-    ) -> list[tuple[str, str, str | None, str | None]]:
-        rows: list[tuple[str, str, str | None, str | None]] = []
+    ) -> list[tuple[str, str, str | None, str | None, bool]]:
+        rows: list[tuple[str, str, str | None, str | None, bool]] = []
         for citation in evidence:
-            attempt = connection.execute(
+            legacy = connection.execute(
                 """SELECT a.id FROM research_experiment_attempts a JOIN research_experiment_variants v ON v.id=a.variant_id
             WHERE a.id=? AND v.experiment_id=?""",
                 (citation["attempt_id"], experiment_id),
             ).fetchone()
-            if attempt is None:
+            admitted = connection.execute(
+                "SELECT id FROM research_experiment_admitted_attempts WHERE id=? AND experiment_id=?",
+                (citation["attempt_id"], experiment_id),
+            ).fetchone()
+            if legacy is None and admitted is None:
                 raise NotFound("Cited attempt was not found.")
+            artifact_table = (
+                "research_admitted_attempt_artifacts"
+                if admitted is not None
+                else "research_attempt_artifacts"
+            )
+            measurement_table = (
+                "research_admitted_attempt_measurements"
+                if admitted is not None
+                else "research_attempt_measurements"
+            )
             for artifact_id in citation["artifact_ids"]:
                 if (
                     connection.execute(
-                        "SELECT 1 FROM research_attempt_artifacts WHERE attempt_id=? AND artifact_id=?",
+                        f"SELECT 1 FROM {artifact_table} WHERE attempt_id=? AND artifact_id=?",
                         (citation["attempt_id"], artifact_id),
                     ).fetchone()
                     is None
@@ -1282,11 +1442,13 @@ class ExperimentStore(Store):
                     raise Conflict(
                         "Conclusions may cite only artifacts linked to the cited attempt."
                     )
-                rows.append((citation["attempt_id"], artifact_id, artifact_id, None))
+                rows.append(
+                    (citation["attempt_id"], artifact_id, artifact_id, None, admitted is not None)
+                )
             for measurement_id in citation["measurement_ids"]:
                 if (
                     connection.execute(
-                        "SELECT 1 FROM research_attempt_measurements WHERE id=? AND attempt_id=?",
+                        f"SELECT 1 FROM {measurement_table} WHERE id=? AND attempt_id=?",
                         (measurement_id, citation["attempt_id"]),
                     ).fetchone()
                     is None
@@ -1294,10 +1456,33 @@ class ExperimentStore(Store):
                     raise Conflict(
                         "Conclusions may cite only measurements linked to the cited attempt."
                     )
-                rows.append((citation["attempt_id"], measurement_id, None, measurement_id))
+                rows.append(
+                    (
+                        citation["attempt_id"],
+                        measurement_id,
+                        None,
+                        measurement_id,
+                        admitted is not None,
+                    )
+                )
         if len({(item[0], item[1]) for item in rows}) != len(rows):
             raise Conflict("Conclusion evidence must be unique.")
         return rows
+
+    @staticmethod
+    def _write_conclusion_evidence(
+        connection: sqlite3.Connection,
+        conclusion_id: str,
+        evidence: list[tuple[str, str, str | None, str | None, bool]],
+    ) -> None:
+        connection.executemany(
+            "INSERT INTO research_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,?,?)",
+            [(conclusion_id, item[0], item[2], item[3]) for item in evidence if not item[4]],
+        )
+        connection.executemany(
+            "INSERT INTO research_admitted_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,?,?)",
+            [(conclusion_id, item[0], item[2], item[3]) for item in evidence if item[4]],
+        )
 
     def create_conclusion(
         self,
@@ -1347,10 +1532,11 @@ class ExperimentStore(Store):
             connection.execute(
                 "DELETE FROM research_conclusion_evidence WHERE conclusion_id=?", (conclusion_id,)
             )
-            connection.executemany(
-                "INSERT INTO research_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,?,?)",
-                [(conclusion_id, item[0], item[2], item[3]) for item in evidence],
+            connection.execute(
+                "DELETE FROM research_admitted_conclusion_evidence WHERE conclusion_id=?",
+                (conclusion_id,),
             )
+            self._write_conclusion_evidence(connection, conclusion_id, evidence)
             experiment = self._experiment(connection, actor, conclusion["experiment_id"])
             self._event(
                 connection,
@@ -1413,10 +1599,7 @@ class ExperimentStore(Store):
                 :updated_at,:created_by_principal_id,:reviewed_at,:reviewed_by_principal_id)""",
                 row,
             )
-            connection.executemany(
-                "INSERT INTO research_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,?,?)",
-                [(ident, item[0], item[2], item[3]) for item in evidence],
-            )
+            self._write_conclusion_evidence(connection, ident, evidence)
             self._event(
                 connection,
                 actor,
@@ -1620,8 +1803,11 @@ class ExperimentStore(Store):
         result["evidence"] = [
             dict(item)
             for item in connection.execute(
-                "SELECT attempt_id,artifact_id,measurement_id FROM research_conclusion_evidence WHERE conclusion_id=? ORDER BY attempt_id,artifact_id,measurement_id",
-                (row["id"],),
+                """SELECT attempt_id,artifact_id,measurement_id FROM research_conclusion_evidence
+                WHERE conclusion_id=? UNION ALL SELECT attempt_id,artifact_id,measurement_id
+                FROM research_admitted_conclusion_evidence WHERE conclusion_id=?
+                ORDER BY attempt_id,artifact_id,measurement_id""",
+                (row["id"], row["id"]),
             )
         ]
         result["scientific_validity"] = "not_assessed"
@@ -1724,19 +1910,26 @@ class ExperimentStore(Store):
                 ),
                 (
                     "artifacts",
-                    """SELECT count(DISTINCT aa.artifact_id) FROM research_attempt_artifacts aa
+                    """SELECT count(DISTINCT artifact_id) FROM (
+                    SELECT aa.artifact_id FROM research_attempt_artifacts aa
                     JOIN research_experiment_attempts a ON a.id=aa.attempt_id
                     JOIN research_experiment_variants v ON v.id=a.variant_id
-                    WHERE v.experiment_id=?""",
-                    (experiment_id,),
+                    WHERE v.experiment_id=? UNION SELECT aa.artifact_id
+                    FROM research_admitted_attempt_artifacts aa
+                    JOIN research_experiment_admitted_attempts a ON a.id=aa.attempt_id
+                    WHERE a.experiment_id=?)""",
+                    (experiment_id, experiment_id),
                 ),
                 (
                     "artifact links",
-                    """SELECT count(*) FROM research_attempt_artifacts aa
+                    """SELECT count(*) FROM (SELECT aa.artifact_id FROM research_attempt_artifacts aa
                     JOIN research_experiment_attempts a ON a.id=aa.attempt_id
                     JOIN research_experiment_variants v ON v.id=a.variant_id
-                    WHERE v.experiment_id=?""",
-                    (experiment_id,),
+                    WHERE v.experiment_id=? UNION ALL SELECT aa.artifact_id
+                    FROM research_admitted_attempt_artifacts aa
+                    JOIN research_experiment_admitted_attempts a ON a.id=aa.attempt_id
+                    WHERE a.experiment_id=?)""",
+                    (experiment_id, experiment_id),
                 ),
                 (
                     "operations",
@@ -1760,11 +1953,14 @@ class ExperimentStore(Store):
                 ),
                 (
                     "measurements",
-                    """SELECT count(*) FROM research_attempt_measurements m
+                    """SELECT count(*) FROM (SELECT m.id FROM research_attempt_measurements m
                     JOIN research_experiment_attempts a ON a.id=m.attempt_id
                     JOIN research_experiment_variants v ON v.id=a.variant_id
-                    WHERE v.experiment_id=?""",
-                    (experiment_id,),
+                    WHERE v.experiment_id=? UNION ALL SELECT m.id
+                    FROM research_admitted_attempt_measurements m
+                    JOIN research_experiment_admitted_attempts a ON a.id=m.attempt_id
+                    WHERE a.experiment_id=?)""",
+                    (experiment_id, experiment_id),
                 ),
                 (
                     "conclusions",
@@ -1773,10 +1969,13 @@ class ExperimentStore(Store):
                 ),
                 (
                     "conclusion evidence",
-                    """SELECT count(*) FROM research_conclusion_evidence ce
+                    """SELECT count(*) FROM (SELECT ce.conclusion_id FROM research_conclusion_evidence ce
                     JOIN research_conclusions c ON c.id=ce.conclusion_id
-                    WHERE c.experiment_id=?""",
-                    (experiment_id,),
+                    WHERE c.experiment_id=? UNION ALL SELECT ce.conclusion_id
+                    FROM research_admitted_conclusion_evidence ce
+                    JOIN research_conclusions c ON c.id=ce.conclusion_id
+                    WHERE c.experiment_id=?)""",
+                    (experiment_id, experiment_id),
                 ),
                 (
                     "conclusion amendments",
@@ -1878,6 +2077,13 @@ class ExperimentStore(Store):
             ):
                 append("artifact_links", dict(row))
             for row in connection.execute(
+                """SELECT aa.* FROM research_admitted_attempt_artifacts aa
+                JOIN research_experiment_admitted_attempts a ON a.id=aa.attempt_id
+                WHERE a.experiment_id=? ORDER BY aa.attempt_id,aa.artifact_id""",
+                (experiment_id,),
+            ):
+                append("artifact_links", dict(row))
+            for row in connection.execute(
                 """SELECT a.id,a.project_id,a.task_id,a.grant_id,a.lease_id,a.worker_principal_id,
                 a.epoch,a.operation_id,a.relative_path,a.sha256,a.size,a.created_at,a.status,
                 classification,late,r.retention_class,r.state AS retention_state,
@@ -1885,11 +2091,14 @@ class ExperimentStore(Store):
                 FROM artifacts a
                 LEFT JOIN project_artifact_retention r ON r.artifact_id=a.id AND r.project_id=a.project_id
                 LEFT JOIN project_artifact_placements p ON p.artifact_id=a.id AND p.project_id=a.project_id
-                WHERE a.project_id=? AND EXISTS (SELECT 1 FROM research_attempt_artifacts aa
+                WHERE a.project_id=? AND (EXISTS (SELECT 1 FROM research_attempt_artifacts aa
                 JOIN research_experiment_attempts ea ON ea.id=aa.attempt_id
                 JOIN research_experiment_variants v ON v.id=ea.variant_id
-                WHERE aa.artifact_id=a.id AND v.experiment_id=?) ORDER BY a.created_at,a.id""",
-                (experiment["project_id"], experiment_id),
+                WHERE aa.artifact_id=a.id AND v.experiment_id=?) OR EXISTS (
+                SELECT 1 FROM research_admitted_attempt_artifacts aa
+                JOIN research_experiment_admitted_attempts ea ON ea.id=aa.attempt_id
+                WHERE aa.artifact_id=a.id AND ea.experiment_id=?)) ORDER BY a.created_at,a.id""",
+                (experiment["project_id"], experiment_id, experiment_id),
             ):
                 append("artifacts", self._artifact_evidence_response(row))
             for row in connection.execute(
@@ -1897,6 +2106,13 @@ class ExperimentStore(Store):
                 JOIN research_experiment_attempts a ON a.id=m.attempt_id
                 JOIN research_experiment_variants v ON v.id=a.variant_id
                 WHERE v.experiment_id=? ORDER BY m.created_at,m.id""",
+                (experiment_id,),
+            ):
+                append("measurements", self._measurement_response(row))
+            for row in connection.execute(
+                """SELECT m.* FROM research_admitted_attempt_measurements m
+                JOIN research_experiment_admitted_attempts a ON a.id=m.attempt_id
+                WHERE a.experiment_id=? ORDER BY m.created_at,m.id""",
                 (experiment_id,),
             ):
                 append("measurements", self._measurement_response(row))

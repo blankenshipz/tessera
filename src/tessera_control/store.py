@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 31);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 32);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -189,6 +189,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .credential_leases import create_credential_access_lease_schema
     from .execution import create_execution_schema
     from .experiments import (
+        create_admitted_attempt_evidence_schema,
         create_experiment_admission_schema,
         create_experiment_evidence_retention_schema,
         create_experiment_schema,
@@ -235,6 +236,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_experiment_schema(connection)
     create_experiment_evidence_retention_schema(connection)
     create_experiment_admission_schema(connection)
+    create_admitted_attempt_evidence_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

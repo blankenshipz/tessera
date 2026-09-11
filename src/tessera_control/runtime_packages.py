@@ -81,6 +81,15 @@ class RuntimePackageStore(ExecutionStore):
             "hard_expires_at": lease["hard_expires_at"],
         }
         package["docker_lookup_key"] = f"tessera-op-{package['operation_id']}"
+        bound = connection.execute(
+            "SELECT id FROM research_experiment_admitted_attempts WHERE grant_id=?", (grant["id"],)
+        ).fetchone()
+        if bound is not None:
+            if admitted_attempt_id is not None and admitted_attempt_id != bound["id"]:
+                raise Conflict("Package request admitted attempt does not match the grant binding.")
+            admitted_attempt_id = bound["id"]
+        elif admitted_attempt_id is not None:
+            raise Conflict("Package request names an attempt not bound to this execution grant.")
         if admitted_attempt_id is not None:
             _attempt, binding = admitted_attempt_package_identity(
                 connection, worker, package, admitted_attempt_id
@@ -92,7 +101,11 @@ class RuntimePackageStore(ExecutionStore):
             package["persistent_output_storage"] = persistent_output_storage
         if expiry <= self._now():
             raise Conflict("Execution lease expired while preparing its package.")
-        return {"package": package, "package_digest": canonical_digest(package)}, dict(lease)
+        return {
+            "package": package,
+            "package_digest": canonical_digest(package),
+            "admitted_attempt_id": admitted_attempt_id,
+        }, dict(lease)
 
     @staticmethod
     def _operation_response(row: Any) -> dict[str, Any]:
@@ -224,9 +237,10 @@ class RuntimePackageStore(ExecutionStore):
             operation, created = self._record_operation_intent(
                 connection, live, package, metadata["package_digest"], operation_request_digest
             )
-            if admitted_attempt_id is not None:
+            bound_attempt_id = metadata["admitted_attempt_id"]
+            if bound_attempt_id is not None:
                 bind_admitted_attempt_package(
-                    connection, live, package, metadata["package_digest"], admitted_attempt_id
+                    connection, live, package, metadata["package_digest"], bound_attempt_id
                 )
             metadata["operation"] = operation
             self._event(
@@ -243,7 +257,7 @@ class RuntimePackageStore(ExecutionStore):
                     "external_operation_intent": created,
                     "retry_class": "manual_reconciliation",
                     "execution_dispatched": False,
-                    "admitted_attempt_id": admitted_attempt_id,
+                    "admitted_attempt_id": bound_attempt_id,
                 },
             )
             return 201, metadata
@@ -265,13 +279,14 @@ class RuntimePackageStore(ExecutionStore):
                 operation_request_digest,
             )
             metadata["operation"] = operation
-            if admitted_attempt_id is not None:
+            bound_attempt_id = metadata["admitted_attempt_id"]
+            if bound_attempt_id is not None:
                 bind_admitted_attempt_package(
                     connection,
                     live,
                     metadata["package"],
                     metadata["package_digest"],
-                    admitted_attempt_id,
+                    bound_attempt_id,
                 )
             if (
                 cached.get("package") != metadata["package"]
