@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -196,8 +198,142 @@ def test_status_and_teardown_are_explicit_and_teardown_never_invokes_minikube(
 
 
 def test_sanitized_result_is_bounded_and_private(tmp_path: Path) -> None:
-    journal = tmp_path / "nested" / "result.json"
+    parent = _private_directory(tmp_path / "nested")
+    journal = parent / "result.json"
     record_result(journal, {"state": "reconciled", "plan_digest": MinikubePlan.default().digest})
 
     assert json.loads(journal.read_text())["state"] == "reconciled"
     assert journal.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("entry_type", ["symlink", "hardlink", "fifo"])
+def test_preexisting_unsafe_temporary_is_never_opened_or_clobbered(
+    monkeypatch, tmp_path: Path, entry_type: str
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    journal = parent / "result.json"
+    temporary = parent / ".result.json.collision.tmp"
+    victim = tmp_path / "victim"
+    victim.write_text("preserve me")
+    if entry_type == "symlink":
+        temporary.symlink_to(victim)
+    elif entry_type == "hardlink":
+        os.link(victim, temporary)
+    else:
+        os.mkfifo(temporary)
+    monkeypatch.setattr("tessera_provisioner.minikube.secrets.token_hex", lambda _: "collision")
+
+    with pytest.raises(MinikubeProvisioningError, match="could not be recorded"):
+        record_result(journal, {"state": "reconciled"})
+
+    assert victim.read_text() == "preserve me"
+    assert not journal.exists()
+
+
+@pytest.mark.parametrize("parent_type", ["nonprivate", "symlink"])
+def test_journal_parent_must_be_existing_private_directory(
+    tmp_path: Path, parent_type: str
+) -> None:
+    private = _private_directory(tmp_path / "private")
+    if parent_type == "nonprivate":
+        parent = tmp_path / "nonprivate"
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o755)
+    else:
+        parent = tmp_path / "parent-link"
+        parent.symlink_to(private, target_is_directory=True)
+
+    with pytest.raises(MinikubeProvisioningError, match="parent is not private"):
+        record_result(parent / "result.json", {"state": "reconciled"})
+
+
+def test_concurrent_result_writers_publish_one_unchanged_record(tmp_path: Path) -> None:
+    journal = _private_directory(tmp_path / "private") / "result.json"
+    start = threading.Barrier(4)
+    successes: list[int] = []
+    failures: list[Exception] = []
+
+    def writer(index: int) -> None:
+        start.wait()
+        try:
+            record_result(journal, {"state": "reconciled", "writer": index})
+        except MinikubeProvisioningError as error:
+            failures.append(error)
+        else:
+            successes.append(index)
+
+    threads = [threading.Thread(target=writer, args=(index,)) for index in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(successes) == 1
+    assert len(failures) == 3
+    assert json.loads(journal.read_text())["writer"] == successes[0]
+
+
+def test_apply_rejects_unsafe_journal_before_constructing_live_provisioner(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    class MustNotConstruct:
+        def __init__(self) -> None:
+            pytest.fail("unsafe journal must block Minikube before construction")
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o755)
+    plan = MinikubePlan.default()
+    monkeypatch.setattr("tessera_provisioner.minikube.MinikubeProvisioner", MustNotConstruct)
+    arguments = cli.parser().parse_args(
+        [
+            "minikube-provision",
+            "--apply",
+            "--approved-plan",
+            plan.digest,
+            "--journal",
+            str(unsafe / "result.json"),
+        ]
+    )
+
+    assert cli._run_minikube_provisioning(arguments) == 1
+    assert "parent is not private" in capsys.readouterr().err
+
+
+def test_apply_records_failure_after_infrastructure_mutation(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    mutations: list[str] = []
+
+    class FailsAfterMutation:
+        def apply(self, plan: MinikubePlan, approved_plan_digest: str) -> dict[str, object]:
+            assert approved_plan_digest == plan.digest
+            mutations.append("profile-created")
+            raise MinikubeProvisioningError(
+                "Local command failed: subprocess_failure; effects unknown."
+            )
+
+    journal = _private_directory(tmp_path / "private") / "result.json"
+    plan = MinikubePlan.default()
+    monkeypatch.setattr("tessera_provisioner.minikube.MinikubeProvisioner", FailsAfterMutation)
+    arguments = cli.parser().parse_args(
+        [
+            "minikube-provision",
+            "--apply",
+            "--approved-plan",
+            plan.digest,
+            "--journal",
+            str(journal),
+        ]
+    )
+
+    assert cli._run_minikube_provisioning(arguments) == 1
+    assert mutations == ["profile-created"]
+    assert json.loads(journal.read_text())["state"] == "failed"
+    assert "subprocess_failure" in capsys.readouterr().err
+
+
+def _private_directory(path: Path) -> Path:
+    path.mkdir(mode=0o700)
+    path.chmod(0o700)
+    return path

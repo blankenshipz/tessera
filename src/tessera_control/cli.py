@@ -56,6 +56,7 @@ def _run_minikube_provisioning(arguments: argparse.Namespace) -> int:
         MinikubePlan,
         MinikubeProvisioner,
         MinikubeProvisioningError,
+        prepare_result_journal,
         record_result,
         render_plan,
     )
@@ -82,23 +83,31 @@ def _run_minikube_provisioning(arguments: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    journal = None
     try:
+        # Custody is a precondition for --apply: never mutate infrastructure if
+        # the mandatory operation record cannot be safely published afterward.
+        if arguments.journal is not None:
+            journal = prepare_result_journal(arguments.journal)
         provisioner = MinikubeProvisioner()
         if arguments.status:
             result = provisioner.status(plan)
         else:
             result = provisioner.apply(plan, arguments.approved_plan)
-        if arguments.journal is not None:
-            record_result(arguments.journal, result)
+        if journal is not None:
+            record_result(journal, result)
     except MinikubeProvisioningError as error:
         result = {"state": "failed", "plan_digest": plan.digest, "message": str(error)}
-        if arguments.journal is not None:
+        if journal is not None:
             try:
-                record_result(arguments.journal, result)
+                record_result(journal, result)
             except MinikubeProvisioningError:
                 pass
         print(json.dumps(result, sort_keys=True), file=sys.stderr)
         return 1
+    finally:
+        if journal is not None:
+            journal.close()
     print(json.dumps(result, sort_keys=True))
     return 0
 

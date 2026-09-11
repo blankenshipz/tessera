@@ -14,8 +14,8 @@ First inspect the immutable dry run. It makes no subprocess call:
 
 Only an eligible human may then explicitly approve the printed digest and run the
 mutation. The digest is an exact-plan acknowledgement, not a research-plan,
-agent, worker, harness, or skill approval. Store the sanitized local result in a
-private local path:
+agent, worker, harness, or skill approval. Store the sanitized local result in an
+existing private (`0700`, owned by the invoking user) directory:
 
 ```sh
 .venv/bin/tessera minikube-provision --apply \
@@ -30,6 +30,12 @@ and PVC steps. Every command has a deadline and an 8 KiB per-stream output bound
 Timeout, malformed data, nonzero process exits, or unclassified errors fail
 closed; records contain only state, plan digest, named resource UIDs, and a
 sanitized category, never command output.
+
+The mandatory `--journal` custody check happens before `--apply` constructs or
+calls Minikube. Its parent must not be a symlink and must already be private; the
+destination must not exist. Results use an exclusive random temporary file and
+atomic no-clobber publication, so a symlink, hardlink, FIFO, existing result, or
+concurrent writer is rejected rather than followed, overwritten, or waited on.
 
 Read status explicitly with `--status`; it performs profile-scoped reads and can
 also write a result when `--journal` is provided. Resources are retained by

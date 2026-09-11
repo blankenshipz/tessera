@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
+import stat
 import subprocess
 import threading
 from collections.abc import Callable
@@ -27,10 +29,31 @@ PVC = "tessera-output"
 MAX_OUTPUT_BYTES = 8_192
 MINIKUBE_TIMEOUT_SECONDS = 300
 KUBECTL_TIMEOUT_SECONDS = 20
+RESULT_MAX_BYTES = 16_384
+RESULT_TEMPORARY_ATTEMPTS = 8
 
 
 class MinikubeProvisioningError(RuntimeError):
     """A live operation cannot be safely continued."""
+
+
+@dataclass
+class ResultJournal:
+    """An opened, private parent directory for one no-clobber result publication."""
+
+    directory_fd: int
+    name: str
+
+    def close(self) -> None:
+        if self.directory_fd >= 0:
+            os.close(self.directory_fd)
+            self.directory_fd = -1
+
+    def __enter__(self) -> ResultJournal:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
@@ -454,26 +477,130 @@ def _verify_pvc(value: dict[str, Any]) -> str:
     return uid
 
 
-def record_result(path: Path, result: dict[str, object]) -> None:
-    """Atomically retain a bounded, secret-free local operation result."""
-    safe = {"recorded_at": _utc_now(), **result}
-    encoded = canonical_json(safe)
-    if len(encoded) > 16_384:
-        raise MinikubeProvisioningError("Operation result exceeded its safe storage bound.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+def prepare_result_journal(path: Path) -> ResultJournal:
+    """Open a private, existing journal parent without following its final component.
+
+    Call this before an infrastructure mutation. The retained directory descriptor
+    avoids re-resolving a path after that check; publication itself remains
+    no-clobber so a concurrent writer cannot replace another operation's record.
+    """
+    if os.name != "posix" or not all(
+        hasattr(os, flag) for flag in ("O_DIRECTORY", "O_NOFOLLOW", "O_EXCL")
+    ):
+        raise MinikubeProvisioningError("Safe operation-result storage is unavailable.")
+    target = Path(path)
+    if target.name in {"", ".", ".."}:
+        raise MinikubeProvisioningError("Operation journal destination is unavailable.")
     try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as output:
-            output.write(encoded)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        directory_fd = os.open(
+            target.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise MinikubeProvisioningError("Operation journal parent is not private.") from error
+    try:
+        directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != os.geteuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700
+        ):
+            raise MinikubeProvisioningError("Operation journal parent is not private.")
+        try:
+            os.stat(target.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return ResultJournal(directory_fd, target.name)
+        raise MinikubeProvisioningError("Operation journal destination is unavailable.")
+    except OSError as error:
+        os.close(directory_fd)
+        raise MinikubeProvisioningError("Operation journal destination is unavailable.") from error
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def _temporary_result_name(name: str) -> str:
+    return f".{name}.{secrets.token_hex(16)}.tmp"
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written == 0:
+            raise OSError("short operation-result write")
+        remaining = remaining[written:]
+
+
+def _record_result(journal: ResultJournal, encoded: bytes) -> None:
+    temporary: str | None = None
+    descriptor = -1
+    try:
+        for _ in range(RESULT_TEMPORARY_ATTEMPTS):
+            candidate = _temporary_result_name(journal.name)
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    0o600,
+                    dir_fd=journal.directory_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if temporary is None:
+            raise OSError("operation-result temporary name collision")
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise OSError("unsafe operation-result temporary file")
+        _write_all(descriptor, encoded)
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("unsafe operation-result temporary file")
+        os.close(descriptor)
+        descriptor = -1
+        os.link(
+            temporary,
+            journal.name,
+            src_dir_fd=journal.directory_fd,
+            dst_dir_fd=journal.directory_fd,
+            follow_symlinks=False,
+        )
+        os.fsync(journal.directory_fd)
     except OSError as error:
         raise MinikubeProvisioningError(
             "Sanitized operation result could not be recorded."
         ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=journal.directory_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def record_result(path: Path | ResultJournal, result: dict[str, object]) -> None:
+    """No-clobber retain a bounded, secret-free local operation result."""
+    safe = {"recorded_at": _utc_now(), **result}
+    encoded = canonical_json(safe)
+    if len(encoded) > RESULT_MAX_BYTES:
+        raise MinikubeProvisioningError("Operation result exceeded its safe storage bound.")
+    if isinstance(path, ResultJournal):
+        _record_result(path, encoded)
+        return
+    with prepare_result_journal(path) as journal:
+        _record_result(journal, encoded)
 
 
 __all__ = [
@@ -484,7 +611,9 @@ __all__ = [
     "NAMESPACE",
     "PROFILE",
     "PVC",
+    "ResultJournal",
     "planned_commands",
+    "prepare_result_journal",
     "record_result",
     "render_plan",
 ]
