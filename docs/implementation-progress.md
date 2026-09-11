@@ -392,10 +392,12 @@ representative investigation have not passed end-to-end acceptance.
      dependency-free contract requiring an explicit profile,
      kubeconfig/context/server/CA/namespace identity, create only a canonical
      digest-pinned non-root Job through injected callbacks, and parse immutable
-     Job/owned-Pod observations. Eight focused tests pass. A local create fence
-     reconciles a lost reply only by deterministic name; delete acknowledgement
-     remains unresolved until fresh Job and owned-Pod absence. Unit fixtures do
-     not start or mutate Minikube. Minikube cluster execution, the OpenCode
+     Job/owned-Pod observations. Focused tests pass. A local create fence
+     reconciles a lost reply only by deterministic name; durable cancellation
+     is persisted before callbacks and fences later create admission across
+     restart; delete acknowledgement remains unresolved until fresh Job and
+     owned-Pod absence. Unit fixtures do not start or mutate Minikube. Minikube
+     cluster execution, the OpenCode
      sidecar, PVC quota enforcement, provider calls, and pilot acceptance remain
      unimplemented. See [decision 0009](decisions/0009-minikube-job-conformance.md).
 

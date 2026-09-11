@@ -28,9 +28,12 @@ observations remain unknown or fail closed; they never create a replacement Job.
 
 The local create-intent journal exists only to test lost-reply behavior. A caller
 persists intent before invoking its injected create callback; retry observes the
-same deterministic Job name rather than calling create again. Delete completion
-is never inferred from an acknowledgement: fresh injected reads must show both
-the Job and all owned Pods absent.
+same deterministic Job name rather than calling create again. Cancellation first
+persists a separate desired-cancellation fence before any injected Kubernetes
+callback. Create admission rejects that fence across restart, including after a
+previously observed Job is deleted, so cancel-before-create invokes no create
+callback. Delete completion is never inferred from an acknowledgement: fresh
+injected reads must show both the Job and all owned Pods absent.
 
 ## Running the local unit contract
 

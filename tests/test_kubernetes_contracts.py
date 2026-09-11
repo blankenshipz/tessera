@@ -351,3 +351,88 @@ def test_cancel_converges_after_restart_without_recreating_an_absent_job(tmp_pat
     assert confirmed.termination_confirmed is True
     assert confirmed.job_observed is True
     assert confirmed.pods_observed is True
+
+
+def test_cancel_before_create_persists_its_fence_before_callbacks_and_restart(tmp_path) -> None:
+    binding = _binding()
+    journal_path = tmp_path / "journal.sqlite3"
+    journal = KubernetesJobJournal(journal_path)
+    create_calls: list[str] = []
+
+    def inspect_after_cancel(_name: str) -> None:
+        import sqlite3
+
+        with sqlite3.connect(journal_path) as connection:
+            assert connection.execute(
+                "SELECT cancellation_requested FROM kubernetes_jobs WHERE operation_id=?",
+                (binding.operation_id,),
+            ).fetchone() == (1,)
+        return None
+
+    cancelled = journal.request_cancel(
+        binding,
+        _cluster(),
+        inspect_after_cancel,
+        lambda _name, _uid: pytest.fail("must not delete an absent Job"),
+        lambda _uid: pytest.fail("must not observe Pods without an attributed Job"),
+    )
+
+    assert cancelled.requested is True
+    restarted = KubernetesJobJournal(journal_path)
+    with pytest.raises(KubernetesUnresolvedError, match="durable cancellation"):
+        restarted.reconcile_create(
+            binding,
+            _cluster(),
+            lambda _name: pytest.fail("cancelled create must not inspect or recreate"),
+            lambda _manifest: create_calls.append("create"),
+        )
+    assert create_calls == []
+
+
+def test_observed_job_cancelled_before_restart_never_recreates_and_reconciles_pods(
+    tmp_path,
+) -> None:
+    binding = _binding()
+    journal_path = tmp_path / "journal.sqlite3"
+    journal = KubernetesJobJournal(journal_path)
+    jobs = {binding.job_name: _job(binding)}
+    pods = [_pod(binding)]
+    deletes: list[tuple[str, str]] = []
+    create_calls: list[str] = []
+
+    observed = journal.reconcile_create(
+        binding,
+        _cluster(),
+        jobs.get,
+        lambda _manifest: pytest.fail("must observe the existing Job, not create"),
+    )
+    assert observed.job_uid == "job-fixture"
+
+    def delete(name: str, uid: str) -> None:
+        deletes.append((name, uid))
+        jobs.pop(name)
+
+    unresolved = journal.request_cancel(binding, _cluster(), jobs.get, delete, lambda _uid: pods)
+    assert unresolved.termination_confirmed is False
+    assert deletes == [(binding.job_name, "job-fixture")]
+
+    restarted = KubernetesJobJournal(journal_path)
+    with pytest.raises(KubernetesUnresolvedError, match="durable cancellation"):
+        restarted.reconcile_create(
+            binding,
+            _cluster(),
+            lambda _name: pytest.fail("cancelled create must not inspect or recreate"),
+            lambda _manifest: create_calls.append("create"),
+        )
+    assert create_calls == []
+
+    pods.clear()
+    confirmed = restarted.request_cancel(
+        binding,
+        _cluster(),
+        jobs.get,
+        lambda _name, _uid: pytest.fail("must not delete an absent Job"),
+        lambda _uid: pods,
+    )
+    assert confirmed.termination_confirmed is True
+    assert confirmed.pods_observed is True

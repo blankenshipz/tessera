@@ -691,8 +691,19 @@ class KubernetesJobJournal:
                 """CREATE TABLE IF NOT EXISTS kubernetes_jobs (
                 operation_id TEXT PRIMARY KEY, binding_json TEXT NOT NULL,
                 manifest_json TEXT NOT NULL, create_intent INTEGER NOT NULL
-                CHECK (create_intent IN (0, 1)), job_uid TEXT)"""
+                CHECK (create_intent IN (0, 1)),
+                cancellation_requested INTEGER NOT NULL DEFAULT 0
+                CHECK (cancellation_requested IN (0, 1)), job_uid TEXT)"""
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(kubernetes_jobs)").fetchall()
+            }
+            if "cancellation_requested" not in columns:
+                connection.execute(
+                    "ALTER TABLE kubernetes_jobs ADD COLUMN cancellation_requested "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (cancellation_requested IN (0, 1))"
+                )
 
     def reconcile_create(
         self,
@@ -703,6 +714,7 @@ class KubernetesJobJournal:
     ) -> KubernetesJobObservation:
         manifest = job_manifest(binding, cluster)
         self._bind(binding, manifest)
+        self._reject_cancelled_create(binding.operation_id)
         found = inspect(binding.job_name)
         if found is not None:
             return self._record_observation(
@@ -736,6 +748,9 @@ class KubernetesJobJournal:
         observation fails, the cancellation remains unresolved.
         """
         self._bind(binding, job_manifest(binding, cluster))
+        # This durable fence precedes every injected Kubernetes callback.  Create
+        # admission checks the same row, including after a journal restart.
+        self._mark_cancellation_requested(binding.operation_id)
         first = inspect(binding.job_name)
         if first is None:
             job_uid = self._recorded_job_uid(binding.operation_id)
@@ -779,7 +794,10 @@ class KubernetesJobJournal:
             ).fetchone()
             if row is None:
                 connection.execute(
-                    "INSERT INTO kubernetes_jobs VALUES (?, ?, ?, 0, NULL)",
+                    """INSERT INTO kubernetes_jobs
+                    (operation_id, binding_json, manifest_json, create_intent,
+                     cancellation_requested, job_uid)
+                    VALUES (?, ?, ?, 0, 0, NULL)""",
                     (binding.operation_id, encoded_binding, encoded_manifest),
                 )
             elif (row["binding_json"], row["manifest_json"]) != (encoded_binding, encoded_manifest):
@@ -801,12 +819,49 @@ class KubernetesJobJournal:
             if (
                 connection.execute(
                     "UPDATE kubernetes_jobs SET create_intent=1 "
-                    "WHERE operation_id=? AND create_intent=0",
+                    "WHERE operation_id=? AND create_intent=0 AND cancellation_requested=0",
                     (operation_id,),
                 ).rowcount
                 != 1
             ):
+                row = connection.execute(
+                    "SELECT cancellation_requested FROM kubernetes_jobs WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if row is None:
+                    raise KubernetesContractError("Kubernetes operation intent disappeared.")
+                if row["cancellation_requested"]:
+                    raise KubernetesUnresolvedError(
+                        "Kubernetes Job create is fenced by durable cancellation."
+                    )
                 raise KubernetesUnresolvedError("Kubernetes Job create intent is already fenced.")
+
+    def _reject_cancelled_create(self, operation_id: str) -> None:
+        if self._cancellation_requested(operation_id):
+            raise KubernetesUnresolvedError(
+                "Kubernetes Job create is fenced by durable cancellation."
+            )
+
+    def _mark_cancellation_requested(self, operation_id: str) -> None:
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "UPDATE kubernetes_jobs SET cancellation_requested=1 WHERE operation_id=?",
+                    (operation_id,),
+                ).rowcount
+                != 1
+            ):
+                raise KubernetesContractError("Kubernetes operation intent disappeared.")
+
+    def _cancellation_requested(self, operation_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT cancellation_requested FROM kubernetes_jobs WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            raise KubernetesContractError("Kubernetes operation intent disappeared.")
+        return bool(row["cancellation_requested"])
 
     def _record_observation(
         self, observation: KubernetesJobObservation, operation_id: str
