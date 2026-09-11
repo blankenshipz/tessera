@@ -251,3 +251,8 @@ Schema 30 adds empty human-admitted experiment execution bindings. A binding is
 created before a worker package can carry its immutable experiment/design/variant
 identity into one external operation; it does not backfill old operations, turn a
 package into dispatch, or infer a result or scientific validity.
+
+Schema 31 repairs the v30 fresh-bootstrap omission of the immutable
+experiment-operation binding index. It preserves all ledger data and makes fresh
+and migrated v30 states eligible for the same fail-closed backup and held-restore
+validation.

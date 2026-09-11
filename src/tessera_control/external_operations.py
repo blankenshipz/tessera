@@ -36,12 +36,8 @@ def create_external_operation_schema(connection: sqlite3.Connection) -> None:
         retry_class TEXT NOT NULL CHECK (retry_class = 'manual_reconciliation'),
         desired_state TEXT NOT NULL CHECK (desired_state IN ('admitted', 'cancel_requested')),
          observed_state TEXT NOT NULL CHECK (observed_state IN ('unknown', 'running', 'exited')),
-         provider_id TEXT,
-         experiment_attempt_id TEXT,
-         experiment_id TEXT,
-         experiment_design_revision INTEGER,
-         experiment_variant_id TEXT,
-         created_at TEXT NOT NULL,
+          provider_id TEXT,
+          created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
         )"""
     )

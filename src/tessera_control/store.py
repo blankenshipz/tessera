@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 30);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 31);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -194,6 +194,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         create_experiment_schema,
     )
     from .external_operations import (
+        create_experiment_operation_binding_schema,
         create_external_operation_receipt_schema,
         create_external_operation_schema,
     )
@@ -225,6 +226,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_skill_schema(connection)
     create_handoff_schema(connection)
     create_external_operation_schema(connection)
+    create_experiment_operation_binding_schema(connection)
     create_external_operation_receipt_schema(connection)
     create_result_acceptance_schema(connection)
     create_credential_access_lease_schema(connection)

@@ -18,9 +18,14 @@ from tessera_control.experiments import (
     create_v25_experiment_schema,
     create_v26_experiment_evidence_retention_schema,
 )
-from tessera_control.migrations import MIGRATIONS, migrate_v27_to_v28
+from tessera_control.external_operations import (
+    create_external_operation_receipt_schema,
+    create_external_operation_schema,
+)
+from tessera_control.migrations import MIGRATIONS, migrate_v27_to_v28, migrate_v30_to_v31
 from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
 from tessera_control.project_artifact_store import ProjectArtifactStore
+from tessera_control.recovery import backup_state, restore_state
 from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.store import (
     Conflict,
@@ -30,6 +35,7 @@ from tessera_control.store import (
     StoreError,
     _token_hash,
     canonical_digest,
+    initialize_state,
     migrate_state,
     utc_now,
 )
@@ -47,37 +53,43 @@ def _command(method, principal, *args, payload):
     return response
 
 
-def _operation(state: Path, owner, grant, lease, operation_id: str) -> None:
+def _insert_operation(
+    connection: sqlite3.Connection, owner, grant, lease, operation_id: str
+) -> None:
     now = utc_now()
+    connection.execute(
+        """INSERT INTO external_operations
+        (operation_id,org_id,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,
+         package_digest,adapter_version,profile_version,docker_lookup_key,request_digest,
+         retry_class,desired_state,observed_state,provider_id,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,'development-local-cpu-v1','local-cpu-v1',?, ?,
+        'manual_reconciliation','admitted','exited',?,?,?)""",
+        (
+            operation_id,
+            owner["org_id"],
+            grant["project_id"],
+            grant["task_id"],
+            grant["id"],
+            lease["id"],
+            lease["worker_principal_id"],
+            lease["epoch"],
+            "a" * 64,
+            f"lookup-{operation_id}",
+            "b" * 64,
+            f"fake-{operation_id}",
+            now,
+            now,
+        ),
+    )
+    connection.execute(
+        "UPDATE execution_observations SET operation_id=? WHERE lease_id=?",
+        (operation_id, lease["id"]),
+    )
+
+
+def _operation(state: Path, owner, grant, lease, operation_id: str) -> None:
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
-        connection.execute(
-            """INSERT INTO external_operations
-            (operation_id,org_id,project_id,task_id,grant_id,lease_id,worker_principal_id,epoch,
-             package_digest,adapter_version,profile_version,docker_lookup_key,request_digest,
-             retry_class,desired_state,observed_state,provider_id,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,'development-local-cpu-v1','local-cpu-v1',?, ?,
-            'manual_reconciliation','admitted','exited',?,?,?)""",
-            (
-                operation_id,
-                owner["org_id"],
-                grant["project_id"],
-                grant["task_id"],
-                grant["id"],
-                lease["id"],
-                lease["worker_principal_id"],
-                lease["epoch"],
-                "a" * 64,
-                f"lookup-{operation_id}",
-                "b" * 64,
-                f"fake-{operation_id}",
-                now,
-                now,
-            ),
-        )
-        connection.execute(
-            "UPDATE execution_observations SET operation_id=? WHERE lease_id=?",
-            (operation_id, lease["id"]),
-        )
+        _insert_operation(connection, owner, grant, lease, operation_id)
 
 
 def _design(revision: int | None = None, grant=None):
@@ -711,7 +723,7 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 30
+    assert migrate_state(state) == 31
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -728,9 +740,8 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
 def _legacy_experiment_state(
     tmp_path: Path, source_version: int
 ) -> tuple[Path, dict, str, str, str]:
-    """Seed one actual v25/v26/v27 ledger without current provenance columns."""
-    state, owner, _worker, grant, _lease, manifest, artifact = _reconciled_manifest(tmp_path)
-    _operation(state, owner, grant, _lease, manifest["operation_id"])
+    """Seed one populated historical v25-v29 ledger with its exact later tables absent."""
+    state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
     experiment_id, attempt_id, measurement_id, conclusion_id = (
         "experiment_legacy",
         "attempt_legacy",
@@ -741,6 +752,10 @@ def _legacy_experiment_state(
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         for table in (
+            "research_experiment_admitted_attempt_states",
+            "research_experiment_admitted_attempts",
+            "research_conclusion_amendments",
+            "research_conclusion_lineage",
             "experiment_artifact_evidence_references",
             "research_conclusion_evidence",
             "research_conclusions",
@@ -752,6 +767,14 @@ def _legacy_experiment_state(
             "research_experiments",
         ):
             connection.execute(f"DROP TABLE {table}")
+        connection.execute("DROP TABLE external_operation_receipts")
+        connection.execute("DROP TABLE external_operations")
+        # An authentic v25-v29 ledger predates the v30 operation binding
+        # columns/index. Recreate that historical shape before placing its
+        # populated attempt/evidence/conclusion chain.
+        create_external_operation_schema(connection)
+        create_external_operation_receipt_schema(connection)
+        _insert_operation(connection, owner, grant, lease, manifest["operation_id"])
         create_v25_experiment_schema(connection)
         connection.execute(
             """INSERT INTO research_experiments
@@ -899,25 +922,53 @@ def _legacy_experiment_state(
             connection.execute("UPDATE schema_meta SET schema_version=26")
         if source_version >= 27:
             MIGRATIONS[26](connection)
+        if source_version >= 28:
+            MIGRATIONS[27](connection)
+        if source_version >= 29:
+            MIGRATIONS[28](connection)
         connection.commit()
     return state, owner, experiment_id, attempt_id, measurement_id
 
 
-@pytest.mark.parametrize("source_version", (25, 26, 27))
-def test_v25_v26_v27_experiment_ledgers_upgrade_reopen_and_repeat_without_provenance_loss(
+def _operation_binding_schema(
+    state: Path,
+) -> tuple[list[tuple[object, ...]], tuple[object, ...] | None]:
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        columns = connection.execute("PRAGMA table_info(external_operations)").fetchall()
+        index = connection.execute(
+            "SELECT name,tbl_name,sql FROM sqlite_schema "
+            "WHERE type='index' AND name='external_operations_experiment_attempt_once'"
+        ).fetchone()
+    return columns, index
+
+
+@pytest.mark.parametrize("source_version", (25, 26, 27, 28, 29))
+def test_v25_through_v29_experiment_ledgers_upgrade_backup_restore_and_repeat_without_loss(
     tmp_path: Path, source_version: int
 ) -> None:
     state, owner, experiment_id, attempt_id, measurement_id = _legacy_experiment_state(
         tmp_path, source_version
     )
 
-    assert migrate_state(state) == 30
+    assert migrate_state(state) == 31
     records = ExperimentStore(state)
     exported = records.export_experiment(owner, experiment_id)
     reopened = ExperimentStore(state).get_experiment(owner, experiment_id)
     assert reopened == exported
-    assert migrate_state(state) == 30
+    assert migrate_state(state) == 31
     assert ExperimentStore(state).get_experiment(owner, experiment_id) == exported
+
+    fresh = tmp_path / "fresh"
+    initialize_state(fresh)
+    assert _operation_binding_schema(state) == _operation_binding_schema(fresh)
+    backup = tmp_path / "backup"
+    backup_state(state, backup)
+    restored = tmp_path / "restored"
+    restore_state(backup, restored)
+    restored_token = (restored / "owner.header").read_text().split("Bearer ", 1)[1].strip()
+    restored_owner = Store(restored).authenticate(restored_token)
+    assert ExperimentStore(restored).get_experiment(restored_owner, experiment_id) == exported
+    assert Store(restored).recovery_status(restored_owner)["state"] == "held_restore"
 
     designs = {item["revision"]: item for item in exported["designs"]}
     assert (designs[1]["goal"], designs[1]["success_criterion"]) == (None, None)
@@ -986,7 +1037,7 @@ def test_v27_to_v28_experiment_provenance_migration_rolls_back_complete_legacy_l
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 30
+    assert migrate_state(state) == 31
 
 
 def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:
@@ -1212,7 +1263,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         connection.execute("DROP TABLE migration_27_conclusion_evidence")
         connection.execute("DROP TABLE migration_27_conclusions")
         connection.execute("UPDATE schema_meta SET schema_version=26")
-    assert migrate_state(state) == 30
+    assert migrate_state(state) == 31
     migrated = ExperimentStore(state).get_experiment(owner, first["id"])
     migrated_designs = {item["revision"]: item for item in migrated["designs"]}
     assert migrated_designs[1]["goal"] is None
@@ -1220,6 +1271,32 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
     assert migrated_designs[2]["goal"] == second_design["goal"]
     assert migrated_designs[2]["success_criterion"] == second_design["success_criterion"]
     assert {item["design_revision"] for item in migrated["conclusions"]} == {1, 2}
+
+
+def test_v30_to_v31_binding_repair_rolls_back_and_preserves_authentic_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, _owner, _experiment_id, _attempt_id, _measurement_id = _legacy_experiment_state(
+        tmp_path, 29
+    )
+    database = state / "tessera.sqlite3"
+    with sqlite3.connect(database) as connection:
+        MIGRATIONS[29](connection)
+        connection.commit()
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 30
+        before = list(connection.iterdump())
+
+    def fail_after_binding_repair(connection: sqlite3.Connection) -> None:
+        migrate_v30_to_v31(connection)
+        raise RuntimeError("injected binding repair failure")
+
+    monkeypatch.setitem(MIGRATIONS, 30, fail_after_binding_repair)
+    with pytest.raises(RuntimeError, match="injected binding repair"):
+        migrate_state(state)
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+    monkeypatch.undo()
+    assert migrate_state(state) == 31
 
 
 def test_experiment_export_rejects_large_measurement_aggregate_before_materializing(

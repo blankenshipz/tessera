@@ -528,19 +528,19 @@ def test_explicit_v1_migration_preserves_records_approval_event_and_replay(
     )
     assert replay.status_code == 200
     assert replay.json()["status"] == "approved"
-    assert migrate_state(state) == 30
+    assert migrate_state(state) == 31
 
 
 def test_fresh_initialization_uses_latest_schema(state_dir: Path) -> None:
     with sqlite3.connect(state_dir / "tessera.sqlite3") as connection:
-        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 30
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 31
 
 
 def test_v2_migration_retains_only_bootstrap_owner_and_disables_legacy_agents(
     tmp_path: Path,
 ) -> None:
     state = _v2_state(tmp_path, with_agent=True)
-    assert migrate_state(state) == 30
+    assert migrate_state(state) == 31
     client = TestClient(create_app(state))
     assert client.get("/tasks/task", headers=_owner_headers(state)).status_code == 200
     agent = {"Authorization": "Bearer legacy-agent-token", "Idempotency-Key": "agent-create"}

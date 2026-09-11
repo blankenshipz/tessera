@@ -24,7 +24,7 @@ def test_online_backup_restore_holds_writes_but_keeps_reads(tmp_path: Path) -> N
     backup = tmp_path / "backup"
     manifest = backup_state(source, backup)
     assert set(entry.name for entry in backup.iterdir()) == {"manifest.json", "snapshot.sqlite3"}
-    assert manifest["schema_version"] == 30
+    assert manifest["schema_version"] == 31
     restored = tmp_path / "restored"
     database, header = restore_state(backup, restored)
     assert database.name == "tessera.sqlite3" and header.stat().st_mode & 0o777 == 0o600

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 30
+LATEST_SCHEMA_VERSION = 31
 LOCAL_ORG_ID = "org_local"
 
 
@@ -600,6 +600,19 @@ def migrate_v29_to_v30(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 30 WHERE singleton = 1")
 
 
+def migrate_v30_to_v31(connection: sqlite3.Connection) -> None:
+    """Repair the v30 bootstrap omission without changing experiment records.
+
+    v30 migrations created the immutable external-operation binding index, but
+    a fresh v30 database did not.  Reapply the idempotent binding helper so old
+    fresh databases and correctly migrated v30 databases converge.
+    """
+    from .external_operations import create_experiment_operation_binding_schema
+
+    create_experiment_operation_binding_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 31 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -630,6 +643,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     27: migrate_v27_to_v28,
     28: migrate_v28_to_v29,
     29: migrate_v29_to_v30,
+    30: migrate_v30_to_v31,
 }
 
 
