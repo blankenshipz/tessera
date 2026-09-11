@@ -18,6 +18,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tessera_control.api import create_app
+from tessera_control.experiments import ExperimentStore
+from tessera_control.recovery import backup_state, restore_state
 from tessera_control.snapshots import SnapshotStore
 from tessera_control.store import Store, canonical_digest, initialize_state
 from tessera_control.workspace import capture_workspace, inventory_digest
@@ -857,3 +859,12 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
         assert exported_body["conclusions"][0]["status"] == "reviewed"
         assert exported_body["conclusions"][0]["scientific_validity"] == "not_assessed"
         assert exported_body["artifacts"][0]["custody_state"] == "active"
+
+    backup, restored = tmp_path / "backup", tmp_path / "restored"
+    backup_state(state, backup)
+    restore_state(backup, restored)
+    held_token = (restored / "owner.header").read_text().split("Bearer ", 1)[1].strip()
+    held_owner = Store(restored).authenticate(held_token)
+    recovered = ExperimentStore(restored).get_experiment(held_owner, experiment["id"])
+    assert recovered["admitted_attempts"] == admitted
+    assert recovered["conclusions"][0]["id"] == reviewed["id"]
