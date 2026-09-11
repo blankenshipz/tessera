@@ -15,6 +15,7 @@ from tessera_control.store import Store, canonical_digest, initialize_state, mig
 from tessera_worker.kubernetes_contracts import (
     KubernetesClusterConfig,
     KubernetesJobBinding,
+    KubernetesNetworkPolicyEvidence,
     domain_identifier_from_resource_name,
     job_manifest,
     parse_job,
@@ -103,6 +104,9 @@ def test_control_issued_admitted_attempt_and_lease_bind_without_renaming(tmp_pat
         namespace="tessera-fixture",
         cluster_uid="cluster-fixture",
         namespace_uid="namespace-fixture",
+        network_none_evidence=KubernetesNetworkPolicyEvidence(
+            "network-policy-enforced-v1", "tessera-deny-all", "policy-fixture", "f" * 64
+        ),
     )
     manifest = job_manifest(binding, cluster)
     annotations = manifest["metadata"]["annotations"]

@@ -507,8 +507,13 @@ class ExecutionStore(Store):
                 spec = json.loads(spec_row["execution_spec_json"])
             except (TypeError, json.JSONDecodeError) as error:
                 raise Conflict("Task execution specification is invalid.") from error
-            if spec.get("profile") != "local-cpu" or spec.get("network_enabled") is not False:
-                raise Conflict("Task execution profile is not supported by the local CPU pilot.")
+            if (
+                spec.get("profile") not in {"local-cpu", "kubernetes-opencode"}
+                or spec.get("network_enabled") is not False
+            ):
+                raise Conflict(
+                    "Task execution profile is not supported by the execution package contract."
+                )
             expected_digest = spec.get("input_snapshot_digest")
             if not isinstance(expected_digest, str):
                 raise Conflict("Task input snapshot digest is invalid.")

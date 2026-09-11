@@ -54,18 +54,36 @@ class RuntimePackageStore(ExecutionStore):
         if canonical_digest(plan) != grant["plan_digest"]:
             raise Conflict("Approved execution plan checksum is invalid.")
         if (
-            spec["profile"] != "local-cpu"
-            or spec["network_enabled"] is not False
+            spec["network_enabled"] is not False
             or spec["pinned_skill_digests"]
             or spec["input_snapshot_digest"] != grant["snapshot_digest"]
             or spec["max_output_bytes"] > 16 * 1024 * 1024
         ):
-            raise Conflict("Execution plan exceeds the supported CPU package capabilities.")
+            raise Conflict("Execution plan exceeds the supported package capabilities.")
+        if spec["profile"] == "local-cpu":
+            adapter_version = "docker-local-cpu-v1"
+            profile_version = "local-cpu-v1"
+            operation_seed = "tessera-cpu-v1"
+        elif spec["profile"] == "kubernetes-opencode":
+            argv = spec["argv"]
+            if (
+                len(argv) > 32
+                or plan["max_duration_seconds"] > 3600
+                or any(not item or len(item.encode("utf-8")) > 4096 for item in argv)
+            ):
+                raise Conflict("Kubernetes workload exceeds the fixed adapter allowlist.")
+            adapter_version = "kubernetes-job-v1"
+            profile_version = "development-minikube-opencode-v1"
+            operation_seed = "tessera-kubernetes-v1"
+        else:
+            raise Conflict("Execution profile is not supported by the package contract.")
         package = {
             "version": 1,
-            "adapter_version": "docker-local-cpu-v1",
-            "profile_version": "local-cpu-v1",
-            "operation_id": hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32],
+            "adapter_version": adapter_version,
+            "profile_version": profile_version,
+            "operation_id": hashlib.sha256(f"{operation_seed}:{lease_id}".encode()).hexdigest()[
+                :32
+            ],
             "lease_id": lease_id,
             "grant_id": grant["id"],
             "worker_principal_id": worker["id"],
@@ -80,6 +98,17 @@ class RuntimePackageStore(ExecutionStore):
             "pinned_image": grant["pinned_image"],
             "hard_expires_at": lease["hard_expires_at"],
         }
+        if spec["profile"] == "kubernetes-opencode":
+            package.update(
+                org_id=worker["org_id"],
+                provider_enabled=False,
+                kubernetes_workload={
+                    "active_deadline_seconds": plan["max_duration_seconds"],
+                    "command": spec["argv"],
+                    "network_mode": "none",
+                },
+                output_paths=spec["output_paths"],
+            )
         package["docker_lookup_key"] = f"tessera-op-{package['operation_id']}"
         bound = connection.execute(
             "SELECT id FROM research_experiment_admitted_attempts WHERE grant_id=?", (grant["id"],)
@@ -190,6 +219,7 @@ class RuntimePackageStore(ExecutionStore):
         persistent_output_storage: Any = None,
         admitted_attempt_id: str | None = None,
         restart_intent: bool = False,
+        execution_adapter: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         if (
             not isinstance(lease_id, str)
@@ -197,6 +227,7 @@ class RuntimePackageStore(ExecutionStore):
             or type(expected_epoch) is not int
             or not 1 <= expected_epoch <= 2**63 - 1
             or type(restart_intent) is not bool
+            or execution_adapter not in {None, "local-cpu", "kubernetes-job"}
             or (
                 admitted_attempt_id is not None
                 and (
@@ -218,6 +249,8 @@ class RuntimePackageStore(ExecutionStore):
             )
         live_lease: dict[str, Any] = {}
         operation_request = {"expected_epoch": expected_epoch}
+        if execution_adapter is not None:
+            operation_request["execution_adapter"] = execution_adapter
         if admitted_attempt_id is not None:
             operation_request["admitted_attempt_id"] = admitted_attempt_id
         if persistent_output_collection:
@@ -236,6 +269,14 @@ class RuntimePackageStore(ExecutionStore):
             )
             live_lease.update(lease)
             package = metadata["package"]
+            requested_adapter = {
+                "local-cpu": "docker-local-cpu-v1",
+                "kubernetes-job": "kubernetes-job-v1",
+            }.get(execution_adapter)
+            if requested_adapter is not None and package["adapter_version"] != requested_adapter:
+                raise Conflict(
+                    "Requested execution adapter does not match the admitted task profile."
+                )
             operation, created = self._record_operation_intent(
                 connection, live, package, metadata["package_digest"], operation_request_digest
             )

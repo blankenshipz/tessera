@@ -48,7 +48,7 @@ class ExecutionSpec(StrictRequest):
     input_snapshot_digest: Sha256Digest
     pinned_skill_digests: Annotated[list[Sha256Digest], Field(max_length=128)]
     output_paths: Annotated[list[RawString4000], Field(max_length=128)]
-    profile: Literal["local-cpu"]
+    profile: Literal["local-cpu", "kubernetes-opencode"]
     network_enabled: Literal[False] = False
     max_output_bytes: StrictBytes
 

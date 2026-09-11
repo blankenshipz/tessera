@@ -293,6 +293,7 @@ def execution_package(
             body.persistent_output_storage,
             body.admitted_attempt_id,
             body.restart_intent is True,
+            body.execution_adapter,
         )
     )
 

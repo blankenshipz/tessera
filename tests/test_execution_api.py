@@ -177,7 +177,10 @@ def test_admission_cancellation_and_retained_exposure_through_http(tmp_path):
         "provider_terminated": True,
     }
     call("POST", f"/execution-grants/{grant['id']}/reconcile", settlement, 409)
-    call("POST", "/worker/observations", observation, 409, worker)
+    # Revocation fences starts and renewals, but the original authenticated worker
+    # may still preserve adverse forensic observations for reconciliation.
+    late = call("POST", "/worker/observations", observation, 201, worker)
+    assert late["desired_state"] == "cancel_requested"
     call(
         "POST",
         "/worker/observations",
