@@ -9,6 +9,7 @@ from tessera_worker.kubernetes_contracts import (
     KubernetesContractError,
     KubernetesJobBinding,
     KubernetesJobJournal,
+    KubernetesNetworkPolicyEvidence,
     KubernetesUnresolvedError,
     cluster_identity_digest,
     domain_identifier_from_resource_name,
@@ -32,6 +33,9 @@ def _cluster() -> KubernetesClusterConfig:
         namespace="tessera-fixture",
         cluster_uid="cluster-fixture",
         namespace_uid="namespace-fixture",
+        network_none_evidence=KubernetesNetworkPolicyEvidence(
+            "network-policy-enforced-v1", "tessera-deny-all", "policy-fixture", "f" * 64
+        ),
     )
 
 
@@ -158,6 +162,19 @@ def test_manifest_has_fixed_isolation_and_resource_fields() -> None:
     assert container["resources"]["limits"] == container["resources"]["requests"]
 
 
+def test_network_none_requires_explicit_target_capability_and_policy_evidence() -> None:
+    missing_evidence = KubernetesClusterConfig(
+        **{**_cluster().__dict__, "network_none_evidence": None}
+    )
+
+    with pytest.raises(KubernetesContractError, match="capability and enforcing-policy"):
+        job_manifest(_binding(), missing_evidence)
+
+    manifest = job_manifest(_binding(), _cluster())
+    assert manifest["metadata"]["annotations"]["tessera.dev/network-mode"] == "none"
+    assert manifest["metadata"]["annotations"]["tessera.dev/network-policy-uid"] == "policy-fixture"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -243,6 +260,11 @@ def test_malformed_or_unknown_observations_fail_closed() -> None:
     unknown = _job(binding)
     unknown["status"] = {"active": "maybe"}
     assert parse_job(unknown, binding, _cluster()).state == "unknown"
+
+    contradictory = _job(binding)
+    contradictory["status"] = {"active": 1, "succeeded": 1}
+    with pytest.raises(KubernetesContractError, match="contradictory"):
+        parse_job(contradictory, binding, _cluster())
 
     malformed_pod = _pod(binding)
     malformed_pod["metadata"]["ownerReferences"] = "not-a-list"

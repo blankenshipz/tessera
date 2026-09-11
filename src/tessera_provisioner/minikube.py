@@ -26,6 +26,7 @@ PLAN_VERSION = "local-minikube-provisioning-v1"
 PROFILE = "tessera-dev"
 NAMESPACE = "tessera-dev"
 PVC = "tessera-output"
+NETWORK_POLICY = "tessera-deny-all"
 MAX_OUTPUT_BYTES = 8_192
 MINIKUBE_TIMEOUT_SECONDS = 300
 KUBECTL_TIMEOUT_SECONDS = 20
@@ -68,6 +69,7 @@ class MinikubePlan:
     disk_mib: int
     namespace: str
     pvc: str
+    network_policy: str
     pvc_storage: str
     retain_resources: bool
     digest: str
@@ -83,6 +85,7 @@ class MinikubePlan:
             "disk_mib": 20_480,
             "namespace": NAMESPACE,
             "pvc": PVC,
+            "network_policy": NETWORK_POLICY,
             "pvc_storage": "1Gi",
             "retain_resources": True,
         }
@@ -141,6 +144,19 @@ def namespace_manifest() -> dict[str, object]:
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}}
 
 
+def network_policy_manifest() -> dict[str, object]:
+    """The sole target-local evidence used to admit network_mode=none Jobs."""
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": NETWORK_POLICY, "namespace": NAMESPACE},
+        "spec": {
+            "podSelector": {"matchLabels": {"app.kubernetes.io/managed-by": "tessera"}},
+            "policyTypes": ["Ingress", "Egress"],
+        },
+    }
+
+
 def planned_commands() -> tuple[tuple[str, ...], ...]:
     """Commands shown by dry run; manifest commands receive canonical JSON on stdin."""
     return (
@@ -160,6 +176,17 @@ def planned_commands() -> tuple[tuple[str, ...], ...]:
         _kubectl("--request-timeout=10s", "create", "-f", "-"),
         _kubectl(
             "--request-timeout=10s", "get", "pvc", PVC, "--namespace", NAMESPACE, "-o", "json"
+        ),
+        _kubectl("--request-timeout=10s", "create", "-f", "-"),
+        _kubectl(
+            "--request-timeout=10s",
+            "get",
+            "networkpolicy",
+            NETWORK_POLICY,
+            "--namespace",
+            NAMESPACE,
+            "-o",
+            "json",
         ),
         _kubectl("--request-timeout=10s", "create", "-f", "-"),
     )
@@ -376,11 +403,23 @@ class MinikubeProvisioner:
                 "plan_digest": plan.digest,
             }
         pvc_uid = _verify_pvc(pvc)
+        policy = self._get("networkpolicy", NETWORK_POLICY, namespace=NAMESPACE)
+        if policy is None:
+            return {
+                "state": "pvc_ready",
+                "cluster_uid": cluster_uid,
+                "namespace_uid": namespace_uid,
+                "pvc_uid": pvc_uid,
+                "plan_digest": plan.digest,
+            }
+        policy_uid = _verify_network_policy(policy)
         return {
             "state": "ready",
             "cluster_uid": cluster_uid,
             "namespace_uid": namespace_uid,
             "pvc_uid": pvc_uid,
+            "network_policy_uid": policy_uid,
+            "network_policy_spec_sha256": _digest(network_policy_manifest()["spec"]),
             "plan_digest": plan.digest,
             "retained": True,
         }
@@ -402,6 +441,7 @@ class MinikubeProvisioner:
         cluster_uid = self._verify_cluster()
 
         namespace = self._get("namespace", NAMESPACE)
+        self._assert_frozen_identity("cluster", cluster_uid, self._verify_cluster())
         if namespace is None:
             self._run(
                 _kubectl("--request-timeout=10s", "create", "-f", "-"),
@@ -412,9 +452,16 @@ class MinikubeProvisioner:
         if namespace is None:
             raise MinikubeProvisioningError("Approved namespace was not observable after creation.")
         namespace_uid = self._identity(namespace, "Namespace", NAMESPACE)
-        cluster_uid = self._verify_cluster()
+        self._assert_frozen_identity("cluster", cluster_uid, self._verify_cluster())
 
         pvc = self._get("pvc", PVC, namespace=NAMESPACE)
+        self._assert_frozen_identity("cluster", cluster_uid, self._verify_cluster())
+        current_namespace = self._get("namespace", NAMESPACE)
+        self._assert_frozen_identity(
+            "namespace",
+            namespace_uid,
+            self._identity(current_namespace or {}, "Namespace", NAMESPACE),
+        )
         if pvc is None:
             self._run(
                 _kubectl("--request-timeout=10s", "create", "-f", "-"),
@@ -425,9 +472,32 @@ class MinikubeProvisioner:
         if pvc is None:
             raise MinikubeProvisioningError("Approved PVC was not observable after creation.")
         pvc_uid = _verify_pvc(pvc)
-        cluster_uid = self._verify_cluster()
-        namespace_uid = self._identity(
-            self._get("namespace", NAMESPACE) or {}, "Namespace", NAMESPACE
+        self._assert_frozen_identity("cluster", cluster_uid, self._verify_cluster())
+        current_namespace = self._get("namespace", NAMESPACE)
+        self._assert_frozen_identity(
+            "namespace",
+            namespace_uid,
+            self._identity(current_namespace or {}, "Namespace", NAMESPACE),
+        )
+        policy = self._get("networkpolicy", NETWORK_POLICY, namespace=NAMESPACE)
+        if policy is None:
+            self._run(
+                _kubectl("--request-timeout=10s", "create", "-f", "-"),
+                timeout=KUBECTL_TIMEOUT_SECONDS,
+                input=canonical_json(network_policy_manifest()).decode("utf-8"),
+            )
+            policy = self._get("networkpolicy", NETWORK_POLICY, namespace=NAMESPACE)
+        if policy is None:
+            raise MinikubeProvisioningError(
+                "Network-none enforcing policy was not observable after creation."
+            )
+        policy_uid = _verify_network_policy(policy)
+        self._assert_frozen_identity("cluster", cluster_uid, self._verify_cluster())
+        current_namespace = self._get("namespace", NAMESPACE)
+        self._assert_frozen_identity(
+            "namespace",
+            namespace_uid,
+            self._identity(current_namespace or {}, "Namespace", NAMESPACE),
         )
         return {
             "state": "reconciled",
@@ -436,8 +506,18 @@ class MinikubeProvisioner:
             "cluster_uid": cluster_uid,
             "namespace_uid": namespace_uid,
             "pvc_uid": pvc_uid,
+            "network_policy_uid": policy_uid,
+            "network_policy_spec_sha256": _digest(network_policy_manifest()["spec"]),
             "retained": True,
         }
+
+    @staticmethod
+    def _assert_frozen_identity(kind: str, expected: str, observed: str) -> None:
+        if expected != observed:
+            raise MinikubeProvisioningError(
+                f"Minikube {kind} identity changed during bootstrap; "
+                "effects require reconciliation."
+            )
 
 
 def _quantity_mib(value: object) -> int | None:
@@ -474,6 +554,18 @@ def _verify_pvc(value: dict[str, Any]) -> str:
     requests = resources.get("requests") if isinstance(resources, dict) else None
     if not isinstance(requests, dict) or requests.get("storage") != "1Gi":
         raise MinikubeProvisioningError("PVC specification did not match the approved plan.")
+    return uid
+
+
+def _verify_network_policy(value: dict[str, Any]) -> str:
+    uid = MinikubeProvisioner._identity(value, "NetworkPolicy", NETWORK_POLICY, NAMESPACE)
+    if (
+        value.get("apiVersion") != "networking.k8s.io/v1"
+        or value.get("spec") != network_policy_manifest()["spec"]
+    ):
+        raise MinikubeProvisioningError(
+            "Network-none enforcing policy did not match the approved plan."
+        )
     return uid
 
 
@@ -609,10 +701,12 @@ __all__ = [
     "MinikubeProvisioner",
     "MinikubeProvisioningError",
     "NAMESPACE",
+    "NETWORK_POLICY",
     "PROFILE",
     "PVC",
     "ResultJournal",
     "planned_commands",
+    "network_policy_manifest",
     "prepare_result_journal",
     "record_result",
     "render_plan",

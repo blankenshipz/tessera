@@ -22,9 +22,11 @@ from .kubernetes_contracts import (
     KubernetesContractError,
     KubernetesJobBinding,
     KubernetesJobJournal,
+    KubernetesNetworkPolicyEvidence,
     KubernetesUnresolvedError,
     canonical_json,
     job_manifest,
+    parse_pod,
 )
 
 PROFILE = "development-minikube-opencode-v1"
@@ -36,6 +38,8 @@ _UID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _COMMAND_TIMEOUT_SECONDS = 15
 _WAIT_TIMEOUT_SECONDS = 90
 _MAX_OUTPUT_BYTES = 16 * 1024
+NETWORK_POLICY_CAPABILITY = "network-policy-enforced-v1"
+NETWORK_POLICY_SELECTOR = {"matchLabels": {"app.kubernetes.io/managed-by": "tessera"}}
 
 
 @dataclass(frozen=True)
@@ -53,12 +57,22 @@ class PersistentOutputTarget:
     namespace_uid: str
     pvc_uid: str
     pvc_spec_sha256: str
+    network_policy: str
+    network_policy_uid: str
+    network_policy_spec_sha256: str
+    network_none_capability: Literal["network-policy-enforced-v1"]
 
     def __post_init__(self) -> None:
         if not isinstance(self.pvc_uid, str) or not _UID.fullmatch(self.pvc_uid):
             raise ValueError("pvc_uid must be a bounded Kubernetes UID.")
         if not isinstance(self.pvc_spec_sha256, str) or not _DIGEST.fullmatch(self.pvc_spec_sha256):
             raise ValueError("pvc_spec_sha256 must be a SHA-256 digest.")
+        KubernetesNetworkPolicyEvidence(
+            self.network_none_capability,
+            self.network_policy,
+            self.network_policy_uid,
+            self.network_policy_spec_sha256,
+        )
 
     def cluster_config(self) -> KubernetesClusterConfig:
         return KubernetesClusterConfig(
@@ -72,12 +86,20 @@ class PersistentOutputTarget:
             namespace=self.namespace,
             cluster_uid=self.cluster_uid,
             namespace_uid=self.namespace_uid,
+            network_none_evidence=KubernetesNetworkPolicyEvidence(
+                self.network_none_capability,
+                self.network_policy,
+                self.network_policy_uid,
+                self.network_policy_spec_sha256,
+            ),
         )
 
 
 @dataclass(frozen=True)
 class FixtureResult:
-    state: Literal["planned", "succeeded", "skipped", "unavailable", "failed", "unresolved"]
+    state: Literal[
+        "planned", "succeeded", "smoke_only", "skipped", "unavailable", "failed", "unresolved"
+    ]
     message: str
     output: str | None = None
 
@@ -223,6 +245,7 @@ def run_fixture(
         observation = journal.reconcile_create(
             verified_binding, target.cluster_config(), inspect, fenced_create
         )
+        pods = _owned_pods(target, runner, verified_binding, observation.job_uid)
         logs = _bounded_text(
             _kubectl(
                 target,
@@ -248,9 +271,158 @@ def run_fixture(
     except (KubernetesContractError, ValueError, json.JSONDecodeError, TypeError):
         return FixtureResult("failed", "fixture Job response was malformed or conflicted.")
     output = f"PVC {target.pvc}:{target.output_mount}/{HELLO_PATH}"
-    if observation.state != "succeeded" or logs != HELLO_BYTES.decode():
+    if (
+        observation.state != "succeeded"
+        or not pods
+        or any(pod.state != "succeeded" for pod in pods)
+        or logs != HELLO_BYTES.decode()
+    ):
         return FixtureResult("failed", f"Job did not prove {output}; inspect Job logs manually.")
-    return FixtureResult("succeeded", f"verified {output}; logs contain hello world", output)
+    try:
+        retained = _authorized_readback(target, runner, verified_binding)
+    except (
+        KubernetesContractError,
+        _CommandFailure,
+        OSError,
+        subprocess.TimeoutExpired,
+        ValueError,
+    ):
+        return FixtureResult(
+            "smoke_only", f"narrow log smoke only for {output}; retained bytes were not verified."
+        )
+    if retained != HELLO_BYTES:
+        return FixtureResult(
+            "smoke_only", f"narrow log smoke only for {output}; retained bytes did not match."
+        )
+    return FixtureResult(
+        "succeeded", f"verified {output}; authorized post-exit readback matched exact bytes", output
+    )
+
+
+def _owned_pods(
+    target: PersistentOutputTarget,
+    runner: CommandRunner,
+    binding: KubernetesJobBinding,
+    job_uid: str,
+) -> list[object]:
+    """Validate every selected effective workload Pod, not its Job template alone."""
+    listing = _json_output(
+        _kubectl(
+            target,
+            runner,
+            "get",
+            "pods",
+            "--selector",
+            f"batch.kubernetes.io/controller-uid={job_uid}",
+            "-o",
+            "json",
+        )
+    )
+    items = listing.get("items")
+    if not isinstance(items, list) or not items:
+        raise KubernetesContractError("Kubernetes Job has no observable owned Pods.")
+    return [parse_pod(item, binding, target.cluster_config(), job_uid) for item in items]
+
+
+def _authorized_readback(
+    target: PersistentOutputTarget, runner: CommandRunner, binding: KubernetesJobBinding
+) -> bytes:
+    """Read retained bytes only through an explicitly authorized readback Pod."""
+    for resource in ("pods", "pods/exec"):
+        authorized = _bounded_text(
+            _kubectl(target, runner, "auth", "can-i", "create", resource).stdout
+        )
+        if authorized != "yes\n":
+            raise KubernetesContractError(
+                "Kubernetes does not explicitly authorize fixture readback."
+            )
+    name = f"tessera-readback-{binding.operation_id}"
+    _kubectl(
+        target,
+        runner,
+        "create",
+        "-f",
+        "-",
+        "-o",
+        "json",
+        input=json.dumps(_readback_manifest(target, binding, name)),
+    )
+    _kubectl(
+        target,
+        runner,
+        "wait",
+        "--for=condition=Ready",
+        f"pod/{name}",
+        "--timeout=30s",
+        command_timeout=35,
+    )
+    return _bounded_text(
+        _kubectl(
+            target,
+            runner,
+            "exec",
+            name,
+            "--",
+            "/bin/cat",
+            f"{target.output_mount}/{HELLO_PATH}",
+        ).stdout
+    ).encode()
+
+
+def _readback_manifest(
+    target: PersistentOutputTarget, binding: KubernetesJobBinding, name: str
+) -> dict[str, object]:
+    """A bounded read-only Pod used only after the workload Job has exited."""
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "labels": {"app.kubernetes.io/managed-by": "tessera"},
+            "name": name,
+            "namespace": target.namespace,
+        },
+        "spec": {
+            "activeDeadlineSeconds": 60,
+            "automountServiceAccountToken": False,
+            "containers": [
+                {
+                    "command": ["/bin/sh", "-ec", "sleep 45"],
+                    "image": binding.image,
+                    "imagePullPolicy": "Never",
+                    "name": "readback",
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                        "privileged": False,
+                        "readOnlyRootFilesystem": True,
+                        "runAsNonRoot": True,
+                        "runAsUser": 65532,
+                    },
+                    "volumeMounts": [
+                        {
+                            "mountPath": target.output_mount,
+                            "name": "persistent-output",
+                            "readOnly": True,
+                        }
+                    ],
+                }
+            ],
+            "enableServiceLinks": False,
+            "hostIPC": False,
+            "hostNetwork": False,
+            "hostPID": False,
+            "restartPolicy": "Never",
+            "securityContext": {
+                "runAsGroup": 65532,
+                "runAsNonRoot": True,
+                "runAsUser": 65532,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "volumes": [
+                {"name": "persistent-output", "persistentVolumeClaim": {"claimName": target.pvc}}
+            ],
+        },
+    }
 
 
 def _kubectl(
@@ -337,9 +509,20 @@ def _verify_target(
         _kubectl(target, runner, "get", "namespace", target.namespace, "-o", "json")
     )
     pvc = _json_output(_kubectl(target, runner, "get", "pvc", target.pvc, "-o", "json"))
+    policy = _json_output(
+        _kubectl(target, runner, "get", "networkpolicy", target.network_policy, "-o", "json")
+    )
     _verify_resource(cluster_anchor, "Namespace", "kube-system", target.cluster_uid)
     _verify_resource(namespace, "Namespace", target.namespace, target.namespace_uid)
     _verify_resource(pvc, "PersistentVolumeClaim", target.pvc, target.pvc_uid, target.namespace)
+    _verify_resource(
+        policy,
+        "NetworkPolicy",
+        target.network_policy,
+        target.network_policy_uid,
+        target.namespace,
+        api_version="networking.k8s.io/v1",
+    )
     spec = pvc.get("spec")
     if not isinstance(spec, Mapping):
         raise ValueError("PVC spec is malformed.")
@@ -351,6 +534,21 @@ def _verify_target(
         or binding.output_pvc_spec_sha256 != observed_spec_sha256
     ):
         raise KubernetesContractError("Job PVC binding conflicts with the verified target.")
+    if pvc.get("status", {}).get("phase") != "Bound":
+        raise KubernetesContractError("PVC is not bound for persistent output.")
+    policy_spec = policy.get("spec")
+    if (
+        not isinstance(policy_spec, Mapping)
+        or hashlib.sha256(canonical_json(policy_spec)).hexdigest()
+        != target.network_policy_spec_sha256
+        or policy_spec.get("podSelector") != NETWORK_POLICY_SELECTOR
+        or policy_spec.get("policyTypes") != ["Ingress", "Egress"]
+        or "ingress" in policy_spec
+        or "egress" in policy_spec
+    ):
+        raise KubernetesContractError(
+            "network-none enforcing policy conflicts with the explicit target."
+        )
     return replace(binding, output_pvc_spec_sha256=observed_spec_sha256)
 
 
@@ -360,10 +558,11 @@ def _verify_resource(
     name: str,
     uid: str,
     namespace: str | None = None,
+    api_version: str = "v1",
 ) -> None:
     metadata = resource.get("metadata")
     if (
-        resource.get("apiVersion") != "v1"
+        resource.get("apiVersion") != api_version
         or resource.get("kind") != kind
         or not isinstance(metadata, Mapping)
     ):

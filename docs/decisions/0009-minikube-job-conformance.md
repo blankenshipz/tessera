@@ -19,6 +19,11 @@ full durable domain IDs remain in annotations rather than being renamed for
 Kubernetes. Its single-container template is non-root, read-only-root,
 non-privileged, capability-dropped, token-disabled, host-namespace-disabled,
 and has no host mounts. `backoffLimit` is zero and `restartPolicy` is `Never`.
+`network_mode=none` additionally requires an explicit
+`network-policy-enforced-v1` target capability with enforcing NetworkPolicy name,
+UID, and canonical spec digest. The mode annotation alone is not admission
+evidence. The status parser rejects an observation that simultaneously reports
+positive active, succeeded, or failed counts.
 
 The contract parses only Jobs and owned Pods that reproduce the frozen identity
 and immutable template. It derives the provider identity from the observed
@@ -39,6 +44,10 @@ or pilot acceptance. It adds no control-plane schema/API, desktop route,
 provider credential, Kubernetes SDK, ambient configuration, or live-cluster
 call. The local journal is only a worker-side test seam; a future dispatch path
 must bind it to admitted authority and a reviewed durable operation journal.
+The persistent-output fixture validates observed owned Pods (including UID,
+effective spec and image), bound PVC identity, and exact post-exit bytes only by
+an explicitly authorized readback Pod. Logs without that readback are labelled
+narrow smoke evidence, not retained-output proof.
 
 Before any real profile is activated, Tessera still needs selected target and
 version pins, node enrollment/build and isolation evidence, credential and cost

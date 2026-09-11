@@ -149,6 +149,36 @@ def _server(value: object) -> str:
 
 
 @dataclass(frozen=True)
+class KubernetesNetworkPolicyEvidence:
+    """Observed target evidence for the network-none enforcement policy.
+
+    A Job annotation only records the requested mode.  Admission additionally
+    needs an explicit target capability and the identity/digest of the policy
+    which enforces it.
+    """
+
+    capability: Literal["network-policy-enforced-v1"]
+    policy_name: str
+    policy_uid: str
+    policy_spec_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.capability != "network-policy-enforced-v1":
+            raise ValueError("network-none capability evidence is unsupported.")
+        _kubernetes_name(self.policy_name, "network policy name")
+        _required_string(self.policy_uid, "network policy UID", _UID)
+        _digest(self.policy_spec_sha256, "network policy spec digest")
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "capability": self.capability,
+            "policy_name": self.policy_name,
+            "policy_spec_sha256": self.policy_spec_sha256,
+            "policy_uid": self.policy_uid,
+        }
+
+
+@dataclass(frozen=True)
 class KubernetesClusterConfig:
     """An explicit cluster/namespace identity; no current-context fallback exists."""
 
@@ -162,6 +192,7 @@ class KubernetesClusterConfig:
     namespace: str
     cluster_uid: str
     namespace_uid: str
+    network_none_evidence: KubernetesNetworkPolicyEvidence | None = None
 
     def __post_init__(self) -> None:
         kubeconfig = _required_string(self.kubeconfig, "kubeconfig")
@@ -177,6 +208,10 @@ class KubernetesClusterConfig:
         _kubernetes_name(self.namespace, "namespace")
         _required_string(self.cluster_uid, "cluster_uid", _UID)
         _required_string(self.namespace_uid, "namespace_uid", _UID)
+        if self.network_none_evidence is not None and not isinstance(
+            self.network_none_evidence, KubernetesNetworkPolicyEvidence
+        ):
+            raise ValueError("network_none_evidence must be explicit policy evidence.")
 
 
 @dataclass(frozen=True)
@@ -298,6 +333,11 @@ def cluster_identity_digest(cluster: KubernetesClusterConfig) -> str:
                 "kubeconfig_sha256": cluster.kubeconfig_sha256,
                 "namespace": cluster.namespace,
                 "namespace_uid": cluster.namespace_uid,
+                "network_none_evidence": (
+                    cluster.network_none_evidence.payload()
+                    if cluster.network_none_evidence is not None
+                    else None
+                ),
                 "profile": cluster.profile,
                 "server": cluster.server,
                 "server_sha256": cluster.server_sha256,
@@ -326,6 +366,10 @@ def job_manifest(
     binding: KubernetesJobBinding, cluster: KubernetesClusterConfig
 ) -> dict[str, object]:
     """Build the sole canonical Job shape for this conformance profile."""
+    if binding.network_mode == "none" and cluster.network_none_evidence is None:
+        raise KubernetesContractError(
+            "network_mode=none requires explicit target capability and enforcing-policy evidence."
+        )
     attempt_resource_name = kubernetes_resource_name(binding.attempt_id, "attempt_id")
     lease_resource_name = kubernetes_resource_name(binding.lease_id, "lease_id")
     operation_resource_name = kubernetes_resource_name(binding.operation_id, "operation_id")
@@ -353,6 +397,18 @@ def job_manifest(
         "tessera.dev/profile": cluster.profile,
         "tessera.dev/server-sha256": cluster.server_sha256,
     }
+    if binding.network_mode == "none":
+        assert cluster.network_none_evidence is not None
+        annotations.update(
+            {
+                "tessera.dev/network-policy-capability": cluster.network_none_evidence.capability,
+                "tessera.dev/network-policy-name": cluster.network_none_evidence.policy_name,
+                "tessera.dev/network-policy-spec-sha256": (
+                    cluster.network_none_evidence.policy_spec_sha256
+                ),
+                "tessera.dev/network-policy-uid": cluster.network_none_evidence.policy_uid,
+            }
+        )
     if binding.output_pvc_uid is not None:
         annotations["tessera.dev/output-pvc-uid"] = binding.output_pvc_uid
         annotations["tessera.dev/output-pvc-spec-sha256"] = binding.output_pvc_spec_sha256
@@ -668,6 +724,16 @@ def parse_job(
     status = observed.get("status", {})
     if not isinstance(status, Mapping):
         state: Literal["pending", "running", "succeeded", "failed", "unknown"] = "unknown"
+    elif (
+        sum(
+            type(status.get(key, 0)) is int and status.get(key, 0) > 0
+            for key in ("succeeded", "failed", "active")
+        )
+        > 1
+    ):
+        raise KubernetesContractError(
+            "Kubernetes Job status has contradictory active/succeeded/failed states."
+        )
     elif type(status.get("succeeded", 0)) is int and status.get("succeeded", 0) > 0:
         state = "succeeded"
     elif type(status.get("failed", 0)) is int and status.get("failed", 0) > 0:
@@ -991,6 +1057,7 @@ __all__ = [
     "KubernetesJobObservation",
     "KubernetesPodObservation",
     "KubernetesProviderIdentity",
+    "KubernetesNetworkPolicyEvidence",
     "KubernetesUnresolvedError",
     "canonical_json",
     "cluster_identity_digest",

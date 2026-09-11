@@ -9,6 +9,7 @@ from tessera_worker.kubernetes_provider import (
     JobBinding,
     KubernetesContractError,
     KubernetesJobJournal,
+    KubernetesNetworkPolicyEvidence,
     KubernetesUnresolvedError,
     canonical_job_spec,
     canonical_job_spec_digest,
@@ -32,6 +33,9 @@ def cluster() -> ClusterIdentity:
         namespace="tessera-fixture",
         cluster_uid="cluster-fixture",
         namespace_uid="namespace-fixture",
+        network_none_evidence=KubernetesNetworkPolicyEvidence(
+            "network-policy-enforced-v1", "tessera-deny-all", "policy-fixture", "f" * 64
+        ),
     )
 
 

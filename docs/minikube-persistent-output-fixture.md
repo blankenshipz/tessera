@@ -12,10 +12,21 @@ UIDs, PVC namespace/name, and canonical PVC spec digest must match the supplied
 target. The Job annotations bind that verified PVC UID/spec digest as well as its
 name; supplied hashes alone are never sufficient to create a Job.
 
+`network_mode=none` is admitted only with a caller-supplied explicit
+`network-policy-enforced-v1` target capability and a named NetworkPolicy
+UID/spec digest. The fixture reads that policy from the selected namespace and
+requires its exact Tessera-managed-Pod selector with empty ingress and egress
+rules. An annotation requesting `none` records the request; it is never
+enforcement evidence.
+
 The Job mounts only the supplied PVC at the supplied output mount, requires that
 mount to be empty, writes exactly `hello.txt` containing `hello world` followed
-by a newline, and prints it in the Job log. On success the script reports the
-human-readable PVC path, for example `PVC fixture-output:/persistent-output/hello.txt`.
+by a newline, and prints it in the Job log. After completion the fixture validates
+effective owned Pod UID/spec/image and PVC binding, then requires explicit
+`create pods` and `create pods/exec` authorization for a fixed read-only
+readback Pod. Only an exact post-exit readback of retained bytes is success. If
+that readback is absent, unauthorized, or differs, the nonzero result reports
+**narrow log smoke only**; logs never prove retained output.
 
 It never installs, starts, switches, creates, or deletes a cluster. Missing
 `kubectl`, Minikube, or Kubernetes `NotFound` prerequisites are reported as

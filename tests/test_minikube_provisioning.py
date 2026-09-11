@@ -11,6 +11,7 @@ import pytest
 from tessera_control import cli
 from tessera_provisioner.minikube import (
     NAMESPACE,
+    NETWORK_POLICY,
     PROFILE,
     PVC,
     CommandResult,
@@ -32,8 +33,10 @@ class FakeRunner:
             }
         }
         self.pvc: dict[str, object] | None = None
+        self.policy: dict[str, object] | None = None
         self.failure: str | None = None
         self.wrong_profile = False
+        self.replace_namespace_during_bootstrap = False
 
     def __call__(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
         self.calls.append(argv)
@@ -64,8 +67,15 @@ class FakeRunner:
             name = argv[argv.index(resource) + 1]
             if resource == "namespace":
                 value = self.namespaces.get(name)
+            elif resource == "networkpolicy":
+                value = self.policy if name == NETWORK_POLICY else None
             else:
                 value = self.pvc if name == PVC else None
+                if self.replace_namespace_during_bootstrap:
+                    self.namespaces[NAMESPACE] = {
+                        "kind": "Namespace",
+                        "metadata": {"name": NAMESPACE, "uid": "namespace-replaced"},
+                    }
             if value is None:
                 return CommandResult(argv, 1, "", "Error from server (NotFound): missing")
             return self._json(argv, value)
@@ -77,11 +87,23 @@ class FakeRunner:
                     "metadata": {"name": NAMESPACE, "uid": "namespace-1"},
                 }
             else:
-                self.pvc = {
-                    "kind": "PersistentVolumeClaim",
-                    "metadata": {"name": PVC, "namespace": NAMESPACE, "uid": "pvc-1"},
-                    "spec": manifest["spec"],
-                }
+                if manifest["kind"] == "PersistentVolumeClaim":
+                    self.pvc = {
+                        "kind": "PersistentVolumeClaim",
+                        "metadata": {"name": PVC, "namespace": NAMESPACE, "uid": "pvc-1"},
+                        "spec": manifest["spec"],
+                    }
+                else:
+                    self.policy = {
+                        "apiVersion": "networking.k8s.io/v1",
+                        "kind": "NetworkPolicy",
+                        "metadata": {
+                            "name": NETWORK_POLICY,
+                            "namespace": NAMESPACE,
+                            "uid": "policy-1",
+                        },
+                        "spec": manifest["spec"],
+                    }
             return CommandResult(argv, 0, "", "")
         raise AssertionError(argv)
 
@@ -99,7 +121,7 @@ def test_apply_sequences_profile_and_named_resources_then_replays_without_create
     create_indexes = [index for index, call in enumerate(runner.calls) if "create" in call]
     assert first["state"] == "reconciled"
     assert first["retained"] is True
-    assert len(create_indexes) == 2
+    assert len(create_indexes) == 3
     assert runner.calls[0] == ("minikube", "profile", "list", "--output=json")
     kubectl_calls = [call for call in runner.calls if "kubectl" in call]
     assert all(call[:4] == ("minikube", "--profile", PROFILE, "kubectl") for call in kubectl_calls)
@@ -108,6 +130,17 @@ def test_apply_sequences_profile_and_named_resources_then_replays_without_create
     replay = provisioner.apply(plan, plan.digest)
     assert replay["profile_created"] is False
     assert not any("create" in call for call in runner.calls[before_replay:])
+
+
+def test_apply_fails_closed_when_namespace_identity_is_replaced_during_bootstrap() -> None:
+    runner = FakeRunner()
+    runner.replace_namespace_during_bootstrap = True
+    plan = MinikubePlan.default()
+
+    with pytest.raises(MinikubeProvisioningError, match="namespace identity changed"):
+        MinikubeProvisioner(runner).apply(plan, plan.digest)
+
+    assert not any("networkpolicy" in call and "create" in call for call in runner.calls)
 
 
 def test_wrong_existing_profile_fails_closed_before_start_or_kubernetes_calls() -> None:

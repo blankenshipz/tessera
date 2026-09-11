@@ -11,6 +11,7 @@ import pytest
 from tessera_worker.kubernetes_contracts import KubernetesJobBinding, canonical_json
 from tessera_worker.minikube_persistent_output_fixture import (
     HELLO_BYTES,
+    NETWORK_POLICY_SELECTOR,
     FixtureResult,
     PersistentOutputTarget,
     fixture_exit_code,
@@ -24,6 +25,8 @@ PVC_SPEC = {
     "resources": {"requests": {"storage": "1Gi"}},
 }
 PVC_SPEC_SHA256 = hashlib.sha256(canonical_json(PVC_SPEC)).hexdigest()
+NETWORK_POLICY_SPEC = {"podSelector": NETWORK_POLICY_SELECTOR, "policyTypes": ["Ingress", "Egress"]}
+NETWORK_POLICY_SPEC_SHA256 = hashlib.sha256(canonical_json(NETWORK_POLICY_SPEC)).hexdigest()
 
 
 def target(tmp_path: Path) -> PersistentOutputTarget:
@@ -45,6 +48,10 @@ def target(tmp_path: Path) -> PersistentOutputTarget:
         "namespace-fixture",
         "pvc-fixture",
         PVC_SPEC_SHA256,
+        "tessera-deny-all",
+        "policy-fixture",
+        NETWORK_POLICY_SPEC_SHA256,
+        "network-policy-enforced-v1",
     )
 
 
@@ -71,6 +78,7 @@ class FakeRunner:
         self.calls: list[tuple[str, ...]] = []
         self.created = False
         self.failure: BaseException | None = None
+        self.missing_policy = False
         self.pvc: object = {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
@@ -80,6 +88,17 @@ class FakeRunner:
                 "uid": fixture_target.pvc_uid,
             },
             "spec": PVC_SPEC,
+            "status": {"phase": "Bound"},
+        }
+        self.policy: object = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": fixture_target.network_policy,
+                "namespace": fixture_target.namespace,
+                "uid": fixture_target.network_policy_uid,
+            },
+            "spec": NETWORK_POLICY_SPEC,
         }
 
     def __call__(self, argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -105,6 +124,12 @@ class FakeRunner:
             )
         if "get" in argv and "pvc" in argv:
             return self._result(self.pvc)
+        if "get" in argv and "networkpolicy" in argv:
+            if self.missing_policy:
+                raise subprocess.CalledProcessError(
+                    1, argv, stderr="Error from server (NotFound): networkpolicies missing"
+                )
+            return self._result(self.policy)
         if "get" in argv and "job" in argv:
             if not self.created:
                 raise subprocess.CalledProcessError(
@@ -114,14 +139,42 @@ class FakeRunner:
             observed["metadata"]["uid"] = "job-fixture"
             observed["status"] = {"succeeded": 1}
             return self._result(observed)
+        if "get" in argv and "pods" in argv:
+            template = fixture_manifest(self.target, self.binding)["spec"]["template"]
+            return self._result(
+                {
+                    "items": [
+                        {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                **template["metadata"],
+                                "namespace": self.target.namespace,
+                                "uid": "pod-fixture",
+                                "ownerReferences": [
+                                    {"kind": "Job", "uid": "job-fixture", "controller": True}
+                                ],
+                            },
+                            "spec": template["spec"],
+                            "status": {"phase": "Succeeded"},
+                        }
+                    ]
+                }
+            )
+        if "auth" in argv:
+            return subprocess.CompletedProcess(argv, 0, "yes\n", "")
         if "create" in argv:
-            self.created = True
             observed = json.loads(str(kwargs["input"]))
+            if observed["kind"] == "Pod":
+                return self._result(observed)
+            self.created = True
             observed["metadata"]["uid"] = "job-fixture"
             observed["status"] = {"succeeded": 1}
             return self._result(observed)
         if "logs" in argv:
             assert "--tail=1" in argv and "--limit-bytes=1024" in argv
+            return subprocess.CompletedProcess(argv, 0, HELLO_BYTES.decode(), "")
+        if "exec" in argv:
             return subprocess.CompletedProcess(argv, 0, HELLO_BYTES.decode(), "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -245,6 +298,21 @@ def test_not_found_and_malformed_pvc_skip_or_fail_without_creating(
     assert not any("create" in command for command in runner.calls)
 
 
+def test_missing_network_policy_skips_without_creating_a_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "tessera_worker.minikube_persistent_output_fixture.shutil.which", lambda _name: "/fixture"
+    )
+    runner = FakeRunner(target(tmp_path), binding())
+    runner.missing_policy = True
+
+    result = run_fixture(target(tmp_path), binding(), tmp_path / "policy.sqlite3", runner)
+
+    assert result.state == "skipped"
+    assert not any("create" in command for command in runner.calls)
+
+
 @pytest.mark.parametrize("field", ["cluster_uid", "namespace_uid", "pvc_uid", "pvc_spec_sha256"])
 def test_contacted_identity_and_pvc_spec_must_match_before_create(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
@@ -278,3 +346,66 @@ def test_exit_status_reserves_zero_for_verified_fixture_not_a_skip() -> None:
     assert fixture_exit_code(FixtureResult("succeeded", "verified")) == 0
     assert fixture_exit_code(FixtureResult("skipped", "missing")) == 2
     assert fixture_exit_code(FixtureResult("failed", "failed")) == 1
+
+
+@pytest.mark.parametrize("output", [b"wrong\n", b""])
+def test_wrong_or_missing_readback_is_narrow_log_smoke_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: bytes
+) -> None:
+    monkeypatch.setattr(
+        "tessera_worker.minikube_persistent_output_fixture.shutil.which", lambda _name: "/fixture"
+    )
+    runner = FakeRunner(target(tmp_path), binding())
+    original = runner.__call__
+
+    def wrong_readback(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "exec" in argv:
+            return subprocess.CompletedProcess(argv, 0, output.decode(), "")
+        return original(argv, **kwargs)
+
+    result = run_fixture(target(tmp_path), binding(), tmp_path / "journal.sqlite3", wrong_readback)
+
+    assert result.state == "smoke_only"
+    assert "narrow log smoke only" in result.message
+
+
+def test_effective_pod_mutation_fails_before_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "tessera_worker.minikube_persistent_output_fixture.shutil.which", lambda _name: "/fixture"
+    )
+    runner = FakeRunner(target(tmp_path), binding())
+    original = runner._result
+
+    def mutated_result(value: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(value, dict) and "items" in value:
+            value["items"][0]["spec"]["containers"][0]["image"] = "unsafe:latest"
+        return original(value)
+
+    runner._result = mutated_result  # type: ignore[method-assign]
+    result = run_fixture(target(tmp_path), binding(), tmp_path / "journal.sqlite3", runner)
+
+    assert result.state == "failed"
+    assert "malformed or conflicted" in result.message
+
+
+def test_foreign_effective_pod_fails_before_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "tessera_worker.minikube_persistent_output_fixture.shutil.which", lambda _name: "/fixture"
+    )
+    runner = FakeRunner(target(tmp_path), binding())
+    original = runner._result
+
+    def foreign_result(value: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(value, dict) and "items" in value:
+            value["items"][0]["metadata"]["ownerReferences"][0]["uid"] = "other-job"
+        return original(value)
+
+    runner._result = foreign_result  # type: ignore[method-assign]
+    result = run_fixture(target(tmp_path), binding(), tmp_path / "journal.sqlite3", runner)
+
+    assert result.state == "failed"
+    assert "malformed or conflicted" in result.message

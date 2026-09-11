@@ -34,6 +34,10 @@ def main() -> int:
         "namespace-uid",
         "pvc-uid",
         "pvc-spec-sha256",
+        "network-policy",
+        "network-policy-uid",
+        "network-policy-spec-sha256",
+        "network-none-capability",
         "operation-id",
         "attempt-id",
         "lease-id",
@@ -58,6 +62,10 @@ def main() -> int:
         namespace_uid=args.namespace_uid,
         pvc_uid=args.pvc_uid,
         pvc_spec_sha256=args.pvc_spec_sha256,
+        network_policy=args.network_policy,
+        network_policy_uid=args.network_policy_uid,
+        network_policy_spec_sha256=args.network_policy_spec_sha256,
+        network_none_capability=args.network_none_capability,
     )
     if args.profile != PROFILE:
         parser.error(f"--profile must be {PROFILE}")
