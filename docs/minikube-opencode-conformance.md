@@ -14,8 +14,11 @@ no default namespace, current-context fallback, environment lookup, or kubeconfi
 read.
 
 The canonical `batch/v1` Job has a deterministic operation-derived name and a
-digest-pinned image. It carries Tessera operation, attempt, lease, epoch, and
-package identity in labels/annotations, freezes a canonical spec digest, uses
+digest-pinned image. Domain IDs are not Kubernetes identifiers: label values use
+a canonical reversible DNS-label-safe encoding, while full unmodified operation,
+admitted-attempt, and lease IDs are immutable annotations. This preserves
+control-issued IDs containing underscores without renaming history. The Job
+freezes a canonical spec digest, uses
 one bounded non-root container, has resource requests equal to limits, and sets
 an active deadline. It forbids restart retries, privilege escalation,
 capabilities, service-account token automounting, host networking/PID/IPC, host

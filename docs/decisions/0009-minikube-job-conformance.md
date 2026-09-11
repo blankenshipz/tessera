@@ -14,7 +14,9 @@ or instantiates a Kubernetes client.
 The builder accepts only digest-pinned images and fixed bounded command,
 deadline, CPU, memory, and ephemeral-storage inputs. It derives one canonical
 Job name and immutable operation/attempt/lease/epoch/package labels and
-annotations. Its single-container template is non-root, read-only-root,
+annotations. Resource names and label values use a reversible DNS-safe encoding;
+full durable domain IDs remain in annotations rather than being renamed for
+Kubernetes. Its single-container template is non-root, read-only-root,
 non-privileged, capability-dropped, token-disabled, host-namespace-disabled,
 and has no host mounts. `backoffLimit` is zero and `restartPolicy` is `Never`.
 

@@ -11,8 +11,10 @@ from tessera_worker.kubernetes_contracts import (
     KubernetesJobJournal,
     KubernetesUnresolvedError,
     cluster_identity_digest,
+    domain_identifier_from_resource_name,
     job_manifest,
     job_manifest_digest,
+    kubernetes_resource_name,
     parse_job,
     parse_pod,
 )
@@ -92,8 +94,42 @@ def test_explicit_identity_and_digest_pinned_manifest_are_deterministic() -> Non
         cluster_identity_digest(_cluster())
     )
     for key in ("operation", "attempt", "lease", "epoch"):
-        assert f"tessera.dev/{key}" in manifest["metadata"]["annotations"]
         assert f"tessera.dev/{key}" in manifest["metadata"]["labels"]
+
+
+def test_domain_identifiers_are_reversibly_encoded_for_labels_and_preserved_in_annotations() -> (
+    None
+):
+    binding = _binding(
+        attempt_id="experiment_admitted_attempt_" + "a" * 32,
+        lease_id="lease_" + "b" * 32,
+    )
+    manifest = job_manifest(binding, _cluster())
+    metadata = manifest["metadata"]
+    annotations = metadata["annotations"]
+    labels = metadata["labels"]
+
+    assert len(binding.attempt_id) == 60 and "_" in binding.attempt_id
+    assert annotations["tessera.dev/attempt-id"] == binding.attempt_id
+    assert annotations["tessera.dev/lease-id"] == binding.lease_id
+    assert annotations["tessera.dev/operation-id"] == binding.operation_id
+    for field, identifier in (("attempt", binding.attempt_id), ("lease", binding.lease_id)):
+        encoded = kubernetes_resource_name(identifier)
+        assert labels[f"tessera.dev/{field}"] == encoded
+        assert annotations[f"tessera.dev/{field}-resource-name"] == encoded
+        assert domain_identifier_from_resource_name(encoded) == identifier
+    assert parse_job(_job(binding), binding, _cluster()).state == "running"
+
+    tampered = _job(binding)
+    tampered["metadata"]["annotations"]["tessera.dev/attempt-id"] = "renamed-attempt"
+    with pytest.raises(KubernetesContractError, match="labels, or annotations conflict"):
+        parse_job(tampered, binding, _cluster())
+
+
+@pytest.mark.parametrize("value", ["-bad", "bad-", "bad-9", "bad-3zz"])
+def test_resource_name_decoder_rejects_noncanonical_values(value: str) -> None:
+    with pytest.raises(ValueError):
+        domain_identifier_from_resource_name(value)
 
 
 def test_manifest_has_fixed_isolation_and_resource_fields() -> None:

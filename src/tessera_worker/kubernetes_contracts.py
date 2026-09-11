@@ -59,6 +59,79 @@ def _kubernetes_name(value: object, field: str) -> str:
     return name
 
 
+def kubernetes_resource_name(value: object, field: str = "identifier") -> str:
+    """Encode one domain identifier as a reversible DNS-label-safe resource value.
+
+    Control-plane IDs are durable domain values, not Kubernetes names.  The
+    narrow escape alphabet keeps the IDs currently issued by control (including
+    underscores) reversible while retaining Kubernetes' 63-byte DNS-label
+    bound.  The original, unmodified values are carried in annotations.
+    """
+    identifier = _required_string(value, field, _UID)
+    encoded: list[str] = []
+    for character in identifier:
+        if "a" <= character <= "z" or "0" <= character <= "9":
+            encoded.append(character)
+        elif character == "-":
+            encoded.append("--")
+        elif character == "_":
+            encoded.append("-0")
+        elif character == ".":
+            encoded.append("-1")
+        elif character == ":":
+            encoded.append("-2")
+        else:
+            # _UID admits only ASCII upper-case letters beyond the cases above.
+            encoded.append(f"-3{ord(character):02x}")
+    name = "".join(encoded)
+    if len(name) > 63:
+        raise ValueError(f"{field} cannot be represented as a Kubernetes resource name.")
+    return _kubernetes_name(name, field)
+
+
+def domain_identifier_from_resource_name(value: object, field: str = "resource name") -> str:
+    """Decode and canonicality-check :func:`kubernetes_resource_name` output."""
+    name = _kubernetes_name(value, field)
+    decoded: list[str] = []
+    index = 0
+    while index < len(name):
+        character = name[index]
+        if character != "-":
+            decoded.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(name):
+            raise ValueError(f"{field} is not a canonical encoded resource name.")
+        code = name[index + 1]
+        if code == "-":
+            decoded.append("-")
+            index += 2
+        elif code == "0":
+            decoded.append("_")
+            index += 2
+        elif code == "1":
+            decoded.append(".")
+            index += 2
+        elif code == "2":
+            decoded.append(":")
+            index += 2
+        elif code == "3" and index + 3 < len(name):
+            try:
+                character = chr(int(name[index + 2 : index + 4], 16))
+            except ValueError as error:
+                raise ValueError(f"{field} is not a canonical encoded resource name.") from error
+            if not "A" <= character <= "Z":
+                raise ValueError(f"{field} is not a canonical encoded resource name.")
+            decoded.append(character)
+            index += 4
+        else:
+            raise ValueError(f"{field} is not a canonical encoded resource name.")
+    identifier = "".join(decoded)
+    if kubernetes_resource_name(identifier, field) != name:
+        raise ValueError(f"{field} is not a canonical encoded resource name.")
+    return identifier
+
+
 def _server(value: object) -> str:
     if not isinstance(value, str) or len(value.encode("utf-8")) > 512:
         raise ValueError("server must be a bounded explicit HTTPS endpoint.")
@@ -129,8 +202,8 @@ class KubernetesJobBinding:
 
     def __post_init__(self) -> None:
         _required_string(self.operation_id, "operation_id", _OPERATION)
-        _kubernetes_name(self.attempt_id, "attempt_id")
-        _kubernetes_name(self.lease_id, "lease_id")
+        kubernetes_resource_name(self.attempt_id, "attempt_id")
+        kubernetes_resource_name(self.lease_id, "lease_id")
         if type(self.epoch) is not int or not 1 <= self.epoch <= 2**31 - 1:
             raise ValueError("epoch must be a positive integer.")
         _digest(self.package_sha256, "package_sha256")
@@ -253,23 +326,29 @@ def job_manifest(
     binding: KubernetesJobBinding, cluster: KubernetesClusterConfig
 ) -> dict[str, object]:
     """Build the sole canonical Job shape for this conformance profile."""
+    attempt_resource_name = kubernetes_resource_name(binding.attempt_id, "attempt_id")
+    lease_resource_name = kubernetes_resource_name(binding.lease_id, "lease_id")
+    operation_resource_name = kubernetes_resource_name(binding.operation_id, "operation_id")
     labels = {
         "app.kubernetes.io/managed-by": "tessera",
-        "tessera.dev/attempt": binding.attempt_id,
+        "tessera.dev/attempt": attempt_resource_name,
         "tessera.dev/epoch": str(binding.epoch),
-        "tessera.dev/lease": binding.lease_id,
-        "tessera.dev/operation": binding.operation_id,
+        "tessera.dev/lease": lease_resource_name,
+        "tessera.dev/operation": operation_resource_name,
     }
     annotations = {
-        "tessera.dev/attempt": binding.attempt_id,
+        "tessera.dev/attempt-id": binding.attempt_id,
+        "tessera.dev/attempt-resource-name": attempt_resource_name,
         "tessera.dev/ca-sha256": cluster.ca_sha256,
         "tessera.dev/cluster-config-sha256": cluster_identity_digest(cluster),
         "tessera.dev/cluster-uid": cluster.cluster_uid,
         "tessera.dev/epoch": str(binding.epoch),
-        "tessera.dev/lease": binding.lease_id,
+        "tessera.dev/lease-id": binding.lease_id,
+        "tessera.dev/lease-resource-name": lease_resource_name,
         "tessera.dev/namespace-uid": cluster.namespace_uid,
         "tessera.dev/network-mode": binding.network_mode,
-        "tessera.dev/operation": binding.operation_id,
+        "tessera.dev/operation-id": binding.operation_id,
+        "tessera.dev/operation-resource-name": operation_resource_name,
         "tessera.dev/package-sha256": binding.package_sha256,
         "tessera.dev/profile": cluster.profile,
         "tessera.dev/server-sha256": cluster.server_sha256,
@@ -915,8 +994,10 @@ __all__ = [
     "KubernetesUnresolvedError",
     "canonical_json",
     "cluster_identity_digest",
+    "domain_identifier_from_resource_name",
     "job_manifest",
     "job_manifest_digest",
+    "kubernetes_resource_name",
     "parse_job",
     "parse_pod",
 ]
