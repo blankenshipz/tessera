@@ -160,7 +160,7 @@ def test_fake_fault_reconciles_and_manifest_waits_for_placement(tmp_path: Path) 
         )[0]
         == 201
     )
-    with pytest.raises(StoreError, match="cannot omit"):
+    with pytest.raises(StoreError, match="placement metadata"):
         backup_state(state, tmp_path / "backup")
 
 

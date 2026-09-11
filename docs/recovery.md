@@ -3,11 +3,16 @@
 Schema 11 supports consistent local SQLite control-state backups. This recovery
 slice preserves history for inspection; it does not provide operational failover.
 
-Schema-v24 project objects are outside SQLite. Until backup/restore bundles and
-verifies them, backup fails closed when committed project placements exist; restore
-never invents placement and held/referenced retention never triggers deletion.
-Retention metadata records manual tombstones, deletion intent, activity, and
-degraded/missing-object incidents; it never starts deletion automatically.
+Schema-v24 local filesystem project objects are outside SQLite. Current backups
+use a versioned bundle when a committed local object exists: one SQLite snapshot,
+the exact referenced object bytes, and a declaration of their custody/retention
+metadata and SQLite-only legacy artifacts. Object namespaces and keys are verified
+against the snapshot, then their regular-file size and SHA-256 are checked before
+publication and again during restore. A deleted object is declared as unavailable;
+it is never fabricated. A missing, corrupt, substituted, or unsafe required object
+fails the backup or restore closed. Retention metadata records manual tombstones,
+deletion intent, activity, and degraded/missing-object incidents; it never starts
+deletion automatically.
 
 Create a backup while the local control service is running:
 
@@ -15,19 +20,23 @@ Create a backup while the local control service is running:
 uv run --locked tessera backup --state-dir .tessera --output /safe/place/tessera-backup
 ```
 
-`--output` must name a new directory. Tessera creates it privately and writes only
-`snapshot.sqlite3` and `manifest.json`. SQLite's online backup API makes a
-consistent point-in-time copy while the source may continue to accept work. It
-includes control records and retained SQLite BLOBs, including quarantined artifacts,
-upload state, labbook history, execution/accounting history, and research records.
-It does not copy `owner.header`, SQLite journals, provider jobs, or runtime journals
-outside the control database.
+`--output` must name a new directory. Tessera creates it privately. SQLite-only
+backups retain the original `snapshot.sqlite3` and `manifest.json` layout. A bundle
+with local project objects additionally contains private `objects/` bytes and a
+format-v2 manifest. SQLite's online backup API makes one consistent point-in-time
+copy while the source may continue to accept work. It includes control records and
+retained SQLite BLOBs, artifact manifests, custody/retention metadata, research
+links, upload state, labbook history, and execution/accounting history. It does not
+copy `owner.header`, SQLite journals, provider jobs, or runtime journals outside the
+control database.
 
 The manifest records the backup ID, time, schema version, event watermark, snapshot
-size, and SHA-256 digest. Backup validates integrity and foreign keys before
-publishing the manifest. The 1 GiB size limit and 30-second deadline are cooperative
-limits; an in-progress kernel I/O operation cannot be preempted. Failed attempts
-leave their private incomplete output directory for diagnosis.
+size, and SHA-256 digest. Bundle manifests additionally declare every external
+object and every SQLite-only legacy artifact. Backup validates integrity and foreign
+keys before publishing the manifest. The 1 GiB total bundle limit, 1,024-object
+limit, 16 MiB per-object limit, and 30-second deadline are cooperative limits; an
+in-progress kernel I/O operation cannot be preempted. Failed attempts leave their
+private incomplete output directory for diagnosis.
 
 Restore only into an absent destination:
 
@@ -35,8 +44,9 @@ Restore only into an absent destination:
 uv run --locked tessera restore --backup /safe/place/tessera-backup --state-dir /safe/place/tessera-restored
 ```
 
-Restore rejects incomplete, altered, unsupported, symlinked, or unsafe inputs and
-refuses existing destinations. It validates the copied snapshot before publishing
+Restore rejects incomplete, altered, unsupported, symlinked, hard-linked, FIFO, or
+unsafe inputs and refuses existing destinations. It validates the copied snapshot,
+the bundle declaration, and all required external object hashes before publishing
 the new database. The destination receives a new private `owner.header`; its token
 is not printed. Every restored principal and credential is revoked, including prior
 owner, human-session, control-agent, and worker credentials.
@@ -50,7 +60,8 @@ Restore does not stop or fence the original control service, workers, or provide
 jobs. The original branch is unfenced and post-backup activity is unknown to the
 restored copy. Historical grants, leases, observations, reservations, settlements,
 and accounting remain records; they do not prove provider termination or reconciled
-spend. Reconcile external operations before considering replacement work.
+spend. The held copy has no dispatch, lease-renewal, replay, or cleanup authority.
+Reconcile external operations before considering replacement work.
 
 If restore fails, Tessera leaves its private incomplete destination in place rather
 than deleting a path that may contain evidence. Do not reuse it as a restore target.
