@@ -10,6 +10,10 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
+# This order makes returned evidence deterministic. It is presentation order,
+# never authority precedence for evidence at an equal observed time.
+RECONCILIATION_SOURCE_ORDER = ("receipt", "worker")
+
 
 def create_external_operation_schema(connection: sqlite3.Connection) -> None:
     """Install v18 operation intent records without fabricating legacy history."""
@@ -119,7 +123,8 @@ def current_operation_reconciliation(
     monotonically increasing receipt observation sequence.  Cross-source order is
     by ``observed_at`` only.  At the same timestamp no source is preferred: an
     ``unknown``, ``running``, or unconfirmed exit contradicts a confirmed exit and
-    therefore blocks terminal reconciliation.
+    therefore blocks terminal reconciliation. ``contradiction_state`` explicitly
+    distinguishes an equal-time conflict from a later adverse observation.
     """
     worker = connection.execute(
         """SELECT id,observed_state,observed_at,termination_confirmed FROM execution_observations
@@ -158,10 +163,29 @@ def current_operation_reconciliation(
     def observed_time(item: dict[str, object]) -> datetime:
         return datetime.fromisoformat(str(item["observed_at"]).replace("Z", "+00:00"))
 
+    source_rank = {source: rank for rank, source in enumerate(RECONCILIATION_SOURCE_ORDER)}
+    sources.sort(
+        key=lambda item: (
+            observed_time(item),
+            source_rank[str(item["source"])],
+            str(item["cursor"]),
+        )
+    )
     latest_time = max(observed_time(item) for item in sources)
     latest = [item for item in sources if observed_time(item) == latest_time]
     latest_at = str(latest[0]["observed_at"])
-    if all(item["observed_state"] == "exited" and item["termination_confirmed"] for item in latest):
+
+    def confirmed_exit(item: dict[str, object]) -> bool:
+        return item["observed_state"] == "exited" and bool(item["termination_confirmed"])
+
+    latest_confirmed_exit = all(confirmed_exit(item) for item in latest)
+    adverse_latest = any(
+        item["observed_state"] != "exited" or not item["termination_confirmed"] for item in latest
+    )
+    prior_confirmed_exit = any(
+        observed_time(item) < latest_time and confirmed_exit(item) for item in sources
+    )
+    if latest_confirmed_exit:
         observed_state, termination_confirmed = "exited", True
     elif any(item["observed_state"] == "unknown" for item in latest):
         observed_state, termination_confirmed = "unknown", False
@@ -169,6 +193,15 @@ def current_operation_reconciliation(
         observed_state, termination_confirmed = "running", False
     else:
         observed_state, termination_confirmed = "exited", False
+    contradiction_state = (
+        "same_time_contradiction"
+        if adverse_latest and any(confirmed_exit(item) for item in latest)
+        else "later_adverse_observation"
+        if adverse_latest and prior_confirmed_exit
+        else "unconfirmed_current_observation"
+        if adverse_latest
+        else "none"
+    )
     cursor = (
         str(latest[0]["cursor"])
         if len(latest) == 1
@@ -180,4 +213,6 @@ def current_operation_reconciliation(
         "termination_confirmed": termination_confirmed,
         "cursor": cursor,
         "sources": sources,
+        "source_order": list(RECONCILIATION_SOURCE_ORDER),
+        "contradiction_state": contradiction_state,
     }

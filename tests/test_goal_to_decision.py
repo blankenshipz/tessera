@@ -21,6 +21,7 @@ from tessera_control.experiments import (
 from tessera_control.external_operations import (
     create_external_operation_receipt_schema,
     create_external_operation_schema,
+    current_operation_reconciliation,
 )
 from tessera_control.migrations import MIGRATIONS, migrate_v27_to_v28, migrate_v30_to_v31
 from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
@@ -928,6 +929,11 @@ def test_same_time_receipt_contradiction_is_fail_closed(tmp_path: Path) -> None:
     current = records.get_experiment(owner, admitted["experiment_id"])["admitted_attempts"][0]
     assert current["operational_observed_state"] == "unknown"
     assert current["operational_observation_cursor"].startswith("reconciliation:")
+    with _connect(_state / "tessera.sqlite3") as connection:
+        reconciliation = current_operation_reconciliation(connection, operation_id)
+    assert reconciliation is not None
+    assert reconciliation["source_order"] == ["receipt", "worker"]
+    assert reconciliation["contradiction_state"] == "same_time_contradiction"
     with pytest.raises(Conflict, match="confirmed attributed terminal observation"):
         _command(
             records.resolve_admitted_attempt,
@@ -1048,10 +1054,10 @@ def test_admitted_confirmed_exit_preserves_separate_operational_and_human_record
     _command(execution.report_external_operation_receipt, worker, operation_id, payload=receipt)
     if outcome == "cancelled":
         execution.revoke_execution_grant(owner, grant["id"], "revoke", "revoke", 1)
-        with pytest.raises(Conflict, match="only confirmed termination"):
-            _command(
-                execution.report_external_operation_receipt, worker, operation_id, payload=receipt
-            )
+        reported = _command(
+            execution.report_external_operation_receipt, worker, operation_id, payload=receipt
+        )
+        assert reported["observed_state"] == "running"
         with pytest.raises(Conflict, match="epoch"):
             _command(
                 execution.report_external_operation_receipt,
@@ -1101,9 +1107,20 @@ def test_admitted_confirmed_exit_preserves_separate_operational_and_human_record
     assert final["operational_state"] == "interrupted"
     assert final["operational_observed_state"] == "exited"
     assert final["state_history"][-1]["state"] == outcome
+    if outcome == "cancelled":
+        adverse = confirmed | {
+            "observed_state": "unknown",
+            "termination_confirmed": False,
+            "observed_at": (datetime.now(UTC) + timedelta(milliseconds=1)).isoformat(),
+        }
+        _command(execution.report_external_operation_receipt, worker, operation_id, payload=adverse)
+        late = records.get_experiment(owner, experiment["id"])["admitted_attempts"][0]
+        assert late["human_outcome"] == final["human_outcome"]
+        assert late["operational_observed_state"] == "unknown"
+        assert late["state_history"][-1]["observed_state"] == "unknown"
 
 
-def test_revocation_allows_only_original_confirmed_termination_reconciliation(
+def test_revocation_records_original_adverse_observations_without_new_authority(
     tmp_path: Path,
 ) -> None:
     state, execution, owner, worker, grant, lease = _delivery(tmp_path)
@@ -1126,25 +1143,52 @@ def test_revocation_allows_only_original_confirmed_termination_reconciliation(
         "provider_id": "revoke-synthetic-provider",
         "termination_confirmed": False,
     }
-    with pytest.raises(Conflict, match="only confirmed termination"):
-        _command(execution.report_execution_observation, worker, lease["id"], payload=unknown)
-    confirmed = unknown | {"observed_state": "exited", "termination_confirmed": True}
+    reported = _command(
+        execution.report_execution_observation, worker, lease["id"], payload=unknown
+    )
+    assert reported["desired_state"] == "cancel_requested"
+    with pytest.raises(Conflict, match="Current operation reconciliation"):
+        _command(
+            execution.reconcile_execution_grant,
+            owner,
+            grant["id"],
+            payload={
+                "expected_revision": revoked["revision"],
+                "settlement_cents": 0,
+                "provider_terminated": True,
+            },
+        )
+    confirmed = unknown | {
+        "observed_state": "exited",
+        "termination_confirmed": True,
+        "observed_at": (datetime.now(UTC) + timedelta(milliseconds=1)).isoformat(),
+    }
     _, observation = execution.report_execution_observation(
         worker, lease["id"], "revoked-confirmed", canonical_digest(confirmed), confirmed
     )
     assert observation["desired_state"] == "cancel_requested"
-    _, reconciled = execution.reconcile_execution_grant(
-        owner,
-        grant["id"],
-        "reconcile",
-        "reconcile",
-        {
-            "expected_revision": revoked["revision"],
-            "settlement_cents": 0,
-            "provider_terminated": True,
-        },
+    running = unknown | {
+        "observed_state": "running",
+        "observed_at": (datetime.now(UTC) + timedelta(milliseconds=2)).isoformat(),
+    }
+    _command(execution.report_execution_observation, worker, lease["id"], payload=running)
+    with pytest.raises(Conflict, match="Current operation reconciliation"):
+        _command(
+            execution.reconcile_execution_grant,
+            owner,
+            grant["id"],
+            payload={
+                "expected_revision": revoked["revision"],
+                "settlement_cents": 0,
+                "provider_terminated": True,
+            },
+        )
+    cancellation = ExecutionStore(state).get_execution_grant(owner, grant["id"])["cancellation"]
+    assert cancellation["state"] == "unresolved"
+    assert (
+        execution.get_project_execution(owner, grant["project_id"])["held_cents"]
+        == grant["max_exposure_cents"]
     )
-    assert reconciled["status"] == "reconciled"
 
 
 @pytest.mark.parametrize("outcome", ("unknown", "failed", "succeeded", "cancelled"))

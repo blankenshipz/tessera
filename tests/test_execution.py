@@ -337,14 +337,16 @@ def test_cancel_observation_reconciliation_and_real_overage(tmp_path: Path) -> N
     execution.report_execution_observation(
         worker, lease["id"], "exited", canonical_digest(exited), exited
     )
-    with pytest.raises(Conflict, match="termination"):
-        execution.report_execution_observation(
-            worker,
-            lease["id"],
-            "later-unknown",
-            canonical_digest(unknown),
-            unknown,
-        )
+    # Revocation retains adverse evidence from the original authenticated lease;
+    # it does not re-enable lease/package authority.
+    _, adverse = execution.report_execution_observation(
+        worker,
+        lease["id"],
+        "later-unknown",
+        canonical_digest(unknown),
+        unknown,
+    )
+    assert adverse["desired_state"] == "cancel_requested"
     _, observation = execution.report_execution_observation(
         worker,
         lease["id"],

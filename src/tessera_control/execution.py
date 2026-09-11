@@ -175,6 +175,14 @@ class ExecutionStore(Store):
             if request is None:
                 return {"state": "not_requested"}
             requested_at = request["created_at"]
+        operation = connection.execute(
+            "SELECT operation_id FROM external_operations WHERE grant_id=?", (row["id"],)
+        ).fetchone()
+        reconciliation = (
+            current_operation_reconciliation(connection, operation["operation_id"])
+            if operation is not None
+            else None
+        )
         observation = connection.execute(
             """SELECT id, operation_id, lease_id, worker_principal_id, epoch, observed_state,
             observed_at, provider_id, termination_confirmed, recorded_at FROM execution_observations
@@ -187,9 +195,12 @@ class ExecutionStore(Store):
         observed = dict(observation)
         observed["termination_confirmed"] = bool(observed["termination_confirmed"])
         result["observation"] = observed
+        if reconciliation is not None:
+            result["reconciliation"] = reconciliation
+        current = reconciliation if reconciliation is not None else observed
         result["state"] = (
             "confirmed_termination"
-            if observed["observed_state"] == "exited" and observed["termination_confirmed"]
+            if current["observed_state"] == "exited" and current["termination_confirmed"]
             else "unresolved"
         )
         return result
@@ -1045,12 +1056,10 @@ class ExecutionStore(Store):
                 )
             if grant["status"] not in UNRESOLVED_GRANT_STATUSES:
                 raise Conflict("Execution authority has already been reconciled.")
-            if grant["status"] == "cancel_requested" and not (
-                payload["observed_state"] == "exited" and payload["termination_confirmed"]
-            ):
-                raise Conflict(
-                    "Revoked execution permits only confirmed termination reconciliation."
-                )
+            # Revocation fences authority, not forensic observation. The original
+            # authenticated worker/lease/operation remains able to record adverse
+            # evidence; active-grant checks still fence starts, renewals, packages,
+            # and any replacement authority.
             if payload["termination_confirmed"] and payload["observed_state"] != "exited":
                 raise Conflict("Termination confirmation requires an exited observation.")
             if payload["termination_confirmed"] and payload.get("provider_id") is None:
@@ -1231,12 +1240,8 @@ class ExecutionStore(Store):
                 or (not post_revocation_reconciliation and grant["epoch"] != lease["epoch"])
             ):
                 raise Conflict("Provider receipt authority is no longer current.")
-            if post_revocation_reconciliation and not (
-                payload["observed_state"] == "exited" and payload["termination_confirmed"]
-            ):
-                raise Conflict(
-                    "Revoked execution permits only confirmed termination reconciliation."
-                )
+            # Matching original receipt evidence remains recordable after
+            # revocation; it cannot revive start, renewal, package, or result authority.
             observed_at = _parse_utc(payload["observed_at"])
             if (
                 observed_at < _parse_utc(lease["issued_at"])

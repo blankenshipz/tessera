@@ -105,8 +105,12 @@ current evidence. At the same observed time, no source wins: `unknown`, `running
 or an unconfirmed exit contradicts a confirmed exit and keeps the operation
 unresolved. A newer confirmed exit can supersede an older nonterminal sample, but
 a newer nonterminal sample blocks admitted success/cancellation resolution and
-grant reconciliation/exposure release. Human outcome rows remain immutable while
-the admitted-attempt operational projection shows that current uncertainty.
+grant reconciliation/exposure release. Reconciliation returns deterministic source
+presentation order (`receipt`, then `worker`) and an explicit contradiction state:
+`same_time_contradiction`, `later_adverse_observation`,
+`unconfirmed_current_observation`, or `none`; presentation order never gives one
+source authority precedence. Human outcome rows remain immutable while the
+admitted-attempt operational projection shows that current uncertainty.
 
 Execution `succeeded` and `cancelled` resolutions require the original bound
 package and operation plus an attributed, confirmed exited observation. A cancelled
@@ -115,10 +119,12 @@ exit is not success/cancellation evidence and may be resolved as `unknown` with 
 reason. A package refresh does not create restart history; callers must carry the
 explicit restart intent.
 
-After revocation, the control plane rejects starts, renewals, replacement packages,
-and ordinary observations/receipt updates. It accepts only a matching original
-operation/worker/lease confirmed-exit report, so termination can be reconciled
-without reopening execution or result authority.
+After revocation, the control plane rejects starts, renewals, and replacement
+packages. It still records matching original-operation, authenticated worker/lease
+observations and fake-provider receipts, including `running`, `unknown`, and
+unconfirmed exits. These are forensic reconciliation reports only: they cannot
+reopen execution or result authority, and later adverse evidence keeps exposure
+held and terminal success/cancellation reconciliation blocked.
 
 Credential-access leases are not provider receipts or operation inputs. If a later
 adapter needs to associate one with an operation, it may retain only the opaque
