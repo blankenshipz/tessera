@@ -61,21 +61,25 @@ partial view labeled complete.
 The goal-to-decision panel separately lists a project's experiments and renders
 only a complete historical chain. Every immutable design revision retains its
 goal, success criterion, protocol, baseline/intervention snapshots, registered
-execution references, and unattempted variants. Attempts identify their design
-membership and typed provenance; operation-backed attempts display desired and
-observed states separately, including unresolved termination, while
-human-reported observations explicitly say that no operation was observed.
+execution references, and unattempted variants. Legacy attempts and admitted
+execution attempts are separate, linked projections: admitted attempts retain their
+complete bounded state history and exact operation/package binding, while
+operation-backed legacy attempts display desired and observed states separately,
+including unresolved termination. Conclusion cards retain any explicit human
+supersession or retraction lineage with reason, actor, and recorded history, while
+leaving the reviewed conclusion and its evidence intact. Human-reported observations
+explicitly say that no operation was observed.
 Explicit `legacy_operation_unverified` history remains visible as unverified;
 the desktop does not invent its missing package, plan, or termination details.
 Artifacts, measurements, and conclusions remain linked to their recorded
 revision snapshots. The response is rejected unless its collections, identifiers,
-unique records, digests, revision membership, duplicate variant snapshots, and
-all evidence/operation cross-links agree. It is read-only: it cannot approve,
-dispatch, or edit a conclusion. Attempt `succeeded` and a reviewed conclusion
-remain explicitly labeled operational/human records with scientific validity
-`not_assessed`; they never display scientific success. Project or connection
-switches discard pending experiment reads, and incomplete, stale-revision, or
-digest-inconsistent responses are not rendered.
+unique records, digests, revision membership, state-history sequencing, correction
+lineage, and all evidence/operation cross-links agree. It is read-only: it cannot
+approve, dispatch, or edit a conclusion. Attempt `succeeded` and a reviewed
+conclusion remain explicitly labeled operational/human records with scientific
+validity `not_assessed`; they never display scientific success. Project or
+connection switches discard pending experiment reads, and incomplete,
+stale-revision, or digest-inconsistent responses are not rendered.
 
 “Save study ledger JSON” fetches a fresh, complete selected-study snapshot and
 uses a native save dialog to create a private JSON file. Choose a new filename;

@@ -109,9 +109,21 @@ def test_v18_to_v19_receipt_migration_does_not_invent_receipts(tmp_path):
     state = tmp_path / "state"
     initialize_state(state)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
-        connection.execute("DROP TABLE external_operation_receipts")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
+        for table in (
+            "project_artifact_retention",
+            "project_artifact_storage_operations",
+            "project_artifact_placements",
+            "project_storage_bindings",
+            "credential_access_leases",
+            "execution_result_acceptances",
+            "external_operation_receipts",
+        ):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
         connection.execute("UPDATE schema_meta SET schema_version=18")
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM external_operation_receipts").fetchone()[0]

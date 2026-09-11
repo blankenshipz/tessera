@@ -290,6 +290,9 @@ def test_schema8_manifest_migration_preserves_artifacts_and_uploads(
         connection.execute("DROP TABLE artifact_manifests")
         connection.execute("DROP TABLE artifact_dispositions")
         connection.execute("DROP TABLE execution_result_checkpoints")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=8")
 
     def fail(connection):
@@ -312,5 +315,5 @@ def test_schema8_manifest_migration_preserves_artifacts_and_uploads(
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 32
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
+    assert migrate_state(state) == 33

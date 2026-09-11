@@ -114,6 +114,14 @@ conclusion. It records `supersedes` or `retracts`, a reason, actor, and expected
 conclusion/design revisions while retaining the original statement, evidence, and
 review attribution. It neither authorizes execution nor accepts a scientific claim.
 
+Schema v33 stores a human admitted-attempt outcome in a separate immutable record.
+Late worker/provider observations remain operational history and cannot erase a
+human `unknown`, failed, cancelled, or succeeded label. A succeeded or cancelled
+execution label requires the bound package/operation and a confirmed attributed
+exit; an unconfirmed exit remains inconclusive. A routine package refresh is not a
+restart, and revoked authority accepts only matching confirmed-termination
+reconciliation—not starts, renewals, replacement packages, or result acceptance.
+
 Schema v15 adds a human-only, immutable synthetic result checkpoint for a
 reconciled, worker-confirmed operation and a complete exact quarantined manifest.
 It rechecks retained bytes and declared metadata, preserves quarantine and labels

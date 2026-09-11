@@ -290,11 +290,6 @@ def test_cancel_observation_reconciliation_and_real_overage(tmp_path: Path) -> N
     )
     _, lease = execution.acquire_execution_lease(worker, grant["id"], "acquire", "acquire")
     execution.renew_execution_lease(worker, lease["id"], "renew", "renew", lease["epoch"])
-    _, cancelled = execution.revoke_execution_grant(owner, grant["id"], "cancel", "cancel", 1)
-    with pytest.raises(Conflict, match="Cached|not active"):
-        execution.acquire_execution_lease(worker, grant["id"], "acquire", "acquire")
-    with pytest.raises(Conflict, match="Cached|not active"):
-        execution.renew_execution_lease(worker, lease["id"], "renew", "renew", lease["epoch"])
     unknown = {
         "expected_epoch": lease["epoch"],
         "observed_state": "unknown",
@@ -302,10 +297,30 @@ def test_cancel_observation_reconciliation_and_real_overage(tmp_path: Path) -> N
         "provider_id": "local-container",
         "termination_confirmed": False,
     }
-    _, observation = execution.report_execution_observation(
-        worker, lease["id"], "unknown", canonical_digest(unknown), unknown
+    execution.report_execution_observation(
+        worker, lease["id"], "unknown-before-revoke", canonical_digest(unknown), unknown
     )
-    assert observation["desired_state"] == "cancel_requested"
+    with pytest.raises(Conflict, match="out of order"):
+        execution.report_execution_observation(
+            worker,
+            lease["id"],
+            "out-of-order",
+            "out-of-order",
+            unknown | {"observed_at": lease["issued_at"]},
+        )
+    with pytest.raises(Conflict, match="Provider identity"):
+        execution.report_execution_observation(
+            worker,
+            lease["id"],
+            "changed-provider",
+            "changed-provider",
+            unknown | {"provider_id": "other-container"},
+        )
+    _, cancelled = execution.revoke_execution_grant(owner, grant["id"], "cancel", "cancel", 1)
+    with pytest.raises(Conflict, match="Cached|not active"):
+        execution.acquire_execution_lease(worker, grant["id"], "acquire", "acquire")
+    with pytest.raises(Conflict, match="Cached|not active"):
+        execution.renew_execution_lease(worker, lease["id"], "renew", "renew", lease["epoch"])
     with pytest.raises(Conflict, match="termination"):
         execution.reconcile_execution_grant(
             owner,
@@ -322,54 +337,22 @@ def test_cancel_observation_reconciliation_and_real_overage(tmp_path: Path) -> N
     execution.report_execution_observation(
         worker, lease["id"], "exited", canonical_digest(exited), exited
     )
-    later_unknown = exited | {
-        "observed_state": "unknown",
-        "observed_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat(),
-        "termination_confirmed": False,
-    }
-    execution.report_execution_observation(
-        worker, lease["id"], "later-unknown", canonical_digest(later_unknown), later_unknown
-    )
     with pytest.raises(Conflict, match="termination"):
-        execution.reconcile_execution_grant(
-            owner,
-            grant["id"],
-            "reconcile-later-unknown",
-            "reconcile-later-unknown",
-            {
-                "expected_revision": cancelled["revision"],
-                "settlement_cents": 0,
-                "provider_terminated": True,
-            },
-        )
-    with pytest.raises(Conflict, match="out of order"):
         execution.report_execution_observation(
             worker,
             lease["id"],
-            "out-of-order",
-            "out-of-order",
-            later_unknown | {"observed_at": unknown["observed_at"]},
+            "later-unknown",
+            canonical_digest(unknown),
+            unknown,
         )
-    with pytest.raises(Conflict, match="Provider identity"):
-        execution.report_execution_observation(
-            worker,
-            lease["id"],
-            "changed-provider",
-            "changed-provider",
-            later_unknown
-            | {
-                "provider_id": "other-container",
-                "observed_at": (datetime.now(UTC) + timedelta(seconds=2)).isoformat(),
-            },
-        )
-    exited = later_unknown | {
-        "observed_state": "exited",
-        "observed_at": (datetime.now(UTC) + timedelta(seconds=2)).isoformat(),
-        "termination_confirmed": True,
-    }
-    execution.report_execution_observation(
-        worker, lease["id"], "exited-final", canonical_digest(exited), exited
+    _, observation = execution.report_execution_observation(
+        worker,
+        lease["id"],
+        "exited-final",
+        "exited-final",
+        exited | {"observed_at": (datetime.now(UTC) + timedelta(seconds=2)).isoformat()},
     )
+    assert observation["desired_state"] == "cancel_requested"
     _, reconciled = execution.reconcile_execution_grant(
         owner,
         grant["id"],
@@ -402,8 +385,6 @@ def test_cancellation_telemetry_is_derived_fenced_and_does_not_clear_unknown(
     )
     assert grant["cancellation"] == {"state": "not_requested"}
     _, lease = execution.acquire_execution_lease(worker, grant["id"], "lease", "lease")
-    _, requested = execution.revoke_execution_grant(owner, grant["id"], "cancel", "cancel", 1)
-    assert requested["cancellation"]["state"] == "requested"
     unknown = {
         "expected_epoch": lease["epoch"],
         "observed_state": "unknown",
@@ -414,7 +395,9 @@ def test_cancellation_telemetry_is_derived_fenced_and_does_not_clear_unknown(
     _, reported = execution.report_execution_observation(
         worker, lease["id"], "unknown", canonical_digest(unknown), unknown
     )
-    assert reported["cancellation"]["state"] == "unresolved"
+    assert reported["cancellation"]["state"] == "not_requested"
+    _, requested = execution.revoke_execution_grant(owner, grant["id"], "cancel", "cancel", 1)
+    assert requested["cancellation"]["state"] == "unresolved"
     repeated = execution.revoke_execution_grant(
         owner, grant["id"], "cancel-again", "cancel-again", requested["revision"]
     )

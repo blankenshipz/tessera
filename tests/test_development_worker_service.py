@@ -307,9 +307,14 @@ def test_revocation_with_receipt_report_failure_cancels_provider_and_retains_wor
         sleep=revoke,
     )
 
-    assert service.run()["state"] == "unknown"
+    result = service.run()
+    assert result["state"] == "unknown"
+    assert result["reason"] == "observation_report_failure"
     assert provider.cancel_calls
-    assert adapter.calls.count("cancel") == 1
+    # Revocation triggers cancellation; the rejected nonterminal observation then
+    # triggers the existing bounded safety cancellation, never another start.
+    assert adapter.calls.count("cancel") == 2
+    assert adapter.calls.count("start") == 1
     assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
 
 

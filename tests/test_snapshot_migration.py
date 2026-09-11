@@ -53,6 +53,9 @@ def _v4_state(tmp_path: Path) -> tuple[Path, dict[str, object], dict[str, object
         connection.execute("DROP TABLE snapshot_releases")
         connection.execute("DROP TABLE snapshot_files")
         connection.execute("DROP TABLE source_snapshots")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version = 4")
         connection.commit()
     return state, project, task
@@ -70,13 +73,13 @@ def test_v4_to_v5_requires_explicit_migration_and_preserves_records(tmp_path: Pa
     state, project, task = _v4_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     assert {"source_snapshots", "snapshot_files"}.issubset(_tables(state))
     store = Store(state)
     owner = _owner(state)
     assert store.get_project(owner, project["id"]) == project
     assert store.get_task(owner, task["id"])["id"] == task["id"]
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
 
 
 def test_v4_to_v5_rolls_back_snapshot_schema_on_failure(

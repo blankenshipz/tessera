@@ -281,6 +281,9 @@ def test_v14_to_v15_checkpoint_migration_preserves_v14_evidence_and_rolls_back(
     state, _owner, _worker, _grant, _lease, manifest, first = _reconciled_manifest(tmp_path)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE execution_result_checkpoints")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=14")
 
     def fail(connection):
@@ -299,5 +302,5 @@ def test_v14_to_v15_checkpoint_migration_preserves_v14_evidence_and_rolls_back(
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
         ).fetchone()
-    assert migrate_state(state) == 32
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
+    assert migrate_state(state) == 33

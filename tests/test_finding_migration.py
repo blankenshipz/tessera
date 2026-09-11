@@ -52,6 +52,9 @@ def _legacy(tmp_path: Path, version: int = 11):
         for table in _TABLES:
             columns = ",".join(row[1] for row in connection.execute(f"PRAGMA table_info({table})"))
             connection.execute(f"INSERT INTO {table} SELECT {columns} FROM old_{table}")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=?", (version,))
     return state, owner, finding, before
 
@@ -63,8 +66,8 @@ def test_v12_preserves_finding_history_and_supports_held_restore(tmp_path: Path)
             connection.execute("UPDATE research_findings SET status='retracted'")
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 32
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
+    assert migrate_state(state) == 33
     store = ResearchStore(state)
     assert store.export_study(owner, finding["study_id"]) == before
     retracted = _run(
@@ -127,7 +130,7 @@ def test_v13_migration_preserves_v12_records_and_rolls_back(
         with sqlite3.connect(database) as connection:
             assert list(connection.iterdump()) == snapshot
         return
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     store = ResearchStore(state)
     assert store.export_study(owner, finding["study_id"]) == before
     result = _run(

@@ -349,9 +349,12 @@ def test_v23_migration_preserves_v22_staged_at_operations_and_placements(tmp_pat
             retention_class,intent_at,committed_at,reconciled_at FROM v23_operations"""
         )
         connection.execute("DROP TABLE v23_operations")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=22")
 
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         migrated = connection.execute(
             """SELECT artifact_id,state,intent_at,reconcile_started_at,committed_at,reconciled_at
@@ -389,6 +392,9 @@ def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
             "project_storage_bindings",
         ):
             connection.execute(f"DROP TABLE {table}")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=21")
 
     def fail(connection):
@@ -420,7 +426,7 @@ def test_v22_migration_is_empty_for_legacy_blobs_and_rolls_back(
             is None
         )
         connection.execute("ROLLBACK")
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM project_artifact_placements").fetchone()[0]
@@ -728,8 +734,11 @@ def test_v24_retention_migration_preserves_placement_and_rolls_back(
     )
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE project_artifact_retention")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=23")
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT retention_class,state FROM project_artifact_retention"

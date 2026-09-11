@@ -79,6 +79,26 @@ failure to confirm either remains unknown and is never reclaimed or reported as
 provider termination. Restart reads a fresh, durably keyed package response so
 an already-running reservation can retain a renewed lease without resubmission.
 
+## Immutable human outcome and revocation reconciliation
+
+Schema v33 stores each human resolution of an admitted experiment attempt in a
+separate immutable row. The legacy outcome/state fields remain a compatibility
+projection, while worker and fake-provider reports update separate operational
+state/observation fields. Thus a late `running`, `unknown`, or `exited` report can
+be retained without replacing a human `unknown` or other outcome label.
+
+Execution `succeeded` and `cancelled` resolutions require the original bound
+package and operation plus an attributed, confirmed exited observation. A cancelled
+resolution additionally requires the durable cancellation request; an unconfirmed
+exit is not success/cancellation evidence and may be resolved as `unknown` with a
+reason. A package refresh does not create restart history; callers must carry the
+explicit restart intent.
+
+After revocation, the control plane rejects starts, renewals, replacement packages,
+and ordinary observations/receipt updates. It accepts only a matching original
+operation/worker/lease confirmed-exit report, so termination can be reconciled
+without reopening execution or result authority.
+
 Credential-access leases are not provider receipts or operation inputs. If a later
 adapter needs to associate one with an operation, it may retain only the opaque
 credential-access lease ID; neither its secret reference nor its value belongs in

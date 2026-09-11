@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 32
+LATEST_SCHEMA_VERSION = 33
 LOCAL_ORG_ID = "org_local"
 
 
@@ -625,6 +625,26 @@ def migrate_v31_to_v32(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 32 WHERE singleton = 1")
 
 
+def migrate_v32_to_v33(connection: sqlite3.Connection) -> None:
+    """Separate historical human outcome labels from later operational observations.
+
+    v32 kept its outcome on a mutable admission projection.  Preserve every old
+    label in both that compatibility projection and one immutable decision row;
+    absent historical operational detail remains explicitly legacy-unverified.
+    """
+    from .experiments import create_admitted_attempt_resolution_schema
+
+    create_admitted_attempt_resolution_schema(connection)
+    connection.execute(
+        """INSERT OR IGNORE INTO research_experiment_admitted_attempt_resolutions
+        (attempt_id,outcome,reason,expected_revision,decided_at,decided_by_principal_id)
+        SELECT id,outcome,reason,revision,updated_at,resolved_by_principal_id
+        FROM research_experiment_admitted_attempts
+        WHERE outcome IS NOT NULL AND resolved_by_principal_id IS NOT NULL"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version = 33 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -657,6 +677,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     29: migrate_v29_to_v30,
     30: migrate_v30_to_v31,
     31: migrate_v31_to_v32,
+    32: migrate_v32_to_v33,
 }
 
 

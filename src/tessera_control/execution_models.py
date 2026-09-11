@@ -104,6 +104,8 @@ class RenewExecutionLease(ExecutionRequest):
 class PrepareExecutionPackage(ExecutionRequest):
     expected_epoch: Revision
     admitted_attempt_id: Identifier | None = None
+    # A fresh authority read is not evidence that a worker or operation restarted.
+    restart_intent: Literal[True] | None = None
     persistent_output_collection: Literal[True] | None = None
     persistent_output_storage: dict[str, Any] | None = None
 

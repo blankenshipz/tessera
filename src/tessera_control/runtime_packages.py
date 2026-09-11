@@ -189,12 +189,14 @@ class RuntimePackageStore(ExecutionStore):
         persistent_output_collection: bool = False,
         persistent_output_storage: Any = None,
         admitted_attempt_id: str | None = None,
+        restart_intent: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         if (
             not isinstance(lease_id, str)
             or not 1 <= len(lease_id) <= 200
             or type(expected_epoch) is not int
             or not 1 <= expected_epoch <= 2**63 - 1
+            or type(restart_intent) is not bool
             or (
                 admitted_attempt_id is not None
                 and (
@@ -240,7 +242,12 @@ class RuntimePackageStore(ExecutionStore):
             bound_attempt_id = metadata["admitted_attempt_id"]
             if bound_attempt_id is not None:
                 bind_admitted_attempt_package(
-                    connection, live, package, metadata["package_digest"], bound_attempt_id
+                    connection,
+                    live,
+                    package,
+                    metadata["package_digest"],
+                    bound_attempt_id,
+                    restart_intent,
                 )
             metadata["operation"] = operation
             self._event(
@@ -287,6 +294,9 @@ class RuntimePackageStore(ExecutionStore):
                     metadata["package"],
                     metadata["package_digest"],
                     bound_attempt_id,
+                    # Replaying an old command cannot assert a new restart after
+                    # a later observation. Only its first application records intent.
+                    False,
                 )
             if (
                 cached.get("package") != metadata["package"]

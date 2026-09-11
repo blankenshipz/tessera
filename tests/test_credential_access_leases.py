@@ -278,8 +278,11 @@ def test_v20_migration_creates_no_credential_access_leases_and_rolls_back(tmp_pa
     initialize_state(state)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE credential_access_leases")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=20")
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM credential_access_leases").fetchone()[0] == 0

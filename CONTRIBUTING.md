@@ -260,3 +260,8 @@ validation.
 Schema 32 adds empty evidence/measurement custody tables keyed by existing
 admitted-attempt IDs. It does not convert historical operation-backed or explicit
 human-reported attempts, infer evidence, or resolve an uncertain execution.
+
+Schema 33 separates immutable human admitted-attempt outcomes from mutable worker
+and provider observations. It preserves every legacy outcome label, records no
+invented operational detail for migrated rows, and allows post-revocation
+reconciliation only for the original worker/lease/operation's confirmed exit.

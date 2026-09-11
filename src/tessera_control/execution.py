@@ -1044,6 +1044,12 @@ class ExecutionStore(Store):
                 )
             if grant["status"] not in UNRESOLVED_GRANT_STATUSES:
                 raise Conflict("Execution authority has already been reconciled.")
+            if grant["status"] == "cancel_requested" and not (
+                payload["observed_state"] == "exited" and payload["termination_confirmed"]
+            ):
+                raise Conflict(
+                    "Revoked execution permits only confirmed termination reconciliation."
+                )
             if payload["termination_confirmed"] and payload["observed_state"] != "exited":
                 raise Conflict("Termination confirmation requires an exited observation.")
             if payload["termination_confirmed"] and payload.get("provider_id") is None:
@@ -1129,6 +1135,7 @@ class ExecutionStore(Store):
                     worker,
                     row["observed_state"],
                     row["desired_state"],
+                    bool(row["termination_confirmed"]),
                 )
             self._event(
                 connection,
@@ -1207,15 +1214,22 @@ class ExecutionStore(Store):
             if lease is None or lease["epoch"] != payload["expected_epoch"]:
                 raise Conflict("Provider receipt epoch is no longer current.")
             grant = self._grant(connection, worker, operation["grant_id"])
+            post_revocation_reconciliation = grant["status"] == "cancel_requested"
             if (
                 grant["project_id"] != operation["project_id"]
                 or grant["task_id"] != operation["task_id"]
                 or grant["worker_principal_id"] != worker["id"]
                 or operation["epoch"] != lease["epoch"]
-                or grant["epoch"] != lease["epoch"]
                 or grant["status"] not in UNRESOLVED_GRANT_STATUSES
+                or (not post_revocation_reconciliation and grant["epoch"] != lease["epoch"])
             ):
                 raise Conflict("Provider receipt authority is no longer current.")
+            if post_revocation_reconciliation and not (
+                payload["observed_state"] == "exited" and payload["termination_confirmed"]
+            ):
+                raise Conflict(
+                    "Revoked execution permits only confirmed termination reconciliation."
+                )
             observed_at = _parse_utc(payload["observed_at"])
             if (
                 observed_at < _parse_utc(lease["issued_at"])
@@ -1289,6 +1303,7 @@ class ExecutionStore(Store):
                 worker,
                 payload["observed_state"],
                 operation["desired_state"],
+                bool(payload["termination_confirmed"]),
             )
             result = dict(row)
             result["termination_confirmed"] = bool(result["termination_confirmed"])

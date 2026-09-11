@@ -372,9 +372,20 @@ def test_v19_to_v20_result_acceptance_migration_is_empty_and_rolls_back(
         _checkpoint_with_receipt(tmp_path)
     )
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
-        connection.execute("DROP TABLE execution_result_acceptances")
+        from schema_fixtures import drop_empty_experiment_schema
+
+        drop_empty_experiment_schema(connection)
+        for table in (
+            "project_artifact_retention",
+            "project_artifact_storage_operations",
+            "project_artifact_placements",
+            "project_storage_bindings",
+            "credential_access_leases",
+            "execution_result_acceptances",
+        ):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
         connection.execute("UPDATE schema_meta SET schema_version=19")
-    assert migrate_state(state) == 32
+    assert migrate_state(state) == 33
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM execution_result_acceptances").fetchone()[0]

@@ -152,6 +152,15 @@ def test_admission_cancellation_and_retained_exposure_through_http(tmp_path):
         plan_body | {"expected_revision": approved["revision"]},
         409,
     )
+    observation = {
+        "lease_id": lease["id"],
+        "expected_epoch": lease["epoch"],
+        "observed_state": "unknown",
+        "termination_confirmed": False,
+        "observed_at": datetime.now(UTC).isoformat(),
+        "provider_id": "synthetic-no-job-was-run",
+    }
+    call("POST", "/worker/observations", observation, 201, worker)
     revoked = call("POST", f"/execution-grants/{grant['id']}/revoke", {"expected_revision": 1}, 200)
     assert revoked["status"] == "cancel_requested"
     call("POST", "/worker/leases", {"grant_id": grant["id"]}, 409, worker, "lease-once")
@@ -168,23 +177,14 @@ def test_admission_cancellation_and_retained_exposure_through_http(tmp_path):
         "provider_terminated": True,
     }
     call("POST", f"/execution-grants/{grant['id']}/reconcile", settlement, 409)
-    for observed_state, confirmed in (("unknown", False), ("exited", True)):
-        call(
-            "POST",
-            "/worker/observations",
-            {
-                "lease_id": lease["id"],
-                "expected_epoch": lease["epoch"],
-                "observed_state": observed_state,
-                "termination_confirmed": confirmed,
-                "observed_at": datetime.now(UTC).isoformat(),
-                "provider_id": "synthetic-no-job-was-run",
-            },
-            201,
-            worker,
-        )
-        if not confirmed:
-            call("POST", f"/execution-grants/{grant['id']}/reconcile", settlement, 409)
+    call("POST", "/worker/observations", observation, 409, worker)
+    call(
+        "POST",
+        "/worker/observations",
+        observation | {"observed_state": "exited", "termination_confirmed": True},
+        201,
+        worker,
+    )
     reconciled = call("POST", f"/execution-grants/{grant['id']}/reconcile", settlement, 200)
     assert reconciled["status"] == "reconciled"
     limits = client.get(f"/projects/{project['id']}/execution-limits", headers=owner).json()

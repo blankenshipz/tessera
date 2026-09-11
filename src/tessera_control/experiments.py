@@ -194,6 +194,42 @@ def create_experiment_admission_schema(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def create_admitted_attempt_resolution_schema(connection: sqlite3.Connection) -> None:
+    """Add immutable human decisions without relabeling historical outcomes."""
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(research_experiment_admitted_attempts)")
+    }
+    for name, definition in (
+        (
+            "operational_state",
+            "TEXT NOT NULL DEFAULT 'legacy_unverified' CHECK (operational_state IN "
+            "('admitted','preparing','running','unknown','interrupted','restart_pending','legacy_unverified'))",
+        ),
+        (
+            "operational_observed_state",
+            "TEXT NOT NULL DEFAULT 'legacy_unverified' CHECK (operational_observed_state IN "
+            "('not_observed','running','unknown','exited','legacy_unverified'))",
+        ),
+        (
+            "operational_termination_confirmed",
+            "INTEGER CHECK (operational_termination_confirmed IN (0,1))",
+        ),
+    ):
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE research_experiment_admitted_attempts ADD COLUMN {name} {definition}"
+            )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS research_experiment_admitted_attempt_resolutions (
+        attempt_id TEXT PRIMARY KEY REFERENCES research_experiment_admitted_attempts(id),
+        outcome TEXT NOT NULL CHECK (outcome IN ('succeeded','failed','cancelled','unknown')),
+        reason TEXT, expected_revision INTEGER NOT NULL CHECK (expected_revision >= 1),
+        decided_at TEXT NOT NULL, decided_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+        CHECK ((outcome='succeeded') OR reason IS NOT NULL))"""
+    )
+
+
 def create_admitted_attempt_evidence_schema(connection: sqlite3.Connection) -> None:
     """Keep pre-execution attempt identity usable by the ordinary evidence APIs.
 
@@ -244,24 +280,46 @@ def _append_admitted_attempt_state(
     operation_id: str | None = None,
     outcome: str | None = None,
     resolved: bool = False,
+    termination_confirmed: bool | None = None,
 ) -> dict[str, Any]:
-    """Advance the mutable projection while retaining each state transition."""
-    if attempt["state"] == state and attempt["outcome"] == outcome:
+    """Append operational facts without allowing them to rewrite a human decision."""
+    if (
+        attempt.get("operational_state", attempt["state"]) == state
+        and not resolved
+        and observed_state is None
+    ):
         return attempt
     now, revision = utc_now(), attempt["revision"] + 1
     result = dict(attempt)
+    human_outcome = attempt["outcome"] if not resolved else outcome
+    human_reason = attempt["reason"] if not resolved else reason
+    human_actor = attempt["resolved_by_principal_id"] if not resolved else actor_principal_id
     result.update(
-        state=state,
-        outcome=outcome,
-        reason=reason,
+        # Keep the legacy state/outcome projection for older readers.  Operational
+        # observations advance their own fields after a human decision.
+        state=outcome if resolved else (attempt["state"] if human_outcome is not None else state),
+        operational_state=attempt.get("operational_state", attempt["state"]) if resolved else state,
+        operational_observed_state=observed_state
+        if observed_state is not None
+        else attempt.get("operational_observed_state", "not_observed"),
+        operational_termination_confirmed=(
+            int(termination_confirmed)
+            if termination_confirmed is not None
+            else attempt.get("operational_termination_confirmed")
+        ),
+        outcome=human_outcome,
+        reason=human_reason,
         revision=revision,
         updated_at=now,
-        resolved_by_principal_id=actor_principal_id if resolved else None,
+        resolved_by_principal_id=human_actor,
     )
     if (
         connection.execute(
-            """UPDATE research_experiment_admitted_attempts SET state=:state,outcome=:outcome,
-            reason=:reason,revision=:revision,updated_at=:updated_at,
+            """UPDATE research_experiment_admitted_attempts SET state=:state,
+            operational_state=:operational_state,
+            operational_observed_state=:operational_observed_state,
+            operational_termination_confirmed=:operational_termination_confirmed,
+            outcome=:outcome,reason=:reason,revision=:revision,updated_at=:updated_at,
             resolved_by_principal_id=:resolved_by_principal_id
             WHERE id=:id AND revision=:expected_revision""",
             result | {"expected_revision": attempt["revision"]},
@@ -357,6 +415,7 @@ def bind_admitted_attempt_package(
     package: dict[str, Any],
     package_digest: str,
     admitted_attempt_id: str,
+    restart_intent: bool = False,
 ) -> dict[str, Any]:
     """Fence a worker package to its prior human admission in the same transaction."""
     attempt, identity = admitted_attempt_package_identity(
@@ -382,10 +441,10 @@ def bind_admitted_attempt_package(
     )
     next_state = (
         "restart_pending"
-        if updated["state"] in {"unknown", "interrupted"}
+        if restart_intent and updated["operational_state"] in {"unknown", "interrupted"}
         else "preparing"
-        if updated["state"] == "admitted"
-        else updated["state"]
+        if updated["operational_state"] == "admitted"
+        else updated["operational_state"]
     )
     return _append_admitted_attempt_state(
         connection,
@@ -402,6 +461,7 @@ def record_admitted_attempt_observation(
     worker: dict[str, Any],
     observed_state: str,
     desired_state: str,
+    termination_confirmed: bool = False,
 ) -> None:
     """Keep an admitted attempt visible through worker uncertainty and restart."""
     attempt_id = operation["experiment_attempt_id"]
@@ -426,7 +486,9 @@ def record_admitted_attempt_observation(
     state = {
         "running": "running",
         "unknown": "unknown",
-        "exited": "cancelled" if desired_state == "cancel_requested" else "interrupted",
+        # An exit (even after cancellation) is operational evidence, not a human
+        # cancelled outcome. Confirmation is retained in its separate field.
+        "exited": "interrupted",
     }[observed_state]
     _append_admitted_attempt_state(
         connection,
@@ -435,6 +497,7 @@ def record_admitted_attempt_observation(
         worker["id"],
         observed_state=observed_state,
         operation_id=operation["operation_id"],
+        termination_confirmed=termination_confirmed,
     )
 
 
@@ -937,6 +1000,9 @@ class ExperimentStore(Store):
                 "operation_id": None,
                 "package_digest": None,
                 "state": "admitted",
+                "operational_state": "admitted",
+                "operational_observed_state": "not_observed",
+                "operational_termination_confirmed": None,
                 "outcome": None,
                 "reason": None,
                 "revision": 1,
@@ -948,10 +1014,12 @@ class ExperimentStore(Store):
             connection.execute(
                 """INSERT INTO research_experiment_admitted_attempts
                 (id,experiment_id,design_revision,variant_id,task_id,plan_digest,grant_id,operation_id,
-                 package_digest,state,outcome,reason,revision,created_at,updated_at,
+                 package_digest,state,operational_state,operational_observed_state,
+                 operational_termination_confirmed,outcome,reason,revision,created_at,updated_at,
                  created_by_principal_id,resolved_by_principal_id)
                 VALUES (:id,:experiment_id,:design_revision,:variant_id,:task_id,:plan_digest,:grant_id,
-                :operation_id,:package_digest,:state,:outcome,:reason,:revision,:created_at,:updated_at,
+                 :operation_id,:package_digest,:state,:operational_state,:operational_observed_state,
+                 :operational_termination_confirmed,:outcome,:reason,:revision,:created_at,:updated_at,
                 :created_by_principal_id,:resolved_by_principal_id)""",
                 row,
             )
@@ -1016,6 +1084,21 @@ class ExperimentStore(Store):
                 raise Conflict("Admitted experiment attempt revision is no longer current.")
             if attempt["outcome"] is not None:
                 raise Conflict("Admitted experiment attempt is already resolved.")
+            self._validate_admitted_resolution_evidence(connection, attempt, body["outcome"])
+            now = utc_now()
+            connection.execute(
+                """INSERT INTO research_experiment_admitted_attempt_resolutions
+                (attempt_id,outcome,reason,expected_revision,decided_at,decided_by_principal_id)
+                VALUES (?,?,?,?,?,?)""",
+                (
+                    attempt_id,
+                    body["outcome"],
+                    body["reason"],
+                    body["expected_revision"],
+                    now,
+                    actor["id"],
+                ),
+            )
             updated = _append_admitted_attempt_state(
                 connection,
                 attempt,
@@ -1026,6 +1109,13 @@ class ExperimentStore(Store):
                 outcome=body["outcome"],
                 resolved=True,
             )
+            updated["human_outcome"] = {
+                "outcome": body["outcome"],
+                "reason": body["reason"],
+                "expected_revision": body["expected_revision"],
+                "decided_at": now,
+                "decided_by_principal_id": actor["id"],
+            }
             experiment = self._experiment(connection, actor, attempt["experiment_id"])
             self._event(
                 connection,
@@ -1051,6 +1141,46 @@ class ExperimentStore(Store):
             digest,
             command,
         )
+
+    @staticmethod
+    def _validate_admitted_resolution_evidence(
+        connection: sqlite3.Connection, attempt: dict[str, Any], outcome: str
+    ) -> None:
+        """Require terminal attributed execution evidence for success and cancellation.
+
+        ``unknown`` deliberately remains available when a package, provider reply,
+        or terminal observation is missing.  A human label never turns a package
+        intent or an unconfirmed exit into an execution success/cancellation.
+        """
+        if outcome not in {"succeeded", "cancelled"}:
+            return
+        if attempt["operation_id"] is None or attempt["package_digest"] is None:
+            raise Conflict(
+                "Execution success or cancellation requires a bound package and operation."
+            )
+        operation = connection.execute(
+            "SELECT desired_state,package_digest FROM external_operations WHERE operation_id=?",
+            (attempt["operation_id"],),
+        ).fetchone()
+        observation = connection.execute(
+            """SELECT observed_state,termination_confirmed FROM execution_observations
+            WHERE operation_id=? ORDER BY rowid DESC LIMIT 1""",
+            (attempt["operation_id"],),
+        ).fetchone()
+        if (
+            operation is None
+            or operation["package_digest"] != attempt["package_digest"]
+            or observation is None
+            or observation["observed_state"] != "exited"
+            or not observation["termination_confirmed"]
+        ):
+            raise Conflict(
+                "Execution success or cancellation requires a confirmed attributed terminal observation."
+            )
+        if outcome == "succeeded" and operation["desired_state"] != "admitted":
+            raise Conflict("Execution success cannot override a requested cancellation.")
+        if outcome == "cancelled" and operation["desired_state"] != "cancel_requested":
+            raise Conflict("Cancelled outcome requires a requested cancellation.")
 
     def record_attempt(
         self,
@@ -1936,12 +2066,21 @@ class ExperimentStore(Store):
                     """SELECT count(DISTINCT o.operation_id) FROM external_operations o
                     WHERE o.experiment_id=? OR EXISTS (SELECT 1 FROM research_experiment_attempts a
                     JOIN research_experiment_variants v ON v.id=a.variant_id
-                    WHERE a.operation_id=o.operation_id AND v.experiment_id=?)""",
-                    (experiment_id, experiment_id),
+                    WHERE a.operation_id=o.operation_id AND v.experiment_id=?) OR EXISTS (
+                    SELECT 1 FROM research_experiment_admitted_attempts a
+                    WHERE a.operation_id=o.operation_id AND a.experiment_id=?)""",
+                    (experiment_id, experiment_id, experiment_id),
                 ),
                 (
                     "admitted attempts",
                     "SELECT count(*) FROM research_experiment_admitted_attempts WHERE experiment_id=?",
+                    (experiment_id,),
+                ),
+                (
+                    "admitted attempt state history",
+                    """SELECT count(*) FROM research_experiment_admitted_attempt_states s
+                    JOIN research_experiment_admitted_attempts a ON a.id=s.attempt_id
+                    WHERE a.experiment_id=?""",
                     (experiment_id,),
                 ),
                 (
@@ -2049,6 +2188,16 @@ class ExperimentStore(Store):
                 (experiment_id,),
             ):
                 admission = dict(row)
+                decision = connection.execute(
+                    """SELECT outcome,reason,expected_revision,decided_at,decided_by_principal_id
+                    FROM research_experiment_admitted_attempt_resolutions WHERE attempt_id=?""",
+                    (admission["id"],),
+                ).fetchone()
+                admission["human_outcome"] = dict(decision) if decision is not None else None
+                if admission["operational_termination_confirmed"] is not None:
+                    admission["operational_termination_confirmed"] = bool(
+                        admission["operational_termination_confirmed"]
+                    )
                 admission["state_history"] = [
                     dict(state)
                     for state in connection.execute(
@@ -2063,9 +2212,17 @@ class ExperimentStore(Store):
                 """SELECT o.* FROM external_operations o WHERE o.org_id=? AND o.project_id=?
                 AND (o.experiment_id=? OR EXISTS (SELECT 1 FROM research_experiment_attempts a
                 JOIN research_experiment_variants v ON v.id=a.variant_id
-                WHERE a.operation_id=o.operation_id AND v.experiment_id=?))
+                WHERE a.operation_id=o.operation_id AND v.experiment_id=?) OR EXISTS (
+                SELECT 1 FROM research_experiment_admitted_attempts a
+                WHERE a.operation_id=o.operation_id AND a.experiment_id=?))
                 ORDER BY o.created_at,o.operation_id""",
-                (actor["org_id"], experiment["project_id"], experiment_id, experiment_id),
+                (
+                    actor["org_id"],
+                    experiment["project_id"],
+                    experiment_id,
+                    experiment_id,
+                    experiment_id,
+                ),
             ):
                 append("operations", dict(row))
             for row in connection.execute(
