@@ -64,6 +64,17 @@ variants, or conclusions) exceeds 1,000 records, or when its complete JSON excee
 desktop control-response limit; callers need a separate bounded snapshot mechanism
 for larger ledgers.
 
+`POST /conclusions/{id}/amendments` is human-only and accepts
+`expected_revision`, `expected_design_revision`, `relation` (`supersedes` or
+`retracts`), and a nonblank `reason`. It only admits a reviewed conclusion whose
+immutable design snapshot matches the request. The initial lineage revision is the
+reviewed conclusion revision; the request compare-and-swap fence rejects stale or
+conflicting terminal relationships. It appends one attributed correction record and
+does not alter the reviewed conclusion's statement, evidence, review attribution,
+or revision. Export/reopen exposes both each conclusion's `lineage` and the complete
+`conclusion_amendments` collection. An amendment is a recorded human correction,
+not plan/execution authority, result acceptance, or scientific validity.
+
 ## Conversations and decision inbox
 
 | Route | Behavior |

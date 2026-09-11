@@ -109,6 +109,11 @@ observed execution, and termination confirmation separately from the human outco
 none establishes scientific success. Earlier attempt links migrate as explicitly
 `legacy_operation_unverified`, with no invented plan/package or termination proof.
 
+Schema v29 adds a human-only append-only correction relationship for a reviewed
+conclusion. It records `supersedes` or `retracts`, a reason, actor, and expected
+conclusion/design revisions while retaining the original statement, evidence, and
+review attribution. It neither authorizes execution nor accepts a scientific claim.
+
 Schema v15 adds a human-only, immutable synthetic result checkpoint for a
 reconciled, worker-confirmed operation and a complete exact quarantined manifest.
 It rechecks retained bytes and declared metadata, preserves quarantine and labels

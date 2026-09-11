@@ -141,6 +141,15 @@ class ReviewConclusion(ExperimentRequest):
     design_revision: Revision | None = None
 
 
+class AmendConclusion(ExperimentRequest):
+    """Append one terminal human correction relationship to a reviewed conclusion."""
+
+    expected_revision: Revision
+    expected_design_revision: Revision
+    relation: Literal["supersedes", "retracts"]
+    reason: NonBlank4000
+
+
 class ExportExperiment(ExperimentRequest):
     """The complete snapshot must fit the control/desktop response boundary."""
 

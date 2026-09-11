@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 28
+LATEST_SCHEMA_VERSION = 29
 LOCAL_ORG_ID = "org_local"
 
 
@@ -582,6 +582,14 @@ def migrate_v27_to_v28(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 28 WHERE singleton = 1")
 
 
+def migrate_v28_to_v29(connection: sqlite3.Connection) -> None:
+    """Add empty append-only conclusion correction lineage without changing reviews."""
+    from .experiments import create_experiment_schema
+
+    create_experiment_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 29 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -610,6 +618,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     25: migrate_v25_to_v26,
     26: migrate_v26_to_v27,
     27: migrate_v27_to_v28,
+    28: migrate_v28_to_v29,
 }
 
 

@@ -241,3 +241,8 @@ must match an immutable variant's recorded task plan and an attributed terminal
 operation observation; human-reported observations are explicit and operationless.
 Migration preserves v27 attempt links as `legacy_operation_unverified` rather than
 inventing a package, terminal observation, cancellation outcome, or scientific success.
+
+Schema 29 adds an empty append-only reviewed-conclusion correction lineage. A human
+can record one explicit `supersedes` or `retracts` relationship with reason,
+attribution, and reviewed design snapshot fencing; it preserves the original
+reviewed conclusion and creates no execution authority or scientific acceptance.

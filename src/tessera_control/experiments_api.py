@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from .api import idempotency_key, principal
 from .experiments import EXPORT_DEFAULT_BYTES, EXPORT_MAX_BYTES, ExperimentStore
 from .experiments_models import (
+    AmendConclusion,
     CreateConclusion,
     CreateExperiment,
     LinkAttemptArtifacts,
@@ -123,6 +124,16 @@ def review(
     payload = body.model_dump(mode="json")
     return response(
         records.review_conclusion(actor, conclusion_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/conclusions/{conclusion_id}/amendments")
+def amend(
+    conclusion_id: str, body: AmendConclusion, actor: Actor, key: Key, records: Experiments
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.amend_conclusion(actor, conclusion_id, key, canonical_digest(payload), payload)
     )
 
 

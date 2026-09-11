@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .experiments_models import (
+    AmendConclusion,
     CreateConclusion,
     CreateExperiment,
     ExportExperiment,
@@ -115,6 +116,22 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
         FOREIGN KEY(experiment_id,design_revision)
         REFERENCES research_experiment_designs(experiment_id,revision))""",
         "CREATE INDEX IF NOT EXISTS research_conclusions_by_experiment ON research_conclusions(experiment_id,created_at,id)",
+        """CREATE TABLE IF NOT EXISTS research_conclusion_lineage (
+        conclusion_id TEXT PRIMARY KEY REFERENCES research_conclusions(id),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        amendment_id TEXT UNIQUE, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS research_conclusion_amendments (
+        id TEXT PRIMARY KEY, conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
+        experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+        relation TEXT NOT NULL CHECK (relation IN ('supersedes','retracts')),
+        reason TEXT NOT NULL, expected_revision INTEGER NOT NULL CHECK (expected_revision >= 1),
+        expected_design_revision INTEGER NOT NULL CHECK (expected_design_revision >= 1),
+        prior_lineage_revision INTEGER NOT NULL CHECK (prior_lineage_revision >= 1),
+        lineage_revision INTEGER NOT NULL CHECK (lineage_revision >= 1),
+        created_at TEXT NOT NULL, actor_principal_id TEXT NOT NULL REFERENCES principals(id),
+        UNIQUE(conclusion_id,lineage_revision))""",
+        "CREATE INDEX IF NOT EXISTS research_conclusion_amendments_by_experiment ON research_conclusion_amendments(experiment_id,created_at,id)",
         """CREATE TABLE IF NOT EXISTS research_conclusion_evidence (
         conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
         attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
@@ -1075,6 +1092,115 @@ class ExperimentStore(Store):
             principal, key, "POST", f"/conclusions/{conclusion_id}/review", digest, command
         )
 
+    def amend_conclusion(
+        self,
+        principal: dict[str, Any],
+        conclusion_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | AmendConclusion,
+    ) -> tuple[int, dict[str, Any]]:
+        """Append, but never rewrite, one reviewed-conclusion correction relationship.
+
+        This is a labbook correction only. It neither changes a plan nor consults
+        or creates execution authority, and it deliberately keeps scientific
+        validity not assessed.
+        """
+        body = self._body(AmendConclusion, payload)
+        path = f"/conclusions/{conclusion_id}/amendments"
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor)
+            conclusion = self._conclusion(connection, actor, conclusion_id)
+            if conclusion["status"] != "reviewed":
+                raise Conflict("Only reviewed conclusions can be amended or retracted.")
+            if conclusion["design_revision"] != body["expected_design_revision"]:
+                raise Conflict("Conclusion design snapshot is no longer the expected revision.")
+            # A head row supplies a compare-and-swap fence without changing the
+            # reviewed conclusion's statement, evidence, review attribution, or
+            # revision. Its initial revision is the immutable reviewed revision.
+            now = utc_now()
+            connection.execute(
+                """INSERT OR IGNORE INTO research_conclusion_lineage
+                (conclusion_id,revision,amendment_id,created_at,updated_at) VALUES (?,?,NULL,?,?)""",
+                (conclusion_id, conclusion["revision"], now, now),
+            )
+            head = connection.execute(
+                "SELECT * FROM research_conclusion_lineage WHERE conclusion_id=?", (conclusion_id,)
+            ).fetchone()
+            if head is None:  # pragma: no cover - database constraints make this defensive.
+                raise Conflict("Conclusion lineage is unavailable.")
+            if head["amendment_id"] is not None or head["revision"] != body["expected_revision"]:
+                raise Conflict("Conclusion amendment revision is no longer current.")
+            amendment_id = "conclusion_amendment_" + uuid.uuid4().hex
+            lineage_revision = head["revision"] + 1
+            if (
+                connection.execute(
+                    """UPDATE research_conclusion_lineage
+                    SET revision=?,amendment_id=?,updated_at=?
+                    WHERE conclusion_id=? AND revision=? AND amendment_id IS NULL""",
+                    (
+                        lineage_revision,
+                        amendment_id,
+                        now,
+                        conclusion_id,
+                        body["expected_revision"],
+                    ),
+                ).rowcount
+                != 1
+            ):
+                raise Conflict("Conclusion amendment revision is no longer current.")
+            amendment = {
+                "id": amendment_id,
+                "conclusion_id": conclusion_id,
+                "experiment_id": conclusion["experiment_id"],
+                "relation": body["relation"],
+                "reason": body["reason"],
+                "expected_revision": body["expected_revision"],
+                "expected_design_revision": body["expected_design_revision"],
+                "prior_lineage_revision": head["revision"],
+                "lineage_revision": lineage_revision,
+                "created_at": now,
+                "actor_principal_id": actor["id"],
+                "scientific_validity": "not_assessed",
+            }
+            connection.execute(
+                """INSERT INTO research_conclusion_amendments
+                (id,conclusion_id,experiment_id,relation,reason,expected_revision,
+                 expected_design_revision,prior_lineage_revision,lineage_revision,
+                 created_at,actor_principal_id)
+                VALUES (:id,:conclusion_id,:experiment_id,:relation,:reason,:expected_revision,
+                :expected_design_revision,:prior_lineage_revision,:lineage_revision,
+                :created_at,:actor_principal_id)""",
+                amendment,
+            )
+            experiment = self._experiment(connection, actor, conclusion["experiment_id"])
+            self._event(
+                connection,
+                actor,
+                experiment,
+                "experiment.conclusion_amended",
+                lineage_revision,
+                {
+                    "experiment_id": experiment["id"],
+                    "conclusion_id": conclusion_id,
+                    "amendment_id": amendment_id,
+                    "relation": body["relation"],
+                    "reason": body["reason"],
+                    "expected_revision": body["expected_revision"],
+                    "expected_design_revision": body["expected_design_revision"],
+                    "scientific_validity": "not_assessed",
+                },
+            )
+            return 201, {
+                "original": self._conclusion_response(connection, conclusion),
+                "amendment": amendment,
+            }
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
     def _conclusion_response(
         self, connection: sqlite3.Connection, row: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1092,6 +1218,24 @@ class ExperimentStore(Store):
             if row["design_revision"] is not None
             else None
         )
+        lineage = connection.execute(
+            "SELECT revision FROM research_conclusion_lineage WHERE conclusion_id=?", (row["id"],)
+        ).fetchone()
+        result["lineage_revision"] = lineage["revision"] if lineage is not None else row["revision"]
+        result["lineage"] = [
+            self._amendment_response(item)
+            for item in connection.execute(
+                """SELECT * FROM research_conclusion_amendments WHERE conclusion_id=?
+                ORDER BY lineage_revision,id""",
+                (row["id"],),
+            )
+        ]
+        return result
+
+    @staticmethod
+    def _amendment_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        result["scientific_validity"] = "not_assessed"
         return result
 
     def _design_response(
@@ -1217,6 +1361,11 @@ class ExperimentStore(Store):
                     WHERE c.experiment_id=?""",
                     (experiment_id,),
                 ),
+                (
+                    "conclusion amendments",
+                    "SELECT count(*) FROM research_conclusion_amendments WHERE experiment_id=?",
+                    (experiment_id,),
+                ),
             )
             for collection, query, parameters in bounded_queries:
                 if connection.execute(query, parameters).fetchone()[0] > EXPORT_RECORD_LIMIT:
@@ -1232,6 +1381,7 @@ class ExperimentStore(Store):
                 "artifacts": [],
                 "measurements": [],
                 "conclusions": [],
+                "conclusion_amendments": [],
                 "completeness": "complete_in_scope_goal_to_decision_chain",
             }
 
@@ -1321,6 +1471,12 @@ class ExperimentStore(Store):
                 (experiment_id,),
             ):
                 append("conclusions", self._conclusion_response(connection, dict(row)))
+            for row in connection.execute(
+                """SELECT * FROM research_conclusion_amendments WHERE experiment_id=?
+                ORDER BY created_at,id""",
+                (experiment_id,),
+            ):
+                append("conclusion_amendments", self._amendment_response(row))
             if encoded_size(result) > body["max_bytes"]:
                 raise Conflict("Export exceeds the requested byte cap.")
             return result

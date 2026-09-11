@@ -565,7 +565,7 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 28
+    assert migrate_state(state) == 29
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -765,12 +765,12 @@ def test_v25_v26_v27_experiment_ledgers_upgrade_reopen_and_repeat_without_proven
         tmp_path, source_version
     )
 
-    assert migrate_state(state) == 28
+    assert migrate_state(state) == 29
     records = ExperimentStore(state)
     exported = records.export_experiment(owner, experiment_id)
     reopened = ExperimentStore(state).get_experiment(owner, experiment_id)
     assert reopened == exported
-    assert migrate_state(state) == 28
+    assert migrate_state(state) == 29
     assert ExperimentStore(state).get_experiment(owner, experiment_id) == exported
 
     designs = {item["revision"]: item for item in exported["designs"]}
@@ -840,7 +840,7 @@ def test_v27_to_v28_experiment_provenance_migration_rolls_back_complete_legacy_l
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 28
+    assert migrate_state(state) == 29
 
 
 def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:
@@ -1066,7 +1066,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         connection.execute("DROP TABLE migration_27_conclusion_evidence")
         connection.execute("DROP TABLE migration_27_conclusions")
         connection.execute("UPDATE schema_meta SET schema_version=26")
-    assert migrate_state(state) == 28
+    assert migrate_state(state) == 29
     migrated = ExperimentStore(state).get_experiment(owner, first["id"])
     migrated_designs = {item["revision"]: item for item in migrated["designs"]}
     assert migrated_designs[1]["goal"] is None
