@@ -75,7 +75,7 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, a local authenticated exact-schema-pinned OpenCode HTTP/SSE fixture seam with durable uncertainty/cursor handling, an opt-in provider-disabled real-server compatibility fixture, a pure explicit-identity Minikube Job conformance contract, a read-only informational capability probe, and Phase 1 pure versioned environment plans plus human-approved fake-only intent reconciliation | Record a real selected-server fixture result (unconfigured/version-unavailable is explicitly not evidence), enrolled-node integration, durable/composable environment/execution adapters, scoped live provisioning operator, explicit Secret delivery authorization, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, dispatch, and broader operational identity lifecycle |
 | §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, schema-v24 project-object intent/reconciliation and manual retention incident metadata, and read-only held restore | Provider fencing/resumption after restore, portable object-bundle recovery, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
-| §8 E2E acceptance | Blocked for real pilot; thin vertical slice planned | Native CPU/control and sandboxed Electron fixtures; migration/rollback and adversarial component tests | Public/simple baseline-plus-intervention CPU workflow; laptop-independent remote control/execution; linked evidence, all four terminal outcome labels, human review, effort measurement, selected investigation/dataset, and remaining failure drills |
+| §8 E2E acceptance | Blocked for real pilot; synthetic integrated evidence | API-shaped synthetic baseline/intervention test joins human admission, immutable package/operation identity, provider-disabled OpenCode context, injected Kubernetes Job/Pod callbacks, quarantine/placement, measurements, reviewed conclusion, bounded export/reopen, and terminal success/failure/cancellation/unknown bookkeeping | Public/simple baseline-plus-intervention CPU workflow; laptop-independent remote control/execution; linked evidence, all four terminal outcome labels, human review, effort measurement, selected investigation/dataset, and remaining failure drills |
 | §9 Operations/product | Partial | Pinned development dependencies, CI, explicit migrations, backup/held-restore runbook, and manual project-object retention/deletion incident metadata | Signed packaging, update/drain/rollback, automatic retention policy, object-bundle recovery, monitoring, operational recovery and pilot measurements |
 | §1 post-pilot/later scope | Deferred | Contracts only where explicitly documented | Additional harnesses/runtimes, GPU/cluster, organization/hosted modes after prerequisite gates |
 
@@ -429,6 +429,17 @@ representative investigation have not passed end-to-end acceptance.
     design revisions. It retains the original conclusion/review exactly and exposes
     attributed reasoned lineage in export/reopen. It creates no plan, grant, lease,
     operation, result acceptance, or scientific validity.
+
+30. **Synthetic integrated experiment workflow:** one focused API-shaped test now
+    composes the normal control services with an injected provider-disabled
+    OpenCode client and injected Kubernetes Job/Pod callbacks. It covers a
+    baseline and intervention, four human terminal labels, stable admitted-attempt
+    identity through package/operation/evidence/measurement/conclusion/export,
+    lost-create reconciliation, cancellation fences, contradictory-observation
+    failure, immutable review, and bounded export/reopen. It uses no live
+    OpenCode/provider/model credentials or calls, no cluster command, and no real
+    remote or laptop-disconnect evidence; it is synthetic integration evidence,
+    not pilot acceptance.
 
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
