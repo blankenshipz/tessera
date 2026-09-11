@@ -71,17 +71,27 @@ out-of-order events are quarantined. Numeric SSE IDs are exclusive replay cursor
 gaps are retained, duplicate/reused IDs are deduplicated or quarantined, and a
 reopened local journal resumes with `Last-Event-ID` at the contiguous cursor.
 
-The private `0700` local journal stores operation binding, session identity,
-effect intent/outcome, cancellation state, and safe pending event metadata. A
-session identity cannot bind more than one operation. The journal persists
-create/message/abort intent before the outbound call and leaves a lost
-reply `uncertain`; a restart cannot create a second operation identity. A
-supervisor authority callback fails closed before contract inspection, create,
-message, abort, and event-stream calls. Abort acknowledgement remains only an
-OpenCode acknowledgement: provider termination, costs, output acceptance, and
-scientific success remain unresolved. The fixture prohibits provider routes and
-does not enable OpenCode shell, MCP, skills, permissions, provider authentication,
-or model calls.
+The private `0700` local journal stores operation/attempt authority references,
+session identity, effect intent/outcome, cancellation state, and safe pending
+event metadata. It also freezes the approved harness instance: endpoint, local
+harness-instance ID, server identity/incarnation, build/version/schema/config
+digests, and an opaque workspace scope. A session identity cannot bind more than
+one operation. On restart, a changed local endpoint, pin, instance, build,
+configuration, or workspace scope rejects polling, cursor acknowledgement, and
+abort before any upstream request or local mutation. The pinned `/doc` fixture
+also carries the expected server identity/incarnation/build/config/workspace
+extension; a changed server document fails contract inspection before an event
+stream or upstream mutation. This extension is a synthetic seam requirement, not a claim
+that a current real OpenCode release supports it.
+
+The journal persists create/message/abort intent before the outbound call and
+leaves a lost reply `uncertain`; a restart cannot create a second operation
+identity. A supervisor authority callback fails closed before contract
+inspection, create, message, abort, and event-stream calls. Abort acknowledgement
+remains only an OpenCode acknowledgement: provider termination, costs, output
+acceptance, and scientific success remain unresolved. The fixture prohibits
+provider routes and does not enable OpenCode shell, MCP, skills, permissions,
+provider authentication, or model calls.
 
 ## Opt-in real-server compatibility fixture
 

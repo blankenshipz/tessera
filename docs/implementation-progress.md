@@ -272,10 +272,14 @@ representative investigation have not passed end-to-end acceptance.
     It rejects non-TLS non-literal-loopback origins, redirects, proxies, cookies,
     unbounded bodies/events, and all routes except session create/message/abort and
     events. A private local journal preserves uncertain create/message/abort
-    effects, operation/session binding, contiguous SSE cursors, gaps and dedup
-    across restart. In-process HTTP fixtures cover authentication/version/schema,
-    redirects, revocation during setup, lost replies, reconnect/gaps, unknown and
-    bounded events, and provider-route non-use. It has no selected real OpenCode
+    effects, operation/session binding, operation/attempt authority references,
+    contiguous SSE cursors, gaps and dedup across restart. The journal freezes
+    endpoint, server identity/incarnation, approved build/schema/config digests,
+    and opaque workspace scope; restart rejects changed local pins before polling
+    or mutation. In-process HTTP fixtures cover authentication/version/schema,
+    instance reconfiguration/incarnation, redirects, revocation during setup, lost
+    replies, reconnect/gaps, unknown and bounded events, and provider-route non-use.
+    It has no selected real OpenCode
     server compatibility result, enrolled-node integration, provider/model call,
     credential handoff, dispatch, artifact/result acceptance, or pilot completion.
 

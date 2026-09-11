@@ -52,6 +52,9 @@ class TesseraBinding:
     operation_id: str
     epoch: int
     harness_instance_id: str
+    attempt_id: str
+    operation_authority_ref: str
+    attempt_authority_ref: str
     session_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -61,6 +64,9 @@ class TesseraBinding:
             "task_id",
             "operation_id",
             "harness_instance_id",
+            "attempt_id",
+            "operation_authority_ref",
+            "attempt_authority_ref",
         ):
             _identifier(getattr(self, field), field)
         if type(self.epoch) is not int or self.epoch < 0:

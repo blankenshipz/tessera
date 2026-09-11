@@ -20,6 +20,7 @@ from tessera_worker.opencode_harness import (
 )
 from tessera_worker.opencode_http import (
     MAX_SSE_FIELD_BYTES,
+    OpenCodeHarnessInstancePin,
     OpenCodeHttpClient,
     OpenCodeHttpError,
     OpenCodeServerPin,
@@ -35,7 +36,17 @@ class OpenCodeFixture:
     """In-process, authenticated OpenCode-shaped server with no provider route."""
 
     def __init__(self) -> None:
-        self.document = {"openapi": "3.1.0", "info": {"title": "OpenCode", "version": "1.2.3"}}
+        self.document = {
+            "openapi": "3.1.0",
+            "info": {"title": "OpenCode", "version": "1.2.3"},
+            "x-tessera-harness-instance": {
+                "server_identity": "server-1",
+                "server_incarnation": "incarnation-1",
+                "build_sha256": "b" * 64,
+                "config_sha256": "c" * 64,
+                "workspace_scope": "workspace-1",
+            },
+        }
         self.requests: list[tuple[str, str, dict[str, str], object | None]] = []
         self.sessions: list[str] = []
         self.messages: list[tuple[str, dict[str, object]]] = []
@@ -174,7 +185,17 @@ def fixture() -> Iterator[OpenCodeFixture]:
 
 
 def binding() -> TesseraBinding:
-    return TesseraBinding("org-1", "project-1", "task-1", "operation-1", 4, "harness-1")
+    return TesseraBinding(
+        "org-1",
+        "project-1",
+        "task-1",
+        "operation-1",
+        4,
+        "harness-1",
+        "attempt-1",
+        "operation-authority-1",
+        "attempt-authority-1",
+    )
 
 
 def context() -> BoundedPlanMessage:
@@ -182,7 +203,26 @@ def context() -> BoundedPlanMessage:
 
 
 def client(value: OpenCodeFixture) -> OpenCodeHttpClient:
-    return OpenCodeHttpClient(value.endpoint, "Bearer fixture-token", value.pin, timeout_seconds=2)
+    return OpenCodeHttpClient(
+        value.endpoint,
+        "Bearer fixture-token",
+        value.pin,
+        instance_pin(),
+        timeout_seconds=2,
+    )
+
+
+def instance_pin(**changes: str) -> OpenCodeHarnessInstancePin:
+    fields = {
+        "harness_instance_id": "harness-1",
+        "server_identity": "server-1",
+        "server_incarnation": "incarnation-1",
+        "build_sha256": "b" * 64,
+        "config_sha256": "c" * 64,
+        "workspace_scope": "workspace-1",
+    }
+    fields.update(changes)
+    return OpenCodeHarnessInstancePin(**fields)
 
 
 class _SseResponse:
@@ -240,6 +280,7 @@ def _stream_client(response: _SseResponse, timeout_seconds: float = 0.1) -> Open
         "http://127.0.0.1:4096",
         "Bearer fixture-token",
         OpenCodeServerPin("1.2.3", "a" * 64),
+        instance_pin(),
         timeout_seconds=timeout_seconds,
         opener=lambda _request, _timeout: response,
     )
@@ -247,9 +288,15 @@ def _stream_client(response: _SseResponse, timeout_seconds: float = 0.1) -> Open
     return value
 
 
-def adapter(value: OpenCodeFixture, journal: Path, **kwargs: object) -> LiveOpenCodeHarnessAdapter:
+def adapter(
+    value: OpenCodeFixture,
+    journal: Path,
+    *,
+    http_client: OpenCodeHttpClient | None = None,
+    **kwargs: object,
+) -> LiveOpenCodeHarnessAdapter:
     return LiveOpenCodeHarnessAdapter(
-        client(value),
+        http_client or client(value),
         journal,
         authority_is_current=kwargs.pop("authority_is_current", lambda _b, _a: True),
     )
@@ -267,13 +314,13 @@ def live_event(
 def test_requires_authenticated_tls_or_literal_loopback_pinned_endpoint() -> None:
     pin = OpenCodeServerPin("1.2.3", "a" * 64)
     with pytest.raises(ValueError, match="Bearer"):
-        OpenCodeHttpClient("http://127.0.0.1:4096", "", pin)
+        OpenCodeHttpClient("http://127.0.0.1:4096", "", pin, instance_pin())
     with pytest.raises(ValueError, match="literal loopback"):
-        OpenCodeHttpClient("http://localhost:4096", "Bearer x", pin)
+        OpenCodeHttpClient("http://localhost:4096", "Bearer x", pin, instance_pin())
     with pytest.raises(ValueError, match="literal loopback"):
-        OpenCodeHttpClient("http://127.0.0.2:4096", "Bearer x", pin)
+        OpenCodeHttpClient("http://127.0.0.2:4096", "Bearer x", pin, instance_pin())
     assert (
-        OpenCodeHttpClient("https://opencode.example", "Bearer x", pin).origin
+        OpenCodeHttpClient("https://opencode.example", "Bearer x", pin, instance_pin()).origin
         == "https://opencode.example"
     )
 
@@ -282,14 +329,18 @@ def test_auth_exact_version_schema_pin_and_redirect_are_checked_before_session(
     tmp_path: Path,
 ) -> None:
     with fixture() as value:
-        unauthenticated = OpenCodeHttpClient(value.endpoint, "Bearer wrong", value.pin)
+        unauthenticated = OpenCodeHttpClient(
+            value.endpoint, "Bearer wrong", value.pin, instance_pin()
+        )
         with pytest.raises(OpenCodeHttpError, match="rejected"):
             unauthenticated.verify_contract()
         assert value.sessions == []
 
         wrong_pin = OpenCodeServerPin("1.2.4", value.pin.schema_sha256)
         with pytest.raises(OpenCodeHttpError, match="incompatible"):
-            OpenCodeHttpClient(value.endpoint, "Bearer fixture-token", wrong_pin).verify_contract()
+            OpenCodeHttpClient(
+                value.endpoint, "Bearer fixture-token", wrong_pin, instance_pin()
+            ).verify_contract()
         assert value.sessions == []
 
         value.redirect_doc = True
@@ -384,7 +435,17 @@ def test_duplicate_upstream_session_cannot_bind_two_operations(tmp_path: Path) -
         first = live.start(binding(), context())
         assert first.session_id == "session-1"
         value.sessions.clear()
-        second = TesseraBinding("org-1", "project-1", "task-2", "operation-2", 5, "harness-1")
+        second = TesseraBinding(
+            "org-1",
+            "project-1",
+            "task-2",
+            "operation-2",
+            5,
+            "harness-1",
+            "attempt-2",
+            "operation-authority-2",
+            "attempt-authority-2",
+        )
         with pytest.raises(OpenCodeHarnessError, match="session identity conflicts"):
             live.start(second, BoundedPlanMessage("plan-8", "Another bounded message"))
         assert live.effect_outcome("operation-2", "create") == "uncertain"
@@ -414,10 +475,98 @@ def test_sse_reconnect_preserves_gap_dedup_cursor_and_attribution_after_restart(
         live.close()
 
         restarted = adapter(value, journal)
+        assert restarted.active_binding("operation-1") == bound
         value.event_batches = [[live_event(3, bound.session_id, state="idle")]]
         assert [item.cursor for item in restarted.reconnect("operation-1")] == [3]
         event_requests = [item for item in value.requests if item[1] == "/event"]
         assert [item[2].get("Last-Event-Id") for item in event_requests] == [None, None, "2"]
+
+
+@pytest.mark.parametrize(
+    "changed_client",
+    [
+        lambda value: OpenCodeHttpClient(
+            "http://127.0.0.1:4097", "Bearer fixture-token", value.pin, instance_pin()
+        ),
+        lambda value: OpenCodeHttpClient(
+            value.endpoint,
+            "Bearer fixture-token",
+            OpenCodeServerPin("1.2.3", "a" * 64),
+            instance_pin(),
+        ),
+        lambda value: OpenCodeHttpClient(
+            value.endpoint,
+            "Bearer fixture-token",
+            value.pin,
+            instance_pin(config_sha256="d" * 64),
+        ),
+        lambda value: OpenCodeHttpClient(
+            value.endpoint,
+            "Bearer fixture-token",
+            value.pin,
+            instance_pin(server_identity="server-2"),
+        ),
+        lambda value: OpenCodeHttpClient(
+            value.endpoint,
+            "Bearer fixture-token",
+            value.pin,
+            instance_pin(server_incarnation="incarnation-2"),
+        ),
+        lambda value: OpenCodeHttpClient(
+            value.endpoint,
+            "Bearer fixture-token",
+            value.pin,
+            instance_pin(build_sha256="d" * 64),
+        ),
+        lambda value: OpenCodeHttpClient(
+            value.endpoint,
+            "Bearer fixture-token",
+            value.pin,
+            instance_pin(workspace_scope="workspace-2"),
+        ),
+    ],
+)
+def test_restarted_journal_rejects_changed_harness_binding_before_poll_or_mutation(
+    tmp_path: Path, changed_client: object
+) -> None:
+    with fixture() as value:
+        journal = tmp_path / "journal"
+        live = adapter(value, journal)
+        live.start(binding(), context())
+        live.close()
+        request_count = len(value.requests)
+        assert callable(changed_client)
+        restarted = adapter(value, journal, http_client=changed_client(value))
+
+        with pytest.raises(OpenCodeHarnessError, match="instance changed"):
+            restarted.poll("operation-1")
+        with pytest.raises(OpenCodeHarnessError, match="instance changed"):
+            restarted.acknowledge_through("operation-1", 0)
+        with pytest.raises(OpenCodeHarnessError, match="instance changed"):
+            restarted.cancel("operation-1")
+
+        assert len(value.requests) == request_count
+        assert restarted.effect_outcome("operation-1", "abort") == "none"
+
+
+def test_restarted_journal_rechecks_server_incarnation_before_opening_event_stream(
+    tmp_path: Path,
+) -> None:
+    with fixture() as value:
+        journal = tmp_path / "journal"
+        original_client = client(value)
+        live = adapter(value, journal, http_client=original_client)
+        live.start(binding(), context())
+        live.close()
+        value.document["x-tessera-harness-instance"]["server_incarnation"] = "incarnation-2"  # type: ignore[index]
+        restarted = adapter(value, journal, http_client=original_client)
+        event_requests_before = len([item for item in value.requests if item[1] == "/event"])
+
+        with pytest.raises(OpenCodeHarnessError, match="contract verification failed"):
+            restarted.poll("operation-1")
+
+        event_requests_after = len([item for item in value.requests if item[1] == "/event"])
+        assert event_requests_after == event_requests_before
 
 
 def test_persistent_sse_returns_a_complete_event_without_waiting_for_eof() -> None:

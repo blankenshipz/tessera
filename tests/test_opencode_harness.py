@@ -63,7 +63,17 @@ class FakeOpenCodeClient:
 
 
 def binding() -> TesseraBinding:
-    return TesseraBinding("org-1", "project-1", "task-1", "operation-1", 4, "harness-1")
+    return TesseraBinding(
+        "org-1",
+        "project-1",
+        "task-1",
+        "operation-1",
+        4,
+        "harness-1",
+        "attempt-1",
+        "operation-authority-1",
+        "attempt-authority-1",
+    )
 
 
 def context() -> BoundedPlanMessage:
@@ -149,9 +159,29 @@ def test_rejects_missing_or_incompatible_upstream_version_before_session(
 
 def test_rejects_invalid_binding_context_and_prebound_session() -> None:
     with pytest.raises(ValueError):
-        TesseraBinding("bad org", "project-1", "task-1", "operation-1", 4, "harness-1")
+        TesseraBinding(
+            "bad org",
+            "project-1",
+            "task-1",
+            "operation-1",
+            4,
+            "harness-1",
+            "attempt-1",
+            "operation-authority-1",
+            "attempt-authority-1",
+        )
     with pytest.raises(ValueError):
-        TesseraBinding("org-1", "project-1", "task-1", "operation-1", True, "harness-1")
+        TesseraBinding(
+            "org-1",
+            "project-1",
+            "task-1",
+            "operation-1",
+            True,
+            "harness-1",
+            "attempt-1",
+            "operation-authority-1",
+            "attempt-authority-1",
+        )
     with pytest.raises(ValueError):
         BoundedPlanMessage("plan-7", "x" * (8192 + 1))
     adapter = OpenCodeHarnessAdapter(

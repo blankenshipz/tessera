@@ -105,6 +105,38 @@ class OpenCodeServerPin:
 
 
 @dataclass(frozen=True)
+class OpenCodeHarnessInstancePin:
+    """Approved identity and immutable configuration for one harness instance.
+
+    The server facts are checked against a deliberately required extension in
+    the pinned document.  No current real OpenCode compatibility claim is made
+    for that extension; an upstream that does not provide it fails closed.
+    """
+
+    harness_instance_id: str
+    server_identity: str
+    server_incarnation: str
+    build_sha256: str
+    config_sha256: str
+    workspace_scope: str
+
+    def __post_init__(self) -> None:
+        for field in (
+            "harness_instance_id",
+            "server_identity",
+            "server_incarnation",
+            "workspace_scope",
+        ):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+                raise ValueError(f"{field} must be a bounded identifier.")
+        for field in ("build_sha256", "config_sha256"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not _SHA256.fullmatch(value):
+                raise ValueError(f"{field} must be a lowercase SHA-256 digest.")
+
+
+@dataclass(frozen=True)
 class OpenCodeSseEvent:
     """One bounded event from the schema-pinned SSE route."""
 
@@ -131,6 +163,7 @@ class OpenCodeHttpClient:
         endpoint: str,
         authorization: str,
         pin: OpenCodeServerPin,
+        harness_instance: OpenCodeHarnessInstancePin,
         *,
         timeout_seconds: float = 5.0,
         opener: OpenRequest | None = None,
@@ -140,6 +173,9 @@ class OpenCodeHttpClient:
         if not isinstance(pin, OpenCodeServerPin):
             raise ValueError("OpenCode endpoint requires an explicit server/schema pin.")
         self.pin = pin
+        if not isinstance(harness_instance, OpenCodeHarnessInstancePin):
+            raise ValueError("OpenCode endpoint requires an approved harness-instance pin.")
+        self.harness_instance = harness_instance
         if (
             type(timeout_seconds) not in {int, float}
             or not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS
@@ -209,6 +245,21 @@ class OpenCodeHttpClient:
             raise OpenCodeHttpError("OpenCode schema lacks an exact server version") from error
         if version != self.pin.server_version or digest != self.pin.schema_sha256:
             raise OpenCodeHttpError("OpenCode server version or schema pin is incompatible")
+        try:
+            reported_instance = document["x-tessera-harness-instance"]
+            if not isinstance(reported_instance, dict):
+                raise TypeError
+            for field in (
+                "server_identity",
+                "server_incarnation",
+                "build_sha256",
+                "config_sha256",
+                "workspace_scope",
+            ):
+                if reported_instance[field] != getattr(self.harness_instance, field):
+                    raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise OpenCodeHttpError("OpenCode harness instance is incompatible") from None
         self._verified = True
 
     def create_session(self, operation_id: str) -> str:

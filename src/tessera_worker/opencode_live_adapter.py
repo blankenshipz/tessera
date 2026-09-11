@@ -73,6 +73,7 @@ class LiveOpenCodeHarnessAdapter:
             raise OpenCodeHarnessError("A new operation cannot supply a session identity.")
         if self._operation(binding.operation_id) is not None:
             raise OpenCodeHarnessError("Operation already has a local OpenCode journal.")
+        self._require_instance_binding(binding)
         self._require_authority(binding, "inspect")
         try:
             self._client.verify_contract()
@@ -107,7 +108,19 @@ class LiveOpenCodeHarnessAdapter:
 
     def active_binding(self, operation_id: str) -> TesseraBinding:
         row = self._required_operation(operation_id)
-        return TesseraBinding(row[1], row[2], row[3], row[0], row[4], row[5], session_id=row[6])
+        self._require_stored_instance_binding(row)
+        return TesseraBinding(
+            row[1],
+            row[2],
+            row[3],
+            row[0],
+            row[4],
+            row[5],
+            row[7],
+            row[8],
+            row[9],
+            session_id=row[6],
+        )
 
     def poll(self, operation_id: str) -> list[AttributedEvent]:
         binding = self.active_binding(operation_id)
@@ -128,7 +141,7 @@ class LiveOpenCodeHarnessAdapter:
         pending = self._drain_contiguous(binding)
         if pending:
             return pending
-        after_cursor = self._required_operation(operation_id)[10]
+        after_cursor = self._required_operation(operation_id)[13]
         try:
             events = self._client.events(after_cursor)
         except OpenCodeHttpError as error:
@@ -151,7 +164,8 @@ class LiveOpenCodeHarnessAdapter:
         if type(cursor) is not int or cursor < 0:
             raise ValueError("OpenCode acknowledgement cursor must be a non-negative integer.")
         row = self._required_operation(operation_id)
-        high_water = row[10]
+        self._require_stored_instance_binding(row)
+        high_water = row[13]
         if high_water is not None and cursor <= high_water:
             return
         expected = 0 if high_water is None else high_water + 1
@@ -208,7 +222,7 @@ class LiveOpenCodeHarnessAdapter:
 
     def cancellation_status(self, operation_id: str) -> CancellationStatus:
         row = self._required_operation(operation_id)
-        requested, acknowledged = bool(row[11]), bool(row[12])
+        requested, acknowledged = bool(row[14]), bool(row[15])
         # An OpenCode abort/session event cannot prove provider termination.
         return CancellationStatus(requested, acknowledged, False, requested)
 
@@ -216,7 +230,7 @@ class LiveOpenCodeHarnessAdapter:
         if boundary not in {"create", "message", "abort"}:
             raise ValueError("Unknown OpenCode effect boundary.")
         row = self._required_operation(operation_id)
-        return row[{"create": 7, "message": 8, "abort": 9}[boundary]]
+        return row[{"create": 10, "message": 11, "abort": 12}[boundary]]
 
     def _record_event(self, binding: TesseraBinding, event: OpenCodeSseEvent) -> None:
         try:
@@ -246,7 +260,7 @@ class LiveOpenCodeHarnessAdapter:
         if seen is not None:
             self._quarantine(event, "event identity reused at another cursor")
             return
-        high_water = self._required_operation(binding.operation_id)[10]
+        high_water = self._required_operation(binding.operation_id)[13]
         if high_water is not None and event.cursor <= high_water:
             self._quarantine(event, "delayed event before replay cursor")
             return
@@ -283,7 +297,7 @@ class LiveOpenCodeHarnessAdapter:
 
     def _drain_contiguous(self, binding: TesseraBinding) -> list[AttributedEvent]:
         row = self._required_operation(binding.operation_id)
-        expected = 0 if row[10] is None else row[10] + 1
+        expected = 0 if row[13] is None else row[13] + 1
         translated: list[AttributedEvent] = []
         while True:
             event = self._connection.execute(
@@ -320,12 +334,39 @@ class LiveOpenCodeHarnessAdapter:
         if allowed is not True:
             raise AuthorityRejectedError("Authority is expired or revised.")
 
+    def _require_instance_binding(self, binding: TesseraBinding) -> None:
+        if binding.harness_instance_id != self._client.harness_instance.harness_instance_id:
+            raise OpenCodeHarnessError(
+                "Operation harness instance does not match the approved endpoint."
+            )
+
+    def _require_stored_instance_binding(self, row: tuple[object, ...]) -> None:
+        instance = self._client.harness_instance
+        expected = (
+            instance.harness_instance_id,
+            self._client.origin,
+            instance.server_identity,
+            instance.server_incarnation,
+            instance.build_sha256,
+            self._client.pin.server_version,
+            self._client.pin.schema_sha256,
+            instance.config_sha256,
+            instance.workspace_scope,
+        )
+        if (row[5], *row[16:24]) != expected:
+            raise OpenCodeHarnessError(
+                "OpenCode harness instance changed; restart reconciliation is blocked."
+            )
+
     def _insert_operation(self, binding: TesseraBinding) -> None:
         self._connection.execute(
             """INSERT INTO operations
             (operation_id, organization_id, project_id, task_id, epoch,
-             harness_instance_id, create_outcome)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+              harness_instance_id, attempt_id, operation_authority_ref,
+              attempt_authority_ref, endpoint, server_identity, server_incarnation,
+              build_sha256, server_version, schema_sha256, config_sha256,
+              workspace_scope, create_outcome)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
             (
                 binding.operation_id,
                 binding.organization_id,
@@ -333,6 +374,17 @@ class LiveOpenCodeHarnessAdapter:
                 binding.task_id,
                 binding.epoch,
                 binding.harness_instance_id,
+                binding.attempt_id,
+                binding.operation_authority_ref,
+                binding.attempt_authority_ref,
+                self._client.origin,
+                self._client.harness_instance.server_identity,
+                self._client.harness_instance.server_incarnation,
+                self._client.harness_instance.build_sha256,
+                self._client.pin.server_version,
+                self._client.pin.schema_sha256,
+                self._client.harness_instance.config_sha256,
+                self._client.harness_instance.workspace_scope,
             ),
         )
         self._connection.commit()
@@ -370,9 +422,12 @@ class LiveOpenCodeHarnessAdapter:
     def _operation(self, operation_id: str) -> tuple[object, ...] | None:
         return self._connection.execute(
             """SELECT operation_id, organization_id, project_id, task_id, epoch,
-            harness_instance_id, session_id, create_outcome, message_outcome,
-            abort_outcome, high_water_cursor, cancellation_requested,
-            abort_acknowledged FROM operations WHERE operation_id=?""",
+            harness_instance_id, session_id, attempt_id, operation_authority_ref,
+            attempt_authority_ref, create_outcome, message_outcome, abort_outcome,
+            high_water_cursor, cancellation_requested, abort_acknowledged, endpoint,
+            server_identity, server_incarnation, build_sha256, server_version,
+            schema_sha256, config_sha256, workspace_scope
+            FROM operations WHERE operation_id=?""",
             (operation_id,),
         ).fetchone()
 
@@ -392,6 +447,17 @@ class LiveOpenCodeHarnessAdapter:
                 epoch INTEGER NOT NULL,
                 harness_instance_id TEXT NOT NULL,
                 session_id TEXT,
+                attempt_id TEXT NOT NULL,
+                operation_authority_ref TEXT NOT NULL,
+                attempt_authority_ref TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                server_identity TEXT NOT NULL,
+                server_incarnation TEXT NOT NULL,
+                build_sha256 TEXT NOT NULL,
+                server_version TEXT NOT NULL,
+                schema_sha256 TEXT NOT NULL,
+                config_sha256 TEXT NOT NULL,
+                workspace_scope TEXT NOT NULL,
                 create_outcome TEXT NOT NULL,
                 message_outcome TEXT NOT NULL DEFAULT 'none',
                 abort_outcome TEXT NOT NULL DEFAULT 'none',
@@ -410,6 +476,26 @@ class LiveOpenCodeHarnessAdapter:
             CREATE UNIQUE INDEX IF NOT EXISTS operations_by_session
                 ON operations(session_id) WHERE session_id IS NOT NULL;"""
         )
+        columns = {
+            row[1] for row in self._connection.execute("PRAGMA table_info(operations)").fetchall()
+        }
+        required_columns = {
+            "attempt_id",
+            "operation_authority_ref",
+            "attempt_authority_ref",
+            "endpoint",
+            "server_identity",
+            "server_incarnation",
+            "build_sha256",
+            "server_version",
+            "schema_sha256",
+            "config_sha256",
+            "workspace_scope",
+        }
+        if not required_columns <= columns:
+            raise ValueError(
+                "OpenCode live journal lacks immutable harness binding; it cannot be resumed."
+            )
         self._connection.commit()
 
     @staticmethod
