@@ -138,17 +138,17 @@ class LiveOpenCodeHarnessAdapter:
         # stream.  A consumer persists these observations before acknowledging
         # their cursor, so a crash between delivery and that persistence only
         # causes a deduplicable redelivery.
-        pending = self._drain_contiguous(binding)
+        pending = self._drain_routed(binding)
         if pending:
             return pending
-        after_cursor = self._required_operation(operation_id)[13]
+        after_cursor = self._stream_replay_cursor()
         try:
             events = self._client.events(after_cursor)
         except OpenCodeHttpError as error:
             raise OpenCodeHarnessError("OpenCode event stream is unavailable or unsafe.") from error
         for event in events:
-            self._record_event(binding, event)
-        return self._drain_contiguous(binding)
+            self._ingest_event(event)
+        return self._drain_routed(binding)
 
     def reconnect(self, operation_id: str) -> list[AttributedEvent]:
         return self.poll(operation_id)
@@ -168,15 +168,23 @@ class LiveOpenCodeHarnessAdapter:
         high_water = row[13]
         if high_water is not None and cursor <= high_water:
             return
-        expected = 0 if high_water is None else high_water + 1
-        span = self._connection.execute(
-            """SELECT MIN(cursor), MAX(cursor), COUNT(*) FROM stream_events
-            WHERE operation_id=? AND cursor>=? AND cursor<=?""",
-            (operation_id, expected, cursor),
-        ).fetchone()
-        if span != (expected, cursor, cursor - expected + 1):
+        stream_cursor = self._stream_replay_cursor()
+        if stream_cursor is None or cursor > stream_cursor:
             raise OpenCodeHarnessError(
-                "OpenCode replay acknowledgement must cover durable contiguous events."
+                "OpenCode replay acknowledgement must cover durable contiguous stream events."
+            )
+        acknowledged = self._connection.execute(
+            """SELECT COUNT(*) FROM stream_events
+            WHERE operation_id=? AND cursor>? AND cursor<=?""",
+            (operation_id, -1 if high_water is None else high_water, cursor),
+        ).fetchone()
+        endpoint = self._connection.execute(
+            "SELECT 1 FROM stream_events WHERE operation_id=? AND cursor=?",
+            (operation_id, cursor),
+        ).fetchone()
+        if acknowledged is None or acknowledged[0] == 0 or endpoint is None:
+            raise OpenCodeHarnessError(
+                "OpenCode replay acknowledgement must cover durable routed events."
             )
         self._connection.execute(
             "UPDATE operations SET high_water_cursor=? WHERE operation_id=?",
@@ -232,52 +240,90 @@ class LiveOpenCodeHarnessAdapter:
         row = self._required_operation(operation_id)
         return row[{"create": 10, "message": 11, "abort": 12}[boundary]]
 
-    def _record_event(self, binding: TesseraBinding, event: OpenCodeSseEvent) -> None:
+    def _ingest_event(self, event: OpenCodeSseEvent) -> None:
+        """Persist a shared-stream event before assigning it to its session.
+
+        OpenCode cursor IDs identify the stream, not an individual session.  A
+        known other session therefore cannot become an unrecoverable gap for the
+        operation that happened to poll the stream.
+        """
+        fingerprint = event.fingerprint()
+        known = self._connection.execute(
+            "SELECT fingerprint FROM stream_ingestion WHERE cursor=?", (event.cursor,)
+        ).fetchone()
+        if known is not None:
+            if known[0] != fingerprint:
+                self._quarantine(event, "cursor reused by another event")
+            return
+        known_fingerprint = self._connection.execute(
+            "SELECT cursor FROM stream_ingestion WHERE fingerprint=?", (fingerprint,)
+        ).fetchone()
+        if known_fingerprint is not None:
+            self._quarantine(event, "event identity reused at another cursor")
+            return
         try:
             kind, session_id, payload = self._translate_event(event)
         except ValueError:
             self._quarantine(event, "unsafe or malformed event")
             return
-        if session_id != binding.session_id:
-            self._quarantine(event, "unknown or foreign session")
-            return
         if kind not in _KNOWN_EVENT_TYPES:
             self._quarantine(event, "unknown event kind")
             return
-        row = self._connection.execute(
-            "SELECT fingerprint FROM stream_events WHERE operation_id=? AND cursor=?",
-            (binding.operation_id, event.cursor),
-        ).fetchone()
-        fingerprint = event.fingerprint()
-        if row is not None:
-            if row[0] != fingerprint:
-                self._quarantine(event, "cursor reused by another event")
+        operations = self._connection.execute(
+            "SELECT operation_id, high_water_cursor FROM operations WHERE session_id=?",
+            (session_id,),
+        ).fetchall()
+        if not operations:
+            self._quarantine(event, "unknown or foreign session")
             return
-        seen = self._connection.execute(
-            "SELECT cursor FROM stream_events WHERE operation_id=? AND fingerprint=?",
-            (binding.operation_id, fingerprint),
-        ).fetchone()
-        if seen is not None:
-            self._quarantine(event, "event identity reused at another cursor")
-            return
-        high_water = self._required_operation(binding.operation_id)[13]
-        if high_water is not None and event.cursor <= high_water:
-            self._quarantine(event, "delayed event before replay cursor")
-            return
-        self._connection.execute(
-            """INSERT INTO stream_events
-            (operation_id, cursor, fingerprint, kind, session_id, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                binding.operation_id,
-                event.cursor,
-                fingerprint,
-                kind,
-                session_id,
-                json.dumps(payload, sort_keys=True, separators=(",", ":")),
-            ),
-        )
+        self._record_ingestion(event, fingerprint, "routed")
+        for operation_id, high_water in operations:
+            if high_water is not None and event.cursor <= high_water:
+                self._quarantine(event, "delayed event before replay cursor")
+                continue
+            self._connection.execute(
+                """INSERT INTO stream_events
+                (operation_id, cursor, fingerprint, kind, session_id, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    operation_id,
+                    event.cursor,
+                    fingerprint,
+                    kind,
+                    session_id,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                ),
+            )
         self._connection.commit()
+
+    def _record_ingestion(self, event: OpenCodeSseEvent, fingerprint: str, outcome: str) -> None:
+        self._connection.execute(
+            "INSERT INTO stream_ingestion (cursor, fingerprint, outcome) VALUES (?, ?, ?)",
+            (event.cursor, fingerprint, outcome),
+        )
+        self._advance_stream_replay_cursor()
+
+    def _advance_stream_replay_cursor(self) -> None:
+        cursor = self._stream_replay_cursor()
+        expected = 0 if cursor is None else cursor + 1
+        while (
+            self._connection.execute(
+                "SELECT 1 FROM stream_ingestion WHERE cursor=?", (expected,)
+            ).fetchone()
+            is not None
+        ):
+            self._connection.execute(
+                "UPDATE stream_state SET replay_cursor=? WHERE singleton=1", (expected,)
+            )
+            expected += 1
+
+    def _stream_replay_cursor(self) -> int | None:
+        row = self._connection.execute(
+            "SELECT replay_cursor FROM stream_state WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise OpenCodeHarnessError("OpenCode stream journal is unavailable.")
+        return row[0]
 
     @staticmethod
     def _translate_event(event: OpenCodeSseEvent) -> tuple[str, str, dict[str, object]]:
@@ -295,18 +341,18 @@ class LiveOpenCodeHarnessAdapter:
         payload = _bounded_payload(properties)
         return kind, session_id, payload
 
-    def _drain_contiguous(self, binding: TesseraBinding) -> list[AttributedEvent]:
+    def _drain_routed(self, binding: TesseraBinding) -> list[AttributedEvent]:
         row = self._required_operation(binding.operation_id)
-        expected = 0 if row[13] is None else row[13] + 1
+        stream_cursor = self._stream_replay_cursor()
+        if stream_cursor is None:
+            return []
         translated: list[AttributedEvent] = []
-        while True:
-            event = self._connection.execute(
-                """SELECT cursor, fingerprint, kind, session_id, payload_json FROM stream_events
-                WHERE operation_id=? AND cursor=?""",
-                (binding.operation_id, expected),
-            ).fetchone()
-            if event is None:
-                break
+        events = self._connection.execute(
+            """SELECT cursor, fingerprint, kind, session_id, payload_json FROM stream_events
+            WHERE operation_id=? AND cursor>? AND cursor<=? ORDER BY cursor""",
+            (binding.operation_id, -1 if row[13] is None else row[13], stream_cursor),
+        ).fetchall()
+        for event in events:
             payload = json.loads(event[4])
             translated.append(
                 AttributedEvent(
@@ -318,7 +364,6 @@ class LiveOpenCodeHarnessAdapter:
                     payload=payload,
                 )
             )
-            expected += 1
         return translated
 
     def _quarantine(self, event: OpenCodeSseEvent, reason: str) -> None:
@@ -475,6 +520,16 @@ class LiveOpenCodeHarnessAdapter:
                 UNIQUE (operation_id, fingerprint));
             CREATE UNIQUE INDEX IF NOT EXISTS operations_by_session
                 ON operations(session_id) WHERE session_id IS NOT NULL;"""
+        )
+        self._connection.executescript(
+            """CREATE TABLE IF NOT EXISTS stream_ingestion (
+                cursor INTEGER PRIMARY KEY,
+                fingerprint TEXT NOT NULL UNIQUE,
+                outcome TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS stream_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+                replay_cursor INTEGER);
+            INSERT OR IGNORE INTO stream_state (singleton, replay_cursor) VALUES (1, NULL);"""
         )
         columns = {
             row[1] for row in self._connection.execute("PRAGMA table_info(operations)").fetchall()

@@ -26,6 +26,7 @@ MAX_SSE_BYTES = 64 * 1024
 MAX_SSE_EVENTS = 64
 MAX_SSE_FIELD_BYTES = 4 * 1024
 MAX_TIMEOUT_SECONDS = 30.0
+_READ_CHUNK_BYTES = 4 * 1024
 _MAX_ENDPOINT_BYTES = 2048
 _MAX_HEADER_BYTES = 4096
 _VERSION = re.compile(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?\Z")
@@ -319,7 +320,8 @@ class OpenCodeHttpClient:
                 **({"Last-Event-ID": str(after_cursor)} if after_cursor is not None else {}),
             },
         )
-        response = self._open_response(request)
+        deadline = time.monotonic() + self.timeout_seconds
+        response = self._open_response(request, deadline)
         try:
             status = response.getcode()
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -332,7 +334,9 @@ class OpenCodeHttpClient:
             # boundary: return after a complete event rather than waiting for an
             # EOF that a healthy long-lived stream will not send.
             content_length = response.headers.get("Content-Length")
-            return self._parse_sse(response, return_after_event=not bool(content_length))
+            return self._parse_sse(
+                response, deadline=deadline, return_after_event=not bool(content_length)
+            )
         except OpenCodeHttpError:
             raise
         except (OSError, ValueError, AttributeError):
@@ -350,7 +354,8 @@ class OpenCodeHttpClient:
         operation_id: str | None = None,
     ) -> dict[str, object]:
         request = self._request(method, path, body, {}, operation_id)
-        response = self._open_response(request)
+        deadline = time.monotonic() + self.timeout_seconds
+        response = self._open_response(request, deadline)
         try:
             status = response.getcode()
             if not isinstance(status, int) or not 200 <= status < 300:
@@ -358,9 +363,7 @@ class OpenCodeHttpClient:
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if expect_json and content_type != "application/json":
                 raise OpenCodeHttpError("OpenCode response has an invalid content type", status)
-            encoded = response.read(MAX_RESPONSE_BYTES + 1)
-            if not isinstance(encoded, bytes) or len(encoded) > MAX_RESPONSE_BYTES:
-                raise OpenCodeHttpError("OpenCode response exceeds its bound", status)
+            encoded = self._read_bounded_response(response, MAX_RESPONSE_BYTES, deadline)
             if not expect_json:
                 if encoded:
                     # Reject malformed non-empty acknowledgements.
@@ -393,16 +396,51 @@ class OpenCodeHttpClient:
         headers.update(extra_headers)
         return Request(f"{self.origin}{path}", data=data, headers=headers, method=method)
 
-    def _open_response(self, request: Request) -> OpenCodeHttpResponse:
-        try:
-            return self._open(request, self.timeout_seconds)
-        except OpenCodeHttpError:
-            raise
-        except HTTPError as error:
-            _close_quietly(error)
-            raise OpenCodeHttpError("OpenCode rejected request", error.code) from None
-        except (OSError, URLError, ValueError):
+    def _open_response(self, request: Request, deadline: float) -> OpenCodeHttpResponse:
+        """Open within the request's absolute deadline.
+
+        An injected or platform transport can ignore its supplied socket timeout.
+        Keep that blocking call outside the request state and close a late response
+        before it can be reused.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OpenCodeHttpError("OpenCode request deadline exceeded")
+        result: list[OpenCodeHttpResponse] = []
+        failure: list[BaseException] = []
+        expired = threading.Event()
+
+        def open_request() -> None:
+            try:
+                response = self._open(request, remaining)
+                if expired.is_set():
+                    _close_quietly(response)
+                else:
+                    result.append(response)
+            except BaseException as error:
+                failure.append(error)
+
+        opener = threading.Thread(target=open_request, daemon=True)
+        opener.start()
+        opener.join(remaining)
+        if opener.is_alive() or time.monotonic() > deadline:
+            expired.set()
+            if result:
+                _close_quietly(result[0])
+            raise OpenCodeHttpError("OpenCode request deadline exceeded")
+        if failure:
+            error = failure[0]
+            if isinstance(error, OpenCodeHttpError):
+                raise error
+            if isinstance(error, HTTPError):
+                _close_quietly(error)
+                raise OpenCodeHttpError("OpenCode rejected request", error.code) from None
+            if isinstance(error, OSError | URLError | ValueError):
+                raise OpenCodeHttpError("OpenCode transport unavailable") from None
             raise OpenCodeHttpError("OpenCode transport unavailable") from None
+        if not result:
+            raise OpenCodeHttpError("OpenCode transport unavailable")
+        return result[0]
 
     @staticmethod
     def _decode_json(encoded: bytes, status: int) -> dict[str, object]:
@@ -415,9 +453,8 @@ class OpenCodeHttpClient:
         return decoded
 
     def _parse_sse(
-        self, response: OpenCodeHttpResponse, *, return_after_event: bool
+        self, response: OpenCodeHttpResponse, *, deadline: float, return_after_event: bool
     ) -> list[OpenCodeSseEvent]:
-        deadline = time.monotonic() + self.timeout_seconds
         total = 0
         fields: dict[str, list[str]] = {}
         events: list[OpenCodeSseEvent] = []
@@ -460,6 +497,26 @@ class OpenCodeHttpClient:
         return events
 
     @staticmethod
+    def _read_bounded_response(
+        response: OpenCodeHttpResponse, maximum: int, deadline: float
+    ) -> bytes:
+        """Read a finite JSON response in bounded chunks under one deadline."""
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = OpenCodeHttpClient._read_before_deadline(
+                response, min(_READ_CHUNK_BYTES, maximum + 1 - total), deadline
+            )
+            if not isinstance(chunk, bytes):
+                raise OpenCodeHttpError("OpenCode response is malformed")
+            total += len(chunk)
+            if total > maximum:
+                raise OpenCodeHttpError("OpenCode response exceeds its bound")
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+    @staticmethod
     def _readline_before_deadline(response: OpenCodeHttpResponse, deadline: float) -> bytes:
         """Read one SSE line without allowing slow bytes to extend the deadline.
 
@@ -469,26 +526,40 @@ class OpenCodeHttpClient:
         whole-stream deadline expires.  The thread only reads the response and
         is bounded by that close; no parsed state can be changed after expiry.
         """
+        return OpenCodeHttpClient._read_before_deadline(
+            response, MAX_SSE_FIELD_BYTES + 1, deadline, line=True
+        )
+
+    @staticmethod
+    def _read_before_deadline(
+        response: OpenCodeHttpResponse, amount: int, deadline: float, *, line: bool = False
+    ) -> bytes:
+        deadline_reason = (
+            "OpenCode event stream deadline exceeded"
+            if line
+            else "OpenCode response deadline exceeded"
+        )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise OpenCodeHttpError("OpenCode event stream deadline exceeded")
+            raise OpenCodeHttpError(deadline_reason)
         result: list[bytes] = []
         failure: list[Exception] = []
 
-        def read_line() -> None:
+        def read() -> None:
             try:
-                result.append(response.readline(MAX_SSE_FIELD_BYTES + 1))
+                reader = response.readline if line else response.read
+                result.append(reader(amount))
             except Exception as error:  # The caller sanitizes transport failures.
                 failure.append(error)
 
-        reader = threading.Thread(target=read_line, daemon=True)
+        reader = threading.Thread(target=read, daemon=True)
         reader.start()
         reader.join(remaining)
         if reader.is_alive():
             _close_quietly(response)
-            raise OpenCodeHttpError("OpenCode event stream deadline exceeded")
+            raise OpenCodeHttpError(deadline_reason)
         if time.monotonic() > deadline:
-            raise OpenCodeHttpError("OpenCode event stream deadline exceeded")
+            raise OpenCodeHttpError(deadline_reason)
         if failure:
             raise failure[0]
         if not result:

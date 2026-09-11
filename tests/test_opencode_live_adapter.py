@@ -275,6 +275,25 @@ class _SlowDripSseResponse(_SseResponse):
         self.closed.set()
 
 
+class _SlowDripJsonResponse(_SseResponse):
+    headers = {"Content-Type": "application/json"}
+
+    def __init__(self) -> None:
+        self.closed = threading.Event()
+
+    def read(self, amount: int = -1) -> bytes:  # noqa: ARG002
+        # A transport can keep a finite response read pending with slow bytes;
+        # the absolute request deadline, not byte progress, wins.
+        end = time.monotonic() + 0.8
+        while time.monotonic() < end:
+            if self.closed.wait(0.01):
+                return b""
+        return b"{"
+
+    def close(self) -> None:
+        self.closed.set()
+
+
 def _stream_client(response: _SseResponse, timeout_seconds: float = 0.1) -> OpenCodeHttpClient:
     value = OpenCodeHttpClient(
         "http://127.0.0.1:4096",
@@ -482,6 +501,43 @@ def test_sse_reconnect_preserves_gap_dedup_cursor_and_attribution_after_restart(
         assert [item[2].get("Last-Event-Id") for item in event_requests] == [None, None, "2"]
 
 
+def test_interleaved_known_sessions_route_from_one_durable_stream_without_gaps(
+    tmp_path: Path,
+) -> None:
+    with fixture() as value:
+        live = adapter(value, tmp_path / "journal")
+        first = live.start(binding(), context())
+        second_binding = TesseraBinding(
+            "org-1",
+            "project-1",
+            "task-2",
+            "operation-2",
+            5,
+            "harness-1",
+            "attempt-2",
+            "operation-authority-2",
+            "attempt-authority-2",
+        )
+        second = live.start(second_binding, BoundedPlanMessage("plan-8", "Second message"))
+        assert first.session_id is not None and second.session_id is not None
+        value.event_batches = [
+            [
+                live_event(0, first.session_id, state="running"),
+                live_event(1, second.session_id, state="running"),
+                live_event(2, first.session_id, state="idle"),
+            ]
+        ]
+
+        assert [event.cursor for event in live.poll("operation-1")] == [0, 2]
+        live.acknowledge_through("operation-1", 2)
+        assert [event.cursor for event in live.poll("operation-2")] == [1]
+        live.acknowledge_through("operation-2", 1)
+        value.event_batches = [[live_event(3, first.session_id, state="idle")]]
+        assert [event.cursor for event in live.reconnect("operation-1")] == [3]
+        event_requests = [item for item in value.requests if item[1] == "/event"]
+        assert [item[2].get("Last-Event-Id") for item in event_requests] == [None, "2"]
+
+
 @pytest.mark.parametrize(
     "changed_client",
     [
@@ -583,6 +639,18 @@ def test_slow_drip_cannot_extend_the_sse_deadline() -> None:
 
     with pytest.raises(OpenCodeHttpError, match="deadline exceeded"):
         _stream_client(response, timeout_seconds=0.05).events(None)
+
+    assert time.monotonic() - started < 0.45
+    assert response.closed.is_set()
+
+
+def test_slow_drip_cannot_extend_the_json_response_deadline() -> None:
+    response = _SlowDripJsonResponse()
+    http = _stream_client(response, timeout_seconds=0.05)
+    started = time.monotonic()
+
+    with pytest.raises(OpenCodeHttpError, match="response deadline exceeded"):
+        http._json("GET", "/doc", None, expect_json=True)  # noqa: SLF001 - transport seam.
 
     assert time.monotonic() - started < 0.45
     assert response.closed.is_set()

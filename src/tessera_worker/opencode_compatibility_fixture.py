@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import stat
@@ -97,6 +98,11 @@ class FixtureResult:
     reconnected: bool = False
     abort_acknowledged: bool = False
     cleanup_confirmed: bool = False
+    transport_checked: bool = False
+    reconnect_checked: bool = False
+    cursor_replay_checked: bool = False
+    session_attribution_checked: bool = False
+    retained_temp_state: str | None = None
 
     def json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
@@ -177,6 +183,16 @@ def _is_provider_disabled_response(status: int, headers: dict[str, str], body: b
     return decoded == {"error": {"code": "provider_disabled", "enabled_providers": []}}
 
 
+def _event_session_id(event: dict[str, str]) -> str | None:
+    """Return only the typed session attribution used by the pinned probe."""
+    try:
+        envelope = json.loads(event["data"])
+        session_id = envelope["properties"]["sessionID"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return None
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
 class _LoopbackClient:
     """Small basic-auth client with no proxy, redirect, cookie, or DNS surface."""
 
@@ -239,7 +255,7 @@ class _LoopbackClient:
         if not 200 <= status < 300:
             raise FixtureProtocolError(f"OpenCode rejected {method} {path} (HTTP {status})")
 
-    def events(self, after: str | None = None) -> tuple[list[dict[str, str]], str | None]:
+    def events(self, after: str | None = None) -> tuple[list[dict[str, str]], str]:
         headers = {"Accept": "text/event-stream"}
         if after is not None:
             headers["Last-Event-ID"] = after
@@ -292,7 +308,12 @@ class _LoopbackClient:
                 fields.setdefault(name, []).append(value.lstrip(" "))
             if not events:
                 raise FixtureProtocolError("OpenCode event stream ended before an event")
-            return events, events[-1].get("id")
+            if any(not isinstance(event.get("id"), str) or not event["id"] for event in events):
+                raise FixtureProtocolError("OpenCode event stream included an id-less event")
+            cursor = events[-1]["id"]
+            if len(cursor.encode("utf-8")) > 512:
+                raise FixtureProtocolError("OpenCode event stream lacked a bounded replay cursor")
+            return events, cursor
         finally:
             connection.close()
 
@@ -341,7 +362,9 @@ class _ServerProcess:
         return True
 
     def _wait_for_group_exit(self) -> bool:
-        deadline = time.monotonic() + _CLEANUP_TIMEOUT
+        return self._wait_for_group_exit_before(time.monotonic() + _CLEANUP_TIMEOUT)
+
+    def _wait_for_group_exit_before(self, deadline: float) -> bool:
         while self._group_is_alive():
             if time.monotonic() >= deadline:
                 return False
@@ -351,16 +374,24 @@ class _ServerProcess:
     def close(self) -> bool:
         if self.process is None:
             return True
+        deadline = time.monotonic() + _CLEANUP_TIMEOUT
+        term_deadline = deadline - (_CLEANUP_TIMEOUT / 2)
         if self._group_is_alive():
-            os.killpg(self._process_group_id, signal.SIGTERM)
+            try:
+                os.killpg(self._process_group_id, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         try:
-            self.process.wait(timeout=_CLEANUP_TIMEOUT)
+            self.process.wait(timeout=max(0, term_deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
+            pass
+        if self._group_is_alive():
+            try:
+                os.killpg(self._process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if not self._wait_for_group_exit_before(deadline):
             return False
-        if not self._wait_for_group_exit():
-            os.killpg(self._process_group_id, signal.SIGKILL)
-            if not self._wait_for_group_exit():
-                return False
         return self.process.poll() is not None and not self._group_is_alive()
 
 
@@ -405,13 +436,13 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
             schema_sha256=settings.schema_sha256,
         )
     server: _ServerProcess | None = None
+    root: Path | None = None
     cleanup = False
+    retained_temp_state: str | None = None
     result: FixtureResult | None = None
     try:
-        temporary = tempfile.TemporaryDirectory(prefix="tessera-opencode-fixture-")
         try:
-            root_text = temporary.name
-            root = Path(root_text)
+            root = Path(tempfile.mkdtemp(prefix="tessera-opencode-fixture-"))
             home, workspace = root / "home", root / "workspace"
             for directory in (
                 home,
@@ -491,7 +522,13 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
                         f"OpenCode rejected POST {message_path} (HTTP {message_status})"
                     )
             first_events, cursor = client.events()
-            second_events, _ = client.events(cursor)
+            second_events, replay_cursor = client.events(cursor)
+            if replay_cursor == cursor or any(event["id"] == cursor for event in second_events):
+                raise FixtureProtocolError("OpenCode did not replay beyond the supplied cursor")
+            if not any(
+                _event_session_id(event) == session_id for event in (*first_events, *second_events)
+            ):
+                raise FixtureProtocolError("OpenCode events lacked created-session attribution")
             client.acknowledge("POST", f"/session/{quote(session_id, safe='')}/abort", {})
             result = FixtureResult(
                 "passed",
@@ -505,6 +542,10 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
                 sse_events=len(first_events) + len(second_events),
                 reconnected=True,
                 abort_acknowledged=True,
+                transport_checked=True,
+                reconnect_checked=True,
+                cursor_replay_checked=True,
+                session_attribution_checked=True,
             )
         finally:
             if server is not None:
@@ -512,7 +553,10 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
                     cleanup = server.close()
                 except (OSError, subprocess.SubprocessError):
                     cleanup = False
-            temporary.cleanup()
+            if root is not None and (server is None or cleanup):
+                shutil.rmtree(root)
+            elif root is not None:
+                retained_temp_state = str(root)
     except (FixtureProtocolError, OSError) as error:
         result = FixtureResult(
             "failed",
@@ -536,6 +580,11 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
             sse_events=result.sse_events,
             reconnected=result.reconnected,
             abort_acknowledged=result.abort_acknowledged,
+            transport_checked=result.transport_checked,
+            reconnect_checked=result.reconnect_checked,
+            cursor_replay_checked=result.cursor_replay_checked,
+            session_attribution_checked=result.session_attribution_checked,
+            retained_temp_state=retained_temp_state,
         )
     return FixtureResult(
         result.status,
@@ -550,6 +599,11 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
         reconnected=result.reconnected,
         abort_acknowledged=result.abort_acknowledged,
         cleanup_confirmed=cleanup,
+        transport_checked=result.transport_checked,
+        reconnect_checked=result.reconnect_checked,
+        cursor_replay_checked=result.cursor_replay_checked,
+        session_attribution_checked=result.session_attribution_checked,
+        retained_temp_state=retained_temp_state,
     )
 
 

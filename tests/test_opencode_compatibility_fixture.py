@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import threading
 from collections.abc import Iterator
@@ -38,6 +39,7 @@ class ServerFixture:
         self.document = {"openapi": "3.1.0", "info": {"title": "OpenCode", "version": "1.2.3"}}
         self.requests: list[tuple[str, str, str | None]] = []
         self.drop_event_once = False
+        self.idless_events = False
         self.message_response: tuple[int, object | None] = (204, None)
         fixture = self
 
@@ -76,8 +78,13 @@ class ServerFixture:
                         fixture.drop_event_once = False
                         return
                     event_id = "2" if self.headers.get("Last-Event-ID") else "1"
+                    event_prefix = "" if fixture.idless_events else f"id: {event_id}\n"
                     self.wfile.write(
-                        f"id: {event_id}\nevent: server.connected\ndata: {{}}\n\n".encode()
+                        (
+                            f"{event_prefix}event: message\n"
+                            'data: {"type":"session.status","properties":'
+                            '{"sessionID":"real-shaped-session"}}\n\n'
+                        ).encode()
                     )
                 else:
                     self.send_json(404, {"error": "not found"})
@@ -167,6 +174,17 @@ def test_lost_sse_response_is_reported_and_deliberate_reconnect_is_one_new_reque
         assert len([item for item in fixture.requests if item[1] == "/event"]) == 2
 
 
+def test_idless_sse_event_cannot_be_claimed_as_cursor_replay_support() -> None:
+    with server_fixture() as fixture:
+        fixture.idless_events = True
+        client = _LoopbackClient(fixture.server.server_port, "fixture", "password")
+
+        with pytest.raises(FixtureProtocolError, match="id-less"):
+            client.events()
+
+        assert [item[2] for item in fixture.requests if item[1] == "/event"] == [None]
+
+
 def test_full_probe_against_a_local_http_fixture_is_not_real_opencode_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -214,6 +232,10 @@ def test_full_probe_against_a_local_http_fixture_is_not_real_opencode_evidence(
     assert result.status == "passed"
     assert result.message == "accepted_no_provider_no_tools"
     assert result.sse_events == 2
+    assert result.transport_checked is True
+    assert result.reconnect_checked is True
+    assert result.cursor_replay_checked is True
+    assert result.session_attribution_checked is True
     assert result.abort_acknowledged is True
     assert result.cleanup_confirmed is True
     assert environments and "HTTPS_PROXY" not in environments[0]
@@ -383,6 +405,10 @@ def test_cleanup_failure_changes_an_otherwise_passing_probe_to_failed(
     assert result.status == "failed"
     assert result.cleanup_confirmed is False
     assert "cleanup was not confirmed" in result.reason
+    assert result.retained_temp_state is not None
+    assert Path(result.retained_temp_state).is_dir()
+    # This is deliberately retained for incident reconciliation, not fixture cleanup.
+    shutil.rmtree(result.retained_temp_state)
     assert fixture_exit_code(result) != 0
 
 
@@ -406,6 +432,25 @@ def test_server_process_cleans_up_its_process_group_descendants(tmp_path: Path) 
     assert server.close() is True
     with pytest.raises(ProcessLookupError):
         os.killpg(process_group_id, 0)
+
+
+def test_server_process_escalates_to_kill_when_main_process_resists_term(tmp_path: Path) -> None:
+    executable = tmp_path / "resistant-opencode"
+    executable.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then printf \'opencode 1.2.3\\n\'; exit 0; fi\n'
+        "trap '' TERM\n"
+        "while :; do sleep 1; done\n",
+        encoding="utf-8",
+    )
+    executable.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    server = _ServerProcess(
+        FixtureSettings(executable, "1.2.3", "a" * 64), tmp_path, {"PATH": os.defpath}, 9999
+    )
+    server.start()
+
+    assert server.close() is True
+    assert server.process is not None and server.process.poll() is not None
 
 
 @pytest.mark.parametrize(

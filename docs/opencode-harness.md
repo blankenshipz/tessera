@@ -65,11 +65,16 @@ credential.
 The client exposes only `POST /session`, `POST /session/{id}/message`, `POST
 /session/{id}/abort`, and `GET /event` after the pinned `/doc` inspection. It
 sets bounded request/response/event sizes and accepts no transport timeout greater
-than 30 seconds. The adapter only emits known typed `/event` envelopes for its
-already attributed session; unknown, foreign, malformed, secret-bearing, oversized, and
-out-of-order events are quarantined. Numeric SSE IDs are exclusive replay cursors;
-gaps are retained, duplicate/reused IDs are deduplicated or quarantined, and a
-reopened local journal resumes with `Last-Event-ID` at the contiguous cursor.
+than 30 seconds. Each request and stream has one absolute deadline: bounded JSON
+reads and SSE lines cannot extend it by slow-dripping bytes. The adapter only emits
+known typed `/event` envelopes for an already attributed session; unknown, foreign,
+malformed, secret-bearing, oversized, and out-of-order events are quarantined.
+Numeric SSE IDs are exclusive stream replay cursors. The journal durably ingests a
+contiguous shared stream before routing its records by known session to operations,
+so a valid interleaved session cannot block another operation's delivery. Downstream
+acknowledgements remain per operation and may only cover durably contiguous stream
+records; a reopened local journal resumes with `Last-Event-ID` at the shared stream
+cursor.
 
 The private `0700` local journal stores operation/attempt authority references,
 session identity, effect intent/outcome, cancellation state, and safe pending
@@ -117,12 +122,17 @@ and starts no replacement or duplicate process.
 
 On a compatible server it verifies unauthenticated health is rejected, then
 checks `/global/health` and `/doc` against the exact version/schema pin, creates
-a session, attempts one `noReply` no-model/no-tool context message, reads an
-actual `/event` SSE event and reconnects with `Last-Event-ID`, aborts the
-session, and terminates its one process group before temporary cleanup. Each SSE
+a session, attempts one `noReply` no-model/no-tool context message, and separately
+records transport, reconnect, replay-cursor, and created-session-attribution
+claims for actual `/event` SSE observations. An id-less event, a reconnect that
+does not advance beyond the supplied cursor, or an event not attributed to the
+created session fails the probe rather than claiming cursor support. It aborts the
+session and terminates its one process group before temporary cleanup. Each SSE
 read has a five-second deadline, no blocked socket read exceeds three seconds,
 and the stream has a 32 KiB total bound; failures report whether cleanup was
-confirmed. A message
+confirmed. Cleanup sends TERM then KILL to the process group (including its main
+process); if termination remains uncertain, it retains and reports the private
+temporary state for reconciliation rather than deleting it. A message
 rejection is reported as `provider_disabled` only for the fixture's exact JSON
 `422 {"error":{"code":"provider_disabled","enabled_providers":[]}}`
 response. Authentication, route, request-schema, content-type, and every other
