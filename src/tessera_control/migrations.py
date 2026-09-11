@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 29
+LATEST_SCHEMA_VERSION = 30
 LOCAL_ORG_ID = "org_local"
 
 
@@ -590,6 +590,16 @@ def migrate_v28_to_v29(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 29 WHERE singleton = 1")
 
 
+def migrate_v29_to_v30(connection: sqlite3.Connection) -> None:
+    """Add empty pre-execution experiment admission bindings without backfills."""
+    from .experiments import create_experiment_admission_schema
+    from .external_operations import create_experiment_operation_binding_schema
+
+    create_experiment_admission_schema(connection)
+    create_experiment_operation_binding_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 30 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -619,6 +629,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     26: migrate_v26_to_v27,
     27: migrate_v27_to_v28,
     28: migrate_v28_to_v29,
+    29: migrate_v29_to_v30,
 }
 
 

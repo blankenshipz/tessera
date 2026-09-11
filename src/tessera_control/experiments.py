@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .experiments_models import (
+    AdmitExperimentAttempt,
     AmendConclusion,
     CreateConclusion,
     CreateExperiment,
@@ -23,6 +24,7 @@ from .experiments_models import (
     LinkAttemptArtifacts,
     RecordAttempt,
     RecordMeasurement,
+    ResolveAdmittedAttempt,
     ReviewConclusion,
     ReviseExperimentDesign,
     UpdateConclusion,
@@ -142,6 +144,238 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
     )
     for statement in statements:
         connection.execute(statement)
+
+
+def create_experiment_admission_schema(connection: sqlite3.Connection) -> None:
+    """Install empty pre-execution bindings without changing prior attempts.
+
+    The admission is distinct from the legacy human result ledger: it exists
+    before package return and keeps the immutable experiment binding while the
+    external operation is still uncertain.
+    """
+    statements = (
+        """CREATE TABLE IF NOT EXISTS research_experiment_admitted_attempts (
+        id TEXT PRIMARY KEY,
+        experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+        design_revision INTEGER NOT NULL CHECK (design_revision >= 1),
+        variant_id TEXT NOT NULL REFERENCES research_experiment_variants(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        plan_digest TEXT NOT NULL CHECK (length(plan_digest)=64 AND plan_digest NOT GLOB '*[^0-9a-f]*'),
+        grant_id TEXT NOT NULL UNIQUE REFERENCES execution_grants(id),
+        operation_id TEXT UNIQUE REFERENCES external_operations(operation_id),
+        package_digest TEXT CHECK (package_digest IS NULL OR (length(package_digest)=64 AND package_digest NOT GLOB '*[^0-9a-f]*')),
+        state TEXT NOT NULL CHECK (state IN ('admitted','preparing','running','unknown','interrupted','restart_pending','succeeded','failed','cancelled')),
+        outcome TEXT CHECK (outcome IN ('succeeded','failed','cancelled','unknown')),
+        reason TEXT,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+        resolved_by_principal_id TEXT REFERENCES principals(id),
+        CHECK ((outcome IS NULL AND reason IS NULL AND resolved_by_principal_id IS NULL)
+               OR (outcome IS NOT NULL AND state=outcome AND resolved_by_principal_id IS NOT NULL)),
+        FOREIGN KEY(experiment_id,design_revision)
+        REFERENCES research_experiment_designs(experiment_id,revision)
+        )""",
+        "CREATE INDEX IF NOT EXISTS research_experiment_admitted_attempts_by_experiment ON research_experiment_admitted_attempts(experiment_id,created_at,id)",
+        "CREATE INDEX IF NOT EXISTS research_experiment_admitted_attempts_by_variant ON research_experiment_admitted_attempts(variant_id,created_at,id)",
+        """CREATE TABLE IF NOT EXISTS research_experiment_admitted_attempt_states (
+        attempt_id TEXT NOT NULL REFERENCES research_experiment_admitted_attempts(id),
+        sequence INTEGER NOT NULL CHECK (sequence >= 1),
+        state TEXT NOT NULL CHECK (state IN ('admitted','preparing','running','unknown','interrupted','restart_pending','succeeded','failed','cancelled')),
+        observed_state TEXT CHECK (observed_state IN ('unknown','running','exited')),
+        reason TEXT, operation_id TEXT REFERENCES external_operations(operation_id),
+        recorded_at TEXT NOT NULL, actor_principal_id TEXT NOT NULL REFERENCES principals(id),
+        PRIMARY KEY(attempt_id,sequence))""",
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
+def _append_admitted_attempt_state(
+    connection: sqlite3.Connection,
+    attempt: dict[str, Any],
+    state: str,
+    actor_principal_id: str,
+    *,
+    observed_state: str | None = None,
+    reason: str | None = None,
+    operation_id: str | None = None,
+    outcome: str | None = None,
+    resolved: bool = False,
+) -> dict[str, Any]:
+    """Advance the mutable projection while retaining each state transition."""
+    if attempt["state"] == state and attempt["outcome"] == outcome:
+        return attempt
+    now, revision = utc_now(), attempt["revision"] + 1
+    result = dict(attempt)
+    result.update(
+        state=state,
+        outcome=outcome,
+        reason=reason,
+        revision=revision,
+        updated_at=now,
+        resolved_by_principal_id=actor_principal_id if resolved else None,
+    )
+    if (
+        connection.execute(
+            """UPDATE research_experiment_admitted_attempts SET state=:state,outcome=:outcome,
+            reason=:reason,revision=:revision,updated_at=:updated_at,
+            resolved_by_principal_id=:resolved_by_principal_id
+            WHERE id=:id AND revision=:expected_revision""",
+            result | {"expected_revision": attempt["revision"]},
+        ).rowcount
+        != 1
+    ):
+        raise Conflict("Admitted experiment attempt revision is no longer current.")
+    sequence = connection.execute(
+        "SELECT coalesce(max(sequence),0)+1 FROM research_experiment_admitted_attempt_states WHERE attempt_id=?",
+        (attempt["id"],),
+    ).fetchone()[0]
+    connection.execute(
+        """INSERT INTO research_experiment_admitted_attempt_states
+        (attempt_id,sequence,state,observed_state,reason,operation_id,recorded_at,actor_principal_id)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            attempt["id"],
+            sequence,
+            state,
+            observed_state,
+            reason,
+            operation_id,
+            now,
+            actor_principal_id,
+        ),
+    )
+    return result
+
+
+def admitted_attempt_package_identity(
+    connection: sqlite3.Connection,
+    worker: dict[str, Any],
+    package: dict[str, Any],
+    admitted_attempt_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a current immutable binding only when it matches the worker grant."""
+    row = connection.execute(
+        """SELECT a.*,v.execution_task_id,v.execution_plan_digest,v.design_revision AS variant_design_revision,
+        e.current_design_revision,p.org_id FROM research_experiment_admitted_attempts a
+        JOIN research_experiment_variants v ON v.id=a.variant_id
+        JOIN research_experiments e ON e.id=a.experiment_id
+        JOIN projects p ON p.id=e.project_id
+        WHERE a.id=? AND p.org_id=? AND e.project_id=?""",
+        (admitted_attempt_id, worker["org_id"], package["project_id"]),
+    ).fetchone()
+    if row is None:
+        raise NotFound("Admitted experiment attempt was not found.")
+    attempt = dict(row)
+    if attempt["state"] in {"succeeded", "failed", "cancelled"}:
+        raise Conflict("Admitted experiment attempt is already resolved.")
+    if (
+        attempt["experiment_id"] != package.get("experiment_id", attempt["experiment_id"])
+        or attempt["design_revision"] != attempt["variant_design_revision"]
+        or attempt["design_revision"] != attempt["current_design_revision"]
+        or attempt["task_id"] != attempt["execution_task_id"]
+        or attempt["plan_digest"] != attempt["execution_plan_digest"]
+        or attempt["grant_id"] != package["grant_id"]
+        or attempt["task_id"] != package["task_id"]
+        or attempt["plan_digest"] != package["plan_digest"]
+    ):
+        raise Conflict(
+            "Admitted experiment attempt no longer matches its variant, design, grant, or plan."
+        )
+    return attempt, {
+        "admitted_attempt_id": attempt["id"],
+        "experiment_id": attempt["experiment_id"],
+        "design_revision": attempt["design_revision"],
+        "variant_id": attempt["variant_id"],
+        "task_id": attempt["task_id"],
+        "plan_digest": attempt["plan_digest"],
+        "grant_id": attempt["grant_id"],
+    }
+
+
+def bind_admitted_attempt_package(
+    connection: sqlite3.Connection,
+    worker: dict[str, Any],
+    package: dict[str, Any],
+    package_digest: str,
+    admitted_attempt_id: str,
+) -> dict[str, Any]:
+    """Fence a worker package to its prior human admission in the same transaction."""
+    attempt, identity = admitted_attempt_package_identity(
+        connection, worker, package, admitted_attempt_id
+    )
+    if package.get("experiment") != identity:
+        raise Conflict("Execution package experiment binding conflicts.")
+    if attempt["operation_id"] not in {None, package["operation_id"]} or attempt[
+        "package_digest"
+    ] not in {None, package_digest}:
+        raise Conflict(
+            "Admitted experiment attempt cannot be reused with another operation or package."
+        )
+    connection.execute(
+        """UPDATE research_experiment_admitted_attempts SET operation_id=?,package_digest=?,updated_at=?
+        WHERE id=? AND operation_id IS NULL AND package_digest IS NULL""",
+        (package["operation_id"], package_digest, utc_now(), attempt["id"]),
+    )
+    updated = dict(
+        connection.execute(
+            "SELECT * FROM research_experiment_admitted_attempts WHERE id=?", (attempt["id"],)
+        ).fetchone()
+    )
+    next_state = (
+        "restart_pending"
+        if updated["state"] in {"unknown", "interrupted"}
+        else "preparing"
+        if updated["state"] == "admitted"
+        else updated["state"]
+    )
+    return _append_admitted_attempt_state(
+        connection,
+        updated,
+        next_state,
+        worker["id"],
+        operation_id=package["operation_id"],
+    )
+
+
+def record_admitted_attempt_observation(
+    connection: sqlite3.Connection,
+    operation: sqlite3.Row | dict[str, Any],
+    worker: dict[str, Any],
+    observed_state: str,
+    desired_state: str,
+) -> None:
+    """Keep an admitted attempt visible through worker uncertainty and restart."""
+    attempt_id = operation["experiment_attempt_id"]
+    if attempt_id is None:
+        return
+    row = connection.execute(
+        "SELECT * FROM research_experiment_admitted_attempts WHERE id=?", (attempt_id,)
+    ).fetchone()
+    if row is None:
+        raise Conflict("External operation experiment admission is missing.")
+    attempt = dict(row)
+    if (
+        attempt["operation_id"] != operation["operation_id"]
+        or attempt["experiment_id"] != operation["experiment_id"]
+        or attempt["design_revision"] != operation["experiment_design_revision"]
+        or attempt["variant_id"] != operation["experiment_variant_id"]
+    ):
+        raise Conflict("External operation experiment admission binding conflicts.")
+    state = {
+        "running": "running",
+        "unknown": "unknown",
+        "exited": "cancelled" if desired_state == "cancel_requested" else "interrupted",
+    }[observed_state]
+    _append_admitted_attempt_state(
+        connection,
+        attempt,
+        state,
+        worker["id"],
+        observed_state=observed_state,
+        operation_id=operation["operation_id"],
+    )
 
 
 def create_v25_experiment_schema(connection: sqlite3.Connection) -> None:
@@ -541,6 +775,180 @@ class ExperimentStore(Store):
             principal, key, "POST", f"/experiments/{experiment_id}/designs", digest, command
         )
 
+    def admit_attempt(
+        self,
+        principal: dict[str, Any],
+        variant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | AdmitExperimentAttempt,
+    ) -> tuple[int, dict[str, Any]]:
+        """Create an immutable human-reviewed binding before any package is returned."""
+        body = self._body(AdmitExperimentAttempt, payload)
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor)
+            variant = self._variant(connection, actor, variant_id)
+            experiment = self._experiment(connection, actor, variant["experiment_id"])
+            if (
+                variant["revision"] != body["expected_variant_revision"]
+                or variant["design_revision"] != body["expected_design_revision"]
+                or experiment["current_design_revision"] != body["expected_design_revision"]
+            ):
+                raise Conflict("Experiment variant or design revision is no longer current.")
+            if variant["execution_task_id"] is None:
+                raise Conflict("Experiment variant does not declare an immutable execution plan.")
+            grant = connection.execute(
+                """SELECT g.* FROM execution_grants g JOIN projects p ON p.id=g.project_id
+                WHERE g.id=? AND p.org_id=? AND g.project_id=?""",
+                (body["grant_id"], actor["org_id"], experiment["project_id"]),
+            ).fetchone()
+            if grant is None:
+                raise NotFound("Execution grant was not found.")
+            if (
+                grant["status"] != "active"
+                or grant["task_id"] != variant["execution_task_id"]
+                or grant["plan_digest"] != variant["execution_plan_digest"]
+            ):
+                raise Conflict(
+                    "Execution grant does not match the immutable experiment variant plan."
+                )
+            if connection.execute(
+                "SELECT 1 FROM research_experiment_admitted_attempts WHERE grant_id=?",
+                (grant["id"],),
+            ).fetchone():
+                raise Conflict(
+                    "Execution grant is already bound to an admitted experiment attempt."
+                )
+            now = utc_now()
+            row = {
+                "id": "experiment_admitted_attempt_" + uuid.uuid4().hex,
+                "experiment_id": experiment["id"],
+                "design_revision": variant["design_revision"],
+                "variant_id": variant["id"],
+                "task_id": variant["execution_task_id"],
+                "plan_digest": variant["execution_plan_digest"],
+                "grant_id": grant["id"],
+                "operation_id": None,
+                "package_digest": None,
+                "state": "admitted",
+                "outcome": None,
+                "reason": None,
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+                "created_by_principal_id": actor["id"],
+                "resolved_by_principal_id": None,
+            }
+            connection.execute(
+                """INSERT INTO research_experiment_admitted_attempts
+                (id,experiment_id,design_revision,variant_id,task_id,plan_digest,grant_id,operation_id,
+                 package_digest,state,outcome,reason,revision,created_at,updated_at,
+                 created_by_principal_id,resolved_by_principal_id)
+                VALUES (:id,:experiment_id,:design_revision,:variant_id,:task_id,:plan_digest,:grant_id,
+                :operation_id,:package_digest,:state,:outcome,:reason,:revision,:created_at,:updated_at,
+                :created_by_principal_id,:resolved_by_principal_id)""",
+                row,
+            )
+            connection.execute(
+                """INSERT INTO research_experiment_admitted_attempt_states
+                (attempt_id,sequence,state,observed_state,reason,operation_id,recorded_at,actor_principal_id)
+                VALUES (?,1,'admitted',NULL,NULL,NULL,?,?)""",
+                (row["id"], now, actor["id"]),
+            )
+            self._event(
+                connection,
+                actor,
+                experiment,
+                "experiment.attempt_admitted",
+                1,
+                {
+                    "experiment_id": experiment["id"],
+                    "design_revision": row["design_revision"],
+                    "variant_id": row["variant_id"],
+                    "admitted_attempt_id": row["id"],
+                    "grant_id": row["grant_id"],
+                    "task_id": row["task_id"],
+                    "plan_digest": row["plan_digest"],
+                    "execution_dispatched": False,
+                },
+            )
+            return 201, row
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/experiment-variants/{variant_id}/admitted-attempts",
+            digest,
+            command,
+        )
+
+    def resolve_admitted_attempt(
+        self,
+        principal: dict[str, Any],
+        attempt_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | ResolveAdmittedAttempt,
+    ) -> tuple[int, dict[str, Any]]:
+        body = self._body(ResolveAdmittedAttempt, payload)
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor)
+            row = connection.execute(
+                """SELECT a.* FROM research_experiment_admitted_attempts a
+                JOIN research_experiments e ON e.id=a.experiment_id JOIN projects p ON p.id=e.project_id
+                WHERE a.id=? AND p.org_id=? AND (? IS NULL OR e.project_id=?)""",
+                (attempt_id, actor["org_id"], actor["project_id"], actor["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Admitted experiment attempt was not found.")
+            attempt = dict(row)
+            if attempt["revision"] != body["expected_revision"]:
+                raise Conflict("Admitted experiment attempt revision is no longer current.")
+            if attempt["outcome"] is not None:
+                raise Conflict("Admitted experiment attempt is already resolved.")
+            updated = _append_admitted_attempt_state(
+                connection,
+                attempt,
+                body["outcome"],
+                actor["id"],
+                reason=body["reason"],
+                operation_id=attempt["operation_id"],
+                outcome=body["outcome"],
+                resolved=True,
+            )
+            experiment = self._experiment(connection, actor, attempt["experiment_id"])
+            self._event(
+                connection,
+                actor,
+                experiment,
+                "experiment.admitted_attempt_resolved",
+                updated["revision"],
+                {
+                    "experiment_id": attempt["experiment_id"],
+                    "admitted_attempt_id": attempt_id,
+                    "operation_id": attempt["operation_id"],
+                    "outcome": body["outcome"],
+                    "scientific_validity": "not_assessed",
+                },
+            )
+            return 200, updated
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/experiment-admitted-attempts/{attempt_id}/resolve",
+            digest,
+            command,
+        )
+
     def record_attempt(
         self,
         principal: dict[str, Any],
@@ -640,6 +1048,10 @@ class ExperimentStore(Store):
         ).fetchone()
         if operation is None:
             raise NotFound("External operation was not found.")
+        if operation["experiment_attempt_id"] is not None:
+            raise Conflict(
+                "External operation is already bound to a pre-execution admitted attempt."
+            )
         if (
             operation["task_id"] != variant["execution_task_id"]
             or operation["grant_plan_digest"] != variant["execution_plan_digest"]
@@ -1329,9 +1741,14 @@ class ExperimentStore(Store):
                 (
                     "operations",
                     """SELECT count(DISTINCT o.operation_id) FROM external_operations o
-                    JOIN research_experiment_attempts a ON a.operation_id=o.operation_id
+                    WHERE o.experiment_id=? OR EXISTS (SELECT 1 FROM research_experiment_attempts a
                     JOIN research_experiment_variants v ON v.id=a.variant_id
-                    WHERE v.experiment_id=?""",
+                    WHERE a.operation_id=o.operation_id AND v.experiment_id=?)""",
+                    (experiment_id, experiment_id),
+                ),
+                (
+                    "admitted attempts",
+                    "SELECT count(*) FROM research_experiment_admitted_attempts WHERE experiment_id=?",
                     (experiment_id,),
                 ),
                 (
@@ -1376,6 +1793,7 @@ class ExperimentStore(Store):
                 "designs": [],
                 "variants": [],
                 "attempts": [],
+                "admitted_attempts": [],
                 "operations": [],
                 "artifact_links": [],
                 "artifacts": [],
@@ -1427,12 +1845,28 @@ class ExperimentStore(Store):
                 attempt["scientific_validity"] = "not_assessed"
                 append("attempts", attempt)
             for row in connection.execute(
+                """SELECT * FROM research_experiment_admitted_attempts WHERE experiment_id=?
+                ORDER BY created_at,id""",
+                (experiment_id,),
+            ):
+                admission = dict(row)
+                admission["state_history"] = [
+                    dict(state)
+                    for state in connection.execute(
+                        """SELECT * FROM research_experiment_admitted_attempt_states
+                        WHERE attempt_id=? ORDER BY sequence""",
+                        (admission["id"],),
+                    )
+                ]
+                admission["scientific_validity"] = "not_assessed"
+                append("admitted_attempts", admission)
+            for row in connection.execute(
                 """SELECT o.* FROM external_operations o WHERE o.org_id=? AND o.project_id=?
-                AND EXISTS (SELECT 1 FROM research_experiment_attempts a
+                AND (o.experiment_id=? OR EXISTS (SELECT 1 FROM research_experiment_attempts a
                 JOIN research_experiment_variants v ON v.id=a.variant_id
-                WHERE a.operation_id=o.operation_id AND v.experiment_id=?)
+                WHERE a.operation_id=o.operation_id AND v.experiment_id=?))
                 ORDER BY o.created_at,o.operation_id""",
-                (actor["org_id"], experiment["project_id"], experiment_id),
+                (actor["org_id"], experiment["project_id"], experiment_id, experiment_id),
             ):
                 append("operations", dict(row))
             for row in connection.execute(

@@ -87,6 +87,28 @@ class RecordAttempt(ExperimentRequest):
         return self
 
 
+class AdmitExperimentAttempt(ExperimentRequest):
+    """Human admission of one immutable variant/grant execution binding."""
+
+    expected_variant_revision: Revision
+    expected_design_revision: Revision
+    grant_id: Identifier
+
+
+class ResolveAdmittedAttempt(ExperimentRequest):
+    """Account for the observed execution without claiming scientific validity."""
+
+    expected_revision: Revision
+    outcome: Literal["succeeded", "failed", "cancelled", "unknown"]
+    reason: NonBlank4000 | None = None
+
+    @model_validator(mode="after")
+    def non_success_outcomes_need_a_reason(self) -> ResolveAdmittedAttempt:
+        if self.outcome != "succeeded" and self.reason is None:
+            raise ValueError("failed, cancelled, and unknown outcomes require a reason")
+        return self
+
+
 class LinkAttemptArtifacts(ExperimentRequest):
     expected_revision: Revision
     artifact_ids: Annotated[list[Identifier], Field(min_length=1, max_length=128)]

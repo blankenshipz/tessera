@@ -8,12 +8,14 @@ from fastapi.responses import JSONResponse
 from .api import idempotency_key, principal
 from .experiments import EXPORT_DEFAULT_BYTES, EXPORT_MAX_BYTES, ExperimentStore
 from .experiments_models import (
+    AdmitExperimentAttempt,
     AmendConclusion,
     CreateConclusion,
     CreateExperiment,
     LinkAttemptArtifacts,
     RecordAttempt,
     RecordMeasurement,
+    ResolveAdmittedAttempt,
     ReviewConclusion,
     ReviseExperimentDesign,
     UpdateConclusion,
@@ -74,6 +76,26 @@ def attempt(
     payload = body.model_dump(mode="json")
     return response(
         records.record_attempt(actor, variant_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/experiment-variants/{variant_id}/admitted-attempts")
+def admit_attempt(
+    variant_id: str, body: AdmitExperimentAttempt, actor: Actor, key: Key, records: Experiments
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.admit_attempt(actor, variant_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/experiment-admitted-attempts/{attempt_id}/resolve")
+def resolve_admitted_attempt(
+    attempt_id: str, body: ResolveAdmittedAttempt, actor: Actor, key: Key, records: Experiments
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.resolve_admitted_attempt(actor, attempt_id, key, canonical_digest(payload), payload)
     )
 
 

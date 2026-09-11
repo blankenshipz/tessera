@@ -447,8 +447,8 @@ def test_journaled_handoff_fences_cancellation_and_orders_confirmation(tmp_path,
 
 def test_open_handoff_survives_restart_and_repeatable_migration(tmp_path):
     state, _, owner, _, grant, _, operation, handoff, _ = _journaled_handoff(tmp_path)
-    assert migrate_state(state) == 29
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
+    assert migrate_state(state) == 30
     restarted = WorkspaceHandoffStore(state).get_handoff(owner, handoff["id"])
     assert restarted["status"] == "stop_requested" and restarted["human_owner"] is False
     with _connect(state / "tessera.sqlite3") as connection:
@@ -510,5 +510,5 @@ def test_schema17_handoff_migration_is_explicit_transactional_and_repeatable(tmp
             is None
         )
     monkeypatch.undo()
-    assert migrate_state(state) == 29
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
+    assert migrate_state(state) == 30

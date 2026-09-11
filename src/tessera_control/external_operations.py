@@ -35,11 +35,32 @@ def create_external_operation_schema(connection: sqlite3.Connection) -> None:
         ),
         retry_class TEXT NOT NULL CHECK (retry_class = 'manual_reconciliation'),
         desired_state TEXT NOT NULL CHECK (desired_state IN ('admitted', 'cancel_requested')),
-        observed_state TEXT NOT NULL CHECK (observed_state IN ('unknown', 'running', 'exited')),
-        provider_id TEXT,
-        created_at TEXT NOT NULL,
+         observed_state TEXT NOT NULL CHECK (observed_state IN ('unknown', 'running', 'exited')),
+         provider_id TEXT,
+         experiment_attempt_id TEXT,
+         experiment_id TEXT,
+         experiment_design_revision INTEGER,
+         experiment_variant_id TEXT,
+         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
         )"""
+    )
+
+
+def create_experiment_operation_binding_schema(connection: sqlite3.Connection) -> None:
+    """Add nullable immutable experiment identity to new operation intents only."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(external_operations)")}
+    for name, definition in (
+        ("experiment_attempt_id", "TEXT"),
+        ("experiment_id", "TEXT"),
+        ("experiment_design_revision", "INTEGER"),
+        ("experiment_variant_id", "TEXT"),
+    ):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE external_operations ADD COLUMN {name} {definition}")
+    connection.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS external_operations_experiment_attempt_once
+        ON external_operations(experiment_attempt_id) WHERE experiment_attempt_id IS NOT NULL"""
     )
 
 

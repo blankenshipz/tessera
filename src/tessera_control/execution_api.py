@@ -291,6 +291,7 @@ def execution_package(
             body.expected_epoch,
             body.persistent_output_collection is True,
             body.persistent_output_storage,
+            body.admitted_attempt_id,
         )
     )
 

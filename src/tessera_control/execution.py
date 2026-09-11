@@ -1121,6 +1121,15 @@ class ExecutionStore(Store):
                         operation["operation_id"],
                     ),
                 )
+                from .experiments import record_admitted_attempt_observation
+
+                record_admitted_attempt_observation(
+                    connection,
+                    operation,
+                    worker,
+                    row["observed_state"],
+                    row["desired_state"],
+                )
             self._event(
                 connection,
                 worker,
@@ -1271,6 +1280,15 @@ class ExecutionStore(Store):
                 """UPDATE external_operations SET provider_id=coalesce(provider_id, ?),
                 observed_state=?, updated_at=? WHERE operation_id=?""",
                 (payload["provider_id"], payload["observed_state"], now, operation_id),
+            )
+            from .experiments import record_admitted_attempt_observation
+
+            record_admitted_attempt_observation(
+                connection,
+                operation,
+                worker,
+                payload["observed_state"],
+                operation["desired_state"],
             )
             result = dict(row)
             result["termination_confirmed"] = bool(result["termination_confirmed"])

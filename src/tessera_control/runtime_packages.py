@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from .execution import ExecutionStore
+from .experiments import admitted_attempt_package_identity, bind_admitted_attempt_package
 from .migrations import plan_payload
 from .models import ExecutionSpec
 from .persistent_output_storage import validate_persistent_output_storage
@@ -14,7 +15,9 @@ from .store import Conflict, NotFound, StoreError, _parse_utc, canonical_digest
 
 
 class RuntimePackageStore(ExecutionStore):
-    def _package(self, connection, worker, lease_id, epoch, persistent_output_storage):
+    def _package(
+        self, connection, worker, lease_id, epoch, persistent_output_storage, admitted_attempt_id
+    ):
         lease = connection.execute(
             "SELECT * FROM execution_leases WHERE id = ?", (lease_id,)
         ).fetchone()
@@ -78,6 +81,11 @@ class RuntimePackageStore(ExecutionStore):
             "hard_expires_at": lease["hard_expires_at"],
         }
         package["docker_lookup_key"] = f"tessera-op-{package['operation_id']}"
+        if admitted_attempt_id is not None:
+            _attempt, binding = admitted_attempt_package_identity(
+                connection, worker, package, admitted_attempt_id
+            )
+            package["experiment"] = binding
         if persistent_output_storage is not None:
             if spec["max_output_bytes"] > persistent_output_storage["capacity_bytes"]:
                 raise Conflict("Persistent output storage byte capacity is below declared outputs.")
@@ -117,7 +125,19 @@ class RuntimePackageStore(ExecutionStore):
             "docker_lookup_key": package["docker_lookup_key"],
             "request_digest": request_digest,
             "retry_class": "manual_reconciliation",
+            "experiment_attempt_id": None,
+            "experiment_id": None,
+            "experiment_design_revision": None,
+            "experiment_variant_id": None,
         }
+        if package.get("experiment") is not None:
+            binding = package["experiment"]
+            expected.update(
+                experiment_attempt_id=binding["admitted_attempt_id"],
+                experiment_id=binding["experiment_id"],
+                experiment_design_revision=binding["design_revision"],
+                experiment_variant_id=binding["variant_id"],
+            )
         if existing is not None:
             if any(existing[field] != value for field, value in expected.items()):
                 raise Conflict("External operation identity or package digest conflicts.")
@@ -135,11 +155,13 @@ class RuntimePackageStore(ExecutionStore):
             (operation_id, org_id, project_id, task_id, grant_id, lease_id, worker_principal_id,
              epoch, package_digest, adapter_version, profile_version, docker_lookup_key,
              request_digest, retry_class, desired_state, observed_state, provider_id, created_at,
-             updated_at)
+              updated_at, experiment_attempt_id, experiment_id, experiment_design_revision,
+              experiment_variant_id)
             VALUES (:operation_id,:org_id,:project_id,:task_id,:grant_id,:lease_id,
             :worker_principal_id,:epoch,:package_digest,:adapter_version,:profile_version,
             :docker_lookup_key,:request_digest,:retry_class,:desired_state,:observed_state,
-            :provider_id,:created_at,:updated_at)""",
+             :provider_id,:created_at,:updated_at,:experiment_attempt_id,:experiment_id,
+             :experiment_design_revision,:experiment_variant_id)""",
             row,
         )
         return row, True
@@ -153,12 +175,20 @@ class RuntimePackageStore(ExecutionStore):
         expected_epoch: int,
         persistent_output_collection: bool = False,
         persistent_output_storage: Any = None,
+        admitted_attempt_id: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         if (
             not isinstance(lease_id, str)
             or not 1 <= len(lease_id) <= 200
             or type(expected_epoch) is not int
             or not 1 <= expected_epoch <= 2**63 - 1
+            or (
+                admitted_attempt_id is not None
+                and (
+                    not isinstance(admitted_attempt_id, str)
+                    or not 1 <= len(admitted_attempt_id) <= 200
+                )
+            )
         ):
             raise StoreError("Invalid package request.")
         if persistent_output_collection:
@@ -173,6 +203,8 @@ class RuntimePackageStore(ExecutionStore):
             )
         live_lease: dict[str, Any] = {}
         operation_request = {"expected_epoch": expected_epoch}
+        if admitted_attempt_id is not None:
+            operation_request["admitted_attempt_id"] = admitted_attempt_id
         if persistent_output_collection:
             operation_request["persistent_output_collection"] = True
             operation_request["persistent_output_storage"] = persistent_output_storage
@@ -180,13 +212,22 @@ class RuntimePackageStore(ExecutionStore):
 
         def command(connection, live):
             metadata, lease = self._package(
-                connection, live, lease_id, expected_epoch, persistent_output_storage
+                connection,
+                live,
+                lease_id,
+                expected_epoch,
+                persistent_output_storage,
+                admitted_attempt_id,
             )
             live_lease.update(lease)
             package = metadata["package"]
             operation, created = self._record_operation_intent(
                 connection, live, package, metadata["package_digest"], operation_request_digest
             )
+            if admitted_attempt_id is not None:
+                bind_admitted_attempt_package(
+                    connection, live, package, metadata["package_digest"], admitted_attempt_id
+                )
             metadata["operation"] = operation
             self._event(
                 connection,
@@ -202,13 +243,19 @@ class RuntimePackageStore(ExecutionStore):
                     "external_operation_intent": created,
                     "retry_class": "manual_reconciliation",
                     "execution_dispatched": False,
+                    "admitted_attempt_id": admitted_attempt_id,
                 },
             )
             return 201, metadata
 
         def replay_guard(connection, live, cached):
             metadata, lease = self._package(
-                connection, live, lease_id, expected_epoch, persistent_output_storage
+                connection,
+                live,
+                lease_id,
+                expected_epoch,
+                persistent_output_storage,
+                admitted_attempt_id,
             )
             operation, _ = self._record_operation_intent(
                 connection,
@@ -218,6 +265,14 @@ class RuntimePackageStore(ExecutionStore):
                 operation_request_digest,
             )
             metadata["operation"] = operation
+            if admitted_attempt_id is not None:
+                bind_admitted_attempt_package(
+                    connection,
+                    live,
+                    metadata["package"],
+                    metadata["package_digest"],
+                    admitted_attempt_id,
+                )
             if (
                 cached.get("package") != metadata["package"]
                 or cached.get("package_digest") != metadata["package_digest"]

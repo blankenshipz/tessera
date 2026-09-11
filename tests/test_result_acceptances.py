@@ -374,7 +374,7 @@ def test_v19_to_v20_result_acceptance_migration_is_empty_and_rolls_back(
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE execution_result_acceptances")
         connection.execute("UPDATE schema_meta SET schema_version=19")
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM execution_result_acceptances").fetchone()[0]

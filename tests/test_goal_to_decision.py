@@ -8,9 +8,11 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from test_input_delivery import _delivery
 from test_result_checkpoints import _reconciled_manifest
 
 from tessera_control.api import create_app
+from tessera_control.execution import ExecutionStore
 from tessera_control.experiments import (
     ExperimentStore,
     create_v25_experiment_schema,
@@ -19,6 +21,7 @@ from tessera_control.experiments import (
 from tessera_control.migrations import MIGRATIONS, migrate_v27_to_v28
 from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
 from tessera_control.project_artifact_store import ProjectArtifactStore
+from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.store import (
     Conflict,
     Forbidden,
@@ -388,6 +391,149 @@ def test_attempt_provenance_admission_human_replay_reuse_and_cancellation(tmp_pa
     assert attempt["operation_desired_state"] == "cancel_requested"
 
 
+def test_pre_execution_admitted_attempt_binds_package_operation_and_restart_accounting(
+    tmp_path: Path,
+) -> None:
+    state, _execution, owner, worker, grant, lease = _delivery(tmp_path)
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    admission_body = {
+        "expected_variant_revision": baseline["revision"],
+        "expected_design_revision": experiment["current_design_revision"],
+        "grant_id": grant["id"],
+    }
+    admitted = _command(records.admit_attempt, owner, baseline["id"], payload=admission_body)
+    assert admitted["state"] == "admitted" and admitted["operation_id"] is None
+
+    package_body = {
+        "expected_epoch": lease["epoch"],
+        "admitted_attempt_id": admitted["id"],
+    }
+    package = RuntimePackageStore(state).execution_package(
+        worker,
+        lease["id"],
+        "admitted-package",
+        canonical_digest(package_body),
+        lease["epoch"],
+        admitted_attempt_id=admitted["id"],
+    )[1]
+    assert package["package"]["experiment"] == {
+        "admitted_attempt_id": admitted["id"],
+        "experiment_id": experiment["id"],
+        "design_revision": 1,
+        "variant_id": baseline["id"],
+        "task_id": grant["task_id"],
+        "plan_digest": grant["plan_digest"],
+        "grant_id": grant["id"],
+    }
+    assert package["operation"]["experiment_attempt_id"] == admitted["id"]
+    assert package["operation"]["experiment_variant_id"] == baseline["id"]
+
+    execution = ExecutionStore(state)
+    for state_name in ("running", "unknown"):
+        observation = {
+            "expected_epoch": lease["epoch"],
+            "operation_id": package["operation"]["operation_id"],
+            "observed_state": state_name,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "provider_id": "synthetic-admission-container",
+            "termination_confirmed": False,
+        }
+        _command(
+            execution.report_execution_observation,
+            worker,
+            lease["id"],
+            payload=observation,
+        )
+    # A fresh worker package request retains the same operation identity and
+    # records restart_pending rather than admitting replacement work.
+    replay = RuntimePackageStore(state).execution_package(
+        worker,
+        lease["id"],
+        "admitted-package-restart",
+        canonical_digest(package_body),
+        lease["epoch"],
+        admitted_attempt_id=admitted["id"],
+    )[1]
+    assert replay["operation"]["operation_id"] == package["operation"]["operation_id"]
+    exported = records.get_experiment(owner, experiment["id"])
+    current = exported["admitted_attempts"][0]
+    assert [item["state"] for item in current["state_history"]] == [
+        "admitted",
+        "preparing",
+        "running",
+        "unknown",
+        "restart_pending",
+    ]
+    resolved = _command(
+        records.resolve_admitted_attempt,
+        owner,
+        admitted["id"],
+        payload={
+            "expected_revision": current["revision"],
+            "outcome": "unknown",
+            "reason": "The synthetic worker restarted before a terminal result was attributable.",
+        },
+    )
+    assert resolved["state"] == resolved["outcome"] == "unknown"
+    final = records.get_experiment(owner, experiment["id"])["admitted_attempts"][0]
+    assert final["state_history"][-1]["state"] == "unknown"
+
+
+def test_admitted_attempt_rejects_stale_design_and_grant_reuse(tmp_path: Path) -> None:
+    state, _execution, owner, _worker, grant, _lease = _delivery(tmp_path)
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    original_baseline = next(
+        item for item in experiment["design"]["variants"] if item["kind"] == "baseline"
+    )
+    body = {
+        "expected_variant_revision": original_baseline["revision"],
+        "expected_design_revision": experiment["current_design_revision"],
+        "grant_id": grant["id"],
+    }
+    _command(records.revise_design, owner, experiment["id"], payload=_design(1, grant))
+    with pytest.raises(Conflict, match="variant or design revision"):
+        _command(records.admit_attempt, owner, original_baseline["id"], payload=body)
+
+    current = records.get_experiment(owner, experiment["id"])
+    baseline = next(
+        item for item in current["experiment"]["design"]["variants"] if item["kind"] == "baseline"
+    )
+    admitted = _command(
+        records.admit_attempt,
+        owner,
+        baseline["id"],
+        payload=body
+        | {
+            "expected_variant_revision": baseline["revision"],
+            "expected_design_revision": current["experiment"]["current_design_revision"],
+        },
+    )
+    intervention = next(
+        item
+        for item in current["experiment"]["design"]["variants"]
+        if item["kind"] == "intervention"
+    )
+    with pytest.raises(Conflict, match="already bound"):
+        _command(
+            records.admit_attempt,
+            owner,
+            intervention["id"],
+            payload=body
+            | {
+                "expected_variant_revision": intervention["revision"],
+                "expected_design_revision": current["experiment"]["current_design_revision"],
+            },
+        )
+    assert admitted["grant_id"] == grant["id"]
+
+
 def test_experiment_evidence_retention_admission_delete_fence_and_export(tmp_path: Path) -> None:
     state, owner, worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
     _operation(state, owner, grant, lease, manifest["operation_id"])
@@ -565,7 +711,7 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -765,12 +911,12 @@ def test_v25_v26_v27_experiment_ledgers_upgrade_reopen_and_repeat_without_proven
         tmp_path, source_version
     )
 
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
     records = ExperimentStore(state)
     exported = records.export_experiment(owner, experiment_id)
     reopened = ExperimentStore(state).get_experiment(owner, experiment_id)
     assert reopened == exported
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
     assert ExperimentStore(state).get_experiment(owner, experiment_id) == exported
 
     designs = {item["revision"]: item for item in exported["designs"]}
@@ -840,7 +986,7 @@ def test_v27_to_v28_experiment_provenance_migration_rolls_back_complete_legacy_l
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
 
 
 def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:
@@ -1066,7 +1212,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         connection.execute("DROP TABLE migration_27_conclusion_evidence")
         connection.execute("DROP TABLE migration_27_conclusions")
         connection.execute("UPDATE schema_meta SET schema_version=26")
-    assert migrate_state(state) == 29
+    assert migrate_state(state) == 30
     migrated = ExperimentStore(state).get_experiment(owner, first["id"])
     migrated_designs = {item["revision"]: item for item in migrated["designs"]}
     assert migrated_designs[1]["goal"] is None

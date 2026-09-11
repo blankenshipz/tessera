@@ -246,3 +246,8 @@ Schema 29 adds an empty append-only reviewed-conclusion correction lineage. A hu
 can record one explicit `supersedes` or `retracts` relationship with reason,
 attribution, and reviewed design snapshot fencing; it preserves the original
 reviewed conclusion and creates no execution authority or scientific acceptance.
+
+Schema 30 adds empty human-admitted experiment execution bindings. A binding is
+created before a worker package can carry its immutable experiment/design/variant
+identity into one external operation; it does not backfill old operations, turn a
+package into dispatch, or infer a result or scientific validity.
