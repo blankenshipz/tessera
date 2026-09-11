@@ -72,28 +72,38 @@ const experimentLedger = (id = 'e1', projectId = 'p1') => {
     method_digest: method.repeat(64), input_digest: input.repeat(64), metadata: { revision, kind },
     execution_task_id: 'task_1', execution_plan_digest: 'a'.repeat(64),
   });
-  const first = { experiment_id: id, revision: 1, goal: 'Original goal.', success_criterion: 'Original criterion.',
+  // v27 only copied goal and criterion to the current design. Earlier records are
+  // intentionally unknown rather than reconstructed during migration.
+  const first = { experiment_id: id, revision: 1, goal: null, success_criterion: null,
     protocol: 'Original bounded protocol.', variants: [variant(1, 'baseline', 'Original baseline', 'b', 'c'), variant(1, 'intervention', 'Original intervention', 'd', 'e')] };
   const second = { experiment_id: id, revision: 2, goal: 'Current goal.', success_criterion: 'Current criterion.',
     protocol: 'Current bounded protocol.', variants: [variant(2, 'baseline', 'Current baseline', 'f', '1'), variant(2, 'intervention', 'Current unattempted intervention', '2', '3')] };
   const operationId = '4'.repeat(32);
   const oldAttempt = { id: 'attempt-old-failed', variant_id: first.variants[0].id, design_revision: 1,
     provenance_kind: 'admitted_operation', operation_id: operationId, execution_plan_digest: 'a'.repeat(64), package_digest: '5'.repeat(64),
-    operation_desired_state: 'cancel_requested', operation_observed_state: 'exited', termination_status: 'observed_exited_unconfirmed', human_observation: null,
+    operation_desired_state: 'admitted', operation_observed_state: 'exited', termination_status: 'confirmed', human_observation: null,
     outcome: 'failed', reason: 'The old bounded operation failed.', scientific_validity: 'not_assessed' };
   const humanAttempt = { id: 'attempt-current-human', variant_id: second.variants[0].id, design_revision: 2,
     provenance_kind: 'human_reported_observation', operation_id: null, execution_plan_digest: null, package_digest: null,
     operation_desired_state: null, operation_observed_state: 'not_observed', termination_status: 'not_applicable',
     human_observation: 'A human recorded the current baseline observation.', outcome: 'inconclusive', reason: 'Human observation remains unresolved.', scientific_validity: 'not_assessed' };
-  const artifact = { id: 'artifact-1', project_id: projectId, relative_path: 'results/metric.json', sha256: '6'.repeat(64), status: 'quarantined', classification: 'unclassified' };
-  const measurement = { id: 'measurement-1', attempt_id: oldAttempt.id, name: 'duration', value: { seconds: 1 }, artifact_id: artifact.id };
+  const artifacts = [
+    { id: 'artifact-legacy', project_id: projectId, relative_path: 'results/metric.json', sha256: '6'.repeat(64), status: 'quarantined', classification: 'unclassified', retention_state: 'legacy_unplaced', custody_state: 'legacy_unplaced' },
+    { id: 'artifact-degraded', project_id: projectId, relative_path: 'results/degraded.json', sha256: '7'.repeat(64), status: 'quarantined', classification: 'unclassified', retention_state: 'degraded', custody_state: 'degraded' },
+    { id: 'artifact-deleted', project_id: projectId, relative_path: 'results/deleted.json', sha256: '8'.repeat(64), status: 'quarantined', classification: 'unclassified', retention_state: 'deleted', custody_state: 'deleted' },
+  ];
+  const measurement = { id: 'measurement-1', attempt_id: oldAttempt.id, name: 'duration', value: { seconds: 1 }, artifact_id: artifacts[0].id };
   return { completeness: 'complete_in_scope_goal_to_decision_chain',
     experiment: { id, project_id: projectId, goal: second.goal, success_criterion: second.success_criterion, current_design_revision: 2, design: second },
     designs: [first, second], variants: [...first.variants, ...second.variants], attempts: [oldAttempt, humanAttempt],
-    operations: [{ operation_id: operationId, project_id: projectId, desired_state: 'cancel_requested', observed_state: 'exited' }],
-    artifact_links: [{ attempt_id: oldAttempt.id, artifact_id: artifact.id }], artifacts: [artifact], measurements: [measurement],
+    // The operation has since entered cancellation and an unknown observation;
+    // this must not rewrite the attempt's recorded outcome or terminal observation.
+    operations: [{ operation_id: operationId, project_id: projectId, desired_state: 'cancel_requested', observed_state: 'unknown' }],
+    artifact_links: artifacts.map(artifact => ({ attempt_id: oldAttempt.id, artifact_id: artifact.id })), artifacts, measurements: [measurement],
     conclusions: [{ id: 'conclusion-1', experiment_id: id, design_revision: 1, design_snapshot: first, status: 'reviewed', statement: 'The old result needs human review.',
-      evidence: [{ attempt_id: oldAttempt.id, artifact_id: null, measurement_id: measurement.id }], scientific_validity: 'not_assessed' }],
+      evidence: [{ attempt_id: oldAttempt.id, artifact_id: null, measurement_id: measurement.id }], scientific_validity: 'not_assessed' },
+    { id: 'conclusion-legacy-unbound', experiment_id: id, design_revision: null, design_snapshot: null, status: 'draft', statement: 'Legacy conclusion needs human review.',
+      evidence: [{ attempt_id: oldAttempt.id, artifact_id: artifacts[1].id, measurement_id: null }], scientific_validity: 'not_assessed' }],
   };
 };
 
@@ -221,27 +231,35 @@ test('cancellation telemetry never renders unresolved termination as stopped or 
   assert.ok(labels.every(label => !/stopped|successful/i.test(label)));
 });
 
-test('experiment projection renders historical designs, unattempted variants, operational provenance, and human conclusions without scientific success', async () => {
+test('experiment projection renders migrated unknown context, attempt history, later operation uncertainty, and artifact custody without scientific success', async () => {
   const data = experimentLedger();
   const ui = fixture({ experiments: async () => ({ experiments: [{ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 }] }),
     experiment: async () => data });
   await ui.selectProject(project('p1'));
   await ui.selectExperiment({ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 });
   const detail = ui.get('experiment-detail');
-  for (const outcome of ['failed', 'inconclusive']) assert.ok(find(detail, node => node.textContent === `Operational outcome: ${outcome}`));
+  for (const outcome of ['failed', 'inconclusive']) assert.ok(find(detail, node => node.textContent === `Attempt-recorded outcome: ${outcome}`));
   assert.ok(find(detail, node => node.textContent === 'Design revision 1'));
   assert.ok(find(detail, node => node.textContent === 'Design revision 2'));
   assert.ok(find(detail, node => /Current unattempted intervention/.test(node.textContent)));
   assert.ok(find(detail, node => node.textContent === 'No attempts recorded for this registered variant.'));
   assert.ok(find(detail, node => /Registered execution reference: task task_1/.test(node.textContent)));
   assert.ok(find(detail, node => /Human-reported observation: A human recorded/.test(node.textContent)));
-  assert.ok(find(detail, node => /observed_exited_unconfirmed — unresolved/.test(node.textContent)));
-  assert.ok(find(detail, node => node.textContent === 'Linked artifacts: artifact-1'));
+  assert.ok(find(detail, node => node.textContent === 'Goal: unknown (not recorded)'));
+  assert.ok(find(detail, node => /Operation state recorded with attempt:.*desired admitted.*observed exited/.test(node.textContent)));
+  assert.ok(find(detail, node => node.textContent === 'Latest desired operation state: cancel_requested'));
+  assert.ok(find(detail, node => node.textContent === 'Latest observed operation state: unknown'));
+  assert.ok(find(detail, node => /Cancellation has been requested/.test(node.textContent)));
+  assert.ok(find(detail, node => /external state and exposure remain unresolved/.test(node.textContent)));
+  assert.ok(find(detail, node => node.textContent === 'Linked artifacts: artifact-legacy, artifact-degraded, artifact-deleted'));
   assert.ok(find(detail, node => node.textContent === 'Linked measurements: measurement-1'));
   assert.ok(find(detail, node => /Reviewed human conclusion/.test(node.textContent)));
+  assert.ok(find(detail, node => /Design snapshot: unknown \(legacy conclusion was not bound/.test(node.textContent)));
+  for (const field of ['Quarantine status: quarantined · classification: unclassified', 'Retention state: legacy_unplaced', 'Custody state: legacy_unplaced']) assert.ok(find(detail, node => node.textContent === field));
+  for (const warning of ['degraded', 'deleted', 'legacy-unplaced']) assert.ok(find(detail, node => new RegExp(`Warning: .*${warning}`).test(node.textContent)));
   const text = JSON.stringify(detail);
   assert.match(text, /Operation provenance is operational evidence only; it does not establish scientific success\./);
-  assert.match(text, /Operational outcome is not scientific success\. Scientific validity: not assessed\./);
+  assert.match(text, /Attempt-recorded outcome is not scientific success\. Scientific validity: not assessed\./);
   assert.match(text, /Human review records an interpretation; it does not establish scientific success\./);
   assert.equal(findAll(detail, node => node.tagName === 'a').length, 0);
 });
@@ -285,11 +303,17 @@ test('experiment projection has accessible loading and empty states and fences s
   await assert.rejects(ui.selectExperiment({ id: 'e1', goal: 'Old goal', current_design_revision: 2 }), /complete current experiment ledger/);
   for (const corrupt of [
     ledger => { ledger.designs = []; },
+    ledger => { ledger.designs[0].goal = ''; },
     ledger => { ledger.variants.push({ ...ledger.variants[0] }); },
+    ledger => { ledger.operations.push({ ...ledger.operations[0] }); },
     ledger => { ledger.attempts[0].variant_id = 'missing-variant'; },
     ledger => { ledger.attempts[0].design_revision = 2; },
+    ledger => { ledger.artifacts[0].sha256 = 'invalid-digest'; },
     ledger => { ledger.artifact_links.push({ ...ledger.artifact_links[0] }); },
     ledger => { ledger.measurements[0].artifact_id = 'missing-artifact'; },
+    ledger => { ledger.conclusions[0].design_revision = 99; },
+    ledger => { ledger.conclusions[0].design_snapshot = null; },
+    ledger => { ledger.conclusions[1].design_snapshot = ledger.designs[0]; },
     ledger => { ledger.conclusions[0].evidence[0].attempt_id = 'missing-attempt'; },
     ledger => { ledger.conclusions[0].evidence.push({ ...ledger.conclusions[0].evidence[0] }); },
   ]) {
