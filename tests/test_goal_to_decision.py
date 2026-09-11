@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 from test_result_checkpoints import _reconciled_manifest
 
 from tessera_control.api import create_app
-from tessera_control.experiments import ExperimentStore
+from tessera_control.experiments import (
+    ExperimentStore,
+    create_v25_experiment_schema,
+    create_v26_experiment_evidence_retention_schema,
+)
+from tessera_control.migrations import MIGRATIONS, migrate_v27_to_v28
 from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
 from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.store import (
@@ -572,6 +577,270 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
             ).fetchone()[0]
             == 0
         )
+
+
+def _legacy_experiment_state(
+    tmp_path: Path, source_version: int
+) -> tuple[Path, dict, str, str, str]:
+    """Seed one actual v25/v26/v27 ledger without current provenance columns."""
+    state, owner, _worker, grant, _lease, manifest, artifact = _reconciled_manifest(tmp_path)
+    _operation(state, owner, grant, _lease, manifest["operation_id"])
+    experiment_id, attempt_id, measurement_id, conclusion_id = (
+        "experiment_legacy",
+        "attempt_legacy",
+        "measurement_legacy",
+        "conclusion_legacy",
+    )
+    now = utc_now()
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        for table in (
+            "experiment_artifact_evidence_references",
+            "research_conclusion_evidence",
+            "research_conclusions",
+            "research_attempt_measurements",
+            "research_attempt_artifacts",
+            "research_experiment_attempts",
+            "research_experiment_variants",
+            "research_experiment_designs",
+            "research_experiments",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        create_v25_experiment_schema(connection)
+        connection.execute(
+            """INSERT INTO research_experiments
+            (id,project_id,goal,success_criterion,current_design_revision,created_at,updated_at,
+             created_by_principal_id) VALUES (?,?,?, ?,2,?,?,?)""",
+            (
+                experiment_id,
+                grant["project_id"],
+                "Current legacy goal remains a projection.",
+                "Current legacy criterion remains a projection.",
+                now,
+                now,
+                owner["id"],
+            ),
+        )
+        connection.executemany(
+            """INSERT INTO research_experiment_designs
+            (experiment_id,revision,protocol,created_at,created_by_principal_id)
+            VALUES (?,?,?,?,?)""",
+            [
+                (experiment_id, 1, "Original protocol.", now, owner["id"]),
+                (experiment_id, 2, "Current protocol.", now, owner["id"]),
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO research_experiment_variants
+            (id,experiment_id,design_revision,kind,name,method_digest,input_digest,metadata_json,
+             revision,created_at,created_by_principal_id)
+            VALUES (?,?,?,?,?,?,?,?,1,?,?)""",
+            [
+                (
+                    "variant_legacy_baseline_1",
+                    experiment_id,
+                    1,
+                    "baseline",
+                    "original baseline",
+                    "a" * 64,
+                    "b" * 64,
+                    "{}",
+                    now,
+                    owner["id"],
+                ),
+                (
+                    "variant_legacy_intervention_1",
+                    experiment_id,
+                    1,
+                    "intervention",
+                    "original intervention",
+                    "c" * 64,
+                    "d" * 64,
+                    "{}",
+                    now,
+                    owner["id"],
+                ),
+                (
+                    "variant_legacy_baseline_2",
+                    experiment_id,
+                    2,
+                    "baseline",
+                    "current baseline",
+                    "e" * 64,
+                    "f" * 64,
+                    "{}",
+                    now,
+                    owner["id"],
+                ),
+                (
+                    "variant_legacy_intervention_2",
+                    experiment_id,
+                    2,
+                    "intervention",
+                    "current intervention",
+                    "0" * 64,
+                    "1" * 64,
+                    "{}",
+                    now,
+                    owner["id"],
+                ),
+            ],
+        )
+        connection.execute(
+            """INSERT INTO research_experiment_attempts
+            (id,variant_id,operation_id,outcome,reason,revision,created_at,created_by_principal_id)
+            VALUES (?,?,?,'failed',?,3,?,?)""",
+            (
+                attempt_id,
+                "variant_legacy_baseline_1",
+                manifest["operation_id"],
+                "Original operation failed; evidence remains reviewable.",
+                now,
+                owner["id"],
+            ),
+        )
+        connection.execute(
+            """INSERT INTO research_attempt_artifacts (attempt_id,artifact_id,created_at)
+            VALUES (?,?,?)""",
+            (attempt_id, artifact["id"], now),
+        )
+        connection.execute(
+            """INSERT INTO research_attempt_measurements
+            (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id)
+            VALUES (?,?,?,'{"seconds":12}',?,?,?)""",
+            (measurement_id, attempt_id, "original duration", artifact["id"], now, owner["id"]),
+        )
+        connection.execute(
+            """INSERT INTO research_conclusions
+            (id,experiment_id,statement,status,revision,created_at,updated_at,created_by_principal_id,
+             reviewed_at,reviewed_by_principal_id)
+            VALUES (?,?,'Original conclusion.','reviewed',2,?,?,?, ?,?)""",
+            (conclusion_id, experiment_id, now, now, owner["id"], now, owner["id"]),
+        )
+        connection.execute(
+            """INSERT INTO research_conclusion_evidence
+            (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,NULL,?)""",
+            (conclusion_id, attempt_id, measurement_id),
+        )
+        connection.execute("UPDATE schema_meta SET schema_version=25")
+        if source_version >= 26:
+            create_v26_experiment_evidence_retention_schema(connection)
+            connection.execute(
+                """INSERT INTO experiment_artifact_evidence_references
+                (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
+                VALUES (?,?,?,?,NULL,'attempt_artifact',?)""",
+                (
+                    f"experiment_evidence_attempt_{attempt_id}_{artifact['id']}",
+                    artifact["id"],
+                    grant["project_id"],
+                    attempt_id,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO experiment_artifact_evidence_references
+                (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
+                VALUES (?,?,?,?,?,'measurement_artifact',?)""",
+                (
+                    f"experiment_evidence_measurement_{measurement_id}",
+                    artifact["id"],
+                    grant["project_id"],
+                    attempt_id,
+                    measurement_id,
+                    now,
+                ),
+            )
+            connection.execute("UPDATE schema_meta SET schema_version=26")
+        if source_version >= 27:
+            MIGRATIONS[26](connection)
+        connection.commit()
+    return state, owner, experiment_id, attempt_id, measurement_id
+
+
+@pytest.mark.parametrize("source_version", (25, 26, 27))
+def test_v25_v26_v27_experiment_ledgers_upgrade_reopen_and_repeat_without_provenance_loss(
+    tmp_path: Path, source_version: int
+) -> None:
+    state, owner, experiment_id, attempt_id, measurement_id = _legacy_experiment_state(
+        tmp_path, source_version
+    )
+
+    assert migrate_state(state) == 28
+    records = ExperimentStore(state)
+    exported = records.export_experiment(owner, experiment_id)
+    reopened = ExperimentStore(state).get_experiment(owner, experiment_id)
+    assert reopened == exported
+    assert migrate_state(state) == 28
+    assert ExperimentStore(state).get_experiment(owner, experiment_id) == exported
+
+    designs = {item["revision"]: item for item in exported["designs"]}
+    assert (designs[1]["goal"], designs[1]["success_criterion"]) == (None, None)
+    assert (designs[2]["goal"], designs[2]["success_criterion"]) == (
+        "Current legacy goal remains a projection.",
+        "Current legacy criterion remains a projection.",
+    )
+    assert exported["measurements"] == [
+        {
+            "artifact_id": exported["artifacts"][0]["id"],
+            "attempt_id": attempt_id,
+            "created_at": exported["measurements"][0]["created_at"],
+            "created_by_principal_id": owner["id"],
+            "id": measurement_id,
+            "name": "original duration",
+            "value": {"seconds": 12},
+        }
+    ]
+    assert exported["conclusions"][0]["design_revision"] == 1
+    assert exported["conclusions"][0]["design_snapshot"]["goal"] is None
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT execution_task_id,execution_plan_digest FROM research_experiment_variants "
+            "WHERE id='variant_legacy_baseline_1'"
+        ).fetchone() == (None, None)
+        assert connection.execute(
+            """SELECT provenance_kind,operation_id,execution_plan_digest,package_digest,
+            operation_desired_state,operation_observed_state,termination_status,human_observation
+            FROM research_experiment_attempts WHERE id=?""",
+            (attempt_id,),
+        ).fetchone() == (
+            "legacy_operation_unverified",
+            exported["operations"][0]["operation_id"],
+            None,
+            None,
+            None,
+            "legacy_unverified",
+            "legacy_unknown",
+            None,
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM experiment_artifact_evidence_references"
+            ).fetchone()[0]
+            == 2
+        )
+
+
+def test_v27_to_v28_experiment_provenance_migration_rolls_back_complete_legacy_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, _owner, _experiment_id, _attempt_id, _measurement_id = _legacy_experiment_state(
+        tmp_path, 27
+    )
+    database = state / "tessera.sqlite3"
+    with sqlite3.connect(database) as connection:
+        before = list(connection.iterdump())
+
+    def fail_after_provenance_rebuild(connection: sqlite3.Connection) -> None:
+        migrate_v27_to_v28(connection)
+        raise RuntimeError("injected provenance migration failure")
+
+    monkeypatch.setitem(MIGRATIONS, 27, fail_after_provenance_rebuild)
+    with pytest.raises(RuntimeError, match="injected provenance"):
+        migrate_state(state)
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+    monkeypatch.undo()
+    assert migrate_state(state) == 28
 
 
 def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:

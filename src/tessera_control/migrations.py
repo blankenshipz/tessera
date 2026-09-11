@@ -413,17 +413,17 @@ def migrate_v23_to_v24(connection: sqlite3.Connection) -> None:
 
 def migrate_v24_to_v25(connection: sqlite3.Connection) -> None:
     """Add empty goal-to-decision records without altering existing research/execution history."""
-    from .experiments import create_experiment_schema
+    from .experiments import create_v25_experiment_schema
 
-    create_experiment_schema(connection, with_design_context=False)
+    create_v25_experiment_schema(connection)
     connection.execute("UPDATE schema_meta SET schema_version = 25 WHERE singleton = 1")
 
 
 def migrate_v25_to_v26(connection: sqlite3.Connection) -> None:
     """Index existing experiment evidence for retention without changing its custody."""
-    from .experiments import create_experiment_evidence_retention_schema
+    from .experiments import create_v26_experiment_evidence_retention_schema
 
-    create_experiment_evidence_retention_schema(connection)
+    create_v26_experiment_evidence_retention_schema(connection)
     connection.execute(
         """INSERT OR IGNORE INTO experiment_artifact_evidence_references
         (id,artifact_id,project_id,attempt_id,measurement_id,reference_kind,created_at)
@@ -498,9 +498,9 @@ def migrate_v26_to_v27(connection: sqlite3.Connection) -> None:
     )
     connection.execute("DROP TABLE research_conclusion_evidence")
     connection.execute("DROP TABLE research_conclusions")
-    from .experiments import create_experiment_schema
+    from .experiments import create_v27_experiment_conclusion_schema
 
-    create_experiment_schema(connection)
+    create_v27_experiment_conclusion_schema(connection)
     connection.execute(
         """INSERT INTO research_conclusions
         (id,experiment_id,design_revision,statement,status,revision,created_at,updated_at,
@@ -523,10 +523,10 @@ def migrate_v26_to_v27(connection: sqlite3.Connection) -> None:
 
 def migrate_v27_to_v28(connection: sqlite3.Connection) -> None:
     """Type new attempt provenance without inventing old execution evidence."""
-    variant_columns = {
-        row[1] for row in connection.execute("PRAGMA table_info(research_experiment_variants)")
+    attempt_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(research_experiment_attempts)")
     }
-    if "execution_task_id" in variant_columns:
+    if "provenance_kind" in attempt_columns:
         # New databases created by a newer binary can pass through intermediate
         # migrations in tests; their records already have the v28 shape.
         connection.execute("UPDATE schema_meta SET schema_version = 28 WHERE singleton = 1")

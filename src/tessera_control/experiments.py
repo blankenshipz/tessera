@@ -37,20 +37,8 @@ EXPORT_DEFAULT_BYTES = 1_000_000
 EXPORT_MAX_BYTES = 4 * 1024 * 1024
 
 
-def create_experiment_schema(
-    connection: sqlite3.Connection, *, with_design_context: bool = True
-) -> None:
+def create_experiment_schema(connection: sqlite3.Connection) -> None:
     """Install empty additive goal-to-decision records without backfilling evidence."""
-    design_context = (
-        "goal TEXT NOT NULL, success_criterion TEXT NOT NULL," if with_design_context else ""
-    )
-    conclusion_context = "design_revision INTEGER," if with_design_context else ""
-    conclusion_snapshot_fk = (
-        ", FOREIGN KEY(experiment_id,design_revision) "
-        "REFERENCES research_experiment_designs(experiment_id,revision)"
-        if with_design_context
-        else ""
-    )
     statements = (
         """CREATE TABLE IF NOT EXISTS research_experiments (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
@@ -59,9 +47,10 @@ def create_experiment_schema(
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         created_by_principal_id TEXT NOT NULL REFERENCES principals(id))""",
         "CREATE INDEX IF NOT EXISTS research_experiments_by_project ON research_experiments(project_id,created_at,id)",
-        f"""CREATE TABLE IF NOT EXISTS research_experiment_designs (
+        """CREATE TABLE IF NOT EXISTS research_experiment_designs (
         experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
-        revision INTEGER NOT NULL CHECK (revision >= 1), {design_context} protocol TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1), goal TEXT NOT NULL, success_criterion TEXT NOT NULL,
+        protocol TEXT NOT NULL,
         created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
         PRIMARY KEY (experiment_id,revision))""",
         """CREATE TABLE IF NOT EXISTS research_experiment_variants (
@@ -116,13 +105,15 @@ def create_experiment_schema(
         name TEXT NOT NULL, value_json TEXT NOT NULL, artifact_id TEXT REFERENCES artifacts(id),
         created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id))""",
         "CREATE INDEX IF NOT EXISTS research_attempt_measurements_by_attempt ON research_attempt_measurements(attempt_id,created_at,id)",
-        f"""CREATE TABLE IF NOT EXISTS research_conclusions (
+        """CREATE TABLE IF NOT EXISTS research_conclusions (
         id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
-        {conclusion_context}
+        design_revision INTEGER,
         statement TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('draft','reviewed')),
         revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         created_by_principal_id TEXT NOT NULL REFERENCES principals(id), reviewed_at TEXT,
-        reviewed_by_principal_id TEXT REFERENCES principals(id){conclusion_snapshot_fk})""",
+        reviewed_by_principal_id TEXT REFERENCES principals(id),
+        FOREIGN KEY(experiment_id,design_revision)
+        REFERENCES research_experiment_designs(experiment_id,revision))""",
         "CREATE INDEX IF NOT EXISTS research_conclusions_by_experiment ON research_conclusions(experiment_id,created_at,id)",
         """CREATE TABLE IF NOT EXISTS research_conclusion_evidence (
         conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
@@ -136,8 +127,95 @@ def create_experiment_schema(
         connection.execute(statement)
 
 
-def create_experiment_evidence_retention_schema(connection: sqlite3.Connection) -> None:
-    """Install retention indexes for already durable experiment evidence links."""
+def create_v25_experiment_schema(connection: sqlite3.Connection) -> None:
+    """Install the exact v25 ledger shape; later provenance columns are absent."""
+    statements = (
+        """CREATE TABLE research_experiments (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+        goal TEXT NOT NULL, success_criterion TEXT NOT NULL,
+        current_design_revision INTEGER NOT NULL CHECK (current_design_revision >= 1),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        created_by_principal_id TEXT NOT NULL REFERENCES principals(id))""",
+        "CREATE INDEX research_experiments_by_project ON research_experiments(project_id,created_at,id)",
+        """CREATE TABLE research_experiment_designs (
+        experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+        revision INTEGER NOT NULL CHECK (revision >= 1), protocol TEXT NOT NULL,
+        created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+        PRIMARY KEY (experiment_id,revision))""",
+        """CREATE TABLE research_experiment_variants (
+        id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+        design_revision INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('baseline','intervention')),
+        name TEXT NOT NULL, method_digest TEXT NOT NULL, input_digest TEXT NOT NULL,
+        metadata_json TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision >= 1),
+        created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+        UNIQUE(experiment_id,design_revision,kind),
+        FOREIGN KEY(experiment_id,design_revision) REFERENCES research_experiment_designs(experiment_id,revision))""",
+        "CREATE INDEX research_experiment_variants_by_experiment ON research_experiment_variants(experiment_id,design_revision,id)",
+        """CREATE TABLE research_experiment_attempts (
+        id TEXT PRIMARY KEY, variant_id TEXT NOT NULL REFERENCES research_experiment_variants(id),
+        operation_id TEXT NOT NULL REFERENCES external_operations(operation_id),
+        outcome TEXT NOT NULL CHECK (outcome IN ('succeeded','failed','cancelled','inconclusive')),
+        reason TEXT, revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL,
+        created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+        CHECK ((outcome = 'succeeded') OR reason IS NOT NULL))""",
+        "CREATE INDEX research_experiment_attempts_by_variant ON research_experiment_attempts(variant_id,created_at,id)",
+        """CREATE TABLE research_attempt_artifacts (
+        attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
+        artifact_id TEXT NOT NULL REFERENCES artifacts(id), created_at TEXT NOT NULL,
+        PRIMARY KEY(attempt_id,artifact_id))""",
+        """CREATE TABLE research_attempt_measurements (
+        id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
+        name TEXT NOT NULL, value_json TEXT NOT NULL, artifact_id TEXT REFERENCES artifacts(id),
+        created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id))""",
+        "CREATE INDEX research_attempt_measurements_by_attempt ON research_attempt_measurements(attempt_id,created_at,id)",
+        """CREATE TABLE research_conclusions (
+        id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+        statement TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('draft','reviewed')),
+        revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        created_by_principal_id TEXT NOT NULL REFERENCES principals(id), reviewed_at TEXT,
+        reviewed_by_principal_id TEXT REFERENCES principals(id))""",
+        "CREATE INDEX research_conclusions_by_experiment ON research_conclusions(experiment_id,created_at,id)",
+        """CREATE TABLE research_conclusion_evidence (
+        conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
+        attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
+        artifact_id TEXT REFERENCES artifacts(id), measurement_id TEXT REFERENCES research_attempt_measurements(id),
+        PRIMARY KEY(conclusion_id,attempt_id,artifact_id,measurement_id),
+        CHECK ((artifact_id IS NOT NULL AND measurement_id IS NULL) OR
+               (artifact_id IS NULL AND measurement_id IS NOT NULL)))""",
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
+def create_v27_experiment_conclusion_schema(connection: sqlite3.Connection) -> None:
+    """Install only the v27 conclusion shape while v25 attempts remain unchanged."""
+    connection.execute(
+        """CREATE TABLE research_conclusions (
+        id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
+        design_revision INTEGER,
+        statement TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('draft','reviewed')),
+        revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        created_by_principal_id TEXT NOT NULL REFERENCES principals(id), reviewed_at TEXT,
+        reviewed_by_principal_id TEXT REFERENCES principals(id),
+        FOREIGN KEY(experiment_id,design_revision)
+        REFERENCES research_experiment_designs(experiment_id,revision))"""
+    )
+    connection.execute(
+        "CREATE INDEX research_conclusions_by_experiment ON research_conclusions(experiment_id,created_at,id)"
+    )
+    connection.execute(
+        """CREATE TABLE research_conclusion_evidence (
+        conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
+        attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
+        artifact_id TEXT REFERENCES artifacts(id), measurement_id TEXT REFERENCES research_attempt_measurements(id),
+        PRIMARY KEY(conclusion_id,attempt_id,artifact_id,measurement_id),
+        CHECK ((artifact_id IS NOT NULL AND measurement_id IS NULL) OR
+               (artifact_id IS NULL AND measurement_id IS NOT NULL)))"""
+    )
+
+
+def create_v26_experiment_evidence_retention_schema(connection: sqlite3.Connection) -> None:
+    """Install the v26 retention indexes for already durable evidence links."""
     statements = (
         """CREATE TABLE IF NOT EXISTS experiment_artifact_evidence_references (
         id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id),
@@ -153,6 +231,11 @@ def create_experiment_evidence_retention_schema(connection: sqlite3.Connection) 
     )
     for statement in statements:
         connection.execute(statement)
+
+
+def create_experiment_evidence_retention_schema(connection: sqlite3.Connection) -> None:
+    """Install the current retention schema, unchanged since v26."""
+    create_v26_experiment_evidence_retention_schema(connection)
 
 
 class ExperimentStore(Store):
