@@ -144,9 +144,13 @@ successful, quiescent, settled, or scientifically accepted result. Repeating a
 cancellation returns the existing state and cannot clear uncertainty or create a
 lease.
 
-Reconciliation uses the latest worker observation. A later `unknown` or `running`
-observation blocks settlement even if an earlier record reported exit. The human
-request's `provider_terminated` flag cannot substitute for worker confirmation.
+Reconciliation uses the current operation observation when an operation journal
+exists: worker and receipt sources are ordered by observed time, with their
+source-local cursors used only inside each source. A later `unknown` or `running`
+observation blocks settlement even if an earlier source reported exit; a same-time
+contradiction is also fail-closed. The human request's `provider_terminated` flag
+cannot substitute for current combined confirmation. Legacy unjournaled leases
+retain their worker-only reconciliation rule.
 Unleased grants can reconcile only zero settlement because no lease was issued.
 Expired or revoked grants retain exposure until reconciliation. Unresolved grants
 also block task plan revision. A reconciled grant is an operational accounting

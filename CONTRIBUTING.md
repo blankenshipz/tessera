@@ -273,3 +273,9 @@ Schema 34 keeps high-frequency worker/provider samples in their operational
 journal. Admitted-attempt detail and export retain every semantic transition plus
 the latest observed state, opaque cursor, and timestamp without consuming their
 1,000-record semantic-history bound during routine polling.
+
+Schema 35 adds receipt-local observation sequences and reconciles current worker
+and receipt observations by observed time. It does not rewrite historical
+receipts; existing receipt rows begin at sequence one. At an equal observed time,
+contradictory nonterminal evidence remains unresolved rather than releasing held
+exposure or resolving an execution success.

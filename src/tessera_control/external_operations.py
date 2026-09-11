@@ -8,6 +8,7 @@ may have no provider receipt, especially after a lost submit reply.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 
 
 def create_external_operation_schema(connection: sqlite3.Connection) -> None:
@@ -74,6 +75,7 @@ def create_external_operation_receipt_schema(connection: sqlite3.Connection) -> 
         ),
         observed_state TEXT NOT NULL CHECK (observed_state IN ('unknown', 'running', 'exited')),
         observed_at TEXT NOT NULL,
+        observation_sequence INTEGER NOT NULL DEFAULT 1 CHECK (observation_sequence >= 1),
         termination_confirmed INTEGER NOT NULL CHECK (termination_confirmed IN (0, 1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -84,6 +86,14 @@ def create_external_operation_receipt_schema(connection: sqlite3.Connection) -> 
         """CREATE INDEX IF NOT EXISTS external_operation_receipts_by_provider
         ON external_operation_receipts(provider_kind, provider_id)"""
     )
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(external_operation_receipts)")
+    }
+    if "observation_sequence" not in columns:
+        connection.execute(
+            "ALTER TABLE external_operation_receipts ADD COLUMN observation_sequence "
+            "INTEGER NOT NULL DEFAULT 1"
+        )
     connection.execute(
         """CREATE INDEX IF NOT EXISTS external_operations_by_project
         ON external_operations(project_id, created_at, operation_id)"""
@@ -97,3 +107,77 @@ def create_external_operation_receipt_schema(connection: sqlite3.Connection) -> 
         """CREATE INDEX IF NOT EXISTS execution_observations_by_operation
         ON execution_observations(operation_id, recorded_at, id)"""
     )
+
+
+def current_operation_reconciliation(
+    connection: sqlite3.Connection, operation_id: str
+) -> dict[str, object] | None:
+    """Return the fail-closed current observation across worker and provider sources.
+
+    Each source is ordered by its reported ``observed_at`` and an opaque cursor:
+    a worker cursor is its immutable observation ID, and a receipt cursor is its
+    monotonically increasing receipt observation sequence.  Cross-source order is
+    by ``observed_at`` only.  At the same timestamp no source is preferred: an
+    ``unknown``, ``running``, or unconfirmed exit contradicts a confirmed exit and
+    therefore blocks terminal reconciliation.
+    """
+    worker = connection.execute(
+        """SELECT id,observed_state,observed_at,termination_confirmed FROM execution_observations
+        WHERE operation_id=? ORDER BY observed_at DESC, rowid DESC LIMIT 1""",
+        (operation_id,),
+    ).fetchone()
+    receipt = connection.execute(
+        """SELECT observed_state,observed_at,termination_confirmed,observation_sequence
+        FROM external_operation_receipts WHERE operation_id=?""",
+        (operation_id,),
+    ).fetchone()
+    sources: list[dict[str, object]] = []
+    if worker is not None:
+        sources.append(
+            {
+                "source": "worker",
+                "cursor": f"observation:{worker['id']}",
+                "observed_state": worker["observed_state"],
+                "observed_at": worker["observed_at"],
+                "termination_confirmed": bool(worker["termination_confirmed"]),
+            }
+        )
+    if receipt is not None:
+        sources.append(
+            {
+                "source": "receipt",
+                "cursor": f"receipt:{operation_id}:{receipt['observation_sequence']}",
+                "observed_state": receipt["observed_state"],
+                "observed_at": receipt["observed_at"],
+                "termination_confirmed": bool(receipt["termination_confirmed"]),
+            }
+        )
+    if not sources:
+        return None
+
+    def observed_time(item: dict[str, object]) -> datetime:
+        return datetime.fromisoformat(str(item["observed_at"]).replace("Z", "+00:00"))
+
+    latest_time = max(observed_time(item) for item in sources)
+    latest = [item for item in sources if observed_time(item) == latest_time]
+    latest_at = str(latest[0]["observed_at"])
+    if all(item["observed_state"] == "exited" and item["termination_confirmed"] for item in latest):
+        observed_state, termination_confirmed = "exited", True
+    elif any(item["observed_state"] == "unknown" for item in latest):
+        observed_state, termination_confirmed = "unknown", False
+    elif any(item["observed_state"] == "running" for item in latest):
+        observed_state, termination_confirmed = "running", False
+    else:
+        observed_state, termination_confirmed = "exited", False
+    cursor = (
+        str(latest[0]["cursor"])
+        if len(latest) == 1
+        else "reconciliation:" + ":".join(sorted(str(item["cursor"]) for item in latest))
+    )
+    return {
+        "observed_state": observed_state,
+        "observed_at": latest_at,
+        "termination_confirmed": termination_confirmed,
+        "cursor": cursor,
+        "sources": sources,
+    }

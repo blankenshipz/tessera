@@ -29,6 +29,7 @@ from .experiments_models import (
     ReviseExperimentDesign,
     UpdateConclusion,
 )
+from .external_operations import current_operation_reconciliation
 from .project_artifact_retention import (
     admit_experiment_artifact_evidence_reference,
     validate_experiment_artifact_evidence_reference,
@@ -494,7 +495,6 @@ def record_admitted_attempt_observation(
     connection: sqlite3.Connection,
     operation: sqlite3.Row | dict[str, Any],
     worker: dict[str, Any],
-    observation: dict[str, Any],
 ) -> bool:
     """Project every sample while appending only a semantic state transition.
 
@@ -522,8 +522,11 @@ def record_admitted_attempt_observation(
         or attempt["package_digest"] != operation["package_digest"]
     ):
         raise Conflict("External operation experiment admission binding conflicts.")
-    observed_state = observation["observed_state"]
-    termination_confirmed = bool(observation["termination_confirmed"])
+    reconciliation = current_operation_reconciliation(connection, operation["operation_id"])
+    if reconciliation is None:
+        raise Conflict("External operation has no current observation to project.")
+    observed_state = str(reconciliation["observed_state"])
+    termination_confirmed = bool(reconciliation["termination_confirmed"])
     state = {
         "running": "running",
         "unknown": "unknown",
@@ -547,7 +550,7 @@ def record_admitted_attempt_observation(
         connection.execute(
             """UPDATE research_experiment_admitted_attempts
             SET operational_observation_cursor=?,operational_observed_at=? WHERE id=?""",
-            (observation["cursor"], observation["observed_at"], attempt["id"]),
+            (reconciliation["cursor"], reconciliation["observed_at"], attempt["id"]),
         )
         return False
     _append_admitted_attempt_state(
@@ -558,8 +561,8 @@ def record_admitted_attempt_observation(
         observed_state=observed_state,
         operation_id=operation["operation_id"],
         termination_confirmed=termination_confirmed,
-        observation_cursor=observation["cursor"],
-        observed_at=observation["observed_at"],
+        observation_cursor=str(reconciliation["cursor"]),
+        observed_at=str(reconciliation["observed_at"]),
     )
     return True
 
@@ -1224,20 +1227,16 @@ class ExperimentStore(Store):
                 "Execution success or cancellation requires a bound package and operation."
             )
         operation = connection.execute(
-            "SELECT desired_state,package_digest FROM external_operations WHERE operation_id=?",
+            "SELECT operation_id,desired_state,package_digest FROM external_operations WHERE operation_id=?",
             (attempt["operation_id"],),
         ).fetchone()
-        observation = connection.execute(
-            """SELECT observed_state,termination_confirmed FROM execution_observations
-            WHERE operation_id=? ORDER BY rowid DESC LIMIT 1""",
-            (attempt["operation_id"],),
-        ).fetchone()
+        reconciliation = current_operation_reconciliation(connection, attempt["operation_id"])
         if (
             operation is None
             or operation["package_digest"] != attempt["package_digest"]
-            or observation is None
-            or observation["observed_state"] != "exited"
-            or not observation["termination_confirmed"]
+            or reconciliation is None
+            or reconciliation["observed_state"] != "exited"
+            or not reconciliation["termination_confirmed"]
         ):
             raise Conflict(
                 "Execution success or cancellation requires a confirmed attributed terminal observation."

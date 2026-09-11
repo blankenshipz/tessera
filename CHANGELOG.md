@@ -8,7 +8,7 @@ commitments.
 
 - Documentation now states the release-readiness boundaries, local-ledger
   quickstart, recovery limits, and synthetic-example scope.
-- Current local schema: v34. See [implementation progress](docs/implementation-progress.md)
+- Current local schema: v35. See [implementation progress](docs/implementation-progress.md)
   and the [compatibility matrix](docs/compatibility-matrix.md) for evidence and
   remaining gates.
 

@@ -315,5 +315,5 @@ def test_schema8_manifest_migration_preserves_artifacts_and_uploads(
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 34
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
+    assert migrate_state(state) == 35

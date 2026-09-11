@@ -20,6 +20,7 @@ from .execution_models import (
     ReportExternalOperationReceipt,
     RevokeExecutionGrant,
 )
+from .external_operations import current_operation_reconciliation
 from .store import (
     Conflict,
     Forbidden,
@@ -1054,20 +1055,24 @@ class ExecutionStore(Store):
                 raise Conflict("Termination confirmation requires an exited observation.")
             if payload["termination_confirmed"] and payload.get("provider_id") is None:
                 raise Conflict("Termination confirmation requires a provider identity.")
+            observed_at = _parse_utc(payload["observed_at"])
             if payload["termination_confirmed"] and operation is not None:
                 receipt = connection.execute(
                     "SELECT * FROM external_operation_receipts WHERE operation_id=?",
                     (operation["operation_id"],),
                 ).fetchone()
-                if receipt is not None and (
-                    receipt["provider_id"] != payload["provider_id"]
-                    or receipt["observed_state"] != "exited"
-                    or not receipt["termination_confirmed"]
+                if (
+                    receipt is not None
+                    and _parse_utc(receipt["observed_at"]) >= observed_at
+                    and (
+                        receipt["provider_id"] != payload["provider_id"]
+                        or receipt["observed_state"] != "exited"
+                        or not receipt["termination_confirmed"]
+                    )
                 ):
                     raise Conflict(
                         "Termination confirmation requires a matching provider receipt observation."
                     )
-            observed_at = _parse_utc(payload["observed_at"])
             issued_at = _parse_utc(lease["issued_at"])
             now_datetime = self._now()
             if observed_at < issued_at or observed_at > now_datetime + MAX_OBSERVATION_FUTURE_SKEW:
@@ -1117,11 +1122,15 @@ class ExecutionStore(Store):
                 row,
             )
             if operation is not None:
+                reconciliation = current_operation_reconciliation(
+                    connection, operation["operation_id"]
+                )
+                assert reconciliation is not None
                 connection.execute(
                     """UPDATE external_operations SET observed_state=?,
                     provider_id=coalesce(provider_id, ?), updated_at=? WHERE operation_id=?""",
                     (
-                        row["observed_state"],
+                        reconciliation["observed_state"],
                         row["provider_id"],
                         row["recorded_at"],
                         operation["operation_id"],
@@ -1130,15 +1139,7 @@ class ExecutionStore(Store):
                 from .experiments import record_admitted_attempt_observation
 
                 semantic_transition = record_admitted_attempt_observation(
-                    connection,
-                    operation,
-                    worker,
-                    {
-                        "cursor": f"observation:{row['id']}",
-                        "observed_state": row["observed_state"],
-                        "observed_at": row["observed_at"],
-                        "termination_confirmed": bool(row["termination_confirmed"]),
-                    },
+                    connection, operation, worker
                 )
             else:
                 semantic_transition = True
@@ -1258,6 +1259,7 @@ class ExecutionStore(Store):
                     "operation_id": operation_id,
                     "observed_state": payload["observed_state"],
                     "observed_at": _utc_string(observed_at),
+                    "observation_sequence": 1,
                     "termination_confirmed": int(payload["termination_confirmed"]),
                     "created_at": now,
                     "updated_at": now,
@@ -1265,10 +1267,11 @@ class ExecutionStore(Store):
                 connection.execute(
                     """INSERT INTO external_operation_receipts
                     (operation_id, provider_kind, provider_version, provider_id,
-                     receipt_payload_json, receipt_digest, observed_state, observed_at,
-                     termination_confirmed, created_at, updated_at)
+                      receipt_payload_json, receipt_digest, observed_state, observed_at,
+                      observation_sequence,
+                      termination_confirmed, created_at, updated_at)
                     VALUES (:operation_id,:provider_kind,:provider_version,:provider_id,
-                    :receipt_payload_json,:receipt_digest,:observed_state,:observed_at,
+                    :receipt_payload_json,:receipt_digest,:observed_state,:observed_at,:observation_sequence,
                     :termination_confirmed,:created_at,:updated_at)""",
                     row,
                 )
@@ -1279,7 +1282,9 @@ class ExecutionStore(Store):
                     raise Conflict("Provider receipt observations cannot be reported out of order.")
                 connection.execute(
                     """UPDATE external_operation_receipts SET observed_state=?, observed_at=?,
-                    termination_confirmed=?, updated_at=? WHERE operation_id=?""",
+                    observation_sequence=observation_sequence+1, termination_confirmed=?,
+                    updated_at=?
+                    WHERE operation_id=?""",
                     (
                         payload["observed_state"],
                         _utc_string(observed_at),
@@ -1291,29 +1296,22 @@ class ExecutionStore(Store):
                 row = dict(existing) | {
                     "observed_state": payload["observed_state"],
                     "observed_at": _utc_string(observed_at),
+                    "observation_sequence": existing["observation_sequence"] + 1,
                     "termination_confirmed": int(payload["termination_confirmed"]),
                     "updated_at": now,
                 }
             if operation["provider_id"] not in {None, payload["provider_id"]}:
                 raise Conflict("Provider identity cannot change within an external operation.")
+            reconciliation = current_operation_reconciliation(connection, operation_id)
+            assert reconciliation is not None
             connection.execute(
                 """UPDATE external_operations SET provider_id=coalesce(provider_id, ?),
                 observed_state=?, updated_at=? WHERE operation_id=?""",
-                (payload["provider_id"], payload["observed_state"], now, operation_id),
+                (payload["provider_id"], reconciliation["observed_state"], now, operation_id),
             )
             from .experiments import record_admitted_attempt_observation
 
-            semantic_transition = record_admitted_attempt_observation(
-                connection,
-                operation,
-                worker,
-                {
-                    "cursor": f"receipt:{operation_id}:{_utc_string(observed_at)}",
-                    "observed_state": payload["observed_state"],
-                    "observed_at": _utc_string(observed_at),
-                    "termination_confirmed": bool(payload["termination_confirmed"]),
-                },
-            )
+            semantic_transition = record_admitted_attempt_observation(connection, operation, worker)
             result = dict(row)
             result["termination_confirmed"] = bool(result["termination_confirmed"])
             result["receipt_evidence"] = "fake_provider_only"
@@ -1363,17 +1361,33 @@ class ExecutionStore(Store):
                 "SELECT count(*) FROM execution_leases WHERE grant_id = ?", (grant_id,)
             ).fetchone()[0]
             if leases:
-                observation = connection.execute(
-                    """SELECT observed_state, termination_confirmed FROM execution_observations
-                    WHERE grant_id = ? ORDER BY rowid DESC LIMIT 1""",
-                    (grant_id,),
+                operation = connection.execute(
+                    "SELECT operation_id FROM external_operations WHERE grant_id=?", (grant_id,)
                 ).fetchone()
-                if (
-                    observation is None
-                    or observation["observed_state"] != "exited"
-                    or not observation["termination_confirmed"]
-                ):
-                    raise Conflict("Authenticated worker termination confirmation is required.")
+                if operation is not None:
+                    reconciliation = current_operation_reconciliation(
+                        connection, operation["operation_id"]
+                    )
+                    if (
+                        reconciliation is None
+                        or reconciliation["observed_state"] != "exited"
+                        or not reconciliation["termination_confirmed"]
+                    ):
+                        raise Conflict(
+                            "Current operation reconciliation requires confirmed termination."
+                        )
+                else:
+                    observation = connection.execute(
+                        """SELECT observed_state, termination_confirmed FROM execution_observations
+                        WHERE grant_id = ? ORDER BY rowid DESC LIMIT 1""",
+                        (grant_id,),
+                    ).fetchone()
+                    if (
+                        observation is None
+                        or observation["observed_state"] != "exited"
+                        or not observation["termination_confirmed"]
+                    ):
+                        raise Conflict("Authenticated worker termination confirmation is required.")
             elif payload["settlement_cents"] != 0:
                 raise Conflict("An unleased execution grant may reconcile only zero settlement.")
             limits = self._limit(connection, actor, grant["project_id"])

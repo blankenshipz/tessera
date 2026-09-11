@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 34
+LATEST_SCHEMA_VERSION = 35
 LOCAL_ORG_ID = "org_local"
 
 
@@ -667,6 +667,14 @@ def migrate_v33_to_v34(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 34 WHERE singleton = 1")
 
 
+def migrate_v34_to_v35(connection: sqlite3.Connection) -> None:
+    """Add receipt-local ordering without rewriting any operational history."""
+    from .external_operations import create_external_operation_receipt_schema
+
+    create_external_operation_receipt_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 35 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -701,6 +709,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     31: migrate_v31_to_v32,
     32: migrate_v32_to_v33,
     33: migrate_v33_to_v34,
+    34: migrate_v34_to_v35,
 }
 
 

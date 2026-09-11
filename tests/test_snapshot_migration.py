@@ -73,13 +73,13 @@ def test_v4_to_v5_requires_explicit_migration_and_preserves_records(tmp_path: Pa
     state, project, task = _v4_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     assert {"source_snapshots", "snapshot_files"}.issubset(_tables(state))
     store = Store(state)
     owner = _owner(state)
     assert store.get_project(owner, project["id"]) == project
     assert store.get_task(owner, task["id"])["id"] == task["id"]
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
 
 
 def test_v4_to_v5_rolls_back_snapshot_schema_on_failure(

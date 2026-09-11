@@ -96,6 +96,18 @@ operational journal and do not consume the 1,000-record experiment export/detail
 bound or create duplicate labbook events. This is not paging and does not discard
 semantic transitions.
 
+Schema v35 reconciles current operational evidence at the operation boundary.
+Worker samples use their immutable `observation:{id}` cursor; the one receipt row
+uses `receipt:{operation_id}:{observation_sequence}`, incremented for every
+accepted receipt observation. Each source rejects its own decreasing observed
+time. Across sources, observed time—not arrival/SQLite row order—selects the
+current evidence. At the same observed time, no source wins: `unknown`, `running`,
+or an unconfirmed exit contradicts a confirmed exit and keeps the operation
+unresolved. A newer confirmed exit can supersede an older nonterminal sample, but
+a newer nonterminal sample blocks admitted success/cancellation resolution and
+grant reconciliation/exposure release. Human outcome rows remain immutable while
+the admitted-attempt operational projection shows that current uncertainty.
+
 Execution `succeeded` and `cancelled` resolutions require the original bound
 package and operation plus an attributed, confirmed exited observation. A cancelled
 resolution additionally requires the durable cancellation request; an unconfirmed

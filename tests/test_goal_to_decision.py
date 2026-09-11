@@ -759,6 +759,255 @@ def test_admitted_success_requires_package_and_confirmed_exit(tmp_path: Path) ->
         )
 
 
+def _admitted_operation_with_confirmed_sources(tmp_path: Path):
+    state, execution, owner, worker, grant, lease = _delivery(tmp_path)
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    admitted = _command(
+        records.admit_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "expected_design_revision": experiment["current_design_revision"],
+            "grant_id": grant["id"],
+        },
+    )
+    body = {"expected_epoch": lease["epoch"]}
+    package = RuntimePackageStore(state).execution_package(
+        worker, lease["id"], "combined-observation-package", canonical_digest(body), lease["epoch"]
+    )[1]
+    observed_at = datetime.now(UTC)
+    receipt = {
+        "lease_id": lease["id"],
+        "expected_epoch": lease["epoch"],
+        "provider_kind": "fake",
+        "provider_version": "1",
+        "provider_id": "combined-synthetic-provider",
+        "receipt_payload": {"synthetic": "combined-observation"},
+        "receipt_digest": canonical_digest({"synthetic": "combined-observation"}),
+        "observed_state": "exited",
+        "observed_at": observed_at.isoformat(),
+        "termination_confirmed": True,
+    }
+    _command(
+        execution.report_external_operation_receipt,
+        worker,
+        package["operation"]["operation_id"],
+        payload=receipt,
+    )
+    worker_exit = {
+        "expected_epoch": lease["epoch"],
+        "operation_id": package["operation"]["operation_id"],
+        "observed_state": "exited",
+        "observed_at": observed_at.isoformat(),
+        "provider_id": receipt["provider_id"],
+        "termination_confirmed": True,
+    }
+    _command(execution.report_execution_observation, worker, lease["id"], payload=worker_exit)
+    return (
+        state,
+        execution,
+        records,
+        owner,
+        worker,
+        grant,
+        lease,
+        admitted,
+        package["operation"]["operation_id"],
+        receipt,
+        worker_exit,
+    )
+
+
+def test_newer_receipt_unknown_blocks_admitted_success_after_confirmed_worker_exit(
+    tmp_path: Path,
+) -> None:
+    (
+        _state,
+        execution,
+        records,
+        owner,
+        worker,
+        _grant,
+        _lease,
+        admitted,
+        operation_id,
+        receipt,
+        _worker_exit,
+    ) = _admitted_operation_with_confirmed_sources(tmp_path)
+    newer_unknown = receipt | {
+        "observed_state": "unknown",
+        "observed_at": (
+            datetime.fromisoformat(receipt["observed_at"]) + timedelta(milliseconds=1)
+        ).isoformat(),
+        "termination_confirmed": False,
+    }
+    _command(
+        execution.report_external_operation_receipt, worker, operation_id, payload=newer_unknown
+    )
+    current = records.get_experiment(owner, admitted["experiment_id"])["admitted_attempts"][0]
+    assert current["operational_state"] == current["operational_observed_state"] == "unknown"
+    with pytest.raises(Conflict, match="confirmed attributed terminal observation"):
+        _command(
+            records.resolve_admitted_attempt,
+            owner,
+            admitted["id"],
+            payload={
+                "expected_revision": current["revision"],
+                "outcome": "succeeded",
+                "reason": None,
+            },
+        )
+
+
+def test_interleaved_delayed_source_observations_use_observed_time_not_arrival_order(
+    tmp_path: Path,
+) -> None:
+    (
+        _state,
+        execution,
+        records,
+        owner,
+        worker,
+        _grant,
+        lease,
+        admitted,
+        operation_id,
+        receipt,
+        worker_exit,
+    ) = _admitted_operation_with_confirmed_sources(tmp_path)
+    base = datetime.fromisoformat(receipt["observed_at"])
+    # The provider's later confirmation arrives before this worker sample, but
+    # the worker sample is accepted in its own source order and cannot overwrite
+    # the provider's newer observed-time state.
+    provider_later = receipt | {"observed_at": (base + timedelta(milliseconds=3)).isoformat()}
+    _command(
+        execution.report_external_operation_receipt, worker, operation_id, payload=provider_later
+    )
+    delayed_worker_exit = worker_exit | {
+        "observed_at": (base + timedelta(milliseconds=2)).isoformat()
+    }
+    _command(
+        execution.report_execution_observation, worker, lease["id"], payload=delayed_worker_exit
+    )
+    current = records.get_experiment(owner, admitted["experiment_id"])["admitted_attempts"][0]
+    assert current["operational_observed_at"] == provider_later["observed_at"].replace(
+        "+00:00", "Z"
+    )
+    resolved = _command(
+        records.resolve_admitted_attempt,
+        owner,
+        admitted["id"],
+        payload={"expected_revision": current["revision"], "outcome": "succeeded", "reason": None},
+    )
+    assert resolved["human_outcome"]["outcome"] == "succeeded"
+
+
+def test_same_time_receipt_contradiction_is_fail_closed(tmp_path: Path) -> None:
+    (
+        _state,
+        execution,
+        records,
+        owner,
+        worker,
+        _grant,
+        _lease,
+        admitted,
+        operation_id,
+        receipt,
+        _worker_exit,
+    ) = _admitted_operation_with_confirmed_sources(tmp_path)
+    same_time_unknown = receipt | {"observed_state": "unknown", "termination_confirmed": False}
+    _command(
+        execution.report_external_operation_receipt, worker, operation_id, payload=same_time_unknown
+    )
+    current = records.get_experiment(owner, admitted["experiment_id"])["admitted_attempts"][0]
+    assert current["operational_observed_state"] == "unknown"
+    assert current["operational_observation_cursor"].startswith("reconciliation:")
+    with pytest.raises(Conflict, match="confirmed attributed terminal observation"):
+        _command(
+            records.resolve_admitted_attempt,
+            owner,
+            admitted["id"],
+            payload={
+                "expected_revision": current["revision"],
+                "outcome": "succeeded",
+                "reason": None,
+            },
+        )
+
+
+def test_newer_worker_running_blocks_reconciliation_and_exposure_release(tmp_path: Path) -> None:
+    (
+        _state,
+        execution,
+        _records,
+        owner,
+        worker,
+        grant,
+        lease,
+        _admitted,
+        _operation_id,
+        receipt,
+        worker_exit,
+    ) = _admitted_operation_with_confirmed_sources(tmp_path)
+    running = worker_exit | {
+        "observed_state": "running",
+        "observed_at": (
+            datetime.fromisoformat(receipt["observed_at"]) + timedelta(milliseconds=1)
+        ).isoformat(),
+        "termination_confirmed": False,
+    }
+    _command(execution.report_execution_observation, worker, lease["id"], payload=running)
+    with pytest.raises(Conflict, match="Current operation reconciliation"):
+        _command(
+            execution.reconcile_execution_grant,
+            owner,
+            grant["id"],
+            payload={
+                "expected_revision": grant["revision"],
+                "settlement_cents": 0,
+                "provider_terminated": True,
+            },
+        )
+    assert ExecutionStore(_state).get_execution_grant(owner, grant["id"])["status"] == "active"
+    assert (
+        execution.get_project_execution(owner, grant["project_id"])["held_cents"]
+        == grant["max_exposure_cents"]
+    )
+
+
+def test_v35_receipt_sequence_migration_preserves_existing_receipt_state(tmp_path: Path) -> None:
+    (
+        state,
+        _execution,
+        _records,
+        _owner,
+        _worker,
+        _grant,
+        _lease,
+        _admitted,
+        operation_id,
+        _receipt,
+        _worker_exit,
+    ) = _admitted_operation_with_confirmed_sources(tmp_path)
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "ALTER TABLE external_operation_receipts DROP COLUMN observation_sequence"
+        )
+        connection.execute("UPDATE schema_meta SET schema_version=34")
+    assert migrate_state(state) == 35
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT observation_sequence FROM external_operation_receipts WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone() == (1,)
+
+
 @pytest.mark.parametrize("outcome", ("succeeded", "cancelled"))
 def test_admitted_confirmed_exit_preserves_separate_operational_and_human_records(
     tmp_path: Path,
@@ -966,14 +1215,14 @@ def test_v32_resolution_migration_preserves_legacy_outcomes_without_operational_
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.setitem(MIGRATIONS, 32, migrate)
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     migrated = records.get_experiment(owner, experiment["id"])["admitted_attempts"][0]
     assert migrated["outcome"] == outcome
     assert migrated["human_outcome"]["outcome"] == outcome
     assert migrated["operational_state"] == "legacy_unverified"
     assert migrated["operational_observed_state"] == "legacy_unverified"
     assert migrated["operational_termination_confirmed"] is None
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     assert records.get_experiment(owner, experiment["id"])["admitted_attempts"][0] == migrated
     fresh = tmp_path / "fresh"
     initialize_state(fresh)
@@ -1045,7 +1294,7 @@ def test_v33_observation_projection_migration_backfills_only_existing_latest_sam
         )
         connection.execute("UPDATE schema_meta SET schema_version=33")
 
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     migrated = ExperimentStore(state).get_experiment(owner, experiment["id"])["admitted_attempts"][
         0
     ]
@@ -1432,7 +1681,7 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -1664,12 +1913,12 @@ def test_v25_through_v29_experiment_ledgers_upgrade_backup_restore_and_repeat_wi
         tmp_path, source_version
     )
 
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     records = ExperimentStore(state)
     exported = records.export_experiment(owner, experiment_id)
     reopened = ExperimentStore(state).get_experiment(owner, experiment_id)
     assert reopened == exported
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     assert ExperimentStore(state).get_experiment(owner, experiment_id) == exported
 
     fresh = tmp_path / "fresh"
@@ -1751,7 +2000,7 @@ def test_v27_to_v28_experiment_provenance_migration_rolls_back_complete_legacy_l
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
 
 
 def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:
@@ -1977,7 +2226,7 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         connection.execute("DROP TABLE migration_27_conclusion_evidence")
         connection.execute("DROP TABLE migration_27_conclusions")
         connection.execute("UPDATE schema_meta SET schema_version=26")
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
     migrated = ExperimentStore(state).get_experiment(owner, first["id"])
     migrated_designs = {item["revision"]: item for item in migrated["designs"]}
     assert migrated_designs[1]["goal"] is None
@@ -2010,7 +2259,7 @@ def test_v30_to_v31_binding_repair_rolls_back_and_preserves_authentic_ledger(
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 34
+    assert migrate_state(state) == 35
 
 
 def test_experiment_export_rejects_large_measurement_aggregate_before_materializing(

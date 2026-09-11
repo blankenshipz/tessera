@@ -84,7 +84,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v34
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v35
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -127,6 +127,10 @@ Schema v34 retains high-frequency worker/provider samples separately from bounde
 admitted-attempt semantic transition history. Detail/export show every semantic
 transition and the latest observed state, opaque cursor, and timestamp, so routine
 polling does not consume the 1,000-record history bound or hide uncertainty.
+
+Schema v35 reconciles current worker and fake-provider receipt observations by
+observed time. A newer or same-time contradictory `unknown`/`running` observation
+blocks operational success and exposure release while preserving any human outcome.
 
 Schema v15 adds a human-only, immutable synthetic result checkpoint for a
 reconciled, worker-confirmed operation and a complete exact quarantined manifest.
@@ -338,7 +342,7 @@ failure handling, and release tests.
 ## Developer-alpha boundaries
 
 Start with the [local ledger quickstart](docs/quickstart.md) and its synthetic
-example. Schema v34 is the current local schema, but the documented component and
+example. Schema v35 is the current local schema, but the documented component and
 synthetic evidence does not make a production workflow. There is no supported
 remote control plane, real provider integration, OpenCode compatibility result,
 or Kubernetes execution path. The tested developer environments are locked Python
