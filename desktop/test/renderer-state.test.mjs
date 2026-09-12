@@ -525,6 +525,20 @@ test('message submission blocks duplicate clicks and keeps its key after an unce
   assert.equal(ui.get('message-form').fields.body, undefined);
 });
 
+test('message delivery exposes session uncertainty and stale/offline reads without treating legacy chat as delivered', async () => {
+  const ui = fixture({ messages: async () => ({ messages: [
+    { id: 'legacy', intent: 'question', sender_principal_id: 'human', body: 'Historical chat', created_at: '2026-01-01T00:00:00Z', delivery_legacy: true },
+    { id: 'delivery', intent: 'direction', sender_principal_id: 'human', body: 'Pinned context', created_at: '2026-01-01T00:00:01Z', delivery: { state: 'uncertain', harness_instance_id: 'harness-1', upstream_session_id: 'session-1', error_code: 'upstream_uncertain' } },
+  ] }) });
+  await ui.selectProject(project('p1')); await ui.selectThread(thread('t1'));
+  assert.ok(find(ui.get('messages'), node => /Legacy conversation message/.test(node.textContent)));
+  assert.ok(find(ui.get('messages'), node => /session session-1/.test(node.textContent)));
+  assert.ok(find(ui.get('messages'), node => /will not be sent again automatically/.test(node.textContent)));
+  ui.api.messages = async () => { throw new Error('offline'); };
+  await assert.rejects(ui.loadMessages(undefined, undefined, true), /offline/);
+  assert.match(ui.get('messages').children[0].textContent, /stale because the control plane is offline/);
+});
+
 test('decision resolution sends an explicit revision-bound intent and does not approve on load', async () => {
   const calls = [];
   const ui = fixture({ decisions: async () => ({ decisions: [pendingDecision()] }),
