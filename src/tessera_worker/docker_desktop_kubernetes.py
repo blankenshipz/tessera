@@ -736,7 +736,12 @@ def _verify_collector(
     if (
         spec.get("automountServiceAccountToken") is not False
         or spec.get("enableServiceLinks") is not False
-        or any(spec.get(field) is not False for field in ("hostIPC", "hostNetwork", "hostPID"))
+        # Kubernetes may omit explicitly false host-namespace fields from a
+        # returned Pod. Their API defaults are false; a present non-false value
+        # is unsafe and remains rejected.
+        or any(
+            spec.get(field, False) is not False for field in ("hostIPC", "hostNetwork", "hostPID")
+        )
         or spec.get("restartPolicy") != "Never"
         or spec.get("securityContext")
         != {

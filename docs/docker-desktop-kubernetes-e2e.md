@@ -1,6 +1,6 @@
 # Docker Desktop Kubernetes conformance E2E
 
-`scripts/check_docker_desktop_kubernetes_e2e.py` is the smallest real,
+`scripts/check_docker_desktop_kubernetes_e2e.py` is the smallest standalone real,
 provider-disabled Kubernetes conformance run. It accepts only an explicit
 absolute kubeconfig and the `docker-desktop` context. It reads that selected
 context's HTTPS server and CA identity, hashes the kubeconfig, and passes all
@@ -14,8 +14,30 @@ Run it only after the focused unit checks:
 .venv/bin/pytest tests/test_kubernetes_provider.py tests/test_kubernetes_execution.py \
   tests/test_docker_desktop_kubernetes.py
 .venv/bin/python scripts/check_docker_desktop_kubernetes_e2e.py --run \
+   --kubeconfig "$HOME/.kube/config" --context docker-desktop
+```
+
+For the real authenticated control-plane dispatch path, run:
+
+```sh
+.venv/bin/pytest tests/test_kubernetes_dispatch.py tests/test_kubernetes_execution.py \
+  tests/test_kubernetes_provider.py tests/test_kubernetes_control_binding.py
+.venv/bin/python scripts/check_authenticated_kubernetes_dispatch_e2e.py --run \
   --kubeconfig "$HOME/.kube/config" --context docker-desktop
 ```
+
+The authenticated runner starts a temporary loopback control service and uses
+the existing authenticated local workspace-adoption command plus normal human
+and worker HTTP routes to create a project, worker, input release, task plan,
+grant, lease, admitted attempt, immutable package, and human-approved dispatch
+outbox. The enrolled worker claims that outbox through the normal worker route;
+the unchanged control-issued package is handed to the durable adapter with only
+explicit Docker Desktop Kubernetes callbacks. It retains one uniquely named
+namespace and its NetworkPolicy, PVC, Job/workload Pod and collector Pod. Its
+temporary control state (and credentials) is removed after the result is printed;
+its non-secret local adapter/claim journal is retained outside the repository.
+The JSON evidence includes control IDs/package digest, target, resource UIDs,
+image digest, exact output/hash, and experiment-export linkage.
 
 The image at `examples/kubernetes-hello/` is built locally for `linux/amd64` as
 an OCI archive. A per-run, non-secret image label prevents a retained node image
@@ -39,15 +61,16 @@ collector contract; the PVC UID/spec are rechecked before output logs are read.
 Success requires the exact bytes, byte hash, Job/Pod/PVC/namespace UIDs, Job
 spec/image checks, and collector image ID. The JSON result records these values.
 
-The adapter persists a local Job create/cancel fence before Kubernetes calls;
+The standalone adapter persists a local Job create/cancel fence before Kubernetes calls;
 lost creates reconcile only by the deterministic Job name. Cancellation checks
 the observed Job UID again before the narrowly named Job delete, then confirms
 only fresh Job and owned-Pod absence. Kubernetes `kubectl delete` has no exposed
 UID precondition, so a hostile same-namespace writer between that check and the
 delete remains an enforcement limitation; the dedicated random namespace is the
-boundary for this conformance fixture. The normal control package path is tested
-with focused temporary-state tests, but the control plane has no remote
-Kubernetes dispatch route. This live run therefore does not create authority
-through SQL, fabricate a receipt, call OpenCode/providers, accept an artifact or
-result, or claim pilot completion. It retains every created resource for manual
-inspection.
+boundary for this conformance fixture. The standalone run does not create
+authority through SQL, fabricate a receipt, call OpenCode/providers, accept an
+artifact or result, or claim pilot completion. The authenticated runner uses
+normal control authority but remains a narrow, provider-disabled development
+conformance fixture: it does not enable a supported Kubernetes target,
+provider/model execution, artifact release, result acceptance, or pilot
+completion. Both runners retain every created resource for manual inspection.

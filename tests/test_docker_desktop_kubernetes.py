@@ -110,6 +110,15 @@ def test_collector_observation_rejects_pvc_or_security_mutation() -> None:
     assert _verify_collector(
         resource, "tessera-e2e-fixture", "collector", image, pvc_name="outputs"
     ) == ("collector-uid", image.manifest_digest)
+    for field in ("hostIPC", "hostNetwork", "hostPID"):
+        resource["spec"].pop(field)  # type: ignore[index]
+    assert _verify_collector(
+        resource, "tessera-e2e-fixture", "collector", image, pvc_name="outputs"
+    ) == ("collector-uid", image.manifest_digest)
+    resource["spec"]["hostNetwork"] = True  # type: ignore[index]
+    with pytest.raises(LiveKubernetesError, match="PVC binding or security"):
+        _verify_collector(resource, "tessera-e2e-fixture", "collector", image, pvc_name="outputs")
+    resource["spec"].pop("hostNetwork")  # type: ignore[index]
     resource["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"] = False  # type: ignore[index]
     with pytest.raises(LiveKubernetesError, match="PVC binding or security"):
         _verify_collector(resource, "tessera-e2e-fixture", "collector", image, pvc_name="outputs")
