@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 from collections.abc import Callable
@@ -34,6 +35,8 @@ from .opencode_http import OpenCodeHttpClient, OpenCodeHttpError, OpenCodeSseEve
 _KNOWN_EVENT_TYPES = frozenset(
     {"session.created", "session.updated", "session.status", "session.idle", "session.error"}
 )
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_FORBIDDEN_PROVIDER_ACTIVITY = re.compile(r"(?:provider|inference|tool|plugin|mcp|assistant)", re.I)
 
 
 class LiveOpenCodeHarnessAdapter:
@@ -51,12 +54,14 @@ class LiveOpenCodeHarnessAdapter:
         *,
         authority_is_current: Callable[[TesseraBinding, str], bool],
         context_only_delivery: bool = False,
+        provider_disabled: bool = False,
     ) -> None:
         if not isinstance(client, OpenCodeHttpClient):
             raise ValueError("Live adapter requires the narrow OpenCode HTTP client.")
         self._client = client
         self._authority_is_current = authority_is_current
         self._context_only_delivery = context_only_delivery
+        self._provider_disabled = provider_disabled
         self._database = self._prepare_journal(Path(journal_dir))
         self._connection = sqlite3.connect(self._database)
         self._connection.execute("PRAGMA journal_mode=DELETE")
@@ -153,6 +158,10 @@ class LiveOpenCodeHarnessAdapter:
         except OpenCodeHttpError as error:
             raise OpenCodeHarnessError("OpenCode event stream is unavailable or unsafe.") from error
         for event in events:
+            if self._provider_disabled and self._observes_forbidden_activity(event):
+                raise OpenCodeHarnessError(
+                    "Provider-disabled OpenCode mode observed inference, provider, tool, plugin, or MCP activity."
+                )
             self._ingest_event(event)
         return self._drain_routed(binding)
 
@@ -261,7 +270,7 @@ class LiveOpenCodeHarnessAdapter:
             raise OpenCodeHarnessError("A designated OpenCode session is required.")
         if not isinstance(delivery_id, str) or not delivery_id or len(delivery_id) > 128:
             raise ValueError("OpenCode delivery identity is invalid.")
-        if not isinstance(context_digest, str) or len(context_digest) != 64:
+        if not isinstance(context_digest, str) or not _SHA256.fullmatch(context_digest):
             raise ValueError("OpenCode context digest is invalid.")
         if not isinstance(message, str) or not message.strip():
             raise ValueError("OpenCode message is invalid.")
@@ -288,12 +297,14 @@ class LiveOpenCodeHarnessAdapter:
             self._client.verify_contract()
             self._require_authority(binding, "message")
             readback = self._client.send_context_only_message(binding.session_id, message, delivery_id)
-            upstream_message_id = readback["id"]
+            info = readback["info"]
+            assert isinstance(info, dict)
+            upstream_message_id = info["id"]
             assert isinstance(upstream_message_id, str)
             readback_digest = hashlib.sha256(
                 json.dumps(readback, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
             ).hexdigest()
-        except (OpenCodeHttpError, AuthorityRejectedError):
+        except (OpenCodeHttpError, AuthorityRejectedError, KeyError, TypeError):
             self._connection.execute(
                 "UPDATE message_deliveries SET outcome='uncertain' WHERE delivery_id=?", (delivery_id,)
             )
@@ -305,6 +316,18 @@ class LiveOpenCodeHarnessAdapter:
         )
         self._connection.commit()
         return upstream_message_id, readback_digest
+
+    @staticmethod
+    def _observes_forbidden_activity(event: OpenCodeSseEvent) -> bool:
+        """Treat a visible forbidden event as a hard provider-disabled failure.
+
+        An SSE stream cannot prove the absence of hidden inference.  This narrow
+        check therefore never makes that claim; it prevents an observed activity
+        from being downgraded to a harmless unknown event.
+        """
+        return bool(_FORBIDDEN_PROVIDER_ACTIVITY.search(event.event_name)) or bool(
+            _FORBIDDEN_PROVIDER_ACTIVITY.search(json.dumps(event.data, sort_keys=True))
+        )
 
     def _ingest_event(self, event: OpenCodeSseEvent) -> None:
         """Persist a shared-stream event before assigning it to its session.

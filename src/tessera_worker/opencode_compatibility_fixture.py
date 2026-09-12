@@ -8,7 +8,6 @@ adapter when that binary or its requested version is absent.
 from __future__ import annotations
 
 import base64
-import hashlib
 import http.client
 import json
 import os
@@ -24,7 +23,10 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote
+
+from .opencode_harness import TesseraBinding
+from .opencode_http import OpenCodeHarnessInstancePin, OpenCodeHttpClient, OpenCodeServerPin
+from .opencode_live_adapter import LiveOpenCodeHarnessAdapter
 
 _VERSION = re.compile(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -102,6 +104,8 @@ class FixtureResult:
     reconnect_checked: bool = False
     cursor_replay_checked: bool = False
     session_attribution_checked: bool = False
+    context_readback_checked: bool = False
+    activity_checked: bool = False
     retained_temp_state: str | None = None
 
     def json(self) -> str:
@@ -191,6 +195,40 @@ def _event_session_id(event: dict[str, str]) -> str | None:
     except (KeyError, TypeError, json.JSONDecodeError):
         return None
     return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _forbidden_activity(value: object) -> bool:
+    """Reject observed provider/inference/tool/plugin/MCP activity, never infer absence.
+
+    A context-only HTTP response cannot prove that an opaque server never made a
+    network call.  It *can* prove that it returned an assistant/tool-shaped part
+    or emitted a forbidden activity event, which makes provider-disabled mode a
+    failure rather than a green claim.
+    """
+    if isinstance(value, str):
+        return any(
+            token in value.lower()
+            for token in ("provider", "inference", "tool", "plugin", "mcp", "assistant")
+        )
+    if isinstance(value, list):
+        return any(_forbidden_activity(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _forbidden_activity(key) or _forbidden_activity(item) for key, item in value.items()
+        )
+    return False
+
+
+def _launcher_pin() -> OpenCodeHarnessInstancePin:
+    """Fixture-local trusted launcher binding; intentionally absent from ``/doc``."""
+    return OpenCodeHarnessInstancePin(
+        harness_instance_id="fixture-launcher",
+        server_identity="fixture-server",
+        server_incarnation="fixture-incarnation",
+        build_sha256="f" * 64,
+        config_sha256="e" * 64,
+        workspace_scope="fixture-workspace",
+    )
 
 
 class _LoopbackClient:
@@ -484,55 +522,81 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
                 )
             if health.get("healthy") is not True or health.get("version") != settings.version:
                 raise FixtureProtocolError("OpenCode health version does not match its exact pin")
-            document = client.json("GET", "/doc")
-            info = document.get("info")
-            schema_matches = (
-                hashlib.sha256(_canonical_json(document)).hexdigest() == settings.schema_sha256
+            upstream = OpenCodeHttpClient(
+                f"http://127.0.0.1:{port}",
+                client.authorization,
+                OpenCodeServerPin(settings.version, settings.schema_sha256),
+                _launcher_pin(),
+                auth_mode="basic",
+                timeout_seconds=_REQUEST_TIMEOUT,
             )
-            version_matches = isinstance(info, dict) and info.get("version") == settings.version
-            if not version_matches or not schema_matches:
+            try:
+                upstream.verify_contract()
+            except Exception as error:
                 raise FixtureProtocolError(
-                    "OpenCode /doc schema digest does not match its exact pin"
-                )
-            session = client.json("POST", "/session", {"title": "tessera-compatibility-fixture"})
-            session_id = session.get("id")
-            if not isinstance(session_id, str) or not session_id:
-                raise FixtureProtocolError("OpenCode session response lacked an id")
-            message_outcome = "accepted_no_provider_no_tools"
-            message_path = f"/session/{quote(session_id, safe='')}/message"
-            message_status, message_headers, message_body = client.request(
-                "POST",
-                message_path,
-                {
-                    "noReply": True,
-                    "parts": [
-                        {
-                            "type": "text",
-                            "text": "Fixture context only; no model, provider, or tool use.",
-                        }
-                    ],
-                    "tools": {},
-                },
-            )
-            if not 200 <= message_status < 300:
-                if _is_provider_disabled_response(message_status, message_headers, message_body):
-                    message_outcome = "provider_disabled"
-                else:
-                    raise FixtureProtocolError(
-                        f"OpenCode rejected POST {message_path} (HTTP {message_status})"
+                    "OpenCode /doc does not prove the selected real protocol"
+                ) from error
+            if upstream.capabilities is None or not upstream.capabilities.context_append:
+                raise FixtureProtocolError("OpenCode /doc does not prove no-reply context append")
+            session_id = upstream.create_session("compatibility")
+            message_outcome = "context_appended_no_reply"
+            journal = root / "journal"
+            try:
+                with LiveOpenCodeHarnessAdapter(
+                    upstream,
+                    journal,
+                    authority_is_current=lambda *_: True,
+                    context_only_delivery=True,
+                    provider_disabled=True,
+                ) as adapter:
+                    binding = TesseraBinding(
+                        "fixture-org",
+                        "fixture-project",
+                        "fixture-task",
+                        "compatibility",
+                        0,
+                        "fixture-launcher",
+                        "fixture-attempt",
+                        "fixture-operation",
+                        "fixture-attempt-authority",
+                        session_id,
                     )
-            first_events, cursor = client.events()
-            second_events, replay_cursor = client.events(cursor)
-            if replay_cursor == cursor or any(event["id"] == cursor for event in second_events):
+                    adapter.deliver_context_only(
+                        binding, "fixture-delivery", "Fixture context only.", "d" * 64
+                    )
+            except Exception as error:
+                raise FixtureProtocolError(
+                    "OpenCode context delivery was not acknowledged"
+                ) from error
+            first_events = upstream.events(None)
+            if _forbidden_activity([event.data for event in first_events]):
+                raise FixtureProtocolError(
+                    "OpenCode emitted provider, inference, tool, plugin, or MCP activity"
+                )
+            cursor = first_events[-1].cursor if first_events else None
+            if cursor is None:
+                raise FixtureProtocolError("OpenCode event stream ended before an event")
+            if upstream.capabilities.replay is not True:
+                raise FixtureProtocolError("OpenCode /doc does not prove event replay")
+            second_events = upstream.events(cursor)
+            if _forbidden_activity([event.data for event in second_events]):
+                raise FixtureProtocolError(
+                    "OpenCode emitted provider, inference, tool, plugin, or MCP activity"
+                )
+            replay_cursor = second_events[-1].cursor if second_events else cursor
+            if replay_cursor == cursor or any(event.cursor == cursor for event in second_events):
                 raise FixtureProtocolError("OpenCode did not replay beyond the supplied cursor")
             if not any(
-                _event_session_id(event) == session_id for event in (*first_events, *second_events)
+                isinstance(event.data.get("properties"), dict)
+                and event.data["properties"].get("sessionID") == session_id
+                for event in (*first_events, *second_events)
             ):
                 raise FixtureProtocolError("OpenCode events lacked created-session attribution")
-            client.acknowledge("POST", f"/session/{quote(session_id, safe='')}/abort", {})
+            upstream.abort(session_id, "compatibility")
             result = FixtureResult(
                 "passed",
-                "real pinned OpenCode server exercised with providers and tools disabled",
+                "real pinned OpenCode server exercised in provider-disabled configuration; "
+                "no forbidden activity observed",
                 settings.version,
                 settings.schema_sha256,
                 health_checked=True,
@@ -546,6 +610,8 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
                 reconnect_checked=True,
                 cursor_replay_checked=True,
                 session_attribution_checked=True,
+                context_readback_checked=True,
+                activity_checked=True,
             )
         finally:
             if server is not None:
@@ -584,6 +650,8 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
             reconnect_checked=result.reconnect_checked,
             cursor_replay_checked=result.cursor_replay_checked,
             session_attribution_checked=result.session_attribution_checked,
+            context_readback_checked=result.context_readback_checked,
+            activity_checked=result.activity_checked,
             retained_temp_state=retained_temp_state,
         )
     return FixtureResult(
@@ -603,6 +671,8 @@ def run_fixture(settings: FixtureSettings) -> FixtureResult:
         reconnect_checked=result.reconnect_checked,
         cursor_replay_checked=result.cursor_replay_checked,
         session_attribution_checked=result.session_attribution_checked,
+        context_readback_checked=result.context_readback_checked,
+        activity_checked=result.activity_checked,
         retained_temp_state=retained_temp_state,
     )
 

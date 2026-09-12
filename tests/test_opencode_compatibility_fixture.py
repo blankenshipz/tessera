@@ -36,11 +36,35 @@ class ServerFixture:
     """OpenCode-shaped transport fixture; it is not compatibility evidence."""
 
     def __init__(self) -> None:
-        self.document = {"openapi": "3.1.0", "info": {"title": "OpenCode", "version": "1.2.3"}}
+        self.document = {
+            "openapi": "3.1.0",
+            "info": {"title": "OpenCode", "version": "1.2.3"},
+            "security": [{"basicAuth": []}],
+            "components": {"securitySchemes": {"basicAuth": {"type": "http", "scheme": "basic"}}},
+            "paths": {
+                "/session": {"post": {}},
+                "/session/{sessionID}/message": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"noReply": {}, "parts": {}},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/session/{sessionID}/abort": {"post": {}},
+                "/event": {"get": {"parameters": [{"name": "Last-Event-ID", "in": "header"}]}},
+            },
+        }
         self.requests: list[tuple[str, str, str | None]] = []
         self.drop_event_once = False
         self.idless_events = False
-        self.message_response: tuple[int, object | None] = (204, None)
+        self.message_response: tuple[int, object | None] = (200, None)
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -94,7 +118,7 @@ class ServerFixture:
                     (self.command, self.path, self.headers.get("Last-Event-ID"))
                 )
                 length = int(self.headers.get("Content-Length", "0"))
-                _ = self.rfile.read(length)
+                body = json.loads(self.rfile.read(length)) if length else None
                 if not self.authorized():
                     self.send_json(401, {"error": "unauthorized"})
                 elif self.path == "/session":
@@ -102,8 +126,13 @@ class ServerFixture:
                 elif self.path.endswith("/message"):
                     status, response = fixture.message_response
                     if response is None:
-                        self.send_response(status)
-                        self.end_headers()
+                        self.send_json(
+                            status,
+                            {
+                                "info": {"id": "message-1", "sessionID": "real-shaped-session"},
+                                "parts": body["parts"],
+                            },
+                        )
                     else:
                         self.send_json(status, response)
                 elif self.path.endswith("/abort"):
@@ -155,7 +184,7 @@ def test_loopback_transport_covers_auth_schema_session_message_sse_reconnect_and
         assert hashlib.sha256(canonical(document)).hexdigest()
         session = client.json("POST", "/session", {"title": "fixture"})
         client.acknowledge(
-            "POST", f"/session/{session['id']}/message", {"noReply": True, "tools": {}}
+            "POST", f"/session/{session['id']}/message", {"noReply": True, "parts": []}
         )
         first, cursor = client.events()
         second, _ = client.events(cursor)
@@ -230,12 +259,14 @@ def test_full_probe_against_a_local_http_fixture_is_not_real_opencode_evidence(
         result = run_fixture(FixtureSettings(executable, "1.2.3", digest))
 
     assert result.status == "passed"
-    assert result.message == "accepted_no_provider_no_tools"
+    assert result.message == "context_appended_no_reply"
     assert result.sse_events == 2
     assert result.transport_checked is True
     assert result.reconnect_checked is True
     assert result.cursor_replay_checked is True
     assert result.session_attribution_checked is True
+    assert result.context_readback_checked is True
+    assert result.activity_checked is True
     assert result.abort_acknowledged is True
     assert result.cleanup_confirmed is True
     assert environments and "HTTPS_PROXY" not in environments[0]
@@ -244,6 +275,7 @@ def test_full_probe_against_a_local_http_fixture_is_not_real_opencode_evidence(
         "/global/health",
         "/doc",
         "/session",
+        "/doc",
         "/session/real-shaped-session/message",
         "/event",
         "/event",
@@ -316,8 +348,8 @@ def test_only_the_exact_provider_disabled_response_is_classified_as_disabled(
         (
             422,
             {"error": {"code": "provider_disabled", "enabled_providers": []}},
-            "passed",
-            "provider_disabled",
+            "failed",
+            None,
         ),
     ],
 )

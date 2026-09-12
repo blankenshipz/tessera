@@ -20,6 +20,7 @@ from tessera_worker.opencode_harness import (
 )
 from tessera_worker.opencode_http import (
     MAX_SSE_FIELD_BYTES,
+    OpenCodeCapabilities,
     OpenCodeHarnessInstancePin,
     OpenCodeHttpClient,
     OpenCodeHttpError,
@@ -39,12 +40,26 @@ class OpenCodeFixture:
         self.document = {
             "openapi": "3.1.0",
             "info": {"title": "OpenCode", "version": "1.2.3"},
-            "x-tessera-harness-instance": {
-                "server_identity": "server-1",
-                "server_incarnation": "incarnation-1",
-                "build_sha256": "b" * 64,
-                "config_sha256": "c" * 64,
-                "workspace_scope": "workspace-1",
+            "security": [{"bearerAuth": []}],
+            "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
+            "paths": {
+                "/session": {"post": {}},
+                "/session/{sessionID}/message": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"noReply": {}, "parts": {}},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/session/{sessionID}/abort": {"post": {}},
+                "/event": {"get": {"parameters": [{"name": "Last-Event-ID", "in": "header"}]}},
             },
         }
         self.requests: list[tuple[str, str, dict[str, str], object | None]] = []
@@ -55,6 +70,8 @@ class OpenCodeFixture:
         self.drop_next: str | None = None
         self.redirect_doc = False
         self.provider_calls = 0
+        self.authorization = "Bearer fixture-token"
+        self.context_readback: object | None = None
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -71,7 +88,7 @@ class OpenCodeFixture:
                 fixture.requests.append((self.command, self.path, dict(self.headers), body))
 
             def _authorized(self) -> bool:
-                return self.headers.get("Authorization") == "Bearer fixture-token"
+                return self.headers.get("Authorization") == fixture.authorization
 
             def _json(self, status: int, body: object) -> None:
                 encoded = _canonical(body)
@@ -143,8 +160,18 @@ class OpenCodeFixture:
                     fixture.messages.append((self.path.split("/")[2], body))
                     if self._drop_if_configured():
                         return
-                    if self.headers.get("X-Tessera-Operation-ID", "").startswith("delivery_"):
-                        self._json(200, {"id": "upstream-message-1"})
+                    if isinstance(body, dict) and body.get("noReply") is True:
+                        self._json(
+                            200,
+                            fixture.context_readback
+                            or {
+                                "info": {
+                                    "id": "upstream-message-1",
+                                    "sessionID": self.path.split("/")[2],
+                                },
+                                "parts": body["parts"],
+                            },
+                        )
                     else:
                         self._json(200, {})
                     return
@@ -152,8 +179,7 @@ class OpenCodeFixture:
                     fixture.aborts.append(self.path.split("/")[2])
                     if self._drop_if_configured():
                         return
-                    self.send_response(204)
-                    self.end_headers()
+                    self._json(200, True)
                     return
                 self._json(404, {"error": "not found"})
 
@@ -240,6 +266,13 @@ def test_context_only_delivery_has_durable_identity_and_never_resends(tmp_path: 
         replay = adapter.deliver_context_only(bound, "delivery_1", "Human context", "a" * 64)
         assert first == replay and first[0] == "upstream-message-1"
         assert len(upstream.messages) == 1 and upstream.provider_calls == 0
+        assert upstream.messages[0][1] == {
+            "noReply": True, "parts": [{"type": "text", "text": "Human context"}]
+        }
+        assert all(
+            "X-Tessera-Operation-Id" not in headers
+            for _, _, headers, _ in upstream.requests
+        )
         adapter.close()
 
 
@@ -257,6 +290,38 @@ def test_context_only_lost_ack_stays_uncertain_and_is_not_resent(tmp_path: Path)
             adapter.deliver_context_only(bound, "delivery_2", "Human context", "b" * 64)
         assert len(upstream.messages) == 1 and upstream.provider_calls == 0
         adapter.close()
+
+
+@pytest.mark.parametrize(
+    "readback",
+    [
+        {"id": "message-1"},
+        {
+            "info": {"id": "message-1", "sessionID": "foreign-session"},
+            "parts": [{"type": "text", "text": "Human context"}],
+        },
+        {
+            "info": {"id": "message-1", "sessionID": "session-1"},
+            "parts": [{"type": "tool", "text": "Human context"}],
+        },
+    ],
+)
+def test_context_readback_requires_real_info_parts_identity_and_exact_content(
+    tmp_path: Path, readback: object
+) -> None:
+    with fixture() as upstream:
+        upstream.context_readback = readback
+        live = LiveOpenCodeHarnessAdapter(
+            client(upstream),
+            tmp_path / "journal",
+            authority_is_current=lambda *_: True,
+            context_only_delivery=True,
+        )
+        bound = binding().__class__(**(binding().__dict__ | {"session_id": "session-1"}))
+        with pytest.raises(OpenCodeHarnessError, match="uncertain"):
+            live.deliver_context_only(bound, "delivery-readback", "Human context", "a" * 64)
+        assert len(upstream.messages) == 1
+        live.close()
 
 
 class _SseResponse:
@@ -338,6 +403,8 @@ def _stream_client(response: _SseResponse, timeout_seconds: float = 0.1) -> Open
         opener=lambda _request, _timeout: response,
     )
     value._verified = True  # type: ignore[attr-defined]  # Unit transport fixture; no server call.
+    value._routes = {"events": "/event"}  # type: ignore[attr-defined]  # Unit transport fixture.
+    value.capabilities = OpenCodeCapabilities(False, False, False, False, True, False)
     return value
 
 
@@ -403,6 +470,36 @@ def test_auth_exact_version_schema_pin_and_redirect_are_checked_before_session(
         assert all("Cookie" not in headers for _, _, headers, _ in value.requests)
 
 
+def test_selected_basic_or_bearer_auth_must_be_proved_by_the_pinned_document() -> None:
+    with fixture() as value:
+        value.authorization = "Basic Zml4dHVyZTp0b2tlbg=="
+        value.document["security"] = [{"basicAuth": []}]
+        value.document["components"] = {
+            "securitySchemes": {"basicAuth": {"type": "http", "scheme": "basic"}}
+        }
+        basic_pin = OpenCodeServerPin(
+            "1.2.3", hashlib.sha256(_canonical(value.document)).hexdigest()
+        )
+        basic = OpenCodeHttpClient(
+            value.endpoint, value.authorization, basic_pin, instance_pin(), auth_mode="basic"
+        )
+        basic.verify_contract()
+        assert basic.capabilities is not None and basic.capabilities.context_append
+
+        with pytest.raises(ValueError, match="Basic"):
+            OpenCodeHttpClient(
+                value.endpoint,
+                "Bearer fixture-token",
+                basic_pin,
+                instance_pin(),
+                auth_mode="basic",
+            )
+        with pytest.raises(ValueError, match="Bearer"):
+            OpenCodeHttpClient(
+                value.endpoint, value.authorization, basic_pin, instance_pin(), auth_mode="bearer"
+            )
+
+
 def test_live_create_message_is_attributed_journaled_and_has_no_provider_surface(
     tmp_path: Path,
 ) -> None:
@@ -416,9 +513,38 @@ def test_live_create_message_is_attributed_journaled_and_has_no_provider_surface
             ("session-1", {"parts": [{"type": "text", "text": context().message}]})
         ]
         session_request = next(item for item in value.requests if item[1] == "/session")
-        assert session_request[2]["X-Tessera-Operation-Id"] == "operation-1"
+        assert "X-Tessera-Operation-Id" not in session_request[2]
         assert value.provider_calls == 0
         assert not hasattr(client(value), "provider")
+
+
+def test_boolean_true_abort_is_an_acknowledgement_not_termination(tmp_path: Path) -> None:
+    with fixture() as value:
+        live = adapter(value, tmp_path / "journal")
+        live.start(binding(), context())
+        status = live.cancel("operation-1")
+        assert status.abort_acknowledged is True
+        assert status.termination_confirmed is False and status.unresolved is True
+        assert live.effect_outcome("operation-1", "abort") == "acknowledged"
+
+
+def test_provider_disabled_mode_fails_on_observed_provider_or_tool_activity(tmp_path: Path) -> None:
+    with fixture() as value:
+        live = LiveOpenCodeHarnessAdapter(
+            client(value),
+            tmp_path / "journal",
+            authority_is_current=lambda *_: True,
+            context_only_delivery=True,
+            provider_disabled=True,
+        )
+        bound = binding().__class__(**(binding().__dict__ | {"session_id": "session-1"}))
+        live._insert_operation(binding())  # noqa: SLF001 - seed an already-designated fake session.
+        live._set_created(bound)  # noqa: SLF001 - no assistant turn is sent in this context-only test.
+        value.event_batches = [[live_event(0, "session-1", "provider.auth", state="prompt")]]
+        with pytest.raises(OpenCodeHarnessError, match="Provider-disabled"):
+            live.poll("operation-1")
+        assert value.provider_calls == 0
+        live.close()
 
 
 @pytest.mark.parametrize(
@@ -648,7 +774,7 @@ def test_restarted_journal_rechecks_server_incarnation_before_opening_event_stre
         live = adapter(value, journal, http_client=original_client)
         live.start(binding(), context())
         live.close()
-        value.document["x-tessera-harness-instance"]["server_incarnation"] = "incarnation-2"  # type: ignore[index]
+        value.document["info"]["title"] = "Changed OpenCode"  # type: ignore[index]
         restarted = adapter(value, journal, http_client=original_client)
         event_requests_before = len([item for item in value.requests if item[1] == "/event"])
 

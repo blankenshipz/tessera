@@ -1,10 +1,10 @@
 # ruff: noqa: E501
 """Narrow, pinned HTTP/SSE client for one configured OpenCode server.
 
-This is deliberately not an OpenCode SDK.  It can inspect the pinned server
-document and issue only the session create/message/abort and event-stream calls
-used by the Tessera harness boundary.  It has no provider, shell, MCP, cookie,
-proxy, or redirect surface.
+This is deliberately not an OpenCode SDK.  It inspects the pinned upstream
+document and issues only documented session/context/abort/event calls used by
+the Tessera harness boundary.  It has no provider, shell, MCP, cookie, proxy,
+or redirect surface.
 """
 
 # fmt: off
@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -112,9 +112,9 @@ class OpenCodeServerPin:
 class OpenCodeHarnessInstancePin:
     """Approved identity and immutable configuration for one harness instance.
 
-    The server facts are checked against a deliberately required extension in
-    the pinned document.  No current real OpenCode compatibility claim is made
-    for that extension; an upstream that does not provide it fails closed.
+    These are trusted launcher/enrollment facts, not claims made by ``/doc``.
+    The immutable OpenAPI digest separately binds the selected upstream
+    protocol.  Never let an upstream document self-attest a Tessera instance.
     """
 
     harness_instance_id: str
@@ -154,6 +154,21 @@ class OpenCodeSseEvent:
         ).hexdigest()
 
 
+@dataclass(frozen=True)
+class OpenCodeCapabilities:
+    """Capabilities explicitly proved by the selected pinned OpenAPI document."""
+
+    session_create: bool
+    context_append: bool
+    assistant_turn: bool
+    abort: bool
+    events: bool
+    replay: bool
+
+
+_AuthMode = Literal["basic", "bearer"]
+
+
 class OpenCodeHttpClient:
     """Authenticated fixed-route OpenCode server client.
 
@@ -169,11 +184,13 @@ class OpenCodeHttpClient:
         pin: OpenCodeServerPin,
         harness_instance: OpenCodeHarnessInstancePin,
         *,
+        auth_mode: _AuthMode = "bearer",
         timeout_seconds: float = 5.0,
         opener: OpenRequest | None = None,
     ) -> None:
         self.origin = self._origin(endpoint)
-        self._authorization = self._authorization_value(authorization)
+        self.auth_mode = self._auth_mode(auth_mode)
+        self._authorization = self._authorization_value(authorization, self.auth_mode)
         if not isinstance(pin, OpenCodeServerPin):
             raise ValueError("OpenCode endpoint requires an explicit server/schema pin.")
         self.pin = pin
@@ -188,6 +205,8 @@ class OpenCodeHttpClient:
         self.timeout_seconds = float(timeout_seconds)
         self._open = opener or _default_open
         self._verified = False
+        self._routes: dict[str, str] = {}
+        self.capabilities: OpenCodeCapabilities | None = None
 
     @staticmethod
     def _origin(endpoint: str) -> str:
@@ -223,20 +242,27 @@ class OpenCodeHttpClient:
         return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
     @staticmethod
-    def _authorization_value(value: str) -> str:
+    def _auth_mode(value: object) -> _AuthMode:
+        if value not in {"basic", "bearer"}:
+            raise ValueError("OpenCode auth mode must be basic or bearer.")
+        return value
+
+    @staticmethod
+    def _authorization_value(value: str, mode: _AuthMode) -> str:
+        prefix = "Basic " if mode == "basic" else "Bearer "
         if (
             not isinstance(value, str)
-            or not value.startswith("Bearer ")
+            or not value.startswith(prefix)
             or len(value.encode("utf-8")) > _MAX_HEADER_BYTES
             or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
         ):
-            raise ValueError("OpenCode endpoint requires a bounded Bearer authorization value.")
+            raise ValueError(f"OpenCode endpoint requires a bounded {prefix[:-1]} authorization value.")
         try:
             value.encode("ascii")
         except UnicodeEncodeError as error:
             raise ValueError("OpenCode authorization must be ASCII.") from error
-        if not value[7:]:
-            raise ValueError("OpenCode endpoint requires a bounded Bearer authorization value.")
+        if not value[len(prefix) :]:
+            raise ValueError(f"OpenCode endpoint requires a bounded {prefix[:-1]} authorization value.")
         return value
 
     def verify_contract(self) -> None:
@@ -250,20 +276,11 @@ class OpenCodeHttpClient:
         if version != self.pin.server_version or digest != self.pin.schema_sha256:
             raise OpenCodeHttpError("OpenCode server version or schema pin is incompatible")
         try:
-            reported_instance = document["x-tessera-harness-instance"]
-            if not isinstance(reported_instance, dict):
-                raise TypeError
-            for field in (
-                "server_identity",
-                "server_incarnation",
-                "build_sha256",
-                "config_sha256",
-                "workspace_scope",
-            ):
-                if reported_instance[field] != getattr(self.harness_instance, field):
-                    raise ValueError
-        except (KeyError, TypeError, ValueError):
-            raise OpenCodeHttpError("OpenCode harness instance is incompatible") from None
+            routes, capabilities = self._document_contract(document)
+        except ValueError as error:
+            raise OpenCodeHttpError("OpenCode document lacks the selected protocol contract") from error
+        self._routes = routes
+        self.capabilities = capabilities
         self._verified = True
 
     def create_session(self, operation_id: str) -> str:
@@ -271,7 +288,7 @@ class OpenCodeHttpClient:
         self._identifier(operation_id, "operation_id")
         response = self._json(
             "POST",
-            "/session",
+            self._route("session_create"),
             {"title": f"tessera-{operation_id}"},
             expect_json=True,
             operation_id=operation_id,
@@ -293,9 +310,10 @@ class OpenCodeHttpClient:
         self._identifier(operation_id, "operation_id")
         if not isinstance(message, str) or not message.strip():
             raise ValueError("OpenCode message must be non-empty text.")
+        self._require_capability("assistant_turn")
         self._json(
             "POST",
-            f"/session/{session_id}/message",
+            self._session_route("assistant_turn", session_id),
             {"parts": [{"type": "text", "text": message}]},
             expect_json=False,
             operation_id=operation_id,
@@ -313,13 +331,18 @@ class OpenCodeHttpClient:
         self._identifier(delivery_id, "delivery_id")
         if not isinstance(message, str) or not message.strip():
             raise ValueError("OpenCode message must be non-empty text.")
+        self._require_capability("context_append")
+        parts: list[dict[str, str]] = [{"type": "text", "text": message}]
         response = self._json(
-            "POST", f"/session/{session_id}/message", {"parts": [{"type": "text", "text": message}]},
+            "POST", self._session_route("context_append", session_id), {"noReply": True, "parts": parts},
             expect_json=True, operation_id=delivery_id,
         )
-        message_id = response.get("id")
-        if not isinstance(message_id, str):
-            raise OpenCodeHttpError("OpenCode message readback lacks an identity")
+        info, returned_parts = response.get("info"), response.get("parts")
+        if not isinstance(info, dict) or returned_parts != parts:
+            raise OpenCodeHttpError("OpenCode context readback lacks the exact submitted content")
+        message_id = info.get("id")
+        if info.get("sessionID") != session_id or not isinstance(message_id, str):
+            raise OpenCodeHttpError("OpenCode context readback lacks the designated message identity")
         self._identifier(message_id, "upstream_message_id")
         return response
 
@@ -327,18 +350,22 @@ class OpenCodeHttpClient:
         self._require_verified()
         self._identifier(session_id, "session_id")
         self._identifier(operation_id, "operation_id")
-        self._json(
-            "POST", f"/session/{session_id}/abort", {}, expect_json=False, operation_id=operation_id
+        self._require_capability("abort")
+        response = self._json_value(
+            "POST", self._session_route("abort", session_id), {}, operation_id=operation_id
         )
+        if response not in ({}, True):
+            raise OpenCodeHttpError("OpenCode abort acknowledgement is not accepted")
 
     def events(self, after_cursor: int | None) -> list[OpenCodeSseEvent]:
         """Read one bounded SSE response, closing it before a reconnect attempt."""
         self._require_verified()
+        self._require_capability("events")
         if after_cursor is not None and (type(after_cursor) is not int or after_cursor < 0):
             raise ValueError("OpenCode replay cursor must be a non-negative integer.")
         request = self._request(
             "GET",
-            "/event",
+            self._route("events"),
             None,
             {
                 "Accept": "text/event-stream",
@@ -402,6 +429,28 @@ class OpenCodeHttpClient:
         finally:
             _close_quietly(response)
 
+    def _json_value(
+        self, method: str, path: str, body: dict[str, object] | None, *, operation_id: str | None = None
+    ) -> object:
+        """Read the two real abort acknowledgement forms: empty or JSON true."""
+        request = self._request(method, path, body, {}, operation_id)
+        deadline = time.monotonic() + self.timeout_seconds
+        response = self._open_response(request, deadline)
+        try:
+            status = response.getcode()
+            if not isinstance(status, int) or not 200 <= status < 300:
+                raise OpenCodeHttpError("OpenCode rejected request", status)
+            encoded = self._read_bounded_response(response, MAX_RESPONSE_BYTES, deadline)
+            if not encoded:
+                return {}
+            return json.loads(encoded.decode("utf-8"), parse_constant=_json_constant)
+        except OpenCodeHttpError:
+            raise
+        except (OSError, ValueError, AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            raise OpenCodeHttpError("OpenCode transport unavailable") from None
+        finally:
+            _close_quietly(response)
+
     def _request(
         self,
         method: str,
@@ -416,8 +465,8 @@ class OpenCodeHttpClient:
         headers = {"Accept": "application/json", "Authorization": self._authorization}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        if operation_id is not None:
-            headers["X-Tessera-Operation-ID"] = operation_id
+        # ``operation_id`` is local journaling metadata.  Do not invent an
+        # upstream header that a selected OpenCode contract did not specify.
         headers.update(extra_headers)
         return Request(f"{self.origin}{path}", data=data, headers=headers, method=method)
 
@@ -613,6 +662,96 @@ class OpenCodeHttpClient:
     def _require_verified(self) -> None:
         if not self._verified:
             raise OpenCodeHttpError("OpenCode server/schema pin has not been verified")
+
+    def _route(self, capability: str) -> str:
+        try:
+            return self._routes[capability]
+        except KeyError as error:
+            raise OpenCodeHttpError("OpenCode capability is not available") from error
+
+    def _session_route(self, capability: str, session_id: str) -> str:
+        route = self._route(capability)
+        return re.sub(r"\{[^{}]+\}", session_id, route)
+
+    def _require_capability(self, capability: str) -> None:
+        if not self._verified or self.capabilities is None or not getattr(self.capabilities, capability):
+            raise OpenCodeHttpError(f"OpenCode {capability.replace('_', ' ')} capability is unavailable")
+
+    def _document_contract(
+        self, document: dict[str, object]
+    ) -> tuple[dict[str, str], OpenCodeCapabilities]:
+        if not self._auth_is_proved(document):
+            raise ValueError("selected authentication mode is not proved by /doc")
+        paths = document.get("paths")
+        if not isinstance(paths, dict):
+            raise ValueError("paths missing")
+
+        def post_path(pattern: str) -> str | None:
+            for path, operation in paths.items():
+                if isinstance(path, str) and re.fullmatch(pattern, path) and isinstance(operation, dict) and isinstance(operation.get("post"), dict):
+                    return path
+            return None
+
+        session = post_path(r"/session")
+        message = post_path(r"/session/\{[^{}]+\}/message")
+        abort = post_path(r"/session/\{[^{}]+\}/abort")
+        events = "/event" if isinstance(paths.get("/event"), dict) and isinstance(paths["/event"].get("get"), dict) else None
+        if session is None or message is None:
+            raise ValueError("session/context route missing")
+        message_operation = paths[message]["post"]
+        assert isinstance(message_operation, dict)
+        context_append = self._schema_has_properties(document, message_operation, {"noReply", "parts"})
+        replay = events is not None and self._operation_has_parameter(paths["/event"]["get"], "Last-Event-ID")
+        routes = {"session_create": session, "assistant_turn": message}
+        if context_append:
+            routes["context_append"] = message
+        if abort is not None:
+            routes["abort"] = abort
+        if events is not None:
+            routes["events"] = events
+        return routes, OpenCodeCapabilities(
+            session_create=True, context_append=context_append, assistant_turn=True,
+            abort=abort is not None, events=events is not None, replay=replay,
+        )
+
+    def _auth_is_proved(self, document: dict[str, object]) -> bool:
+        components = document.get("components")
+        schemes = components.get("securitySchemes") if isinstance(components, dict) else None
+        if not isinstance(schemes, dict):
+            return False
+        expected = "basic" if self.auth_mode == "basic" else "bearer"
+        names = [
+            name for name, definition in schemes.items()
+            if isinstance(name, str) and isinstance(definition, dict)
+            and definition.get("type") == "http" and str(definition.get("scheme", "")).lower() == expected
+        ]
+        security = document.get("security")
+        return isinstance(security, list) and any(
+            isinstance(requirement, dict) and any(name in requirement for name in names)
+            for requirement in security
+        )
+
+    @staticmethod
+    def _operation_has_parameter(operation: object, name: str) -> bool:
+        return isinstance(operation, dict) and any(
+            isinstance(parameter, dict) and parameter.get("name") == name and parameter.get("in") == "header"
+            for parameter in operation.get("parameters", []) if isinstance(operation.get("parameters", []), list)
+        )
+
+    @staticmethod
+    def _schema_has_properties(document: dict[str, object], operation: dict[str, object], required: set[str]) -> bool:
+        try:
+            schema = operation["requestBody"]["content"]["application/json"]["schema"]
+        except (KeyError, TypeError):
+            return False
+        if not isinstance(schema, dict):
+            return False
+        reference = schema.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/components/schemas/"):
+            components = document.get("components")
+            schemas = components.get("schemas") if isinstance(components, dict) else None
+            schema = schemas.get(reference.rsplit("/", 1)[1]) if isinstance(schemas, dict) else None
+        return isinstance(schema, dict) and required <= set(schema.get("properties", {}))
 
     @staticmethod
     def _identifier(value: object, field: str) -> None:

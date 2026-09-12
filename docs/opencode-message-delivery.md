@@ -16,10 +16,14 @@ State history is append-only: `queued`, `delivered`, then `acknowledged`,
 
 The worker uses `LiveOpenCodeHarnessAdapter.deliver_context_only` only when its
 explicit context-only mode is enabled. That narrow path verifies the pinned
-HTTP schema and harness instance, sends only the human context to the designated
-session, and keeps a private local intent/readback journal. It has no provider,
-model inference, tool, permission, MCP, Kubernetes credential, dispatch, or
-approval path. Cancellation is a control-plane fence and does not wait for
+HTTP schema and a trusted launcher-bound harness instance, sends the documented
+`{"noReply":true,"parts":[...]}` request only to the designated session, validates
+the upstream `{info,parts}` session/message identity and exact submitted parts,
+and keeps a private local intent/readback journal. It has no provider, model
+inference, tool, permission, MCP, Kubernetes credential, dispatch, or approval
+path. A visible provider, inference, tool, plugin, MCP, or assistant activity
+fails provider-disabled mode; lack of a `/provider` request does not prove no
+inference. Cancellation is a control-plane fence and does not wait for
 OpenCode health or imply upstream session/provider termination.
 
 Existing `POST /interaction/messages` conversations remain legacy messages;

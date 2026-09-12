@@ -58,9 +58,10 @@ response. It verifies both before session mutation and before each independently
 opened event stream. The endpoint must use
 TLS, unless it is a literal `127.0.0.1` or `[::1]` HTTP origin; endpoint paths,
 credentials in URLs, redirects, proxy environment settings, cookies, and general
-OpenCode routes are rejected or unavailable. The endpoint authorization value is
-an endpoint-only Bearer header, never a message part, journal value, or provider
-credential.
+OpenCode routes are rejected or unavailable. The endpoint authentication mode is
+explicitly HTTP Basic or Bearer, and the pinned document must prove the selected
+OpenAPI security scheme. The endpoint authorization value is never a message
+part, journal value, or provider credential.
 
 The client exposes only `POST /session`, `POST /session/{id}/message`, `POST
 /session/{id}/abort`, and `GET /event` after the pinned `/doc` inspection. It
@@ -83,20 +84,25 @@ harness-instance ID, server identity/incarnation, build/version/schema/config
 digests, and an opaque workspace scope. A session identity cannot bind more than
 one operation. On restart, a changed local endpoint, pin, instance, build,
 configuration, or workspace scope rejects polling, cursor acknowledgement, and
-abort before any upstream request or local mutation. The pinned `/doc` fixture
-also carries the expected server identity/incarnation/build/config/workspace
-extension; a changed server document fails contract inspection before an event
-stream or upstream mutation. This extension is a synthetic seam requirement, not a claim
-that a current real OpenCode release supports it.
+abort before any upstream request or local mutation. Trusted launcher/enrollment
+data—not upstream `/doc` self-claims—binds the server identity/incarnation/build/
+config/workspace facts. `/doc` supplies only the exact pinned protocol digest and
+version, and must prove separately declared session-create, no-reply context-
+append, assistant-turn, abort, event, and replay capabilities.
 
-The journal persists create/message/abort intent before the outbound call and
+The journal persists create/context-append/abort intent before the outbound call and
 leaves a lost reply `uncertain`; a restart cannot create a second operation
 identity. A supervisor authority callback fails closed before contract
 inspection, create, message, abort, and event-stream calls. Abort acknowledgement
 remains only an OpenCode acknowledgement: provider termination, costs, output
 acceptance, and scientific success remain unresolved. The fixture prohibits
 provider routes and does not enable OpenCode shell, MCP, skills, permissions,
-provider authentication, or model calls.
+provider authentication, or model calls. Context append sends exactly
+`{"noReply":true,"parts":[...]}` and accepts only an upstream `{info,parts}`
+readback whose message/session identity and parts exactly match. JSON boolean
+`true` is an accepted abort acknowledgement. Provider-disabled mode fails on any
+observed provider, inference, tool, plugin, MCP, or assistant activity; an absent
+`/provider` request is not evidence that inference did not occur.
 
 ## Opt-in real-server compatibility fixture
 
@@ -122,7 +128,8 @@ and starts no replacement or duplicate process.
 
 On a compatible server it verifies unauthenticated health is rejected, then
 checks `/global/health` and `/doc` against the exact version/schema pin, creates
-a session, attempts one `noReply` no-model/no-tool context message, and separately
+a session, delivers one no-reply context message through the same narrow HTTP
+client and `LiveOpenCodeHarnessAdapter` path, and separately
 records transport, reconnect, replay-cursor, and created-session-attribution
 claims for actual `/event` SSE observations. An id-less event, a reconnect that
 does not advance beyond the supplied cursor, or an event not attributed to the
@@ -132,11 +139,13 @@ read has a five-second deadline, no blocked socket read exceeds three seconds,
 and the stream has a 32 KiB total bound; failures report whether cleanup was
 confirmed. Cleanup sends TERM then KILL to the process group (including its main
 process); if termination remains uncertain, it retains and reports the private
-temporary state for reconciliation rather than deleting it. A message
-rejection is reported as `provider_disabled` only for the fixture's exact JSON
-`422 {"error":{"code":"provider_disabled","enabled_providers":[]}}`
-response. Authentication, route, request-schema, content-type, and every other
-response fail rather than being inferred as provider-disabled. It confirms that
+temporary state for reconciliation rather than deleting it. A message rejection,
+including a provider-disabled-looking response, fails context delivery rather than
+being mistaken for acknowledgement. The fixture records only that its
+provider-disabled configuration produced no *observed* forbidden activity; it
+cannot infer no hidden inference from an absent `/provider` route/call.
+Authentication, route, request-schema, content-type, and every other response
+fail rather than being inferred as provider-disabled. It confirms that
 the server process group has exited, including ordinary descendants in that
 group, before it returns `passed`; failed or uncertain cleanup returns `failed`
 with a nonzero CLI exit. This does not detect descendants that deliberately leave

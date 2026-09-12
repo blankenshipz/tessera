@@ -272,6 +272,10 @@ representative investigation have not passed end-to-end acceptance.
 
     **Local HTTP/SSE seam:** a second narrow client only reaches one authenticated
     configured endpoint after exact version and canonical `/doc` digest pinning.
+    It selects/proves only Basic or Bearer HTTP authentication, keeps trusted
+    launcher binding separate from `/doc` self-claims, and exposes separately
+    proved session-create, context-append, assistant-turn, abort, event, and
+    replay capabilities.
     It rejects non-TLS non-literal-loopback origins, redirects, proxies, cookies,
     unbounded bodies/events, and all routes except session create/message/abort and
     events. A private local journal preserves uncertain create/message/abort
@@ -280,8 +284,9 @@ representative investigation have not passed end-to-end acceptance.
     endpoint, server identity/incarnation, approved build/schema/config digests,
     and opaque workspace scope; restart rejects changed local pins before polling
     or mutation. In-process HTTP fixtures cover authentication/version/schema,
-    instance reconfiguration/incarnation, redirects, revocation during setup, lost
-    replies, reconnect/gaps, unknown and bounded events, and provider-route non-use.
+    launcher reconfiguration, redirects, revocation during setup, lost replies,
+    reconnect/gaps, missing/foreign readbacks, Boolean abort acknowledgement,
+    unknown and bounded events, and observed provider/tool activity.
     It has no selected real OpenCode
     server compatibility result, enrolled-node integration, provider/model call,
     credential handoff, dispatch, artifact/result acceptance, or pilot completion.
@@ -291,13 +296,17 @@ representative investigation have not passed end-to-end acceptance.
     version, and canonical `/doc` hash are supplied. It isolates HOME/config/
     workspace, removes inherited proxy/provider/OpenCode state, enables only
     generated Basic test authentication, denies tools and providers, checks
-    health/schema/auth/session/no-reply context/SSE reconnect/abort, and confirms
+    health/schema/auth/session/no-reply `{info,parts}` context/SSE reconnect/abort,
+    and confirms
     its process group has exited before reporting a pass. Its full local HTTP-double
     test is fixture behavior only, not a real-server result. No opt-in is `skipped`;
     incomplete or unusable pins are `unavailable`; protocol and cleanup uncertainty
     are `failed`, all with nonzero exits except a clean `passed` result. Only the
-    fixture's exact validated `422` provider-disabled response is an expected
-    no-provider case; authentication, route, or schema failures are not. Synthetic
+    fixture must acknowledge context delivery; no response, including a
+    provider-disabled-looking `422`, is a successful delivery. It fails on observed
+    provider/inference/tool/plugin/MCP activity and does not infer no inference from
+    an absent `/provider` call. Authentication, route, or schema failures are not.
+    Synthetic
     transport tests cover response classification, lost response/reconnect and
     cleanup, but no real pinned executable has been selected or recorded in this
     repository, so this is not yet real compatibility evidence or a provider-enabled
