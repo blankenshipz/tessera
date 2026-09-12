@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 37
+LATEST_SCHEMA_VERSION = 38
 LOCAL_ORG_ID = "org_local"
 
 
@@ -691,6 +691,23 @@ def migrate_v36_to_v37(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 37 WHERE singleton = 1")
 
 
+def migrate_v37_to_v38(connection: sqlite3.Connection) -> None:
+    """Fence new delivery claims to their original operation/grant/lease tuple.
+
+    Existing v37 delivery rows intentionally remain NULL and unclaimable: their
+    complete lease association was never recorded and must not be reconstructed.
+    """
+    for column, definition in (
+        ("operation_id", "TEXT REFERENCES external_operations(operation_id)"),
+        ("grant_id", "TEXT REFERENCES execution_grants(id)"),
+        ("lease_id", "TEXT REFERENCES execution_leases(id)"),
+    ):
+        connection.execute(
+            f"ALTER TABLE interaction_message_deliveries ADD COLUMN {column} {definition}"
+        )
+    connection.execute("UPDATE schema_meta SET schema_version = 38 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -728,6 +745,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     34: migrate_v34_to_v35,
     35: migrate_v35_to_v36,
     36: migrate_v36_to_v37,
+    37: migrate_v37_to_v38,
 }
 
 

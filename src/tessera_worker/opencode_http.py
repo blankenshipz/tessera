@@ -96,16 +96,55 @@ def _canonical_json(value: object) -> bytes:
 
 @dataclass(frozen=True)
 class OpenCodeServerPin:
-    """Exact version and canonical OpenAPI document digest for one server schema."""
+    """Release/build and API-document facts for one selected server.
 
-    server_version: str
+    Release identity and the ``/doc`` API schema identity are deliberately
+    separate.  Omitted optional facts mark a legacy synthetic fixture, not a
+    v1.18.30 compatibility assertion.
+    """
+
+    release_version: str
     schema_sha256: str
+    api_schema_version: str | None = None
+    release_commit: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.server_version, str) or not _VERSION.fullmatch(self.server_version):
-            raise ValueError("OpenCode server_version must be an exact semantic version.")
+        if not isinstance(self.release_version, str) or not _VERSION.fullmatch(self.release_version):
+            raise ValueError("OpenCode release_version must be an exact semantic version.")
         if not isinstance(self.schema_sha256, str) or not _SHA256.fullmatch(self.schema_sha256):
             raise ValueError("OpenCode schema_sha256 must be a lowercase SHA-256 digest.")
+        if self.api_schema_version is not None and (
+            not isinstance(self.api_schema_version, str) or not self.api_schema_version
+        ):
+            raise ValueError("OpenCode api_schema_version must be a bounded non-empty string.")
+        if self.release_commit is not None and (
+            not isinstance(self.release_commit, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", self.release_commit)
+        ):
+            raise ValueError("OpenCode release_commit must be a lowercase 40-character commit.")
+
+    @property
+    def server_version(self) -> str:
+        """Compatibility spelling for old synthetic callers."""
+        return self.release_version
+
+
+@dataclass(frozen=True)
+class OpenCodeAdapterProfile:
+    """Adapter behavior, separate from upstream and launcher identity."""
+
+    profile_id: str
+    event_contract: Literal["legacy_numeric_replay", "opaque_reconnect"]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile_id, str) or not _IDENTIFIER.fullmatch(self.profile_id):
+            raise ValueError("OpenCode adapter profile must be a bounded identifier.")
+
+
+LEGACY_SYNTHETIC_PROFILE = OpenCodeAdapterProfile("legacy-synthetic-v1", "legacy_numeric_replay")
+OPENCODE_V1_18_30_CONTEXT_PROFILE = OpenCodeAdapterProfile(
+    "opencode-v1.18.30-context-only", "opaque_reconnect"
+)
 
 
 @dataclass(frozen=True)
@@ -144,13 +183,20 @@ class OpenCodeHarnessInstancePin:
 class OpenCodeSseEvent:
     """One bounded event from the schema-pinned SSE route."""
 
-    cursor: int
+    upstream_event_id: str | None
     event_name: str
     data: dict[str, object]
 
+    @property
+    def cursor(self) -> int:
+        """Legacy fixture-only numeric cursor compatibility."""
+        if self.upstream_event_id is None or not self.upstream_event_id.isdecimal():
+            raise ValueError("OpenCode upstream event ID is opaque, not a replay cursor.")
+        return int(self.upstream_event_id)
+
     def fingerprint(self) -> str:
         return hashlib.sha256(
-            _canonical_json({"cursor": self.cursor, "event": self.event_name, "data": self.data})
+            _canonical_json({"id": self.upstream_event_id, "event": self.event_name, "data": self.data})
         ).hexdigest()
 
 
@@ -166,7 +212,7 @@ class OpenCodeCapabilities:
     replay: bool
 
 
-_AuthMode = Literal["basic", "bearer"]
+_AuthMode = Literal["basic", "bearer", "none"]
 
 
 class OpenCodeHttpClient:
@@ -185,6 +231,7 @@ class OpenCodeHttpClient:
         harness_instance: OpenCodeHarnessInstancePin,
         *,
         auth_mode: _AuthMode = "bearer",
+        adapter_profile: OpenCodeAdapterProfile = LEGACY_SYNTHETIC_PROFILE,
         timeout_seconds: float = 5.0,
         opener: OpenRequest | None = None,
     ) -> None:
@@ -197,6 +244,14 @@ class OpenCodeHttpClient:
         if not isinstance(harness_instance, OpenCodeHarnessInstancePin):
             raise ValueError("OpenCode endpoint requires an approved harness-instance pin.")
         self.harness_instance = harness_instance
+        if not isinstance(adapter_profile, OpenCodeAdapterProfile):
+            raise ValueError("OpenCode endpoint requires an explicit adapter profile.")
+        if adapter_profile == OPENCODE_V1_18_30_CONTEXT_PROFILE and (
+            pin.release_version != "1.18.30"
+            or pin.release_commit != "3104c1428ec91f809e5ab86631300de41eb6952e"
+        ):
+            raise ValueError("The v1.18.30 adapter profile requires its exact inspected release/build pin.")
+        self.adapter_profile = adapter_profile
         if (
             type(timeout_seconds) not in {int, float}
             or not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS
@@ -243,12 +298,16 @@ class OpenCodeHttpClient:
 
     @staticmethod
     def _auth_mode(value: object) -> _AuthMode:
-        if value not in {"basic", "bearer"}:
-            raise ValueError("OpenCode auth mode must be basic or bearer.")
+        if value not in {"basic", "bearer", "none"}:
+            raise ValueError("OpenCode auth mode must be basic, bearer, or explicit none.")
         return value
 
     @staticmethod
     def _authorization_value(value: str, mode: _AuthMode) -> str:
+        if mode == "none":
+            if value != "":
+                raise ValueError("OpenCode unauthenticated mode requires an empty authorization value.")
+            return ""
         prefix = "Basic " if mode == "basic" else "Bearer "
         if (
             not isinstance(value, str)
@@ -273,7 +332,8 @@ class OpenCodeHttpClient:
             version = document["info"]["version"]
         except (KeyError, TypeError) as error:
             raise OpenCodeHttpError("OpenCode schema lacks an exact server version") from error
-        if version != self.pin.server_version or digest != self.pin.schema_sha256:
+        expected_schema_version = self.pin.api_schema_version or self.pin.release_version
+        if version != expected_schema_version or digest != self.pin.schema_sha256:
             raise OpenCodeHttpError("OpenCode server version or schema pin is incompatible")
         try:
             routes, capabilities = self._document_contract(document)
@@ -338,10 +398,19 @@ class OpenCodeHttpClient:
             expect_json=True, operation_id=delivery_id,
         )
         info, returned_parts = response.get("info"), response.get("parts")
-        if not isinstance(info, dict) or returned_parts != parts:
+        if not isinstance(info, dict) or not isinstance(returned_parts, list) or len(returned_parts) != 1:
             raise OpenCodeHttpError("OpenCode context readback lacks the exact submitted content")
-        message_id = info.get("id")
-        if info.get("sessionID") != session_id or not isinstance(message_id, str):
+        message_id, returned = info.get("id"), returned_parts[0]
+        if (
+            info.get("sessionID") != session_id
+            or info.get("role") not in {None, "user"}
+            or not isinstance(message_id, str)
+            or not isinstance(returned, dict)
+            or returned.get("type") != "text"
+            or returned.get("text") != message
+            or (returned.get("sessionID") is not None and returned.get("sessionID") != session_id)
+            or (returned.get("messageID") is not None and returned.get("messageID") != message_id)
+        ):
             raise OpenCodeHttpError("OpenCode context readback lacks the designated message identity")
         self._identifier(message_id, "upstream_message_id")
         return response
@@ -357,19 +426,26 @@ class OpenCodeHttpClient:
         if response not in ({}, True):
             raise OpenCodeHttpError("OpenCode abort acknowledgement is not accepted")
 
-    def events(self, after_cursor: int | None) -> list[OpenCodeSseEvent]:
+    def events(self, after_cursor: int | None = None) -> list[OpenCodeSseEvent]:
         """Read one bounded SSE response, closing it before a reconnect attempt."""
         self._require_verified()
         self._require_capability("events")
         if after_cursor is not None and (type(after_cursor) is not int or after_cursor < 0):
             raise ValueError("OpenCode replay cursor must be a non-negative integer.")
+        if after_cursor is not None and self.adapter_profile.event_contract != "legacy_numeric_replay":
+            raise OpenCodeHttpError("OpenCode profile does not prove upstream event replay")
         request = self._request(
             "GET",
             self._route("events"),
             None,
             {
                 "Accept": "text/event-stream",
-                **({"Last-Event-ID": str(after_cursor)} if after_cursor is not None else {}),
+                **(
+                    {"Last-Event-ID": str(after_cursor)}
+                    if after_cursor is not None
+                    and self.adapter_profile.event_contract == "legacy_numeric_replay"
+                    else {}
+                ),
             },
         )
         deadline = time.monotonic() + self.timeout_seconds
@@ -462,7 +538,9 @@ class OpenCodeHttpClient:
         data = None if body is None else _canonical_json(body)
         if data is not None and len(data) > MAX_REQUEST_BYTES:
             raise ValueError("OpenCode request exceeds its bound.")
-        headers = {"Accept": "application/json", "Authorization": self._authorization}
+        headers = {"Accept": "application/json"}
+        if self.auth_mode != "none":
+            headers["Authorization"] = self._authorization
         if data is not None:
             headers["Content-Type"] = "application/json"
         # ``operation_id`` is local journaling metadata.  Do not invent an
@@ -640,24 +718,28 @@ class OpenCodeHttpClient:
             raise OpenCodeHttpError("OpenCode event stream is malformed")
         return result[0]
 
-    @staticmethod
-    def _sse_event(fields: Mapping[str, list[str]]) -> OpenCodeSseEvent:
+    def _sse_event(self, fields: Mapping[str, list[str]]) -> OpenCodeSseEvent:
         try:
-            cursor_text = "".join(fields["id"])
             event_name = "".join(fields["event"])
             data = json.loads("\n".join(fields["data"]), parse_constant=_json_constant)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError, RecursionError):
             raise OpenCodeHttpError("OpenCode event is malformed") from None
-        if not cursor_text.isascii() or not cursor_text.isdecimal():
-            raise OpenCodeHttpError("OpenCode event cursor is malformed")
-        cursor = int(cursor_text)
+        upstream_event_id = "".join(fields.get("id", [])) or None
+        if upstream_event_id is not None and (
+            len(upstream_event_id.encode("utf-8")) > 512
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in upstream_event_id)
+        ):
+            raise OpenCodeHttpError("OpenCode event id is malformed")
+        if self.adapter_profile.event_contract == "legacy_numeric_replay" and (
+            upstream_event_id is None or not upstream_event_id.isdecimal()
+        ):
+            raise OpenCodeHttpError("OpenCode legacy event cursor is malformed")
         if (
-            cursor > 2**63 - 1
-            or not _IDENTIFIER.fullmatch(event_name)
+            not _IDENTIFIER.fullmatch(event_name)
             or not isinstance(data, dict)
         ):
             raise OpenCodeHttpError("OpenCode event is malformed")
-        return OpenCodeSseEvent(cursor, event_name, data)
+        return OpenCodeSseEvent(upstream_event_id, event_name, data)
 
     def _require_verified(self) -> None:
         if not self._verified:
@@ -701,7 +783,11 @@ class OpenCodeHttpClient:
         message_operation = paths[message]["post"]
         assert isinstance(message_operation, dict)
         context_append = self._schema_has_properties(document, message_operation, {"noReply", "parts"})
-        replay = events is not None and self._operation_has_parameter(paths["/event"]["get"], "Last-Event-ID")
+        replay = (
+            self.adapter_profile.event_contract == "legacy_numeric_replay"
+            and events is not None
+            and self._operation_has_parameter(paths["/event"]["get"], "Last-Event-ID")
+        )
         routes = {"session_create": session, "assistant_turn": message}
         if context_append:
             routes["context_append"] = message
@@ -715,6 +801,8 @@ class OpenCodeHttpClient:
         )
 
     def _auth_is_proved(self, document: dict[str, object]) -> bool:
+        if self.auth_mode == "none":
+            return document.get("security") in (None, [])
         components = document.get("components")
         schemes = components.get("securitySchemes") if isinstance(components, dict) else None
         if not isinstance(schemes, dict):

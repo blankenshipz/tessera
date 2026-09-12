@@ -36,6 +36,7 @@ _KNOWN_EVENT_TYPES = frozenset(
     {"session.created", "session.updated", "session.status", "session.idle", "session.error"}
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _FORBIDDEN_PROVIDER_ACTIVITY = re.compile(r"(?:provider|inference|tool|plugin|mcp|assistant)", re.I)
 
 
@@ -80,6 +81,13 @@ class LiveOpenCodeHarnessAdapter:
 
     def start(self, binding: TesseraBinding, context: BoundedPlanMessage) -> TesseraBinding:
         """Verify the pin, then create and message exactly one operation session."""
+        if self._provider_disabled:
+            # v1.18.30's normal prompt route is an assistant-turn API even when
+            # it accepts ``noReply``.  Context-only delivery must target a
+            # previously designated session; never create or start a turn here.
+            raise OpenCodeHarnessError(
+                "Provider-disabled OpenCode mode rejects session start and assistant turns."
+            )
         if binding.session_id is not None:
             raise OpenCodeHarnessError("A new operation cannot supply a session identity.")
         if self._operation(binding.operation_id) is not None:
@@ -152,6 +160,8 @@ class LiveOpenCodeHarnessAdapter:
         pending = self._drain_routed(binding)
         if pending:
             return pending
+        if self._client.adapter_profile.event_contract == "opaque_reconnect":
+            return self._poll_opaque(binding)
         after_cursor = self._stream_replay_cursor()
         try:
             events = self._client.events(after_cursor)
@@ -180,6 +190,9 @@ class LiveOpenCodeHarnessAdapter:
             raise ValueError("OpenCode acknowledgement cursor must be a non-negative integer.")
         row = self._required_operation(operation_id)
         self._require_stored_instance_binding(row)
+        if self._client.adapter_profile.event_contract == "opaque_reconnect":
+            self._acknowledge_opaque(row, cursor)
+            return
         high_water = row[13]
         if high_water is not None and cursor <= high_water:
             return
@@ -272,35 +285,39 @@ class LiveOpenCodeHarnessAdapter:
             raise ValueError("OpenCode delivery identity is invalid.")
         if not isinstance(context_digest, str) or not _SHA256.fullmatch(context_digest):
             raise ValueError("OpenCode context digest is invalid.")
-        if not isinstance(message, str) or not message.strip():
+        if not isinstance(message, str) or not message.strip() or len(message.encode()) > 8 * 1024:
             raise ValueError("OpenCode message is invalid.")
         self._require_instance_binding(binding)
+        message_digest = hashlib.sha256(message.encode()).hexdigest()
+        binding_digest = hashlib.sha256(
+            json.dumps(binding.__dict__, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         existing = self._connection.execute(
-            "SELECT session_id,context_digest,outcome,upstream_message_id,readback_digest FROM message_deliveries WHERE delivery_id=?",
+            "SELECT session_id,context_digest,message_digest,binding_digest,outcome,upstream_message_id,readback_digest FROM message_deliveries WHERE delivery_id=?",
             (delivery_id,),
         ).fetchone()
         if existing is not None:
-            if existing[0] != binding.session_id or existing[1] != context_digest:
+            if (
+                existing[0] != binding.session_id or existing[1] != context_digest
+                or existing[2] != message_digest or existing[3] != binding_digest
+            ):
                 raise OpenCodeHarnessError("OpenCode delivery identity conflicts with its durable context.")
-            if existing[2] == "acknowledged":
-                return existing[3], existing[4]
+            if existing[4] == "acknowledged":
+                return existing[5], existing[6]
             raise OpenCodeHarnessError("OpenCode delivery is uncertain; reconcile it.")
         self._require_authority(binding, "message")
         self._connection.execute(
             """INSERT INTO message_deliveries
-            (delivery_id,operation_id,session_id,context_digest,outcome,upstream_message_id,readback_digest)
-            VALUES (?,?,?,?, 'pending',NULL,NULL)""",
-            (delivery_id, binding.operation_id, binding.session_id, context_digest),
+            (delivery_id,operation_id,session_id,context_digest,message_digest,binding_digest,outcome,upstream_message_id,readback_digest)
+            VALUES (?,?,?,?,?,?, 'pending',NULL,NULL)""",
+            (delivery_id, binding.operation_id, binding.session_id, context_digest, message_digest, binding_digest),
         )
         self._connection.commit()
         try:
             self._client.verify_contract()
             self._require_authority(binding, "message")
             readback = self._client.send_context_only_message(binding.session_id, message, delivery_id)
-            info = readback["info"]
-            assert isinstance(info, dict)
-            upstream_message_id = info["id"]
-            assert isinstance(upstream_message_id, str)
+            upstream_message_id = self._validate_context_readback(readback, binding.session_id, message)
             readback_digest = hashlib.sha256(
                 json.dumps(readback, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
             ).hexdigest()
@@ -430,6 +447,36 @@ class LiveOpenCodeHarnessAdapter:
         payload = _bounded_payload(properties)
         return kind, session_id, payload
 
+    @staticmethod
+    def _validate_context_readback(readback: object, session_id: str, text: str) -> str:
+        """Accept real `{info, parts}` readback with generated IDs/metadata.
+
+        Upstream owns generated message/part identifiers and timestamps.  Tessera
+        verifies only the immutable attribution it can prove: designated session,
+        a user message, and exactly the intended text part.
+        """
+        if not isinstance(readback, dict):
+            raise OpenCodeHttpError("OpenCode context readback is malformed")
+        info, parts = readback.get("info"), readback.get("parts")
+        if not isinstance(info, dict) or not isinstance(parts, list) or len(parts) != 1:
+            raise OpenCodeHttpError("OpenCode context readback lacks the designated message")
+        message_id = info.get("id")
+        part = parts[0]
+        if (
+            info.get("sessionID") != session_id
+            or info.get("role") not in {None, "user"}
+            or not isinstance(message_id, str)
+            or not isinstance(part, dict)
+            or part.get("type") != "text"
+            or part.get("text") != text
+            or (part.get("sessionID") is not None and part.get("sessionID") != session_id)
+            or (part.get("messageID") is not None and part.get("messageID") != message_id)
+        ):
+            raise OpenCodeHttpError("OpenCode context readback lacks exact session/text attribution")
+        if not _IDENTIFIER.fullmatch(message_id):
+            raise OpenCodeHttpError("OpenCode context readback has an invalid message identity")
+        return message_id
+
     def _drain_routed(self, binding: TesseraBinding) -> list[AttributedEvent]:
         row = self._required_operation(binding.operation_id)
         stream_cursor = self._stream_replay_cursor()
@@ -455,9 +502,122 @@ class LiveOpenCodeHarnessAdapter:
             )
         return translated
 
+    def _poll_opaque(self, binding: TesseraBinding) -> list[AttributedEvent]:
+        """Reconnect v1.18.30's live stream without claiming replay support."""
+        try:
+            events = self._client.events()
+        except OpenCodeHttpError as error:
+            raise OpenCodeHarnessError("OpenCode event stream is unavailable or unsafe.") from error
+        for event in events:
+            if self._provider_disabled and self._observes_forbidden_activity(event):
+                raise OpenCodeHarnessError(
+                    "Provider-disabled OpenCode mode observed inference, provider, tool, plugin, or MCP activity."
+                )
+            self._ingest_opaque_event(event)
+        return self._drain_opaque(binding)
+
+    def _ingest_opaque_event(self, event: OpenCodeSseEvent) -> None:
+        """Assign a Tessera-owned sequence and a durable gap disposition.
+
+        The upstream ID is optional and opaque.  It cannot be turned into a
+        cursor, deduplication proof, or replay assertion merely because a later
+        connection supplies a different ID.
+        """
+        row = self._connection.execute("SELECT next_sequence FROM opaque_stream_state WHERE singleton=1").fetchone()
+        if row is None:
+            raise OpenCodeHarnessError("OpenCode opaque stream journal is unavailable.")
+        sequence = row[0]
+        disposition, operation_id, kind, session_id, payload = "quarantined", None, None, None, None
+        try:
+            kind, session_id, payload = self._translate_opaque_event(event)
+            operation = self._connection.execute(
+                "SELECT operation_id FROM operations WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if operation is not None:
+                disposition, operation_id = "routed", operation[0]
+            else:
+                self._quarantine(event, "unknown or foreign session")
+        except ValueError:
+            self._quarantine(event, "unsafe or malformed event")
+        self._connection.execute(
+            """INSERT INTO opaque_stream_events
+            (sequence,upstream_event_id,fingerprint,disposition,operation_id,kind,session_id,payload_json)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                sequence, event.upstream_event_id, event.fingerprint(), disposition, operation_id, kind,
+                session_id, None if payload is None else json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        self._connection.execute(
+            "UPDATE opaque_stream_state SET next_sequence=? WHERE singleton=1", (sequence + 1,)
+        )
+        self._connection.commit()
+
+    @staticmethod
+    def _translate_opaque_event(event: OpenCodeSseEvent) -> tuple[str, str, dict[str, object]]:
+        if event.event_name != "message":
+            raise ValueError("unsupported SSE event name")
+        kind = event.data.get("type")
+        properties = event.data.get("properties")
+        if not isinstance(kind, str) or not isinstance(properties, dict):
+            raise ValueError("malformed envelope")
+        # Do not journal arbitrary event/error text.  These are the only
+        # metadata-only observations currently admitted by this profile.
+        allowed = {
+            "session.created": {"sessionID"},
+            "session.updated": {"sessionID"},
+            "session.status": {"sessionID", "status"},
+            "session.idle": {"sessionID"},
+            "session.error": {"sessionID"},
+        }
+        if kind not in allowed or not set(properties) <= allowed[kind]:
+            raise ValueError("untrusted event values")
+        session_id = properties.get("sessionID")
+        if not isinstance(session_id, str):
+            raise ValueError("event lacks session")
+        payload: dict[str, object] = {}
+        status = properties.get("status")
+        if status is not None:
+            if status not in {"idle", "busy"}:
+                raise ValueError("unsafe status")
+            payload["status"] = status
+        return kind, session_id, payload
+
+    def _drain_opaque(self, binding: TesseraBinding) -> list[AttributedEvent]:
+        row = self._required_operation(binding.operation_id)
+        events = self._connection.execute(
+            """SELECT sequence,upstream_event_id,kind,session_id,payload_json FROM opaque_stream_events
+            WHERE operation_id=? AND disposition='routed' AND sequence>? ORDER BY sequence""",
+            (binding.operation_id, -1 if row[13] is None else row[13]),
+        ).fetchall()
+        return [
+            AttributedEvent(binding, event[3], event[0], event[1] or event[0], event[2], json.loads(event[4]))
+            for event in events
+        ]
+
+    def _acknowledge_opaque(self, row: tuple[object, ...], sequence: int) -> None:
+        current = row[13]
+        endpoint = self._connection.execute(
+            """SELECT 1 FROM opaque_stream_events WHERE operation_id=? AND disposition='routed'
+            AND sequence=?""", (row[0], sequence)
+        ).fetchone()
+        if endpoint is None or (current is not None and sequence <= current):
+            raise OpenCodeHarnessError("OpenCode acknowledgement must name one durable Tessera event.")
+        self._connection.execute("UPDATE operations SET high_water_cursor=? WHERE operation_id=?", (sequence, row[0]))
+        self._connection.commit()
+
     def _quarantine(self, event: OpenCodeSseEvent, reason: str) -> None:
+        if self._client.adapter_profile.event_contract == "opaque_reconnect":
+            self.quarantine.append(QuarantinedEvent(reason, "untrusted", event.fingerprint(), -1))
+            return
+        try:
+            cursor = event.cursor
+        except ValueError:
+            # Opaque upstream IDs are intentionally not converted into a
+            # numeric cursor.  ``-1`` denotes unavailable upstream ordering.
+            cursor = -1
         self.quarantine.append(
-            QuarantinedEvent(reason, "untrusted", event.fingerprint(), event.cursor)
+            QuarantinedEvent(reason, "untrusted", event.fingerprint(), cursor)
         )
 
     def _require_authority(self, binding: TesseraBinding, action: str) -> None:
@@ -618,13 +778,23 @@ class LiveOpenCodeHarnessAdapter:
             CREATE TABLE IF NOT EXISTS stream_state (
                 singleton INTEGER PRIMARY KEY CHECK (singleton=1),
                 replay_cursor INTEGER);
-            INSERT OR IGNORE INTO stream_state (singleton, replay_cursor) VALUES (1, NULL);"""
+             INSERT OR IGNORE INTO stream_state (singleton, replay_cursor) VALUES (1, NULL);"""
         )
         self._connection.execute(
             """CREATE TABLE IF NOT EXISTS message_deliveries (
             delivery_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, session_id TEXT NOT NULL,
-            context_digest TEXT NOT NULL, outcome TEXT NOT NULL,
+            context_digest TEXT NOT NULL, message_digest TEXT NOT NULL, binding_digest TEXT NOT NULL,
+            outcome TEXT NOT NULL,
             upstream_message_id TEXT, readback_digest TEXT)"""
+        )
+        self._connection.executescript(
+            """CREATE TABLE IF NOT EXISTS opaque_stream_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton=1), next_sequence INTEGER NOT NULL);
+            INSERT OR IGNORE INTO opaque_stream_state (singleton,next_sequence) VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS opaque_stream_events (
+            sequence INTEGER PRIMARY KEY, upstream_event_id TEXT, fingerprint TEXT NOT NULL,
+            disposition TEXT NOT NULL CHECK (disposition IN ('routed','quarantined')),
+            operation_id TEXT, kind TEXT, session_id TEXT, payload_json TEXT);"""
         )
         columns = {
             row[1] for row in self._connection.execute("PRAGMA table_info(operations)").fetchall()

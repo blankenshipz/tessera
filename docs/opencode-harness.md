@@ -52,15 +52,16 @@ completion.
 
 `tessera_worker.opencode_http` and `tessera_worker.opencode_live_adapter` add a
 separate live transport seam, exercised only against an in-process fixture so far.
-It accepts exactly one configured authenticated endpoint, an exact semantic
-server-version pin, and the SHA-256 of the canonical pinned `/doc` OpenAPI
-response. It verifies both before session mutation and before each independently
+It accepts exactly one configured endpoint, a release/build pin, an independently
+versioned/digested canonical `/doc` OpenAPI response, an adapter profile, and a
+trusted launcher instance binding. It verifies the protocol facts before session mutation and before each independently
 opened event stream. The endpoint must use
 TLS, unless it is a literal `127.0.0.1` or `[::1]` HTTP origin; endpoint paths,
 credentials in URLs, redirects, proxy environment settings, cookies, and general
 OpenCode routes are rejected or unavailable. The endpoint authentication mode is
-explicitly HTTP Basic or Bearer, and the pinned document must prove the selected
-OpenAPI security scheme. The endpoint authorization value is never a message
+explicitly HTTP Basic, Bearer, or explicitly unauthenticated; the pinned document
+must prove the selected mode and a required scheme cannot be silently omitted. The
+endpoint authorization value is never a message
 part, journal value, or provider credential.
 
 The client exposes only `POST /session`, `POST /session/{id}/message`, `POST
@@ -70,7 +71,11 @@ than 30 seconds. Each request and stream has one absolute deadline: bounded JSON
 reads and SSE lines cannot extend it by slow-dripping bytes. The adapter only emits
 known typed `/event` envelopes for an already attributed session; unknown, foreign,
 malformed, secret-bearing, oversized, and out-of-order events are quarantined.
-Numeric SSE IDs are exclusive stream replay cursors. The journal durably ingests a
+The legacy synthetic profile alone treats numeric SSE IDs as replay cursors. The
+source-inspected v1.18.30 profile treats upstream SSE IDs as opaque and optional:
+reconnect opens a fresh stream without `Last-Event-ID`, never asserts replay, and
+assigns Tessera-owned durable sequences with routed/quarantined gap dispositions.
+The legacy journal durably ingests a
 contiguous shared stream before routing its records by known session to operations,
 so a valid interleaved session cannot block another operation's delivery. Downstream
 acknowledgements remain per operation and may only cover durably contiguous stream
@@ -98,8 +103,10 @@ remains only an OpenCode acknowledgement: provider termination, costs, output
 acceptance, and scientific success remain unresolved. The fixture prohibits
 provider routes and does not enable OpenCode shell, MCP, skills, permissions,
 provider authentication, or model calls. Context append sends exactly
-`{"noReply":true,"parts":[...]}` and accepts only an upstream `{info,parts}`
-readback whose message/session identity and parts exactly match. JSON boolean
+`{"noReply":true,"parts":[...]}` and accepts an upstream `{info,parts}`
+readback whose message/session identity and intended text exactly match while
+allowing generated IDs and metadata. Provider-disabled mode rejects `start()` and
+ordinary assistant turns before any upstream mutation. JSON boolean
 `true` is an accepted abort acknowledgement. Provider-disabled mode fails on any
 observed provider, inference, tool, plugin, MCP, or assistant activity; an absent
 `/provider` request is not evidence that inference did not occur.

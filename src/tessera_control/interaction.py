@@ -51,6 +51,9 @@ def create_interaction_schema(connection: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE REFERENCES interaction_messages(id),
             org_id TEXT NOT NULL REFERENCES organizations(id), project_id TEXT NOT NULL REFERENCES projects(id),
             task_id TEXT NOT NULL REFERENCES tasks(id),
+            operation_id TEXT NOT NULL REFERENCES external_operations(operation_id),
+            grant_id TEXT NOT NULL REFERENCES execution_grants(id),
+            lease_id TEXT NOT NULL REFERENCES execution_leases(id),
             admitted_attempt_id TEXT NOT NULL REFERENCES research_experiment_admitted_attempts(id),
             attempt_revision INTEGER NOT NULL, context_revision INTEGER NOT NULL,
             epoch INTEGER NOT NULL, worker_principal_id TEXT NOT NULL REFERENCES principals(id),
@@ -115,9 +118,10 @@ class InteractionStore:
         callback: Any,
         *,
         audience: str = "control",
+        replay_guard: Any | None = None,
     ):
         return self.store._mutate(
-            principal, key, method, path, digest, callback, audience=audience
+            principal, key, method, path, digest, callback, audience=audience, replay_guard=replay_guard
         )
 
     @staticmethod
@@ -243,6 +247,7 @@ class InteractionStore:
         value = dict(row)
         return {
             "delivery_id": value["id"], "state": value["state"], "revision": value["revision"],
+            "operation_id": value["operation_id"], "grant_id": value["grant_id"], "lease_id": value["lease_id"],
             "admitted_attempt_id": value["admitted_attempt_id"],
             "attempt_revision": value["attempt_revision"], "context_revision": value["context_revision"],
             "epoch": value["epoch"], "harness_instance_id": value["harness_instance_id"],
@@ -299,7 +304,7 @@ class InteractionStore:
             if (
                 operation is None or operation["epoch"] != body.expected_epoch
                 or operation["worker_principal_id"] != body.worker_principal_id
-                or operation["desired_state"] != "admitted"
+                or operation["desired_state"] != "admitted" or operation["grant_id"] != attempt["grant_id"]
             ):
                 raise Conflict("Admitted attempt has no current worker/epoch delivery authority.")
             task_id = operation["task_id"]
@@ -321,7 +326,11 @@ class InteractionStore:
             message_id, delivery_id, now = str(uuid.uuid4()), "delivery_" + uuid.uuid4().hex, utc_now()
             message_digest = _digest({"intent": body.intent, "body": body.body, "reply_to": body.reply_to})
             context_digest = _digest({
-                "message_digest": message_digest, "admitted_attempt_id": body.admitted_attempt_id,
+                "message_digest": message_digest, "organization_id": live["org_id"],
+                "project_id": thread["project_id"], "task_id": task_id,
+                "operation_id": operation["operation_id"], "grant_id": operation["grant_id"],
+                "lease_id": operation["lease_id"], "worker_principal_id": body.worker_principal_id,
+                "admitted_attempt_id": body.admitted_attempt_id,
                 "attempt_revision": body.expected_attempt_revision, "context_revision": body.context_revision,
                 "epoch": body.expected_epoch, "harness_instance_id": body.harness_instance_id,
                 "upstream_session_id": body.upstream_session_id,
@@ -329,6 +338,7 @@ class InteractionStore:
             conn.execute("INSERT INTO interaction_messages VALUES (?,?,?,?,?,?,?)", (message_id, body.thread_id, live["id"], body.intent, body.body, body.reply_to, now))
             row = {
                 "id": delivery_id, "message_id": message_id, "org_id": live["org_id"], "project_id": thread["project_id"], "task_id": task_id,
+                "operation_id": operation["operation_id"], "grant_id": operation["grant_id"], "lease_id": operation["lease_id"],
                 "admitted_attempt_id": body.admitted_attempt_id, "attempt_revision": body.expected_attempt_revision,
                 "context_revision": body.context_revision, "epoch": body.expected_epoch, "worker_principal_id": body.worker_principal_id,
                 "harness_instance_id": body.harness_instance_id, "upstream_session_id": body.upstream_session_id,
@@ -336,7 +346,7 @@ class InteractionStore:
                 "upstream_message_id": None, "upstream_readback_digest": None, "error_code": None, "revision": 1, "created_at": now, "updated_at": now,
             }
             conn.execute("""INSERT INTO interaction_message_deliveries VALUES
-            (:id,:message_id,:org_id,:project_id,:task_id,:admitted_attempt_id,:attempt_revision,:context_revision,:epoch,:worker_principal_id,:harness_instance_id,:upstream_session_id,:message_digest,:context_digest,:state,:claimed_by_principal_id,:upstream_message_id,:upstream_readback_digest,:error_code,:revision,:created_at,:updated_at)""", row)
+            (:id,:message_id,:org_id,:project_id,:task_id,:operation_id,:grant_id,:lease_id,:admitted_attempt_id,:attempt_revision,:context_revision,:epoch,:worker_principal_id,:harness_instance_id,:upstream_session_id,:message_digest,:context_digest,:state,:claimed_by_principal_id,:upstream_message_id,:upstream_readback_digest,:error_code,:revision,:created_at,:updated_at)""", row)
             conn.execute("INSERT INTO interaction_message_delivery_states VALUES (?,?,?,?,?,?,?)", (delivery_id, 1, "queued", context_digest, live["id"], None, now))
             self.store._event(conn, live, thread["project_id"], task_id, "interaction_message_delivery_queued", body.context_revision, {"delivery_id": delivery_id, "context_digest": context_digest, "harness_instance_id": body.harness_instance_id})
             return 201, {"id": message_id, "thread_id": body.thread_id, "intent": body.intent, "body": body.body, "reply_to": body.reply_to, "sender_principal_id": live["id"], "created_at": now, "delivery": self._delivery_response(row)}
@@ -351,18 +361,35 @@ class InteractionStore:
             delivery = dict(row)
             if delivery["epoch"] != body.expected_epoch or delivery["state"] in {"cancelled", "acknowledged", "uncertain", "failed"}:
                 raise Conflict("Harness delivery is no longer claimable.")
-            attempt = conn.execute(
-                "SELECT revision,operation_id FROM research_experiment_admitted_attempts WHERE id=?",
-                (delivery["admitted_attempt_id"],),
+            attempt = conn.execute("SELECT revision,operation_id,grant_id FROM research_experiment_admitted_attempts WHERE id=?", (delivery["admitted_attempt_id"],)).fetchone()
+            operation = conn.execute(
+                """SELECT o.operation_id,o.desired_state,o.epoch,o.worker_principal_id,o.grant_id,o.lease_id,
+                g.project_id,g.task_id,g.status,l.grant_id AS lease_grant_id,l.worker_principal_id AS lease_worker,l.epoch AS lease_epoch
+                FROM external_operations o JOIN execution_grants g ON g.id=o.grant_id
+                JOIN execution_leases l ON l.id=o.lease_id WHERE o.operation_id=?""", (delivery["operation_id"],)
             ).fetchone()
-            operation = conn.execute("SELECT operation_id,desired_state,epoch,worker_principal_id FROM external_operations WHERE operation_id=(SELECT operation_id FROM research_experiment_admitted_attempts WHERE id=?)", (delivery["admitted_attempt_id"],)).fetchone()
-            if attempt is None or attempt["revision"] != delivery["attempt_revision"] or operation is None or operation["operation_id"] != attempt["operation_id"] or operation["desired_state"] != "admitted" or operation["epoch"] != delivery["epoch"] or operation["worker_principal_id"] != live["id"]:
+            if (attempt is None or attempt["revision"] != delivery["attempt_revision"] or operation is None
+                or operation["operation_id"] != attempt["operation_id"] or operation["grant_id"] != attempt["grant_id"]
+                or operation["grant_id"] != delivery["grant_id"] or operation["lease_id"] != delivery["lease_id"]
+                or operation["desired_state"] != "admitted" or operation["epoch"] != delivery["epoch"]
+                or operation["worker_principal_id"] != live["id"] or operation["lease_grant_id"] != operation["grant_id"]
+                or operation["lease_worker"] != live["id"] or operation["lease_epoch"] != delivery["epoch"]
+                or operation["status"] != "active" or operation["project_id"] != delivery["project_id"]
+                or operation["task_id"] != delivery["task_id"]):
                 raise Conflict("Harness delivery authority is no longer current.")
             if delivery["state"] == "queued":
                 delivery = self._append_delivery_state(conn, delivery, "delivered", live)
                 self.store._event(conn, live, delivery["project_id"], delivery["task_id"], "interaction_message_delivery_delivered", delivery["context_revision"], {"delivery_id": delivery_id, "context_digest": delivery["context_digest"]})
             return 200, {"delivery": self._delivery_response(delivery) | {"organization_id": delivery["org_id"], "project_id": delivery["project_id"], "task_id": delivery["task_id"], "operation_id": operation["operation_id"], "worker_principal_id": live["id"], "body": row["body"], "intent": row["intent"], "reply_to": row["reply_to"]}}
-        return self._mutate(actor, key, "POST", f"/worker/interaction-deliveries/{delivery_id}/claim", _digest(body.model_dump(mode="json")), command, audience="worker")
+        def replay_guard(conn, live, response):
+            # Store idempotency normally returns a saved response without the
+            # command callback.  A delivery claim is authority-sensitive, so a
+            # same-key replay must re-run the identical complete predicate.
+            _status, current = command(conn, live)
+            if current.get("delivery", {}).get("delivery_id") != response.get("delivery", {}).get("delivery_id"):
+                raise Conflict("Harness delivery replay no longer names its original delivery.")
+
+        return self._mutate(actor, key, "POST", f"/worker/interaction-deliveries/{delivery_id}/claim", _digest(body.model_dump(mode="json")), command, audience="worker", replay_guard=replay_guard)
 
     def acknowledge_harness_delivery(self, actor, key, delivery_id, **payload):
         body = AcknowledgeHarnessDelivery(**payload)

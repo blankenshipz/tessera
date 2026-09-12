@@ -20,6 +20,7 @@ from tessera_worker.opencode_harness import (
 )
 from tessera_worker.opencode_http import (
     MAX_SSE_FIELD_BYTES,
+    OPENCODE_V1_18_30_CONTEXT_PROFILE,
     OpenCodeCapabilities,
     OpenCodeHarnessInstancePin,
     OpenCodeHttpClient,
@@ -544,6 +545,90 @@ def test_provider_disabled_mode_fails_on_observed_provider_or_tool_activity(tmp_
         with pytest.raises(OpenCodeHarnessError, match="Provider-disabled"):
             live.poll("operation-1")
         assert value.provider_calls == 0
+        live.close()
+
+
+def test_provider_disabled_mode_rejects_start_before_any_upstream_mutation(tmp_path: Path) -> None:
+    with fixture() as value:
+        live = LiveOpenCodeHarnessAdapter(
+            client(value), tmp_path / "journal", authority_is_current=lambda *_: True,
+            context_only_delivery=True, provider_disabled=True,
+        )
+        with pytest.raises(OpenCodeHarnessError, match="rejects session start"):
+            live.start(binding(), context())
+        assert value.requests == [] and value.sessions == [] and value.messages == []
+        live.close()
+
+
+def test_v1_18_30_profile_uses_explicit_basic_auth_opaque_ids_and_tessera_sequences(
+    tmp_path: Path,
+) -> None:
+    """Source-inspected v1.18.30 contract: Basic auth, optional opaque SSE IDs, no replay."""
+    with fixture() as value:
+        value.authorization = "Basic Zml4dHVyZTp0b2tlbg=="
+        value.document["info"]["version"] = "0.0.1"  # API schema, not release identity.
+        value.document["security"] = [{"basicAuth": []}]
+        value.document["components"] = {
+            "securitySchemes": {"basicAuth": {"type": "http", "scheme": "basic"}}
+        }
+        pinned = OpenCodeServerPin(
+            "1.18.30", hashlib.sha256(_canonical(value.document)).hexdigest(), "0.0.1",
+            "3104c1428ec91f809e5ab86631300de41eb6952e",
+        )
+        upstream = OpenCodeHttpClient(
+            value.endpoint, value.authorization, pinned, instance_pin(), auth_mode="basic",
+            adapter_profile=OPENCODE_V1_18_30_CONTEXT_PROFILE,
+        )
+        live = LiveOpenCodeHarnessAdapter(
+            upstream, tmp_path / "journal", authority_is_current=lambda *_: True,
+            context_only_delivery=True, provider_disabled=True,
+        )
+        bound = binding().__class__(**(binding().__dict__ | {"session_id": "session-1"}))
+        live._insert_operation(binding())  # noqa: SLF001 - designated session fixture.
+        live._set_created(bound)  # noqa: SLF001 - no assistant turn occurs.
+        value.event_batches = [[live_event(77, "session-1", status="busy")]]
+        observed = live.poll("operation-1")
+        assert [event.cursor for event in observed] == [0]
+        live.acknowledge_through("operation-1", 0)
+        value.event_batches = [
+            [live_event(78, "session-1", "session.error", error="secret-canary")]
+        ]
+        assert live.reconnect("operation-1") == []
+        journal = live._connection.execute(  # noqa: SLF001
+            "SELECT payload_json FROM opaque_stream_events"
+        ).fetchall()
+        assert "secret-canary" not in str(journal)
+        assert live.quarantine[-1].cursor == -1
+        with pytest.raises(OpenCodeHttpError, match="does not prove upstream event replay"):
+            upstream.events(0)
+        event_request = next(item for item in value.requests if item[1] == "/event")
+        assert "Last-Event-Id" not in event_request[2]
+        live.close()
+
+
+def test_real_shaped_context_readback_accepts_generated_metadata_but_not_secret_text(
+    tmp_path: Path,
+) -> None:
+    with fixture() as value:
+        value.context_readback = {
+            "info": {
+                "id": "message-1", "sessionID": "session-1", "role": "user", "time": {"created": 1}
+            },
+            "parts": [
+                {
+                    "id": "part-1", "messageID": "message-1", "sessionID": "session-1",
+                    "type": "text", "text": "Human context",
+                }
+            ],
+        }
+        live = LiveOpenCodeHarnessAdapter(
+            client(value), tmp_path / "journal", authority_is_current=lambda *_: True,
+            context_only_delivery=True,
+        )
+        bound = binding().__class__(**(binding().__dict__ | {"session_id": "session-1"}))
+        live.deliver_context_only(bound, "delivery-rich", "Human context", "a" * 64)
+        journal_rows = live._connection.execute("SELECT * FROM message_deliveries").fetchall()  # noqa: SLF001
+        assert "fixture-token" not in str(journal_rows)
         live.close()
 
 

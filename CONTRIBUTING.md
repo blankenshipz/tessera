@@ -289,3 +289,7 @@ executable schema.
 Schema 37 adds an empty context-only OpenCode message-delivery journal. It preserves
 legacy conversation messages without inventing a harness session, delivery, upstream
 readback, or OpenCode compatibility result; see `docs/opencode-message-delivery.md`.
+
+Schema 38 fences new OpenCode deliveries to their immutable operation, grant, and
+lease tuple. Existing v37 queued/delivered rows remain unclaimable rather than having
+that authority association inferred during migration.

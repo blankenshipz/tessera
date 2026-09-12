@@ -1,6 +1,7 @@
 # 0004: Optional pinned OpenCode harness boundary
 
-Status: accepted design decision; adapter integration and synthetic POC pending.
+Status: accepted design decision; synthetic POC and local HTTP/SSE seam implemented;
+the v1.18.30 source contract is inspected, but real-server integration is pending.
 
 This supersedes the first-harness selection in decision 0002; it does not change
 that decision's control-plane, credential, sandbox, or cancellation boundaries.
@@ -16,8 +17,9 @@ separate from research control.
 
 The adapter translates bounded Tessera commands into OpenCode's supported
 interface and attributes every upstream event to the tenant, task, operation,
-epoch, and OpenCode session/job. It must handle reconnect by cursor, duplicate
-events, and cancellation without treating an abort acknowledgement as provider
+epoch, and OpenCode session/job. It must distinguish an opaque upstream event ID
+from a Tessera sequence and reconnect from replay; it must not claim replay from
+changed IDs. Cancellation does not treat an abort acknowledgement as provider
 termination. Unknown attribution, incompatible versions, expired authority, and
 unconfirmed cancellation fail closed or remain visibly unresolved.
 
@@ -36,6 +38,9 @@ compatibility testing.
 - **Require OpenCode:** rejected; the contract must preserve harness portability
   and allow Tessera control without coupling the product to one upstream.
 
-The next evidence is a synthetic, no-provider-call POC covering start, event
-translation, attribution, reconnect, expiry, and cancellation failure cases.
-Passing it does not complete the pilot.
+Synthetic, no-provider-call POC evidence now covers start, event translation,
+attribution, reconnect, expiry, and cancellation failure cases, including a
+local authenticated exact-schema-pinned HTTP/SSE fixture seam. The next evidence
+is a selected real-server compatibility/security result and enrolled-node
+integration under the activation gates in the compatibility matrix. Passing
+synthetic evidence does not complete the pilot.
