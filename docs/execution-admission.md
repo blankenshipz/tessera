@@ -18,13 +18,18 @@ Schema v36 adds an explicitly human-approved, provider-disabled Kubernetes
 dispatch outbox for an already packaged admitted attempt. The control plane
 stores the immutable package response, then binds its stable operation ID,
 admitted attempt, enrolled worker, lease/epoch, exact target digest and profile
-before a worker can claim it. Claim rechecks those bindings and returns the same
-control-issued package; it does not create identities, select a current context,
-provision a target, or invoke Kubernetes. Grant revocation fences queued/claimed
-dispatch effects in the same transaction while original-operation observations
-remain available for reconciliation. The fake-client worker service only passes
-that unchanged package to the hardened adapter and records operational status;
-its collection handoff remains metadata-only and export retains the dispatch to
+before a worker can claim it. Every claim replay, including one using the same
+idempotency key after a lost reply, rechecks the current grant, lease expiry and
+ready-worker state before returning the same control-issued package. It does not
+create identities, select a current context, provision a target, or invoke
+Kubernetes. Grant revocation fences queued/claimed dispatch effects in the same
+transaction while original-operation observations remain available for
+reconciliation. The fake-client worker service supervises its one durable Job:
+it rechecks authority, reconciles long-running status, requests cancellation on
+denial/lease deadline, and never uses a replay or restart to create a replacement
+Job. Its report journal scopes immutable payload bytes and idempotency keys to
+the dispatch and operation, so a lost report reply is replayed exactly after
+restart. Collection remains metadata-only and export retains the dispatch to
 canonical admitted-attempt/operation linkage. This is not live-cluster support.
 
 Schema v21 adds human-created, metadata-only credential-access leases. They are

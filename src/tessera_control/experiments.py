@@ -1266,9 +1266,16 @@ class ExperimentStore(Store):
         body = self._body(ClaimKubernetesDispatch, payload)
         path = f"/kubernetes-dispatches/{dispatch_id}/claim"
 
-        def command(
+        def current(
             connection: sqlite3.Connection, worker: dict[str, Any]
-        ) -> tuple[int, dict[str, Any]]:
+        ) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row, sqlite3.Row, sqlite3.Row, dict[str, Any]]:
+            """Recheck the authority behind a claimed-package replay.
+
+            Claim responses are executable material, unlike an ordinary mutation
+            receipt.  The idempotency row may preserve its immutable package, but
+            it must never preserve authority after a revoke, expiry, or worker
+            lifecycle change.
+            """
             dispatch = connection.execute(
                 "SELECT * FROM kubernetes_dispatches WHERE id=? AND org_id=?",
                 (dispatch_id, worker["org_id"]),
@@ -1307,6 +1314,9 @@ class ExperimentStore(Store):
                 or grant["epoch"] != dispatch["epoch"]
                 or lease["epoch"] != dispatch["epoch"]
                 or operation["epoch"] != dispatch["epoch"]
+                or lease["grant_id"] != dispatch["grant_id"]
+                or operation["grant_id"] != dispatch["grant_id"]
+                or operation["lease_id"] != dispatch["lease_id"]
                 or lease["worker_principal_id"] != worker["id"]
                 or operation["worker_principal_id"] != worker["id"]
                 or operation["package_digest"] != dispatch["package_digest"]
@@ -1323,6 +1333,14 @@ class ExperimentStore(Store):
                 or package_value.get("operation_id") != dispatch["operation_id"]
             ):
                 raise Conflict("Kubernetes dispatch package identity conflicts.")
+            return dispatch, operation, lease, grant, package, package_value
+
+        def command(
+            connection: sqlite3.Connection, worker: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            dispatch, operation, lease, _grant, _package, package_value = current(
+                connection, worker
+            )
             if dispatch["state"] == "queued":
                 now = utc_now()
                 connection.execute(
@@ -1357,7 +1375,29 @@ class ExperimentStore(Store):
                 "execution_dispatched": True,
             }
 
-        return self._mutate(principal, key, "POST", path, digest, command, audience="worker")
+        def replay_guard(
+            connection: sqlite3.Connection, worker: dict[str, Any], response: dict[str, Any]
+        ) -> None:
+            dispatch, _operation, _lease, _grant, _package, _package_value = current(
+                connection, worker
+            )
+            if (
+                dispatch["state"] != "claimed"
+                or dispatch["claimed_by_principal_id"] != worker["id"]
+                or response.get("dispatch", {}).get("id") != dispatch_id
+            ):
+                raise Conflict("Kubernetes dispatch claim is no longer current.")
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            path,
+            digest,
+            command,
+            audience="worker",
+            replay_guard=replay_guard,
+        )
 
     def resolve_admitted_attempt(
         self,
