@@ -430,3 +430,62 @@ def test_missing_contradictory_and_zero_pod_observations_block_collection(tmp_pa
     assert adapter.reconcile(package).observed_state == "unknown"
     with pytest.raises(KubernetesExecutionError, match="observed successful"):
         adapter.artifact_collection_handoff(package)
+
+
+def test_missing_job_reconciles_recorded_owned_pods_across_restart_without_create(
+    tmp_path: Path,
+) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    journal = tmp_path / "kubernetes.sqlite3"
+    adapter = fake.adapter(journal)
+    assert adapter.submit(package).observed_state == "running"
+
+    fake.jobs.clear()
+    fake.pods = [fake.pod("Running")]
+    missing_with_pod = adapter.reconcile(package)
+    assert missing_with_pod.observed_state == "unknown"
+    assert [pod.pod_uid for pod in missing_with_pod.pods] == ["pod-fixture"]
+
+    restarted = fake.adapter(journal)
+    fake.pods.clear()
+    eventual_absence = restarted.reconcile(package)
+    assert eventual_absence.observed_state == "unknown" and not eventual_absence.pods
+    proof = restarted.cancel(package)
+    assert proof.termination_confirmed is True
+    assert fake.creates == 1
+    with pytest.raises(KubernetesExecutionError, match="observed successful"):
+        restarted.artifact_collection_handoff(package)
+
+
+def test_repeated_read_failures_keep_unknown_and_recorded_job_recovery_identity(
+    tmp_path: Path,
+) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    journal = tmp_path / "kubernetes.sqlite3"
+
+    def unreadable_pods(_job_uid: str) -> list[dict]:
+        raise RuntimeError("temporary Pod read failure")
+
+    adapter = KubernetesExecutionAdapter(
+        journal,
+        fake.cluster,
+        inspect_job=fake.jobs.get,
+        create_job=fake.create,
+        delete_job=fake.delete,
+        observe_pods=unreadable_pods,
+    )
+    with pytest.raises(RuntimeError, match="temporary Pod"):
+        adapter.submit(package)
+    with pytest.raises(RuntimeError, match="temporary Pod"):
+        adapter.reconcile(package)
+
+    with sqlite3.connect(journal) as connection:
+        assert connection.execute(
+            "SELECT observed_state,job_uid FROM kubernetes_execution_bindings WHERE operation_id=?",
+            (package.operation_id,),
+        ).fetchone() == ("unknown", "job-fixture")
+    assert fake.creates == 1
+    with pytest.raises(KubernetesExecutionError, match="observed successful"):
+        adapter.artifact_collection_handoff(package)

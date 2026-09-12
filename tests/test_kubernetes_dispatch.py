@@ -17,6 +17,7 @@ from tessera_worker.kubernetes_dispatch_service import (
     KubernetesDispatchWorkerConfig,
     KubernetesDispatchWorkerService,
 )
+from tessera_worker.kubernetes_execution import KubernetesExecutionAdapter
 
 
 class _ApiChannel:
@@ -431,6 +432,9 @@ def test_restart_after_revocation_reconciles_then_cancels_without_a_create(tmp_p
     )
     assert revoked.status_code == 200
 
+    # The Job has disappeared before recovery, so the first reconciliation is
+    # authoritative unknown.  Revocation must still reach the UID-scoped stop.
+    fake.jobs.clear()
     recovered = _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=2)
     assert recovered["status"] == "cancel_requested"
     assert recovered["cancellation"]["job_uid"] == "job-fixture"
@@ -571,4 +575,97 @@ def test_full_control_outage_is_bounded_to_observe_then_cancel_without_create(tm
     result = service.run(max_cycles=3)
     assert result["status"] == "cancel_requested"
     assert result["cancellation"]["reason"] == "control_outage"
+    assert fake.creates == 1
+
+
+def test_unknown_recovery_reconciles_existing_job_without_handoff_or_replacement_create(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    root = tmp_path / "worker"
+    root.mkdir(mode=0o700)
+    credential = tmp_path / "worker.credential"
+    credential.write_text("worker-token")
+    credential.chmod(0o600)
+    journal = root / "kubernetes.sqlite3"
+    reads = 0
+
+    def transient_pod_read(_job_uid: str):
+        nonlocal reads
+        reads += 1
+        if reads <= 2:
+            raise RuntimeError("temporary Pod read failure")
+        return fake.pods
+
+    unknown = KubernetesDispatchWorkerService(
+        KubernetesDispatchWorkerConfig("http://127.0.0.1:8765", dispatch["id"], credential, root),
+        cluster,
+        package.output,
+        KubernetesExecutionAdapter(
+            journal,
+            cluster,
+            inspect_job=fake.jobs.get,
+            create_job=fake.create,
+            delete_job=fake.delete,
+            observe_pods=transient_pod_read,
+        ),
+        channel=_ApiChannel(client),
+    ).run(max_cycles=1)
+    assert unknown["status"] == "unknown"
+    assert unknown["reconciliation_required"] is True
+    assert unknown["recovery_owner"] == "worker"
+    assert "artifact_handoff" not in unknown and fake.creates == 1
+
+    recovered = KubernetesDispatchWorkerService(
+        KubernetesDispatchWorkerConfig("http://127.0.0.1:8765", dispatch["id"], credential, root),
+        cluster,
+        package.output,
+        fake.adapter(journal),
+        channel=_ApiChannel(client),
+    ).run(max_cycles=1)
+    assert recovered["status"] == "running"
+    assert fake.creates == 1
+
+
+def test_unknown_at_expired_deadline_still_cancels_the_recorded_job(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    now = [datetime.now(UTC)]
+    first = _service(tmp_path, client, dispatch, fake, cluster)
+    first.now = lambda: now[0]
+    assert first.run(max_cycles=1)["status"] == "running"
+
+    reads = 0
+
+    def fail_then_recover_pod_read(_job_uid: str):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            raise RuntimeError("temporary Pod read failure")
+        return fake.pods
+
+    now[0] += timedelta(seconds=package.binding.active_deadline_seconds)
+    root = tmp_path / "worker"
+    credential = tmp_path / "worker.credential"
+    expired = KubernetesDispatchWorkerService(
+        KubernetesDispatchWorkerConfig("http://127.0.0.1:8765", dispatch["id"], credential, root),
+        cluster,
+        package.output,
+        KubernetesExecutionAdapter(
+            root / "kubernetes.sqlite3",
+            cluster,
+            inspect_job=fake.jobs.get,
+            create_job=fake.create,
+            delete_job=fake.delete,
+            observe_pods=fail_then_recover_pod_read,
+        ),
+        channel=_ApiChannel(client),
+        now=lambda: now[0],
+    ).run(max_cycles=1)
+    assert expired["status"] == "cancel_requested"
+    assert expired["cancellation"]["reason"] == "hard_deadline"
+    assert expired["cancellation"]["termination_confirmed"] is True
     assert fake.creates == 1

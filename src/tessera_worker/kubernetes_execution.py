@@ -198,7 +198,7 @@ class KubernetesExecutionAdapter:
         try:
             observed = self._inspect_job(package.binding.job_name)
             if observed is None:
-                return self._record_unknown(package)
+                return self._record_disappeared_job(package)
             job = self._journal.reconcile_observation(package.binding, self.cluster, observed)
             return self._record_status(package, job)
         except Exception:
@@ -354,6 +354,9 @@ class KubernetesExecutionAdapter:
     def _record_status(
         self, package: KubernetesExecutionPackage, job: KubernetesJobObservation
     ) -> KubernetesExecutionStatus:
+        # The Job UID is recovery ownership and must survive a later Pod read
+        # failure.  Persist it before invoking the injected Pod observer.
+        self._record_job_identity(package, job.job_uid)
         pods = tuple(
             parse_pod(pod, package.binding, self.cluster, job.job_uid)
             for pod in self._observe_pods(job.job_uid)
@@ -395,19 +398,83 @@ class KubernetesExecutionAdapter:
             )
         return KubernetesExecutionStatus(package.operation_id, job, pods, state)
 
+    def _record_job_identity(self, package: KubernetesExecutionPackage, job_uid: str) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT job_uid FROM kubernetes_execution_bindings WHERE operation_id=?",
+                (package.operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
+            if row["job_uid"] not in {None, job_uid}:
+                raise KubernetesExecutionError(
+                    "Kubernetes Job UID conflicts with the durable operation."
+                )
+            connection.execute(
+                "UPDATE kubernetes_execution_bindings SET job_uid=? WHERE operation_id=?",
+                (job_uid, package.operation_id),
+            )
+
     def _record_unknown(self, package: KubernetesExecutionPackage) -> KubernetesExecutionStatus:
-        """Make a newer absent, malformed, or contradictory observation authoritative."""
+        """Make a newer failed read authoritative without dropping recovery identity."""
         with self._connect() as connection:
             if (
                 connection.execute(
-                    "UPDATE kubernetes_execution_bindings SET pod_uids_json='[]', "
-                    "observed_state='unknown' WHERE operation_id=?",
+                    "UPDATE kubernetes_execution_bindings SET observed_state='unknown' "
+                    "WHERE operation_id=?",
                     (package.operation_id,),
                 ).rowcount
                 != 1
             ):
                 raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
         return KubernetesExecutionStatus(package.operation_id, None, (), "unknown")
+
+    def _record_disappeared_job(
+        self, package: KubernetesExecutionPackage
+    ) -> KubernetesExecutionStatus:
+        """Keep reconciling Pods against the first recorded Job UID after Job deletion.
+
+        A deterministic Job name is reusable, while its UID is the operation's
+        durable recovery ownership.  Therefore a missing Job is never a terminal
+        observation and never permits a replacement create.  Fresh owned-Pod
+        reads remain required on every recovery pass, including after restart.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT job_uid FROM kubernetes_execution_bindings WHERE operation_id=?",
+                (package.operation_id,),
+            ).fetchone()
+        if row is None:
+            raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
+        job_uid = row["job_uid"]
+        if job_uid is None:
+            return self._record_unknown(package)
+        try:
+            # Validate durable recovery identity before sending it to the injected
+            # Pod observer.  It is not a name lookup and cannot attach a replacement.
+            KubernetesProviderIdentity(
+                self.cluster.cluster_uid, self.cluster.namespace_uid, job_uid
+            )
+            pods = tuple(
+                parse_pod(pod, package.binding, self.cluster, job_uid)
+                for pod in self._observe_pods(job_uid)
+            )
+        except Exception:
+            self._record_unknown(package)
+            raise
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "UPDATE kubernetes_execution_bindings SET pod_uids_json=?, "
+                    "observed_state='unknown' WHERE operation_id=? AND job_uid=?",
+                    (json.dumps([pod.pod_uid for pod in pods]), package.operation_id, job_uid),
+                ).rowcount
+                != 1
+            ):
+                raise KubernetesExecutionError(
+                    "Kubernetes Job UID conflicts with the durable operation."
+                )
+        return KubernetesExecutionStatus(package.operation_id, None, pods, "unknown")
 
     def _mark_cancellation_requested(self, operation_id: str) -> None:
         with self._connect() as connection:

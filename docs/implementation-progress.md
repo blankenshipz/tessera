@@ -32,7 +32,7 @@ relabeled as live validation.
 
 ## Design status matrix
 
-Reviewed 2026-09-11 against schema v36 human-approved Kubernetes dispatch/outbox
+Reviewed 2026-09-12 against schema v36 human-approved Kubernetes dispatch/outbox
 full-predicate replay, immutable private descriptor, bounded heartbeat/renewal and
 hard-deadline supervision, post-revocation observe/cancel-only recovery, durable
 report ordering, cancellation-UID uncertainty, and worker-supervision fences, and v32 admitted-attempt evidence identity,
@@ -451,7 +451,10 @@ representative investigation have not passed end-to-end acceptance.
     intent and invokes injected Job callbacks. It translates only the fixed command,
     deadline, network-none and PVC fields into the existing canonical Job contract;
     it records Job/owned-Pod bindings, holds lost create replies and contradictory
-    observations, persists cancellation before create, survives local journal
+    observations, persists authoritative read-failure unknowns with the recorded
+    Job UID as recovery ownership, reconciles owned Pods after Job disappearance,
+    and still applies deadline/revocation cancellation before a bounded unknown
+    return. It persists cancellation before create, survives local journal
     restart, associates only a matching adjacent OpenCode session, and emits a
     successful-Job artifact-collection handoff without moving bytes. Focused tests
     use only temporary SQLite and fake callbacks. This is not a Kubernetes client,

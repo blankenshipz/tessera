@@ -354,6 +354,11 @@ class KubernetesDispatchWorkerService:
         if cancellation is not None:
             result["cancellation"] = cancellation
             result["reconciliation_required"] = bool(cancellation["reconciliation_required"])
+        elif status == "unknown":
+            # A bounded caller return is not a terminal outcome.  The same worker
+            # root owns recovery through the immutable Job UID and descriptor.
+            result["reconciliation_required"] = True
+            result["recovery_owner"] = "worker"
         if status == "succeeded":
             # This is target-bound collection intent only. It neither reads bytes
             # nor accepts an artifact/result.
@@ -427,10 +432,27 @@ class KubernetesDispatchWorkerService:
                 # Reporting can never delay local reconciliation or a stop.
                 pass
             cycles += 1
-            if status.observed_state in {"succeeded", "failed", "unknown"}:
-                return self._result(dispatch, package, status.observed_state)
             if self.now() >= hard_deadline:
                 return self._cancel(dispatch, package, "hard_deadline")
+            if status.observed_state in {"succeeded", "failed"}:
+                return self._result(dispatch, package, status.observed_state)
+            if status.observed_state == "unknown":
+                # Unknown is an authoritative adverse observation, not a reason to
+                # stop enforcing cancellation.  Recheck the same claim before a
+                # bounded return so a revocation/cancellation intent still reaches
+                # the adapter's Job-UID-scoped stop/reconciliation path.
+                try:
+                    response = self._claim(target_digest)
+                    dispatch, package = self._package(response, target_digest)
+                    outage_started = None
+                except ConnectionError as error:
+                    if getattr(error, "status", None) in {401, 403, 404, 409}:
+                        return self._cancel(dispatch, package, "authority_lost")
+                    outage_started = outage_started or self.now()
+                    if self.now() - outage_started >= timedelta(
+                        seconds=self.control_outage_seconds
+                    ):
+                        return self._cancel(dispatch, package, "control_outage")
             if max_cycles is not None and cycles >= max_cycles:
                 return self._result(dispatch, package, status.observed_state)
             self.sleep(self.poll_seconds)
