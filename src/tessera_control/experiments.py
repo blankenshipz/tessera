@@ -1290,6 +1290,14 @@ class ExperimentStore(Store):
             from .workers import WorkerRegistryStore
 
             WorkerRegistryStore.require_ready_worker(connection, worker, dispatch["project_id"])
+            # Claims return executable material.  Keep their fresh and replayed
+            # authorization identical to lease acquisition/renewal, including
+            # issuer eligibility, snapshot/skill releases and project limits.
+            from .execution import ExecutionStore
+
+            active_grant = ExecutionStore(self.database_path.parent)._active_worker_grant(
+                connection, worker, dispatch["grant_id"]
+            )
             operation = connection.execute(
                 "SELECT * FROM external_operations WHERE operation_id=?",
                 (dispatch["operation_id"],),
@@ -1311,6 +1319,7 @@ class ExperimentStore(Store):
                 or package is None
                 or dispatch["state"] == "cancel_requested"
                 or grant["status"] != "active"
+                or active_grant["id"] != grant["id"]
                 or grant["epoch"] != dispatch["epoch"]
                 or lease["epoch"] != dispatch["epoch"]
                 or operation["epoch"] != dispatch["epoch"]

@@ -18,19 +18,25 @@ Schema v36 adds an explicitly human-approved, provider-disabled Kubernetes
 dispatch outbox for an already packaged admitted attempt. The control plane
 stores the immutable package response, then binds its stable operation ID,
 admitted attempt, enrolled worker, lease/epoch, exact target digest and profile
-before a worker can claim it. Every claim replay, including one using the same
-idempotency key after a lost reply, rechecks the current grant, lease expiry and
-ready-worker state before returning the same control-issued package. It does not
+before a worker can claim it. Every fresh or replayed executable claim uses the
+same complete active-grant predicate as lease acquisition/renewal: ready worker,
+current task/approval, eligible issuer, snapshot and skill releases, and current
+currency/exposure/concurrency limits, as well as grant/lease/epoch identity. It does not
 create identities, select a current context, provision a target, or invoke
 Kubernetes. Grant revocation fences queued/claimed dispatch effects in the same
 transaction while original-operation observations remain available for
 reconciliation. The fake-client worker service supervises its one durable Job:
-it rechecks authority, reconciles long-running status, requests cancellation on
-denial/lease deadline, and never uses a replay or restart to create a replacement
-Job. Its report journal scopes immutable payload bytes and idempotency keys to
-the dispatch and operation, so a lost report reply is replayed exactly after
-restart. Collection remains metadata-only and export retains the dispatch to
-canonical admitted-attempt/operation linkage. This is not live-cluster support.
+it persists an immutable private descriptor before submission, rechecks
+start/renew authority, and otherwise only observes/cancels an existing Job. A
+restart after revocation, expiry, or control loss never creates a replacement
+Job. Heartbeat/renewal and control-outage handling are bounded; the immutable Job
+deadline is never extended. Its report journal scopes exact payload bytes and
+idempotency keys to the dispatch and operation, flushing an old pending report
+before a later terminal report. Reporting failure cannot block local stop or
+reconciliation. Cancellation retains the original Job UID and structured fresh
+absence proof; uncertainty remains an explicit reconciliation obligation.
+Collection remains metadata-only and export retains the dispatch to canonical
+admitted-attempt/operation linkage. This is not live-cluster support.
 
 Schema v21 adds human-created, metadata-only credential-access leases. They are
 separate from Tessera authentication credentials and bind one opaque `secret_ref`

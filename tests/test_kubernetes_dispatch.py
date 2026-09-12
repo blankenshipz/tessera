@@ -242,6 +242,49 @@ def test_claim_replay_with_same_key_rechecks_current_authority(tmp_path, authori
     assert fake.creates == 0
 
 
+@pytest.mark.parametrize("authority_change", ("release", "issuer", "limits"))
+def test_claim_uses_the_same_full_grant_predicate_as_lease_authority(tmp_path, authority_change):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client = TestClient(create_app(state))
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        if authority_change == "release":
+            connection.execute(
+                "UPDATE snapshot_releases SET expires_at=? WHERE id=?",
+                (
+                    (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                    connection.execute(
+                        "SELECT snapshot_release_id FROM execution_grants WHERE id=?",
+                        (package.package["grant_id"],),
+                    ).fetchone()[0],
+                ),
+            )
+        elif authority_change == "issuer":
+            issuer_id = connection.execute(
+                "SELECT created_by_principal_id FROM execution_grants WHERE id=?",
+                (package.package["grant_id"],),
+            ).fetchone()[0]
+            connection.execute("UPDATE principals SET role='agent' WHERE id=?", (issuer_id,))
+        else:
+            connection.execute(
+                "UPDATE execution_project_limits SET monetary_limit_cents=0 WHERE project_id=?",
+                (package.package["project_id"],),
+            )
+    rejected = client.post(
+        f"/worker/kubernetes-dispatches/{dispatch['id']}/claim",
+        json={
+            "target_digest": cluster_identity_digest(cluster),
+            "profile_version": cluster.profile,
+        },
+        headers={
+            "Authorization": "Bearer worker-token",
+            "Idempotency-Key": f"full-{authority_change}",
+        },
+    )
+    assert 400 <= rejected.status_code < 500
+
+
 def test_supervisor_cancels_long_running_dispatch_and_restart_after_disconnect(tmp_path):
     response, _worker, package = _admitted_package(tmp_path)
     state, cluster = tmp_path / "state", _cluster()
@@ -338,8 +381,14 @@ def test_lost_observation_reply_replays_exact_body_key_and_dispatch_scope(tmp_pa
             return super().post(path, body, key)
 
     lost = LostObservationReply(client)
-    with pytest.raises(ConnectionError, match="lost observation"):
-        _service(tmp_path, client, dispatch, fake, cluster, channel=lost).run(max_cycles=1)
+    # A reporting failure preserves the exact report for recovery but cannot
+    # prevent local reconciliation from returning its bounded state.
+    assert (
+        _service(tmp_path, client, dispatch, fake, cluster, channel=lost).run(max_cycles=1)[
+            "status"
+        ]
+        == "running"
+    )
     recovered = _service(tmp_path, client, dispatch, fake, cluster, channel=lost)
     assert recovered.run(max_cycles=1)["status"] == "running"
     assert lost.observations[0] == lost.observations[1]
@@ -362,5 +411,164 @@ def test_lost_observation_reply_replays_exact_body_key_and_dispatch_scope(tmp_pa
             "SELECT dispatch_id,operation_id,key FROM dispatch_reports "
             "ORDER BY dispatch_id,operation_id"
         ).fetchall()
-    assert len(rows) == 2 and {row[0] for row in rows} == {dispatch["id"], second_dispatch["id"]}
-    assert len({row[2] for row in rows}) == 2
+    assert len(rows) == 3 and {row[0] for row in rows} == {dispatch["id"], second_dispatch["id"]}
+    assert len({row[2] for row in rows}) == 3
+
+
+def test_restart_after_revocation_reconciles_then_cancels_without_a_create(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+
+    assert (
+        _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=1)["status"] == "running"
+    )
+    revoked = client.post(
+        f"/execution-grants/{package.package['grant_id']}/revoke",
+        json={"expected_revision": 1},
+        headers=_owner_headers(state) | {"Idempotency-Key": "restart-revoke"},
+    )
+    assert revoked.status_code == 200
+
+    recovered = _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=2)
+    assert recovered["status"] == "cancel_requested"
+    assert recovered["cancellation"]["job_uid"] == "job-fixture"
+    assert recovered["cancellation"]["termination_confirmed"] is True
+    assert recovered["reconciliation_required"] is False
+    assert fake.creates == 1
+
+
+def test_restart_uses_the_original_immutable_hard_deadline(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    now = [datetime.now(UTC)]
+    first = _service(tmp_path, client, dispatch, fake, cluster)
+    first.now = lambda: now[0]
+    assert first.run(max_cycles=1)["status"] == "running"
+
+    now[0] += timedelta(seconds=package.binding.active_deadline_seconds)
+    restarted = _service(tmp_path, client, dispatch, fake, cluster)
+    restarted.now = lambda: now[0]
+    result = restarted.run(max_cycles=1)
+    assert result["status"] == "cancel_requested"
+    assert result["cancellation"]["reason"] == "hard_deadline"
+    assert fake.creates == 1
+
+
+def test_renewal_retries_its_exact_key_after_a_lost_reply(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    now = [datetime.now(UTC)]
+
+    class LostRenewal(_ApiChannel):
+        def __init__(self, client):
+            super().__init__(client)
+            self.renewals: list[tuple[dict, str]] = []
+            self.lost = False
+
+        def post(self, path, body, key):
+            if path == "/worker/leases/renew":
+                self.renewals.append((body, key))
+                response = super().post(path, body, key)
+                if not self.lost:
+                    self.lost = True
+                    raise ConnectionError("lost renewal reply")
+                return response
+            return super().post(path, body, key)
+
+    channel = LostRenewal(client)
+    service = _service(tmp_path, client, dispatch, fake, cluster, channel=channel)
+    service.now = lambda: now[0]
+    service.renewal_seconds = 1
+    service.sleep = lambda _: now.__setitem__(0, now[0] + timedelta(seconds=2))
+    assert service.run(max_cycles=3)["status"] == "running"
+    assert len(channel.renewals) == 2 and channel.renewals[0] == channel.renewals[1]
+    assert fake.creates == 1
+
+
+def test_pending_running_report_flushes_before_fresh_terminal_report(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+
+    class LostFirstReport(_ApiChannel):
+        def __init__(self, client):
+            super().__init__(client)
+            self.reports: list[tuple[str, str]] = []
+            self.lost = False
+
+        def post(self, path, body, key):
+            if path == "/worker/observations":
+                self.reports.append((body["observed_state"], key))
+                response = super().post(path, body, key)
+                if not self.lost:
+                    self.lost = True
+                    raise ConnectionError("lost report reply")
+                return response
+            return super().post(path, body, key)
+
+    channel = LostFirstReport(client)
+    _service(tmp_path, client, dispatch, fake, cluster, channel=channel).run(max_cycles=1)
+    fake.jobs[package.binding.job_name] = fake.job("succeeded")
+    fake.pods = [fake.pod("Succeeded")]
+    assert (
+        _service(tmp_path, client, dispatch, fake, cluster, channel=channel).run()["status"]
+        == "succeeded"
+    )
+    assert channel.reports[:3] == [
+        ("running", channel.reports[0][1]),
+        ("running", channel.reports[0][1]),
+        ("exited", channel.reports[2][1]),
+    ]
+
+
+def test_cancellation_callback_uncertainty_retains_job_ownership_for_reconciliation(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=1)
+    fake.delete = lambda _name, _uid: (_ for _ in ()).throw(RuntimeError("delete unknown"))
+    assert (
+        client.post(
+            f"/execution-grants/{package.package['grant_id']}/revoke",
+            json={"expected_revision": 1},
+            headers=_owner_headers(state) | {"Idempotency-Key": "uncertain-cancel"},
+        ).status_code
+        == 200
+    )
+
+    result = _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=2)
+    assert result["status"] == "cancel_requested"
+    assert result["cancellation"]["job_uid"] == "job-fixture"
+    assert result["cancellation"]["termination_confirmed"] is False
+    assert result["reconciliation_required"] is True
+    assert fake.creates == 1
+
+
+def test_full_control_outage_is_bounded_to_observe_then_cancel_without_create(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=1)
+    now = [datetime.now(UTC)]
+
+    class Offline:
+        def post(self, _path, _body, _key):
+            raise ConnectionError("control offline")
+
+    service = _service(tmp_path, client, dispatch, fake, cluster, channel=Offline())
+    service.now = lambda: now[0]
+    service.control_outage_seconds = 1
+    service.sleep = lambda _: now.__setitem__(0, now[0] + timedelta(seconds=2))
+    result = service.run(max_cycles=3)
+    assert result["status"] == "cancel_requested"
+    assert result["cancellation"]["reason"] == "control_outage"
+    assert fake.creates == 1

@@ -252,8 +252,8 @@ def _cluster(live: DockerDesktopKubernetesAdapter, namespace: str):
     return cluster, _uid(pvc, "PersistentVolumeClaim", "outputs", namespace), _pvc_spec_sha256(pvc)
 
 
-class _BlockingLiveAdapter:
-    """The durable adapter with only explicit real-Kubernetes callbacks."""
+class _LiveAdapter:
+    """The durable nonblocking adapter with only explicit Kubernetes callbacks."""
 
     def __init__(self, live: DockerDesktopKubernetesAdapter, cluster, journal: Path) -> None:
         self.live, self.cluster, self.package = live, cluster, None
@@ -274,16 +274,7 @@ class _BlockingLiveAdapter:
 
     def submit(self, package):
         self.package = package
-        self.adapter.submit(package)
-        self.live._kubectl(
-            "wait",
-            "--for=condition=complete",
-            f"job/{package.binding.job_name}",
-            "--timeout=75s",
-            namespace=self.cluster.namespace,
-            timeout=90,
-        )
-        return self.adapter.reconcile(package)
+        return self.adapter.submit(package)
 
     def artifact_collection_handoff(self, package):
         return self.adapter.artifact_collection_handoff(package)
@@ -516,7 +507,7 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             credential_file = temporary_root / "worker.credential"
             credential_file.write_text(worker_token)
             credential_file.chmod(0o600)
-            adapter = _BlockingLiveAdapter(live, cluster, journal)
+            adapter = _LiveAdapter(live, cluster, journal)
             result = KubernetesDispatchWorkerService(
                 KubernetesDispatchWorkerConfig(
                     origin, dispatch["id"], credential_file, worker_root

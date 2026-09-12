@@ -31,8 +31,9 @@ the existing authenticated local workspace-adoption command plus normal human
 and worker HTTP routes to create a project, worker, input release, task plan,
 grant, lease, admitted attempt, immutable package, and human-approved dispatch
 outbox. The enrolled worker claims that outbox through the normal worker route;
-the unchanged control-issued package is handed to the durable adapter with only
-explicit Docker Desktop Kubernetes callbacks. It retains one uniquely named
+the unchanged control-issued package is handed to the same nonblocking durable
+adapter contract used by fake-callback tests; the runner never hides supervision
+inside a blocking Job wait. It retains one uniquely named
 namespace and its NetworkPolicy, PVC, Job/workload Pod and collector Pod. Its
 temporary control state (and credentials) is removed after the result is printed;
 its non-secret local adapter/claim journal is retained outside the repository.

@@ -33,8 +33,9 @@ relabeled as live validation.
 ## Design status matrix
 
 Reviewed 2026-09-11 against schema v36 human-approved Kubernetes dispatch/outbox
-late-observation, post-revocation confirmed-termination, replayed-claim authority,
-durable report-replay, and worker-supervision fences, and v32 admitted-attempt evidence identity,
+full-predicate replay, immutable private descriptor, bounded heartbeat/renewal and
+hard-deadline supervision, post-revocation observe/cancel-only recovery, durable
+report ordering, cancellation-UID uncertainty, and worker-supervision fences, and v32 admitted-attempt evidence identity,
 v29 append-only reviewed-conclusion correction lineage,
 v28 typed experiment-attempt operation provenance,
 v27 goal-to-decision historical-design-context and v26 evidence-retention records and v24 manual project-artifact

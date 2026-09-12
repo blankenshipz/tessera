@@ -24,6 +24,7 @@ from .kubernetes_contracts import (
     KubernetesJobJournal,
     KubernetesJobObservation,
     KubernetesPodObservation,
+    KubernetesProviderIdentity,
     canonical_json,
     cluster_identity_digest,
     parse_pod,
@@ -209,16 +210,47 @@ class KubernetesExecutionAdapter:
         self._bind(package)
         self._mark_cancellation_requested(package.operation_id)
         try:
-            return self._journal.request_cancel(
+            observation = self._journal.request_cancel(
                 package.binding,
                 self.cluster,
                 self._inspect_job,
                 self._delete_job,
                 self._observe_pods,
             )
+            self._record_cancellation(package, observation)
+            return observation
         except Exception:
+            self._record_cancellation(
+                package, KubernetesCancellationObservation(True, False, False, False)
+            )
             self._record_unknown(package)
             raise
+
+    def cancellation_proof(self, package: KubernetesExecutionPackage) -> dict[str, object]:
+        """Return the durable cancellation evidence without claiming a stop.
+
+        The first attributed Job UID survives Job deletion and restart.  A missing
+        UID or an unconfirmed fresh absence is explicitly reconciliation work.
+        """
+        self._bind(package)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT job_uid,cancellation_json FROM kubernetes_execution_bindings "
+                "WHERE operation_id=?",
+                (package.operation_id,),
+            ).fetchone()
+        if row is None:
+            raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
+        proof = json.loads(row["cancellation_json"]) if row["cancellation_json"] else {}
+        if not isinstance(proof, dict):
+            raise KubernetesExecutionError("Kubernetes cancellation evidence is malformed.")
+        proof["job_uid"] = row["job_uid"]
+        proof["reconciliation_required"] = not bool(proof.get("termination_confirmed"))
+        if row["job_uid"] is not None:
+            proof["provider_id"] = KubernetesProviderIdentity(
+                self.cluster.cluster_uid, self.cluster.namespace_uid, row["job_uid"]
+            ).provider_id
+        return proof
 
     def associate_opencode_session(
         self, package: KubernetesExecutionPackage, binding: TesseraBinding
@@ -389,6 +421,21 @@ class KubernetesExecutionAdapter:
             ):
                 raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
 
+    def _record_cancellation(
+        self, package: KubernetesExecutionPackage, observation: KubernetesCancellationObservation
+    ) -> None:
+        proof = canonical_json(observation.__dict__).decode("utf-8")
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "UPDATE kubernetes_execution_bindings SET cancellation_json=? "
+                    "WHERE operation_id=?",
+                    (proof, package.operation_id),
+                ).rowcount
+                != 1
+            ):
+                raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
+
     def _bind(self, package: KubernetesExecutionPackage) -> None:
         target_digest = cluster_identity_digest(self.cluster)
         encoded = canonical_json(
@@ -408,8 +455,10 @@ class KubernetesExecutionAdapter:
                     """INSERT INTO kubernetes_execution_bindings
                     (operation_id, intent_json, target_digest, namespace, namespace_uid, pvc_name,
                      pvc_uid, pvc_spec_sha256, job_name, pod_uids_json, observed_state,
-                     cancellation_requested, handoff_json, harness_instance_id, opencode_session_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 'unknown', 0, NULL, NULL, NULL)""",
+                     cancellation_requested, cancellation_json, handoff_json,
+                     harness_instance_id, opencode_session_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 'unknown', 0,
+                     NULL, NULL, NULL, NULL)""",
                     (
                         package.operation_id,
                         encoded,
@@ -436,9 +485,17 @@ class KubernetesExecutionAdapter:
                 namespace TEXT NOT NULL, namespace_uid TEXT NOT NULL, pvc_name TEXT NOT NULL,
                 pvc_uid TEXT NOT NULL, pvc_spec_sha256 TEXT NOT NULL, job_name TEXT NOT NULL,
                 job_uid TEXT, pod_uids_json TEXT NOT NULL, observed_state TEXT NOT NULL,
-                cancellation_requested INTEGER NOT NULL, handoff_json TEXT,
+                cancellation_requested INTEGER NOT NULL, cancellation_json TEXT, handoff_json TEXT,
                 harness_instance_id TEXT, opencode_session_id TEXT)"""
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(kubernetes_execution_bindings)")
+            }
+            if "cancellation_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE kubernetes_execution_bindings ADD COLUMN cancellation_json TEXT"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database)
