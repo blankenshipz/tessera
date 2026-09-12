@@ -3,7 +3,7 @@
 This file tracks executable evidence against DESIGN.md. Tessera is a source-only
 developer alpha: initial development uses logical commits on main and PRs remain
 paused. The full design and real research pilot are not complete. It has no
-production remote/provider/OpenCode/Kubernetes support claim; schema v35 is the
+production remote/provider/OpenCode/Kubernetes support claim; schema v36 is the
 current local schema.
 
 ## Redirected next milestone (planned)
@@ -32,7 +32,7 @@ relabeled as live validation.
 
 ## Design status matrix
 
-Reviewed 2026-09-11 against schema v35 immutable human admitted-attempt outcomes,
+Reviewed 2026-09-11 against schema v36 human-approved Kubernetes dispatch/outbox
 late-observation and post-revocation confirmed-termination fences, and v32 admitted-attempt evidence identity,
 v29 append-only reviewed-conclusion correction lineage,
 v28 typed experiment-attempt operation provenance,
@@ -443,9 +443,10 @@ representative investigation have not passed end-to-end acceptance.
     not pilot acceptance.
 
 31. **Kubernetes execution fake adapter:** a normal, human-admitted
-    `kubernetes-opencode` package records its schema-v35 external-operation intent
-    before the worker adapter persists its exact cluster/namespace/PVC/Job intent
-    and invokes injected Job callbacks. It translates only the fixed command,
+    `kubernetes-opencode` package records its external-operation intent. Schema
+    v36 adds an explicit human target-bound dispatch/outbox and enrolled-worker
+    claim before the worker adapter persists its exact cluster/namespace/PVC/Job
+    intent and invokes injected Job callbacks. It translates only the fixed command,
     deadline, network-none and PVC fields into the existing canonical Job contract;
     it records Job/owned-Pod bindings, holds lost create replies and contradictory
     observations, persists cancellation before create, survives local journal

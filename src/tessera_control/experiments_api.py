@@ -5,13 +5,15 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from .api import idempotency_key, principal
+from .api import idempotency_key, principal, worker_principal
 from .experiments import EXPORT_DEFAULT_BYTES, EXPORT_MAX_BYTES, ExperimentStore
 from .experiments_models import (
     AdmitExperimentAttempt,
     AmendConclusion,
+    ClaimKubernetesDispatch,
     CreateConclusion,
     CreateExperiment,
+    DispatchAdmittedAttempt,
     LinkAttemptArtifacts,
     RecordAttempt,
     RecordMeasurement,
@@ -86,6 +88,34 @@ def admit_attempt(
     payload = body.model_dump(mode="json")
     return response(
         records.admit_attempt(actor, variant_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/experiment-admitted-attempts/{attempt_id}/dispatch")
+def dispatch_admitted_attempt(
+    attempt_id: str, body: DispatchAdmittedAttempt, actor: Actor, key: Key, records: Experiments
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.dispatch_admitted_attempt(
+            actor, attempt_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/worker/kubernetes-dispatches/{dispatch_id}/claim")
+def claim_kubernetes_dispatch(
+    dispatch_id: str,
+    body: ClaimKubernetesDispatch,
+    worker: Annotated[dict[str, Any], Depends(worker_principal)],
+    key: Key,
+    records: Experiments,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.claim_kubernetes_dispatch(
+            worker, dispatch_id, key, canonical_digest(payload), payload
+        )
     )
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -18,8 +19,10 @@ from pydantic import BaseModel, ValidationError
 from .experiments_models import (
     AdmitExperimentAttempt,
     AmendConclusion,
+    ClaimKubernetesDispatch,
     CreateConclusion,
     CreateExperiment,
+    DispatchAdmittedAttempt,
     ExportExperiment,
     LinkAttemptArtifacts,
     RecordAttempt,
@@ -34,7 +37,7 @@ from .project_artifact_retention import (
     admit_experiment_artifact_evidence_reference,
     validate_experiment_artifact_evidence_reference,
 )
-from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, utc_now
+from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, _parse_utc, utc_now
 
 T = TypeVar("T", bound=BaseModel)
 EXPORT_RECORD_LIMIT = 1_000
@@ -1125,6 +1128,237 @@ class ExperimentStore(Store):
             command,
         )
 
+    def dispatch_admitted_attempt(
+        self,
+        principal: dict[str, Any],
+        attempt_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | DispatchAdmittedAttempt,
+    ) -> tuple[int, dict[str, Any]]:
+        """Write the human dispatch outbox after, never before, package admission.
+
+        The normal package endpoint intentionally remains the sole package issuer.
+        This command only authorizes the already frozen package to be claimed on
+        the named target; it makes no Kubernetes call.
+        """
+        body = self._body(DispatchAdmittedAttempt, payload)
+        path = f"/experiment-admitted-attempts/{attempt_id}/dispatch"
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor)
+            attempt_row = connection.execute(
+                """SELECT a.*,e.project_id,p.org_id FROM research_experiment_admitted_attempts a
+                JOIN research_experiments e ON e.id=a.experiment_id JOIN projects p ON p.id=e.project_id
+                WHERE a.id=? AND p.org_id=? AND (? IS NULL OR e.project_id=?)""",
+                (attempt_id, actor["org_id"], actor["project_id"], actor["project_id"]),
+            ).fetchone()
+            if attempt_row is None:
+                raise NotFound("Admitted experiment attempt was not found.")
+            attempt = dict(attempt_row)
+            if attempt["revision"] != body["expected_revision"]:
+                raise Conflict("Admitted experiment attempt revision is no longer current.")
+            if attempt["outcome"] is not None or attempt["operation_id"] is None:
+                raise Conflict("An unresolved packaged admitted attempt is required for dispatch.")
+            operation = connection.execute(
+                "SELECT * FROM external_operations WHERE operation_id=?", (attempt["operation_id"],)
+            ).fetchone()
+            package = connection.execute(
+                "SELECT * FROM execution_runtime_packages WHERE operation_id=?",
+                (attempt["operation_id"],),
+            ).fetchone()
+            if (
+                operation is None
+                or package is None
+                or operation["adapter_version"] != "kubernetes-job-v1"
+                or operation["profile_version"] != body["profile_version"]
+                or operation["desired_state"] != "admitted"
+                or operation["package_digest"] != attempt["package_digest"]
+                or package["package_digest"] != attempt["package_digest"]
+                or operation["experiment_attempt_id"] != attempt_id
+            ):
+                raise Conflict("Admitted attempt has no current Kubernetes package authority.")
+            grant = connection.execute(
+                "SELECT * FROM execution_grants WHERE id=?", (operation["grant_id"],)
+            ).fetchone()
+            lease = connection.execute(
+                "SELECT * FROM execution_leases WHERE id=?", (operation["lease_id"],)
+            ).fetchone()
+            if (
+                grant is None
+                or lease is None
+                or grant["status"] != "active"
+                or grant["epoch"] != lease["epoch"]
+                or operation["epoch"] != lease["epoch"]
+                or _parse_utc(lease["expires_at"]) <= datetime.now(UTC)
+            ):
+                raise Conflict("Kubernetes dispatch authority is no longer current.")
+            existing = connection.execute(
+                "SELECT * FROM kubernetes_dispatches WHERE operation_id=?",
+                (operation["operation_id"],),
+            ).fetchone()
+            expected = {
+                "operation_id": operation["operation_id"],
+                "admitted_attempt_id": attempt_id,
+                "org_id": actor["org_id"],
+                "project_id": attempt["project_id"],
+                "grant_id": operation["grant_id"],
+                "lease_id": operation["lease_id"],
+                "worker_principal_id": operation["worker_principal_id"],
+                "epoch": operation["epoch"],
+                "package_digest": operation["package_digest"],
+                "target_digest": body["target_digest"],
+                "profile_version": body["profile_version"],
+            }
+            if existing is not None:
+                if any(existing[field] != value for field, value in expected.items()):
+                    raise Conflict("Kubernetes dispatch identity or target conflicts.")
+                return 200, dict(existing)
+            now = utc_now()
+            row = expected | {
+                "id": "kubernetes_dispatch_" + uuid.uuid4().hex,
+                "state": "queued",
+                "claimed_at": None,
+                "claimed_by_principal_id": None,
+                "created_at": now,
+                "updated_at": now,
+                "created_by_principal_id": actor["id"],
+            }
+            connection.execute(
+                """INSERT INTO kubernetes_dispatches
+                (id,operation_id,admitted_attempt_id,org_id,project_id,grant_id,lease_id,
+                 worker_principal_id,epoch,package_digest,target_digest,profile_version,state,
+                 claimed_at,claimed_by_principal_id,created_at,updated_at,created_by_principal_id)
+                VALUES (:id,:operation_id,:admitted_attempt_id,:org_id,:project_id,:grant_id,:lease_id,
+                :worker_principal_id,:epoch,:package_digest,:target_digest,:profile_version,:state,
+                :claimed_at,:claimed_by_principal_id,:created_at,:updated_at,:created_by_principal_id)""",
+                row,
+            )
+            self._event(
+                connection,
+                actor,
+                self._experiment(connection, actor, attempt["experiment_id"]),
+                "experiment.kubernetes_dispatch_approved",
+                attempt["revision"],
+                {
+                    "admitted_attempt_id": attempt_id,
+                    "operation_id": row["operation_id"],
+                    "target_digest": row["target_digest"],
+                    "profile_version": row["profile_version"],
+                    "execution_dispatched": True,
+                },
+            )
+            return 201, row
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
+    def claim_kubernetes_dispatch(
+        self,
+        principal: dict[str, Any],
+        dispatch_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | ClaimKubernetesDispatch,
+    ) -> tuple[int, dict[str, Any]]:
+        """Return one exact package only to its enrolled target-bound worker."""
+        body = self._body(ClaimKubernetesDispatch, payload)
+        path = f"/kubernetes-dispatches/{dispatch_id}/claim"
+
+        def command(
+            connection: sqlite3.Connection, worker: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            dispatch = connection.execute(
+                "SELECT * FROM kubernetes_dispatches WHERE id=? AND org_id=?",
+                (dispatch_id, worker["org_id"]),
+            ).fetchone()
+            if dispatch is None or dispatch["worker_principal_id"] != worker["id"]:
+                raise NotFound("Kubernetes dispatch was not found.")
+            if (
+                dispatch["target_digest"] != body["target_digest"]
+                or dispatch["profile_version"] != body["profile_version"]
+            ):
+                raise Conflict("Kubernetes dispatch target or profile does not match this worker.")
+            from .workers import WorkerRegistryStore
+
+            WorkerRegistryStore.require_ready_worker(connection, worker, dispatch["project_id"])
+            operation = connection.execute(
+                "SELECT * FROM external_operations WHERE operation_id=?",
+                (dispatch["operation_id"],),
+            ).fetchone()
+            lease = connection.execute(
+                "SELECT * FROM execution_leases WHERE id=?", (dispatch["lease_id"],)
+            ).fetchone()
+            grant = connection.execute(
+                "SELECT * FROM execution_grants WHERE id=?", (dispatch["grant_id"],)
+            ).fetchone()
+            package = connection.execute(
+                "SELECT * FROM execution_runtime_packages WHERE operation_id=?",
+                (dispatch["operation_id"],),
+            ).fetchone()
+            if (
+                operation is None
+                or lease is None
+                or grant is None
+                or package is None
+                or dispatch["state"] == "cancel_requested"
+                or grant["status"] != "active"
+                or grant["epoch"] != dispatch["epoch"]
+                or lease["epoch"] != dispatch["epoch"]
+                or operation["epoch"] != dispatch["epoch"]
+                or lease["worker_principal_id"] != worker["id"]
+                or operation["worker_principal_id"] != worker["id"]
+                or operation["package_digest"] != dispatch["package_digest"]
+                or package["package_digest"] != dispatch["package_digest"]
+                or _parse_utc(lease["expires_at"]) <= datetime.now(UTC)
+            ):
+                raise Conflict("Kubernetes dispatch authority is no longer current.")
+            try:
+                package_value = json.loads(package["package_json"])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise Conflict("Kubernetes dispatch package record is invalid.") from error
+            if (
+                not isinstance(package_value, dict)
+                or package_value.get("operation_id") != dispatch["operation_id"]
+            ):
+                raise Conflict("Kubernetes dispatch package identity conflicts.")
+            if dispatch["state"] == "queued":
+                now = utc_now()
+                connection.execute(
+                    "UPDATE kubernetes_dispatches SET state='claimed',claimed_at=?,claimed_by_principal_id=?,updated_at=? WHERE id=? AND state='queued'",
+                    (now, worker["id"], now, dispatch_id),
+                )
+                dispatch = connection.execute(
+                    "SELECT * FROM kubernetes_dispatches WHERE id=?", (dispatch_id,)
+                ).fetchone()
+                self._event(
+                    connection,
+                    worker,
+                    {"project_id": dispatch["project_id"]},
+                    "experiment.kubernetes_dispatch_claimed",
+                    dispatch["epoch"],
+                    {
+                        "dispatch_id": dispatch_id,
+                        "admitted_attempt_id": dispatch["admitted_attempt_id"],
+                        "operation_id": dispatch["operation_id"],
+                        "execution_dispatched": True,
+                    },
+                )
+            elif dispatch["claimed_by_principal_id"] != worker["id"]:
+                raise Conflict("Kubernetes dispatch was claimed by another worker.")
+            return 200, {
+                "dispatch": dict(dispatch),
+                "operation": dict(operation),
+                "package": package_value,
+                "package_digest": dispatch["package_digest"],
+                "admitted_attempt_id": dispatch["admitted_attempt_id"],
+                "lease": dict(lease),
+                "execution_dispatched": True,
+            }
+
+        return self._mutate(principal, key, "POST", path, digest, command, audience="worker")
+
     def resolve_admitted_attempt(
         self,
         principal: dict[str, Any],
@@ -2141,6 +2375,13 @@ class ExperimentStore(Store):
                     (experiment_id,),
                 ),
                 (
+                    "kubernetes dispatches",
+                    """SELECT count(*) FROM kubernetes_dispatches d
+                    JOIN research_experiment_admitted_attempts a ON a.id=d.admitted_attempt_id
+                    WHERE a.experiment_id=?""",
+                    (experiment_id,),
+                ),
+                (
                     "admitted attempt state history",
                     """SELECT count(*) FROM research_experiment_admitted_attempt_states s
                     JOIN research_experiment_admitted_attempts a ON a.id=s.attempt_id
@@ -2196,6 +2437,7 @@ class ExperimentStore(Store):
                 "variants": [],
                 "attempts": [],
                 "admitted_attempts": [],
+                "kubernetes_dispatches": [],
                 "operations": [],
                 "artifact_links": [],
                 "artifacts": [],
@@ -2272,6 +2514,13 @@ class ExperimentStore(Store):
                 ]
                 admission["scientific_validity"] = "not_assessed"
                 append("admitted_attempts", admission)
+            for row in connection.execute(
+                """SELECT d.* FROM kubernetes_dispatches d
+                JOIN research_experiment_admitted_attempts a ON a.id=d.admitted_attempt_id
+                WHERE a.experiment_id=? ORDER BY d.created_at,d.id""",
+                (experiment_id,),
+            ):
+                append("kubernetes_dispatches", dict(row))
             for row in connection.execute(
                 """SELECT o.* FROM external_operations o WHERE o.org_id=? AND o.project_id=?
                 AND (o.experiment_id=? OR EXISTS (SELECT 1 FROM research_experiment_attempts a

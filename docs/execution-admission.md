@@ -14,6 +14,19 @@ fences tenant, worker, lease, epoch and immutable provider identity. It updates
 only the receipt's observed state and cannot settle cost, accept a result, or
 release an artifact. v18 operations and legacy leases migrate with no receipts.
 
+Schema v36 adds an explicitly human-approved, provider-disabled Kubernetes
+dispatch outbox for an already packaged admitted attempt. The control plane
+stores the immutable package response, then binds its stable operation ID,
+admitted attempt, enrolled worker, lease/epoch, exact target digest and profile
+before a worker can claim it. Claim rechecks those bindings and returns the same
+control-issued package; it does not create identities, select a current context,
+provision a target, or invoke Kubernetes. Grant revocation fences queued/claimed
+dispatch effects in the same transaction while original-operation observations
+remain available for reconciliation. The fake-client worker service only passes
+that unchanged package to the hardened adapter and records operational status;
+its collection handoff remains metadata-only and export retains the dispatch to
+canonical admitted-attempt/operation linkage. This is not live-cluster support.
+
 Schema v21 adds human-created, metadata-only credential-access leases. They are
 separate from Tessera authentication credentials and bind one opaque `secret_ref`
 to the current grant, execution lease, worker and epoch. The lease is provider

@@ -280,6 +280,32 @@ class RuntimePackageStore(ExecutionStore):
             operation, created = self._record_operation_intent(
                 connection, live, package, metadata["package_digest"], operation_request_digest
             )
+            if package["adapter_version"] == "kubernetes-job-v1":
+                connection.execute(
+                    """INSERT INTO execution_runtime_packages
+                    (operation_id,package_digest,package_json,created_at) VALUES (?,?,?,?)
+                    ON CONFLICT(operation_id) DO NOTHING""",
+                    (
+                        package["operation_id"],
+                        metadata["package_digest"],
+                        json.dumps(package, sort_keys=True, separators=(",", ":")),
+                        self._now().isoformat(),
+                    ),
+                )
+                stored = connection.execute(
+                    "SELECT package_digest,package_json FROM execution_runtime_packages "
+                    "WHERE operation_id=?",
+                    (package["operation_id"],),
+                ).fetchone()
+                if (
+                    stored is None
+                    or stored["package_digest"] != metadata["package_digest"]
+                    or stored["package_json"]
+                    != json.dumps(package, sort_keys=True, separators=(",", ":"))
+                ):
+                    raise Conflict(
+                        "Execution package record conflicts with immutable operation identity."
+                    )
             bound_attempt_id = metadata["admitted_attempt_id"]
             if bound_attempt_id is not None:
                 bind_admitted_attempt_package(
@@ -326,6 +352,19 @@ class RuntimePackageStore(ExecutionStore):
                 metadata["package_digest"],
                 operation_request_digest,
             )
+            if metadata["package"]["adapter_version"] == "kubernetes-job-v1":
+                stored = connection.execute(
+                    "SELECT package_digest,package_json FROM execution_runtime_packages "
+                    "WHERE operation_id=?",
+                    (metadata["package"]["operation_id"],),
+                ).fetchone()
+                if (
+                    stored is None
+                    or stored["package_digest"] != metadata["package_digest"]
+                    or stored["package_json"]
+                    != json.dumps(metadata["package"], sort_keys=True, separators=(",", ":"))
+                ):
+                    raise Conflict("Execution package record is no longer current.")
             metadata["operation"] = operation
             bound_attempt_id = metadata["admitted_attempt_id"]
             if bound_attempt_id is not None:

@@ -65,6 +65,57 @@ def create_experiment_operation_binding_schema(connection: sqlite3.Connection) -
     )
 
 
+def create_kubernetes_dispatch_schema(connection: sqlite3.Connection) -> None:
+    """Install empty durable package and Kubernetes dispatch records.
+
+    A package remains control-issued authority.  The dispatch row is a separate
+    human decision that binds that immutable package to one already identified
+    Kubernetes target; it is not a provider receipt or a Kubernetes credential.
+    """
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS execution_runtime_packages (
+        operation_id TEXT PRIMARY KEY REFERENCES external_operations(operation_id),
+        package_digest TEXT NOT NULL CHECK (
+            length(package_digest)=64 AND package_digest NOT GLOB '*[^0-9a-f]*'),
+        package_json TEXT NOT NULL, created_at TEXT NOT NULL)"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS kubernetes_dispatches (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL UNIQUE REFERENCES external_operations(operation_id),
+        admitted_attempt_id TEXT NOT NULL UNIQUE
+            REFERENCES research_experiment_admitted_attempts(id),
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        grant_id TEXT NOT NULL UNIQUE REFERENCES execution_grants(id),
+        lease_id TEXT NOT NULL UNIQUE REFERENCES execution_leases(id),
+        worker_principal_id TEXT NOT NULL REFERENCES principals(id),
+        epoch INTEGER NOT NULL CHECK (epoch >= 1),
+        package_digest TEXT NOT NULL CHECK (
+            length(package_digest)=64 AND package_digest NOT GLOB '*[^0-9a-f]*'),
+        target_digest TEXT NOT NULL CHECK (
+            length(target_digest)=64 AND target_digest NOT GLOB '*[^0-9a-f]*'),
+        profile_version TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('queued','claimed','cancel_requested')),
+        claimed_at TEXT, claimed_by_principal_id TEXT REFERENCES principals(id),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        created_by_principal_id TEXT NOT NULL REFERENCES principals(id))"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS kubernetes_dispatches_by_worker "
+        "ON kubernetes_dispatches(worker_principal_id,state,created_at,id)"
+    )
+    connection.execute(
+        """CREATE TRIGGER IF NOT EXISTS kubernetes_dispatches_fence_cancel
+        AFTER UPDATE OF desired_state ON external_operations
+        WHEN NEW.desired_state='cancel_requested'
+        BEGIN
+          UPDATE kubernetes_dispatches SET state='cancel_requested',updated_at=NEW.updated_at
+          WHERE operation_id=NEW.operation_id AND state IN ('queued','claimed');
+        END"""
+    )
+
+
 def create_external_operation_receipt_schema(connection: sqlite3.Connection) -> None:
     """Install v19 receipt records without assigning evidence to v18 rows."""
     connection.execute(

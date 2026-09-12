@@ -1006,12 +1006,13 @@ def test_v35_receipt_sequence_migration_preserves_existing_receipt_state(tmp_pat
             "ALTER TABLE external_operation_receipts DROP COLUMN observation_sequence"
         )
         connection.execute("UPDATE schema_meta SET schema_version=34")
-    assert migrate_state(state) == 35
+    assert migrate_state(state) == 36
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT observation_sequence FROM external_operation_receipts WHERE operation_id=?",
             (operation_id,),
         ).fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM kubernetes_dispatches").fetchone() == (0,)
 
 
 @pytest.mark.parametrize("outcome", ("succeeded", "cancelled"))

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 35
+LATEST_SCHEMA_VERSION = 36
 LOCAL_ORG_ID = "org_local"
 
 
@@ -675,6 +675,14 @@ def migrate_v34_to_v35(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 35 WHERE singleton = 1")
 
 
+def migrate_v35_to_v36(connection: sqlite3.Connection) -> None:
+    """Add empty human-approved Kubernetes dispatch/outbox records."""
+    from .external_operations import create_kubernetes_dispatch_schema
+
+    create_kubernetes_dispatch_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 36 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -710,6 +718,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     32: migrate_v32_to_v33,
     33: migrate_v33_to_v34,
     34: migrate_v34_to_v35,
+    35: migrate_v35_to_v36,
 }
 
 

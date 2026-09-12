@@ -109,6 +109,21 @@ class ResolveAdmittedAttempt(ExperimentRequest):
         return self
 
 
+class DispatchAdmittedAttempt(ExperimentRequest):
+    """A human binds an already frozen Kubernetes package to one target."""
+
+    expected_revision: Revision
+    target_digest: Digest
+    profile_version: Literal["development-minikube-opencode-v1"]
+
+
+class ClaimKubernetesDispatch(ExperimentRequest):
+    """A worker proves its local target before receiving its frozen package."""
+
+    target_digest: Digest
+    profile_version: Literal["development-minikube-opencode-v1"]
+
+
 class LinkAttemptArtifacts(ExperimentRequest):
     expected_revision: Revision
     artifact_ids: Annotated[list[Identifier], Field(min_length=1, max_length=128)]
