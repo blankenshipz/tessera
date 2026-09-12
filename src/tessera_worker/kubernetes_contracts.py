@@ -874,9 +874,7 @@ class KubernetesJobJournal:
         self._reject_cancelled_create(binding.operation_id)
         found = inspect(binding.job_name)
         if found is not None:
-            return self._record_observation(
-                parse_job(found, binding, cluster), binding.operation_id
-            )
+            return self.reconcile_observation(binding, cluster, found)
         if self._create_intent(binding.operation_id):
             raise KubernetesUnresolvedError(
                 "Kubernetes Job create remains unresolved; inspect only."
@@ -889,7 +887,24 @@ class KubernetesJobJournal:
         found = created if created is not None else inspect(binding.job_name)
         if found is None:
             raise KubernetesUnresolvedError("Kubernetes Job create reply was lost; inspect only.")
-        return self._record_observation(parse_job(found, binding, cluster), binding.operation_id)
+        return self.reconcile_observation(binding, cluster, found)
+
+    def reconcile_observation(
+        self,
+        binding: KubernetesJobBinding,
+        cluster: KubernetesClusterConfig,
+        observed: Mapping[str, object],
+    ) -> KubernetesJobObservation:
+        """Validate and durably bind one observed Job before handing it onward.
+
+        A deterministic name can be reused after deletion. The first valid UID
+        is therefore immutable operation identity, not merely create replay
+        metadata. Every normal observation path uses this fence before a status,
+        Pod query, or collection handoff can identify the Job.
+        """
+        manifest = job_manifest(binding, cluster)
+        self._bind(binding, manifest)
+        return self._record_observation(parse_job(observed, binding, cluster), binding.operation_id)
 
     def request_cancel(
         self,
@@ -920,15 +935,19 @@ class KubernetesJobJournal:
             except Exception:
                 return KubernetesCancellationObservation(True, True, False, False)
             return KubernetesCancellationObservation(True, True, True, not pods)
-        initial = self._record_observation(parse_job(first, binding, cluster), binding.operation_id)
+        initial = self.reconcile_observation(binding, cluster, first)
         try:
             delete(binding.job_name, initial.job_uid)
         except Exception:
             return KubernetesCancellationObservation(True, False, False, False)
         try:
             after = inspect(binding.job_name)
-            fresh_job = parse_job(after, binding, cluster) if after is not None else None
+            fresh_job = (
+                self.reconcile_observation(binding, cluster, after) if after is not None else None
+            )
             pods = observe_pods(initial.job_uid)
+        except KubernetesContractError:
+            raise
         except Exception:
             return KubernetesCancellationObservation(True, False, False, False)
         if fresh_job is not None and fresh_job.job_uid != initial.job_uid:

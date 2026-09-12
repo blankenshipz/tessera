@@ -24,10 +24,8 @@ from .kubernetes_contracts import (
     KubernetesJobJournal,
     KubernetesJobObservation,
     KubernetesPodObservation,
-    KubernetesUnresolvedError,
     canonical_json,
     cluster_identity_digest,
-    parse_job,
     parse_pod,
 )
 from .opencode_harness import TesseraBinding
@@ -188,39 +186,39 @@ class KubernetesExecutionAdapter:
             job = self._journal.reconcile_create(
                 package.binding, self.cluster, self._inspect_job, self._create_job
             )
-        except KubernetesUnresolvedError:
+            return self._record_status(package, job)
+        except Exception:
+            self._record_unknown(package)
             raise
-        return self._record_status(package, job)
 
     def reconcile(self, package: KubernetesExecutionPackage) -> KubernetesExecutionStatus:
         """Observe existing Job/owned Pods only; reconciliation never creates work."""
         self._bind(package)
-        observed = self._inspect_job(package.binding.job_name)
-        if observed is None:
-            return KubernetesExecutionStatus(package.operation_id, None, (), "unknown")
-        job = parse_job(observed, package.binding, self.cluster)
-        return self._record_status(package, job)
+        try:
+            observed = self._inspect_job(package.binding.job_name)
+            if observed is None:
+                return self._record_unknown(package)
+            job = self._journal.reconcile_observation(package.binding, self.cluster, observed)
+            return self._record_status(package, job)
+        except Exception:
+            self._record_unknown(package)
+            raise
 
     def cancel(self, package: KubernetesExecutionPackage) -> KubernetesCancellationObservation:
-        """Persisted cancellation is delegated to the durable Job create fence."""
+        """Persist cancellation before any Kubernetes callback or inspection."""
         self._bind(package)
-        observed = self._inspect_job(package.binding.job_name)
-        if observed is not None:
-            self._record_status(package, parse_job(observed, package.binding, self.cluster))
-        result = self._journal.request_cancel(
-            package.binding,
-            self.cluster,
-            self._inspect_job,
-            self._delete_job,
-            self._observe_pods,
-        )
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE kubernetes_execution_bindings SET cancellation_requested=1 "
-                "WHERE operation_id=?",
-                (package.operation_id,),
+        self._mark_cancellation_requested(package.operation_id)
+        try:
+            return self._journal.request_cancel(
+                package.binding,
+                self.cluster,
+                self._inspect_job,
+                self._delete_job,
+                self._observe_pods,
             )
-        return result
+        except Exception:
+            self._record_unknown(package)
+            raise
 
     def associate_opencode_session(
         self, package: KubernetesExecutionPackage, binding: TesseraBinding
@@ -272,24 +270,35 @@ class KubernetesExecutionAdapter:
         self._bind(package)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT job_uid, pod_uids_json, observed_state FROM kubernetes_execution_bindings "
+                "SELECT job_uid, pod_uids_json, observed_state, cancellation_requested, "
+                "namespace, namespace_uid, pvc_name, pvc_uid, pvc_spec_sha256 "
+                "FROM kubernetes_execution_bindings "
                 "WHERE operation_id=?",
                 (package.operation_id,),
             ).fetchone()
-            if row is None or row["observed_state"] != "succeeded" or row["job_uid"] is None:
+            if (
+                row is None
+                or row["observed_state"] != "succeeded"
+                or row["cancellation_requested"]
+                or row["job_uid"] is None
+            ):
                 raise KubernetesExecutionError(
                     "Artifact collection requires an observed successful Kubernetes Job."
                 )
             pod_uids = tuple(json.loads(row["pod_uids_json"]))
+            if not pod_uids:
+                raise KubernetesExecutionError(
+                    "Artifact collection requires explicit successful owned-Pod evidence."
+                )
             handoff = ArtifactCollectionHandoff(
                 operation_id=package.operation_id,
                 admitted_attempt_id=package.binding.attempt_id,
                 target_digest=cluster_identity_digest(self.cluster),
-                namespace=self.cluster.namespace,
-                namespace_uid=self.cluster.namespace_uid,
-                pvc_name=package.output.pvc_name,
-                pvc_uid=package.output.pvc_uid,
-                pvc_spec_sha256=package.output.pvc_spec_sha256,
+                namespace=row["namespace"],
+                namespace_uid=row["namespace_uid"],
+                pvc_name=row["pvc_name"],
+                pvc_uid=row["pvc_uid"],
+                pvc_spec_sha256=row["pvc_spec_sha256"],
                 mount_path=package.output.mount_path,
                 output_paths=tuple(package.package["output_paths"]),
                 job_uid=row["job_uid"],
@@ -318,7 +327,9 @@ class KubernetesExecutionAdapter:
             for pod in self._observe_pods(job.job_uid)
         )
         states = {pod.state for pod in pods}
-        if "unknown" in states or (job.state == "succeeded" and states - {"succeeded"}):
+        if "unknown" in states or (
+            job.state == "succeeded" and (not pods or states != {"succeeded"})
+        ):
             state: Literal["pending", "running", "succeeded", "failed", "unknown"] = "unknown"
         elif job.state == "failed" or "failed" in states:
             state = "failed"
@@ -329,6 +340,16 @@ class KubernetesExecutionAdapter:
         else:
             state = "pending"
         with self._connect() as connection:
+            row = connection.execute(
+                "SELECT job_uid FROM kubernetes_execution_bindings WHERE operation_id=?",
+                (package.operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
+            if row["job_uid"] not in {None, job.job_uid}:
+                raise KubernetesExecutionError(
+                    "Kubernetes Job UID conflicts with the durable operation."
+                )
             connection.execute(
                 "UPDATE kubernetes_execution_bindings SET job_uid=?, pod_uids_json=?, "
                 "observed_state=? "
@@ -341,6 +362,32 @@ class KubernetesExecutionAdapter:
                 ),
             )
         return KubernetesExecutionStatus(package.operation_id, job, pods, state)
+
+    def _record_unknown(self, package: KubernetesExecutionPackage) -> KubernetesExecutionStatus:
+        """Make a newer absent, malformed, or contradictory observation authoritative."""
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "UPDATE kubernetes_execution_bindings SET pod_uids_json='[]', "
+                    "observed_state='unknown' WHERE operation_id=?",
+                    (package.operation_id,),
+                ).rowcount
+                != 1
+            ):
+                raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
+        return KubernetesExecutionStatus(package.operation_id, None, (), "unknown")
+
+    def _mark_cancellation_requested(self, operation_id: str) -> None:
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "UPDATE kubernetes_execution_bindings SET cancellation_requested=1 "
+                    "WHERE operation_id=?",
+                    (operation_id,),
+                ).rowcount
+                != 1
+            ):
+                raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
 
     def _bind(self, package: KubernetesExecutionPackage) -> None:
         target_digest = cluster_identity_digest(self.cluster)

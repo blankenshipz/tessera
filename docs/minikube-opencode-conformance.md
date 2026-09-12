@@ -25,15 +25,21 @@ capabilities, service-account token automounting, host networking/PID/IPC, host
 mounts, and a writable root filesystem.
 
 Observed Jobs and owned Pods must reproduce that identity and template before
-they are attributed. Provider identity is a deterministic digest of the observed
-cluster UID, namespace UID, and Job UID. Malformed, unknown, foreign, or changed
-observations remain unknown or fail closed; they never create a replacement Job.
+they are attributed. The journal records the first validated Job UID and every
+normal reconciliation validates the immutable spec through that same journal;
+a deterministic name reused with a replacement UID is rejected and cannot reach
+status, Pod, or collection handoff. Provider identity is a deterministic digest
+of the observed cluster UID, namespace UID, and Job UID. Missing, malformed,
+unknown, foreign, or contradictory newer observations become authoritative
+`unknown` state and block collection; a succeeded Job additionally requires one
+or more explicitly observed owned Pods, all terminal `Succeeded`.
 
 The local create-intent journal exists only to test lost-reply behavior. A caller
 persists intent before invoking its injected create callback; retry observes the
 same deterministic Job name rather than calling create again. Cancellation first
-persists a separate desired-cancellation fence before any injected Kubernetes
-callback. Create admission rejects that fence across restart, including after a
+persists separate adapter and Job-journal desired-cancellation fences before any
+injected Kubernetes callback or inspection, including a failed inspection.
+Create admission rejects that fence across restart, including after a
 previously observed Job is deleted, so cancel-before-create invokes no create
 callback. Delete completion is never inferred from an acknowledgement: fresh
 injected reads must show both the Job and all owned Pods absent.

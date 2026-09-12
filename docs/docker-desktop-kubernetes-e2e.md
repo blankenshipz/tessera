@@ -32,7 +32,10 @@ NetworkPolicy, a 64 MiB PVC, one non-root `batch/v1` Job, and one non-root,
 read-only post-exit collector Pod. The Job writes exactly
 `/outputs/result.txt` containing `hello tessera kubernetes e2e\n`. Before
 collection, Kubernetes RBAC must explicitly allow `create pods`, `get pods`,
-and `get pods/log`; the collector mounts the PVC read-only and prints the bytes.
+and `get pods/log`; the collector mounts the verified PVC read-only at both the
+volume and mount layers and prints the bytes. Its observed PVC claim, read-only
+mount, container security context, and Pod security fields must match the fixed
+collector contract; the PVC UID/spec are rechecked before output logs are read.
 Success requires the exact bytes, byte hash, Job/Pod/PVC/namespace UIDs, Job
 spec/image checks, and collector image ID. The JSON result records these values.
 

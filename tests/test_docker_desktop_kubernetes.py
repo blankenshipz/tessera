@@ -13,11 +13,13 @@ import pytest
 from tessera_worker.docker_desktop_kubernetes import (
     RESULT_BYTES,
     RESULT_PATH,
+    ExactImage,
     LiveKubernetesError,
     _collector_manifest,
     _pvc_spec_sha256,
     _run,
     _verify_bound_pvc,
+    _verify_collector,
     _verify_oci_archive,
 )
 
@@ -85,7 +87,36 @@ def test_collector_is_read_only_digest_pinned_and_never_pulls() -> None:
     assert container["volumeMounts"] == [
         {"name": "outputs", "mountPath": "/outputs", "readOnly": True}
     ]
+    assert manifest["spec"]["volumes"] == [  # type: ignore[index]
+        {
+            "name": "outputs",
+            "persistentVolumeClaim": {"claimName": "outputs", "readOnly": True},
+        }
+    ]
     assert RESULT_BYTES == b"hello tessera kubernetes e2e\n"
+
+
+def test_collector_observation_rejects_pvc_or_security_mutation() -> None:
+    image = ExactImage(
+        "example@sha256:" + "a" * 64,
+        "sha256:" + "a" * 64,
+        "sha256:config",
+        "b" * 64,
+    )
+    resource = _collector_manifest("tessera-e2e-fixture", "collector", image.reference)
+    resource["metadata"]["uid"] = "collector-uid"  # type: ignore[index]
+    resource["status"] = {"containerStatuses": [{"imageID": image.manifest_digest}]}
+
+    assert _verify_collector(
+        resource, "tessera-e2e-fixture", "collector", image, pvc_name="outputs"
+    ) == ("collector-uid", image.manifest_digest)
+    resource["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"] = False  # type: ignore[index]
+    with pytest.raises(LiveKubernetesError, match="PVC binding or security"):
+        _verify_collector(resource, "tessera-e2e-fixture", "collector", image, pvc_name="outputs")
+    resource["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"] = True  # type: ignore[index]
+    resource["spec"]["securityContext"]["runAsUser"] = 0  # type: ignore[index]
+    with pytest.raises(LiveKubernetesError, match="PVC binding or security"):
+        _verify_collector(resource, "tessera-e2e-fixture", "collector", image, pvc_name="outputs")
 
 
 def test_live_command_failure_identifies_the_failed_command(

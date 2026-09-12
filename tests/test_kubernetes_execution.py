@@ -317,3 +317,107 @@ def test_contradictory_status_and_opencode_session_association(tmp_path: Path) -
             package,
             replace(binding, session_id="other-session"),
         )
+
+
+def test_replacement_uid_is_rejected_and_cannot_replace_collection_identity(tmp_path: Path) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    adapter = fake.adapter(tmp_path / "kubernetes.sqlite3")
+    fake.jobs[package.binding.job_name] = fake.job("succeeded")
+    fake.pods = [fake.pod("Succeeded")]
+    assert adapter.submit(package).observed_state == "succeeded"
+    original = adapter.artifact_collection_handoff(package)
+
+    replacement = fake.job("succeeded")
+    replacement["metadata"]["uid"] = "replacement-job"
+    fake.jobs[package.binding.job_name] = replacement
+    with pytest.raises(KubernetesContractError, match="UID conflicts"):
+        adapter.reconcile(package)
+    with pytest.raises(KubernetesExecutionError, match="observed successful"):
+        adapter.artifact_collection_handoff(package)
+    assert original.job_uid == "job-fixture"
+
+
+def test_cancellation_rejects_a_replacement_job_uid(tmp_path: Path) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    journal = tmp_path / "kubernetes.sqlite3"
+    fake.jobs[package.binding.job_name] = fake.job()
+    adapter = fake.adapter(journal)
+    assert adapter.submit(package).job is not None
+
+    def replace_on_delete(name: str, _uid: str) -> None:
+        replacement = fake.job()
+        replacement["metadata"]["uid"] = "replacement-job"
+        fake.jobs[name] = replacement
+
+    cancelling = KubernetesExecutionAdapter(
+        journal,
+        fake.cluster,
+        inspect_job=fake.jobs.get,
+        create_job=fake.create,
+        delete_job=replace_on_delete,
+        observe_pods=lambda _uid: fake.pods,
+    )
+    with pytest.raises(KubernetesContractError, match="UID conflicts"):
+        cancelling.cancel(package)
+
+
+def test_cancel_persists_both_fences_before_failed_inspection_and_restart(tmp_path: Path) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    journal = tmp_path / "kubernetes.sqlite3"
+
+    def failed_inspection(_name: str) -> None:
+        import sqlite3
+
+        with sqlite3.connect(journal) as connection:
+            assert connection.execute(
+                "SELECT cancellation_requested FROM kubernetes_execution_bindings "
+                "WHERE operation_id=?",
+                (package.operation_id,),
+            ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT cancellation_requested FROM kubernetes_jobs WHERE operation_id=?",
+                (package.operation_id,),
+            ).fetchone() == (1,)
+        raise RuntimeError("inspection failed")
+
+    adapter = KubernetesExecutionAdapter(
+        journal,
+        _cluster(),
+        inspect_job=failed_inspection,
+        create_job=lambda _manifest: pytest.fail("must not create"),
+        delete_job=lambda _name, _uid: pytest.fail("must not delete"),
+        observe_pods=lambda _uid: pytest.fail("must not observe Pods"),
+    )
+    with pytest.raises(RuntimeError, match="inspection failed"):
+        adapter.cancel(package)
+    with pytest.raises(KubernetesUnresolvedError, match="durable cancellation"):
+        adapter.submit(package)
+
+
+def test_missing_contradictory_and_zero_pod_observations_block_collection(tmp_path: Path) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    adapter = fake.adapter(tmp_path / "kubernetes.sqlite3")
+    fake.jobs[package.binding.job_name] = fake.job("succeeded")
+    fake.pods = [fake.pod("Succeeded")]
+    assert adapter.submit(package).observed_state == "succeeded"
+
+    fake.jobs.clear()
+    assert adapter.reconcile(package).observed_state == "unknown"
+    with pytest.raises(KubernetesExecutionError, match="observed successful"):
+        adapter.artifact_collection_handoff(package)
+
+    fake.jobs[package.binding.job_name] = fake.job("succeeded")
+    fake.jobs[package.binding.job_name]["status"] = {"active": 1, "succeeded": 1}
+    with pytest.raises(KubernetesContractError, match="contradictory"):
+        adapter.reconcile(package)
+    with pytest.raises(KubernetesExecutionError, match="observed successful"):
+        adapter.artifact_collection_handoff(package)
+
+    fake.jobs[package.binding.job_name] = fake.job("succeeded")
+    fake.pods = []
+    assert adapter.reconcile(package).observed_state == "unknown"
+    with pytest.raises(KubernetesExecutionError, match="observed successful"):
+        adapter.artifact_collection_handoff(package)

@@ -30,7 +30,6 @@ from .kubernetes_contracts import (
     KubernetesJobJournal,
     KubernetesNetworkPolicyEvidence,
     canonical_json,
-    parse_job,
     parse_pod,
 )
 
@@ -480,7 +479,7 @@ class DockerDesktopKubernetesAdapter:
             timeout=90,
         )
         observed = self._get("job", binding.job_name, namespace)
-        job = parse_job(observed, binding, cluster)
+        job = journal.reconcile_observation(binding, cluster, observed)
         if job.state != "succeeded":
             raise LiveKubernetesError("workload Job did not reach succeeded")
         _verify_bound_pvc(
@@ -501,7 +500,12 @@ class DockerDesktopKubernetesAdapter:
             timeout=70,
         )
         collector_resource = self._get("pod", collector, namespace)
-        collector_uid, image_id = _verify_collector(collector_resource, namespace, collector, image)
+        collector_uid, image_id = _verify_collector(
+            collector_resource, namespace, collector, image, pvc_name="outputs"
+        )
+        _verify_bound_pvc(
+            self._get("pvc", "outputs", namespace), namespace, pvc_uid, pvc_spec_sha256
+        )
         output = self._kubectl(
             "logs", f"pod/{collector}", "--limit-bytes=1024", namespace=namespace
         ).stdout.encode()
@@ -682,13 +686,23 @@ def _collector_manifest(namespace: str, name: str, image: str) -> dict[str, obje
                 "runAsUser": 65532,
                 "seccompProfile": {"type": "RuntimeDefault"},
             },
-            "volumes": [{"name": "outputs", "persistentVolumeClaim": {"claimName": "outputs"}}],
+            "volumes": [
+                {
+                    "name": "outputs",
+                    "persistentVolumeClaim": {"claimName": "outputs", "readOnly": True},
+                }
+            ],
         },
     }
 
 
 def _verify_collector(
-    resource: Mapping[str, object], namespace: str, name: str, image: ExactImage
+    resource: Mapping[str, object],
+    namespace: str,
+    name: str,
+    image: ExactImage,
+    *,
+    pvc_name: str,
 ) -> tuple[str, str]:
     uid = _uid(resource, "Pod", name, namespace)
     spec = _mapping(resource.get("spec"), "collector spec")
@@ -704,8 +718,42 @@ def _verify_collector(
         container.get("image") != image.reference
         or container.get("imagePullPolicy") != "Never"
         or container.get("command") != ["/hello", "--read", RESULT_PATH]
+        or container.get("securityContext")
+        != {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"]},
+            "privileged": False,
+            "readOnlyRootFilesystem": True,
+            "runAsNonRoot": True,
+            "runAsUser": 65532,
+        }
+        or container.get("volumeMounts")
+        != [{"name": "outputs", "mountPath": "/outputs", "readOnly": True}]
     ):
-        raise LiveKubernetesError("collector Pod image or command conflicts")
+        raise LiveKubernetesError(
+            "collector Pod image, read-only mount, or security fields conflict"
+        )
+    if (
+        spec.get("automountServiceAccountToken") is not False
+        or spec.get("enableServiceLinks") is not False
+        or any(spec.get(field) is not False for field in ("hostIPC", "hostNetwork", "hostPID"))
+        or spec.get("restartPolicy") != "Never"
+        or spec.get("securityContext")
+        != {
+            "runAsGroup": 65532,
+            "runAsNonRoot": True,
+            "runAsUser": 65532,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        }
+        or spec.get("volumes")
+        != [
+            {
+                "name": "outputs",
+                "persistentVolumeClaim": {"claimName": pvc_name, "readOnly": True},
+            }
+        ]
+    ):
+        raise LiveKubernetesError("collector Pod PVC binding or security fields conflict")
     statuses = _mapping(resource.get("status"), "collector status").get("containerStatuses")
     if not isinstance(statuses, list) or len(statuses) != 1 or not isinstance(statuses[0], Mapping):
         raise LiveKubernetesError("collector image status is unavailable")
