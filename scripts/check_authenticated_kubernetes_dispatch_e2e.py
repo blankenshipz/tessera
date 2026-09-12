@@ -276,6 +276,15 @@ class _LiveAdapter:
         self.package = package
         return self.adapter.submit(package)
 
+    def reconcile(self, package):
+        return self.adapter.reconcile(package)
+
+    def cancel(self, package):
+        return self.adapter.cancel(package)
+
+    def cancellation_proof(self, package):
+        return self.adapter.cancellation_proof(package)
+
     def artifact_collection_handoff(self, package):
         return self.adapter.artifact_collection_handoff(package)
 

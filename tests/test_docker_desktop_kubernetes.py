@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import subprocess
@@ -22,6 +23,15 @@ from tessera_worker.docker_desktop_kubernetes import (
     _verify_collector,
     _verify_oci_archive,
 )
+
+_RUNNER_SPEC = importlib.util.spec_from_file_location(
+    "authenticated_kubernetes_dispatch_e2e",
+    Path(__file__).parents[1] / "scripts" / "check_authenticated_kubernetes_dispatch_e2e.py",
+)
+assert _RUNNER_SPEC is not None and _RUNNER_SPEC.loader is not None
+_RUNNER = importlib.util.module_from_spec(_RUNNER_SPEC)
+_RUNNER_SPEC.loader.exec_module(_RUNNER)
+_LiveAdapter = _RUNNER._LiveAdapter
 
 
 def _oci_archive(path: Path, tag: str, *, architecture: str = "amd64") -> tuple[str, str]:
@@ -179,3 +189,23 @@ def test_bound_pvc_must_keep_its_pre_schedule_identity() -> None:
     resource["status"] = {"phase": "Pending"}
     with pytest.raises(LiveKubernetesError, match="did not bind"):
         _verify_bound_pvc(resource, "tessera-e2e-fixture", "pvc-uid", spec_sha256)
+
+
+def test_authenticated_dispatch_live_adapter_delegates_full_supervision_contract() -> None:
+    class Adapter:
+        def reconcile(self, package: object) -> tuple[str, object]:
+            return "reconciled", package
+
+        def cancel(self, package: object) -> tuple[str, object]:
+            return "cancelled", package
+
+        def cancellation_proof(self, package: object) -> tuple[str, object]:
+            return "proof", package
+
+    live_adapter = object.__new__(_LiveAdapter)
+    live_adapter.adapter = Adapter()
+    package = object()
+
+    assert live_adapter.reconcile(package) == ("reconciled", package)
+    assert live_adapter.cancel(package) == ("cancelled", package)
+    assert live_adapter.cancellation_proof(package) == ("proof", package)
