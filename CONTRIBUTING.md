@@ -279,3 +279,9 @@ and receipt observations by observed time. It does not rewrite historical
 receipts; existing receipt rows begin at sequence one. At an equal observed time,
 contradictory nonterminal evidence remains unresolved rather than releasing held
 exposure or resolving an execution success.
+
+Schema 36 adds an empty human-approved Kubernetes dispatch/outbox ledger with its
+cancellation fence trigger and worker lookup index. It preserves all v35 records and
+does not infer a dispatch, target, worker claim, provider action, or receipt. Backups
+and held restores validate the exact trusted trigger rather than accepting arbitrary
+executable schema.

@@ -168,14 +168,20 @@ def _write_exclusive(path: Path, data: bytes, mode: int = 0o600) -> None:
         os.close(descriptor)
 
 
-def _table_shapes(connection: sqlite3.Connection) -> dict:
+def _table_shapes(connection: sqlite3.Connection) -> tuple[dict, list[tuple[str, str, str]]]:
     rows = connection.execute(
         "SELECT type,name,tbl_name,sql FROM sqlite_schema LIMIT 257"
     ).fetchall()
-    if len(rows) > 256 or any(row[0] not in {"table", "index"} for row in rows):
+    if len(rows) > 256 or any(row[0] not in {"table", "index", "trigger"} for row in rows):
         raise StoreError("Backup has unsupported executable schema.")
     result = {}
+    triggers = []
     for kind, name, _table, sql in rows:
+        if kind == "trigger":
+            if sql is None:
+                raise StoreError("Backup has unsupported executable schema.")
+            triggers.append((name, _table, sql))
+            continue
         if kind != "table":
             continue
         if sql is None or not sql.upper().startswith("CREATE TABLE "):
@@ -212,11 +218,13 @@ def _table_shapes(connection: sqlite3.Connection) -> dict:
             foreign_keys,
             sorted(indexes),
         )
-    return result
+    # Triggers are executable, unlike indexes. Keep no general trigger allowance:
+    # callers compare this complete definition list with bootstrap's trusted list.
+    return result, sorted(triggers)
 
 
 @lru_cache(maxsize=1)
-def _expected_tables() -> dict:
+def _expected_tables() -> tuple[dict, list[tuple[str, str, str]]]:
     from .store import _create_schema
 
     connection = sqlite3.connect(":memory:")
@@ -244,7 +252,10 @@ def _validate_snapshot(path: Path, start: float | None = None) -> tuple[int, int
     try:
         _defensive(connection, start)
         _deadline(start)
-        actual, expected = _table_shapes(connection), _expected_tables()
+        (actual, actual_triggers), (expected, expected_triggers) = (
+            _table_shapes(connection),
+            _expected_tables(),
+        )
         if actual.keys() != expected.keys():
             raise StoreError("Backup schema does not match supported control tables.")
         for name, (columns, foreign_keys, indexes) in actual.items():
@@ -259,6 +270,8 @@ def _validate_snapshot(path: Path, start: float | None = None) -> tuple[int, int
                 or any(index[1] and index not in indexes for index in expected_indexes)
             ):
                 raise StoreError("Backup schema does not match supported control tables.")
+        if actual_triggers != expected_triggers:
+            raise StoreError("Backup schema does not match supported control tables.")
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok" or connection.execute("PRAGMA foreign_key_check").fetchone():
             raise StoreError("Backup database integrity validation failed.")

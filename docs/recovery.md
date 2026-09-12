@@ -51,6 +51,11 @@ the new database. The destination receives a new private `owner.header`; its tok
 is not printed. Every restored principal and credential is revoked, including prior
 owner, human-session, control-agent, and worker credentials.
 
+Schema validation admits only the exact trusted bootstrap definitions, including
+v36's cancellation fence trigger for the Kubernetes dispatch ledger. An added,
+removed, renamed, or altered trigger is rejected before restore authority fencing;
+recovery never permits arbitrary backup-supplied executable schema.
+
 The restored database enters permanent `held_restore`. Its fresh owner can read APIs
 and the desktop can show recovered history, but every mutation and replay is refused.
 There is no CLI, API, or desktop resume/clear-hold operation. `GET /recovery` reports

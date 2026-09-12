@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -50,9 +51,17 @@ def _cluster(**changes: object) -> KubernetesClusterConfig:
     return KubernetesClusterConfig(**values)  # type: ignore[arg-type]
 
 
-def _admitted_package(tmp_path: Path) -> tuple[dict, dict, KubernetesExecutionPackage]:
+def _admitted_package(
+    tmp_path: Path, *, migrate_from_v35: bool = False
+) -> tuple[dict, dict, KubernetesExecutionPackage]:
     state = tmp_path / "state"
     initialize_state(state)
+    if migrate_from_v35:
+        with sqlite3.connect(state / "tessera.sqlite3") as connection:
+            connection.execute("DROP TRIGGER kubernetes_dispatches_fence_cancel")
+            connection.execute("DROP TABLE kubernetes_dispatches")
+            connection.execute("DROP TABLE execution_runtime_packages")
+            connection.execute("UPDATE schema_meta SET schema_version=35 WHERE singleton=1")
     migrate_state(state)
     owner = _owner(state)
     store = Store(state)
