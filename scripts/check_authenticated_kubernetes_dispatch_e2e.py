@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from tessera_worker.control_channel import HttpControlChannel
 from tessera_worker.docker_desktop_kubernetes import (
     CONTEXT,
     RESULT_BYTES,
@@ -34,7 +35,6 @@ from tessera_worker.docker_desktop_kubernetes import (
     _uid,
     _verify_bound_pvc,
     _verify_collector,
-    build_and_load_exact_image,
     new_nonce,
     target_from_kubeconfig,
 )
@@ -58,6 +58,10 @@ class DispatchE2EError(RuntimeError):
     """The bounded dispatch fixture cannot safely continue."""
 
 
+class DispatchE2EUnavailable(DispatchE2EError):
+    """The selected retained image cannot safely exercise the requested mode."""
+
+
 def _run(argv: tuple[str, ...], *, timeout: int = 90) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=True, timeout=timeout)
@@ -66,8 +70,8 @@ def _run(argv: tuple[str, ...], *, timeout: int = 90) -> subprocess.CompletedPro
         raise DispatchE2EError(f"local command failed: {detail[:500]}") from error
 
 
-def _node_image_or_build(root: Path, nonce: str) -> tuple[ExactImage, str]:
-    """Use a node-resident exact hello image, or build/load the pinned local source."""
+def _node_image(expected_reference: str) -> ExactImage:
+    """Use only a pre-existing exact image in Docker Desktop's node containerd."""
     listed = _run(
         (
             "docker",
@@ -82,10 +86,11 @@ def _node_image_or_build(root: Path, nonce: str) -> tuple[ExactImage, str]:
         )
     ).stdout.splitlines()
     prefix = "docker.io/library/tessera-e2e-hello@sha256:"
-    references = sorted({value for value in listed if value.startswith(prefix)})
-    if not references:
-        return build_and_load_exact_image(root, nonce), "built-and-loaded"
-    reference = references[0]
+    if not expected_reference.startswith(prefix) or expected_reference not in listed:
+        raise DispatchE2EUnavailable(
+            "the requested node-resident pinned tessera-e2e-hello image is unavailable"
+        )
+    reference = expected_reference
     digest = reference.rsplit("@", 1)[1]
     manifest = json.loads(
         _run(
@@ -117,9 +122,7 @@ def _node_image_or_build(root: Path, nonce: str) -> tuple[ExactImage, str]:
         or spec.get("config", {}).get("User") != "65532:65532"
     ):
         raise DispatchE2EError("Docker Desktop node image is not the deterministic hello workload.")
-    return ExactImage(
-        reference, digest, config_digest, "node-resident-not-rebuilt"
-    ), "node-resident"
+    return ExactImage(reference, digest, config_digest, "node-resident-not-rebuilt")
 
 
 def _port() -> int:
@@ -289,10 +292,108 @@ class _LiveAdapter:
         return self.adapter.artifact_collection_handoff(package)
 
 
+class _LoseOneReportResponse(HttpControlChannel):
+    """Test-only control-boundary failure after one real report request commits.
+
+    The request uses the normal authenticated transport and control route.  Only
+    its response is deliberately discarded, so restart must replay the journaled
+    payload and idempotency key rather than inventing an observation.
+    """
+
+    def __init__(self, origin: str, token: str) -> None:
+        super().__init__(origin, token)
+        self.lost = False
+        self.reports: list[tuple[str, str]] = []
+
+    def post(self, path: str, body: dict[str, Any], key: str) -> dict[str, Any]:
+        response = super().post(path, body, key)
+        if path == "/worker/observations":
+            encoded = json.dumps(body, sort_keys=True, separators=(",", ":"))
+            self.reports.append((encoded, key))
+            if not self.lost:
+                self.lost = True
+                raise ConnectionError("test-controlled loss of one control report response")
+        return response
+
+
+def _workload(mode: str, seconds: int) -> tuple[str, ...]:
+    if mode == "success":
+        return ("/hello", "--write", "/outputs/result.txt")
+    return ("/hello", "--sleep-write", str(seconds), "/outputs/result.txt")
+
+
+def _grant_id(package_response: dict[str, Any]) -> str:
+    package = package_response.get("package")
+    grant_id = package.get("grant_id") if isinstance(package, dict) else None
+    if not isinstance(grant_id, str) or not grant_id:
+        raise DispatchE2EError("control package has no execution grant identity")
+    return grant_id
+
+
+def _wait_for_state(
+    adapter: _LiveAdapter, package: Any, expected: set[str], timeout_seconds: int
+) -> str:
+    """Observe the actual named Job through the durable adapter, never a wait claim."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status = adapter.reconcile(package).observed_state
+        if status in expected:
+            return status
+        if status in {"failed", "succeeded", "unknown"}:
+            raise DispatchE2EUnavailable(
+                "the existing node-resident image did not keep the deterministic workload running"
+            )
+        if time.monotonic() >= deadline:
+            raise DispatchE2EUnavailable(
+                "real Kubernetes Job did not reach the required state in time"
+            )
+        time.sleep(0.5)
+
+
+def _wait_for_bound_pvc(
+    live: DockerDesktopKubernetesAdapter,
+    namespace: str,
+    pvc_uid: str,
+    pvc_spec: str,
+    timeout_seconds: int,
+) -> None:
+    """Wait only for the named retained PVC's real binding observation."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        pvc = live._get("pvc", "outputs", namespace)
+        try:
+            _verify_bound_pvc(pvc, namespace, pvc_uid, pvc_spec)
+            return
+        except LiveKubernetesError as error:
+            if "did not bind" not in str(error) or time.monotonic() >= deadline:
+                raise
+        time.sleep(0.5)
+
+
+def _report_rows(root: Path, dispatch_id: str, operation_id: str) -> list[dict[str, Any]]:
+    import sqlite3
+
+    with sqlite3.connect(root / "kubernetes-claims.sqlite3") as connection:
+        rows = connection.execute(
+            """SELECT sequence,payload_json,key,completed FROM dispatch_reports
+            WHERE dispatch_id=? AND operation_id=? ORDER BY sequence""",
+            (dispatch_id, operation_id),
+        ).fetchall()
+    return [
+        {
+            "sequence": row[0],
+            "payload": json.loads(row[1]),
+            "key": row[2],
+            "completed": bool(row[3]),
+        }
+        for row in rows
+    ]
+
+
 def _main(args: argparse.Namespace) -> dict[str, Any]:
-    nonce, root = new_nonce(), Path(__file__).resolve().parents[1]
+    nonce = new_nonce()
     target = target_from_kubeconfig(args.kubeconfig)
-    image, image_source = _node_image_or_build(root, nonce)
+    image = _node_image(args.image)
     journal = args.journal or Path("/tmp") / f"tessera-authenticated-kubernetes-e2e-{nonce}.sqlite3"
     if journal.exists():
         raise DispatchE2EError("refusing to reuse a local dispatch journal")
@@ -378,10 +479,10 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
                 "POST",
                 f"/projects/{project['id']}/tasks",
                 {
-                    "title": "Deterministic Kubernetes hello",
+                    "title": f"Deterministic Kubernetes {args.mode}",
                     "purpose": "Authenticated provider-disabled Kubernetes dispatch conformance.",
                     "budget_cents": 0,
-                    "max_duration_seconds": 60,
+                    "max_duration_seconds": args.timeout,
                 },
                 key=_key(nonce, "task"),
             )
@@ -393,9 +494,9 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
                     "title": task["title"],
                     "purpose": task["purpose"],
                     "budget_cents": 0,
-                    "max_duration_seconds": 60,
+                    "max_duration_seconds": args.timeout,
                     "execution_spec": {
-                        "argv": ["/hello", "--write", "/outputs/result.txt"],
+                        "argv": list(_workload(args.mode, args.workload_seconds)),
                         "input_snapshot_digest": snapshot["digest"],
                         "pinned_skill_digests": [],
                         "output_paths": ["result.txt"],
@@ -517,21 +618,173 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             credential_file.write_text(worker_token)
             credential_file.chmod(0o600)
             adapter = _LiveAdapter(live, cluster, journal)
-            result = KubernetesDispatchWorkerService(
-                KubernetesDispatchWorkerConfig(
-                    origin, dispatch["id"], credential_file, worker_root
-                ),
-                cluster,
-                KubernetesOutputBinding("outputs", "/outputs", pvc_uid, pvc_spec),
-                adapter,
-            ).run()
-            if result.get("status") != "succeeded" or adapter.package is None:
-                raise DispatchE2EError(
-                    "worker claim did not observe a successful real Kubernetes Job"
+
+            def service(channel: Any | None = None) -> KubernetesDispatchWorkerService:
+                return KubernetesDispatchWorkerService(
+                    KubernetesDispatchWorkerConfig(
+                        origin, dispatch["id"], credential_file, worker_root
+                    ),
+                    cluster,
+                    KubernetesOutputBinding("outputs", "/outputs", pvc_uid, pvc_spec),
+                    adapter,
+                    channel=channel,
+                    poll_seconds=0.5,
                 )
+
+            lost_channel: _LoseOneReportResponse | None = None
+            if args.mode == "success":
+                result = service().run()
+            else:
+                lost_channel = (
+                    _LoseOneReportResponse(origin, worker_token)
+                    if args.mode == "lost-report"
+                    else None
+                )
+                result = service(lost_channel).run(max_cycles=1)
+            if adapter.package is None:
+                raise DispatchE2EError("worker claim did not return a real Kubernetes Job package")
             job = live._get("job", adapter.package.binding.job_name, namespace)
             job_uid = _uid(job, "Job", adapter.package.binding.job_name, namespace)
-            _verify_bound_pvc(live._get("pvc", "outputs", namespace), namespace, pvc_uid, pvc_spec)
+            _wait_for_bound_pvc(live, namespace, pvc_uid, pvc_spec, min(args.timeout, 60))
+            if args.mode != "success":
+                _wait_for_state(adapter, adapter.package, {"running"}, min(args.timeout, 60))
+                if args.mode == "cancel":
+                    revoked = owner.request(
+                        "POST",
+                        f"/execution-grants/{_grant_id(package)}/revoke",
+                        {"expected_revision": 1},
+                        key=_key(nonce, "cancel-while-running"),
+                    )
+                    if revoked.get("status") != "cancel_requested":
+                        raise DispatchE2EError(
+                            "normal authenticated cancellation did not fence the grant"
+                        )
+                    result = service().run(max_cycles=2)
+                    proof = result.get("cancellation")
+                    if result.get("status") != "cancel_requested" or not isinstance(proof, dict):
+                        raise DispatchE2EError("supervisor did not return cancellation evidence")
+                    current = live._maybe_get("job", adapter.package.binding.job_name, namespace)
+                    if (
+                        current is not None
+                        and _uid(current, "Job", adapter.package.binding.job_name, namespace)
+                        != job_uid
+                    ):
+                        raise DispatchE2EError(
+                            "cancellation observed an unsafe replacement Job UID"
+                        )
+                    remaining_pods = live._owned_pod_resources(job_uid, namespace)
+                    report_rows = _report_rows(
+                        worker_root, dispatch["id"], adapter.package.operation_id
+                    )
+                    return {
+                        "state": "cancel_requested",
+                        "context": CONTEXT,
+                        "target_digest": target_digest,
+                        "namespace": namespace,
+                        "namespace_uid": cluster.namespace_uid,
+                        "pvc": "outputs",
+                        "pvc_uid": pvc_uid,
+                        "job": adapter.package.binding.job_name,
+                        "job_uid": job_uid,
+                        "job_present_after_cancel": current is not None,
+                        "owned_pod_uids_after_cancel": [
+                            _uid(item, "Pod", item.get("metadata", {}).get("name", ""), namespace)
+                            for item in remaining_pods
+                        ],
+                        "cancellation": proof,
+                        "report_states": [row["payload"]["observed_state"] for row in report_rows],
+                        "operation_id": adapter.package.operation_id,
+                        "kubernetes_dispatch_id": dispatch["id"],
+                        "package_digest": package["package_digest"],
+                        "journal": str(journal),
+                        "retained": (
+                            "namespace, NetworkPolicy, PVC, Job/Pod state, and local journal"
+                        ),
+                        "limitations": [
+                            (
+                                "termination is confirmed only when fresh Job and owned-Pod "
+                                "absence "
+                                "is recorded"
+                            ),
+                            (
+                                "a present Job or Pod is intentionally reported as unresolved "
+                                "rather "
+                                "than fabricated"
+                            ),
+                            (
+                                "no namespace deletion, broad deletion, prune, or context "
+                                "switch was "
+                                "issued"
+                            ),
+                        ],
+                    }
+                if args.mode == "restart":
+                    restarted = service().run(max_cycles=1)
+                    status = adapter.reconcile(adapter.package)
+                    if (
+                        restarted.get("status") != "running"
+                        or status.job is None
+                        or status.job.job_uid != job_uid
+                    ):
+                        raise DispatchE2EError(
+                            "restarted supervisor did not reconcile the original running Job UID"
+                        )
+                    return {
+                        "state": "reconciled_running",
+                        "context": CONTEXT,
+                        "target_digest": target_digest,
+                        "namespace": namespace,
+                        "namespace_uid": cluster.namespace_uid,
+                        "pvc": "outputs",
+                        "pvc_uid": pvc_uid,
+                        "job": adapter.package.binding.job_name,
+                        "job_uid": job_uid,
+                        "reconciled_job_uid": status.job.job_uid,
+                        "report_states": [
+                            row["payload"]["observed_state"]
+                            for row in _report_rows(
+                                worker_root, dispatch["id"], adapter.package.operation_id
+                            )
+                        ],
+                        "operation_id": adapter.package.operation_id,
+                        "kubernetes_dispatch_id": dispatch["id"],
+                        "package_digest": package["package_digest"],
+                        "journal": str(journal),
+                        "retained": (
+                            "namespace, NetworkPolicy, PVC, running Job/Pod, and local journal"
+                        ),
+                        "limitations": [
+                            (
+                                "supervision interruption is a runner restart, not a control-plane "
+                                "restart"
+                            ),
+                            (
+                                "no replacement Job, namespace deletion, broad deletion, prune, or "
+                                "context switch was issued"
+                            ),
+                        ],
+                    }
+                assert args.mode == "lost-report" and lost_channel is not None
+                _wait_for_state(adapter, adapter.package, {"succeeded"}, min(args.timeout, 60))
+                result = service().run()
+                report_rows = _report_rows(
+                    worker_root, dispatch["id"], adapter.package.operation_id
+                )
+                if (
+                    result.get("status") != "succeeded"
+                    or len(lost_channel.reports) != 1
+                    or len(report_rows) < 2
+                    or report_rows[0]["payload"] != json.loads(lost_channel.reports[0][0])
+                    or report_rows[0]["key"] != lost_channel.reports[0][1]
+                    or report_rows[-1]["payload"]["observed_state"] != "exited"
+                ):
+                    raise DispatchE2EError(
+                        "lost report response was not replayed exactly before terminal state"
+                    )
+            if result.get("status") != "succeeded":
+                raise DispatchE2EError(
+                    "worker supervision did not observe a successful real Kubernetes Job"
+                )
             pods = live._owned_pods(adapter.package.binding, cluster, job_uid)
             if not pods or any(pod.state != "succeeded" for pod in pods):
                 raise DispatchE2EError("real Kubernetes Job lacks successful owned Pod evidence")
@@ -584,7 +837,7 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
                 "image": image.reference,
                 "image_manifest_digest": image.manifest_digest,
                 "image_config_digest": image.config_digest,
-                "image_source": image_source,
+                "image_source": "node-resident",
                 "output_utf8": output.decode("utf-8"),
                 "output_sha256": hashlib.sha256(output).hexdigest(),
                 "experiment_id": experiment["id"],
@@ -594,6 +847,12 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
                 "package_digest": package["package_digest"],
                 "exported_dispatch_operation_id": exported_dispatch["operation_id"],
                 "worker_registration_id": registered["id"],
+                "report_states": [
+                    row["payload"]["observed_state"]
+                    for row in _report_rows(
+                        worker_root, dispatch["id"], adapter.package.operation_id
+                    )
+                ],
                 "journal": str(journal),
                 "retained": (
                     "namespace, NetworkPolicy, PVC, Job, workload Pod, collector Pod, "
@@ -619,23 +878,56 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true", help="perform the retained live dispatch run")
     parser.add_argument(
+        "--mode",
+        choices=("success", "cancel", "restart", "lost-report"),
+        default="success",
+        help="one normal-path conformance mode; failure injection is limited to lost-report",
+    )
+    parser.add_argument(
         "--kubeconfig", type=Path, required=True, help="explicit absolute kubeconfig"
     )
     parser.add_argument("--context", choices=[CONTEXT], default=CONTEXT)
     parser.add_argument(
+        "--image",
+        required=True,
+        help="exact existing node-resident tessera-e2e-hello@sha256 reference",
+    )
+    parser.add_argument(
         "--journal", type=Path, help="new local journal path outside the repository"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="per-live-wait deadline in seconds (1-180; default: 120)",
+    )
+    parser.add_argument(
+        "--workload-seconds",
+        type=int,
+        default=30,
+        help="deterministic --sleep-write duration for non-success modes (1-120; default: 30)",
     )
     args = parser.parse_args()
     if not args.run:
         parser.error("--run is required; this command has no ambient live mode")
+    if not 1 <= args.timeout <= 180:
+        parser.error("--timeout must be between 1 and 180 seconds")
+    if not 1 <= args.workload_seconds <= 120:
+        parser.error("--workload-seconds must be between 1 and 120 seconds")
+    if args.mode != "success" and args.workload_seconds >= args.timeout:
+        parser.error("--workload-seconds must be less than --timeout for a live recovery mode")
     try:
         print(json.dumps(_main(args), sort_keys=True))
+        return 0
+    except DispatchE2EUnavailable as error:
+        print(json.dumps({"state": "unavailable", "message": str(error)}, sort_keys=True))
         return 0
     except (
         DispatchE2EError,
         LiveKubernetesError,
         OSError,
         subprocess.SubprocessError,
+        KeyError,
         ValueError,
     ) as error:
         print(json.dumps({"state": "failed", "message": str(error)}, sort_keys=True))

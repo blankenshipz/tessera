@@ -23,7 +23,8 @@ For the real authenticated control-plane dispatch path, run:
 .venv/bin/pytest tests/test_kubernetes_dispatch.py tests/test_kubernetes_execution.py \
   tests/test_kubernetes_provider.py tests/test_kubernetes_control_binding.py
 .venv/bin/python scripts/check_authenticated_kubernetes_dispatch_e2e.py --run \
-  --kubeconfig "$HOME/.kube/config" --context docker-desktop
+  --kubeconfig "$HOME/.kube/config" --context docker-desktop \
+  --image 'docker.io/library/tessera-e2e-hello@sha256:EXACT_NODE_MANIFEST'
 ```
 
 The authenticated runner starts a temporary loopback control service and uses
@@ -40,7 +41,33 @@ its non-secret local adapter/claim journal is retained outside the repository.
 The JSON evidence includes control IDs/package digest, target, resource UIDs,
 image digest, exact output/hash, and experiment-export linkage.
 
-The image at `examples/kubernetes-hello/` is built locally for `linux/amd64` as
+The authenticated runner accepts `--mode success` (the default), `--mode
+cancel`, `--mode restart`, and `--mode lost-report`. Recovery modes use the
+normal authenticated dispatch claim/package/adapter path. They require an exact
+already node-resident image supplied with `--image`; this runner never builds,
+loads, pulls, tags, or otherwise changes an image. The source's deterministic
+`/hello --sleep-write SECONDS /outputs/result.txt` mode is required for the
+three recovery modes. If the supplied retained image lacks that mode, is missing,
+or cannot remain running long enough, the runner prints `state=unavailable` and
+stops without a success claim. `--timeout` is bounded to 180 seconds and every
+live wait is bounded; `--workload-seconds` is bounded to 120 seconds and must be
+less than the timeout.
+
+`cancel` first observes the actual Job running, then uses the ordinary
+authenticated grant-revocation route. The restarted supervisor sees the control
+fence, invokes the existing narrowly named Job cancellation adapter, and emits
+the durable cancellation proof. The JSON includes the original Job UID,
+post-cancel Job/owned-Pod presence, report states, and either fresh
+Job/Pod-absence confirmation or explicit unresolved termination. It rejects a
+replacement UID. `restart` exits one supervisor after submission, opens a new
+supervisor over the same local journal, and requires it to observe the same
+still-running Job UID without a create. `lost-report` discards exactly one
+response only after the normal authenticated `/worker/observations` request has
+returned to the test transport; restart must replay the persisted payload and
+idempotency key exactly before submitting a fresh terminal observation. Its JSON
+includes report states, IDs, output, and output hash.
+
+The standalone runner's image at `examples/kubernetes-hello/` is built locally for `linux/amd64` as
 an OCI archive. A per-run, non-secret image label prevents a retained node image
 with a matching cached config from being selected for a new fixture. The runner verifies the archive/index manifest digest, config
 digest, and image config architecture before loading exactly that archive into
