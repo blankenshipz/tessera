@@ -287,6 +287,16 @@ async function loadMessages(version = epoch, selection = threadEpoch, reset = fa
     for (const message of response.messages) {
       const row = element('article', undefined, 'message');
       row.append(element('span', `${message.intent} · ${message.sender_principal_id}`, 'tag'));
+      if (message.delivery && typeof message.delivery === 'object') {
+        const delivery = message.delivery;
+        const session = typeof delivery.upstream_session_id === 'string' ? delivery.upstream_session_id : 'not recorded';
+        row.append(element('p', `Delivery ${delivery.state} · harness ${delivery.harness_instance_id} · session ${session}`, 'muted'));
+        if (delivery.state === 'uncertain') row.append(element('p', 'Upstream delivery is uncertain; it will not be sent again automatically.', 'muted'));
+        if (delivery.state === 'failed') row.append(element('p', `Upstream delivery failed (${delivery.error_code ?? 'unclassified'}).`, 'muted'));
+        if (delivery.state === 'cancelled') row.append(element('p', 'Delivery was cancelled in control. This does not claim OpenCode session termination.', 'muted'));
+      } else if (message.delivery_legacy) {
+        row.append(element('p', 'Legacy conversation message — no harness delivery/session record was created.', 'muted'));
+      }
       row.append(element('p', message.body)); row.append(element('time', new Date(message.created_at).toLocaleString(), 'muted'));
       $('messages').append(row);
     }
@@ -294,7 +304,7 @@ async function loadMessages(version = epoch, selection = threadEpoch, reset = fa
     if (!messageOffset) $('messages').append(element('p', 'No messages yet.', 'muted'));
   } catch (error) {
     if (version === epoch && requestVersion === readVersion.messages && selection === threadEpoch) {
-      if (reset) $('messages').replaceChildren(element('p', 'Could not load messages. Use Refresh to retry.', 'muted'));
+      if (reset) $('messages').replaceChildren(element('p', 'Messages may be stale because the control plane is offline or the selected context changed. Use Refresh to retry.', 'muted'));
       throw error;
     }
   } finally {

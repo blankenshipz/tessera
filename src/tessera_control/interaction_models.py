@@ -12,6 +12,7 @@ class InteractionRequest(BaseModel):
 
 ProjectId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 Body = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8000)]
+Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 Intent = Literal["question", "direction", "status", "evidence"]
 DecisionKind = Literal["direction", "spending", "access", "publication"]
 Scope = Annotated[dict[str, Any], Field(max_length=32)]
@@ -28,6 +29,44 @@ class CreateMessage(InteractionRequest):
     intent: Intent
     body: Body
     reply_to: str | None = None
+
+
+class EnqueueHarnessDelivery(InteractionRequest):
+    """A human-directed, context-only message for an already admitted attempt."""
+
+    thread_id: Identifier
+    admitted_attempt_id: Identifier
+    expected_attempt_revision: int = Field(ge=1)
+    context_revision: int = Field(ge=1)
+    expected_epoch: int = Field(ge=1)
+    worker_principal_id: Identifier
+    harness_instance_id: Identifier
+    upstream_session_id: Identifier
+    intent: Intent
+    body: Body
+    reply_to: Identifier | None = None
+
+
+class ClaimHarnessDelivery(InteractionRequest):
+    expected_epoch: int = Field(ge=1)
+
+
+class AcknowledgeHarnessDelivery(InteractionRequest):
+    expected_revision: int = Field(ge=1)
+    context_digest: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    upstream_message_id: Identifier
+    upstream_readback_digest: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+
+class ReportHarnessDelivery(InteractionRequest):
+    expected_revision: int = Field(ge=1)
+    context_digest: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    outcome: Literal["uncertain", "failed"]
+    error_code: Annotated[str, StringConstraints(pattern=r"^[a-z0-9_.-]{1,100}$")]
+
+
+class CancelHarnessDelivery(InteractionRequest):
+    expected_revision: int = Field(ge=1)
 
 
 class CreateDecision(InteractionRequest):

@@ -285,3 +285,7 @@ cancellation fence trigger and worker lookup index. It preserves all v35 records
 does not infer a dispatch, target, worker claim, provider action, or receipt. Backups
 and held restores validate the exact trusted trigger rather than accepting arbitrary
 executable schema.
+
+Schema 37 adds an empty context-only OpenCode message-delivery journal. It preserves
+legacy conversation messages without inventing a harness session, delivery, upstream
+readback, or OpenCode compatibility result; see `docs/opencode-message-delivery.md`.

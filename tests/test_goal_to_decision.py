@@ -1006,7 +1006,7 @@ def test_v35_receipt_sequence_migration_preserves_existing_receipt_state(tmp_pat
             "ALTER TABLE external_operation_receipts DROP COLUMN observation_sequence"
         )
         connection.execute("UPDATE schema_meta SET schema_version=34")
-    assert migrate_state(state) == 36
+    assert migrate_state(state) == 37
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT observation_sequence FROM external_operation_receipts WHERE operation_id=?",

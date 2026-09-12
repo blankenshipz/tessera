@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 36
+LATEST_SCHEMA_VERSION = 37
 LOCAL_ORG_ID = "org_local"
 
 
@@ -683,6 +683,14 @@ def migrate_v35_to_v36(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 36 WHERE singleton = 1")
 
 
+def migrate_v36_to_v37(connection: sqlite3.Connection) -> None:
+    """Add an empty context-only harness delivery journal without changing legacy chat."""
+    from .interaction import create_interaction_schema
+
+    create_interaction_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 37 WHERE singleton = 1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -719,6 +727,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     33: migrate_v33_to_v34,
     34: migrate_v34_to_v35,
     35: migrate_v35_to_v36,
+    36: migrate_v36_to_v37,
 }
 
 

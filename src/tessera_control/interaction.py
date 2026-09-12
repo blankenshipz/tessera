@@ -1,4 +1,7 @@
+# ruff: noqa: E501
 """Durable, tenant-scoped conversations and human decision inbox records."""
+
+# fmt: off
 
 from __future__ import annotations
 
@@ -9,7 +12,17 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .interaction_models import CreateDecision, CreateMessage, CreateThread, ResolveDecision
+from .interaction_models import (
+    AcknowledgeHarnessDelivery,
+    CancelHarnessDelivery,
+    ClaimHarnessDelivery,
+    CreateDecision,
+    CreateMessage,
+    CreateThread,
+    EnqueueHarnessDelivery,
+    ReportHarnessDelivery,
+    ResolveDecision,
+)
 from .store import Conflict, Forbidden, NotFound, Store, _connect, utc_now
 
 
@@ -34,6 +47,29 @@ def create_interaction_schema(connection: sqlite3.Connection) -> None:
         )""",
         """CREATE INDEX IF NOT EXISTS interaction_messages_by_thread
         ON interaction_messages(thread_id, created_at, id)""",
+        """CREATE TABLE IF NOT EXISTS interaction_message_deliveries (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE REFERENCES interaction_messages(id),
+            org_id TEXT NOT NULL REFERENCES organizations(id), project_id TEXT NOT NULL REFERENCES projects(id),
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            admitted_attempt_id TEXT NOT NULL REFERENCES research_experiment_admitted_attempts(id),
+            attempt_revision INTEGER NOT NULL, context_revision INTEGER NOT NULL,
+            epoch INTEGER NOT NULL, worker_principal_id TEXT NOT NULL REFERENCES principals(id),
+            harness_instance_id TEXT NOT NULL, upstream_session_id TEXT NOT NULL,
+            message_digest TEXT NOT NULL, context_digest TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('queued','delivered','acknowledged','uncertain','failed','cancelled')),
+            claimed_by_principal_id TEXT REFERENCES principals(id), upstream_message_id TEXT,
+            upstream_readback_digest TEXT, error_code TEXT, revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        """CREATE INDEX IF NOT EXISTS interaction_message_deliveries_by_worker
+        ON interaction_message_deliveries(worker_principal_id, state, created_at, id)""",
+        """CREATE TABLE IF NOT EXISTS interaction_message_delivery_states (
+            delivery_id TEXT NOT NULL REFERENCES interaction_message_deliveries(id),
+            sequence INTEGER NOT NULL, state TEXT NOT NULL,
+            context_digest TEXT NOT NULL, actor_principal_id TEXT NOT NULL REFERENCES principals(id),
+            error_code TEXT, recorded_at TEXT NOT NULL,
+            PRIMARY KEY (delivery_id, sequence)
+        )""",
         """CREATE TABLE IF NOT EXISTS decision_requests (
             id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id),
             project_id TEXT NOT NULL REFERENCES projects(id), task_id TEXT REFERENCES tasks(id),
@@ -77,8 +113,12 @@ class InteractionStore:
         path: str,
         digest: str,
         callback: Any,
+        *,
+        audience: str = "control",
     ):
-        return self.store._mutate(principal, key, method, path, digest, callback)
+        return self.store._mutate(
+            principal, key, method, path, digest, callback, audience=audience
+        )
 
     @staticmethod
     def _decision_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -198,6 +238,181 @@ class InteractionStore:
             command,
         )
 
+    @staticmethod
+    def _delivery_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        value = dict(row)
+        return {
+            "delivery_id": value["id"], "state": value["state"], "revision": value["revision"],
+            "admitted_attempt_id": value["admitted_attempt_id"],
+            "attempt_revision": value["attempt_revision"], "context_revision": value["context_revision"],
+            "epoch": value["epoch"], "harness_instance_id": value["harness_instance_id"],
+            "upstream_session_id": value["upstream_session_id"], "upstream_message_id": value["upstream_message_id"],
+            "upstream_readback_digest": value["upstream_readback_digest"],
+            "context_digest": value["context_digest"], "error_code": value["error_code"],
+            "created_at": value["created_at"], "updated_at": value["updated_at"],
+        }
+
+    @staticmethod
+    def _require_human(actor: dict[str, Any]) -> None:
+        if actor["role"] != "human":
+            raise Forbidden("Only an authenticated human can enqueue or cancel a harness delivery.")
+
+    @staticmethod
+    def _append_delivery_state(
+        conn: sqlite3.Connection, delivery: dict[str, Any], state: str, actor: dict[str, Any], error_code: str | None = None
+    ) -> dict[str, Any]:
+        now = utc_now()
+        revision = delivery["revision"] + 1
+        conn.execute(
+            """UPDATE interaction_message_deliveries SET state=?,revision=?,updated_at=?,error_code=?,
+            claimed_by_principal_id=CASE WHEN ?='delivered' THEN ? ELSE claimed_by_principal_id END WHERE id=?""",
+            (state, revision, now, error_code, state, actor["id"], delivery["id"]),
+        )
+        conn.execute(
+            """INSERT INTO interaction_message_delivery_states
+            (delivery_id,sequence,state,context_digest,actor_principal_id,error_code,recorded_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (delivery["id"], revision, state, delivery["context_digest"], actor["id"], error_code, now),
+        )
+        delivery.update(state=state, revision=revision, updated_at=now, error_code=error_code)
+        return delivery
+
+    def enqueue_harness_delivery(self, actor, key, **payload):
+        body = EnqueueHarnessDelivery(**payload)
+        payload = body.model_dump(mode="json")
+
+        def command(conn, live):
+            self._require_human(live)
+            thread = self._thread(conn, live, body.thread_id)
+            attempt_row = conn.execute(
+                """SELECT a.*,e.project_id FROM research_experiment_admitted_attempts a
+                JOIN research_experiments e ON e.id=a.experiment_id
+                WHERE a.id=? AND e.project_id=?""",
+                (body.admitted_attempt_id, thread["project_id"]),
+            ).fetchone()
+            if attempt_row is None or attempt_row["revision"] != body.expected_attempt_revision:
+                raise Conflict("Admitted attempt is missing or its revision is stale.")
+            attempt = dict(attempt_row)
+            operation = conn.execute(
+                "SELECT * FROM external_operations WHERE operation_id=?", (attempt["operation_id"],)
+            ).fetchone()
+            if (
+                operation is None or operation["epoch"] != body.expected_epoch
+                or operation["worker_principal_id"] != body.worker_principal_id
+                or operation["desired_state"] != "admitted"
+            ):
+                raise Conflict("Admitted attempt has no current worker/epoch delivery authority.")
+            task_id = operation["task_id"]
+            if thread["task_id"] is not None and thread["task_id"] != task_id:
+                raise Conflict("Thread task does not match the admitted attempt.")
+            worker = conn.execute(
+                """SELECT p.id FROM principals p JOIN credentials c ON c.principal_id=p.id
+                WHERE p.id=? AND p.org_id=? AND p.revoked_at IS NULL AND c.kind='worker'
+                AND c.audience='worker' AND c.revoked_at IS NULL
+                AND (c.project_id IS NULL OR c.project_id=?)""",
+                (body.worker_principal_id, live["org_id"], thread["project_id"]),
+            ).fetchone()
+            if worker is None:
+                raise NotFound("Designated worker was not found.")
+            if body.reply_to is not None:
+                reply = conn.execute("SELECT thread_id FROM interaction_messages WHERE id=?", (body.reply_to,)).fetchone()
+                if reply is None or reply["thread_id"] != body.thread_id:
+                    raise Conflict("Reply must belong to the same thread.")
+            message_id, delivery_id, now = str(uuid.uuid4()), "delivery_" + uuid.uuid4().hex, utc_now()
+            message_digest = _digest({"intent": body.intent, "body": body.body, "reply_to": body.reply_to})
+            context_digest = _digest({
+                "message_digest": message_digest, "admitted_attempt_id": body.admitted_attempt_id,
+                "attempt_revision": body.expected_attempt_revision, "context_revision": body.context_revision,
+                "epoch": body.expected_epoch, "harness_instance_id": body.harness_instance_id,
+                "upstream_session_id": body.upstream_session_id,
+            })
+            conn.execute("INSERT INTO interaction_messages VALUES (?,?,?,?,?,?,?)", (message_id, body.thread_id, live["id"], body.intent, body.body, body.reply_to, now))
+            row = {
+                "id": delivery_id, "message_id": message_id, "org_id": live["org_id"], "project_id": thread["project_id"], "task_id": task_id,
+                "admitted_attempt_id": body.admitted_attempt_id, "attempt_revision": body.expected_attempt_revision,
+                "context_revision": body.context_revision, "epoch": body.expected_epoch, "worker_principal_id": body.worker_principal_id,
+                "harness_instance_id": body.harness_instance_id, "upstream_session_id": body.upstream_session_id,
+                "message_digest": message_digest, "context_digest": context_digest, "state": "queued", "claimed_by_principal_id": None,
+                "upstream_message_id": None, "upstream_readback_digest": None, "error_code": None, "revision": 1, "created_at": now, "updated_at": now,
+            }
+            conn.execute("""INSERT INTO interaction_message_deliveries VALUES
+            (:id,:message_id,:org_id,:project_id,:task_id,:admitted_attempt_id,:attempt_revision,:context_revision,:epoch,:worker_principal_id,:harness_instance_id,:upstream_session_id,:message_digest,:context_digest,:state,:claimed_by_principal_id,:upstream_message_id,:upstream_readback_digest,:error_code,:revision,:created_at,:updated_at)""", row)
+            conn.execute("INSERT INTO interaction_message_delivery_states VALUES (?,?,?,?,?,?,?)", (delivery_id, 1, "queued", context_digest, live["id"], None, now))
+            self.store._event(conn, live, thread["project_id"], task_id, "interaction_message_delivery_queued", body.context_revision, {"delivery_id": delivery_id, "context_digest": context_digest, "harness_instance_id": body.harness_instance_id})
+            return 201, {"id": message_id, "thread_id": body.thread_id, "intent": body.intent, "body": body.body, "reply_to": body.reply_to, "sender_principal_id": live["id"], "created_at": now, "delivery": self._delivery_response(row)}
+        return self._mutate(actor, key, "POST", "/interaction/deliveries", _digest(payload), command)
+
+    def claim_harness_delivery(self, actor, key, delivery_id, **payload):
+        body = ClaimHarnessDelivery(**payload)
+        def command(conn, live):
+            row = conn.execute("SELECT d.*,m.body,m.intent,m.reply_to FROM interaction_message_deliveries d JOIN interaction_messages m ON m.id=d.message_id WHERE d.id=? AND d.org_id=?", (delivery_id, live["org_id"])).fetchone()
+            if row is None or row["worker_principal_id"] != live["id"]:
+                raise NotFound("Harness delivery was not found.")
+            delivery = dict(row)
+            if delivery["epoch"] != body.expected_epoch or delivery["state"] in {"cancelled", "acknowledged", "uncertain", "failed"}:
+                raise Conflict("Harness delivery is no longer claimable.")
+            attempt = conn.execute(
+                "SELECT revision,operation_id FROM research_experiment_admitted_attempts WHERE id=?",
+                (delivery["admitted_attempt_id"],),
+            ).fetchone()
+            operation = conn.execute("SELECT operation_id,desired_state,epoch,worker_principal_id FROM external_operations WHERE operation_id=(SELECT operation_id FROM research_experiment_admitted_attempts WHERE id=?)", (delivery["admitted_attempt_id"],)).fetchone()
+            if attempt is None or attempt["revision"] != delivery["attempt_revision"] or operation is None or operation["operation_id"] != attempt["operation_id"] or operation["desired_state"] != "admitted" or operation["epoch"] != delivery["epoch"] or operation["worker_principal_id"] != live["id"]:
+                raise Conflict("Harness delivery authority is no longer current.")
+            if delivery["state"] == "queued":
+                delivery = self._append_delivery_state(conn, delivery, "delivered", live)
+                self.store._event(conn, live, delivery["project_id"], delivery["task_id"], "interaction_message_delivery_delivered", delivery["context_revision"], {"delivery_id": delivery_id, "context_digest": delivery["context_digest"]})
+            return 200, {"delivery": self._delivery_response(delivery) | {"organization_id": delivery["org_id"], "project_id": delivery["project_id"], "task_id": delivery["task_id"], "operation_id": operation["operation_id"], "worker_principal_id": live["id"], "body": row["body"], "intent": row["intent"], "reply_to": row["reply_to"]}}
+        return self._mutate(actor, key, "POST", f"/worker/interaction-deliveries/{delivery_id}/claim", _digest(body.model_dump(mode="json")), command, audience="worker")
+
+    def acknowledge_harness_delivery(self, actor, key, delivery_id, **payload):
+        body = AcknowledgeHarnessDelivery(**payload)
+        return self._settle_harness_delivery(actor, key, delivery_id, body, "acknowledged")
+
+    def report_harness_delivery(self, actor, key, delivery_id, **payload):
+        body = ReportHarnessDelivery(**payload)
+        return self._settle_harness_delivery(actor, key, delivery_id, body, body.outcome)
+
+    def _settle_harness_delivery(self, actor, key, delivery_id, body, state):
+        def command(conn, live):
+            row = conn.execute("SELECT * FROM interaction_message_deliveries WHERE id=? AND org_id=?", (delivery_id, live["org_id"])).fetchone()
+            if row is None or row["worker_principal_id"] != live["id"]:
+                raise NotFound("Harness delivery was not found.")
+            delivery = dict(row)
+            if delivery["context_digest"] != body.context_digest:
+                raise Conflict("Harness delivery context digest does not match.")
+            if delivery["state"] == state and delivery["revision"] == body.expected_revision:
+                return 200, self._delivery_response(delivery)
+            if delivery["state"] != "delivered" or delivery["revision"] != body.expected_revision:
+                raise Conflict("Harness delivery state or revision is stale.")
+            error_code = getattr(body, "error_code", None)
+            delivery = self._append_delivery_state(conn, delivery, state, live, error_code)
+            if state == "acknowledged":
+                conn.execute("UPDATE interaction_message_deliveries SET upstream_message_id=?,upstream_readback_digest=? WHERE id=?", (body.upstream_message_id, body.upstream_readback_digest, delivery_id))
+                delivery.update(upstream_message_id=body.upstream_message_id, upstream_readback_digest=body.upstream_readback_digest)
+            self.store._event(conn, live, delivery["project_id"], delivery["task_id"], f"interaction_message_delivery_{state}", delivery["context_revision"], {"delivery_id": delivery_id, "context_digest": delivery["context_digest"], "error_code": error_code})
+            return 200, self._delivery_response(delivery)
+        return self._mutate(actor, key, "POST", f"/worker/interaction-deliveries/{delivery_id}/{'ack' if state == 'acknowledged' else 'report'}", _digest(body.model_dump(mode="json")), command, audience="worker")
+
+    def cancel_harness_delivery(self, actor, key, delivery_id, **payload):
+        body = CancelHarnessDelivery(**payload)
+
+        def command(conn, live):
+            self._require_human(live)
+            row = conn.execute("SELECT * FROM interaction_message_deliveries WHERE id=? AND org_id=?", (delivery_id, live["org_id"])).fetchone()
+            if row is None or (live["project_id"] is not None and row["project_id"] != live["project_id"]):
+                raise NotFound("Harness delivery was not found.")
+            delivery = dict(row)
+            if delivery["state"] == "cancelled" and delivery["revision"] == body.expected_revision:
+                return 200, self._delivery_response(delivery)
+            if delivery["state"] not in {"queued", "delivered"} or delivery["revision"] != body.expected_revision:
+                raise Conflict("Harness delivery state or revision is stale.")
+            # This control-plane fence never waits for or calls OpenCode.
+            delivery = self._append_delivery_state(conn, delivery, "cancelled", live)
+            self.store._event(conn, live, delivery["project_id"], delivery["task_id"], "interaction_message_delivery_cancelled", delivery["context_revision"], {"delivery_id": delivery_id, "context_digest": delivery["context_digest"]})
+            return 200, self._delivery_response(delivery)
+
+        return self._mutate(actor, key, "POST", f"/interaction/deliveries/{delivery_id}/cancel", _digest(body.model_dump(mode="json")), command)
+
     def list_messages(self, actor, thread_id, offset=0, limit=50):
         if not 0 <= offset <= 100000 or not 1 <= limit <= 100:
             raise ValueError("Invalid page bounds.")
@@ -205,14 +420,33 @@ class InteractionStore:
         try:
             actor = self.store._live_principal(conn, actor)
             self._thread(conn, actor, thread_id)
-            return [
-                {**dict(row), "delivery_status": "queued"}
-                for row in conn.execute(
-                    """SELECT * FROM interaction_messages WHERE thread_id = ?
-                    ORDER BY created_at, id LIMIT ? OFFSET ?""",
-                    (thread_id, limit, offset),
-                )
-            ]
+            messages = []
+            for row in conn.execute(
+                """SELECT m.*,d.id AS delivery_id,d.state AS delivery_state,d.revision AS delivery_revision,
+                d.harness_instance_id,d.upstream_session_id,d.upstream_message_id,d.error_code,
+                d.context_digest,d.updated_at AS delivery_updated_at
+                FROM interaction_messages m LEFT JOIN interaction_message_deliveries d ON d.message_id=m.id
+                WHERE m.thread_id=? ORDER BY m.created_at,m.id LIMIT ? OFFSET ?""",
+                (thread_id, limit, offset),
+            ):
+                message = dict(row)
+                if message.pop("delivery_id") is None:
+                    for key in ("delivery_state", "delivery_revision", "harness_instance_id", "upstream_session_id", "upstream_message_id", "error_code", "context_digest", "delivery_updated_at"):
+                        message.pop(key)
+                    message.update(delivery_status="queued", delivery=None, delivery_legacy=True)
+                else:
+                    delivery = {
+                        "delivery_id": row["delivery_id"], "state": row["delivery_state"],
+                        "revision": row["delivery_revision"], "harness_instance_id": row["harness_instance_id"],
+                        "upstream_session_id": row["upstream_session_id"], "upstream_message_id": row["upstream_message_id"],
+                        "error_code": row["error_code"], "context_digest": row["context_digest"],
+                        "updated_at": row["delivery_updated_at"],
+                    }
+                    for key in ("delivery_state", "delivery_revision", "harness_instance_id", "upstream_session_id", "upstream_message_id", "error_code", "context_digest", "delivery_updated_at"):
+                        message.pop(key)
+                    message.update(delivery_status=delivery["state"], delivery=delivery, delivery_legacy=False)
+                messages.append(message)
+            return messages
         finally:
             conn.close()
 

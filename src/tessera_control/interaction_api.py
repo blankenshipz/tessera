@@ -5,11 +5,22 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from .api import idempotency_key, principal
+from .api import idempotency_key, principal, worker_principal
 from .interaction import InteractionStore
-from .interaction_models import CreateDecision, CreateMessage, CreateThread, ResolveDecision
+from .interaction_models import (
+    AcknowledgeHarnessDelivery,
+    CancelHarnessDelivery,
+    ClaimHarnessDelivery,
+    CreateDecision,
+    CreateMessage,
+    CreateThread,
+    EnqueueHarnessDelivery,
+    ReportHarnessDelivery,
+    ResolveDecision,
+)
 
 router = APIRouter(prefix="/interaction")
+worker_router = APIRouter(prefix="/worker")
 Actor = Annotated[dict[str, Any], Depends(principal)]
 Key = Annotated[str, Depends(idempotency_key)]
 Offset = Annotated[int, Query(ge=0, le=100000)]
@@ -36,6 +47,61 @@ def create_thread(body: CreateThread, actor: Actor, key: Key, store: Records) ->
 @router.post("/messages")
 def send_message(body: CreateMessage, actor: Actor, key: Key, store: Records) -> JSONResponse:
     return response(store.send_message(actor, key, **body.model_dump(mode="json")))
+
+
+@router.post("/deliveries")
+def enqueue_delivery(
+    body: EnqueueHarnessDelivery, actor: Actor, key: Key, store: Records
+) -> JSONResponse:
+    return response(store.enqueue_harness_delivery(actor, key, **body.model_dump(mode="json")))
+
+
+@router.post("/deliveries/{delivery_id}/cancel")
+def cancel_delivery(
+    delivery_id: str, body: CancelHarnessDelivery, actor: Actor, key: Key, store: Records
+) -> JSONResponse:
+    return response(
+        store.cancel_harness_delivery(actor, key, delivery_id, **body.model_dump(mode="json"))
+    )
+
+
+@worker_router.post("/interaction-deliveries/{delivery_id}/claim")
+def claim_delivery(
+    delivery_id: str,
+    body: ClaimHarnessDelivery,
+    worker: Annotated[dict[str, Any], Depends(worker_principal)],
+    key: Key,
+    store: Records,
+) -> JSONResponse:
+    return response(
+        store.claim_harness_delivery(worker, key, delivery_id, **body.model_dump(mode="json"))
+    )
+
+
+@worker_router.post("/interaction-deliveries/{delivery_id}/ack")
+def acknowledge_delivery(
+    delivery_id: str,
+    body: AcknowledgeHarnessDelivery,
+    worker: Annotated[dict[str, Any], Depends(worker_principal)],
+    key: Key,
+    store: Records,
+) -> JSONResponse:
+    return response(
+        store.acknowledge_harness_delivery(worker, key, delivery_id, **body.model_dump(mode="json"))
+    )
+
+
+@worker_router.post("/interaction-deliveries/{delivery_id}/report")
+def report_delivery(
+    delivery_id: str,
+    body: ReportHarnessDelivery,
+    worker: Annotated[dict[str, Any], Depends(worker_principal)],
+    key: Key,
+    store: Records,
+) -> JSONResponse:
+    return response(
+        store.report_harness_delivery(worker, key, delivery_id, **body.model_dump(mode="json"))
+    )
 
 
 @router.get("/projects/{project_id}/threads")

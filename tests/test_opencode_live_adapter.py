@@ -143,7 +143,10 @@ class OpenCodeFixture:
                     fixture.messages.append((self.path.split("/")[2], body))
                     if self._drop_if_configured():
                         return
-                    self._json(200, {})
+                    if self.headers.get("X-Tessera-Operation-ID", "").startswith("delivery_"):
+                        self._json(200, {"id": "upstream-message-1"})
+                    else:
+                        self._json(200, {})
                     return
                 if self.path.startswith("/session/") and self.path.endswith("/abort"):
                     fixture.aborts.append(self.path.split("/")[2])
@@ -223,6 +226,37 @@ def instance_pin(**changes: str) -> OpenCodeHarnessInstancePin:
     }
     fields.update(changes)
     return OpenCodeHarnessInstancePin(**fields)
+
+
+# fmt: off
+def test_context_only_delivery_has_durable_identity_and_never_resends(tmp_path: Path) -> None:
+    with fixture() as upstream:
+        adapter = LiveOpenCodeHarnessAdapter(
+            client(upstream), tmp_path / "journal", authority_is_current=lambda *_: True,
+            context_only_delivery=True,
+        )
+        bound = binding().__class__(**(binding().__dict__ | {"session_id": "session-1"}))
+        first = adapter.deliver_context_only(bound, "delivery_1", "Human context", "a" * 64)
+        replay = adapter.deliver_context_only(bound, "delivery_1", "Human context", "a" * 64)
+        assert first == replay and first[0] == "upstream-message-1"
+        assert len(upstream.messages) == 1 and upstream.provider_calls == 0
+        adapter.close()
+
+
+def test_context_only_lost_ack_stays_uncertain_and_is_not_resent(tmp_path: Path) -> None:
+    with fixture() as upstream:
+        adapter = LiveOpenCodeHarnessAdapter(
+            client(upstream), tmp_path / "journal", authority_is_current=lambda *_: True,
+            context_only_delivery=True,
+        )
+        upstream.drop_next = "/session/session-1/message"
+        bound = binding().__class__(**(binding().__dict__ | {"session_id": "session-1"}))
+        with pytest.raises(OpenCodeHarnessError, match="uncertain"):
+            adapter.deliver_context_only(bound, "delivery_2", "Human context", "b" * 64)
+        with pytest.raises(OpenCodeHarnessError, match="uncertain"):
+            adapter.deliver_context_only(bound, "delivery_2", "Human context", "b" * 64)
+        assert len(upstream.messages) == 1 and upstream.provider_calls == 0
+        adapter.close()
 
 
 class _SseResponse:

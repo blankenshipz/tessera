@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Narrow, pinned HTTP/SSE client for one configured OpenCode server.
 
 This is deliberately not an OpenCode SDK.  It can inspect the pinned server
@@ -5,6 +6,8 @@ document and issue only the session create/message/abort and event-stream calls
 used by the Tessera harness boundary.  It has no provider, shell, MCP, cookie,
 proxy, or redirect surface.
 """
+
+# fmt: off
 
 from __future__ import annotations
 
@@ -297,6 +300,28 @@ class OpenCodeHttpClient:
             expect_json=False,
             operation_id=operation_id,
         )
+
+    def send_context_only_message(self, session_id: str, message: str, delivery_id: str) -> dict[str, object]:
+        """Send one human context message and require an upstream readback identity.
+
+        This deliberately has no model, provider, tool, MCP, or permission route.
+        A server that cannot return a message identity is uncertain rather than
+        treated as an exactly-once delivery.
+        """
+        self._require_verified()
+        self._identifier(session_id, "session_id")
+        self._identifier(delivery_id, "delivery_id")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("OpenCode message must be non-empty text.")
+        response = self._json(
+            "POST", f"/session/{session_id}/message", {"parts": [{"type": "text", "text": message}]},
+            expect_json=True, operation_id=delivery_id,
+        )
+        message_id = response.get("id")
+        if not isinstance(message_id, str):
+            raise OpenCodeHttpError("OpenCode message readback lacks an identity")
+        self._identifier(message_id, "upstream_message_id")
+        return response
 
     def abort(self, session_id: str, operation_id: str) -> None:
         self._require_verified()

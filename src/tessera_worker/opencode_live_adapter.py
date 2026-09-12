@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Live OpenCode session adapter behind the existing Tessera harness boundary.
 
 The journal is local recovery evidence, not control authority.  It persists an
@@ -5,8 +6,11 @@ intent before each externally visible OpenCode call and keeps uncertainty rather
 than creating a replacement session/message/abort request.
 """
 
+# fmt: off
+
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -46,11 +50,13 @@ class LiveOpenCodeHarnessAdapter:
         journal_dir: Path,
         *,
         authority_is_current: Callable[[TesseraBinding, str], bool],
+        context_only_delivery: bool = False,
     ) -> None:
         if not isinstance(client, OpenCodeHttpClient):
             raise ValueError("Live adapter requires the narrow OpenCode HTTP client.")
         self._client = client
         self._authority_is_current = authority_is_current
+        self._context_only_delivery = context_only_delivery
         self._database = self._prepare_journal(Path(journal_dir))
         self._connection = sqlite3.connect(self._database)
         self._connection.execute("PRAGMA journal_mode=DELETE")
@@ -239,6 +245,66 @@ class LiveOpenCodeHarnessAdapter:
             raise ValueError("Unknown OpenCode effect boundary.")
         row = self._required_operation(operation_id)
         return row[{"create": 10, "message": 11, "abort": 12}[boundary]]
+
+    def deliver_context_only(
+        self, binding: TesseraBinding, delivery_id: str, message: str, context_digest: str
+    ) -> tuple[str, str]:
+        """Deliver one already-claimed human message to its designated session.
+
+        The durable delivery intent is written before the HTTP call.  A lost
+        reply stays uncertain and is never resent; callers report that state to
+        control instead of fabricating an acknowledgement.
+        """
+        if not self._context_only_delivery:
+            raise OpenCodeHarnessError("OpenCode context-only delivery mode is disabled.")
+        if binding.session_id is None:
+            raise OpenCodeHarnessError("A designated OpenCode session is required.")
+        if not isinstance(delivery_id, str) or not delivery_id or len(delivery_id) > 128:
+            raise ValueError("OpenCode delivery identity is invalid.")
+        if not isinstance(context_digest, str) or len(context_digest) != 64:
+            raise ValueError("OpenCode context digest is invalid.")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("OpenCode message is invalid.")
+        self._require_instance_binding(binding)
+        existing = self._connection.execute(
+            "SELECT session_id,context_digest,outcome,upstream_message_id,readback_digest FROM message_deliveries WHERE delivery_id=?",
+            (delivery_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != binding.session_id or existing[1] != context_digest:
+                raise OpenCodeHarnessError("OpenCode delivery identity conflicts with its durable context.")
+            if existing[2] == "acknowledged":
+                return existing[3], existing[4]
+            raise OpenCodeHarnessError("OpenCode delivery is uncertain; reconcile it.")
+        self._require_authority(binding, "message")
+        self._connection.execute(
+            """INSERT INTO message_deliveries
+            (delivery_id,operation_id,session_id,context_digest,outcome,upstream_message_id,readback_digest)
+            VALUES (?,?,?,?, 'pending',NULL,NULL)""",
+            (delivery_id, binding.operation_id, binding.session_id, context_digest),
+        )
+        self._connection.commit()
+        try:
+            self._client.verify_contract()
+            self._require_authority(binding, "message")
+            readback = self._client.send_context_only_message(binding.session_id, message, delivery_id)
+            upstream_message_id = readback["id"]
+            assert isinstance(upstream_message_id, str)
+            readback_digest = hashlib.sha256(
+                json.dumps(readback, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+            ).hexdigest()
+        except (OpenCodeHttpError, AuthorityRejectedError):
+            self._connection.execute(
+                "UPDATE message_deliveries SET outcome='uncertain' WHERE delivery_id=?", (delivery_id,)
+            )
+            self._connection.commit()
+            raise OpenCodeHarnessError("OpenCode message delivery is uncertain; reconcile it.") from None
+        self._connection.execute(
+            """UPDATE message_deliveries SET outcome='acknowledged',upstream_message_id=?,readback_digest=?
+            WHERE delivery_id=?""", (upstream_message_id, readback_digest, delivery_id)
+        )
+        self._connection.commit()
+        return upstream_message_id, readback_digest
 
     def _ingest_event(self, event: OpenCodeSseEvent) -> None:
         """Persist a shared-stream event before assigning it to its session.
@@ -530,6 +596,12 @@ class LiveOpenCodeHarnessAdapter:
                 singleton INTEGER PRIMARY KEY CHECK (singleton=1),
                 replay_cursor INTEGER);
             INSERT OR IGNORE INTO stream_state (singleton, replay_cursor) VALUES (1, NULL);"""
+        )
+        self._connection.execute(
+            """CREATE TABLE IF NOT EXISTS message_deliveries (
+            delivery_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            context_digest TEXT NOT NULL, outcome TEXT NOT NULL,
+            upstream_message_id TEXT, readback_digest TEXT)"""
         )
         columns = {
             row[1] for row in self._connection.execute("PRAGMA table_info(operations)").fetchall()

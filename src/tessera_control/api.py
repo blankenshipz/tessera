@@ -74,6 +74,7 @@ def create_app(state_dir: Path) -> FastAPI:
     from .handoffs import WorkspaceHandoffStore
     from .interaction import InteractionStore
     from .interaction_api import router as interaction_router
+    from .interaction_api import worker_router as interaction_worker_router
     from .research import ResearchStore
     from .research_api import router as research_router
     from .skill_api import router as skill_router
@@ -103,6 +104,7 @@ def create_app(state_dir: Path) -> FastAPI:
     app.include_router(research_router)
     app.include_router(experiments_router)
     app.include_router(interaction_router)
+    app.include_router(interaction_worker_router)
     app.include_router(handoff_router)
     app.add_middleware(
         TrustedHostMiddleware,
