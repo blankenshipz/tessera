@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 38
+LATEST_SCHEMA_VERSION = 43
 LOCAL_ORG_ID = "org_local"
 
 
@@ -697,15 +697,84 @@ def migrate_v37_to_v38(connection: sqlite3.Connection) -> None:
     Existing v37 delivery rows intentionally remain NULL and unclaimable: their
     complete lease association was never recorded and must not be reconstructed.
     """
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(interaction_message_deliveries)")
+    }
     for column, definition in (
         ("operation_id", "TEXT REFERENCES external_operations(operation_id)"),
         ("grant_id", "TEXT REFERENCES execution_grants(id)"),
         ("lease_id", "TEXT REFERENCES execution_leases(id)"),
     ):
-        connection.execute(
-            f"ALTER TABLE interaction_message_deliveries ADD COLUMN {column} {definition}"
-        )
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE interaction_message_deliveries ADD COLUMN {column} {definition}"
+            )
     connection.execute("UPDATE schema_meta SET schema_version = 38 WHERE singleton = 1")
+
+
+def migrate_v38_to_v39(connection: sqlite3.Connection) -> None:
+    """Add empty immutable operation-to-harness bindings without inferring sessions.
+
+    Existing delivery rows remain historical records with a NULL binding.  They
+    retain read/cancel semantics but cannot acquire newly introduced binding
+    authority.
+    """
+    from .interaction import create_interaction_schema
+
+    create_interaction_schema(connection)
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(interaction_message_deliveries)")
+    }
+    if "harness_session_binding_id" not in columns:
+        connection.execute(
+            "ALTER TABLE interaction_message_deliveries ADD COLUMN "
+            "harness_session_binding_id TEXT REFERENCES operation_harness_session_bindings(id)"
+        )
+    connection.execute("UPDATE schema_meta SET schema_version = 39 WHERE singleton = 1")
+
+
+def migrate_v39_to_v40(connection: sqlite3.Connection) -> None:
+    """Add empty provider-disabled Astra conversation/coordinator records.
+
+    No historical conversation, harness binding, approval, grant, dispatch, or
+    proposal is inferred from v39 data.
+    """
+    from .astra import create_astra_schema
+
+    create_astra_schema(connection, include_proposal_promotion=False)
+    connection.execute("UPDATE schema_meta SET schema_version = 40 WHERE singleton = 1")
+
+
+def migrate_v40_to_v41(connection: sqlite3.Connection) -> None:
+    """Add empty human proposal-to-design registrations without execution authority."""
+    from .astra import create_astra_schema
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(astra_proposals)")}
+    if "design_json" not in columns:
+        connection.execute("ALTER TABLE astra_proposals ADD COLUMN design_json TEXT")
+    create_astra_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 41 WHERE singleton = 1")
+
+
+def migrate_v41_to_v42(connection: sqlite3.Connection) -> None:
+    """Add empty, non-execution Astra explain-status discussion records.
+
+    No old coordinator turn is inferred to be a tool call, answer, binding, or
+    lease.  These records are deliberately separate from operation harness
+    session bindings and execution leases.
+    """
+    from .astra_status import create_astra_status_schema
+
+    create_astra_status_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 42 WHERE singleton = 1")
+
+
+def migrate_v42_to_v43(connection: sqlite3.Connection) -> None:
+    """Add empty operation-bound remote lifecycle records without inferred runs."""
+    from .remote_workflows import create_remote_workflow_schema
+
+    create_remote_workflow_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 43 WHERE singleton = 1")
 
 
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
@@ -746,6 +815,11 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     35: migrate_v35_to_v36,
     36: migrate_v36_to_v37,
     37: migrate_v37_to_v38,
+    38: migrate_v38_to_v39,
+    39: migrate_v39_to_v40,
+    40: migrate_v40_to_v41,
+    41: migrate_v41_to_v42,
+    42: migrate_v42_to_v43,
 }
 
 

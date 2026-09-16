@@ -20,3 +20,6 @@ owner.header
 node_modules/
 desktop/out/
 desktop/release/
+
+# Local immutable verification bundles; never commit dirty-tree snapshots.
+.evidence/

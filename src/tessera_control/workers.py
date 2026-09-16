@@ -9,7 +9,17 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, _parse_utc, utc_now
+from .store import (
+    Conflict,
+    Forbidden,
+    NotFound,
+    Store,
+    StoreError,
+    _connect,
+    _parse_utc,
+    _utc_string,
+    utc_now,
+)
 from .worker_models import RegisterWorker, WorkerHeartbeat, WorkerLifecycle
 
 HEARTBEAT_MAX_AGE = timedelta(seconds=60)
@@ -45,6 +55,10 @@ def create_worker_schema(connection: sqlite3.Connection) -> None:
 
 class WorkerRegistryStore(Store):
     """Owner-managed metadata and worker-authenticated liveness only."""
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(UTC)
 
     @staticmethod
     def _body(model: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -100,7 +114,7 @@ class WorkerRegistryStore(Store):
                 "SELECT 1 FROM worker_registry WHERE worker_principal_id = ?", (worker["id"],)
             ).fetchone():
                 raise Conflict("Worker principal is already registered.")
-            now = utc_now()
+            now = _utc_string(self._now())
             row = {
                 "id": "worker_" + uuid.uuid4().hex,
                 "org_id": live["org_id"],
@@ -222,7 +236,7 @@ class WorkerRegistryStore(Store):
                 raise Forbidden("Worker is not registered.")
             if row["lifecycle_state"] == "retired":
                 raise Forbidden("Worker is retired.")
-            now = utc_now()
+            now = _utc_string(self._now())
             updated = dict(row)
             updated.update(heartbeat_at=now, last_seen_at=now, revision=row["revision"] + 1)
             connection.execute(
@@ -277,5 +291,5 @@ class WorkerRegistryStore(Store):
             last_seen = _parse_utc(row["last_seen_at"])
         except ValueError as error:
             raise Conflict("Worker liveness metadata is invalid.") from error
-        if last_seen < datetime.now(UTC) - HEARTBEAT_MAX_AGE:
+        if last_seen < cls._now() - HEARTBEAT_MAX_AGE:
             raise Conflict("Worker is disconnected and cannot receive lease authority.")

@@ -302,5 +302,5 @@ def test_v14_to_v15_checkpoint_migration_preserves_v14_evidence_and_rolls_back(
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
         ).fetchone()
-    assert migrate_state(state) == 35
-    assert migrate_state(state) == 35
+    assert migrate_state(state) == 43
+    assert migrate_state(state) == 43

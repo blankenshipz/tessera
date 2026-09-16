@@ -99,11 +99,22 @@ class RuntimePackageStore(ExecutionStore):
             "hard_expires_at": lease["hard_expires_at"],
         }
         if spec["profile"] == "kubernetes-opencode":
+            try:
+                issued_at = _parse_utc(lease["issued_at"])
+                hard_expires_at = _parse_utc(lease["hard_expires_at"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise Conflict("Kubernetes execution authority expiry is invalid.") from error
+            authority_seconds = int((hard_expires_at - issued_at).total_seconds())
+            if authority_seconds < 1:
+                raise Conflict("Kubernetes execution authority has no runnable duration.")
             package.update(
                 org_id=worker["org_id"],
                 provider_enabled=False,
                 kubernetes_workload={
-                    "active_deadline_seconds": plan["max_duration_seconds"],
+                    # This provider-side relative deadline is only a backstop.
+                    # The worker also enforces the absolute control-issued bound,
+                    # including when submission is delayed.
+                    "active_deadline_seconds": min(plan["max_duration_seconds"], authority_seconds),
                     "command": spec["argv"],
                     "network_mode": "none",
                 },
@@ -206,6 +217,9 @@ class RuntimePackageStore(ExecutionStore):
              :experiment_design_revision,:experiment_variant_id)""",
             row,
         )
+        from .remote_workflows import record_remote_workflow_intent
+
+        record_remote_workflow_intent(connection, row)
         return row, True
 
     def execution_package(

@@ -66,8 +66,8 @@ def test_v12_preserves_finding_history_and_supports_held_restore(tmp_path: Path)
             connection.execute("UPDATE research_findings SET status='retracted'")
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 35
-    assert migrate_state(state) == 35
+    assert migrate_state(state) == 43
+    assert migrate_state(state) == 43
     store = ResearchStore(state)
     assert store.export_study(owner, finding["study_id"]) == before
     retracted = _run(
@@ -130,7 +130,7 @@ def test_v13_migration_preserves_v12_records_and_rolls_back(
         with sqlite3.connect(database) as connection:
             assert list(connection.iterdump()) == snapshot
         return
-    assert migrate_state(state) == 35
+    assert migrate_state(state) == 43
     store = ResearchStore(state)
     assert store.export_study(owner, finding["study_id"]) == before
     result = _run(

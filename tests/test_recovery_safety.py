@@ -50,9 +50,35 @@ def test_restore_rejects_untrusted_schema_before_authority_updates(tmp_path: Pat
     assert not (restored / recovery.RESTORE_MARKER).exists()
 
 
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "CREATE TABLE astra_proposal_promotions (proposal_id TEXT)",
+        "CREATE INDEX unexpected_astra_registration "
+        "ON astra_proposal_design_registrations(context_digest)",
+        """CREATE TRIGGER unexpected_astra_proposal_trigger AFTER INSERT ON astra_proposals
+        BEGIN UPDATE control_recovery SET state='active'; END""",
+        "ALTER TABLE astra_proposals ADD COLUMN unexpected_v42_authority TEXT",
+    ],
+)
+def test_restore_rejects_schema_outside_exact_current_allowlist(
+    tmp_path: Path, schema: str
+) -> None:
+    _source, backup = _backup(tmp_path)
+    with sqlite3.connect(backup / recovery.BACKUP_DATABASE) as connection:
+        connection.execute(schema)
+    _refresh_manifest(backup)
+
+    restored = tmp_path / "restored"
+    with pytest.raises(StoreError, match="schema|tables"):
+        recovery.restore_state(backup, restored)
+    assert not (restored / recovery.DATABASE_NAME).exists()
+    assert not (restored / recovery.RESTORE_MARKER).exists()
+
+
 def test_supported_legacy_migration_can_be_backed_up_and_restored(tmp_path: Path):
     source = _legacy_state(tmp_path)
-    assert migrate_state(source) == 37
+    assert migrate_state(source) == 43
     backup = tmp_path / "backup"
     recovery.backup_state(source, backup)
     restored = tmp_path / "restored"

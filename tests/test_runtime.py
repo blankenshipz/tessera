@@ -319,53 +319,69 @@ def test_stalled_http_response_cannot_hold_supervisor_cancellation(tmp_path):
 
     state, _, _, worker, _, lease = _delivery(tmp_path)
     client = TestClient(create_app(state))
-    stall, release = threading.Event(), threading.Event()
+    read_entered, release = threading.Event(), threading.Event()
 
     class Response:
-        def __init__(self, response):
+        def __init__(self, response, *, block_read=False):
             self.response = response
             self.headers = response.headers
+            self.block_read = block_read
 
         def getcode(self):
             return self.response.status_code
 
         def read(self, size):
-            if stall.is_set():
+            if self.block_read:
+                read_entered.set()
                 release.wait(2)
             return self.response.content[:size]
 
         def close(self):
             self.response.close()
 
-    def open_request(request, timeout):
+    def open_request(request, timeout, *, block_read=False):
         return Response(
             client.post(
                 urlsplit(request.full_url).path,
                 content=request.data,
                 headers=dict(request.header_items()),
-            )
+            ),
+            block_read=block_read,
         )
 
-    channel = HttpControlChannel(
-        "http://127.0.0.1:8765", "worker-token", timeout_seconds=0.2, opener=open_request
+    startup_channel = HttpControlChannel(
+        "http://127.0.0.1:8765", "worker-token", timeout_seconds=5, opener=open_request
+    )
+    stalled_read_channel = HttpControlChannel(
+        "http://127.0.0.1:8765",
+        "worker-token",
+        timeout_seconds=0.2,
+        opener=lambda request, timeout: open_request(request, timeout, block_read=True),
     )
     root = tmp_path / "inputs"
     root.mkdir(mode=0o700)
     adapter = FakeAdapter()
     try:
         with CpuRuntime(
-            tmp_path / "runtime", root, channel, adapter, worker_id=worker["id"]
+            tmp_path / "runtime", root, startup_channel, adapter, worker_id=worker["id"]
         ) as runtime:
             assert runtime.start(lease["id"], lease["epoch"]).phase == "running"
-            stall.set()
+            runtime.channel = stalled_read_channel
+            result = []
+            tick = threading.Thread(target=lambda: result.append(runtime.tick()))
             start = time.monotonic()
-            stopped = runtime.tick()
+            tick.start()
+            assert read_entered.wait(1)
+            tick.join(1)
             assert time.monotonic() - start < 1
+            assert not tick.is_alive()
+            assert len(result) == 1
+            stopped = result[0]
             assert stopped.phase == "terminal"
             assert stopped.reason == "cancelled_lease_denied"
             assert adapter.calls.count("cancel") == 1
     finally:
         release.set()
-        if channel._inflight is not None:
-            channel._inflight.result(timeout=2)
+        if stalled_read_channel._inflight is not None:
+            stalled_read_channel._inflight.result(timeout=2)
         client.close()

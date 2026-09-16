@@ -882,7 +882,11 @@ class ExecutionStore(Store):
             expires_at = min(now_datetime + timedelta(seconds=LEASE_SECONDS), hard_expires_at)
             if expires_at <= now_datetime:
                 raise Conflict("Worker authority expires before a lease can be issued.")
-            epoch, now = self._next_epoch(connection, grant["task_id"]), utc_now()
+            epoch = self._next_epoch(connection, grant["task_id"])
+            # Use the same authority clock for the absolute lease bounds and its
+            # durable issuance timestamp.  A second wall-clock sample can make a
+            # nominal N-second approved duration appear to exceed hard expiry.
+            now = _utc_string(now_datetime)
             lease = {
                 "id": "lease_" + uuid.uuid4().hex,
                 "grant_id": grant_id,
@@ -1150,6 +1154,12 @@ class ExecutionStore(Store):
                         operation["operation_id"],
                     ),
                 )
+                from .remote_workflows import sync_remote_workflow_observation
+
+                sync_remote_workflow_observation(
+                    connection,
+                    operation["operation_id"],
+                )
                 from .experiments import record_admitted_attempt_observation
 
                 semantic_transition = record_admitted_attempt_observation(
@@ -1319,6 +1329,9 @@ class ExecutionStore(Store):
                 observed_state=?, updated_at=? WHERE operation_id=?""",
                 (payload["provider_id"], reconciliation["observed_state"], now, operation_id),
             )
+            from .remote_workflows import sync_remote_workflow_observation
+
+            sync_remote_workflow_observation(connection, operation_id)
             from .experiments import record_admitted_attempt_observation
 
             semantic_transition = record_admitted_attempt_observation(connection, operation, worker)

@@ -1,4 +1,4 @@
-"""Schema-v37 dispatch ledger recovery fixtures using only fake local state."""
+"""Schema-v43 dispatch ledger recovery fixtures using only fake local state."""
 
 from __future__ import annotations
 
@@ -50,14 +50,14 @@ def _refresh_manifest(backup: Path) -> None:
     manifest_path.write_text(json.dumps(manifest))
 
 
-@pytest.mark.parametrize("migrated", (False, True), ids=("fresh-v37", "migrated-v35"))
+@pytest.mark.parametrize("migrated", (False, True), ids=("fresh-v43", "migrated-v35"))
 def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatable(
     tmp_path: Path, migrated: bool
 ) -> None:
     response, _worker, _package = _admitted_package(tmp_path, migrate_from_v35=migrated)
     state = tmp_path / "state"
-    assert migrate_state(state) == 37
-    assert migrate_state(state) == 37
+    assert migrate_state(state) == 43
+    assert migrate_state(state) == 43
 
     with sqlite3.connect(state / DATABASE_NAME) as connection:
         assert connection.execute(
@@ -85,7 +85,7 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
     assert len(before["execution_runtime_packages"]) == len(before["kubernetes_dispatches"]) == 1
 
     backup = tmp_path / "backup"
-    assert backup_state(state, backup)["schema_version"] == 37
+    assert backup_state(state, backup)["schema_version"] == 43
     restored = tmp_path / "restored"
     restore_state(backup, restored)
     assert _ledger_rows(restored) == before

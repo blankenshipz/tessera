@@ -36,9 +36,12 @@ uv run --locked tessera backup --state-dir .tessera --output /safe/place/tessera
 uv run --locked tessera migrate --state-dir .tessera
 ```
 
-Schema v35 is current. Startup refuses older schemas; older binaries refuse newer
-state. Backup and held restore have important object-custody and original-service
-limits—read [recovery](recovery.md) before relying on either command.
+Schema v43 is current. Startup refuses older schemas; older binaries refuse newer
+state. A backup copies committed local project objects into a versioned object
+bundle, while SQLite-only legacy artifacts remain in the snapshot. Restore places
+those bytes in a permanently read-only held history. Neither operation stops or
+fences the original service, workers, or external jobs, so this is not operational
+failover—read [recovery](recovery.md) before relying on either command.
 
 For a deliberately non-executable, synthetic public workflow narrative, see
 [examples/local-ledger](../examples/local-ledger/README.md).

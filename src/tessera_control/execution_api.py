@@ -19,6 +19,12 @@ from .execution_models import (
     RevokeExecutionGrant,
 )
 from .input_delivery import DeliverInputs, InputDeliveryStore
+from .remote_workflows import (
+    RemoteWorkflowCheckpoint,
+    RemoteWorkflowHeartbeat,
+    RemoteWorkflowReconnect,
+    RemoteWorkflowStore,
+)
 from .result_acceptances import ResultAcceptanceRequest, ResultAcceptanceStore
 from .result_checkpoints import CommitExecutionResultCheckpoint, ResultCheckpointStore
 from .runtime_packages import RuntimePackageStore
@@ -69,6 +75,13 @@ def result_acceptances(request: Request) -> ResultAcceptanceStore:
 Acceptances = Annotated[ResultAcceptanceStore, Depends(result_acceptances)]
 
 
+def remote_workflows(request: Request) -> RemoteWorkflowStore:
+    return RemoteWorkflowStore(request.app.state.execution.database_path.parent)
+
+
+RemoteWorkflows = Annotated[RemoteWorkflowStore, Depends(remote_workflows)]
+
+
 def result(value) -> JSONResponse:
     status, body = value
     return JSONResponse(status_code=status, content=body)
@@ -110,6 +123,22 @@ def list_grants(
     limit: int = Query(default=100, ge=1, le=200),
 ) -> dict[str, Any]:
     return {"grants": store.list_execution_grants(actor, project_id, offset, limit)}
+
+
+@router.get("/projects/{project_id}/remote-workflows")
+def list_remote_workflows(
+    project_id: str,
+    actor: Actor,
+    store: RemoteWorkflows,
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    return {"remote_workflows": store.list_workflows(actor, project_id, offset, limit)}
+
+
+@router.get("/remote-workflows/{operation_id}")
+def get_remote_workflow(operation_id: str, actor: Actor, store: RemoteWorkflows) -> dict[str, Any]:
+    return store.get_workflow(actor, operation_id)
 
 
 @router.get("/execution-grants/{grant_id}")
@@ -260,6 +289,42 @@ def report_provider_receipt(
 def heartbeat(body: WorkerHeartbeat, worker: Worker, key: Key, store: Workers) -> JSONResponse:
     payload = body.model_dump(mode="json")
     return result(store.heartbeat(worker, key, canonical_digest(payload), payload))
+
+
+@router.post("/worker/remote-workflows/{operation_id}/heartbeat")
+def remote_workflow_heartbeat(
+    operation_id: str,
+    body: RemoteWorkflowHeartbeat,
+    worker: Worker,
+    key: Key,
+    store: RemoteWorkflows,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(store.heartbeat(worker, operation_id, key, canonical_digest(payload), payload))
+
+
+@router.post("/worker/remote-workflows/{operation_id}/checkpoints")
+def remote_workflow_checkpoint(
+    operation_id: str,
+    body: RemoteWorkflowCheckpoint,
+    worker: Worker,
+    key: Key,
+    store: RemoteWorkflows,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(store.checkpoint(worker, operation_id, key, canonical_digest(payload), payload))
+
+
+@router.post("/worker/remote-workflows/{operation_id}/reconnect")
+def remote_workflow_reconnect(
+    operation_id: str,
+    body: RemoteWorkflowReconnect,
+    worker: Worker,
+    key: Key,
+    store: RemoteWorkflows,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(store.reconnect(worker, operation_id, key, canonical_digest(payload), payload))
 
 
 @router.get("/worker/status")

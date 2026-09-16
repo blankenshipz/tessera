@@ -82,7 +82,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 38);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 43);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -186,6 +186,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .artifact_dispositions import create_artifact_disposition_schema
     from .artifact_manifests import create_artifact_manifest_schema
     from .artifacts import create_artifact_schema, create_artifact_upload_schema
+    from .astra import create_astra_schema
+    from .astra_status import create_astra_status_schema
     from .credential_leases import create_credential_access_lease_schema
     from .execution import create_execution_schema
     from .experiments import (
@@ -207,6 +209,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .project_artifact_retention import create_project_artifact_retention_schema
     from .project_artifact_store import create_project_artifact_storage_schema
     from .recovery import create_recovery_schema
+    from .remote_workflows import create_remote_workflow_schema
     from .research import create_research_schema
     from .result_acceptances import create_result_acceptance_schema
     from .result_checkpoints import create_result_checkpoint_schema
@@ -243,6 +246,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_admitted_attempt_resolution_schema(connection)
     create_admitted_attempt_observation_projection_schema(connection)
     create_admitted_attempt_evidence_schema(connection)
+    create_astra_schema(connection)
+    create_astra_status_schema(connection)
+    create_remote_workflow_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from copy import deepcopy
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -52,7 +55,11 @@ def _cluster(**changes: object) -> KubernetesClusterConfig:
 
 
 def _admitted_package(
-    tmp_path: Path, *, migrate_from_v35: bool = False
+    tmp_path: Path,
+    *,
+    migrate_from_v35: bool = False,
+    max_duration_seconds: int = 300,
+    grant_seconds: int | None = None,
 ) -> tuple[dict, dict, KubernetesExecutionPackage]:
     state = tmp_path / "state"
     initialize_state(state)
@@ -79,7 +86,7 @@ def _admitted_package(
             "title": "Kubernetes",
             "purpose": "Exercise admitted Kubernetes execution.",
             "budget_cents": 100,
-            "max_duration_seconds": 300,
+            "max_duration_seconds": max_duration_seconds,
         },
     )
     revision = {
@@ -87,7 +94,7 @@ def _admitted_package(
         "title": "Kubernetes",
         "purpose": "Exercise admitted Kubernetes execution.",
         "budget_cents": 100,
-        "max_duration_seconds": 300,
+        "max_duration_seconds": max_duration_seconds,
         "execution_spec": {
             "argv": ["opencode", "serve"],
             "input_snapshot_digest": snapshot["digest"],
@@ -120,6 +127,10 @@ def _admitted_package(
         owner, project["id"], "limits", canonical_digest(limits), limits
     )
     grant_payload = _grant_payload(task, worker, {"id": snapshot["id"]})
+    if grant_seconds is not None:
+        grant_payload["expires_at"] = (
+            datetime.now(UTC) + timedelta(seconds=grant_seconds)
+        ).isoformat()
     _, grant = execution.issue_execution_grant(
         owner,
         project["id"],
@@ -169,9 +180,13 @@ class _FakeKubernetes:
         self.pods: list[dict] = []
         self.creates = 0
 
-    def create(self, _manifest: object) -> None:
+    def create(self, manifest: object) -> None:
         self.creates += 1
-        self.jobs[self.package.binding.job_name] = self.job()
+        observed = deepcopy(manifest)
+        assert isinstance(observed, dict)
+        observed["metadata"]["uid"] = "job-fixture"
+        observed["status"] = {"active": 1}
+        self.jobs[self.package.binding.job_name] = observed
         return None
 
     def job(self, state: str = "running") -> dict:
@@ -476,10 +491,8 @@ def test_repeated_read_failures_keep_unknown_and_recorded_job_recovery_identity(
         delete_job=fake.delete,
         observe_pods=unreadable_pods,
     )
-    with pytest.raises(RuntimeError, match="temporary Pod"):
-        adapter.submit(package)
-    with pytest.raises(RuntimeError, match="temporary Pod"):
-        adapter.reconcile(package)
+    assert adapter.submit(package).observed_state == "unknown"
+    assert adapter.reconcile(package).observed_state == "unknown"
 
     with sqlite3.connect(journal) as connection:
         assert connection.execute(
@@ -489,3 +502,80 @@ def test_repeated_read_failures_keep_unknown_and_recorded_job_recovery_identity(
     assert fake.creates == 1
     with pytest.raises(KubernetesExecutionError, match="observed successful"):
         adapter.artifact_collection_handoff(package)
+
+
+def test_provider_callback_deadline_returns_unknown_and_prevents_overlap(tmp_path: Path) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    calls = 0
+
+    def blocked_inspection(_name: str) -> None:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        release.wait(1)
+        return None
+
+    adapter = KubernetesExecutionAdapter(
+        tmp_path / "kubernetes.sqlite3",
+        _cluster(),
+        inspect_job=blocked_inspection,
+        create_job=lambda _manifest: pytest.fail("must not create"),
+        delete_job=lambda _name, _uid: pytest.fail("must not delete"),
+        observe_pods=lambda _uid: (),
+    )
+    started = time.monotonic()
+    assert adapter.reconcile(package, timeout_seconds=0.03).observed_state == "unknown"
+    assert time.monotonic() - started < 0.5 and entered.is_set()
+    assert adapter.reconcile(package, timeout_seconds=0.03).observed_state == "unknown"
+    assert calls == 1
+    release.set()
+    adapter._inflight.result(timeout=0.5)
+
+
+@pytest.mark.parametrize(
+    "new_observation",
+    ("job_read_error", "pod_read_error", "running_job", "pending_job", "unknown_job"),
+)
+def test_new_contradictory_observation_supersedes_old_cancellation_confirmation(
+    tmp_path: Path, new_observation: str
+) -> None:
+    _response, _worker, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    journal = tmp_path / "kubernetes.sqlite3"
+    adapter = fake.adapter(journal)
+    assert adapter.submit(package).observed_state == "running"
+    assert adapter.cancel(package).termination_confirmed is True
+    assert adapter.cancellation_proof(package)["termination_confirmed"] is True
+
+    if new_observation in {"running_job", "pending_job", "unknown_job"}:
+        fake.jobs[package.binding.job_name] = fake.job(new_observation.removesuffix("_job"))
+        if new_observation == "unknown_job":
+            fake.jobs[package.binding.job_name]["status"] = {"active": "unavailable"}
+
+    failed = KubernetesExecutionAdapter(
+        journal,
+        fake.cluster,
+        inspect_job=(
+            (lambda _name: (_ for _ in ()).throw(RuntimeError("new failed Job read")))
+            if new_observation == "job_read_error"
+            else fake.jobs.get
+        ),
+        create_job=fake.create,
+        delete_job=fake.delete,
+        observe_pods=(
+            (lambda _uid: (_ for _ in ()).throw(RuntimeError("new failed Pod read")))
+            if new_observation == "pod_read_error"
+            else lambda _uid: fake.pods
+        ),
+    )
+    status = failed.reconcile(package)
+    expected = {
+        "running_job": "running",
+        "pending_job": "pending",
+        "unknown_job": "unknown",
+    }.get(new_observation, "unknown")
+    assert status.observed_state == expected
+    proof = failed.cancellation_proof(package)
+    assert proof["termination_confirmed"] is False
+    assert proof["reconciliation_required"] is True

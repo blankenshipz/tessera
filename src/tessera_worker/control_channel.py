@@ -167,9 +167,9 @@ class HttpControlChannel:
             raise ValueError("Control request body exceeds its bound.")
         return encoded
 
-    def _perform(self, request: Request) -> dict[str, Any]:
+    def _perform(self, request: Request, timeout_seconds: float) -> dict[str, Any]:
         try:
-            response = self._open(request, self.timeout_seconds)
+            response = self._open(request, timeout_seconds)
         except ControlChannelError:
             raise
         except HTTPError as error:
@@ -203,21 +203,27 @@ class HttpControlChannel:
             raise ControlChannelError("control response must be a JSON object", status)
         return decoded
 
-    def _run_request(self, future: Future[dict[str, Any]], request: Request) -> None:
+    def _run_request(
+        self, future: Future[dict[str, Any]], request: Request, timeout_seconds: float
+    ) -> None:
         try:
-            future.set_result(self._perform(request))
+            future.set_result(self._perform(request, timeout_seconds))
         except BaseException as error:
             # The caller retrieves every worker failure through the Future, so a
             # daemon cannot write an unhandled exception containing transport data.
             future.set_exception(error)
 
-    def _submit(self, request: Request) -> Future[dict[str, Any]]:
+    def _submit(self, request: Request, timeout_seconds: float) -> Future[dict[str, Any]]:
         with self._inflight_lock:
             if self._inflight is not None and not self._inflight.done():
                 raise ControlChannelError("control request is still in progress")
             future: Future[dict[str, Any]] = Future()
             self._inflight = future
-            thread = threading.Thread(target=self._run_request, args=(future, request), daemon=True)
+            thread = threading.Thread(
+                target=self._run_request,
+                args=(future, request, timeout_seconds),
+                daemon=True,
+            )
             try:
                 thread.start()
             except RuntimeError:
@@ -225,8 +231,24 @@ class HttpControlChannel:
                 raise ControlChannelError("control transport unavailable") from None
             return future
 
-    def post(self, path: str, body: dict[str, Any], key: str) -> dict[str, Any]:
+    def post(
+        self,
+        path: str,
+        body: dict[str, Any],
+        key: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """POST one bounded JSON command without redirects, cookies, or retries."""
+        if timeout_seconds is None:
+            request_timeout = self.timeout_seconds
+        elif (
+            type(timeout_seconds) not in {int, float}
+            or not 0 < timeout_seconds <= self.timeout_seconds
+        ):
+            raise ValueError("Request timeout must be positive and no longer than channel timeout.")
+        else:
+            request_timeout = float(timeout_seconds)
         request = Request(
             f"{self.origin}{self._path(path)}",
             data=self._body(body),
@@ -238,9 +260,9 @@ class HttpControlChannel:
             },
             method="POST",
         )
-        future = self._submit(request)
+        future = self._submit(request, request_timeout)
         try:
-            return future.result(timeout=self.timeout_seconds)
+            return future.result(timeout=request_timeout)
         except TimeoutError:
             raise ControlChannelError("control response deadline exceeded") from None
         except ControlChannelError:

@@ -13,10 +13,13 @@ Current limits:
 
 - The developer workflow does not provide organization account recovery,
   centralized deletion, retention scheduling, or a hosted support channel.
-- Backup is a local SQLite snapshot. Project objects outside SQLite cause backup
-  to fail closed until object-bundle recovery exists; see [recovery](recovery.md).
-- Restore creates a permanently read-only held history with a fresh local owner
-  credential. It does not stop the original service, workers, or external jobs.
+- Backup is a local SQLite snapshot plus a versioned object bundle containing
+  committed local project bytes and custody metadata. Missing or unsafe required
+  objects fail closed; SQLite-only legacy artifacts remain in the snapshot. See
+  [recovery](recovery.md).
+- Restore copies bundled objects into a permanently read-only held history with a
+  fresh local owner credential. It does not stop or fence the original service,
+  workers, or external jobs; operational failover is unsupported.
 - Synthetic OpenCode and fake-provider fixtures do not use real provider
   credentials. No real OpenCode/provider integration is supported or claimed.
 

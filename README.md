@@ -84,7 +84,7 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v35
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v43
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
@@ -131,6 +131,25 @@ polling does not consume the 1,000-record history bound or hide uncertainty.
 Schema v35 reconciles current worker and fake-provider receipt observations by
 observed time. A newer or same-time contradictory `unknown`/`running` observation
 blocks operational success and exposure release while preserving any human outcome.
+
+Schema v36 adds a human-approved, provider-disabled Kubernetes dispatch/outbox
+ledger. Schemas v37-v39 add context-only OpenCode delivery and immutable
+operation-to-session binding records; none activates a Kubernetes client,
+OpenCode provider, model, credential delivery, or artifact collection.
+
+Schemas v40-v41 add provider-disabled Astra conversation, proposal, and
+human proposal-to-design registration records. Registration creates no approval,
+grant, dispatch, or execution authority. Schema v42 adds one deterministic
+Explain-status path: a scoped agent may mediate exactly one bound
+`read_experiment_status` call whose intent, result digest, observed time, and
+answer are durable. It has no generic tool, skill, shell, provider, or model path.
+
+Schema v43 adds empty operation-bound remote-workflow lifecycle records for new
+packages: worker heartbeats, opaque checkpoints, and reconnect/outage observations.
+They are operational evidence fenced to the original worker, lease, and operation;
+migration does not invent runs for existing operations, authorize replacement
+submission, make held history writable, or prove provider termination or
+laptop-independent execution.
 
 Schema v15 adds a human-only, immutable synthetic result checkpoint for a
 reconciled, worker-confirmed operation and a complete exact quarantined manifest.
@@ -331,10 +350,25 @@ not attach a Kubernetes target or authorize execution. Automatic destructive
 teardown is not authorized. See the
 [compatibility matrix](docs/compatibility-matrix.md) for the current evidence.
 
+The separate [Astra operator setup](docs/astra-operator-setup.md) prepares one
+explicit Docker Desktop Kubernetes profile from a digest-bound human plan. It
+retains only allowlisted resources and does not attach a target, create research
+authority, enroll a worker, start a workload, create a Secret, or invoke a
+provider. Its documentation also defines an explicit, standalone in-cluster
+NetworkPolicy/PVC conformance probe; the probe is opt-in, cleanup-bounded, and
+does not establish a supported execution target or storage quota enforcement.
+
 Cluster packaging, organization login/administration, paid hosting, additional
 runtimes, GPUs, schedules, and automatic memory follow the pilot. Compare it with
 the researcher's current workflow, including setup, review, verification, and
 cost—not just agent execution speed.
+
+An explicitly owner-authorized, remote Kubernetes OpenAI ChatGPT OAuth reconnect
+harness is available as a default-disabled operational fixture. It requires a
+pre-existing remote runner deployment, an opaque owner-bound runtime reference,
+preflight, and a digest-bound one-call confirmation; it remains outside pytest/CI
+and does not relabel provider-disabled records or claim a supported provider
+integration. See [remote Kubernetes OAuth reconnect E2E](docs/remote-kubernetes-oauth-reconnect-e2e.md).
 
 See [DESIGN.md](./DESIGN.md) for the architecture, implementation sequence,
 failure handling, and release tests.
@@ -342,13 +376,14 @@ failure handling, and release tests.
 ## Developer-alpha boundaries
 
 Start with the [local ledger quickstart](docs/quickstart.md) and its synthetic
-example. Schema v35 is the current local schema, but the documented component and
+example. Schema v43 is the current local schema, but the documented component and
 synthetic evidence does not make a production workflow. There is no supported
 remote control plane, real provider integration, OpenCode compatibility result,
 or Kubernetes execution path. The tested developer environments are locked Python
 3.11+ and Docker Compose/native fixtures; no production OS support matrix is
-declared. Backups and held restore are limited local recovery tools and do not
-provide retention automation, owner/account recovery, object-bundle recovery, or
-fencing of the original service/workers/jobs. See [privacy](docs/privacy.md),
+declared. Local object-bundle backups copy committed project bytes and restore
+them into a permanently read-only held history. Backup/restore do not provide
+retention automation, owner/account recovery, operational failover, or fencing of
+the original service/workers/jobs. See [privacy](docs/privacy.md),
 [support](docs/support.md), [release checklist](docs/release-checklist.md), and
 [SECURITY.md](SECURITY.md). No license has been selected.

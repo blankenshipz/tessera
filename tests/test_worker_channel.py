@@ -229,3 +229,22 @@ def test_total_deadline_fences_a_blocked_request_without_spawning_more_threads()
     channel._inflight.result(timeout=0.5)
     assert channel.post("/worker/leases/lease/package", {}, "third") == {"ok": True}
     assert len(opener.requests) == 2
+
+
+def test_per_request_timeout_narrows_transport_and_total_deadline() -> None:
+    response = BlockingResponse()
+    opener = FakeOpener(response)
+    channel = HttpControlChannel(
+        "https://control.example", "worker-token", timeout_seconds=5, opener=opener
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ControlChannelError, match="deadline"):
+        channel.post("/worker/leases/lease/package", {}, "bounded", timeout_seconds=0.03)
+    assert time.monotonic() - started < 0.5
+    assert opener.requests[0][1] == 0.03
+    response.release.set()
+    channel._inflight.result(timeout=0.5)
+
+    with pytest.raises(ValueError, match="no longer"):
+        channel.post("/worker/leases/lease/package", {}, "too-long", timeout_seconds=6)

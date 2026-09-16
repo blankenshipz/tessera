@@ -3,7 +3,7 @@
 This file tracks executable evidence against DESIGN.md. Tessera is a source-only
 developer alpha: initial development uses logical commits on main and PRs remain
 paused. The full design and real research pilot are not complete. It has no
-production remote/provider/OpenCode/Kubernetes support claim; schema v36 is the
+production remote/provider/OpenCode/Kubernetes support claim; schema v43 is the
 current local schema.
 
 ## Redirected next milestone (planned)
@@ -32,7 +32,12 @@ relabeled as live validation.
 
 ## Design status matrix
 
-Reviewed 2026-09-12 against schema v36 human-approved Kubernetes dispatch/outbox
+Reviewed 2026-09-15 against current schema v43, including the schema-v43
+operation-bound remote workflow lifecycle records, and the dated 2026-09-13
+schema v42 bounded provider-disabled Astra Explain
+status turn (one read-only mediated experiment-status facade call, durable
+intent/result digests and observed time, attributed deterministic answer, and
+restart/expiry/cancellation fences), schema v36 human-approved Kubernetes dispatch/outbox
 full-predicate replay, immutable private descriptor, bounded heartbeat/renewal and
 hard-deadline supervision, post-revocation observe/cancel-only recovery, durable
 report ordering, cancellation-UID uncertainty, and worker-supervision fences, and v32 admitted-attempt evidence identity,
@@ -54,7 +59,7 @@ capability attestation, dispatch, or pilot completion.
 The local-CPU-first direction and credential-delivery boundary remain design
 decisions. Phase 1 now adds pure, in-memory, versioned environment-plan and
 fake-only provisioning contracts: an explicit target/revision and digest-bound
-human approval fence a deterministic intent reconciliation. They add no live
+human approval fence and deterministic intent reconciliation. They add no live
 target attachment, Kubernetes client, namespace/PVC/Secret, credential, teardown,
 persistence migration, or execution integration. A separate human-invoked local
 operator now reconciles only the fixed `tessera-dev` Docker profile, namespace,
@@ -71,15 +76,15 @@ No entire pilot workflow should be marked complete from component tests alone.
 | §2.1 Start/adopt | Partial | Bounded inventory, retained snapshots, releases, desktop projects/studies, and a tenant-scoped goal/success-criterion record with versioned baseline/intervention design plus a read-only complete desktop projection | Desktop adoption workflow and imported-work continuity |
 | §2.2 Runtime skills | Partial | Metadata-only immutable snapshots, human worker releases and release-fenced pin admission | Skill editor/testing and mediated loading; local CPU packages reject pins because materialization/verification and mediated harness execution remain unimplemented |
 | §2.3 Plan/approve/execute | Partial; real output integration blocked | Immutable plans, human decisions, budgets, grants, leases, v33 immutable human outcomes preserved beside late operational observation/restart history, v34 bounded semantic transition history, and v35 observed-time worker/receipt operation reconciliation that keeps same-time or newer contradictions visible and fail-closed; confirmed-evidence success/cancellation and original-operation-only revocation reconciliation; v32 human-admitted experiment identity automatically carried by normal worker packages; v20 human bookkeeping over v19 fake-provider receipt evidence and v18 durable package intents, CPU supervisor, live HTTP/input fixtures, an explicit development-only native one-shot worker, and v23 explicit project-object placement after quarantine | Decisive Linux Docker-host byte/inode exhaustion and restart evidence, backend-enforced worker-slot storage and automatic production collection, real provider dispatch/accounting and broader authoritative result policy; approval does not launch a job |
-| §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels | Full telemetry, queue-pressure behavior, integrated agent steering |
+| §2.4 Discuss/steer | Partial | Durable threads, messages, typed decision inbox, explicit human resolution, desktop cancellation status labels, and one provider-disabled Astra Explain-status turn with a turn-scoped binding and exactly one mediated `read_experiment_status` facade call | Full telemetry, queue-pressure behavior, integrated agent steering; this status path cannot approve, grant, dispatch, invoke OpenCode, or run a provider/model |
 | §2.5 Stop/takeover/handback | Partial | CPU cancellation, revocation/duration enforcement, cancellation attempts independent of provider/control report failures, restart-safe development heartbeats, bounded requested/unresolved/worker-confirmed termination telemetry, and schema v17 confirmed handoff/digest diff/fresh-context fence | Arbitrary shared-writer mediation, full provider quiescence, desktop adoption and full telemetry milestones |
 | §2.6 Labbook | Partial | Complete bounded study ledger, all variants, attributed events, desktop browsing | Broader investigation navigation and linked execution/report history |
 | §2.7 Review/export | Partial | Source correction; human accept/reaffirm/narrow/supersede/retract; all versions retained; consistent study JSON; schema-v29 goal-to-decision export with immutable historical design context, typed operation/human observation provenance, conclusion snapshots, and append-only reviewed-conclusion supersede/retract lineage, plus a read-only desktop projection of designs, linked attempts/operations/artifacts/measurements, actual evidence custody, and reviewed conclusions | Impact propagation beyond sources/findings; portable reproduction bundle with code, artifacts, reports and instructions |
-| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, a local authenticated exact-schema-pinned OpenCode HTTP/SSE fixture seam with durable uncertainty/cursor handling, an opt-in provider-disabled real-server compatibility fixture, a versioned admitted-package Kubernetes fake adapter with explicit target/PVC identity, durable local Job intent/reconciliation, adjacent OpenCode-session association, and collection handoff, plus a synthetic Kubernetes dispatch supervisor that rechecks replayed claims, reconciles long-running Jobs, requests cancellation at authority/deadline fences, and replays immutable dispatch/operation-scoped reports after lost replies, a read-only informational capability probe, and Phase 1 pure versioned environment plans plus human-approved fake-only intent reconciliation | Record a real selected-server fixture result (unconfigured/version-unavailable is explicitly not evidence), enrolled-node integration, live target attachment and adapter conformance, scoped live provisioning operator, explicit Secret delivery authorization, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, byte collection, dispatch, and broader operational identity lifecycle |
-| §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, schema-v24 project-object intent/reconciliation and manual retention incident metadata, and read-only held restore | Provider fencing/resumption after restore, portable object-bundle recovery, release/result policy, spend and incident reconciliation |
+| §§3–5 Architecture/authority | Partial | Separate control/desktop/worker components, scoped credentials/data access, isolated renderer with context-fenced drafts, immutable input delivery, owner-managed worker registration/lifecycle, schema v21 human-bound metadata-only credential-access leases with short-lived fake handles, documented optional pinned-harness boundary, synthetic OpenCode authority-rechecked contiguous replay/cancellation POC, a local authenticated exact-schema-pinned OpenCode HTTP/SSE fixture seam with durable uncertainty/cursor handling, an opt-in provider-disabled real-server compatibility fixture, a versioned admitted-package Kubernetes fake adapter with explicit target/PVC identity, durable local Job intent/reconciliation, adjacent OpenCode-session association, and collection handoff, plus a synthetic Kubernetes dispatch supervisor that rechecks replayed claims, reconciles long-running Jobs, requests cancellation at authority/deadline fences, and replays immutable dispatch/operation-scoped reports after lost replies, a read-only informational capability probe, Phase 1 pure versioned environment plans plus human-approved fake-only intent reconciliation, and the narrow `astra-setup` operator for one retained Docker Desktop profile | Record a real selected-server fixture result (unconfigured/version-unavailable is explicitly not evidence), enrolled-node integration, live target attachment and adapter conformance, explicit Secret delivery authorization, cryptographic build trust and capability attestation, production secret backend/real provider credential integration, byte collection, dispatch, supported remote deployment, and broader operational identity lifecycle |
+| §6 Execution/recovery | Partial | Durable external-operation intent/observations, stable operations, conservative exposure, quarantine, resumable transfer, schema-v24 project-object intent/reconciliation and manual retention incident metadata, versioned local object-bundle backup/restore, and read-only held restore | Provider fencing/resumption after restore, portable object-store recovery, release/result policy, spend and incident reconciliation |
 | §7 Scientific integrity | Partial | Registered/accounted variants, source support gates, explicit human judgments and review history | Protected evaluation, stronger independence profiles, method-specific validation and real scientific acceptance |
-| §8 E2E acceptance | Blocked for real pilot; synthetic integrated evidence | API-shaped synthetic baseline/intervention test joins human admission, immutable package/operation identity, provider-disabled OpenCode context, injected Kubernetes Job/Pod callbacks, quarantine/placement, measurements, reviewed conclusion, bounded export/reopen/held-recovery, and terminal success/failure/cancellation/unknown bookkeeping | Public/simple baseline-plus-intervention CPU workflow; laptop-independent remote control/execution; linked evidence, all four terminal outcome labels, human review, effort measurement, selected investigation/dataset, and remaining failure drills |
-| §9 Operations/product | Partial | Pinned development dependencies, CI, explicit migrations, backup/held-restore runbook, and manual project-object retention/deletion incident metadata | Signed packaging, update/drain/rollback, automatic retention policy, object-bundle recovery, monitoring, operational recovery and pilot measurements |
+| §8 E2E acceptance | Blocked for real pilot; synthetic integrated evidence | API-shaped synthetic baseline/intervention test joins provider-disabled Astra proposal registration and one mediated status read, human admission, immutable package/operation identity, provider-disabled OpenCode context, injected Kubernetes Job/Pod callbacks, quarantine/placement, measurements, reviewed conclusion, bounded export/reopen/held-recovery, and terminal success/failure/cancellation/unknown bookkeeping | Public/simple baseline-plus-intervention CPU workflow; laptop-independent remote control/execution; linked evidence, all four terminal outcome labels, human review, effort measurement, selected investigation/dataset, and remaining failure drills |
+| §9 Operations/product | Partial | Pinned development dependencies, CI, explicit migrations, versioned object-bundle backup/held-restore runbook, and manual project-object retention/deletion incident metadata | Signed packaging, update/drain/rollback, automatic retention policy, operational restore fencing/failover, monitoring, and pilot measurements |
 | §1 post-pilot/later scope | Deferred | Contracts only where explicitly documented | Additional harnesses/runtimes, GPU/cluster, organization/hosted modes after prerequisite gates |
 
 The [compatibility matrix](compatibility-matrix.md) records exact fixture pins,
@@ -99,7 +104,14 @@ full workflow and its required adverse cases pass on the supported target.
 
 ## Verified evidence
 
-- Current local schema-v24/OpenCode/Minikube-contract collection: 586 Python tests passed
+- Reproducible schema-v42 baseline (2026-09-13): 848 Python tests passed
+  natively, including 37 focused integrated-workflow, Astra status/coordinator,
+  migration, and recovery tests without skips. All 86 desktop Node tests, Ruff lint/format,
+  and Python syntax compilation passed. The native desktop/control fixture also
+  passed active and held-restore browsing while reporting `execution_started` as
+  false. This remains local synthetic/development evidence, not provider,
+  Kubernetes, OpenCode, remote-execution, or scientific acceptance evidence.
+- Historical schema-v24/OpenCode/Minikube-contract collection: 586 Python tests passed
   natively (2026-09-09); the focused OpenCode suites and combined synthetic
   runner pass. Coverage includes cancellation/report-failure handling, restart/heartbeat replay,
   v22 `staged_at` and v24 retention migration sequencing, project-object integrity,
@@ -107,25 +119,69 @@ full workflow and its required adverse cases pass on the supported target.
   after object corruption, OpenCode HTTP/SSE authority/replay/session fencing, and
   migration rollback/evidence preservation. This remains development/synthetic
   evidence only.
-- Ruff lint and format checks pass.
-- The pure Kubernetes contract modules `kubernetes_provider.py` and
+- At that 2026-09-09 checkpoint, Ruff lint and format checks passed.
+- At that checkpoint, the pure Kubernetes contract modules `kubernetes_provider.py` and
   `kubernetes_contracts.py` have 8 focused tests passing. This is unit-contract
   evidence only; Minikube cluster execution, the OpenCode sidecar, PVC quota
   enforcement, provider calls, and pilot acceptance are unimplemented.
-- 65 desktop connection/IPC and renderer tests pass using the locked desktop
+- At that checkpoint, 65 desktop connection/IPC and renderer tests passed using the locked desktop
   dependencies.
-- Explicit migrations through schema v24 preserve historical records, input bytes,
+- That checkpoint's explicit migrations through schema v24 preserved historical records, input bytes,
   active grants, leases, v22 project placements and held exposure; injected
   migration faults roll back.
-- Native CPU, HTTP/control and development-worker Docker fixtures pass. The
+- At that checkpoint, native CPU, HTTP/control and development-worker Docker fixtures passed. The
   development fixture persists declared output to project storage after quarantine;
   it remains synthetic and does not establish pilot storage or result acceptance.
-- No tests were skipped. Dependency deprecation warnings remain.
+- No tests were skipped at that checkpoint. Dependency deprecation warnings remained.
 
 These include component tests and synthetic live acceptance of container
 isolation, read-only released inputs, control revocation, duration stops, and
 sandboxed Electron startup. Visual QA, scientific output validation, and a
 representative investigation have not passed end-to-end acceptance.
+
+### 2026-09-15 T01–T06 checkpoint
+
+The following results were run on the dirty working tree whose `HEAD` is
+`6668ab8789c1fc5c99f9b09b94cb8f4d5e1f23b6`. This identity is a limitation:
+uncommitted source, test, and documentation edits were included, so the commit
+does not identify the tested source. The separate ignored evidence bundle is
+`.evidence/phase1-20260916T001743Z/`; its `gate-report.md` SHA-256 is
+`65fc13719b96f2dd0aa751de50ce960ffc92c33e4eac5174350c9ca085783c67` and its
+`SHA256SUMS` manifest lists the remaining bundle members. The bundle itself is
+excluded from Git and is not a committed source identity.
+
+```sh
+.venv/bin/pytest -q tests/test_kubernetes_dispatch.py tests/test_kubernetes_dispatch_recovery.py tests/test_kubernetes_execution.py
+# 60 passed, 2 warnings
+.venv/bin/pytest -q tests/test_workers.py tests/test_kubernetes_dispatch.py -k 'heartbeat or fresh or stale or renewal'
+# 16 passed, 28 deselected, 2 warnings
+.venv/bin/pytest -q tests/test_execution_migration.py tests/test_records_migration.py tests/test_artifact_migration.py tests/test_finding_migration.py tests/test_snapshot_migration.py tests/test_recovery.py tests/test_recovery_safety.py tests/test_remote_workflows.py
+# 42 passed, 2 warnings
+.venv/bin/ruff check .
+# All checks passed!
+.venv/bin/ruff format --check .
+# 251 files already formatted
+.venv/bin/pytest
+# 917 passed, 2 warnings
+npm test --prefix desktop
+# 87 passed, 0 failed, 0 skipped
+.venv/bin/python scripts/check_desktop_control.py
+# active and held restore passed; 80 variants displayed; exports matched;
+# execution_started=false
+```
+
+The focused T01–T04 checks therefore pass on this tested tree, and the standard
+T06 gates pass. An additional 50-test dispatch/remote-workflow rerun covers
+monotonic wall-clock rollback/restart cancellation, deadline precedence,
+single-Job recovery, observed-time/sequence projection, delayed arrival, and
+equal-time contradiction. The warnings are existing Starlette/httpx and anyio
+deprecations. Remaining failures are acceptance gaps, not failed default tests:
+there is no live cluster/remote deployment, provider or OpenCode activation,
+hard-quota/runtime collection proof, supported remote deployment, operational
+failover, or scientific pilot evidence. The narrow `astra-setup` Kubernetes
+operator is implemented and separately tested, but it only reconciles its
+retained Docker Desktop profile; it is not remote deployment or target
+attachment.
 
 ## Reviewed implementation steps
 
@@ -230,12 +286,15 @@ representative investigation have not passed end-to-end acceptance.
     access checks. Result acceptance and data release remain unimplemented.
 
 12. **Held recovery:** online SQLite backups preserve records and retained bytes.
+     Current local backups also copy committed project bytes into a versioned
+     object bundle and restore them with their custody metadata into held history.
     Restores revoke copied credentials and create a fresh owner on a permanently
     read-only branch. Review fixes reject executable schema and changed foreign-key
     or index definitions before publication. Concurrent-write, partial-upload,
     cached-replay and publication-fault tests pass. Native Electron browses the
     restored 80-variant ledger with writes disabled. This does not fence the original
-    control service or reconcile its providers; see [recovery](recovery.md).
+    control service or reconcile its providers; operational failover remains
+    unsupported. See [recovery](recovery.md).
 
 13. **Finding reaffirmation:** humans can explicitly reaffirm unchanged findings
     after their existing citations regain support. Reasons and review actors enter
@@ -413,9 +472,10 @@ representative investigation have not passed end-to-end acceptance.
      is persisted before callbacks and fences later create admission across
      restart; delete acknowledgement remains unresolved until fresh Job and
      owned-Pod absence. Unit fixtures do not start or mutate Minikube. Minikube
-     cluster execution, the OpenCode
-     sidecar, PVC quota enforcement, provider calls, and pilot acceptance remain
-     unimplemented. See [decision 0009](decisions/0009-minikube-job-conformance.md).
+     cluster execution, the OpenCode sidecar, PVC quota enforcement, provider
+     calls, and pilot acceptance remain unsupported by this fake adapter. The
+     separate `astra-setup` operator is narrow retained-profile setup tooling,
+     not supported remote deployment. See [decision 0009](decisions/0009-minikube-job-conformance.md).
 
 29. **Goal-to-decision ledger:** schema v25 adds one empty-by-default, human-only
     bounded record chain: explicit goal/success criterion, immutable versioned
@@ -470,6 +530,18 @@ representative investigation have not passed end-to-end acceptance.
     live target attachment, storage/network enforcement proof, collection/release,
     OpenCode/provider activation, or pilot conformance.
 
+32. **Remote workflow lifecycle and capability documentation:** schema v43 adds
+     operation-bound heartbeat, opaque checkpoint, and reconnect/outage records for
+     new packages only. Its state projection follows reconciled worker/provider
+     observed time and receipt sequence rather than arrival order; equal-time
+     adverse evidence remains unresolved, while raw samples remain in their
+     operational journals. The synthetic reconnect and Kubernetes/operator fixtures
+     remain opt-in evidence paths; provider-disabled records remain distinct from
+     separately authorized live/provider contracts. Local object-bundle backup
+     copies committed project bytes and held restore preserves them for inspection.
+     None of these paths provides supported remote execution, hard quota support,
+     provider use, scientific validity, or operational failover.
+
 Each material delegated result was inspected and verified by the primary agent.
 Incomplete subagent results were returned for correction; review findings have
 regression tests. Successful simulated provider operations are never treated as
@@ -519,7 +591,7 @@ The foundation was merged earlier as `0599b96`. Implementation checkpoints inclu
 - Schema v27: immutable design goal/criterion snapshots and conclusion context binding.
 - Schema v29: append-only reviewed-conclusion correction lineage.
 - `e2543a5`: authenticated exact-schema-pinned OpenCode HTTP/SSE seam.
-- Current combined checkpoint: reconciled v24 migration sequencing and progress
+- 2026-09-09 combined checkpoint: reconciled v24 migration sequencing and progress
   documentation, retention inspection/deletion races, and OpenCode authority and
   session-identity fencing.
 
@@ -569,7 +641,7 @@ representative research question/dataset remain open configuration inputs.
 5. Desktop adoption, skills, broader reproduction exports, full telemetry and
    arbitrary writer mediation/full stop-edit-handback adoption; portable artifact bundles.
 6. Operational restore fencing/resumption, lifecycle recovery, automatic cleanup
-    policy/object-bundle recovery, packaging and the remaining adversarial
+    policy/portable object-store recovery, packaging and the remaining adversarial
     acceptance fixtures in DESIGN.md section 8.
 7. A maintainer-selected real investigation and measured pilot, including trusted
    signing, identity and infrastructure configuration where required.
@@ -577,5 +649,6 @@ representative research question/dataset remain open configuration inputs.
    deferred design features after their prerequisite acceptance gates.
 
 Unattended research dispatch remains disabled pending its integration gates.
-Kubernetes bootstrap/attachment, provisioning, Secret materialization, and
-destructive teardown have no live evidence and remain unimplemented.
+The narrow Kubernetes operator setup path has implementation and fixture
+evidence, but no live evidence. Target attachment, supported remote deployment,
+Secret materialization, and destructive teardown remain unsupported.

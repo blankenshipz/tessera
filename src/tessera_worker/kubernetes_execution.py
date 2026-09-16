@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, TimeoutError
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,6 +35,8 @@ from .kubernetes_contracts import (
     parse_pod,
 )
 from .opencode_harness import TesseraBinding
+
+MAX_PROVIDER_CALL_SECONDS = 30.0
 
 
 class KubernetesExecutionError(RuntimeError):
@@ -62,6 +69,10 @@ class KubernetesExecutionPackage:
     package_digest: str
     output: KubernetesOutputBinding
     binding: KubernetesJobBinding
+    approved_duration_seconds: int
+    lease_issued_at: datetime
+    lease_expires_at: datetime
+    hard_expires_at: datetime
 
     @classmethod
     def from_admitted_package(
@@ -70,8 +81,13 @@ class KubernetesExecutionPackage:
         package = response.get("package")
         package_digest = response.get("package_digest")
         operation = response.get("operation")
+        lease = response.get("lease")
         admitted_attempt_id = response.get("admitted_attempt_id")
-        if not isinstance(package, dict) or not isinstance(operation, Mapping):
+        if (
+            not isinstance(package, dict)
+            or not isinstance(operation, Mapping)
+            or not isinstance(lease, Mapping)
+        ):
             raise KubernetesExecutionError(
                 "Kubernetes adapter requires a normal admitted package response."
             )
@@ -80,6 +96,7 @@ class KubernetesExecutionPackage:
         if hashlib.sha256(canonical_json(package)).hexdigest() != package_digest:
             raise KubernetesExecutionError("Kubernetes package digest does not match its content.")
         experiment = package.get("experiment")
+        plan = package.get("plan")
         workload = package.get("kubernetes_workload")
         if (
             package.get("version") != 1
@@ -87,6 +104,7 @@ class KubernetesExecutionPackage:
             or package.get("profile_version") != "development-minikube-opencode-v1"
             or package.get("provider_enabled") is not False
             or not isinstance(experiment, Mapping)
+            or not isinstance(plan, Mapping)
             or not isinstance(workload, Mapping)
             or not isinstance(admitted_attempt_id, str)
             or experiment.get("admitted_attempt_id") != admitted_attempt_id
@@ -108,6 +126,10 @@ class KubernetesExecutionPackage:
         ):
             raise KubernetesExecutionError("Kubernetes workload command is malformed.")
         try:
+            lease_issued_at = _utc_datetime(lease, "issued_at")
+            lease_expires_at = _utc_datetime(lease, "expires_at")
+            hard_expires_at = _utc_datetime(lease, "hard_expires_at")
+            package_hard_expires_at = _utc_datetime(package, "hard_expires_at")
             binding = KubernetesJobBinding(
                 operation_id=_string(package, "operation_id"),
                 attempt_id=admitted_attempt_id,
@@ -120,11 +142,33 @@ class KubernetesExecutionPackage:
                 network_mode=_network_mode(workload),
                 **output.job_fields(),
             )
+            approved_duration_seconds = _positive_int(plan, "max_duration_seconds")
         except (TypeError, ValueError) as error:
             raise KubernetesExecutionError(
                 "Kubernetes package workload violates the fixed Job contract."
             ) from error
-        return cls(dict(package), package_digest, output, binding)
+        if (
+            lease.get("id") != binding.lease_id
+            or lease.get("grant_id") != package.get("grant_id")
+            or lease.get("worker_principal_id") != package.get("worker_principal_id")
+            or lease.get("epoch") != binding.epoch
+            or package_hard_expires_at != hard_expires_at
+            or lease_issued_at > lease_expires_at
+            or lease_expires_at > hard_expires_at
+        ):
+            raise KubernetesExecutionError(
+                "Kubernetes package lease identity or expiry is inconsistent."
+            )
+        return cls(
+            dict(package),
+            package_digest,
+            output,
+            binding,
+            approved_duration_seconds,
+            lease_issued_at,
+            lease_expires_at,
+            hard_expires_at,
+        )
 
     @property
     def operation_id(self) -> str:
@@ -178,44 +222,63 @@ class KubernetesExecutionAdapter:
         self._observe_pods = observe_pods
         self._journal = KubernetesJobJournal(journal_path)
         self._database = Path(journal_path)
+        self._inflight: Future[Any] | None = None
+        self._inflight_lock = threading.Lock()
         self._initialize()
 
-    def submit(self, package: KubernetesExecutionPackage) -> KubernetesExecutionStatus:
+    def submit(
+        self, package: KubernetesExecutionPackage, *, timeout_seconds: float | None = None
+    ) -> KubernetesExecutionStatus:
         """Persist target intent, then inspect/create only the deterministic Job."""
         self._bind(package)
+        deadline = self._operation_deadline(package, timeout_seconds)
         try:
             job = self._journal.reconcile_create(
-                package.binding, self.cluster, self._inspect_job, self._create_job
+                package.binding,
+                self.cluster,
+                lambda name: self._call_before(deadline, self._inspect_job, name),
+                lambda manifest: self._call_before(deadline, self._create_job, manifest),
             )
-            return self._record_status(package, job)
+            return self._record_status(package, job, deadline)
         except Exception:
             self._record_unknown(package)
             raise
 
-    def reconcile(self, package: KubernetesExecutionPackage) -> KubernetesExecutionStatus:
+    def reconcile(
+        self, package: KubernetesExecutionPackage, *, timeout_seconds: float | None = None
+    ) -> KubernetesExecutionStatus:
         """Observe existing Job/owned Pods only; reconciliation never creates work."""
         self._bind(package)
+        deadline = self._operation_deadline(package, timeout_seconds)
         try:
-            observed = self._inspect_job(package.binding.job_name)
+            observed = self._call_before(deadline, self._inspect_job, package.binding.job_name)
+        except Exception:
+            # A provider read failure is an adverse observation, not an escape
+            # from the supervisor that owns this already-submitted operation.
+            return self._record_unknown(package)
+        try:
             if observed is None:
-                return self._record_disappeared_job(package)
+                return self._record_disappeared_job(package, deadline)
             job = self._journal.reconcile_observation(package.binding, self.cluster, observed)
-            return self._record_status(package, job)
+            return self._record_status(package, job, deadline)
         except Exception:
             self._record_unknown(package)
             raise
 
-    def cancel(self, package: KubernetesExecutionPackage) -> KubernetesCancellationObservation:
+    def cancel(
+        self, package: KubernetesExecutionPackage, *, timeout_seconds: float | None = None
+    ) -> KubernetesCancellationObservation:
         """Persist cancellation before any Kubernetes callback or inspection."""
         self._bind(package)
         self._mark_cancellation_requested(package.operation_id)
+        deadline = self._operation_deadline(package, timeout_seconds)
         try:
             observation = self._journal.request_cancel(
                 package.binding,
                 self.cluster,
-                self._inspect_job,
-                self._delete_job,
-                self._observe_pods,
+                lambda name: self._call_before(deadline, self._inspect_job, name),
+                lambda name, uid: self._call_before(deadline, self._delete_job, name, uid),
+                lambda uid: self._call_before(deadline, self._observe_pods, uid),
             )
             self._record_cancellation(package, observation)
             return observation
@@ -352,18 +415,26 @@ class KubernetesExecutionAdapter:
         return handoff
 
     def _record_status(
-        self, package: KubernetesExecutionPackage, job: KubernetesJobObservation
+        self,
+        package: KubernetesExecutionPackage,
+        job: KubernetesJobObservation,
+        deadline: float,
     ) -> KubernetesExecutionStatus:
         # The Job UID is recovery ownership and must survive a later Pod read
         # failure.  Persist it before invoking the injected Pod observer.
         self._record_job_identity(package, job.job_uid)
+        try:
+            observed_pods = self._call_before(deadline, self._observe_pods, job.job_uid)
+        except Exception:
+            return self._record_unknown(package)
         pods = tuple(
-            parse_pod(pod, package.binding, self.cluster, job.job_uid)
-            for pod in self._observe_pods(job.job_uid)
+            parse_pod(pod, package.binding, self.cluster, job.job_uid) for pod in observed_pods
         )
         states = {pod.state for pod in pods}
-        if "unknown" in states or (
-            job.state == "succeeded" and (not pods or states != {"succeeded"})
+        if (
+            job.state == "unknown"
+            or "unknown" in states
+            or (job.state == "succeeded" and (not pods or states != {"succeeded"}))
         ):
             state: Literal["pending", "running", "succeeded", "failed", "unknown"] = "unknown"
         elif job.state == "failed" or "failed" in states:
@@ -374,6 +445,9 @@ class KubernetesExecutionAdapter:
             state = "running"
         else:
             state = "pending"
+        unconfirmed = canonical_json(
+            KubernetesCancellationObservation(True, False, False, False).__dict__
+        ).decode("utf-8")
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT job_uid FROM kubernetes_execution_bindings WHERE operation_id=?",
@@ -387,12 +461,14 @@ class KubernetesExecutionAdapter:
                 )
             connection.execute(
                 "UPDATE kubernetes_execution_bindings SET job_uid=?, pod_uids_json=?, "
-                "observed_state=? "
+                "observed_state=?, cancellation_json=CASE WHEN cancellation_requested=1 THEN ? "
+                "ELSE cancellation_json END "
                 "WHERE operation_id=?",
                 (
                     job.job_uid,
                     json.dumps([pod.pod_uid for pod in pods]),
                     state,
+                    unconfirmed,
                     package.operation_id,
                 ),
             )
@@ -417,12 +493,17 @@ class KubernetesExecutionAdapter:
 
     def _record_unknown(self, package: KubernetesExecutionPackage) -> KubernetesExecutionStatus:
         """Make a newer failed read authoritative without dropping recovery identity."""
+        unconfirmed = canonical_json(
+            KubernetesCancellationObservation(True, False, False, False).__dict__
+        ).decode("utf-8")
         with self._connect() as connection:
             if (
                 connection.execute(
-                    "UPDATE kubernetes_execution_bindings SET observed_state='unknown' "
+                    "UPDATE kubernetes_execution_bindings SET observed_state='unknown', "
+                    "cancellation_json=CASE WHEN cancellation_requested=1 THEN ? "
+                    "ELSE cancellation_json END "
                     "WHERE operation_id=?",
-                    (package.operation_id,),
+                    (unconfirmed, package.operation_id),
                 ).rowcount
                 != 1
             ):
@@ -430,7 +511,7 @@ class KubernetesExecutionAdapter:
         return KubernetesExecutionStatus(package.operation_id, None, (), "unknown")
 
     def _record_disappeared_job(
-        self, package: KubernetesExecutionPackage
+        self, package: KubernetesExecutionPackage, deadline: float
     ) -> KubernetesExecutionStatus:
         """Keep reconciling Pods against the first recorded Job UID after Job deletion.
 
@@ -455,19 +536,32 @@ class KubernetesExecutionAdapter:
             KubernetesProviderIdentity(
                 self.cluster.cluster_uid, self.cluster.namespace_uid, job_uid
             )
+            observed_pods = self._call_before(deadline, self._observe_pods, job_uid)
+        except Exception:
+            return self._record_unknown(package)
+        try:
             pods = tuple(
-                parse_pod(pod, package.binding, self.cluster, job_uid)
-                for pod in self._observe_pods(job_uid)
+                parse_pod(pod, package.binding, self.cluster, job_uid) for pod in observed_pods
             )
         except Exception:
             self._record_unknown(package)
             raise
+        cancellation = canonical_json(
+            KubernetesCancellationObservation(True, True, True, not pods).__dict__
+        ).decode("utf-8")
         with self._connect() as connection:
             if (
                 connection.execute(
                     "UPDATE kubernetes_execution_bindings SET pod_uids_json=?, "
-                    "observed_state='unknown' WHERE operation_id=? AND job_uid=?",
-                    (json.dumps([pod.pod_uid for pod in pods]), package.operation_id, job_uid),
+                    "observed_state='unknown', cancellation_json=CASE "
+                    "WHEN cancellation_requested=1 THEN ? ELSE cancellation_json END "
+                    "WHERE operation_id=? AND job_uid=?",
+                    (
+                        json.dumps([pod.pod_uid for pod in pods]),
+                        cancellation,
+                        package.operation_id,
+                        job_uid,
+                    ),
                 ).rowcount
                 != 1
             ):
@@ -475,6 +569,58 @@ class KubernetesExecutionAdapter:
                     "Kubernetes Job UID conflicts with the durable operation."
                 )
         return KubernetesExecutionStatus(package.operation_id, None, pods, "unknown")
+
+    def _operation_deadline(
+        self, package: KubernetesExecutionPackage, timeout_seconds: float | None
+    ) -> float:
+        if timeout_seconds is None:
+            now = datetime.now(UTC)
+            wall_deadline = min(
+                package.hard_expires_at,
+                package.lease_expires_at,
+                package.lease_issued_at + timedelta(seconds=package.approved_duration_seconds),
+            )
+            remaining = (wall_deadline - now).total_seconds()
+        elif type(timeout_seconds) not in {int, float} or not math.isfinite(timeout_seconds):
+            raise ValueError("Kubernetes provider timeout must be finite.")
+        else:
+            remaining = float(timeout_seconds)
+        return time.monotonic() + max(0.0, min(MAX_PROVIDER_CALL_SECONDS, remaining))
+
+    def _run_callback(
+        self, future: Future[Any], callback: Callable[..., Any], arguments: tuple[Any, ...]
+    ) -> None:
+        try:
+            future.set_result(callback(*arguments))
+        except BaseException as error:
+            future.set_exception(error)
+
+    def _call_before(self, deadline: float, callback: Callable[..., Any], *arguments: Any) -> Any:
+        """Bound one injected provider call and never overlap a timed-out effect."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise KubernetesExecutionError("Kubernetes provider call deadline exceeded.")
+        with self._inflight_lock:
+            if self._inflight is not None and not self._inflight.done():
+                raise KubernetesExecutionError("Kubernetes provider call is still in progress.")
+            future: Future[Any] = Future()
+            self._inflight = future
+            thread = threading.Thread(
+                target=self._run_callback,
+                args=(future, callback, arguments),
+                daemon=True,
+            )
+            try:
+                thread.start()
+            except RuntimeError:
+                self._inflight = None
+                raise KubernetesExecutionError(
+                    "Kubernetes provider callback is unavailable."
+                ) from None
+        try:
+            return future.result(timeout=remaining)
+        except TimeoutError:
+            raise KubernetesExecutionError("Kubernetes provider call deadline exceeded.") from None
 
     def _mark_cancellation_requested(self, operation_id: str) -> None:
         with self._connect() as connection:
@@ -582,6 +728,16 @@ def _positive_int(value: Mapping[str, object], field: str) -> int:
     if type(result) is not int or result < 1:
         raise KubernetesExecutionError(f"Kubernetes package {field} is malformed.")
     return result
+
+
+def _utc_datetime(value: Mapping[str, object], field: str) -> datetime:
+    result = value.get(field)
+    if not isinstance(result, str):
+        raise ValueError
+    parsed = datetime.fromisoformat(result.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError
+    return parsed.astimezone(UTC)
 
 
 def _network_mode(workload: Mapping[str, object]) -> Literal["none", "cluster"]:
