@@ -223,6 +223,61 @@ def test_goal_design_attempt_evidence_conclusion_and_reopen_chain(tmp_path: Path
     assert reopened["conclusions"][0]["design_snapshot"]["revision"] == 2
 
 
+def test_operation_artifact_linkage_and_export_require_one_exact_provenance(tmp_path: Path) -> None:
+    state, owner, _worker, grant, lease, manifest, artifact = _reconciled_manifest(tmp_path)
+    _operation(state, owner, grant, lease, manifest["operation_id"])
+    records = ExperimentStore(state)
+    experiment = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    baseline = next(item for item in experiment["design"]["variants"] if item["kind"] == "baseline")
+    attempt = _command(
+        records.record_attempt,
+        owner,
+        baseline["id"],
+        payload={
+            "expected_variant_revision": baseline["revision"],
+            "provenance_kind": "admitted_operation",
+            "operation_id": manifest["operation_id"],
+            "outcome": "succeeded",
+        },
+    )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE artifacts SET operation_id=? WHERE id=?", ("f" * 32, artifact["id"])
+        )
+    with pytest.raises(NotFound, match="attempt provenance"):
+        _command(
+            records.link_attempt_artifacts,
+            owner,
+            attempt["id"],
+            payload={"expected_revision": attempt["revision"], "artifact_ids": [artifact["id"]]},
+        )
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE artifacts SET operation_id=? WHERE id=?",
+            (manifest["operation_id"], artifact["id"]),
+        )
+    linked = _command(
+        records.link_attempt_artifacts,
+        owner,
+        attempt["id"],
+        payload={"expected_revision": attempt["revision"], "artifact_ids": [artifact["id"]]},
+    )
+    exported = records.export_experiment(owner, experiment["id"])
+    assert linked["artifact_ids"] == [artifact["id"]]
+    assert exported["attempts"][0]["operation_id"] == exported["artifacts"][0]["operation_id"]
+    assert exported["operations"][0]["operation_id"] == exported["artifacts"][0]["operation_id"]
+
+    # A legacy/pre-hardening contradictory row must not be emitted as coherent evidence.
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE artifacts SET operation_id=? WHERE id=?", ("f" * 32, artifact["id"])
+        )
+    with pytest.raises(Conflict, match="contradictory artifact operation provenance"):
+        records.export_experiment(owner, experiment["id"])
+
+
 def test_outcomes_tenant_revision_and_human_fences(tmp_path: Path) -> None:
     state, owner, _worker, grant, lease, manifest, _artifact = _reconciled_manifest(tmp_path)
     _operation(state, owner, grant, lease, manifest["operation_id"])

@@ -12,9 +12,141 @@ test('connection metadata never returns bearer credentials', async () => {
   const status = await connection.connect(config());
   assert.equal(status.organizationId, 'org');
   assert.equal(status.principalId, 'human');
+  assert.equal(status.health, 'online');
   assert.ok(!JSON.stringify(status).includes(tokenA));
   connection.disconnect();
   assert.equal(connection.status(), null);
+});
+
+test('harness-context routes use only a server-derived binding and an explicit command key', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org' } : { id: 'binding_1' });
+  });
+  await connection.connect(config());
+  const enqueue = { thread_id: 'thread_1', harness_session_binding_id: 'binding_1',
+    context_revision: 4, intent: 'direction', body: 'Use this as context only.' };
+  await connection.harnessSessionBinding('binding_1');
+  await connection.enqueueHarnessDelivery(enqueue, 'context-command');
+  await connection.cancelHarnessDelivery('delivery_1', { expected_revision: 2 }, 'cancel-command');
+  assert.match(calls[1].url, /\/interaction\/harness-session-bindings\/binding_1$/);
+  assert.match(calls[2].url, /\/interaction\/deliveries$/);
+  assert.deepEqual(JSON.parse(calls[2].options.body), enqueue);
+  assert.equal(calls[2].options.headers['Idempotency-Key'], 'context-command');
+  assert.match(calls[3].url, /\/interaction\/deliveries\/delivery_1\/cancel$/);
+  assert.deepEqual(JSON.parse(calls[3].options.body), { expected_revision: 2 });
+  assert.equal(calls[3].options.headers['Idempotency-Key'], 'cancel-command');
+  assert.throws(() => connection.harnessSessionBinding('../binding'));
+  assert.throws(() => connection.cancelHarnessDelivery('../delivery', { expected_revision: 2 }, 'key'));
+});
+
+test('worker discovery is a bounded project-scoped read with no command key', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org' } : { workers: [] });
+  });
+  await connection.connect(config());
+  await connection.workers('project_1', { offset: 100, limit: 200 });
+  assert.match(calls[1].url, /\/projects\/project_1\/workers\?offset=100&limit=200$/);
+  assert.equal(calls[1].options.method, 'GET');
+  assert.equal(calls[1].options.body, undefined);
+  assert.equal(calls[1].options.headers['Idempotency-Key'], undefined);
+  assert.throws(() => connection.workers('../project'));
+  assert.throws(() => connection.workers('project_1', { limit: 201 }));
+});
+
+test('an unavailable request marks the connection offline without replaying a command', async () => {
+  let commands = 0;
+  const connection = new ControlConnection(async (url) => {
+    if (url.endsWith('/me')) return json({ principal_id: 'human', org_id: 'org' });
+    commands++;
+    throw new Error('network lost');
+  });
+  await connection.connect(config());
+  await assert.rejects(connection.enqueueHarnessDelivery({ thread_id: 'thread_1', harness_session_binding_id: 'binding_1',
+    context_revision: 1, intent: 'question', body: 'Context' }, 'context-command'), /outcome is unknown/);
+  assert.equal(connection.status().health, 'offline');
+  assert.equal(commands, 1);
+});
+
+test('only the freshest request in an active connection generation can change health', async () => {
+  let resolveOlder;
+  const connection = new ControlConnection(async url => {
+    if (url.endsWith('/me')) return json({ principal_id: 'human', org_id: 'org' });
+    if (url.includes('/projects?')) return new Promise(resolve => { resolveOlder = resolve; });
+    throw new Error('newer request lost its network');
+  });
+  await connection.connect(config());
+  const older = connection.projects();
+  await assert.rejects(connection.tasks('project_1'), /Control plane unavailable/);
+  resolveOlder(json({ projects: [] }));
+  await older;
+  assert.equal(connection.status().health, 'offline');
+});
+
+test('a late request failure cannot mark a newer successful request offline', async () => {
+  let rejectOlder;
+  const connection = new ControlConnection(async url => {
+    if (url.endsWith('/me')) return json({ principal_id: 'human', org_id: 'org' });
+    if (url.includes('/projects?')) return new Promise((_resolve, reject) => { rejectOlder = reject; });
+    return json({ tasks: [] });
+  });
+  await connection.connect(config());
+  const older = connection.projects();
+  await connection.tasks('project_1');
+  rejectOlder(new Error('older request lost its network'));
+  await assert.rejects(older, /Control plane unavailable/);
+  assert.equal(connection.status().health, 'online');
+});
+
+test('desktop reconnect reads the same durable remote-workflow timeline without replaying work', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ remote_workflows: [{ operation_id: 'a'.repeat(32), state: 'unknown', reconciliation_required: true }] });
+  });
+  await connection.connect(config());
+  await connection.remoteWorkflows('project_1', { offset: 0, limit: 100 });
+  connection.disconnect(); // Desktop exit/disconnect only drops its client context.
+  await connection.connect(config());
+  const timeline = await connection.remoteWorkflows('project_1', { offset: 0, limit: 100 });
+  assert.equal(timeline.remote_workflows[0].reconciliation_required, true);
+  assert.equal(calls.filter(call => /remote-workflows/.test(call.url)).length, 2);
+  assert.ok(calls.filter(call => /remote-workflows/.test(call.url)).every(call => call.options.method === 'GET'));
+});
+
+test('remote-workflow detail is an authenticated read fenced to an operation identity', async () => {
+  const calls = [];
+  const operationId = 'a'.repeat(32);
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ operation_id: operationId });
+  });
+  await connection.connect(config());
+  await connection.remoteWorkflow(operationId);
+  assert.match(calls[1].url, new RegExp(`/remote-workflows/${operationId}$`));
+  assert.equal(calls[1].options.method, 'GET');
+  assert.equal(calls[1].options.headers['Idempotency-Key'], undefined);
+  assert.throws(() => connection.remoteWorkflow('../operation'));
+  assert.throws(() => connection.remoteWorkflow('A'.repeat(32)));
+});
+
+test('remote workflow stop request reads the current grant revision and remains an explicit command', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ id: 'grant_1' });
+  });
+  await connection.connect(config());
+  await connection.executionGrant('grant_1');
+  await connection.revokeExecutionGrant('grant_1', { expected_revision: 4 }, 'stop-command');
+  assert.match(calls[1].url, /\/execution-grants\/grant_1$/);
+  assert.equal(calls[1].options.method, 'GET');
+  assert.match(calls[2].url, /\/execution-grants\/grant_1\/revoke$/);
+  assert.equal(calls[2].options.headers['Idempotency-Key'], 'stop-command');
+  assert.deepEqual(JSON.parse(calls[2].options.body), { expected_revision: 4 });
 });
 
 test('a late response from an old connection cannot become current data', async () => {
@@ -98,6 +230,45 @@ test('interaction routes carry bounded pages, pending status, and explicit idemp
   assert.equal(calls[6].options.method, 'POST');
   assert.equal(calls[6].options.headers['Idempotency-Key'], 'resolution-command');
   assert.deepEqual(JSON.parse(calls[6].options.body), resolution);
+});
+
+test('provider-disabled coordinator routes use bounded reads and an explicit human turn command', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ messages: [], proposals: [] });
+  });
+  await connection.connect(config());
+  const body = { expected_conversation_revision: 2, prompt: '[Discuss]\nReview the recorded context.',
+    selected_context: [{ kind: 'task', record_id: 'task_1', expected_revision: 4 }] };
+  await connection.astraConversation('project_1', { offset: 0, limit: 100 });
+  await connection.astraProposals('project_1', { offset: 10, limit: 50 });
+  await connection.explainStatusTurns('project_1', { offset: 0, limit: 100 });
+  await connection.requestCoordinatorTurn('project_1', body, 'coordinator-command');
+  assert.match(calls[1].url, /\/astra\/projects\/project_1\/conversation\?offset=0&limit=100$/);
+  assert.match(calls[2].url, /\/astra\/projects\/project_1\/proposals\?offset=10&limit=50$/);
+  assert.match(calls[3].url, /\/astra\/projects\/project_1\/explain-status-turns\?offset=0&limit=100$/);
+  assert.match(calls[4].url, /\/astra\/projects\/project_1\/turns$/);
+  assert.equal(calls[4].options.headers['Idempotency-Key'], 'coordinator-command');
+  assert.deepEqual(JSON.parse(calls[4].options.body), body);
+  assert.throws(() => connection.astraConversation('../project'));
+  assert.throws(() => connection.requestCoordinatorTurn('../project', body, 'key'));
+});
+
+test('human design registration is a separate coordinator command, never an approval or run command', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ execution_authorized: false });
+  });
+  await connection.connect(config());
+  const body = { expected_context_digest: 'a'.repeat(64) };
+  await connection.registerProposalDesign('proposal_1', body, 'register-design-command');
+  assert.match(calls[1].url, /\/astra\/proposals\/proposal_1\/register-design$/);
+  assert.equal(calls[1].options.method, 'POST');
+  assert.equal(calls[1].options.headers['Idempotency-Key'], 'register-design-command');
+  assert.deepEqual(JSON.parse(calls[1].options.body), body);
+  assert.throws(() => connection.registerProposalDesign('../proposal', body, 'key'));
 });
 
 test('interaction identifiers and API page bounds fail closed', async () => {

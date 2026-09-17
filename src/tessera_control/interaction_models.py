@@ -35,20 +35,33 @@ class EnqueueHarnessDelivery(InteractionRequest):
     """A human-directed, context-only message for an already admitted attempt."""
 
     thread_id: Identifier
-    admitted_attempt_id: Identifier
-    expected_attempt_revision: int = Field(ge=1)
+    harness_session_binding_id: Identifier
     context_revision: int = Field(ge=1)
-    expected_epoch: int = Field(ge=1)
-    worker_principal_id: Identifier
-    harness_instance_id: Identifier
-    upstream_session_id: Identifier
     intent: Intent
     body: Body
     reply_to: Identifier | None = None
 
 
+class CreateOperationHarnessSessionBinding(InteractionRequest):
+    """One worker-designated context-only session for an admitted operation."""
+
+    operation_id: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
+    harness_instance_id: Identifier
+    upstream_session_id: Identifier
+    adapter_profile: Literal["opencode-v1.18.30-context-only"]
+    provider_disabled: Literal[True]
+
+
 class ClaimHarnessDelivery(InteractionRequest):
     expected_epoch: int = Field(ge=1)
+
+
+class AuthorizeHarnessDelivery(InteractionRequest):
+    """A body-free, live control recheck before the worker contacts OpenCode."""
+
+    expected_epoch: int = Field(ge=1)
+    expected_revision: int = Field(ge=1)
+    context_digest: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 class AcknowledgeHarnessDelivery(InteractionRequest):

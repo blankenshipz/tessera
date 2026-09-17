@@ -1,0 +1,213 @@
+# Single-active lab profile. Replace the example image and public origin before apply.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tessera-lab
+  labels:
+    app.kubernetes.io/part-of: tessera
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tessera-control-remote
+  namespace: tessera-lab
+data:
+  # This name must be accepted by the TLS endpoint that clients actually use.
+  TESSERA_TRUSTED_HOST: tessera-control.tessera-lab.svc.cluster.local
+  TESSERA_PUBLIC_ORIGIN: https://tessera-control.tessera-lab.svc.cluster.local
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tessera-control-state
+  namespace: tessera-lab
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tessera-control
+  namespace: tessera-lab
+  labels:
+    app.kubernetes.io/name: tessera-control
+    app.kubernetes.io/part-of: tessera
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tessera-control
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tessera-control
+        app.kubernetes.io/part-of: tessera
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: initialize-state
+          image: registry.example.invalid/tessera-control:replace-me
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec", "test -f /state/control/tessera.sqlite3 || tessera init --state-dir /state/control"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: state
+              mountPath: /state
+      containers:
+        - name: control
+          image: registry.example.invalid/tessera-control:replace-me
+          imagePullPolicy: IfNotPresent
+          args:
+            - tessera
+            - serve
+            - --state-dir
+            - /state/control
+            - --port
+            - "8765"
+            - --bind-host
+            - 0.0.0.0
+            - --trusted-host
+            - $(TESSERA_TRUSTED_HOST)
+            - --public-origin
+            - $(TESSERA_PUBLIC_ORIGIN)
+          envFrom:
+            - configMapRef:
+                name: tessera-control-remote
+          ports:
+            - name: http
+              containerPort: 8765
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+              httpHeaders:
+                # Kubernetes does not expand container environment variables in
+                # probe headers. Keep this literal equal to the ConfigMap value.
+                - name: Host
+                  value: tessera-control.tessera-lab.svc.cluster.local
+            initialDelaySeconds: 2
+            timeoutSeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: tessera-control.tessera-lab.svc.cluster.local
+            initialDelaySeconds: 5
+            timeoutSeconds: 2
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: tessera-control-state
+        - name: temporary
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera-control
+  namespace: tessera-lab
+spec:
+  selector:
+    app.kubernetes.io/name: tessera-control
+  ports:
+    - name: http
+      port: 8765
+      targetPort: http
+---
+# Default deny for every Pod in the namespace, including egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tessera-lab
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Explicitly labelled in-namespace clients may use the Service; no broad namespace,
+# node, or Internet ingress is allowed by this profile.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-labelled-control-clients
+  namespace: tessera-lab
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tessera-control
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tessera.io/control-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8765
+---
+# The namespace-wide deny also blocks client egress. Permit only explicitly
+# labelled clients to reach the selected control Pods on the Service port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-labelled-control-client-egress
+  namespace: tessera-lab
+spec:
+  podSelector:
+    matchLabels:
+      tessera.io/control-client: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tessera-control
+      ports:
+        - protocol: TCP
+          port: 8765
+    # Service-name lookup is required for the in-namespace Service; this does
+    # not permit arbitrary external DNS or application egress.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

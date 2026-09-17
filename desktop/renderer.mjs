@@ -12,30 +12,78 @@ const $ = id => document.getElementById(id);
 let epoch = 0;
 let connectionId = null;
 let recoveryHeld = true;
+let connectionOnline = false;
+let connectionState = null;
 let activeProject = null;
 let activeExperiment = null;
+let activeExperimentLedger = null;
 let activeLedger = null;
 let outcomeContext = null;
 let closeContext = null;
 const evidenceContexts = new Map();
 let projectOffset = 0;
 let taskOffset = 0;
+let workerOffset = 0;
 let eventCursor = 0;
+let workbenchView = 'conversation';
+let workbenchEntries = [];
+let coordinatorConversationRevision = 0;
+const selectedCoordinatorContext = [];
+let coordinatorMessageOffset = 0;
+let proposalOffset = 0;
+let statusTurnOffset = 0;
+let coordinatorMessagesMore = true;
+let proposalsMore = true;
+let statusTurnsMore = true;
 let threadOffset = 0;
 let decisionOffset = 0;
 let studyOffset = 0;
 let experimentOffset = 0;
+let remoteWorkflowOffset = 0;
 let messageOffset = 0;
 let activeThread = null;
 let threadEpoch = 0;
+let activeHarnessBinding = null;
 let activeStudy = null;
 let studyEpoch = 0;
 const pendingKeys = new Map();
 const pendingDecisionResolutions = new Map();
 const loading = new Set();
-const readVersion = { threads: 0, messages: 0, decisions: 0, experiments: 0, experiment: 0, studies: 0, study: 0 };
+const readVersion = { workers: 0, threads: 0, messages: 0, binding: 0, decisions: 0, experiments: 0, experiment: 0, remoteWorkflows: 0, studies: 0, study: 0, workbench: 0 };
 
 function notice(message = '') { $('notice').textContent = message; }
+function canMutate() { return !recoveryHeld && connectionOnline; }
+function applyConnectionHealth(state) {
+  if (state) connectionState = state;
+  connectionOnline = state?.health === 'online';
+  const unavailable = !canMutate();
+  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close', 'source-new', 'finding-new']) $(id).disabled = unavailable;
+  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form', 'message-form', 'context-form', 'coordinator-form']) {
+    $(id).querySelector('button[type="submit"]').disabled = unavailable;
+  }
+  for (const button of document.querySelectorAll('#tasks button, #decisions button, #events button, #message-form button, #context-form button, #remote-workflows button')) button.disabled = unavailable;
+  // Study-detail controls have additional source, accounting, and revision fences.
+  // Going offline disables them all; coming back online must not undo those fences.
+  if (unavailable) {
+    for (const button of document.querySelectorAll('#study-detail button')) button.disabled = true;
+  }
+  // Connection health must not loosen the authoritative study-ledger fences that
+  // were applied after the current complete study read.
+  if (activeLedger?.study) {
+    const open = activeLedger.study.status === 'open';
+    $('variant-new').disabled = unavailable || !open;
+    $('study-close').disabled = unavailable || !open || activeLedger.variants.some(variant => variant.status === 'registered');
+    $('source-new').disabled = unavailable;
+    $('finding-new').disabled = unavailable || !open;
+  }
+  if (connectionId || state?.name) {
+    const suffix = connectionOnline ? 'online' : 'offline — displayed data may be stale; consequential actions are disabled';
+    $('connection-status').textContent = `${state.name}\n${state.endpoint}\n${state.organizationId}\n${suffix}`;
+  }
+  $('coordinator-health').textContent = connectionOnline ?
+    'Coordinator status: provider disabled. Proposals require separate human review; no approval, grant, dispatch, or execution is authorized.' :
+    'Coordinator status: offline — displayed context may be stale; consequential actions are disabled.';
+}
 function applyRecoveryStatus(status) {
   recoveryHeld = true;
   if (!status || typeof status.recovery_hold !== 'boolean' ||
@@ -46,15 +94,45 @@ function applyRecoveryStatus(status) {
   $('recovery-banner').hidden = !recoveryHeld;
   $('recovery-banner').textContent = recoveryHeld ?
     'Restored history — read-only. Changes and execution are blocked. The original control plane and its jobs may still be active; activity after the backup is unknown.' : '';
-  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close', 'source-new', 'finding-new']) $(id).disabled = recoveryHeld;
-  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) $(id).querySelector('button[type="submit"]').disabled = recoveryHeld;
-  $('message-form').querySelector('button[type="submit"]').disabled = recoveryHeld;
+  applyConnectionHealth(connectionState ?? { health: recoveryHeld ? 'offline' : 'online' });
 }
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
   if (className) node.className = className;
   return node;
+}
+function clearHarnessBinding() {
+  activeHarnessBinding = null;
+  readVersion.binding++;
+  $('binding-form').reset(); $('context-form').reset();
+  $('binding-detail').textContent = 'No server-derived harness binding loaded.';
+}
+function validHarnessBinding(binding, requestedId, project, thread) {
+  return binding && binding.id === requestedId && binding.project_id === project.id &&
+    typeof binding.task_id === 'string' && typeof binding.admitted_attempt_id === 'string' &&
+    Number.isSafeInteger(binding.attempt_revision) && binding.attempt_revision >= 1 &&
+    binding.adapter_profile === 'opencode-v1.18.30-context-only' && binding.provider_disabled === true &&
+    (thread.task_id === null || thread.task_id === undefined || thread.task_id === binding.task_id);
+}
+function renderHarnessBinding(binding) {
+  $('binding-detail').replaceChildren(
+    element('p', `Server-derived binding: ${binding.id}`),
+    element('p', `Admitted attempt: ${binding.admitted_attempt_id} · attempt revision ${binding.attempt_revision}`),
+    element('p', `Context-only profile: ${binding.adapter_profile} · provider disabled`, 'muted'),
+    element('p', 'Skills metadata: not loaded. This binding does not claim any skill was loaded.', 'muted'),
+    element('p', 'The server derives worker, epoch, harness instance, and session routing. They are not desktop inputs.', 'muted'),
+  );
+}
+function contextStateLabel(state) {
+  return {
+    queued: 'Context queued for harness delivery',
+    delivered: 'Context delivered to the harness worker — not an answer, execution, or acceptance',
+    acknowledged: 'Context acknowledged by the harness — not an answer, execution, or acceptance',
+    uncertain: 'Context delivery is uncertain — it will not be sent again automatically',
+    failed: 'Context delivery failed',
+    cancelled: 'Context delivery was cancelled in control — this does not terminate a harness session',
+  }[state] ?? 'Context delivery state is unrecognized';
 }
 function resetAuthoringForms() {
   outcomeContext = closeContext = null; evidenceContexts.clear();
@@ -63,7 +141,7 @@ function resetAuthoringForms() {
   }
   for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) {
     const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
-    form.querySelector('button[type="submit"]').disabled = recoveryHeld;
+    form.querySelector('button[type="submit"]').disabled = !canMutate();
   }
 }
 function resetConnectionForm() {
@@ -73,36 +151,49 @@ function clearContext() {
   epoch++;
   connectionId = null;
   recoveryHeld = true;
+  connectionOnline = false;
+  connectionState = null;
   $('recovery-banner').hidden = true;
   activeProject = null;
-  projectOffset = taskOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = studyOffset = messageOffset = 0;
-  activeThread = null; threadEpoch++; activeStudy = null; activeLedger = null; studyEpoch++;
+  projectOffset = taskOffset = workerOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = remoteWorkflowOffset = studyOffset = messageOffset = 0;
+  coordinatorMessageOffset = proposalOffset = statusTurnOffset = 0;
+  coordinatorMessagesMore = proposalsMore = statusTurnsMore = true;
+  activeThread = null; threadEpoch++; activeHarnessBinding = null; readVersion.binding++; activeStudy = null; activeLedger = null; studyEpoch++;
   pendingKeys.clear();
   pendingDecisionResolutions.clear();
-  activeExperiment = null;
-  for (const name of ['projects', 'tasks', 'events', 'threads', 'messages', 'decisions', 'experiments', 'experiment-detail', 'studies', 'study-detail']) $(name).replaceChildren();
+  activeExperiment = null; activeExperimentLedger = null;
+  workbenchEntries = []; coordinatorConversationRevision = 0; selectedCoordinatorContext.splice(0); readVersion.workbench++;
+  for (const name of ['projects', 'tasks', 'workers', 'events', 'threads', 'messages', 'decisions', 'experiments', 'experiment-detail', 'remote-workflows', 'studies', 'study-detail']) $(name).replaceChildren();
   $('project-title').textContent = 'Start with a question.';
   $('welcome').hidden = false;
   $('workspace').hidden = true;
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
-  for (const name of ['projects-more', 'tasks-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'studies-more']) $(name).hidden = true;
+  for (const name of ['projects-more', 'tasks-more', 'workers-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'remote-workflows-more', 'studies-more']) $(name).hidden = true;
   $('experiments-more').hidden = true;
   $('experiment-title').textContent = 'Select an experiment';
   $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
   resetConnectionForm();
   $('study-export').hidden = true;
-  $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
+  $('message-form').hidden = true; $('message-form').reset(); $('harness-context').hidden = true; $('binding-form').reset(); $('context-form').reset(); $('binding-detail').textContent = 'No server-derived harness binding loaded.'; $('thread-title').textContent = 'Select a thread';
+  $('coordinator-form').reset(); renderCoordinatorContext();
   loading.clear();
 }
 async function guarded(work) {
   notice();
-  try { await work(); } catch (error) {
+  try {
+    await work();
+    const state = api && await api.status();
+    if (state) applyConnectionHealth(state);
+  } catch (error) {
     notice(error.message || 'The request could not be completed.');
-    if (api && !(await api.status())) {
+    const state = api && await api.status();
+    if (!state) {
       clearContext();
       $('connection-status').textContent = 'Not connected';
+    } else {
+      applyConnectionHealth(state);
     }
   }
 }
@@ -117,6 +208,7 @@ async function keyFor(scope, body) {
 }
 async function command(scope, body, execute, valid = () => true) {
   if (recoveryHeld) throw new Error('Restored or unverified control state is read-only.');
+  if (!connectionOnline) throw new Error('Control plane is offline; displayed context may be stale. Reconnect or Refresh before a new command.');
   const id = connectionId;
   const version = epoch;
   const fingerprint = JSON.stringify([scope, body]);
@@ -144,25 +236,29 @@ async function selectProject(project) {
   epoch++;
   if (activeProject?.id !== project.id) pendingDecisionResolutions.clear();
   activeProject = project;
-  taskOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = studyOffset = messageOffset = 0;
-  activeThread = null; threadEpoch++; activeStudy = null; activeLedger = null; studyEpoch++;
+  taskOffset = workerOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = remoteWorkflowOffset = studyOffset = messageOffset = 0;
+  coordinatorMessageOffset = proposalOffset = statusTurnOffset = 0;
+  coordinatorMessagesMore = proposalsMore = statusTurnsMore = true;
+  activeThread = null; threadEpoch++; activeHarnessBinding = null; readVersion.binding++; activeStudy = null; activeLedger = null; studyEpoch++;
   const selectionUpdate = api.studySelection(connectionId, null, studyEpoch, null);
-  activeExperiment = null;
-  for (const name of ['threads-more', 'messages-more', 'decisions-more', 'experiments-more', 'studies-more']) $(name).hidden = true;
-  $('tasks').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('experiments').replaceChildren(); $('experiment-detail').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
-  $('message-form').hidden = true; $('message-form').reset(); $('thread-title').textContent = 'Select a thread';
+  activeExperiment = null; activeExperimentLedger = null;
+  workbenchEntries = []; coordinatorConversationRevision = 0; selectedCoordinatorContext.splice(0); readVersion.workbench++;
+  for (const name of ['workers-more', 'threads-more', 'messages-more', 'decisions-more', 'experiments-more', 'remote-workflows-more', 'studies-more']) $(name).hidden = true;
+  $('tasks').replaceChildren(); $('workers').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('experiments').replaceChildren(); $('experiment-detail').replaceChildren(); $('remote-workflows').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
+  $('message-form').hidden = true; $('message-form').reset(); $('harness-context').hidden = true; clearHarnessBinding(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
   $('experiment-title').textContent = 'Select an experiment';
   $('study-export').hidden = true;
   $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
+  $('coordinator-form').reset(); renderCoordinatorContext();
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
   for (const button of $('projects').children) {
     if (button.dataset.projectId === project.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   }
-  await Promise.all([selectionUpdate, loadTasks(), loadEvents(), loadThreads(true), loadDecisions(true), loadExperiments(true), loadStudies(true)]);
+  await Promise.all([selectionUpdate, loadTasks(), loadWorkers(true), loadWorkbench(true), loadThreads(true), loadDecisions(true), loadExperiments(true), loadRemoteWorkflows(true), loadStudies(true)]);
 }
 async function loadTasks() {
   const version = epoch;
@@ -178,6 +274,69 @@ async function loadTasks() {
   taskOffset += response.tasks.length;
   $('tasks-more').hidden = response.tasks.length < 100;
   if (!taskOffset) $('tasks').append(element('p', 'No research plans yet. Create a draft to begin.', 'muted'));
+}
+function validWorkerDiscovery(worker, project) {
+  return worker && worker.project_id === project.id && isIdentifier(worker.id) &&
+    worker.approved_metadata && typeof worker.approved_metadata === 'object' &&
+    typeof worker.approved_metadata.build_identifier === 'string' &&
+    typeof worker.approved_metadata.build_digest === 'string' &&
+    typeof worker.approved_metadata.region === 'string' &&
+    worker.lifecycle && typeof worker.lifecycle === 'object' &&
+    ['ready', 'draining', 'disconnected', 'quarantined', 'retired'].includes(worker.lifecycle.state) &&
+    Number.isSafeInteger(worker.lifecycle.revision) && worker.lifecycle.revision >= 1 &&
+    ['active', 'revoked'].includes(worker.lifecycle.credential_status) &&
+    worker.freshness && ['fresh', 'stale', 'unknown'].includes(worker.freshness.status) &&
+    worker.capabilities?.status === 'not_probed' && worker.capabilities.probed === false &&
+    worker.trust_zone?.status === 'declared_unverified' && typeof worker.trust_zone.trust_class === 'string' &&
+    worker.lease_admission?.registration_is_not_scheduling === true &&
+    ['requires_separate_active_grant', 'fenced'].includes(worker.lease_admission.status) &&
+    typeof worker.lease_admission.fence_reason === 'string';
+}
+function renderWorkerDiscovery(worker) {
+  const card = element('article', undefined, 'card');
+  card.append(element('span', `Lifecycle: ${worker.lifecycle.state} · revision ${worker.lifecycle.revision}`, 'tag'));
+  card.append(element('h3', `Worker ${worker.id}`));
+  card.append(element('p', `Approved build: ${worker.approved_metadata.build_identifier}`));
+  card.append(element('p', `Approved build digest: ${worker.approved_metadata.build_digest}`, 'muted'));
+  card.append(element('p', `Region: ${worker.approved_metadata.region}`));
+  card.append(element('p', `Freshness: ${worker.freshness.status} · last seen ${worker.freshness.last_seen_at ?? 'not recorded'}`));
+  card.append(element('p', `Worker credential: ${worker.lifecycle.credential_status}`));
+  card.append(element('p', 'Capabilities: not probed. No capability attestation is implied.'));
+  card.append(element('p', `Trust zone: ${worker.trust_zone.trust_class} (${worker.trust_zone.status})`));
+  const admission = worker.lease_admission.status === 'fenced' ?
+    `New lease admission is fenced (${worker.lease_admission.fence_reason}).` :
+    'New lease admission requires a separate active grant.';
+  card.append(element('p', admission, 'muted'));
+  card.append(element('p', 'Registration is metadata only; it does not schedule, dispatch, or authorize work.', 'muted'));
+  return card;
+}
+async function loadWorkers(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) { workerOffset = 0; readVersion.workers++; $('workers').replaceChildren(element('p', 'Loading worker discovery…', 'muted')); }
+  const requestVersion = readVersion.workers;
+  const loadingKey = `workers:${version}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('workers-more').disabled = true;
+  try {
+    const response = await api.workers(connectionId, project.id, { offset: workerOffset, limit: 100 });
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.workers) return;
+    if (!response || !Array.isArray(response.workers) || !response.workers.every(worker => validWorkerDiscovery(worker, project))) {
+      throw new Error('The control plane did not return a safe project worker-discovery projection.');
+    }
+    if (reset) $('workers').replaceChildren();
+    for (const worker of response.workers) $('workers').append(renderWorkerDiscovery(worker));
+    workerOffset += response.workers.length;
+    $('workers-more').hidden = response.workers.length < 100 || workerOffset > 100000;
+    if (!workerOffset) $('workers').append(element('p', 'No approved workers are registered for this project.', 'muted'));
+  } catch (error) {
+    if (version === epoch && project === activeProject && requestVersion === readVersion.workers) {
+      if (reset) $('workers').replaceChildren(element('p', 'Could not load worker discovery. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey);
+    if (version === epoch && project === activeProject && requestVersion === readVersion.workers) $('workers-more').disabled = false;
+  }
 }
 function validTaskPlan(plan, task, project) {
   return plan && plan.task_id === task.id && plan.project_id === project.id &&
@@ -210,8 +369,12 @@ async function loadTaskPlan(card, task, version, project) {
       card.append(element('p', `${label}: ${value}`));
     }
     card.append(element('p', `Verified immutable plan digest: ${plan.plan_digest}`, 'muted'));
+    const context = element('button', 'Include plan in coordinator context'); context.type = 'button';
+    context.disabled = !connectionOnline || recoveryHeld;
+    context.addEventListener('click', () => toggleCoordinatorContext({ kind: 'task', record_id: task.id, expected_revision: plan.revision }));
+    card.append(context);
     const button = element('button', task.status === 'approved' ? 'Plan approved' : 'Approve this plan');
-    button.disabled = recoveryHeld || task.status !== 'draft';
+    button.disabled = !canMutate() || task.status !== 'draft';
     button.addEventListener('click', () => guarded(async () => {
       button.disabled = true;
       const body = { expected_revision: plan.revision, expected_plan_digest: plan.plan_digest };
@@ -219,7 +382,7 @@ async function loadTaskPlan(card, task, version, project) {
         if (version !== epoch || project !== activeProject) return;
         await command(`approve:${task.id}`, body, (id, key) => api.approve(id, task.id, body, key));
         if (version === epoch && project === activeProject) { await selectProject(project); notice('Plan approval recorded. No execution was started.'); }
-      } finally { if (button.isConnected) button.disabled = recoveryHeld || task.status !== 'draft'; }
+      } finally { if (button.isConnected) button.disabled = !canMutate() || task.status !== 'draft'; }
     }));
     card.append(button);
   } catch (error) {
@@ -259,9 +422,9 @@ async function loadThreads(reset = false) {
 }
 async function selectThread(thread) {
   const version = epoch; const selection = ++threadEpoch;
-  activeThread = thread; messageOffset = 0; $('messages').replaceChildren();
+  activeThread = thread; activeHarnessBinding = null; readVersion.binding++; messageOffset = 0; $('messages').replaceChildren();
   $('messages-more').hidden = true;
-  $('thread-title').textContent = thread.title; $('message-form').reset(); $('message-form').hidden = false;
+  $('thread-title').textContent = thread.title; $('message-form').reset(); $('message-form').hidden = false; $('harness-context').hidden = false; clearHarnessBinding();
   for (const button of $('threads').children) {
     if (button.dataset.threadId === thread.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
@@ -289,13 +452,30 @@ async function loadMessages(version = epoch, selection = threadEpoch, reset = fa
       row.append(element('span', `${message.intent} · ${message.sender_principal_id}`, 'tag'));
       if (message.delivery && typeof message.delivery === 'object') {
         const delivery = message.delivery;
-        const session = typeof delivery.upstream_session_id === 'string' ? delivery.upstream_session_id : 'not recorded';
-        row.append(element('p', `Delivery ${delivery.state} · harness ${delivery.harness_instance_id} · session ${session}`, 'muted'));
-        if (delivery.state === 'uncertain') row.append(element('p', 'Upstream delivery is uncertain; it will not be sent again automatically.', 'muted'));
-        if (delivery.state === 'failed') row.append(element('p', `Upstream delivery failed (${delivery.error_code ?? 'unclassified'}).`, 'muted'));
-        if (delivery.state === 'cancelled') row.append(element('p', 'Delivery was cancelled in control. This does not claim OpenCode session termination.', 'muted'));
+        row.append(element('p', contextStateLabel(delivery.state), 'muted'));
+        row.append(element('p', 'Server-derived delivery destination recorded; raw harness and session identifiers are not shown.', 'muted'));
+        row.append(element('p', `Context delivery revision ${delivery.revision} · context digest ${delivery.context_digest}`, 'muted'));
+        if (delivery.state === 'failed') row.append(element('p', `Context delivery failure code: ${delivery.error_code ?? 'unclassified'}.`, 'muted'));
+        if (['queued', 'delivered'].includes(delivery.state) &&
+            Number.isSafeInteger(delivery.revision) && delivery.revision >= 1) {
+          const cancel = element('button', 'Cancel queued context'); cancel.type = 'button'; cancel.disabled = !canMutate();
+          cancel.addEventListener('click', () => guarded(async () => {
+            cancel.disabled = true;
+            const body = { expected_revision: delivery.revision };
+            try {
+              await command(`context-cancel:${delivery.delivery_id}`, body,
+                (id, key) => api.cancelHarnessDelivery(id, delivery.delivery_id, body, key),
+                () => version === epoch && thread === activeThread && selection === threadEpoch);
+              if (version === epoch && thread === activeThread && selection === threadEpoch) {
+                await loadMessages(version, selection, true);
+                notice('Context cancellation recorded. This does not terminate a harness session.');
+              }
+            } finally { if (cancel.isConnected) cancel.disabled = !canMutate(); }
+          }));
+          row.append(cancel);
+        }
       } else if (message.delivery_legacy) {
-        row.append(element('p', 'Legacy conversation message — no harness delivery/session record was created.', 'muted'));
+        row.append(element('p', 'Legacy conversation record — no harness context delivery or session record was created.', 'muted'));
       }
       row.append(element('p', message.body)); row.append(element('time', new Date(message.created_at).toLocaleString(), 'muted'));
       $('messages').append(row);
@@ -348,7 +528,7 @@ async function loadDecisions(reset = false) {
       const actions = element('div', undefined, 'decision-actions');
       const approve = element('button', 'Approve'); approve.type = 'button';
       const reject = element('button', 'Reject'); reject.type = 'button';
-      approve.disabled = reject.disabled = recoveryHeld;
+      approve.disabled = reject.disabled = !canMutate();
       if (retry?.projectId === project.id && retry.revision === decision.revision) {
         (retry.body.decision === 'approve' ? reject : approve).disabled = true;
       }
@@ -400,8 +580,8 @@ async function loadDecisions(reset = false) {
           throw new Error('Decision outcome is unknown. Refresh this project before retrying; retry will keep the original request and command identifier.');
         } finally {
           const pending = pendingDecisionResolutions.get(decision.id);
-          approve.disabled = recoveryHeld || (pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'reject');
-          reject.disabled = recoveryHeld || (pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'approve');
+          approve.disabled = !canMutate() || (pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'reject');
+          reject.disabled = !canMutate() || (pending?.projectId === decisionProject.id && pending.revision === decision.revision && pending.body.decision === 'approve');
         }
       });
       approve.addEventListener('click', () => resolve('approve'));
@@ -795,6 +975,106 @@ function renderExperimentLedger(ledger) {
     return card;
   });
 }
+function validRemoteWorkflow(workflow, project) {
+  const reconciliation = workflow?.reconciliation;
+  return workflow && isOperationId(workflow.operation_id) && workflow.project_id === project.id &&
+    isIdentifier(workflow.task_id) && isIdentifier(workflow.grant_id) && isIdentifier(workflow.lease_id) &&
+    isIdentifier(workflow.worker_principal_id) && isPositiveInteger(workflow.epoch) &&
+    ['prepared', 'running', 'unknown', 'exited'].includes(workflow.state) &&
+    ['admitted', 'cancel_requested'].includes(workflow.operation_desired_state) &&
+    typeof workflow.reconciliation_required === 'boolean' && workflow.operational_only === true &&
+    (workflow.experiment_attempt_id === null || isIdentifier(workflow.experiment_attempt_id)) &&
+    (workflow.experiment_id === null || isIdentifier(workflow.experiment_id)) &&
+    (workflow.experiment_design_revision === null || isPositiveInteger(workflow.experiment_design_revision)) &&
+    (workflow.experiment_variant_id === null || isIdentifier(workflow.experiment_variant_id)) &&
+    (reconciliation === null || (reconciliation && operationObservedStates.has(reconciliation.observed_state) &&
+      isText(reconciliation.observed_at) && typeof reconciliation.termination_confirmed === 'boolean' &&
+      isText(reconciliation.cursor) && Array.isArray(reconciliation.sources) &&
+      ['none', 'same_time_contradiction', 'later_adverse_observation', 'unconfirmed_current_observation'].includes(reconciliation.contradiction_state)));
+}
+function remoteWorkflowStateText(workflow) {
+  if (workflow.state === 'prepared') return 'Execution admission/package intent is recorded; no run observation is recorded.';
+  if (workflow.state === 'running') return 'A remote run observation is recorded; it is not a result, evidence, or conclusion.';
+  if (workflow.state === 'unknown') return 'Remote state is unknown; execution, cost exposure, and termination require reconciliation.';
+  if (workflow.reconciliation?.termination_confirmed) return 'Termination is confirmed by attributed operational evidence only; evidence and conclusions remain separate.';
+  return 'An exit is observed but termination is not confirmed; reconciliation remains required.';
+}
+function renderRemoteWorkflow(workflow, project, version, requestVersion) {
+  const card = ledgerCard(`Remote operation ${workflow.operation_id}`, 'remoteWorkflowOperationId', { id: workflow.operation_id });
+  card.append(element('span', `Operational state: ${workflow.state}`, 'tag'));
+  card.append(element('p', `Admitted attempt: ${workflow.experiment_attempt_id ?? 'not linked'} · grant ${workflow.grant_id}`));
+  card.append(element('p', workflow.operation_desired_state === 'cancel_requested' ?
+    'Stop requested in control. This is not confirmed termination.' :
+    'No stop request is recorded in control.'));
+  card.append(element('p', `Task ${workflow.task_id} · lease epoch ${workflow.epoch} · worker ${workflow.worker_principal_id}`, 'muted'));
+  card.append(element('p', remoteWorkflowStateText(workflow), 'muted'));
+  const reconciliation = workflow.reconciliation;
+  if (reconciliation) {
+    card.append(element('p', `Reconciled observation: ${reconciliation.observed_state} · ${reconciliation.termination_confirmed ? 'termination confirmed' : 'termination unconfirmed'} · ${reconciliation.observed_at}`, 'muted'));
+    card.append(element('p', `Reconciliation cursor: ${reconciliation.cursor} · ${reconciliation.contradiction_state}`, 'muted'));
+  } else card.append(element('p', 'No attributed worker/provider observation has been reconciled yet.', 'muted'));
+  if (workflow.reconciliation_required) card.append(element('p', 'Reconciliation required. Do not treat a stop request, reconnect, or displayed exit as confirmed termination.', 'muted'));
+  const inspect = element('button', 'Refresh reconciled operation');
+  inspect.addEventListener('click', () => guarded(async () => {
+    const detail = await api.remoteWorkflow(connectionId, workflow.operation_id);
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.remoteWorkflows || !validRemoteWorkflow(detail, project)) return;
+    await loadRemoteWorkflows(true);
+    notice('Remote workflow projection refreshed. No run, dispatch, stop, evidence, or conclusion was replayed.');
+  }));
+  card.append(inspect);
+  if (!reconciliation?.termination_confirmed && workflow.operation_desired_state !== 'cancel_requested') {
+    const stop = element('button', 'Request stop');
+    stop.addEventListener('click', () => guarded(async () => {
+      if (stop.disabled) return;
+      stop.disabled = true;
+      try {
+        const grant = await api.executionGrant(connectionId, workflow.grant_id);
+        if (version !== epoch || project !== activeProject || requestVersion !== readVersion.remoteWorkflows ||
+            !grant || grant.id !== workflow.grant_id || !isPositiveInteger(grant.revision) ||
+            !['active', 'cancel_requested'].includes(grant.status)) {
+          throw new Error('The current execution grant cannot be used for a stop request. Refresh the workflow projection.');
+        }
+        if (grant.status === 'cancel_requested') {
+          notice('Stop was already requested. Termination remains unconfirmed until reconciled operational evidence says otherwise.');
+          return;
+        }
+        const body = { expected_revision: grant.revision };
+        await command(`remote-stop:${workflow.operation_id}:${workflow.grant_id}`, body,
+          (id, key) => api.revokeExecutionGrant(id, workflow.grant_id, body, key),
+          () => version === epoch && project === activeProject && requestVersion === readVersion.remoteWorkflows);
+        await Promise.all([loadRemoteWorkflows(true), loadExperiments(true)]);
+        notice('Stop requested. This fences new work but does not confirm termination, settle exposure, link evidence, or resolve a conclusion.');
+      } finally {
+        if (version === epoch && project === activeProject) stop.disabled = !canMutate();
+      }
+    }));
+    card.append(stop);
+  }
+  return card;
+}
+async function loadRemoteWorkflows(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) { remoteWorkflowOffset = 0; readVersion.remoteWorkflows++; $('remote-workflows').replaceChildren(element('p', 'Loading reconciled remote workflows…', 'muted')); }
+  const requestVersion = readVersion.remoteWorkflows;
+  const loadingKey = `remote-workflows:${version}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('remote-workflows-more').disabled = true;
+  try {
+    const response = await api.remoteWorkflows(connectionId, project.id, { offset: remoteWorkflowOffset, limit: 100 });
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.remoteWorkflows) return;
+    if (!response || !Array.isArray(response.remote_workflows) || !response.remote_workflows.every(workflow => validRemoteWorkflow(workflow, project))) {
+      throw new Error('The control plane did not return a safe reconciled remote-workflow projection.');
+    }
+    if (reset) $('remote-workflows').replaceChildren();
+    for (const workflow of response.remote_workflows) $('remote-workflows').append(renderRemoteWorkflow(workflow, project, version, requestVersion));
+    remoteWorkflowOffset += response.remote_workflows.length;
+    $('remote-workflows-more').hidden = response.remote_workflows.length < 100 || remoteWorkflowOffset > 100000;
+    if (!remoteWorkflowOffset) $('remote-workflows').append(element('p', 'No admitted remote operation has a workflow projection yet.', 'muted'));
+  } finally {
+    loading.delete(loadingKey);
+    if (version === epoch && project === activeProject && requestVersion === readVersion.remoteWorkflows) $('remote-workflows-more').disabled = false;
+  }
+}
 async function loadExperiments(reset = false) {
   const version = epoch; const project = activeProject;
   if (reset) readVersion.experiments++;
@@ -812,7 +1092,10 @@ async function loadExperiments(reset = false) {
       const button = element('button', `${experiment.goal} · design revision ${experiment.current_design_revision}`);
       button.dataset.experimentId = experiment.id;
       button.addEventListener('click', () => guarded(() => selectExperiment(experiment)));
-      $('experiments').append(button);
+      const context = element('button', 'Include experiment in coordinator context'); context.type = 'button';
+      context.disabled = !connectionOnline || recoveryHeld;
+      context.addEventListener('click', () => toggleCoordinatorContext({ kind: 'experiment', record_id: experiment.id, expected_revision: experiment.current_design_revision }));
+      $('experiments').append(button, context);
     }
     experimentOffset += response.experiments.length;
     $('experiments-more').hidden = response.experiments.length < 100 || experimentOffset > 100000;
@@ -830,6 +1113,12 @@ async function loadExperiments(reset = false) {
 async function selectExperiment(experiment) {
   const version = epoch; const project = activeProject; const requestVersion = ++readVersion.experiment;
   activeExperiment = experiment;
+  // Projections belong to an exact complete experiment ledger.  Remove the old
+  // experiment's cards before the next read settles, rather than showing them
+  // as context for the newly selected experiment.
+  activeExperimentLedger = null;
+  workbenchEntries = workbenchEntries.filter(item => item.source !== 'projection');
+  renderWorkbenchEntries();
   $('experiment-title').textContent = `Experiment ${experiment.id}`;
   $('experiment-detail').setAttribute('aria-busy', 'true');
   $('experiment-detail').replaceChildren(element('p', 'Loading complete goal-to-decision chain…', 'muted'));
@@ -842,7 +1131,10 @@ async function selectExperiment(experiment) {
     if (version !== epoch || project !== activeProject || experiment !== activeExperiment || requestVersion !== readVersion.experiment) return;
     if (!completeExperimentLedger(ledger, experiment, project)) throw new Error('The control plane did not return a complete current experiment ledger.');
     Object.assign(experiment, ledger.experiment);
+    activeExperimentLedger = ledger;
     renderExperimentLedger(ledger);
+    workbenchEntries = [...workbenchEntries.filter(item => item.source !== 'projection'), ...workbenchEvidenceEntries(ledger)];
+    renderWorkbenchEntries();
     $('experiment-detail').setAttribute('aria-busy', 'false');
   } catch (error) {
     if (version === epoch && project === activeProject && experiment === activeExperiment && requestVersion === readVersion.experiment) {
@@ -880,9 +1172,9 @@ function renderStudyLedger(ledger) {
     if (variant.status === 'registered') {
       const record = element('button', 'Record outcome');
       record.dataset.recordVariantId = variant.id;
-      record.disabled = recoveryHeld || study.status !== 'open';
+      record.disabled = !canMutate() || study.status !== 'open';
       record.addEventListener('click', () => guarded(async () => {
-        if (recoveryHeld || ledger !== activeLedger || study.status !== 'open') {
+        if (!canMutate() || ledger !== activeLedger || study.status !== 'open') {
           throw new Error('Select a current open study to record an outcome.');
         }
         outcomeContext = researchContext(ledger, variant);
@@ -907,7 +1199,7 @@ function renderStudyLedger(ledger) {
     if (!source.superseded_at) {
       for (const [kind, label] of [['assessment', 'Assess source'], ['correction', 'Correct source']]) {
         const button = element('button', label); button.dataset[kind + 'SourceId'] = source.id;
-        button.disabled = recoveryHeld;
+        button.disabled = !canMutate();
         button.addEventListener('click', () => guarded(async () => {
           openEvidenceForm(kind, ledger, { source });
           $(kind === 'assessment' ? 'assessment-source' : 'correction-original').textContent =
@@ -932,7 +1224,7 @@ function renderStudyLedger(ledger) {
       const reaffirm = finding.status === 'needs_review';
       const accept = element('button', reaffirm ? 'Review reaffirmation' : 'Review acceptance');
       accept.dataset[reaffirm ? 'reaffirmFindingId' : 'acceptFindingId'] = finding.id;
-      accept.disabled = recoveryHeld || !findingIsAcceptable(ledger, finding);
+      accept.disabled = !canMutate() || !findingIsAcceptable(ledger, finding);
       if (!findingIsAcceptable(ledger, finding)) {
         card.append(element('p', 'Acceptance needs currently supported cited sources. Confirmatory studies must also be closed and fully accounted for.', 'muted'));
       }
@@ -957,7 +1249,7 @@ function renderStudyLedger(ledger) {
     if (['candidate', 'accepted', 'needs_review'].includes(finding.status)) {
       const retract = element('button', 'Review retraction');
       retract.dataset.retractFindingId = finding.id;
-      retract.disabled = recoveryHeld;
+      retract.disabled = !canMutate();
       retract.addEventListener('click', () => guarded(async () => {
         const context = openEvidenceForm('finding-retract', ledger, { finding });
         const review = $('finding-retract-review');
@@ -969,7 +1261,7 @@ function renderStudyLedger(ledger) {
     if (['candidate', 'accepted', 'needs_review'].includes(finding.status)) {
       const revise = element('button', 'Review revision');
       revise.dataset.reviseFindingId = finding.id;
-      revise.disabled = recoveryHeld;
+      revise.disabled = !canMutate();
       revise.addEventListener('click', () => guarded(async () => {
         const context = openEvidenceForm('finding-revise', ledger, { finding });
         $('finding-revise-original').replaceChildren(
@@ -1068,13 +1360,13 @@ async function selectStudy(study) {
     Object.assign(study, ledger.study);
     activeLedger = ledger;
     renderStudyLedger(ledger);
-    $('source-new').hidden = false; $('source-new').disabled = recoveryHeld;
-    $('finding-new').hidden = ledger.study.status !== 'open'; $('finding-new').disabled = recoveryHeld;
+    $('source-new').hidden = false; $('source-new').disabled = !canMutate();
+    $('finding-new').hidden = ledger.study.status !== 'open'; $('finding-new').disabled = !canMutate();
     $('study-close').hidden = ledger.study.status !== 'open';
-    $('study-close').disabled = recoveryHeld || ledger.variants.some(variant => variant.status === 'registered');
+    $('study-close').disabled = !canMutate() || ledger.variants.some(variant => variant.status === 'registered');
     $('study-export').hidden = false;
     $('variant-new').hidden = ledger.study.status !== 'open';
-    $('variant-new').disabled = recoveryHeld;
+    $('variant-new').disabled = !canMutate();
   } catch (error) {
     if (studyReadIsCurrent(version, project, selection, study, requestVersion)) {
       $('study-detail').replaceChildren(element('p', 'Could not load a complete study ledger. Partial records are not shown as complete; use Refresh to retry.', 'muted'));
@@ -1287,19 +1579,225 @@ function cancellationEventLabel(event) {
   }
   return eventLabels[event.event_type] ?? event.event_type;
 }
-async function loadEvents() {
-  const version = epoch;
-  const response = await api.labbook(connectionId, activeProject.id, eventCursor);
-  if (version !== epoch) return;
-  for (const event of response.events) {
-    const entry = element('li');
-    entry.append(element('span', cancellationEventLabel(event)));
-    entry.append(element('time', `${new Date(event.created_at).toLocaleString()} · revision ${event.resource_revision}`));
-    $('events').append(entry);
-    eventCursor = event.cursor;
+function renderCoordinatorContext() {
+  const container = $('coordinator-context'); container.replaceChildren();
+  if (!selectedCoordinatorContext.length) {
+    container.append(element('span', 'No selected context. Select a plan or experiment below to include its current revision.', 'muted'));
+    return;
   }
-  $('events-more').hidden = response.events.length < 200;
+  for (const reference of selectedCoordinatorContext) {
+    const chip = element('span', `${reference.kind} ${reference.record_id} · revision ${reference.expected_revision}`, 'context-chip');
+    const remove = element('button', 'Remove'); remove.type = 'button'; remove.disabled = !canMutate();
+    remove.addEventListener('click', () => {
+      const index = selectedCoordinatorContext.findIndex(item => item.kind === reference.kind && item.record_id === reference.record_id);
+      if (index >= 0) selectedCoordinatorContext.splice(index, 1);
+      renderCoordinatorContext();
+    });
+    chip.append(remove); container.append(chip);
+  }
 }
+function toggleCoordinatorContext(reference) {
+  if (!activeProject || !isPositiveInteger(reference.expected_revision)) return;
+  const index = selectedCoordinatorContext.findIndex(item => item.kind === reference.kind && item.record_id === reference.record_id);
+  if (index >= 0) selectedCoordinatorContext.splice(index, 1);
+  else if (selectedCoordinatorContext.length >= 16) throw new Error('Select at most 16 current context records.');
+  else selectedCoordinatorContext.push(reference);
+  renderCoordinatorContext();
+}
+function validCoordinatorDesign(design) {
+  if (!design || !isText(design.goal) || !isText(design.success_criterion) || !isText(design.protocol) ||
+      !Array.isArray(design.variants) || design.variants.length !== 2 ||
+      new Set(design.variants.map(variant => variant?.kind)).size !== 2 ||
+      !['baseline', 'intervention'].every(kind => design.variants.some(variant => variant?.kind === kind))) return false;
+  return design.variants.every(variant => isText(variant.name) && isDigest(variant.method_digest) &&
+    isDigest(variant.input_digest) && variant.metadata && typeof variant.metadata === 'object' &&
+    !Array.isArray(variant.metadata) && ((variant.execution_task_id === null && variant.execution_plan_digest === null) ||
+      (isIdentifier(variant.execution_task_id) && isDigest(variant.execution_plan_digest))));
+}
+function typedWorkbenchEvent(event) {
+  if (event.event_type.startsWith('astra_coordinator_')) return null;
+  const type = event.event_type === 'decision_resolved' || event.event_type === 'decision_expired' ? 'human-decision-receipt' :
+    (event.event_type.startsWith('execution.') || event.event_type.startsWith('interaction_message_delivery_')) ? 'execution-milestone' : 'labbook-record';
+  return { id: `event:${event.cursor}`, source: 'labbook', type, created_at: event.created_at, event };
+}
+function workbenchEvidenceEntries(ledger) {
+  if (!ledger) return [];
+  const entries = [];
+  const projection = { experimentId: ledger.experiment.id, ledgerRevision: ledger.experiment.current_design_revision };
+  for (const conclusion of ledger.conclusions ?? []) {
+    entries.push({ id: `conclusion:${conclusion.id}`, source: 'projection', type: 'conclusion-card', created_at: null,
+      projection: { ...projection, designRevision: conclusion.design_revision }, conclusion });
+    for (const evidence of conclusion.evidence ?? []) {
+      entries.push({ id: `evidence:${conclusion.id}:${evidence.attempt_id}:${evidence.artifact_id ?? evidence.measurement_id}`,
+        source: 'projection', type: 'evidence-link', created_at: null,
+        projection: { ...projection, designRevision: conclusion.design_revision }, evidence, conclusion });
+    }
+  }
+  return entries;
+}
+function renderWorkbenchEntry(item) {
+  const entry = element('li'); entry.dataset.workbenchType = item.type;
+  const labels = { 'scientist-message': 'Scientist message', 'coordinator-reply': 'Deterministic local coordinator reply',
+    'coordinator-proposal': 'Coordinator proposal', 'status-turn': 'Explain status turn', 'human-decision-receipt': 'Human decision receipt',
+    'execution-milestone': 'Execution milestone', 'evidence-link': 'Evidence link', 'conclusion-card': 'Conclusion card', 'labbook-record': 'Labbook record' };
+  if (item.event) entry.append(element('span', cancellationEventLabel(item.event)));
+  entry.append(element('span', labels[item.type] ?? 'Recorded item', 'tag'));
+  if (item.message) {
+    entry.append(element('p', item.message.body));
+    if (item.message.sender_kind === 'coordinator') entry.append(element('p', 'Provider disabled. This reply has no approval, grant, dispatch, tool, shell, or skill-loading authority.', 'muted'));
+  } else if (item.proposal) {
+    entry.append(element('p', item.proposal.body));
+    entry.append(element('p', `Recap: ${item.proposal.recap}`));
+    entry.append(element('p', `Status: ${item.proposal.status.join(' | ')}`));
+    entry.append(element('p', 'Human review needed. Authority effect: none. Execution is not authorized.', 'muted'));
+    if (item.proposal.design) {
+      const design = item.proposal.design;
+      const preview = element('article', undefined, 'card');
+      preview.append(element('h4', 'Complete design preview'));
+      preview.append(element('p', `Goal: ${design.goal}`));
+      preview.append(element('p', `Success criterion: ${design.success_criterion}`));
+      preview.append(element('p', `Protocol: ${design.protocol}`));
+      for (const variant of design.variants) {
+        const execution = variant.execution_task_id === null ? 'No registered execution reference.' :
+          `Registered execution reference: task ${variant.execution_task_id} · plan ${variant.execution_plan_digest}.`;
+        preview.append(element('p', `${variant.kind} variant: ${variant.name}`));
+        preview.append(element('p', `Method digest: ${variant.method_digest}`));
+        preview.append(element('p', `Input digest: ${variant.input_digest}`));
+        preview.append(element('p', `Metadata: ${JSON.stringify(variant.metadata)}`));
+        preview.append(element('p', execution, 'muted'));
+      }
+      preview.append(element('p', `Registration context digest: ${item.proposal.context_digest}`, 'muted'));
+      preview.append(element('p', 'Review this complete candidate before registration. Registration does not authorize execution.', 'muted'));
+      entry.append(preview);
+      if (item.proposal.registration) {
+        entry.append(element('p', `Registered design revision ${item.proposal.registration.design_revision} for experiment ${item.proposal.registration.experiment_id}. Execution remains unauthorized.`, 'muted'));
+      } else {
+        const register = element('button', 'Register design — execution not authorized'); register.type = 'button';
+        register.disabled = !canMutate();
+        register.addEventListener('click', () => guarded(async () => {
+          const project = activeProject; const proposal = item.proposal;
+          if (!project || !validCoordinatorDesign(proposal.design) || !isDigest(proposal.context_digest)) {
+            throw new Error('This coordinator design proposal is incomplete or stale. Refresh before registering it.');
+          }
+          register.disabled = true;
+          const body = { expected_context_digest: proposal.context_digest };
+          try {
+            await command(`register-design:${proposal.id}`, body,
+              (id, key) => api.registerProposalDesign(id, proposal.id, body, key),
+              () => project === activeProject);
+            if (project === activeProject) {
+              await Promise.all([loadWorkbench(true), loadExperiments(true)]);
+              notice('Design registered. Execution is not authorized.');
+            }
+          } finally { if (register.isConnected) register.disabled = !canMutate(); }
+        }));
+        entry.append(register);
+      }
+    }
+  } else if (item.statusTurn) {
+    const turn = item.statusTurn;
+    entry.append(element('p', `Turn state: ${turn.state}. Design revision: ${turn.design_revision}.`));
+    if (turn.binding) entry.append(element('p', `Discussion binding: ${turn.binding.state}; lease expires ${turn.binding.lease_expires_at}.`, 'muted'));
+    if (turn.tool_invocation) entry.append(element('p', `Mediated tool: ${turn.tool_invocation.tool_name}; outcome ${turn.tool_invocation.outcome}; input digest ${turn.tool_invocation.input_digest}.`, 'muted'));
+    if (turn.answer) entry.append(element('p', turn.answer.body));
+    entry.append(element('p', 'Provider disabled. This status turn has no approval, grant, dispatch, execution, shell, MCP, or skill-loading authority.', 'muted'));
+  } else if (item.event) {
+    if (item.type === 'human-decision-receipt') entry.append(element('p', `Recorded human decision: ${item.event.payload?.decision ?? 'status not recorded'}. This receipt does not issue a grant or start execution.`, 'muted'));
+  } else if (item.evidence) {
+    entry.append(element('p', `Experiment ${item.projection.experimentId} · loaded design revision ${item.projection.ledgerRevision}; conclusion design revision ${item.projection.designRevision ?? 'unknown legacy revision'}.`, 'muted'));
+    entry.append(element('p', `Conclusion ${item.conclusion.id} links attempt ${item.evidence.attempt_id} to ${item.evidence.artifact_id ? `artifact ${item.evidence.artifact_id}` : `measurement ${item.evidence.measurement_id}`}.`));
+    entry.append(element('p', 'Evidence link only; it does not establish scientific success.', 'muted'));
+  } else if (item.conclusion) {
+    entry.append(element('p', `Experiment ${item.projection.experimentId} · loaded design revision ${item.projection.ledgerRevision}; conclusion design revision ${item.projection.designRevision ?? 'unknown legacy revision'}.`, 'muted'));
+    entry.append(element('p', item.conclusion.statement));
+    entry.append(element('p', `Human conclusion status: ${item.conclusion.status}. Scientific validity: ${item.conclusion.scientific_validity}.`, 'muted'));
+  }
+  const timestamp = item.created_at ?? item.event?.created_at ?? item.proposal?.created_at ?? item.message?.created_at;
+  if (timestamp) entry.append(element('time', new Date(timestamp).toLocaleString()));
+  return entry;
+}
+function renderWorkbenchEntries() {
+  const visible = workbenchView === 'labbook' ?
+    workbenchEntries.filter(item => item.source === 'labbook' || item.source === 'projection') : workbenchEntries;
+  $('events').replaceChildren();
+  if (!visible.length) $('events').append(element('li', workbenchView === 'labbook' ? 'No labbook records yet.' : 'No coordinator workbench records yet.', 'muted'));
+  else for (const item of visible) $('events').append(renderWorkbenchEntry(item));
+  $('conversation-view').setAttribute('aria-pressed', String(workbenchView === 'conversation'));
+  $('labbook-view').setAttribute('aria-pressed', String(workbenchView === 'labbook'));
+}
+async function loadWorkbench(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) {
+    eventCursor = coordinatorMessageOffset = proposalOffset = statusTurnOffset = 0;
+    coordinatorMessagesMore = proposalsMore = statusTurnsMore = true;
+    readVersion.workbench++;
+  }
+  const requestVersion = readVersion.workbench;
+  const messagePage = coordinatorMessagesMore ? { offset: coordinatorMessageOffset, limit: 100 } : null;
+  const proposalPage = proposalsMore ? { offset: proposalOffset, limit: 100 } : null;
+  const statusTurnPage = statusTurnsMore ? { offset: statusTurnOffset, limit: 100 } : null;
+  const loadingKey = `workbench:${version}:${requestVersion}:${eventCursor}:${coordinatorMessageOffset}:${proposalOffset}:${statusTurnOffset}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey); $('events-more').disabled = true;
+  try {
+    const [conversation, proposals, statusTurns, labbook] = await Promise.all([
+      messagePage ? api.astraConversation(connectionId, project.id, messagePage) : Promise.resolve({ messages: [] }),
+      proposalPage ? api.astraProposals(connectionId, project.id, proposalPage) : Promise.resolve({ proposals: [] }),
+      statusTurnPage ? api.explainStatusTurns(connectionId, project.id, statusTurnPage) : Promise.resolve({ turns: [] }),
+      api.labbook(connectionId, project.id, eventCursor),
+    ]);
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.workbench) return;
+    if (!conversation || !Array.isArray(conversation.messages) || !Array.isArray(proposals.proposals) || !Array.isArray(statusTurns.turns) || !Array.isArray(labbook.events)) {
+      throw new Error('The control plane did not return a complete coordinator projection.');
+    }
+    const messages = conversation.messages.filter(message => message.project_id === project.id &&
+      ['human', 'coordinator'].includes(message.sender_kind) && isIdentifier(message.id) && isText(message.body)).map(message => ({
+      id: `message:${message.id}`, source: 'conversation', type: message.sender_kind === 'human' ? 'scientist-message' : 'coordinator-reply', created_at: message.created_at, message,
+    }));
+    const proposalEntries = proposals.proposals.filter(proposal => proposal.project_id === project.id &&
+      proposal.provider_disabled === true && proposal.authority_effect === 'none' && proposal.execution_authorized === false &&
+      proposal.proposal_type === 'human_review_needed' && Array.isArray(proposal.status) &&
+      (proposal.design === null || validCoordinatorDesign(proposal.design)) &&
+      (proposal.context_digest === undefined || isDigest(proposal.context_digest))).map(proposal => ({
+      id: `proposal:${proposal.id}`, source: 'conversation', type: 'coordinator-proposal', created_at: proposal.created_at, proposal,
+    }));
+    const statusEntries = statusTurns.turns.filter(turn => turn.project_id === project.id &&
+      isIdentifier(turn.turn_id) && isIdentifier(turn.experiment_id) && isPositiveInteger(turn.design_revision) &&
+      ['requested', 'claimed', 'completed', 'cancelled'].includes(turn.state)).map(turn => ({
+      id: `status-turn:${turn.turn_id}`, source: 'conversation', type: 'status-turn', created_at: turn.answer?.created_at, statusTurn: turn,
+    }));
+    const events = labbook.events.map(typedWorkbenchEvent).filter(Boolean);
+    if (messagePage) coordinatorConversationRevision = conversation.conversation === null ? 0 : conversation.conversation.revision;
+    if (messagePage) {
+      coordinatorMessageOffset += conversation.messages.length;
+      coordinatorMessagesMore = conversation.messages.length === 100 && coordinatorMessageOffset <= 100000;
+    }
+    if (proposalPage) {
+      proposalOffset += proposals.proposals.length;
+      proposalsMore = proposals.proposals.length === 100 && proposalOffset <= 100000;
+    }
+    if (statusTurnPage) {
+      statusTurnOffset += statusTurns.turns.length;
+      statusTurnsMore = statusTurns.turns.length === 100 && statusTurnOffset <= 100000;
+    }
+    eventCursor = labbook.events.length ? labbook.events[labbook.events.length - 1].cursor : eventCursor;
+    const evidence = workbenchEvidenceEntries(activeExperimentLedger);
+    const merged = [...messages, ...proposalEntries, ...statusEntries, ...events, ...evidence];
+    if (new Set(merged.map(item => item.id)).size !== merged.length) throw new Error('The control plane returned duplicate workbench records.');
+    workbenchEntries = reset ? merged : [...workbenchEntries, ...merged.filter(item => !workbenchEntries.some(existing => existing.id === item.id))];
+    workbenchEntries.sort((left, right) => String(left.created_at ?? '').localeCompare(String(right.created_at ?? '')) || left.id.localeCompare(right.id));
+    $('events-more').hidden = !coordinatorMessagesMore && !proposalsMore && !statusTurnsMore && labbook.events.length < 200;
+    renderWorkbenchEntries();
+  } catch (error) {
+    if (version === epoch && project === activeProject && requestVersion === readVersion.workbench) {
+      $('events').replaceChildren(element('li', 'Coordinator workbench may be stale because the control plane is offline or selected context changed. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey); if (version === epoch && requestVersion === readVersion.workbench) $('events-more').disabled = false;
+  }
+}
+async function loadEvents() { return loadWorkbench(false); }
 for (const button of document.querySelectorAll('[data-close]')) {
   button.addEventListener('click', () => button.closest('dialog').close());
 }
@@ -1323,7 +1821,7 @@ $('connection-form').addEventListener('submit', event => {
     if (version !== epoch) return;
     if (!state) { $('connection-status').textContent = 'Not connected'; return; }
     connectionId = state.id;
-    $('connection-status').textContent = `${state.name}\n${state.endpoint}\n${state.organizationId}`;
+    applyConnectionHealth(state);
     $('disconnect').hidden = false;
     let recovery;
     try { recovery = await api.recovery(connectionId); } catch (error) {
@@ -1374,7 +1872,7 @@ $('thread-form').addEventListener('submit', event => {
       $('thread-dialog').close(); event.target.reset(); await loadThreads(true);
       if (version !== epoch) return;
       await selectThread(thread);
-    } finally { button.disabled = recoveryHeld; }
+    } finally { button.disabled = !canMutate(); }
   });
 });
 $('study-form').addEventListener('submit', event => {
@@ -1401,7 +1899,7 @@ $('study-form').addEventListener('submit', event => {
       $('study-dialog').close(); event.target.reset();
       await loadStudies(true);
       if (version === epoch && project === activeProject) await selectStudy(study);
-    } finally { if (version === epoch && project === activeProject) button.disabled = recoveryHeld; }
+    } finally { if (version === epoch && project === activeProject) button.disabled = !canMutate(); }
   });
 });
 $('variant-form').addEventListener('submit', event => {
@@ -1430,7 +1928,7 @@ $('variant-form').addEventListener('submit', event => {
       $('variant-dialog').close(); event.target.reset(); await selectStudy(study);
     } finally {
       if (version === epoch && project === activeProject && study === activeStudy && selection === studyEpoch) {
-        button.disabled = recoveryHeld;
+        button.disabled = !canMutate();
       }
     }
   });
@@ -1446,20 +1944,110 @@ $('message-form').addEventListener('submit', event => {
       const body = { thread_id: thread.id, intent: fields.get('intent'), body: fields.get('body') };
       await command(`message:${thread.id}`, body, (id, key) => api.sendMessage(id, body, key),
         () => version === epoch && thread === activeThread && selection === threadEpoch);
-      if (version === epoch && thread === activeThread && selection === threadEpoch) { event.target.reset(); await loadMessages(version, threadEpoch, true); }
-    } finally { button.disabled = recoveryHeld; }
+      if (version === epoch && thread === activeThread && selection === threadEpoch) {
+        event.target.reset(); await loadMessages(version, threadEpoch, true);
+        notice('Conversation message recorded. It was not sent to a harness.');
+      }
+    } finally { button.disabled = !canMutate(); }
   });
 });
+$('binding-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const version = epoch; const selection = threadEpoch; const thread = activeThread; const project = activeProject;
+    const requestedId = new FormData(event.target).get('harness_session_binding_id');
+    if (!thread || !project || typeof requestedId !== 'string' || !requestedId) throw new Error('Select a thread and enter a server-derived harness binding ID.');
+    const requestVersion = ++readVersion.binding;
+    $('binding-detail').textContent = 'Fetching server-derived harness binding…';
+    const binding = await api.harnessSessionBinding(connectionId, requestedId);
+    if (version !== epoch || selection !== threadEpoch || thread !== activeThread || project !== activeProject || requestVersion !== readVersion.binding) return;
+    if (!validHarnessBinding(binding, requestedId, project, thread)) {
+      activeHarnessBinding = null;
+      $('binding-detail').textContent = 'The server binding is missing, stale, or does not belong to this thread/project. Context was not queued.';
+      throw new Error('The server-derived harness binding is not valid for the selected context.');
+    }
+    activeHarnessBinding = binding;
+    renderHarnessBinding(binding);
+  });
+});
+$('context-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const button = event.target.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const version = epoch; const selection = threadEpoch; const thread = activeThread; const project = activeProject;
+      const fields = new FormData(event.target);
+      const bindingId = new FormData($('binding-form')).get('harness_session_binding_id');
+      const contextRevision = Number(fields.get('context_revision'));
+      if (!thread || !project || !activeHarnessBinding || activeHarnessBinding.id !== bindingId ||
+          !Number.isSafeInteger(contextRevision) || contextRevision < 1) {
+        throw new Error('Fetch a current server-derived harness binding and enter a valid context revision first.');
+      }
+      const body = { thread_id: thread.id, harness_session_binding_id: bindingId,
+        context_revision: contextRevision, intent: fields.get('intent'), body: fields.get('body') };
+      await command(`harness-context:${thread.id}:${bindingId}`, body,
+        (id, key) => api.enqueueHarnessDelivery(id, body, key),
+        () => version === epoch && selection === threadEpoch && thread === activeThread && project === activeProject &&
+          activeHarnessBinding?.id === bindingId);
+      if (version === epoch && selection === threadEpoch && thread === activeThread && project === activeProject) {
+        event.target.reset(); await loadMessages(version, selection, true);
+        notice('Context queued for harness delivery. It is not an answer, execution, or acceptance.');
+      }
+    } finally { button.disabled = !canMutate(); }
+  });
+});
+$('coordinator-form').addEventListener('submit', event => {
+  event.preventDefault();
+  guarded(async () => {
+    const button = event.target.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    const version = epoch; const project = activeProject; const fields = new FormData(event.target);
+    const mode = fields.get('mode'); const prompt = fields.get('prompt')?.trim();
+    if (!project || !['Discuss', 'Draft experiment', 'Explain status', 'Review results'].includes(mode) || !prompt) {
+      throw new Error('Choose a composer mode and enter a message.');
+    }
+    if (!Number.isSafeInteger(coordinatorConversationRevision) || coordinatorConversationRevision < 0) {
+      throw new Error('Refresh the coordinator workbench before requesting a turn.');
+    }
+    const statusReference = selectedCoordinatorContext.length === 1 && selectedCoordinatorContext[0].kind === 'experiment' ? selectedCoordinatorContext[0] : null;
+    if (mode === 'Explain status' && !statusReference) throw new Error('Explain status requires exactly one current experiment context.');
+    const body = mode === 'Explain status' ? { expected_conversation_revision: coordinatorConversationRevision,
+      prompt, experiment_id: statusReference.record_id, expected_design_revision: statusReference.expected_revision } :
+      { expected_conversation_revision: coordinatorConversationRevision,
+        prompt: `[${mode}]\n${prompt}`, selected_context: selectedCoordinatorContext.map(reference => ({ ...reference })) };
+    button.disabled = true;
+    try {
+      await command(`coordinator:${project.id}:${mode}`, body,
+        (id, key) => mode === 'Explain status' ? api.requestExplainStatusTurn(id, project.id, body, key) : api.requestCoordinatorTurn(id, project.id, body, key),
+        () => version === epoch && project === activeProject);
+      if (version === epoch && project === activeProject) {
+        event.target.reset(); await loadWorkbench(true);
+        notice(mode === 'Explain status' ? 'Explain status turn requested. It is provider-disabled and runs only the mediated status read.' : 'Coordinator turn requested. It is provider-disabled and does not approve, grant, dispatch, or execute work.');
+      }
+    } catch (error) {
+      if (/\(409\)/.test(error.message)) {
+        throw new Error('The selected coordinator context or conversation revision is stale. Refresh before requesting another turn.');
+      }
+      throw error;
+    } finally { if (version === epoch && project === activeProject) button.disabled = !canMutate(); }
+  });
+});
+$('conversation-view').addEventListener('click', () => { workbenchView = 'conversation'; renderWorkbenchEntries(); });
+$('labbook-view').addEventListener('click', () => { workbenchView = 'labbook'; renderWorkbenchEntries(); });
 $('refresh').addEventListener('click', () => guarded(async () => {
   await loadProjects(true); if (activeProject) await selectProject(activeProject);
 }));
 $('projects-more').addEventListener('click', () => guarded(() => loadProjects()));
 $('tasks-more').addEventListener('click', () => guarded(() => loadTasks()));
+$('workers-more').addEventListener('click', () => guarded(() => loadWorkers()));
 $('events-more').addEventListener('click', () => guarded(() => loadEvents()));
 $('threads-more').addEventListener('click', () => guarded(() => loadThreads()));
 $('messages-more').addEventListener('click', () => guarded(() => loadMessages()));
 $('decisions-more').addEventListener('click', () => guarded(() => loadDecisions()));
 $('experiments-more').addEventListener('click', () => guarded(() => loadExperiments()));
+$('remote-workflows-more').addEventListener('click', () => guarded(() => loadRemoteWorkflows()));
 $('studies-more').addEventListener('click', () => guarded(() => loadStudies()));
 if (!api) {
   $('connection-open').disabled = true;

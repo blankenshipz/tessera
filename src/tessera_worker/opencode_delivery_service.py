@@ -76,9 +76,42 @@ class OpenCodeDeliveryWorkerService:
             session_id=str(delivery.get("upstream_session_id", "")),
         )
         context_digest = str(delivery.get("context_digest", ""))
+
+        def authority_is_current(binding: TesseraBinding, action: str) -> bool:
+            """Use control's live predicate at both adapter message boundaries."""
+            if action != "message" or (
+                binding.organization_id != delivery["organization_id"]
+                or binding.project_id != delivery["project_id"]
+                or binding.task_id != delivery["task_id"]
+                or binding.operation_id != delivery["operation_id"]
+                or binding.epoch != expected_epoch
+                or binding.harness_instance_id != delivery["harness_instance_id"]
+                or binding.attempt_id != delivery["admitted_attempt_id"]
+                or binding.session_id != delivery["upstream_session_id"]
+            ):
+                return False
+            body = {
+                "expected_epoch": expected_epoch,
+                "expected_revision": delivery["revision"],
+                "context_digest": context_digest,
+            }
+            try:
+                response = self.channel.post(
+                    f"/worker/interaction-deliveries/{self.config.delivery_id}/authorize",
+                    body,
+                    self._key("authorize", body),
+                )
+            except Exception:
+                return False
+            return response == {"authorized": True}
+
         try:
             upstream_id, readback_digest = self.adapter.deliver_context_only(
-                binding, self.config.delivery_id, delivery["body"], context_digest
+                binding,
+                self.config.delivery_id,
+                delivery["body"],
+                context_digest,
+                authority_is_current=authority_is_current,
             )
         except OpenCodeHarnessError:
             body = {"expected_revision": delivery["revision"], "context_digest": context_digest,

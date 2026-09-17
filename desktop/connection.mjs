@@ -20,6 +20,12 @@ function resourceId(value) {
   }
   return encodeURIComponent(value);
 }
+function operationId(value) {
+  if (typeof value !== 'string' || !/^[0-9a-f]{32}$/.test(value)) {
+    throw new ConnectionError('Invalid operation identifier.');
+  }
+  return value;
+}
 
 function pageQuery({ offset = 0, limit = 100 } = {}) {
   if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
@@ -40,6 +46,9 @@ export class ControlConnection {
   #fetch;
   #active = null;
   #generation = 0;
+  // Requests on one connection can settle out of order.  Only the newest
+  // request may change the displayed health for that connection generation.
+  #healthFreshness = 0;
   #pending = new Set();
   #timeout;
 
@@ -50,6 +59,7 @@ export class ControlConnection {
 
   disconnect() {
     this.#generation++;
+    this.#healthFreshness = 0;
     for (const controller of this.#pending) controller.abort();
     this.#pending.clear();
     this.#active = null;
@@ -77,9 +87,16 @@ export class ControlConnection {
 
   status() {
     if (!this.#active) return null;
-    const { id, name, origin, identity } = this.#active;
+    const { id, name, origin, identity, health = 'online' } = this.#active;
     return { id, name, endpoint: origin, principalId: identity.principal_id, organizationId: identity.org_id,
-      role: identity.role, projectId: identity.project_id ?? null, expiresAt: identity.expires_at ?? null };
+      role: identity.role, projectId: identity.project_id ?? null, expiresAt: identity.expires_at ?? null, health };
+  }
+
+  #setHealth(connection, freshness, health) {
+    if (freshness !== null && this.#active === connection &&
+        connection.generation === this.#generation && freshness === this.#healthFreshness) {
+      connection.health = health;
+    }
   }
 
   assertActive(expectedId) {
@@ -89,6 +106,9 @@ export class ControlConnection {
   }
 
   async #send(connection, path, body, key) {
+    // `/me` authenticates a candidate before it becomes active, so it must not
+    // affect the health of the currently selected connection.
+    const healthFreshness = this.#active === connection ? ++this.#healthFreshness : null;
     const controller = new AbortController();
     this.#pending.add(controller);
     const timer = setTimeout(() => controller.abort(), this.#timeout);
@@ -123,9 +143,12 @@ export class ControlConnection {
         await reader.cancel();
       }
       if (connection.generation !== this.#generation) throw new ConnectionError('Connection changed.');
-      return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      this.#setHealth(connection, healthFreshness, 'online');
+      return payload;
     } catch (error) {
       if (error instanceof ConnectionError) throw error;
+      this.#setHealth(connection, healthFreshness, 'offline');
       throw new ConnectionError(body === undefined ? 'Control plane unavailable.' :
         'Command outcome is unknown. Reconnect to this connection and inspect its history before retrying.');
     } finally {
@@ -145,12 +168,35 @@ export class ControlConnection {
   projects(page) { return this.#request(`/projects?${pageQuery(page)}`); }
   recovery() { return this.#request('/recovery'); }
   tasks(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/tasks?${pageQuery(page)}`); }
+  workers(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/workers?${pageQuery(page)}`); }
   threads(projectId, page) { return this.#request(`/interaction/projects/${resourceId(projectId)}/threads?${interactionPageQuery(page)}`); }
   messages(threadId, page) { return this.#request(`/interaction/threads/${resourceId(threadId)}/messages?${interactionPageQuery(page)}`); }
   decisions(projectId, page) {
     return this.#request(`/interaction/projects/${resourceId(projectId)}/decisions?${interactionPageQuery(page)}&status=pending`);
   }
+  astraConversation(projectId, page) {
+    return this.#request(`/astra/projects/${resourceId(projectId)}/conversation?${interactionPageQuery(page)}`);
+  }
+  astraProposals(projectId, page) {
+    return this.#request(`/astra/projects/${resourceId(projectId)}/proposals?${interactionPageQuery(page)}`);
+  }
+  requestCoordinatorTurn(projectId, body, key) {
+    return this.#request(`/astra/projects/${resourceId(projectId)}/turns`, body, key);
+  }
+  explainStatusTurns(projectId, page) {
+    return this.#request(`/astra/projects/${resourceId(projectId)}/explain-status-turns?${interactionPageQuery(page)}`);
+  }
+  requestExplainStatusTurn(projectId, body, key) {
+    return this.#request(`/astra/projects/${resourceId(projectId)}/explain-status-turns`, body, key);
+  }
+  registerProposalDesign(proposalId, body, key) {
+    return this.#request(`/astra/proposals/${resourceId(proposalId)}/register-design`, body, key);
+  }
   experiments(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/experiments?${pageQuery(page)}`); }
+  remoteWorkflows(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/remote-workflows?${pageQuery(page)}`); }
+  remoteWorkflow(operationIdValue) { return this.#request(`/remote-workflows/${operationId(operationIdValue)}`); }
+  executionGrant(grantId) { return this.#request(`/execution-grants/${resourceId(grantId)}`); }
+  revokeExecutionGrant(grantId, body, key) { return this.#request(`/execution-grants/${resourceId(grantId)}/revoke`, body, key); }
   experiment(experimentId) { return this.#request(`/experiments/${resourceId(experimentId)}`); }
   studies(projectId, page) { return this.#request(`/projects/${resourceId(projectId)}/studies?${pageQuery(page)}`); }
   study(studyId) { return this.#request(`/studies/${resourceId(studyId)}`); }
@@ -182,6 +228,13 @@ export class ControlConnection {
   createTask(projectId, body, key) { return this.#request(`/projects/${resourceId(projectId)}/tasks`, body, key); }
   createThread(body, key) { return this.#request('/interaction/threads', body, key); }
   sendMessage(body, key) { return this.#request('/interaction/messages', body, key); }
+  harnessSessionBinding(bindingId) {
+    return this.#request(`/interaction/harness-session-bindings/${resourceId(bindingId)}`);
+  }
+  enqueueHarnessDelivery(body, key) { return this.#request('/interaction/deliveries', body, key); }
+  cancelHarnessDelivery(deliveryId, body, key) {
+    return this.#request(`/interaction/deliveries/${resourceId(deliveryId)}/cancel`, body, key);
+  }
   resolveDecision(body, key) { return this.#request('/interaction/decisions/resolve', body, key); }
   approve(taskId, body, key) { return this.#request(`/tasks/${resourceId(taskId)}/approve`, body, key); }
   commandId() { return randomUUID(); }

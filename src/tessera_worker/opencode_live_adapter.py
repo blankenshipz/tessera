@@ -269,7 +269,13 @@ class LiveOpenCodeHarnessAdapter:
         return row[{"create": 10, "message": 11, "abort": 12}[boundary]]
 
     def deliver_context_only(
-        self, binding: TesseraBinding, delivery_id: str, message: str, context_digest: str
+        self,
+        binding: TesseraBinding,
+        delivery_id: str,
+        message: str,
+        context_digest: str,
+        *,
+        authority_is_current: Callable[[TesseraBinding, str], bool] | None = None,
     ) -> tuple[str, str]:
         """Deliver one already-claimed human message to its designated session.
 
@@ -305,7 +311,8 @@ class LiveOpenCodeHarnessAdapter:
             if existing[4] == "acknowledged":
                 return existing[5], existing[6]
             raise OpenCodeHarnessError("OpenCode delivery is uncertain; reconcile it.")
-        self._require_authority(binding, "message")
+        authority_check = authority_is_current or self._authority_is_current
+        self._require_authority(binding, "message", authority_check)
         self._connection.execute(
             """INSERT INTO message_deliveries
             (delivery_id,operation_id,session_id,context_digest,message_digest,binding_digest,outcome,upstream_message_id,readback_digest)
@@ -315,7 +322,7 @@ class LiveOpenCodeHarnessAdapter:
         self._connection.commit()
         try:
             self._client.verify_contract()
-            self._require_authority(binding, "message")
+            self._require_authority(binding, "message", authority_check)
             readback = self._client.send_context_only_message(binding.session_id, message, delivery_id)
             upstream_message_id = self._validate_context_readback(readback, binding.session_id, message)
             readback_digest = hashlib.sha256(
@@ -620,9 +627,14 @@ class LiveOpenCodeHarnessAdapter:
             QuarantinedEvent(reason, "untrusted", event.fingerprint(), cursor)
         )
 
-    def _require_authority(self, binding: TesseraBinding, action: str) -> None:
+    def _require_authority(
+        self,
+        binding: TesseraBinding,
+        action: str,
+        authority_is_current: Callable[[TesseraBinding, str], bool] | None = None,
+    ) -> None:
         try:
-            allowed = self._authority_is_current(binding, action)
+            allowed = (authority_is_current or self._authority_is_current)(binding, action)
         except Exception as error:
             raise AuthorityRejectedError("Authority check failed closed.") from error
         if allowed is not True:

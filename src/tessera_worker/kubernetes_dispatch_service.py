@@ -841,7 +841,6 @@ class KubernetesDispatchWorkerService:
             self._heartbeat()
             response = self._claim(target_digest)
             dispatch, package = self._package(response, target_digest)
-            self._arm_clock(dispatch, package)
             # Keep the exact control-issued execution descriptor private and
             # immutable before any injected Kubernetes create callback.
             hard_deadline = min(
@@ -871,6 +870,10 @@ class KubernetesDispatchWorkerService:
                     active_deadline_seconds=provider_deadline_seconds,
                 ),
             )
+            # Rollback handling must use the exact binding passed to submit.
+            # In particular, the provider deadline above may be narrower than
+            # the control package and is part of the adapter's durable intent.
+            self._arm_clock(dispatch, package)
             lease_deadline, outage_deadline = package.lease_expires_at, None
             provider_duration_available = remaining_seconds >= 1
         else:

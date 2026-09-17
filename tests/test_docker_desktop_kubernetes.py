@@ -1,6 +1,7 @@
 # ruff: noqa: E501
 from __future__ import annotations
 
+import gzip
 import hashlib
 import importlib.util
 import io
@@ -14,11 +15,13 @@ import pytest
 from tessera_worker.docker_desktop_kubernetes import (
     RESULT_BYTES,
     RESULT_PATH,
+    DockerDesktopKubernetesAdapter,
     ExactImage,
     LiveKubernetesError,
     _collector_manifest,
     _pvc_spec_sha256,
     _run,
+    _uncompressed_layer,
     _verify_bound_pvc,
     _verify_collector,
     _verify_oci_archive,
@@ -86,6 +89,16 @@ def test_oci_image_verification_can_use_the_node_canonical_repository(tmp_path: 
     )
 
     assert image.reference == f"docker.io/library/tessera-e2e-hello@{manifest}"
+
+
+def test_containerd_docker_save_gzip_layer_is_converted_to_oci_tar_bytes() -> None:
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as archive:
+        info = tarfile.TarInfo("hello")
+        info.size = 2
+        archive.addfile(info, io.BytesIO(b"ok"))
+
+    assert _uncompressed_layer(gzip.compress(payload.getvalue())) == payload.getvalue()
 
 
 def test_collector_is_read_only_digest_pinned_and_never_pulls() -> None:
@@ -209,3 +222,11 @@ def test_authenticated_dispatch_live_adapter_delegates_full_supervision_contract
     assert live_adapter.reconcile(package) == ("reconciled", package)
     assert live_adapter.cancel(package) == ("cancelled", package)
     assert live_adapter.cancellation_proof(package) == ("proof", package)
+
+
+def test_explicit_conformance_namespace_rejects_malformed_values() -> None:
+    adapter = object.__new__(DockerDesktopKubernetesAdapter)
+    image = ExactImage("example@sha256:" + "a" * 64, "sha256:" + "a" * 64, "config", "b" * 64)
+
+    with pytest.raises(LiveKubernetesError, match="namespace is malformed"):
+        adapter.run(image, "fixture", "foreign_namespace")

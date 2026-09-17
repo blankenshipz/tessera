@@ -1,11 +1,12 @@
 # Context-only OpenCode message delivery
 
-Schema 38 fences the empty, tenant-scoped message-delivery journal to its immutable
-operation, grant, and lease tuple. A human can
-enqueue one message only after the referenced admitted attempt, revision,
-operation epoch, project, worker, harness instance, and upstream session all
-match. The stable delivery ID and exact message/context digests are committed
-with the queued state before a worker can claim it.
+Schema 39 adds an empty, immutable, tenant-scoped operation-to-harness session
+binding. Only the assigned worker can create one after the operation, admitted
+attempt/revision, grant, lease, worker, epoch, and provider-disabled
+`opencode-v1.18.30-context-only` profile all match. A human enqueue names that
+binding, never a client-controlled worker, harness, session, operation, grant, or
+lease destination. The stable delivery ID and exact message/context digests are
+committed with the queued state before a worker can claim it.
 
 Only the designated worker-audience credential can claim, acknowledge, or
 report a delivery. Claim rechecks the active operation, grant, lease, worker,
@@ -39,3 +40,7 @@ only: no selected executable/build has been validated against a live OpenCode
 server, cluster, or provider. The upstream release/build identity, `/doc` API
 schema version/digest, adapter profile, and launcher instance binding are
 separate records; source inspection is not live compatibility evidence.
+
+Pre-v39 delivery rows have no session binding. They remain historically readable
+and cancellable, but claim and authorization fail closed rather than reconstructing
+their destination from old client-supplied fields.

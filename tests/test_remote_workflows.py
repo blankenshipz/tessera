@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -58,6 +59,7 @@ def test_remote_workflow_lifecycle_reuses_operation_identity_and_attempt_binding
     assert workflow[0]["operation_id"] == operation_id
     assert workflow[0]["experiment_attempt_id"] == response["admitted_attempt_id"]
     assert workflow[0]["state"] == "prepared"
+    assert workflow[0]["operation_desired_state"] == "admitted"
 
     heartbeat = {
         "lease_id": lease_id,
@@ -188,11 +190,28 @@ def test_remote_projection_uses_observed_time_not_cross_source_arrival_order(
     assert projected["state"] == projected["last_observed_state"] == "running"
     assert projected["last_observed_at"] == later_receipt["observed_at"].replace("+00:00", "Z")
     assert projected["reconciliation"]["cursor"].startswith("receipt:")
+    heartbeat = client.post(
+        f"/worker/remote-workflows/{operation_id}/heartbeat",
+        json={
+            "lease_id": lease_id,
+            "expected_epoch": epoch,
+            "observed_state": "unknown",
+        },
+        headers=_worker_headers("remote-raw-heartbeat"),
+    )
+    assert heartbeat.status_code == 201
+    assert heartbeat.json()["state"] == "running"
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT observed_state,observed_at FROM execution_observations WHERE operation_id=?",
             (operation_id,),
         ).fetchall() == [("unknown", delayed_worker["observed_at"].replace("+00:00", "Z"))]
+        event = connection.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type='remote_workflow.heartbeat_recorded' ORDER BY cursor DESC LIMIT 1"
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event[0])["observed_state"] == "unknown"
 
 
 def test_remote_projection_equal_time_contradiction_fails_closed_and_retains_samples(

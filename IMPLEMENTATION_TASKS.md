@@ -238,6 +238,15 @@ capability/evidence record; use this file to track remaining work.
 - Acceptance: full storage, unsafe paths, incomplete/corrupt output and interrupted
   transfer cannot produce a false complete manifest or lost accepted custody.
   Real target conformance evidence is distinct from userspace fixture accounting.
+- Focused conformance-harness safety evidence (2026-09-16, dirty tree): the
+  opt-in Astra Kubernetes quota probe now refuses public or symlinked evidence
+  parents and writes its target/resource evidence with directory-descriptor,
+  no-follow, exclusive, complete-write, and fsync handling. `.venv/bin/pytest -q
+  tests/test_astra_kubernetes_conformance_runner.py` passed 12 tests. The live
+  probe stopped at validation with `--kubeconfig must name an existing absolute
+  file`, before any Kubernetes or provider effect; no selected target was supplied
+  to this checkout. This is harness-hardening evidence, not storage quota,
+  artifact-custody, or remote-target acceptance.
 
 ### T14 — Expose remote progress and reconnect history [Medium; review F7]
 
@@ -349,3 +358,81 @@ requires it and the change has an explicit contract and acceptance criterion.
 | F6 — Incomplete remote deployment/runtime | T07–T13, T18 |
 | F7 — Missing remote-workflow desktop projection | T14 |
 | F8 — Capability/schema/backup documentation drift | T05 |
+| F9 — No deployment/setup or user-journey acceptance walkthrough | T07–T18 |
+
+## Astra checkpoint — deferred follow-up TODOs
+
+The Astra additions in the current dirty tree are provider-disabled or synthetic
+seams, not a remote deployment or an execution claim. The following statuses make
+the remaining review work explicit. “Addressed” means only that the named local
+repair has focused fake-client evidence; it is not remote, provider, Kubernetes,
+or scientific acceptance.
+
+- [x] **P0 — deployment-profile conformance slice:** Compose explicitly selects
+  the `dev` image target while the non-root `lab` target remains opt-in. The
+  single-active Kubernetes lab profile pairs namespace default-deny with
+  labelled-client ingress and egress on TCP/8765, and its health probes use the
+  configured trusted host. The opt-in restart fixture renders the shipped profile
+  into its new namespace where feasible, then checks durable backend identity,
+  idempotent project-command response, the one durable `project.created` event
+  cursor, and label-plus-UID-bounded cleanup. This is local/synthetic harness
+  coverage only; it does not establish NetworkPolicy enforcement, live Kubernetes
+  success, PostgreSQL, HA, scheduling, or provider behavior.
+- Focused evidence (2026-09-16, dirty working tree): `.venv/bin/pytest -q
+  tests/test_kubernetes_lab_deployment.py
+  tests/test_kubernetes_control_plane_restart_runner.py` passed 19 tests. The
+  opt-in Docker Desktop fixture was not run, so this is not a Kubernetes
+  conformance result.
+
+- [ ] **F1 — hard-expiry overrun:** status: addressed locally by T01, including
+  the wall-clock rollback repair. Re-record the scoped dispatch/execution evidence
+  at the next checkpoint and prove the selected target's expiry behavior only in
+  the separately authorized T18 fixture.
+- [ ] **F2 — stale registry heartbeat:** status: addressed locally by T03.
+  Exercise remote worker identity, heartbeat custody, and outage behavior in T10
+  and T18; do not infer those properties from the fake worker.
+- [ ] **F3 — escaped observation error:** status: addressed locally by T02.
+  Validate the selected cluster's read-error/reconciliation path in T18 without
+  creating a replacement operation.
+- [ ] **F4 — schema-43 integration failures:** status: addressed locally by T04
+  and the baseline gate in T06. Re-run migration/recovery gates on the selected
+  deployment packaging before it becomes an operational profile.
+- [ ] **F5 — ordinary coordinator consumer:** status: deferred. Implement the
+  independently hosted, scoped, durable Astra consumer in T09, including health,
+  bounded retry, restart recovery, and an honest unavailable state. The current
+  provider-disabled facade and fixture completions are not that consumer.
+- [ ] **F6 — remote deployment/runtime:** status: deferred. Select and document
+  the always-on control service, worker, credential custody, storage, and recovery
+  profile in T07–T13 before any remote claim. No desktop relay, local volume, or
+  interactive bearer-login dependency may remain.
+- [ ] **F7 — remote-workflow bridge:** status: deferred. Complete and verify the
+  typed preload/main/renderer `remoteWorkflows` bridge in T14 against a normal
+  backend consumer, including reconnect, freshness, checkpoint, and
+  cross-project fencing. Synthetic timeline reads do not establish resume.
+- [ ] **F8 — capability/schema/backup documentation drift:** status: locally
+  addressed by T05 but remains a documentation TODO for every newly enabled
+  profile. Update capability, custody, schema, and backup claims together with
+  its evidence; held restore must remain read-only unless a separate contract
+  changes it.
+- [ ] **F9 — end-to-end admission, execution, and evidence flow:** status:
+  deferred. Deliver T12, T13, and T15 as one readable flow from proposal through
+  explicit approval and separate execution admission to remote work, retained
+  measurements/evidence, and human conclusion. Keep proposal, approval, grant,
+  dispatch, custody, and scientific review distinct.
+
+### Required deferred acceptance walkthroughs
+
+- [ ] **Deployment/setup walkthrough:** write and exercise a selected-target
+  operator walkthrough for discovery, immutable plan review, explicit apply,
+  identity/status verification, bounded rollback/reconciliation, and evidence
+  retention. It must state prerequisites, credential custody, safe abort points,
+  and that setup neither admits work nor invokes a provider.
+- [ ] **User walkthrough 1 — proposal to evidence:** document a researcher using
+  the desktop to create the bounded proposal, approve scope, perform separate
+  execution admission, inspect retained remote evidence/negative outcomes, and
+  record a human conclusion without direct database or test-only completion calls.
+- [ ] **User walkthrough 2 — reconnect and stop:** document a researcher closing
+  the desktop or losing connection, reopening the same operation/history, making
+  a required decision, and distinguishing requested stop from confirmed
+  termination and unresolved exposure. T18 must supply the live acceptance
+  evidence before this is advertised as laptop-independent behavior.

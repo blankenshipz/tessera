@@ -293,6 +293,35 @@ def test_context_only_lost_ack_stays_uncertain_and_is_not_resent(tmp_path: Path)
         adapter.close()
 
 
+def test_context_only_authority_race_never_sends_upstream_message(tmp_path: Path) -> None:
+    with fixture() as upstream:
+        checks = 0
+
+        def authority(_binding: TesseraBinding, action: str) -> bool:
+            nonlocal checks
+            assert action == "message"
+            checks += 1
+            return checks == 1
+
+        adapter = LiveOpenCodeHarnessAdapter(
+            client(upstream),
+            tmp_path / "journal",
+            authority_is_current=lambda *_: True,
+            context_only_delivery=True,
+        )
+        bound = binding().__class__(**(binding().__dict__ | {"session_id": "session-1"}))
+        with pytest.raises(OpenCodeHarnessError, match="uncertain"):
+            adapter.deliver_context_only(
+                bound,
+                "delivery-race",
+                "Human context",
+                "a" * 64,
+                authority_is_current=authority,
+            )
+        assert checks == 2 and upstream.messages == []
+        adapter.close()
+
+
 @pytest.mark.parametrize(
     "readback",
     [

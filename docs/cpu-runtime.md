@@ -155,3 +155,8 @@ while Docker may still run. Restarted terminal journals use a fresh read-only
 provider observation where possible and never restart an operation. Run the synthetic local
 Docker proof with `scripts/check_development_e2e.py` when Docker and the pinned
 image are available. Linux quota/restart and Minikube evidence remain open.
+
+The separate [Minikube/OpenCode conformance contract](minikube-opencode-conformance.md)
+is pure worker-side dictionary/callback evidence only. It neither invokes
+Minikube nor changes this CPU runtime, Docker adapter, fake provider, control
+schema/API, enrollment, storage quota, dispatch, or pilot acceptance gates.

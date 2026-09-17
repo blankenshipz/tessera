@@ -259,8 +259,27 @@ class ArtifactStore(Store):
     ) -> int:
         if body["expected_epoch"] != lease["epoch"]:
             raise Conflict("Artifact epoch does not match the issued lease.")
-        if body["operation_id"] != self._expected_operation(lease["id"]):
-            raise Conflict("Artifact operation does not match the lease.")
+        # Once control has issued an operation, its durable identity supersedes
+        # the old local-CPU lease-derived value.  The latter remains only for a
+        # genuinely legacy CPU lease with no operation-intent record at all.
+        operation = connection.execute(
+            """SELECT o.*,p.org_id AS operation_project_org_id FROM external_operations o
+            JOIN projects p ON p.id=o.project_id WHERE o.lease_id=?""",
+            (lease["id"],),
+        ).fetchone()
+        if operation is None:
+            if body["operation_id"] != self._expected_operation(lease["id"]):
+                raise Conflict("Artifact operation does not match the legacy CPU lease.")
+        elif (
+            operation["org_id"] != operation["operation_project_org_id"]
+            or operation["project_id"] != grant["project_id"]
+            or operation["task_id"] != grant["task_id"]
+            or operation["grant_id"] != grant["id"]
+            or operation["worker_principal_id"] != lease["worker_principal_id"]
+            or operation["epoch"] != lease["epoch"]
+            or body["operation_id"] != operation["operation_id"]
+        ):
+            raise Conflict("Artifact operation does not match the control-issued lease operation.")
         _portable_path(body["relative_path"])
         plan, _ = self._plan(connection, grant)
         spec = plan["execution_spec"]

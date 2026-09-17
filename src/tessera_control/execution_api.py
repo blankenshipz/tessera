@@ -222,6 +222,17 @@ def register_worker(
     return result(store.register_worker(actor, project_id, key, canonical_digest(payload), payload))
 
 
+@router.get("/projects/{project_id}/workers")
+def list_worker_discovery(
+    project_id: str,
+    actor: Actor,
+    store: Workers,
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    return {"workers": store.list_discovery(actor, project_id, offset, limit)}
+
+
 @router.post("/workers/{worker_id}/drain")
 @router.post("/workers/{worker_id}/quarantine")
 @router.post("/workers/{worker_id}/retire")

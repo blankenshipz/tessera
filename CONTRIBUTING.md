@@ -84,7 +84,7 @@ On a provisioned Linux output-slot mount, the read-only inspection command is
 mount, write, or invoke Docker; a passing host inspection is not the required
 Docker byte/inode exhaustion or restart evidence for automatic collection.
 
-After installing the locked desktop dependencies, run
+For the opt-in native desktop fixture, after installing the locked dependencies, run
 `.venv/bin/python scripts/check_desktop_control.py` on a native graphical host
 for the synthetic desktop-to-control fixture. It starts a temporary loopback
 service and opens the sandboxed Electron application. A test-only file-picker
@@ -102,21 +102,55 @@ assessment, candidate selection, explicit finding acceptance, correction and
 downstream review through the UI. No real project or credential is used.
 
 The maintainer has paused PRs while the initial implementation takes shape.
-Use logical, tested commits on `main`; PRs can resume when requested.
+When commits are explicitly requested, use logical, tested commits on `main`;
+PRs can resume when requested. Commit and push each require explicit user
+authorization, subject to higher-priority policy; neither authorizes the other.
 
-1. Start from an up-to-date `main` and preserve unrelated local work.
-2. Keep one reviewable behavior change per commit. Reference the relevant design
-   section and add a decision note if changing a boundary or supported behavior.
-3. Add tests for the behavior and its failure cases. Use temporary directories
-   and synthetic data, not real tokens, research inputs, or external paid calls.
-4. Run the checks above. Update the README if runnable behavior or setup changes.
-5. Commit explicit paths and push completed changes to `main`.
-   State validation performed, limitations, and any migration or security impact.
-6. Check CI results and fix failures. Do not bypass required checks.
+1. Inspect the branch and existing edits; preserve unrelated local work. When
+   integrating on `main`, verify its baseline without silently switching or resetting.
+2. Keep one reviewable behavior change per task (and per authorized commit).
+   Reference the relevant design section and add a decision note if changing a
+   boundary or supported behavior.
+3. Add tests for the behavior and its failure cases. Default suites use temporary
+   directories and synthetic data, without real tokens, research inputs or paid calls.
+   Explicitly requested live/provider tests are separate opt-in harnesses: implement
+   them when asked and execute when requested, with bounded calls/tokens/time/retries.
+   Use existing authorized credentials via runtime references; never commit or print
+   secrets. Missing live prerequisites do not prevent independent harness work.
+4. Use the verification gates below. Update the README if runnable behavior or
+   setup changes.
+5. Leave changes uncommitted unless explicitly authorized to commit; then stage
+   only intended paths. Push only with separate explicit authorization. State
+   validation performed, limitations, and any migration or security impact.
+6. For an authorized push/PR, check CI results and fix in-scope failures. Report
+   unrelated failures to their owner; do not bypass required checks.
 
 If a PR is requested, use a feature branch and the repository PR template; merging
 still requires the maintainer's instruction. Repository rules/branch protections
 depend on the hosting plan and are not assumed configured.
+
+### Verification gates
+
+- **Task acceptance:** derive targeted tests and relevant lint/format checks from
+  the requested behavior; clarify only material ambiguity. Stop when those acceptance conditions pass; report broader
+  verification separately. For docs/instruction-only changes, check the scoped
+  diff, references, consistency and skill frontmatter/discovery where affected;
+  runtime tests are not required unless behavior or an explicit assignment warrants them.
+- **Integration acceptance:** the integrating implementer owns the full gate. For
+  multi-worker work, the parent owns it or explicitly assigns an integrator. Before
+  declaring integration ready, run `.venv/bin/ruff check .`,
+  `.venv/bin/ruff format --check .`, and `.venv/bin/pytest` (or the isolated Compose
+  test service). Record failures/unrun checks; targeted success is not full-suite
+  success. Before a full gate, check for concurrent work affecting the tested tree;
+  coordinate when possible and report observed changes as a validation limitation.
+  Reproduce unrelated failures boundedly and hand them to their owner,
+  rather than silently expanding the task.
+- **Opt-in fixtures:** Docker runtime, native graphical desktop, Kubernetes and
+  combined E2E fixtures are separate gates requiring explicit scope, prerequisites
+  and permission for their effects. Neither gate above implicitly authorizes them.
+  Existing user authorization satisfies this scope requirement; do not repeatedly
+  request it. Ask only for missing prerequisites or additional effects outside the
+  authorized scope. Keep synthetic, live operational and scientific evidence distinct.
 
 ## Engineering boundaries
 
@@ -127,7 +161,10 @@ proof of a completed experiment. Test stale revisions, duplicate commands,
 unauthorized access, and restart behavior when they touch your change.
 
 Avoid speculative adapters and abstractions. New infrastructure or billable
-providers need a separate proposal. Research runtime skills must never edit the
+providers outside the requested scope need a separate proposal. An explicit request
+to implement a live/provider test authorizes that implementation; a request to run
+it authorizes a bounded run within the stated scope, not unrelated provisioning,
+credit purchases, or top-up. Research runtime skills must never edit the
 platform, policy, or CI; repository-development skills have a different purpose.
 Kubernetes/Minikube bootstrap, target attachment, control-plane provisioning, and
 credential delivery are separate planned workflows: do not rely on the current
@@ -293,3 +330,27 @@ readback, or OpenCode compatibility result; see `docs/opencode-message-delivery.
 Schema 38 fences new OpenCode deliveries to their immutable operation, grant, and
 lease tuple. Existing v37 queued/delivered rows remain unclaimable rather than having
 that authority association inferred during migration.
+
+Schema 39 adds empty immutable operation-to-harness session bindings. A worker records
+one provider-disabled context-only destination for its admitted operation; migration
+does not infer bindings for legacy deliveries, which remain readable and cancellable
+but cannot be newly claimed or authorized.
+
+Schema 40 adds empty provider-disabled Astra conversation and coordinator records.
+Migration does not infer conversations, turns, selected context, proposals, approvals,
+grants, dispatches, or provider activity from v39 data.
+
+Schema 41 adds human proposal-to-design registrations. Migration adds no
+registration, experiment, approval, grant, dispatch, or execution authority to
+existing Astra proposals.
+
+Schema 42 adds empty provider-disabled Astra Explain-status discussions, scoped
+bindings, one-tool invocation records, and attributed answers. Migration does not
+reinterpret existing turns or create a tool call, answer, operation binding,
+execution lease, provider/model call, or authority.
+
+Schema 43 adds empty operation-bound remote workflow lifecycle records for new
+packages only: heartbeat, opaque checkpoint, and reconnect/outage metadata remain
+operational evidence fenced to the original worker/lease/operation. It does not
+infer a run for existing operations, make held restores writable, authorize a
+replacement submit, or establish provider termination or laptop independence.

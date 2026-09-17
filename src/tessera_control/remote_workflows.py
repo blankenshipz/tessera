@@ -157,6 +157,13 @@ class RemoteWorkflowStore(ExecutionStore):
         connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
     ) -> dict[str, Any]:
         value = dict(row)
+        operation = connection.execute(
+            "SELECT desired_state FROM external_operations WHERE operation_id=? AND org_id=?",
+            (value["operation_id"], value["org_id"]),
+        ).fetchone()
+        # This is a projection of the immutable operation intent, not a request to
+        # stop and never an assertion that a remote process has terminated.
+        value["operation_desired_state"] = operation["desired_state"] if operation else "unknown"
         reconciliation = current_operation_reconciliation(connection, value["operation_id"])
         value["reconciliation"] = reconciliation
         value["reconciliation_required"] = (
@@ -258,7 +265,11 @@ class RemoteWorkflowStore(ExecutionStore):
                 row["task_id"],
                 "remote_workflow.heartbeat_recorded",
                 row["epoch"],
-                {"operation_id": operation_id, "observed_state": state, "operational_only": True},
+                {
+                    "operation_id": operation_id,
+                    "observed_state": payload["observed_state"],
+                    "operational_only": True,
+                },
             )
             return 201, self._response(connection, updated)
 

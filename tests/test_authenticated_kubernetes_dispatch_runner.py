@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -46,3 +47,83 @@ def test_node_image_refuses_an_unnamed_or_missing_node_resident_reference(
     monkeypatch.setattr(runner_module, "_run", lambda _argv: Completed())
     with pytest.raises(runner_module.DispatchE2EUnavailable, match="node-resident"):
         runner_module._node_image("docker.io/library/tessera-e2e-hello@sha256:" + "b" * 64)
+
+
+def test_cli_classifies_passed_fixture_without_replacing_operational_state(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], runner_module
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "_main",
+        lambda _args: {"state": "cancel_requested", "cancellation": {"state": "unknown"}},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--run",
+            "--kubeconfig",
+            "/tmp/fixture-kubeconfig",
+            "--image",
+            "docker.io/library/tessera-e2e-hello@sha256:" + "a" * 64,
+        ],
+    )
+
+    assert runner_module.main() == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "cancellation": {"state": "unknown"},
+        "fixture_verdict": "passed",
+        "state": "cancel_requested",
+    }
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_verdict"),
+    [([], "skipped"), (["--run"], "failed")],
+)
+def test_cli_classifies_nonexecuted_fixture_outcomes_without_subprocesses(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    runner_module,
+    argv: list[str],
+    expected_verdict: str,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["runner", *argv])
+
+    assert runner_module.main() == 1
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["fixture_verdict"] == expected_verdict
+    assert result["state"] == "not_started"
+
+
+def test_cli_classifies_unavailable_fixture_without_subprocesses(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], runner_module
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "_main",
+        lambda _args: (_ for _ in ()).throw(runner_module.DispatchE2EUnavailable("image absent")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--run",
+            "--kubeconfig",
+            "/tmp/fixture-kubeconfig",
+            "--image",
+            "docker.io/library/tessera-e2e-hello@sha256:" + "a" * 64,
+        ],
+    )
+
+    assert runner_module.main() == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "fixture_verdict": "unavailable",
+        "message": "image absent",
+        "state": "unavailable",
+    }

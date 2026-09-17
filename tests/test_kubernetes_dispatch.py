@@ -793,6 +793,50 @@ def test_control_hard_expiry_and_delayed_start_narrow_local_and_provider_deadlin
     assert fake.creates == 1
 
 
+def test_first_start_rollback_cancels_the_submitted_narrowed_binding(tmp_path):
+    response, _worker, package = _admitted_package(
+        tmp_path, max_duration_seconds=300, grant_seconds=20
+    )
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    wall = [package.lease_issued_at + timedelta(seconds=5)]
+    monotonic = [100.0]
+    original_create = fake.create
+    submitted_deadlines = []
+
+    def create_then_rollback(manifest):
+        submitted_deadlines.append(manifest["spec"]["activeDeadlineSeconds"])
+        original_create(manifest)
+        wall[0] -= timedelta(seconds=5)
+        monotonic[0] += 1
+
+    fake.create = create_then_rollback
+    service = _service(tmp_path, client, dispatch, fake, cluster)
+    service.now = lambda: wall[0]
+    service.monotonic = lambda: monotonic[0]
+
+    result = service.run(max_cycles=1)
+
+    assert result["status"] == "cancel_requested"
+    assert result["cancellation"]["reason"] == "clock_rollback"
+    assert result["cancellation"]["job_uid"] == "job-fixture"
+    assert fake.creates == 1
+    assert submitted_deadlines == [
+        pytest.approx(package.binding.active_deadline_seconds - 5, abs=1)
+    ]
+    with sqlite3.connect(tmp_path / "worker" / "kubernetes.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT cancellation_requested,job_uid "
+            "FROM kubernetes_execution_bindings WHERE operation_id=?",
+            (package.operation_id,),
+        ).fetchone() == (1, "job-fixture")
+        assert connection.execute(
+            "SELECT cancellation_requested,job_uid FROM kubernetes_jobs WHERE operation_id=?",
+            (package.operation_id,),
+        ).fetchone() == (1, "job-fixture")
+
+
 def test_first_start_delayed_to_hard_expiry_never_creates_provider_job(tmp_path):
     response, _worker, package = _admitted_package(
         tmp_path, max_duration_seconds=300, grant_seconds=20

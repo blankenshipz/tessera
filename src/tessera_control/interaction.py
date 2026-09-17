@@ -12,12 +12,15 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .execution import ExecutionStore, _parse_utc
 from .interaction_models import (
     AcknowledgeHarnessDelivery,
+    AuthorizeHarnessDelivery,
     CancelHarnessDelivery,
     ClaimHarnessDelivery,
     CreateDecision,
     CreateMessage,
+    CreateOperationHarnessSessionBinding,
     CreateThread,
     EnqueueHarnessDelivery,
     ReportHarnessDelivery,
@@ -54,6 +57,7 @@ def create_interaction_schema(connection: sqlite3.Connection) -> None:
             operation_id TEXT NOT NULL REFERENCES external_operations(operation_id),
             grant_id TEXT NOT NULL REFERENCES execution_grants(id),
             lease_id TEXT NOT NULL REFERENCES execution_leases(id),
+            harness_session_binding_id TEXT REFERENCES operation_harness_session_bindings(id),
             admitted_attempt_id TEXT NOT NULL REFERENCES research_experiment_admitted_attempts(id),
             attempt_revision INTEGER NOT NULL, context_revision INTEGER NOT NULL,
             epoch INTEGER NOT NULL, worker_principal_id TEXT NOT NULL REFERENCES principals(id),
@@ -66,6 +70,34 @@ def create_interaction_schema(connection: sqlite3.Connection) -> None:
         )""",
         """CREATE INDEX IF NOT EXISTS interaction_message_deliveries_by_worker
         ON interaction_message_deliveries(worker_principal_id, state, created_at, id)""",
+        """CREATE TABLE IF NOT EXISTS operation_harness_session_bindings (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES organizations(id),
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES external_operations(operation_id),
+            admitted_attempt_id TEXT NOT NULL UNIQUE REFERENCES research_experiment_admitted_attempts(id),
+            attempt_revision INTEGER NOT NULL CHECK (attempt_revision >= 1),
+            grant_id TEXT NOT NULL UNIQUE REFERENCES execution_grants(id),
+            lease_id TEXT NOT NULL UNIQUE REFERENCES execution_leases(id),
+            worker_principal_id TEXT NOT NULL REFERENCES principals(id),
+            epoch INTEGER NOT NULL CHECK (epoch >= 1),
+            harness_instance_id TEXT NOT NULL,
+            upstream_session_id TEXT NOT NULL,
+            adapter_profile TEXT NOT NULL CHECK (adapter_profile = 'opencode-v1.18.30-context-only'),
+            provider_disabled INTEGER NOT NULL CHECK (provider_disabled = 1),
+            created_at TEXT NOT NULL,
+            created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
+            UNIQUE(worker_principal_id, harness_instance_id, upstream_session_id)
+        )""",
+        """CREATE INDEX IF NOT EXISTS operation_harness_session_bindings_by_project
+        ON operation_harness_session_bindings(project_id, created_at, id)""",
+        """CREATE TRIGGER IF NOT EXISTS operation_harness_session_bindings_no_update
+        BEFORE UPDATE ON operation_harness_session_bindings
+        BEGIN SELECT RAISE(ABORT, 'operation harness session bindings are immutable'); END""",
+        """CREATE TRIGGER IF NOT EXISTS operation_harness_session_bindings_no_delete
+        BEFORE DELETE ON operation_harness_session_bindings
+        BEGIN SELECT RAISE(ABORT, 'operation harness session bindings are immutable'); END""",
         """CREATE TABLE IF NOT EXISTS interaction_message_delivery_states (
             delivery_id TEXT NOT NULL REFERENCES interaction_message_deliveries(id),
             sequence INTEGER NOT NULL, state TEXT NOT NULL,
@@ -247,6 +279,7 @@ class InteractionStore:
         value = dict(row)
         return {
             "delivery_id": value["id"], "state": value["state"], "revision": value["revision"],
+            "harness_session_binding_id": value["harness_session_binding_id"],
             "operation_id": value["operation_id"], "grant_id": value["grant_id"], "lease_id": value["lease_id"],
             "admitted_attempt_id": value["admitted_attempt_id"],
             "attempt_revision": value["attempt_revision"], "context_revision": value["context_revision"],
@@ -255,6 +288,22 @@ class InteractionStore:
             "upstream_readback_digest": value["upstream_readback_digest"],
             "context_digest": value["context_digest"], "error_code": value["error_code"],
             "created_at": value["created_at"], "updated_at": value["updated_at"],
+        }
+
+    @staticmethod
+    def _binding_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        value = dict(row)
+        return {
+            "id": value["id"], "organization_id": value["org_id"], "project_id": value["project_id"],
+            "task_id": value["task_id"], "operation_id": value["operation_id"],
+            "admitted_attempt_id": value["admitted_attempt_id"], "attempt_revision": value["attempt_revision"],
+            "grant_id": value["grant_id"], "lease_id": value["lease_id"],
+            "worker_principal_id": value["worker_principal_id"], "epoch": value["epoch"],
+            "harness_instance_id": value["harness_instance_id"],
+            "upstream_session_id": value["upstream_session_id"],
+            "adapter_profile": value["adapter_profile"],
+            "provider_disabled": bool(value["provider_disabled"]), "created_at": value["created_at"],
+            "created_by_principal_id": value["created_by_principal_id"],
         }
 
     @staticmethod
@@ -282,6 +331,181 @@ class InteractionStore:
         delivery.update(state=state, revision=revision, updated_at=now, error_code=error_code)
         return delivery
 
+    def _require_current_harness_binding_authority(
+        self, conn: sqlite3.Connection, live: dict[str, Any], binding: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply the lease predicate, then fence every immutable session binding.
+
+        A queued message is not cached execution authority.  This deliberately
+        shares ``ExecutionStore._active_worker_grant`` with lease acquisition so
+        lifecycle, grant expiry, task basis, issuer, limits, and releases cannot
+        diverge at the OpenCode boundary.
+        """
+        if (
+            binding["adapter_profile"] != "opencode-v1.18.30-context-only"
+            or binding["provider_disabled"] != 1
+            or binding["worker_principal_id"] != live["id"]
+        ):
+            raise Conflict("Harness session binding authority is no longer current.")
+        grant = ExecutionStore(self.store.database_path.parent)._active_worker_grant(
+            conn, live, binding["grant_id"]
+        )
+        lease = conn.execute(
+            "SELECT * FROM execution_leases WHERE id=?", (binding["lease_id"],)
+        ).fetchone()
+        operation = conn.execute(
+            "SELECT * FROM external_operations WHERE operation_id=?", (binding["operation_id"],)
+        ).fetchone()
+        attempt = conn.execute(
+            """SELECT a.revision,a.operation_id,a.grant_id,e.project_id FROM
+            research_experiment_admitted_attempts a
+            JOIN research_experiments e ON e.id=a.experiment_id WHERE a.id=?""",
+            (binding["admitted_attempt_id"],),
+        ).fetchone()
+        if lease is None or operation is None or attempt is None:
+            raise Conflict("Harness session binding authority is no longer current.")
+        try:
+            lease_expired = _parse_utc(lease["expires_at"]) <= ExecutionStore._now()
+        except ValueError as error:
+            raise Conflict("Harness session binding lease expiry is invalid.") from error
+        if (
+            lease_expired
+            or grant["id"] != binding["grant_id"]
+            or grant["project_id"] != binding["project_id"]
+            or grant["task_id"] != binding["task_id"]
+            or grant["worker_principal_id"] != live["id"]
+            or grant["epoch"] != binding["epoch"]
+            or lease["grant_id"] != grant["id"]
+            or lease["worker_principal_id"] != live["id"]
+            or lease["epoch"] != binding["epoch"]
+            or operation["org_id"] != live["org_id"]
+            or operation["project_id"] != binding["project_id"]
+            or operation["task_id"] != binding["task_id"]
+            or operation["grant_id"] != grant["id"]
+            or operation["lease_id"] != lease["id"]
+            or operation["worker_principal_id"] != live["id"]
+            or operation["epoch"] != binding["epoch"]
+            or operation["desired_state"] != "admitted"
+            or attempt["revision"] != binding["attempt_revision"]
+            or attempt["operation_id"] != operation["operation_id"]
+            or attempt["grant_id"] != grant["id"]
+            or attempt["project_id"] != binding["project_id"]
+        ):
+            raise Conflict("Harness session binding authority is no longer current.")
+        return dict(operation)
+
+    def _require_current_harness_delivery_authority(
+        self, conn: sqlite3.Connection, live: dict[str, Any], delivery: dict[str, Any]
+    ) -> dict[str, Any]:
+        binding_id = delivery.get("harness_session_binding_id")
+        if not isinstance(binding_id, str) or not binding_id:
+            raise Conflict("Harness delivery has no session binding authority.")
+        row = conn.execute(
+            "SELECT * FROM operation_harness_session_bindings WHERE id=? AND org_id=?",
+            (binding_id, live["org_id"]),
+        ).fetchone()
+        if row is None:
+            raise Conflict("Harness delivery session binding is no longer current.")
+        binding = dict(row)
+        fields = (
+            "project_id", "task_id", "operation_id", "grant_id", "lease_id",
+            "admitted_attempt_id", "attempt_revision", "epoch", "worker_principal_id",
+            "harness_instance_id", "upstream_session_id",
+        )
+        if any(delivery[field] != binding[field] for field in fields):
+            raise Conflict("Harness delivery does not match its session binding.")
+        return self._require_current_harness_binding_authority(conn, live, binding)
+
+    @staticmethod
+    def _binding_worker(conn: sqlite3.Connection, binding: dict[str, Any]) -> dict[str, Any]:
+        row = conn.execute(
+            """SELECT p.id,p.org_id,p.role,c.id AS credential_id,c.kind,c.audience,c.project_id,
+            c.expires_at,c.revoked_at,c.parent_id FROM principals p JOIN credentials c
+            ON c.principal_id=p.id WHERE p.id=? AND p.org_id=? AND p.revoked_at IS NULL""",
+            (binding["worker_principal_id"], binding["org_id"]),
+        ).fetchone()
+        return Store._credential_principal(conn, row, "worker")
+
+    def create_harness_session_binding(self, actor, key, **payload):
+        body = CreateOperationHarnessSessionBinding(**payload)
+        payload = body.model_dump(mode="json")
+
+        def command(conn, live):
+            operation = conn.execute(
+                "SELECT * FROM external_operations WHERE operation_id=? AND org_id=? AND worker_principal_id=?",
+                (body.operation_id, live["org_id"], live["id"]),
+            ).fetchone()
+            if operation is None:
+                raise NotFound("External operation was not found.")
+            attempt = conn.execute(
+                """SELECT a.id,a.revision,a.operation_id,a.grant_id,e.project_id FROM
+                research_experiment_admitted_attempts a JOIN research_experiments e ON e.id=a.experiment_id
+                WHERE a.operation_id=? AND a.grant_id=?""",
+                (body.operation_id, operation["grant_id"]),
+            ).fetchone()
+            if attempt is None:
+                raise Conflict("External operation has no admitted attempt binding.")
+            row = {
+                "id": "harness_binding_" + uuid.uuid4().hex, "org_id": live["org_id"],
+                "project_id": operation["project_id"], "task_id": operation["task_id"],
+                "operation_id": operation["operation_id"], "admitted_attempt_id": attempt["id"],
+                "attempt_revision": attempt["revision"], "grant_id": operation["grant_id"],
+                "lease_id": operation["lease_id"], "worker_principal_id": live["id"],
+                "epoch": operation["epoch"], "harness_instance_id": body.harness_instance_id,
+                "upstream_session_id": body.upstream_session_id, "adapter_profile": body.adapter_profile,
+                "provider_disabled": 1, "created_at": utc_now(), "created_by_principal_id": live["id"],
+            }
+            existing = conn.execute(
+                "SELECT * FROM operation_harness_session_bindings WHERE operation_id=?", (body.operation_id,)
+            ).fetchone()
+            if existing is not None:
+                immutable = (
+                    "org_id", "project_id", "task_id", "operation_id", "admitted_attempt_id",
+                    "attempt_revision", "grant_id", "lease_id", "worker_principal_id", "epoch",
+                    "harness_instance_id", "upstream_session_id", "adapter_profile", "provider_disabled",
+                )
+                if all(existing[field] == row[field] for field in immutable):
+                    return 200, self._binding_response(existing)
+                raise Conflict("Operation harness session binding conflicts with its immutable identity.")
+            self._require_current_harness_binding_authority(conn, live, row)
+            conn.execute(
+                """INSERT INTO operation_harness_session_bindings
+                (id,org_id,project_id,task_id,operation_id,admitted_attempt_id,attempt_revision,grant_id,
+                 lease_id,worker_principal_id,epoch,harness_instance_id,upstream_session_id,adapter_profile,
+                 provider_disabled,created_at,created_by_principal_id)
+                VALUES (:id,:org_id,:project_id,:task_id,:operation_id,:admitted_attempt_id,:attempt_revision,
+                 :grant_id,:lease_id,:worker_principal_id,:epoch,:harness_instance_id,:upstream_session_id,
+                 :adapter_profile,:provider_disabled,:created_at,:created_by_principal_id)""",
+                row,
+            )
+            self.store._event(
+                conn, live, row["project_id"], row["task_id"], "operation_harness_session_bound",
+                row["epoch"], {"binding_id": row["id"], "operation_id": row["operation_id"],
+                "adapter_profile": row["adapter_profile"], "provider_disabled": True},
+            )
+            return 201, self._binding_response(row)
+
+        return self._mutate(
+            actor, key, "POST", "/worker/operation-harness-session-bindings", _digest(payload), command,
+            audience="worker",
+        )
+
+    def get_harness_session_binding(self, actor, binding_id):
+        conn = _connect(self.store.database_path)
+        try:
+            live = self.store._live_principal(conn, actor)
+            row = conn.execute(
+                "SELECT * FROM operation_harness_session_bindings WHERE id=? AND org_id=?",
+                (binding_id, live["org_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Operation harness session binding was not found.")
+            binding = dict(row)
+            self.store._project(conn, live, binding["project_id"])
+            return self._binding_response(binding)
+        finally:
+            conn.close()
+
     def enqueue_harness_delivery(self, actor, key, **payload):
         body = EnqueueHarnessDelivery(**payload)
         payload = body.model_dump(mode="json")
@@ -289,36 +513,19 @@ class InteractionStore:
         def command(conn, live):
             self._require_human(live)
             thread = self._thread(conn, live, body.thread_id)
-            attempt_row = conn.execute(
-                """SELECT a.*,e.project_id FROM research_experiment_admitted_attempts a
-                JOIN research_experiments e ON e.id=a.experiment_id
-                WHERE a.id=? AND e.project_id=?""",
-                (body.admitted_attempt_id, thread["project_id"]),
+            binding_row = conn.execute(
+                """SELECT * FROM operation_harness_session_bindings
+                WHERE id=? AND org_id=? AND project_id=?""",
+                (body.harness_session_binding_id, live["org_id"], thread["project_id"]),
             ).fetchone()
-            if attempt_row is None or attempt_row["revision"] != body.expected_attempt_revision:
-                raise Conflict("Admitted attempt is missing or its revision is stale.")
-            attempt = dict(attempt_row)
-            operation = conn.execute(
-                "SELECT * FROM external_operations WHERE operation_id=?", (attempt["operation_id"],)
-            ).fetchone()
-            if (
-                operation is None or operation["epoch"] != body.expected_epoch
-                or operation["worker_principal_id"] != body.worker_principal_id
-                or operation["desired_state"] != "admitted" or operation["grant_id"] != attempt["grant_id"]
-            ):
-                raise Conflict("Admitted attempt has no current worker/epoch delivery authority.")
+            if binding_row is None:
+                raise NotFound("Operation harness session binding was not found.")
+            binding = dict(binding_row)
+            worker = self._binding_worker(conn, binding)
+            operation = self._require_current_harness_binding_authority(conn, worker, binding)
             task_id = operation["task_id"]
             if thread["task_id"] is not None and thread["task_id"] != task_id:
-                raise Conflict("Thread task does not match the admitted attempt.")
-            worker = conn.execute(
-                """SELECT p.id FROM principals p JOIN credentials c ON c.principal_id=p.id
-                WHERE p.id=? AND p.org_id=? AND p.revoked_at IS NULL AND c.kind='worker'
-                AND c.audience='worker' AND c.revoked_at IS NULL
-                AND (c.project_id IS NULL OR c.project_id=?)""",
-                (body.worker_principal_id, live["org_id"], thread["project_id"]),
-            ).fetchone()
-            if worker is None:
-                raise NotFound("Designated worker was not found.")
+                raise Conflict("Thread task does not match the operation harness session binding.")
             if body.reply_to is not None:
                 reply = conn.execute("SELECT thread_id FROM interaction_messages WHERE id=?", (body.reply_to,)).fetchone()
                 if reply is None or reply["thread_id"] != body.thread_id:
@@ -329,26 +536,31 @@ class InteractionStore:
                 "message_digest": message_digest, "organization_id": live["org_id"],
                 "project_id": thread["project_id"], "task_id": task_id,
                 "operation_id": operation["operation_id"], "grant_id": operation["grant_id"],
-                "lease_id": operation["lease_id"], "worker_principal_id": body.worker_principal_id,
-                "admitted_attempt_id": body.admitted_attempt_id,
-                "attempt_revision": body.expected_attempt_revision, "context_revision": body.context_revision,
-                "epoch": body.expected_epoch, "harness_instance_id": body.harness_instance_id,
-                "upstream_session_id": body.upstream_session_id,
+                "lease_id": operation["lease_id"], "worker_principal_id": binding["worker_principal_id"],
+                "admitted_attempt_id": binding["admitted_attempt_id"],
+                "attempt_revision": binding["attempt_revision"], "context_revision": body.context_revision,
+                "epoch": binding["epoch"], "harness_instance_id": binding["harness_instance_id"],
+                "upstream_session_id": binding["upstream_session_id"],
             })
             conn.execute("INSERT INTO interaction_messages VALUES (?,?,?,?,?,?,?)", (message_id, body.thread_id, live["id"], body.intent, body.body, body.reply_to, now))
             row = {
                 "id": delivery_id, "message_id": message_id, "org_id": live["org_id"], "project_id": thread["project_id"], "task_id": task_id,
                 "operation_id": operation["operation_id"], "grant_id": operation["grant_id"], "lease_id": operation["lease_id"],
-                "admitted_attempt_id": body.admitted_attempt_id, "attempt_revision": body.expected_attempt_revision,
-                "context_revision": body.context_revision, "epoch": body.expected_epoch, "worker_principal_id": body.worker_principal_id,
-                "harness_instance_id": body.harness_instance_id, "upstream_session_id": body.upstream_session_id,
+                "harness_session_binding_id": binding["id"], "admitted_attempt_id": binding["admitted_attempt_id"], "attempt_revision": binding["attempt_revision"],
+                "context_revision": body.context_revision, "epoch": binding["epoch"], "worker_principal_id": binding["worker_principal_id"],
+                "harness_instance_id": binding["harness_instance_id"], "upstream_session_id": binding["upstream_session_id"],
                 "message_digest": message_digest, "context_digest": context_digest, "state": "queued", "claimed_by_principal_id": None,
                 "upstream_message_id": None, "upstream_readback_digest": None, "error_code": None, "revision": 1, "created_at": now, "updated_at": now,
             }
-            conn.execute("""INSERT INTO interaction_message_deliveries VALUES
-            (:id,:message_id,:org_id,:project_id,:task_id,:operation_id,:grant_id,:lease_id,:admitted_attempt_id,:attempt_revision,:context_revision,:epoch,:worker_principal_id,:harness_instance_id,:upstream_session_id,:message_digest,:context_digest,:state,:claimed_by_principal_id,:upstream_message_id,:upstream_readback_digest,:error_code,:revision,:created_at,:updated_at)""", row)
+            conn.execute("""INSERT INTO interaction_message_deliveries
+            (id,message_id,org_id,project_id,task_id,operation_id,grant_id,lease_id,harness_session_binding_id,
+             admitted_attempt_id,attempt_revision,context_revision,epoch,worker_principal_id,
+             harness_instance_id,upstream_session_id,message_digest,context_digest,state,
+             claimed_by_principal_id,upstream_message_id,upstream_readback_digest,error_code,
+             revision,created_at,updated_at) VALUES
+            (:id,:message_id,:org_id,:project_id,:task_id,:operation_id,:grant_id,:lease_id,:harness_session_binding_id,:admitted_attempt_id,:attempt_revision,:context_revision,:epoch,:worker_principal_id,:harness_instance_id,:upstream_session_id,:message_digest,:context_digest,:state,:claimed_by_principal_id,:upstream_message_id,:upstream_readback_digest,:error_code,:revision,:created_at,:updated_at)""", row)
             conn.execute("INSERT INTO interaction_message_delivery_states VALUES (?,?,?,?,?,?,?)", (delivery_id, 1, "queued", context_digest, live["id"], None, now))
-            self.store._event(conn, live, thread["project_id"], task_id, "interaction_message_delivery_queued", body.context_revision, {"delivery_id": delivery_id, "context_digest": context_digest, "harness_instance_id": body.harness_instance_id})
+            self.store._event(conn, live, thread["project_id"], task_id, "interaction_message_delivery_queued", body.context_revision, {"delivery_id": delivery_id, "context_digest": context_digest, "harness_session_binding_id": binding["id"]})
             return 201, {"id": message_id, "thread_id": body.thread_id, "intent": body.intent, "body": body.body, "reply_to": body.reply_to, "sender_principal_id": live["id"], "created_at": now, "delivery": self._delivery_response(row)}
         return self._mutate(actor, key, "POST", "/interaction/deliveries", _digest(payload), command)
 
@@ -361,22 +573,9 @@ class InteractionStore:
             delivery = dict(row)
             if delivery["epoch"] != body.expected_epoch or delivery["state"] in {"cancelled", "acknowledged", "uncertain", "failed"}:
                 raise Conflict("Harness delivery is no longer claimable.")
-            attempt = conn.execute("SELECT revision,operation_id,grant_id FROM research_experiment_admitted_attempts WHERE id=?", (delivery["admitted_attempt_id"],)).fetchone()
-            operation = conn.execute(
-                """SELECT o.operation_id,o.desired_state,o.epoch,o.worker_principal_id,o.grant_id,o.lease_id,
-                g.project_id,g.task_id,g.status,l.grant_id AS lease_grant_id,l.worker_principal_id AS lease_worker,l.epoch AS lease_epoch
-                FROM external_operations o JOIN execution_grants g ON g.id=o.grant_id
-                JOIN execution_leases l ON l.id=o.lease_id WHERE o.operation_id=?""", (delivery["operation_id"],)
-            ).fetchone()
-            if (attempt is None or attempt["revision"] != delivery["attempt_revision"] or operation is None
-                or operation["operation_id"] != attempt["operation_id"] or operation["grant_id"] != attempt["grant_id"]
-                or operation["grant_id"] != delivery["grant_id"] or operation["lease_id"] != delivery["lease_id"]
-                or operation["desired_state"] != "admitted" or operation["epoch"] != delivery["epoch"]
-                or operation["worker_principal_id"] != live["id"] or operation["lease_grant_id"] != operation["grant_id"]
-                or operation["lease_worker"] != live["id"] or operation["lease_epoch"] != delivery["epoch"]
-                or operation["status"] != "active" or operation["project_id"] != delivery["project_id"]
-                or operation["task_id"] != delivery["task_id"]):
-                raise Conflict("Harness delivery authority is no longer current.")
+            operation = self._require_current_harness_delivery_authority(conn, live, delivery)
+            if delivery["state"] == "delivered" and delivery["claimed_by_principal_id"] != live["id"]:
+                raise Conflict("Harness delivery claim binding is no longer current.")
             if delivery["state"] == "queued":
                 delivery = self._append_delivery_state(conn, delivery, "delivered", live)
                 self.store._event(conn, live, delivery["project_id"], delivery["task_id"], "interaction_message_delivery_delivered", delivery["context_revision"], {"delivery_id": delivery_id, "context_digest": delivery["context_digest"]})
@@ -390,6 +589,45 @@ class InteractionStore:
                 raise Conflict("Harness delivery replay no longer names its original delivery.")
 
         return self._mutate(actor, key, "POST", f"/worker/interaction-deliveries/{delivery_id}/claim", _digest(body.model_dump(mode="json")), command, audience="worker", replay_guard=replay_guard)
+
+    def authorize_harness_delivery(self, actor, key, delivery_id, **payload):
+        """Recheck live authority without returning the context body to the worker."""
+        body = AuthorizeHarnessDelivery(**payload)
+
+        def command(conn, live):
+            row = conn.execute(
+                "SELECT * FROM interaction_message_deliveries WHERE id=? AND org_id=?",
+                (delivery_id, live["org_id"]),
+            ).fetchone()
+            if row is None or row["worker_principal_id"] != live["id"]:
+                raise NotFound("Harness delivery was not found.")
+            delivery = dict(row)
+            if (
+                delivery["state"] != "delivered"
+                or delivery["claimed_by_principal_id"] != live["id"]
+                or delivery["revision"] != body.expected_revision
+                or delivery["epoch"] != body.expected_epoch
+                or delivery["context_digest"] != body.context_digest
+            ):
+                raise Conflict("Harness delivery is no longer authorized.")
+            self._require_current_harness_delivery_authority(conn, live, delivery)
+            return 200, {"authorized": True}
+
+        def replay_guard(conn, live, response):
+            if response != {"authorized": True}:
+                raise Conflict("Cached harness delivery authority response is invalid.")
+            command(conn, live)
+
+        return self._mutate(
+            actor,
+            key,
+            "POST",
+            f"/worker/interaction-deliveries/{delivery_id}/authorize",
+            _digest(body.model_dump(mode="json")),
+            command,
+            audience="worker",
+            replay_guard=replay_guard,
+        )
 
     def acknowledge_harness_delivery(self, actor, key, delivery_id, **payload):
         body = AcknowledgeHarnessDelivery(**payload)

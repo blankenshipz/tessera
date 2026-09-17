@@ -21,6 +21,22 @@ it does not issue a grant, start an experiment, or spend funds. Credential files
 main-process memory; saved encrypted sessions and organization login are later
 work. Closing the desktop does not stop the backend.
 
+The coordinator workbench projects provider-disabled Astra conversation messages,
+non-authoritative local coordinator proposals, human decision receipts, execution
+milestones, and the selected experiment's evidence links and conclusion cards as
+typed records. Conversation and Labbook filter that one projection rather than
+copying history; Labbook includes the selected experiment's revision-bound evidence
+and conclusion cards. Conversation messages, proposals, and explain-status turns
+page independently, so a long category cannot hide records from another one. A
+new experiment selection immediately removes the prior projection while its
+complete ledger loads. Proposal cards show the complete structured candidate
+(goal, criterion, protocol, variants, digests, metadata, and execution references)
+before the separate human registration action. Its composer has explicit Discuss, Draft experiment, Explain
+status, and Review results modes; selected task/experiment revision chips are sent
+only when the human requests a turn. A turn neither approves nor executes work.
+The renderer does not show or ask for raw harness/session identifiers, and stale,
+offline, or held state disables its command controls.
+
 The research-ledger panel can create a study with purpose, protocol and mode,
 then register variants with method/input digests and explicit metadata. These are
 attributed records; they do not launch work or prove that the supplied digests
@@ -98,21 +114,26 @@ are dependency-free; Electron installation is required to launch the interface.
 Locked dependency installation and the native Electron smoke now pass. Run:
 
 ```sh
-env -u ELECTRON_RUN_AS_NODE desktop/node_modules/.bin/electron desktop/test/electron-smoke.cjs
+env -u ELECTRON_RUN_AS_NODE node desktop/test/electron-smoke.cjs
 ```
 
 Run this from the repository root in a desktop-capable environment. The smoke
-uses temporary application state, checks the real application URL and renderer
-bridge, rejects disabled sandbox settings, and reports renderer errors. It does
-not connect to a control plane or establish visual, signed-package, or full
-desktop E2E acceptance.
+launches the normal `electron .` package entrypoint with temporary application
+state. It checks a visible, non-minimized native window, the real application
+URL, renderer errors, and a harmless renderer-to-main `status` IPC round trip.
+It confirms Electron exits before reporting success and does not connect to a
+control plane. It does not establish visual, signed-package, or full desktop
+E2E acceptance.
 
 `.venv/bin/python scripts/check_desktop_control.py` additionally passes a live
 synthetic decision through the actual sandboxed renderer, IPC and loopback control
 API. It uses temporary control and application state, with a test-only native
 file-picker stub selecting the fixture credential. The fixture verifies human
 attribution and absence of execution grants or leases. It also displays all 80
-synthetic registered variants and source-correction history. It also creates a new
+synthetic registered variants and source-correction history. It selects a complete
+provider-disabled goal-to-decision history, verifies historical/current design and
+inconclusive-outcome labels, disconnects and reconnects, and confirms the same
+read-only history returns without a control-plane mutation. It also creates a new
 study and registers two variants through the UI, records failed/abandoned
 outcomes, closes the accounted study, and checks the stored attribution and
 metadata. The fixture also verifies unsupported-citation blocking, explicit

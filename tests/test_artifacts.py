@@ -132,6 +132,26 @@ def test_upload_is_quarantined_and_replay_is_metadata_only(tmp_path: Path) -> No
         )
 
 
+def test_genuinely_legacy_cpu_lease_accepts_only_its_derived_operation(tmp_path: Path) -> None:
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    store = ArtifactStore(state)
+    payload = _payload(lease)
+
+    status, artifact = store.upload_artifact(
+        worker, lease["id"], "legacy-cpu", canonical_digest(payload), payload
+    )
+
+    assert status == 201
+    assert artifact["operation_id"] == payload["operation_id"]
+    with _connect(state / "tessera.sqlite3") as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM external_operations WHERE lease_id=?", (lease["id"],)
+            ).fetchone()[0]
+            == 0
+        )
+
+
 @pytest.mark.parametrize(
     "change",
     [

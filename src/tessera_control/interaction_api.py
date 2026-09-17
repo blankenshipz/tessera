@@ -9,10 +9,12 @@ from .api import idempotency_key, principal, worker_principal
 from .interaction import InteractionStore
 from .interaction_models import (
     AcknowledgeHarnessDelivery,
+    AuthorizeHarnessDelivery,
     CancelHarnessDelivery,
     ClaimHarnessDelivery,
     CreateDecision,
     CreateMessage,
+    CreateOperationHarnessSessionBinding,
     CreateThread,
     EnqueueHarnessDelivery,
     ReportHarnessDelivery,
@@ -56,6 +58,11 @@ def enqueue_delivery(
     return response(store.enqueue_harness_delivery(actor, key, **body.model_dump(mode="json")))
 
 
+@router.get("/harness-session-bindings/{binding_id}")
+def get_harness_session_binding(binding_id: str, actor: Actor, store: Records) -> dict[str, Any]:
+    return store.get_harness_session_binding(actor, binding_id)
+
+
 @router.post("/deliveries/{delivery_id}/cancel")
 def cancel_delivery(
     delivery_id: str, body: CancelHarnessDelivery, actor: Actor, key: Key, store: Records
@@ -78,6 +85,18 @@ def claim_delivery(
     )
 
 
+@worker_router.post("/operation-harness-session-bindings")
+def create_harness_session_binding(
+    body: CreateOperationHarnessSessionBinding,
+    worker: Annotated[dict[str, Any], Depends(worker_principal)],
+    key: Key,
+    store: Records,
+) -> JSONResponse:
+    return response(
+        store.create_harness_session_binding(worker, key, **body.model_dump(mode="json"))
+    )
+
+
 @worker_router.post("/interaction-deliveries/{delivery_id}/ack")
 def acknowledge_delivery(
     delivery_id: str,
@@ -88,6 +107,19 @@ def acknowledge_delivery(
 ) -> JSONResponse:
     return response(
         store.acknowledge_harness_delivery(worker, key, delivery_id, **body.model_dump(mode="json"))
+    )
+
+
+@worker_router.post("/interaction-deliveries/{delivery_id}/authorize")
+def authorize_delivery(
+    delivery_id: str,
+    body: AuthorizeHarnessDelivery,
+    worker: Annotated[dict[str, Any], Depends(worker_principal)],
+    key: Key,
+    store: Records,
+) -> JSONResponse:
+    return response(
+        store.authorize_harness_delivery(worker, key, delivery_id, **body.model_dump(mode="json"))
     )
 
 

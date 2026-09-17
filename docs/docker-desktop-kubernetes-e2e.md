@@ -102,3 +102,10 @@ normal control authority but remains a narrow, provider-disabled development
 conformance fixture: it does not enable a supported Kubernetes target,
 provider/model execution, artifact release, result acceptance, or pilot
 completion. Both runners retain every created resource for manual inspection.
+
+Pass `--namespace EXISTING_RETAINED_NAMESPACE` only to use an explicitly named,
+already-existing retained namespace (for example one prepared by Astra operator
+setup). The runner verifies that namespace's UID and creates only its fixed
+Job/PVC/collector names there; it never creates or deletes the supplied
+namespace. Its `deny-all` policy and `outputs` PVC remain separate from Astra
+setup resources.

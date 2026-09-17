@@ -25,12 +25,16 @@ const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolv
 function fixture(overrides = {}) {
   const nodes = new Map();
   const get = id => { if (!nodes.has(id)) nodes.set(id, Object.assign(new Element(), { id })); return nodes.get(id); };
-  const api = { status: async () => ({ id: 'connection' }), commandId: async () => 'command',
-    tasks: async () => ({ tasks: [] }), taskPlan: async () => null, labbook: async () => ({ events: [] }),
+  const api = { status: async () => ({ id: 'connection', name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health: 'online' }), commandId: async () => 'command',
+    tasks: async () => ({ tasks: [] }), workers: async () => ({ workers: [] }), taskPlan: async () => null, labbook: async () => ({ events: [] }),
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
+    harnessSessionBinding: async () => null, enqueueHarnessDelivery: async () => ({ id: 'message' }), cancelHarnessDelivery: async () => ({}),
+    astraConversation: async () => ({ conversation: null, messages: [] }), astraProposals: async () => ({ proposals: [] }),
+    explainStatusTurns: async () => ({ turns: [] }), requestCoordinatorTurn: async () => ({}), requestExplainStatusTurn: async () => ({}),
+    registerProposalDesign: async () => ({ execution_authorized: false }),
     studySelection: async () => {},
     recovery: async () => ({ state: 'active', recovery_hold: false }),
-    decisions: async () => ({ decisions: [] }), experiments: async () => ({ experiments: [] }), studies: async () => ({ studies: [] }),
+    decisions: async () => ({ decisions: [] }), experiments: async () => ({ experiments: [] }), remoteWorkflows: async () => ({ remote_workflows: [] }), remoteWorkflow: async () => null, executionGrant: async () => ({ id: 'grant_1', revision: 1, status: 'active' }), revokeExecutionGrant: async () => ({}), studies: async () => ({ studies: [] }),
     createStudy: async () => ({ id: 's-created', purpose: 'Created', protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1, project_id: 'p1' }),
     registerVariant: async () => ({ id: 'v-created' }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
@@ -39,11 +43,24 @@ function fixture(overrides = {}) {
     FormData: class { constructor(form) { this.fields = { ...form.fields }; } get(name) { return this.fields[name]; } },
   });
   const source = readFileSync(new URL('../renderer.mjs', import.meta.url), 'utf8');
-  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadExperiments, selectExperiment, loadStudies, selectStudy, loadEvents, clearContext, state: () => ({ activeProject, activeThread, activeExperiment, activeStudy }) };', context);
+  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, applyConnectionHealth, guarded, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadExperiments, selectExperiment, loadRemoteWorkflows, loadStudies, selectStudy, loadEvents, loadWorkbench, renderWorkbenchEntries, clearContext, state: () => ({ activeProject, activeThread, activeExperiment, activeStudy, activeHarnessBinding, coordinatorConversationRevision, selectedCoordinatorContext: [...selectedCoordinatorContext] }) };', context);
   return { ...context.hooks, get, api, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
 }
 const thread = id => ({ id, title: id });
 const project = id => ({ id, name: id });
+const remoteWorkflow = (state = 'unknown') => ({
+  operation_id: 'a'.repeat(32), org_id: 'org', project_id: 'p1', task_id: 'task_1', grant_id: 'grant_1',
+  lease_id: 'lease_1', worker_principal_id: 'worker_1', epoch: 2, experiment_attempt_id: 'attempt_1',
+  experiment_id: 'experiment_1', experiment_design_revision: 1, experiment_variant_id: 'variant_1', state,
+  operation_desired_state: 'admitted',
+  last_heartbeat_at: null, last_checkpoint_sequence: 0, last_checkpoint_cursor: null, last_checkpoint_digest: null,
+  last_reconnected_at: null, control_outage_at: null, last_observed_at: '2026-01-01T00:00:00Z',
+  last_observed_state: state === 'prepared' ? null : state, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+  reconciliation_required: state !== 'exited', operational_only: true,
+  reconciliation: state === 'prepared' ? null : { observed_state: state, observed_at: '2026-01-01T00:00:00Z',
+    termination_confirmed: state === 'exited', cursor: 'observation:synthetic', sources: [], source_order: ['worker'],
+    contradiction_state: state === 'exited' ? 'none' : 'unconfirmed_current_observation' },
+});
 function find(node, predicate) {
   if (predicate(node)) return node;
   for (const child of node.children ?? []) {
@@ -123,6 +140,63 @@ const experimentLedger = (id = 'e1', projectId = 'p1') => {
   };
 };
 
+test('worker discovery renders only the safe project projection and labels stale workers fenced', async () => {
+  const calls = [];
+  const worker = {
+    id: 'worker_1', project_id: 'p1',
+    approved_metadata: { build_identifier: 'approved-supervisor-v1', build_digest: 'a'.repeat(64), region: 'local' },
+    lifecycle: { state: 'ready', revision: 3, credential_status: 'active' },
+    freshness: { status: 'stale', last_seen_at: '2026-01-01T00:00:00Z', heartbeat_max_age_seconds: 60 },
+    capabilities: { status: 'not_probed', probed: false },
+    trust_zone: { status: 'declared_unverified', trust_class: 'test' },
+    lease_admission: { registration_is_not_scheduling: true, status: 'fenced', fence_reason: 'heartbeat_stale' },
+  };
+  const ui = fixture({ workers: async (_connection, projectId, page) => {
+    calls.push({ projectId, page }); return { workers: [worker] };
+  } });
+  await ui.selectProject(project('p1'));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].projectId, 'p1');
+  assert.equal(calls[0].page.offset, 0);
+  assert.equal(calls[0].page.limit, 100);
+  const rendered = JSON.stringify(ui.get('workers'));
+  assert.match(rendered, /Approved build: approved-supervisor-v1/);
+  assert.match(rendered, /Freshness: stale/);
+  assert.match(rendered, /New lease admission is fenced \(heartbeat_stale\)/);
+  assert.match(rendered, /Registration is metadata only; it does not schedule, dispatch, or authorize work/);
+  for (const forbidden of ['kubeconfig', 'endpoint', 'secret', 'worker_principal_id', 'credential_id']) {
+    assert.ok(!rendered.includes(forbidden));
+  }
+});
+
+test('remote workflow projection keeps admission, unknown state, reconciliation, and conclusions distinct', async () => {
+  const calls = [];
+  const record = remoteWorkflow('unknown');
+  const stops = [];
+  const ui = fixture({ remoteWorkflows: async (_connection, projectId, page) => {
+    calls.push({ projectId, page }); return { remote_workflows: [record] };
+  }, remoteWorkflow: async (_connection, operationId) => {
+    assert.equal(operationId, record.operation_id); return record;
+  }, executionGrant: async () => ({ id: record.grant_id, revision: 4, status: 'active' }),
+  revokeExecutionGrant: async (_connection, grantId, body, key) => { stops.push({ grantId, body, key }); return {}; } });
+  await ui.selectProject(project('p1'));
+  assert.equal(JSON.stringify(calls), JSON.stringify([{ projectId: 'p1', page: { offset: 0, limit: 100 } }]));
+  const rendered = JSON.stringify(ui.get('remote-workflows'));
+  assert.match(rendered, /Execution admission\/package intent is recorded|Remote state is unknown/);
+  assert.match(rendered, /Reconciliation required/);
+  assert.match(rendered, /Do not treat a stop request, reconnect, or displayed exit as confirmed termination/);
+  assert.ok(!rendered.includes('scientific success'));
+  const refresh = find(ui.get('remote-workflows'), node => node.textContent === 'Refresh reconciled operation');
+  refresh.listeners.click(); await flush();
+  assert.equal(calls.length, 2);
+  assert.match(ui.get('notice').textContent, /No run, dispatch, stop, evidence, or conclusion was replayed/);
+  const stop = find(ui.get('remote-workflows'), node => node.textContent === 'Request stop');
+  stop.listeners.click(); await flush();
+  assert.equal(stops.length, 1);
+  assert.equal(JSON.stringify(stops[0].body), JSON.stringify({ expected_revision: 4 }));
+  assert.match(ui.get('notice').textContent, /does not confirm termination/);
+});
+
 test('renderer keeps earlier pages, removes loading markers, and deduplicates concurrent More reads', async () => {
   const next = deferred(); let calls = 0;
   const ui = fixture({ threads: async (_id, _project, page) => {
@@ -138,6 +212,38 @@ test('renderer keeps earlier pages, removes loading markers, and deduplicates co
   assert.equal(ui.get('threads').children.length, 101);
   assert.equal(ui.get('threads-more').hidden, true);
   assert.equal(ui.get('decisions').children[0].textContent, 'No pending decisions.');
+});
+
+test('coordinator messages, proposals, and status turns paginate independently beyond 100 records', async () => {
+  const calls = { messages: [], proposals: [], turns: [] };
+  const ui = fixture({
+    astraConversation: async (_connection, _project, page) => {
+      calls.messages.push(page); return { conversation: { revision: 3 }, messages: Array.from({ length: page.offset ? 1 : 100 }, (_, index) => ({
+        id: `message-${page.offset + index}`, project_id: 'p1', sender_kind: 'human', body: `Message ${page.offset + index}`,
+      })) };
+    },
+    astraProposals: async (_connection, _project, page) => {
+      calls.proposals.push(page); return { proposals: Array.from({ length: page.offset < 200 ? 100 : 1 }, (_, index) => ({
+        id: `proposal-${page.offset + index}`, project_id: 'p1', proposal_type: 'human_review_needed', body: 'Review it.', recap: 'No authority.', status: [],
+        provider_disabled: true, authority_effect: 'none', execution_authorized: false, design: null, context_digest: 'e'.repeat(64),
+      })) };
+    },
+    explainStatusTurns: async (_connection, _project, page) => {
+      calls.turns.push(page); return { turns: Array.from({ length: page.offset ? 1 : 100 }, (_, index) => ({
+        turn_id: `turn-${page.offset + index}`, project_id: 'p1', experiment_id: 'e1', design_revision: 1, state: 'completed',
+      })) };
+    },
+  });
+  await ui.selectProject(project('p1'));
+  await ui.loadEvents();
+  await ui.loadEvents();
+  assert.deepEqual(calls.messages.map(page => page.offset), [0, 100]);
+  assert.deepEqual(calls.proposals.map(page => page.offset), [0, 100, 200]);
+  assert.deepEqual(calls.turns.map(page => page.offset), [0, 100]);
+  assert.equal(findAll(ui.get('events'), node => node.dataset?.workbenchType === 'scientist-message').length, 101);
+  assert.equal(findAll(ui.get('events'), node => node.dataset?.workbenchType === 'coordinator-proposal').length, 201);
+  assert.equal(findAll(ui.get('events'), node => node.dataset?.workbenchType === 'status-turn').length, 101);
+  assert.equal(ui.get('events-more').hidden, true);
 });
 
 test('approval displays only the digest-verified immutable specification and binds that revision', async () => {
@@ -188,6 +294,88 @@ test('renderer ignores thread and message replies from a previous context and cl
   assert.equal(ui.get('messages').children[0].textContent, 'No messages yet.');
   ui.get('message-form').fields.body = 'Another draft'; ui.clearContext();
   assert.equal(ui.get('message-form').fields.body, undefined);
+});
+
+const harnessBinding = (id = 'binding_1', projectId = 'p1', taskId = 'task_1') => ({
+  id, organization_id: 'org', project_id: projectId, task_id: taskId, operation_id: 'a'.repeat(32),
+  admitted_attempt_id: 'attempt_1', attempt_revision: 3, grant_id: 'grant_1', lease_id: 'lease_1',
+  worker_principal_id: 'worker_1', epoch: 7, harness_instance_id: 'harness_1', upstream_session_id: 'session_1',
+  adapter_profile: 'opencode-v1.18.30-context-only', provider_disabled: true,
+});
+
+test('server-derived harness binding is displayed and context enqueue carries no routing authority inputs', async () => {
+  const calls = [];
+  const ui = fixture({ harnessSessionBinding: async (_connection, id) => harnessBinding(id),
+    enqueueHarnessDelivery: async (_connection, body, key) => { calls.push({ body, key }); return {}; } });
+  await ui.selectProject(project('p1'));
+  await ui.selectThread({ ...thread('t1'), task_id: 'task_1' });
+  ui.get('binding-form').fields = { harness_session_binding_id: 'binding_1' };
+  ui.submit('binding-form'); await flush();
+  assert.match(JSON.stringify(ui.get('binding-detail')), /Admitted attempt: attempt_1 · attempt revision 3/);
+  assert.match(JSON.stringify(ui.get('binding-detail')), /Skills metadata: not loaded/);
+  ui.get('context-form').fields = { context_revision: '4', intent: 'direction', body: 'Use the selected records.' };
+  ui.submit('context-form'); await flush();
+  assert.equal(JSON.stringify(calls[0].body), JSON.stringify({ thread_id: 't1', harness_session_binding_id: 'binding_1',
+    context_revision: 4, intent: 'direction', body: 'Use the selected records.' }));
+  assert.deepEqual(Object.keys(calls[0].body).sort(), ['body', 'context_revision', 'harness_session_binding_id', 'intent', 'thread_id']);
+});
+
+test('missing or stale harness bindings never become a send target across thread switches', async () => {
+  const late = deferred();
+  const ui = fixture({ harnessSessionBinding: async (_connection, id) => id === 'late' ? late.promise : null });
+  await ui.selectProject(project('p1'));
+  await ui.selectThread({ ...thread('t1'), task_id: 'task_1' });
+  ui.get('binding-form').fields = { harness_session_binding_id: 'late' };
+  ui.submit('binding-form'); await flush();
+  await ui.selectThread({ ...thread('t2'), task_id: 'task_1' });
+  late.resolve(harnessBinding('late')); await flush();
+  assert.equal(ui.state().activeHarnessBinding, null);
+  assert.match(ui.get('binding-detail').textContent, /No server-derived harness binding loaded/);
+  ui.get('binding-form').fields = { harness_session_binding_id: 'missing' };
+  ui.submit('binding-form'); await flush();
+  assert.equal(ui.state().activeHarnessBinding, null);
+  assert.match(ui.get('binding-detail').textContent, /missing, stale, or does not belong/);
+});
+
+test('uncertain harness context retries retain their command key and are never automatic', async () => {
+  const calls = [];
+  const ui = fixture({ harnessSessionBinding: async () => harnessBinding(),
+    enqueueHarnessDelivery: async (_connection, body, key) => { calls.push({ body, key }); throw new Error('lost reply'); } });
+  await ui.selectProject(project('p1'));
+  await ui.selectThread({ ...thread('t1'), task_id: 'task_1' });
+  ui.get('binding-form').fields = { harness_session_binding_id: 'binding_1' }; ui.submit('binding-form'); await flush();
+  ui.get('context-form').fields = { context_revision: '2', intent: 'question', body: 'Is this context visible?' };
+  ui.submit('context-form'); await flush();
+  assert.equal(calls.length, 1);
+  assert.match(ui.get('notice').textContent, /lost reply/);
+  ui.submit('context-form'); await flush();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].key, calls[1].key);
+});
+
+test('legacy and context delivery labels do not imply an answer, execution, or acceptance', async () => {
+  const ui = fixture({ messages: async () => ({ messages: [
+    { intent: 'question', sender_principal_id: 'human', body: 'Old record', created_at: '2026-01-01T00:00:00Z', delivery_legacy: true, delivery: null },
+    { intent: 'direction', sender_principal_id: 'human', body: 'New context', created_at: '2026-01-01T00:00:00Z', delivery: { delivery_id: 'delivery_1', state: 'acknowledged', revision: 2, context_digest: 'a'.repeat(64) } },
+  ] }) });
+  await ui.selectProject(project('p1')); await ui.selectThread(thread('t1'));
+  const rendered = JSON.stringify(ui.get('messages'));
+  assert.match(rendered, /Legacy conversation record/);
+  assert.match(rendered, /Context acknowledged by the harness — not an answer, execution, or acceptance/);
+});
+
+test('offline health marks displayed records stale and disables record and context actions', async () => {
+  const ui = fixture();
+  await ui.selectProject(project('p1')); await ui.selectThread(thread('t1'));
+  ui.applyConnectionHealth({ name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health: 'offline' });
+  assert.equal(ui.get('message-form').querySelector('button[type="submit"]').disabled, true);
+  assert.equal(ui.get('context-form').querySelector('button[type="submit"]').disabled, true);
+  assert.equal(ui.get('coordinator-form').querySelector('button[type="submit"]').disabled, true);
+  assert.match(ui.get('connection-status').textContent, /offline — displayed data may be stale/);
+  await assert.rejects(ui.command('offline', {}, async () => {}), /offline/);
+  await ui.guarded(async () => {});
+  assert.equal(ui.get('message-form').querySelector('button[type="submit"]').disabled, false);
+  assert.equal(ui.get('coordinator-form').querySelector('button[type="submit"]').disabled, false);
 });
 
 test('project and connection context changes close and clear task and thread drafts', async () => {
@@ -285,6 +473,31 @@ test('experiment projection renders migrated unknown context, attempt history, l
   assert.match(text, /Human review records an interpretation; it does not establish scientific success\./);
   assert.match(text, /Admission, operational state history, human outcome, and an operation link are records only; they do not establish scientific success\./);
   assert.equal(findAll(detail, node => node.tagName === 'a').length, 0);
+});
+
+test('experiment switches clear projection cards immediately and only render the selected ledger revision', async () => {
+  const first = experimentLedger('e1'); const second = experimentLedger('e2'); const delayed = deferred();
+  const ui = fixture({ experiment: async (_connection, id) => id === 'e1' ? first : delayed.promise });
+  await ui.selectProject(project('p1'));
+  await ui.selectExperiment({ id: 'e1', goal: first.experiment.goal, current_design_revision: 2 });
+  assert.ok(find(ui.get('events'), node => /Experiment e1 · loaded design revision 2/.test(node.textContent)));
+  const switching = ui.selectExperiment({ id: 'e2', goal: second.experiment.goal, current_design_revision: 2 });
+  assert.equal(find(ui.get('events'), node => node.dataset?.workbenchType === 'conclusion-card'), null);
+  assert.equal(find(ui.get('events'), node => node.dataset?.workbenchType === 'evidence-link'), null);
+  delayed.resolve(second); await switching;
+  assert.ok(find(ui.get('events'), node => /Experiment e2 · loaded design revision 2/.test(node.textContent)));
+  assert.equal(find(ui.get('events'), node => /Experiment e1 · loaded design revision 2/.test(node.textContent)), null);
+});
+
+test('Labbook includes the selected experiment evidence and conclusion projection cards', async () => {
+  const data = experimentLedger('e1');
+  const ui = fixture({ experiment: async () => data, labbook: async () => ({ events: [] }) });
+  await ui.selectProject(project('p1'));
+  await ui.selectExperiment({ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 });
+  ui.get('labbook-view').listeners.click();
+  assert.ok(find(ui.get('events'), node => node.dataset?.workbenchType === 'conclusion-card'));
+  assert.ok(find(ui.get('events'), node => node.dataset?.workbenchType === 'evidence-link'));
+  assert.ok(find(ui.get('events'), node => /Experiment e1 · loaded design revision 2/.test(node.textContent)));
 });
 
 test('experiment projection retains explicitly unverified legacy operation provenance without inventing a package or termination', async () => {
@@ -531,8 +744,8 @@ test('message delivery exposes session uncertainty and stale/offline reads witho
     { id: 'delivery', intent: 'direction', sender_principal_id: 'human', body: 'Pinned context', created_at: '2026-01-01T00:00:01Z', delivery: { state: 'uncertain', harness_instance_id: 'harness-1', upstream_session_id: 'session-1', error_code: 'upstream_uncertain' } },
   ] }) });
   await ui.selectProject(project('p1')); await ui.selectThread(thread('t1'));
-  assert.ok(find(ui.get('messages'), node => /Legacy conversation message/.test(node.textContent)));
-  assert.ok(find(ui.get('messages'), node => /session session-1/.test(node.textContent)));
+  assert.ok(find(ui.get('messages'), node => /Legacy conversation record/.test(node.textContent)));
+  assert.ok(find(ui.get('messages'), node => /raw harness and session identifiers are not shown/.test(node.textContent)));
   assert.ok(find(ui.get('messages'), node => /will not be sent again automatically/.test(node.textContent)));
   ui.api.messages = async () => { throw new Error('offline'); };
   await assert.rejects(ui.loadMessages(undefined, undefined, true), /offline/);
@@ -921,6 +1134,8 @@ test('acceptance UI requires current supported citations and closed confirmatory
     await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1' });
     const button = find(ui.get('study-detail'), node => node.dataset?.acceptFindingId);
     assert.equal(button.disabled, !entry.allowed);
+    ui.applyConnectionHealth({ name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health: 'online' });
+    assert.equal(button.disabled, !entry.allowed);
     if (!entry.allowed) { button.listeners.click(); await flush(); assert.equal(accepted, 0); }
   }
 });
@@ -1101,4 +1316,131 @@ test('finding revision is blocked by held or stale authority and superseded find
   assert.ok(find(ui.get('study-detail'), node => node.textContent === 'Revision kind: supersede'));
   assert.ok(find(ui.get('study-detail'), node => node.textContent === 'Revision reason: Updated'));
   assert.equal(find(ui.get('study-detail'), node => node.dataset?.reviseFindingId), null);
+});
+
+test('coordinator workbench gives each returned record a typed label without self-approval', async () => {
+  const ui = fixture({
+    astraConversation: async () => ({ conversation: { project_id: 'p1', revision: 2 }, messages: [
+      { id: 'message-human', project_id: 'p1', sender_kind: 'human', body: '[Discuss]\nWhat should we inspect?', created_at: '2026-01-01T00:00:00Z' },
+      { id: 'message-coordinator', project_id: 'p1', sender_kind: 'coordinator', body: 'Status: provider disabled', created_at: '2026-01-01T00:00:01Z' },
+    ] }),
+    astraProposals: async () => ({ proposals: [{ id: 'proposal-1', project_id: 'p1', conversation_revision: 2, turn_id: 'turn-1', proposal_type: 'human_review_needed',
+      body: 'Ask a human to review the plan.', recap: 'No provider activity.', status: ['provider disabled'],
+      provider_disabled: true, authority_effect: 'none', execution_authorized: false, design: null,
+      context_digest: 'e'.repeat(64), registration: null, created_at: '2026-01-01T00:00:02Z' }] }),
+    labbook: async () => ({ events: [
+      { cursor: 1, event_type: 'decision_resolved', resource_revision: 2, created_at: '2026-01-01T00:00:03Z', payload: { decision: 'approved' } },
+      { cursor: 2, event_type: 'execution.observation_reported', resource_revision: 2, created_at: '2026-01-01T00:00:04Z', payload: {} },
+    ] }),
+  });
+  await ui.selectProject(project('p1'));
+  const entries = ui.get('events'); const rendered = JSON.stringify(entries);
+  for (const label of ['Scientist message', 'Deterministic local coordinator reply', 'Coordinator proposal', 'Human decision receipt', 'Execution milestone']) {
+    assert.match(rendered, new RegExp(label));
+  }
+  assert.match(rendered, /Authority effect: none\. Execution is not authorized/);
+  assert.equal(find(entries, node => node.tagName === 'button' && /Approve|Authorize|Dispatch/.test(node.textContent)), null);
+  ui.get('labbook-view').listeners.click();
+  assert.equal(find(entries, node => /Scientist message/.test(node.textContent)), null);
+  ui.get('conversation-view').listeners.click();
+  assert.ok(find(entries, node => /Scientist message/.test(node.textContent)));
+});
+
+test('coordinator design card requires an explicit human registration action without execution authority', async () => {
+  const calls = [];
+  const design = { goal: 'Compare the recorded baseline.', success_criterion: 'A human compares measurements.',
+    protocol: 'Register one baseline and one intervention.', variants: [
+      { kind: 'baseline', name: 'baseline', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: {}, execution_task_id: null, execution_plan_digest: null },
+      { kind: 'intervention', name: 'intervention', method_digest: 'c'.repeat(64), input_digest: 'd'.repeat(64), metadata: {}, execution_task_id: null, execution_plan_digest: null },
+    ] };
+  const ui = fixture({ astraConversation: async () => ({ conversation: { revision: 2 }, messages: [] }),
+    astraProposals: async () => ({ proposals: [{ id: 'proposal-1', project_id: 'p1', proposal_type: 'human_review_needed',
+      body: 'A human may register this candidate.', recap: 'No authority was created.', status: ['Candidate ready.'],
+      provider_disabled: true, authority_effect: 'none', execution_authorized: false, design,
+      context_digest: 'e'.repeat(64), registration: null, created_at: '2026-01-01T00:00:00Z' }] }),
+    registerProposalDesign: async (_connection, proposalId, body, key) => {
+      calls.push({ proposalId, body, key }); return { execution_authorized: false };
+    } });
+  await ui.selectProject(project('p1'));
+  const preview = find(ui.get('events'), node => node.tagName === 'article' &&
+    node.children.some(child => child.textContent === 'Complete design preview'));
+  assert.ok(preview);
+  const previewText = JSON.stringify(preview);
+  for (const expected of ['Goal: Compare the recorded baseline.', 'Success criterion: A human compares measurements.',
+    'Protocol: Register one baseline and one intervention.', 'baseline variant: baseline', 'intervention variant: intervention',
+    `Method digest: ${'a'.repeat(64)}`, `Input digest: ${'d'.repeat(64)}`, 'Metadata: {}',
+    'No registered execution reference.', `Registration context digest: ${'e'.repeat(64)}`]) assert.match(previewText, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const button = find(ui.get('events'), node => node.textContent === 'Register design — execution not authorized');
+  assert.ok(button);
+  button.listeners.click(); await flush();
+  assert.equal(JSON.stringify(calls[0].body), JSON.stringify({ expected_context_digest: 'e'.repeat(64) }));
+  assert.equal(calls[0].proposalId, 'proposal-1');
+  assert.match(ui.get('notice').textContent, /Design registered\. Execution is not authorized/);
+  assert.equal(find(ui.get('events'), node => /approve and run/i.test(node.textContent)), null);
+});
+
+test('coordinator composer carries only explicit current context and reports stale revisions without approval', async () => {
+  const calls = [];
+  const ui = fixture({ astraConversation: async () => ({ conversation: { project_id: 'p1', revision: 3 }, messages: [] }),
+    tasks: async () => ({ tasks: [{ id: 'task_1', status: 'draft', revision: 4, plan_digest: 'a'.repeat(64) }] }),
+    taskPlan: async () => ({ task_id: 'task_1', project_id: 'p1', revision: 4, plan_digest: 'a'.repeat(64), title: 'Selected plan', purpose: 'Explicit context',
+      execution_spec: { argv: ['python'], input_snapshot_digest: 'b'.repeat(64), pinned_skill_digests: [], output_paths: [], profile: 'local-cpu', network_enabled: false, max_output_bytes: 1 } }),
+    requestCoordinatorTurn: async (_connection, projectId, body, key) => { calls.push({ projectId, body, key }); throw new Error('Control request failed (409).'); } });
+  await ui.selectProject(project('p1')); await flush();
+  find(ui.get('tasks'), node => node.textContent === 'Include plan in coordinator context').listeners.click();
+  ui.get('coordinator-form').fields = { mode: 'Draft experiment', prompt: 'Compare the registered variants.' };
+  ui.submit('coordinator-form'); await flush();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].body.expected_conversation_revision, 3);
+  assert.equal(calls[0].body.prompt, '[Draft experiment]\nCompare the registered variants.');
+  assert.equal(JSON.stringify(calls[0].body.selected_context), JSON.stringify([{ kind: 'task', record_id: 'task_1', expected_revision: 4 }]));
+  assert.match(ui.get('notice').textContent, /selected coordinator context or conversation revision is stale/);
+  assert.equal(find(ui.get('events'), node => node.tagName === 'button' && /Approve/.test(node.textContent)), null);
+});
+
+test('researcher prompt, proposal registration, and plan approval remain separate from execution', async () => {
+  const calls = []; let proposalVisible = false; let registered = false;
+  const design = { goal: 'Compare the bounded candidates.', success_criterion: 'A human reviews the records.',
+    protocol: 'Register a baseline and intervention before separate execution review.', variants: [
+      { kind: 'baseline', name: 'baseline', method_digest: 'a'.repeat(64), input_digest: 'b'.repeat(64), metadata: {}, execution_task_id: null, execution_plan_digest: null },
+      { kind: 'intervention', name: 'intervention', method_digest: 'c'.repeat(64), input_digest: 'd'.repeat(64), metadata: {}, execution_task_id: null, execution_plan_digest: null },
+    ] };
+  const proposal = () => ({ id: 'proposal_1', project_id: 'p1', proposal_type: 'human_review_needed',
+    body: 'A human may register this candidate.', recap: 'No authority was created.', status: ['Candidate ready.'],
+    provider_disabled: true, authority_effect: 'none', execution_authorized: false, design,
+    context_digest: 'e'.repeat(64), registration: registered ? { experiment_id: 'experiment_1', design_revision: 1 } : null,
+    created_at: '2026-01-01T00:00:00Z' });
+  const task = { id: 'task_1', status: 'draft', revision: 4, plan_digest: 'f'.repeat(64) };
+  const plan = { task_id: task.id, project_id: 'p1', revision: 4, plan_digest: task.plan_digest,
+    title: 'Reviewed plan', purpose: 'A separate human plan decision.', budget_cents: 0, max_duration_seconds: 60,
+    execution_spec: { argv: ['python', '-c', 'pass'], input_snapshot_digest: 'a'.repeat(64),
+      pinned_skill_digests: [], output_paths: [], profile: 'local-cpu', network_enabled: false, max_output_bytes: 1 } };
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan,
+    astraConversation: async () => ({ conversation: { project_id: 'p1', revision: 2 }, messages: [] }),
+    astraProposals: async () => ({ proposals: proposalVisible ? [proposal()] : [] }),
+    requestCoordinatorTurn: async (_connection, projectId, body, key) => {
+      calls.push({ type: 'prompt', projectId, body, key }); proposalVisible = true; return {};
+    },
+    registerProposalDesign: async (_connection, proposalId, body, key) => {
+      calls.push({ type: 'registration', proposalId, body, key }); registered = true; return { execution_authorized: false };
+    },
+    approve: async (_connection, taskId, body, key) => {
+      calls.push({ type: 'approval', taskId, body, key }); return {};
+    } });
+  await ui.selectProject(project('p1')); await flush();
+  ui.get('coordinator-form').fields = { mode: 'Draft experiment', prompt: 'Compare the candidates.' };
+  ui.submit('coordinator-form'); await flush();
+  const register = find(ui.get('events'), node => node.textContent === 'Register design — execution not authorized');
+  assert.ok(register);
+  register.listeners.click(); await flush();
+  find(ui.get('tasks'), node => node.textContent === 'Approve this plan').listeners.click(); await flush();
+
+  assert.deepEqual(calls.map(call => call.type), ['prompt', 'registration', 'approval']);
+  assert.equal(JSON.stringify(calls[0].body), JSON.stringify({
+    expected_conversation_revision: 2, prompt: '[Draft experiment]\nCompare the candidates.', selected_context: [],
+  }));
+  assert.equal(JSON.stringify(calls[1].body), JSON.stringify({ expected_context_digest: 'e'.repeat(64) }));
+  assert.equal(JSON.stringify(calls[2].body), JSON.stringify({ expected_revision: 4, expected_plan_digest: 'f'.repeat(64) }));
+  assert.match(JSON.stringify(ui.get('events')), /Execution remains unauthorized/);
+  assert.match(ui.get('notice').textContent, /Plan approval recorded\. No execution was started/);
 });

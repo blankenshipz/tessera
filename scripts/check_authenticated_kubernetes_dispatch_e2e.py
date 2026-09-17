@@ -62,6 +62,39 @@ class DispatchE2EUnavailable(DispatchE2EError):
     """The selected retained image cannot safely exercise the requested mode."""
 
 
+def _fixture_result(
+    verdict: str, *, state: str, message: str | None = None, **evidence: Any
+) -> tuple[dict[str, Any], int]:
+    """Keep fixture assessment separate from the observed operational state."""
+    result: dict[str, Any] = {"fixture_verdict": verdict, "state": state, **evidence}
+    if message is not None:
+        result["message"] = message
+    return result, 0 if verdict == "passed" else 1
+
+
+def _argument_error(args: argparse.Namespace) -> str | None:
+    if not args.run:
+        return None
+    if args.kubeconfig is None:
+        return "--kubeconfig is required when --run is supplied"
+    if not args.image:
+        return "--image is required when --run is supplied"
+    if args.mode not in {"success", "cancel", "restart", "lost-report"}:
+        return "--mode must be success, cancel, restart, or lost-report"
+    if not 1 <= args.timeout <= 180:
+        return "--timeout must be between 1 and 180 seconds"
+    if not 1 <= args.workload_seconds <= 120:
+        return "--workload-seconds must be between 1 and 120 seconds"
+    if args.mode != "success" and args.workload_seconds >= args.timeout:
+        return "--workload-seconds must be less than --timeout for a live recovery mode"
+    return None
+
+
+def _emit_fixture_result(result: dict[str, Any], exit_code: int) -> int:
+    print(json.dumps(result, sort_keys=True))
+    return exit_code
+
+
 def _run(argv: tuple[str, ...], *, timeout: int = 90) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=True, timeout=timeout)
@@ -275,15 +308,21 @@ class _LiveAdapter:
             raise DispatchE2EError("Job UID changed before narrowly named deletion")
         self.live._kubectl("delete", "job", name, "--wait=false", namespace=self.cluster.namespace)
 
-    def submit(self, package):
+    def submit(self, package, *, timeout_seconds: float | None = None):
         self.package = package
-        return self.adapter.submit(package)
+        if timeout_seconds is None:
+            return self.adapter.submit(package)
+        return self.adapter.submit(package, timeout_seconds=timeout_seconds)
 
-    def reconcile(self, package):
-        return self.adapter.reconcile(package)
+    def reconcile(self, package, *, timeout_seconds: float | None = None):
+        if timeout_seconds is None:
+            return self.adapter.reconcile(package)
+        return self.adapter.reconcile(package, timeout_seconds=timeout_seconds)
 
-    def cancel(self, package):
-        return self.adapter.cancel(package)
+    def cancel(self, package, *, timeout_seconds: float | None = None):
+        if timeout_seconds is None:
+            return self.adapter.cancel(package)
+        return self.adapter.cancel(package, timeout_seconds=timeout_seconds)
 
     def cancellation_proof(self, package):
         return self.adapter.cancellation_proof(package)
@@ -879,17 +918,13 @@ def main() -> int:
     parser.add_argument("--run", action="store_true", help="perform the retained live dispatch run")
     parser.add_argument(
         "--mode",
-        choices=("success", "cancel", "restart", "lost-report"),
         default="success",
         help="one normal-path conformance mode; failure injection is limited to lost-report",
     )
-    parser.add_argument(
-        "--kubeconfig", type=Path, required=True, help="explicit absolute kubeconfig"
-    )
+    parser.add_argument("--kubeconfig", type=Path, help="explicit absolute kubeconfig")
     parser.add_argument("--context", choices=[CONTEXT], default=CONTEXT)
     parser.add_argument(
         "--image",
-        required=True,
         help="exact existing node-resident tessera-e2e-hello@sha256 reference",
     )
     parser.add_argument(
@@ -909,19 +944,20 @@ def main() -> int:
     )
     args = parser.parse_args()
     if not args.run:
-        parser.error("--run is required; this command has no ambient live mode")
-    if not 1 <= args.timeout <= 180:
-        parser.error("--timeout must be between 1 and 180 seconds")
-    if not 1 <= args.workload_seconds <= 120:
-        parser.error("--workload-seconds must be between 1 and 120 seconds")
-    if args.mode != "success" and args.workload_seconds >= args.timeout:
-        parser.error("--workload-seconds must be less than --timeout for a live recovery mode")
+        result, exit_code = _fixture_result(
+            "skipped",
+            state="not_started",
+            message="--run was not supplied; this command intentionally has no ambient live mode",
+        )
+        return _emit_fixture_result(result, exit_code)
+    argument_error = _argument_error(args)
+    if argument_error is not None:
+        result, exit_code = _fixture_result("failed", state="not_started", message=argument_error)
+        return _emit_fixture_result(result, exit_code)
     try:
-        print(json.dumps(_main(args), sort_keys=True))
-        return 0
+        result, exit_code = _fixture_result("passed", **_main(args))
     except DispatchE2EUnavailable as error:
-        print(json.dumps({"state": "unavailable", "message": str(error)}, sort_keys=True))
-        return 0
+        result, exit_code = _fixture_result("unavailable", state="unavailable", message=str(error))
     except (
         DispatchE2EError,
         LiveKubernetesError,
@@ -930,8 +966,8 @@ def main() -> int:
         KeyError,
         ValueError,
     ) as error:
-        print(json.dumps({"state": "failed", "message": str(error)}, sort_keys=True))
-        return 1
+        result, exit_code = _fixture_result("failed", state="failed", message=str(error))
+    return _emit_fixture_result(result, exit_code)
 
 
 if __name__ == "__main__":

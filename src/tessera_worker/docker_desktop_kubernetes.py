@@ -11,9 +11,11 @@ post-exit collection seam while the control plane has no remote dispatch route.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import io
 import json
+import re
 import shlex
 import subprocess
 import tarfile
@@ -166,13 +168,10 @@ def build_and_load_exact_image(repository_root: Path, nonce: str) -> ExactImage:
         _run(("docker", "save", "--output", str(docker_archive), tag))
         _docker_archive_to_oci(docker_archive, archive, tag)
         image = _verify_oci_archive(archive, tag, node_repository)
-        loaded_config = _run(
-            ("docker", "image", "inspect", tag, "--format", "{{.Id}}")
-        ).stdout.strip()
-        if loaded_config != image.config_digest:
-            raise LiveKubernetesError(
-                "locally loaded image config digest conflicts with OCI archive"
-            )
+        # Docker Desktop's containerd image store can report a local Docker
+        # image ID that differs from the config blob emitted by ``docker save``.
+        # The archive's config digest is verified above and imported below, so
+        # host-cache presentation must not reject that exact archive.
         _run(
             (
                 "docker",
@@ -276,7 +275,9 @@ def _docker_archive_to_oci(source_path: Path, destination: Path, tag: str) -> No
             if not isinstance(config_name, str) or not isinstance(layer_names, list):
                 raise ValueError("Docker archive manifest is malformed")
             config = source.extractfile(config_name).read()
-            layers = [(name, source.extractfile(name).read()) for name in layer_names]
+            layers = [
+                (name, _uncompressed_layer(source.extractfile(name).read())) for name in layer_names
+            ]
     except (
         KeyError,
         AttributeError,
@@ -344,6 +345,23 @@ def _docker_archive_to_oci(source_path: Path, destination: Path, tag: str) -> No
         raise LiveKubernetesError("locally built OCI archive could not be written") from error
 
 
+def _uncompressed_layer(value: bytes) -> bytes:
+    """Return the OCI layer's required uncompressed tar bytes.
+
+    Docker Desktop's containerd image store may serialize ``docker save`` layer
+    blobs as gzip streams rather than legacy ``layer.tar`` files. OCI's
+    ``application/vnd.oci.image.layer.v1.tar`` descriptor is explicitly an
+    uncompressed tar, and its digest must therefore be over the decoded bytes.
+    """
+    try:
+        decoded = gzip.decompress(value) if value.startswith(b"\x1f\x8b") else value
+        with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:"):
+            pass
+    except (EOFError, OSError, tarfile.TarError) as error:
+        raise LiveKubernetesError("Docker image layer is not a valid uncompressed tar") from error
+    return decoded
+
+
 def _tar_bytes(archive: tarfile.TarFile, name: str, value: bytes) -> None:
     info = tarfile.TarInfo(name)
     info.size = len(value)
@@ -407,12 +425,18 @@ class DockerDesktopKubernetesAdapter:
         self.target = target
         self.journal_path = Path(journal_path)
 
-    def run(self, image: ExactImage, nonce: str) -> LiveKubernetesEvidence:
+    def run(
+        self, image: ExactImage, nonce: str, namespace: str | None = None
+    ) -> LiveKubernetesEvidence:
         """Run one deterministic Job and a read-only post-exit collector; retain all objects."""
-        namespace = f"tessera-e2e-{nonce}"
-        self._create(
-            {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace}}, None
-        )
+        if namespace is None:
+            namespace = f"tessera-e2e-{nonce}"
+            self._create(
+                {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace}},
+                None,
+            )
+        elif not re.fullmatch(r"[a-z]([-a-z0-9]{0,61}[a-z0-9])?", namespace):
+            raise LiveKubernetesError("explicit conformance namespace is malformed")
         namespace_resource = self._get("namespace", namespace, None)
         namespace_uid = _uid(namespace_resource, "Namespace", namespace, None)
         self._create(_deny_all_policy(namespace), namespace)

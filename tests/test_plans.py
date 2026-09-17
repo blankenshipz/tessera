@@ -500,8 +500,11 @@ def test_explicit_v1_migration_preserves_records_approval_event_and_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     state = _legacy_state(tmp_path)
-    with pytest.raises(ValueError, match="explicit"):
-        create_app(state)
+    # An older schema keeps the process alive only for unauthenticated health
+    # reporting; authority routes remain closed until the explicit migration.
+    legacy_client = TestClient(create_app(state))
+    assert legacy_client.get("/health/ready").status_code == 503
+    assert legacy_client.get("/tasks/task").status_code == 503
     monkeypatch.setattr("sys.argv", ["tessera", "migrate", "--state-dir", str(state)])
     assert main() == 0
     assert capsys.readouterr().out.strip() == "43"

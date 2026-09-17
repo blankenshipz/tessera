@@ -1,7 +1,9 @@
 # Local development only. The native CLI remains loopback-only.
 services:
   control:
-    build: .
+    build:
+      context: .
+      target: dev
     ports:
       - "127.0.0.1:8765:8765"
     volumes:
@@ -12,7 +14,9 @@ services:
       timeout: 3s
       retries: 10
   test:
-    build: .
+    build:
+      context: .
+      target: dev
     profiles: [test]
     command: ["sh", "-c", "ruff check . && ruff format --check . && pytest"]
     network_mode: none

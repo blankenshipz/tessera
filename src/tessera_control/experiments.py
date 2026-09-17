@@ -8,6 +8,7 @@ validity.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -774,6 +775,59 @@ class ExperimentStore(Store):
             if row is None:
                 raise NotFound("Experiment attempt was not found.") from None
             return dict(row) | {"attempt_kind": "admitted"}
+
+    @staticmethod
+    def _legacy_cpu_operation(lease_id: str) -> str:
+        """Return the only artifact identity supported before operation intents."""
+        return hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
+
+    @classmethod
+    def _artifact_matches_attempt_provenance(
+        cls,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        attempt: dict[str, Any],
+        artifact_id: str,
+    ) -> bool:
+        """Require exact issued-operation identity, without inventing legacy authority.
+
+        A human-reported observation deliberately has no operation provenance. It
+        may cite project evidence, while an operation-backed attempt can cite only
+        an artifact carrying that same operation ID. If control issued an operation
+        for the artifact lease, its complete immutable lease tuple must agree too.
+        The lease-derived CPU identifier is accepted only when no such record exists.
+        """
+        artifact = connection.execute(
+            """SELECT a.*,o.operation_id AS issued_operation_id,o.org_id AS issued_org_id,
+            o.project_id AS issued_project_id,o.task_id AS issued_task_id,
+            o.grant_id AS issued_grant_id,o.lease_id AS issued_lease_id,
+            o.worker_principal_id AS issued_worker_principal_id,o.epoch AS issued_epoch
+            FROM artifacts a LEFT JOIN external_operations o ON o.lease_id=a.lease_id
+            WHERE a.id=? AND a.project_id=?""",
+            (artifact_id, attempt["project_id"]),
+        ).fetchone()
+        if artifact is None:
+            return False
+        if attempt["operation_id"] is None:
+            return True
+        if artifact["issued_operation_id"] is None:
+            return (
+                attempt["operation_id"]
+                == artifact["operation_id"]
+                == cls._legacy_cpu_operation(artifact["lease_id"])
+            )
+        return (
+            artifact["issued_org_id"] == actor["org_id"]
+            and artifact["issued_project_id"] == artifact["project_id"]
+            and artifact["issued_task_id"] == artifact["task_id"]
+            and artifact["issued_grant_id"] == artifact["grant_id"]
+            and artifact["issued_lease_id"] == artifact["lease_id"]
+            and artifact["issued_worker_principal_id"] == artifact["worker_principal_id"]
+            and artifact["issued_epoch"] == artifact["epoch"]
+            and attempt["operation_id"]
+            == artifact["operation_id"]
+            == artifact["issued_operation_id"]
+        )
 
     @staticmethod
     def _admit_bound_artifact_reference(
@@ -1693,21 +1747,9 @@ class ExperimentStore(Store):
             if attempt["revision"] != body["expected_revision"]:
                 raise Conflict("Experiment attempt revision is no longer current.")
             for artifact_id in body["artifact_ids"]:
-                if (
-                    attempt["attempt_kind"] == "legacy"
-                    and attempt["provenance_kind"] == "human_reported_observation"
+                if not self._artifact_matches_attempt_provenance(
+                    connection, actor, attempt, artifact_id
                 ):
-                    linked = connection.execute(
-                        "SELECT 1 FROM artifacts WHERE id=? AND project_id=?",
-                        (artifact_id, attempt["project_id"]),
-                    ).fetchone()
-                else:
-                    linked = connection.execute(
-                        """SELECT 1 FROM artifacts a JOIN external_operations o ON o.lease_id=a.lease_id
-                    WHERE a.id=? AND o.operation_id=? AND o.project_id=?""",
-                        (artifact_id, attempt["operation_id"], attempt["project_id"]),
-                    ).fetchone()
-                if linked is None:
                     raise NotFound("Artifact is not linked to this attempt provenance.")
             now, revision = utc_now(), attempt["revision"] + 1
             for artifact_id in body["artifact_ids"]:
@@ -2479,6 +2521,31 @@ class ExperimentStore(Store):
             for collection, query, parameters in bounded_queries:
                 if connection.execute(query, parameters).fetchone()[0] > EXPORT_RECORD_LIMIT:
                     raise Conflict(f"Export exceeds the per-experiment {collection} record limit.")
+
+            # Do not turn pre-hardening rows (or out-of-band database damage) into
+            # an apparently coherent export. A complete snapshot must fail closed
+            # rather than publish an artifact link whose operation provenance
+            # disagrees with its attempt.
+            provenance_links = connection.execute(
+                """SELECT aa.attempt_id,aa.artifact_id,a.operation_id,e.project_id
+                FROM research_attempt_artifacts aa
+                JOIN research_experiment_attempts a ON a.id=aa.attempt_id
+                JOIN research_experiment_variants v ON v.id=a.variant_id
+                JOIN research_experiments e ON e.id=v.experiment_id
+                WHERE v.experiment_id=?
+                UNION ALL
+                SELECT aa.attempt_id,aa.artifact_id,a.operation_id,e.project_id
+                FROM research_admitted_attempt_artifacts aa
+                JOIN research_experiment_admitted_attempts a ON a.id=aa.attempt_id
+                JOIN research_experiments e ON e.id=a.experiment_id
+                WHERE a.experiment_id=?""",
+                (experiment_id, experiment_id),
+            )
+            for link in provenance_links:
+                if not self._artifact_matches_attempt_provenance(
+                    connection, actor, dict(link), link["artifact_id"]
+                ):
+                    raise Conflict("Export contains contradictory artifact operation provenance.")
 
             result: dict[str, Any] = {
                 "experiment": self._experiment_response(connection, experiment),

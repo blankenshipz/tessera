@@ -31,6 +31,15 @@ and private in-memory test handle seam are implemented. Production secret backen
 real provider credential integration, provider dispatch, result acceptance, and
 restore fencing remain unimplemented.
 
+`GET /projects/{project_id}/workers` is a project-scoped read-only discovery
+projection for the desktop. It exposes only an opaque registry ID, approved build
+metadata, region, lifecycle/revision, recorded freshness, unprobed capability
+status, and declared-unverified trust class. It omits workload principals and
+credential IDs as well as kubeconfigs, target endpoints, secret references, and
+secret values. The projection labels registration as non-scheduling and reports
+whether separate new-lease admission is fenced; it never grants, dispatches, or
+schedules work.
+
 The Stage 1 native development runner does not enroll itself: it sends this
 heartbeat before requesting its one supplied grant lease, then sends distinct
 periodic heartbeats on its renewal cadence. Each heartbeat key is durably

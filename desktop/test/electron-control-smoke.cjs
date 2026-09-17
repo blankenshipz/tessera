@@ -38,7 +38,7 @@ async function main() {
     throw new Error('Application isolation settings are missing.');
   }
   const result = await window.webContents.executeJavaScript(`(async () => {
-    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId, studyId: fixture.studyId, held: Boolean(fixture.held) })};
+    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId, experimentId: fixture.experimentId, studyId: fixture.studyId, coordinatorProposal: fixture.coordinatorProposal, statusAnswer: fixture.statusAnswer, held: Boolean(fixture.held) })};
     const waitFor = async predicate => {
       const deadline = Date.now() + 10000;
       while (!predicate()) {
@@ -55,6 +55,13 @@ async function main() {
     const project = [...document.querySelectorAll('#projects button')].find(button => button.dataset.projectId === expected.projectId);
     if (!project) throw new Error('Expected synthetic project is missing.');
     project.click();
+    await waitFor(() => document.querySelector('#events').textContent.includes(expected.coordinatorProposal) &&
+      document.querySelector('#events').textContent.includes(expected.statusAnswer));
+    if (!document.querySelector('#message-form button').textContent.includes('Record conversation') ||
+        !document.querySelector('#context-form button').textContent.includes('Queue context') ||
+        !document.querySelector('#binding-load').textContent.includes('Fetch binding')) {
+      throw new Error('Conversation and harness-context actions are not distinct.');
+    }
     if (expected.held) {
       await waitFor(() => !document.querySelector('#recovery-banner').hidden);
       for (const id of ['project-new', 'task-new', 'thread-new', 'study-new']) {
@@ -219,8 +226,48 @@ async function main() {
     await waitFor(() => !document.querySelector('#study-export').hidden);
     document.querySelector('#study-export').click();
     await waitFor(() => document.querySelector('#notice').textContent === 'Saved study ledger JSON: ' + (expected.held ? 'held-study.json' : 'study.json'));
+    const inspectExperiment = async () => {
+      await waitFor(() => [...document.querySelectorAll('[data-experiment-id]')].some(node => node.dataset.experimentId === expected.experimentId));
+      [...document.querySelectorAll('[data-experiment-id]')].find(node => node.dataset.experimentId === expected.experimentId).click();
+      await waitFor(() => document.querySelector('#experiment-detail').textContent.includes('Completeness: complete in-scope goal-to-decision chain.'));
+      const experimentDetail = document.querySelector('#experiment-detail');
+      for (const expectedText of ['Current goal: Current synthetic goal.', 'Design revision 1', 'Design revision 2',
+          'Synthetic baseline v1', 'Synthetic intervention v2', 'Attempt-recorded outcome: failed',
+          'Attempt-recorded outcome: inconclusive', 'Synthetic uncertainty remains unresolved.',
+          'No attempts recorded for this registered variant.',
+          'Operation provenance: no operation observed (human-reported status).',
+          'Attempt-recorded outcome is not scientific success. Scientific validity: not assessed.']) {
+        if (!experimentDetail.textContent.includes(expectedText)) throw new Error('Missing experiment history: ' + expectedText);
+      }
+      if (experimentDetail.querySelector('button')) throw new Error('Read-only experiment history exposes a mutation control.');
+      return experimentDetail.textContent;
+    };
+    // Reload after the UI-authored records so the first comparison is the
+    // complete persisted workbench rather than its initial stale projection.
+    if (!expected.held) {
+      document.querySelector('#refresh').click();
+      await waitFor(() => document.querySelector('#events').textContent.includes('research.study_closed'));
+    }
+    const originalWorkbenchHistory = document.querySelector('#events').textContent;
+    const originalExperimentHistory = await inspectExperiment();
+    document.querySelector('#disconnect').click();
+    await waitFor(() => document.querySelector('#connection-status').textContent === 'Not connected' && document.querySelector('#workspace').hidden);
+    document.querySelector('#connection-open').click();
+    const reconnectForm = document.querySelector('#connection-form');
+    reconnectForm.elements.name.value = 'Synthetic fixture reconnect';
+    reconnectForm.elements.endpoint.value = expected.endpoint;
+    reconnectForm.requestSubmit();
+    await waitFor(() => document.querySelector('#projects button'));
+    const reconnectedProject = [...document.querySelectorAll('#projects button')].find(button => button.dataset.projectId === expected.projectId);
+    if (!reconnectedProject) throw new Error('Expected project is missing after reconnect.');
+    reconnectedProject.click();
+    await waitFor(() => document.querySelector('#events').textContent.includes(expected.coordinatorProposal) &&
+      document.querySelector('#events').textContent.includes(expected.statusAnswer));
+    if (document.querySelector('#events').textContent !== originalWorkbenchHistory) throw new Error('Coordinator workbench history changed across reconnect.');
+    const reconnectedExperimentHistory = await inspectExperiment();
+    if (reconnectedExperimentHistory !== originalExperimentHistory) throw new Error('Experiment history changed across reconnect.');
     if (typeof window.require !== 'undefined') throw new Error('Node is exposed to renderer.');
-    return { href: location.href, decisionRemoved: !expected.held, held: expected.held, researchVariants: 80 };
+    return { href: location.href, decisionRemoved: !expected.held, held: expected.held, researchVariants: 80, experimentReconnected: true, workbenchReconnected: true };
   })()`, true);
   if (result.href !== 'tessera://app/index.html' || errors.length) throw new Error('Unexpected renderer state.');
   console.log(JSON.stringify(result));

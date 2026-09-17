@@ -275,6 +275,85 @@ class WorkerRegistryStore(Store):
             connection.close()
 
     @classmethod
+    def _discovery_projection(cls, row: sqlite3.Row) -> dict[str, Any]:
+        """Return safe, read-only worker discovery metadata.
+
+        This deliberately is not a scheduling view.  It has no workload identity,
+        credential, target, endpoint, kubeconfig, or secret-reference fields.
+        A separate grant and lease admission still rechecks the worker record.
+        """
+        try:
+            fresh = _parse_utc(row["last_seen_at"]) >= cls._now() - HEARTBEAT_MAX_AGE
+            freshness = "fresh" if fresh else "stale"
+        except ValueError:
+            freshness = "unknown"
+
+        credential_status = "revoked" if row["credential_revoked_at"] is not None else "active"
+        if credential_status == "revoked":
+            admission, fence_reason = "fenced", "credential_revoked"
+        elif row["lifecycle_state"] == "retired":
+            admission, fence_reason = "fenced", "retired"
+        elif row["lifecycle_state"] != "ready":
+            admission, fence_reason = "fenced", f"lifecycle_{row['lifecycle_state']}"
+        elif freshness != "fresh":
+            admission, fence_reason = "fenced", f"heartbeat_{freshness}"
+        else:
+            # Even a fresh ready registration is not a dispatch decision.
+            admission, fence_reason = "requires_separate_active_grant", "registration_only"
+
+        return {
+            "id": row["id"],
+            "project_id": row["project_id"],
+            "approved_metadata": {
+                "build_identifier": row["approved_build_identifier"],
+                "build_digest": row["approved_build_digest"],
+                "region": row["region"],
+            },
+            "lifecycle": {
+                "state": row["lifecycle_state"],
+                "revision": row["revision"],
+                "registered_at": row["registered_at"],
+                "retired_at": row["retired_at"],
+                "credential_status": credential_status,
+            },
+            "freshness": {
+                "status": freshness,
+                "last_seen_at": row["last_seen_at"],
+                "heartbeat_max_age_seconds": int(HEARTBEAT_MAX_AGE.total_seconds()),
+            },
+            "capabilities": {"status": "not_probed", "probed": False},
+            "trust_zone": {
+                "status": "declared_unverified",
+                "trust_class": row["trust_class"],
+            },
+            "lease_admission": {
+                "registration_is_not_scheduling": True,
+                "status": admission,
+                "fence_reason": fence_reason,
+            },
+        }
+
+    def list_discovery(
+        self, actor: dict[str, Any], project_id: str, offset: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """List the project's safe worker-discovery projection only."""
+        connection = _connect(self.database_path)
+        try:
+            live = self._live_principal(connection, actor)
+            self._project(connection, live, project_id)
+            rows = connection.execute(
+                """SELECT registry.*, credentials.revoked_at AS credential_revoked_at
+                FROM worker_registry AS registry
+                JOIN credentials ON credentials.id = registry.credential_id
+                WHERE registry.org_id=? AND registry.project_id=?
+                ORDER BY registry.registered_at, registry.id LIMIT ? OFFSET ?""",
+                (live["org_id"], project_id, limit, offset),
+            ).fetchall()
+            return [self._discovery_projection(row) for row in rows]
+        finally:
+            connection.close()
+
+    @classmethod
     def require_ready_worker(
         cls, connection: sqlite3.Connection, worker: dict[str, Any], project_id: str
     ) -> None:

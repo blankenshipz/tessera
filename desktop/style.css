@@ -30,7 +30,7 @@ p { line-height: 1.65; }
 .messages { min-height: 100px; max-height: 380px; overflow: auto; margin: 18px 0; }
 .message { border-bottom: 1px solid #d8ddcf; padding: 10px 0; }
 .message .tag { margin-right: 8px; }
-.inbox, .experiments { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
+.inbox, .experiments, .workbench, .worker-discovery { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
 .ledger { border-top: 1px solid #d5dccd; margin: 34px 0; padding-top: 25px; }
 .ledger-grid { display: grid; grid-template-columns: minmax(220px, .65fr) minmax(360px, 1.35fr); gap: 28px; }
 .ledger-detail { min-height: 160px; }
@@ -42,10 +42,15 @@ p { line-height: 1.65; }
 .decision-actions { display: flex; gap: 10px; margin-top: 12px; }
 .decision-actions button:last-child { border-color: #9b7543; color: #704f27; }
 .tag { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: #65724f; }
-.labbook { border-top: 1px solid #d5dccd; margin-top: 40px; padding-top: 25px; }
 ol { list-style: none; padding-left: 0; }
 li { border-left: 2px solid #c2ceb5; padding: 4px 0 18px 20px; margin-left: 4px; }
 li time { display: block; font-size: 12px; color: #7b8073; margin-top: 6px; }
+select { display: block; width: 100%; margin-top: 8px; background: white; border: 1px solid #c2cabb; border-radius: 5px; padding: 11px; font: inherit; color: inherit; }
+.view-switch { display: flex; gap: 6px; }
+.view-switch button[aria-pressed="true"] { background: #d4dfc9; border-color: #8fa282; }
+.context-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.context-chip { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #c2ceb5; border-radius: 16px; padding: 5px 7px 5px 10px; font-size: 12px; overflow-wrap: anywhere; }
+.context-chip button { padding: 3px 7px; font-size: 11px; }
 dialog { border: 1px solid #b5c0ad; border-radius: 12px; background: #faf9f3; color: inherit; padding: 30px; max-width: 530px; width: 90%; }
 dialog::backdrop { background: #1d302a66; }
 label { display: block; font-size: 13px; margin: 20px 0; }

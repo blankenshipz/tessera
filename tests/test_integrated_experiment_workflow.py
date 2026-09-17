@@ -17,17 +17,25 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from tessera_agent import (
+    AgentCredential,
+    AstraAgentFacade,
+    ContextReference,
+    ExplainStatusCoordinator,
+    ProviderDisabledCoordinator,
+)
 from tessera_control.api import create_app
 from tessera_control.experiments import ExperimentStore
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.snapshots import SnapshotStore
-from tessera_control.store import Store, canonical_digest, initialize_state
+from tessera_control.store import Store, _connect, canonical_digest, initialize_state
 from tessera_control.workspace import capture_workspace, inventory_digest
 from tessera_worker.kubernetes_provider import (
     ClusterIdentity,
     JobBinding,
     KubernetesContractError,
     KubernetesJobJournal,
+    KubernetesNetworkPolicyEvidence,
     parse_job,
     reconcile_cancellation,
     reconcile_create,
@@ -132,6 +140,12 @@ def _cluster() -> ClusterIdentity:
         namespace="synthetic",
         cluster_uid="synthetic-cluster",
         namespace_uid="synthetic-namespace",
+        network_none_evidence=KubernetesNetworkPolicyEvidence(
+            "network-policy-enforced-v1",
+            "synthetic-deny-all",
+            "synthetic-policy",
+            "d" * 64,
+        ),
     )
 
 
@@ -148,6 +162,8 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     worker_token = "synthetic-worker-" + "x" * 48
     worker_headers = {"Authorization": f"Bearer {worker_token}"}
+    coordinator_token = "synthetic-coordinator-" + "y" * 40
+    coordinator_headers = {"Authorization": f"Bearer {coordinator_token}"}
     counter = 0
 
     with TestClient(create_app(state)) as client:
@@ -159,6 +175,7 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
             expected: int | tuple[int, ...] = (200, 201),
             *,
             worker: bool = False,
+            coordinator: bool = False,
             key: str | None = None,
         ) -> dict[str, Any]:
             nonlocal counter
@@ -167,7 +184,13 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
                 method,
                 path,
                 json=body,
-                headers=(worker_headers if worker else owner_headers)
+                headers=(
+                    worker_headers
+                    if worker
+                    else coordinator_headers
+                    if coordinator
+                    else owner_headers
+                )
                 | {"Idempotency-Key": key or f"integrated-{counter}"},
             )
             expected_codes = (expected,) if isinstance(expected, int) else expected
@@ -195,6 +218,22 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             },
             201,
+        )
+        coordinator_credential = call(
+            "POST",
+            "/credentials",
+            {
+                "kind": "agent",
+                "audience": "control",
+                "token": coordinator_token,
+                "project_id": project["id"],
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            },
+            201,
+        )
+        coordinator = AstraAgentFacade(
+            client,
+            AgentCredential(token=coordinator_token, project_id=project["id"]),
         )
         call(
             "POST",
@@ -252,6 +291,126 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
                 },
             },
         )
+
+        def design_for(
+            active_task: dict[str, Any],
+            active_plan: dict[str, Any],
+            expected_revision: int | None = None,
+        ) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                "goal": "Compare one synthetic baseline with one intervention.",
+                "success_criterion": "A human reviews quarantined synthetic evidence.",
+                "protocol": "No live execution; retain all terminal labels.",
+                "variants": [
+                    {
+                        "kind": "baseline",
+                        "name": "baseline",
+                        "method_digest": "d" * 64,
+                        "input_digest": "e" * 64,
+                        "execution_task_id": active_task["id"],
+                        "execution_plan_digest": active_plan["current_plan_digest"],
+                        "metadata": {"synthetic": True},
+                    },
+                    {
+                        "kind": "intervention",
+                        "name": "intervention",
+                        "method_digest": "f" * 64,
+                        "input_digest": "0" * 64,
+                        "execution_task_id": active_task["id"],
+                        "execution_plan_digest": active_plan["current_plan_digest"],
+                        "metadata": {"synthetic": True},
+                    },
+                ],
+            }
+            if expected_revision is not None:
+                body["expected_revision"] = expected_revision
+            return body
+
+        # The coordinator sees only a revision-fenced control record.  Its output
+        # is a durable proposal, not authority to approve the plan or dispatch it.
+        requested_turn = call(
+            "POST",
+            f"/astra/projects/{project['id']}/turns",
+            {
+                "expected_conversation_revision": 0,
+                "prompt": "Propose one baseline and intervention for human review.",
+                "selected_context": [
+                    {
+                        "kind": "task",
+                        "record_id": task["id"],
+                        "expected_revision": plan["revision"],
+                    }
+                ],
+            },
+            201,
+        )
+        claimed_turn = call(
+            "POST",
+            f"/astra/turns/{requested_turn['turn']['id']}/claim",
+            {"expected_revision": requested_turn["turn"]["revision"]},
+            coordinator=True,
+        )
+        coordinator_output = ProviderDisabledCoordinator(coordinator).assemble(
+            "Propose one baseline and intervention for human review.",
+            [
+                ContextReference(
+                    kind="task",
+                    record_id=task["id"],
+                    expected_revision=plan["revision"],
+                )
+            ],
+        )
+        completed_turn = call(
+            "POST",
+            f"/astra/turns/{requested_turn['turn']['id']}/complete",
+            {
+                "expected_revision": claimed_turn["revision"],
+                **coordinator_output.model_dump(mode="json"),
+                "design": design_for(task, plan),
+            },
+            coordinator=True,
+        )
+        proposal = completed_turn["proposal"]
+        assert proposal["provider_disabled"] is True
+        assert proposal["authority_effect"] == "none"
+        assert proposal["execution_authorized"] is False
+        registered = call(
+            "POST",
+            f"/astra/proposals/{proposal['id']}/register-design",
+            {"expected_context_digest": proposal["context_digest"]},
+            201,
+            key="registered-coordinator-design",
+        )
+        # Retrying a lost registration response returns its original persisted
+        # record; it cannot create another experiment/design operation.
+        assert (
+            call(
+                "POST",
+                f"/astra/proposals/{proposal['id']}/register-design",
+                {"expected_context_digest": proposal["context_digest"]},
+                201,
+                key="registered-coordinator-design",
+            )
+            == registered
+        )
+        experiment = registered["experiment"]
+        assert registered["execution_authorized"] is False
+        assert {variant["kind"] for variant in experiment["design"]["variants"]} == {
+            "baseline",
+            "intervention",
+        }
+
+        # Agent credentials are read-only coordinator credentials.  Neither a
+        # proposal nor its registration can impersonate the human approval gate.
+        agent_approval = client.post(
+            f"/tasks/{task['id']}/approve",
+            json={
+                "expected_revision": plan["revision"],
+                "expected_plan_digest": plan["current_plan_digest"],
+            },
+            headers=coordinator_headers | {"Idempotency-Key": "agent-cannot-approve"},
+        )
+        assert agent_approval.status_code == 403
         approved = call(
             "POST",
             f"/tasks/{task['id']}/approve",
@@ -313,43 +472,78 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
                 },
             )
 
-        def design_for(
-            active_task: dict[str, Any],
-            active_plan: dict[str, Any],
-            expected_revision: int | None = None,
-        ) -> dict[str, Any]:
-            body: dict[str, Any] = {
-                "goal": "Compare one synthetic baseline with one intervention.",
-                "success_criterion": "A human reviews quarantined synthetic evidence.",
-                "protocol": "No live execution; retain all terminal labels.",
-                "variants": [
-                    {
-                        "kind": "baseline",
-                        "name": "baseline",
-                        "method_digest": "d" * 64,
-                        "input_digest": "e" * 64,
-                        "execution_task_id": active_task["id"],
-                        "execution_plan_digest": active_plan["current_plan_digest"],
-                        "metadata": {"synthetic": True},
-                    },
-                    {
-                        "kind": "intervention",
-                        "name": "intervention",
-                        "method_digest": "f" * 64,
-                        "input_digest": "0" * 64,
-                        "execution_task_id": active_task["id"],
-                        "execution_plan_digest": active_plan["current_plan_digest"],
-                        "metadata": {"synthetic": True},
-                    },
-                ],
-            }
-            if expected_revision is not None:
-                body["expected_revision"] = expected_revision
-            return body
-
-        experiment = call(
-            "POST", f"/projects/{project['id']}/experiments", design_for(task, approved), 201
+        # The human-approved exact plan is distinct from the earlier proposal
+        # registration.  The status turn below permits one mediated, attributed
+        # control read and no provider/model/tool/skill execution.
+        status_request = call(
+            "POST",
+            f"/astra/projects/{project['id']}/explain-status-turns",
+            {
+                "expected_conversation_revision": 2,
+                "prompt": "What is the durable experiment status before execution?",
+                "experiment_id": experiment["id"],
+                "expected_design_revision": experiment["current_design_revision"],
+            },
+            201,
         )
+
+        class StatusControl:
+            def claim(self, turn_id: str, expected_revision: int) -> dict[str, Any]:
+                return call(
+                    "POST",
+                    f"/astra/explain-status-turns/{turn_id}/claim",
+                    {"expected_revision": expected_revision},
+                    coordinator=True,
+                )
+
+            def begin_tool(
+                self, turn_id: str, expected_revision: int, experiment_id: str
+            ) -> dict[str, Any]:
+                assert experiment_id == experiment["id"]
+                return call(
+                    "POST",
+                    f"/astra/explain-status-turns/{turn_id}/tool-intent",
+                    {
+                        "expected_revision": expected_revision,
+                        "tool": "read_experiment_status",
+                        "arguments": {"identifier": experiment_id},
+                    },
+                    coordinator=True,
+                )
+
+            def record_result(
+                self, turn_id: str, expected_revision: int, result: dict[str, Any]
+            ) -> dict[str, Any]:
+                return call(
+                    "POST",
+                    f"/astra/explain-status-turns/{turn_id}/tool-result",
+                    {"expected_revision": expected_revision, "result": result},
+                    coordinator=True,
+                )
+
+            def answer(self, turn_id: str, expected_revision: int) -> dict[str, Any]:
+                return call(
+                    "POST",
+                    f"/astra/explain-status-turns/{turn_id}/answer",
+                    {"expected_revision": expected_revision},
+                    coordinator=True,
+                )
+
+            def uncertain(self, turn_id: str, expected_revision: int) -> dict[str, Any]:
+                return call(
+                    "POST",
+                    f"/astra/explain-status-turns/{turn_id}/uncertain",
+                    {"expected_revision": expected_revision},
+                    coordinator=True,
+                )
+
+        status = ExplainStatusCoordinator(coordinator, StatusControl()).run(
+            status_request["turn_id"], 1
+        )
+        assert status["state"] == "completed"
+        assert status["answer"]["provider_disabled"] is True
+        assert status["answer"]["operation_ids"] == []
+        assert "Scientific validity remains not assessed" in status["answer"]["body"]
         variants = {variant["kind"]: variant for variant in experiment["design"]["variants"]}
 
         def admitted_package(
@@ -441,6 +635,23 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
             variants["baseline"], "success", task, approved
         )
         baseline_attempt = baseline_package["admitted_attempt_id"]
+        baseline_admitted = next(
+            item
+            for item in client.get(
+                f"/experiments/{experiment['id']}", headers=owner_headers
+            ).json()["admitted_attempts"]
+            if item["id"] == baseline_attempt
+        )
+        agent_dispatch = client.post(
+            f"/experiment-admitted-attempts/{baseline_attempt}/dispatch",
+            json={
+                "expected_revision": baseline_admitted["revision"],
+                "target_digest": "a" * 64,
+                "profile_version": "development-minikube-opencode-v1",
+            },
+            headers=coordinator_headers | {"Idempotency-Key": "agent-cannot-dispatch"},
+        )
+        assert agent_dispatch.status_code == 403
         baseline_kube, _ = kube(baseline_package, baseline_attempt, "success")
         baseline_kube.complete("succeeded")
         assert (
@@ -859,6 +1070,36 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
         assert exported_body["conclusions"][0]["status"] == "reviewed"
         assert exported_body["conclusions"][0]["scientific_validity"] == "not_assessed"
         assert exported_body["artifacts"][0]["custody_state"] == "active"
+        # The injected Kubernetes observations are explicitly fixture effects;
+        # only their receipts, observations, artifacts, measurements, and human
+        # conclusion are persisted control records.  No coordinator path loaded a
+        # skill or gained provider/model/approval/dispatch authority.
+        assert coordinator.provider_enabled is False
+        assert coordinator_output.provider_disabled is True
+        assert unknown_current["operational_observed_state"] == "unknown"
+        assert unknown_current["operational_termination_confirmed"] is False
+        with _connect(state / "tessera.sqlite3") as connection:
+            assert (
+                connection.execute(
+                    "SELECT count(*) FROM astra_proposals WHERE provider_disabled=1"
+                ).fetchone()[0]
+                == 1
+            )
+            assert (
+                connection.execute(
+                    "SELECT count(*) FROM astra_status_tool_invocations "
+                    "WHERE tool_name != 'read_experiment_status'"
+                ).fetchone()[0]
+                == 0
+            )
+            assert connection.execute("SELECT count(*) FROM skill_snapshots").fetchone()[0] == 0
+            assert (
+                connection.execute(
+                    "SELECT count(*) FROM execution_grants WHERE created_by_principal_id=?",
+                    (coordinator_credential["principal_id"],),
+                ).fetchone()[0]
+                == 0
+            )
 
     backup, restored = tmp_path / "backup", tmp_path / "restored"
     backup_state(state, backup)

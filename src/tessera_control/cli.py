@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
+import stat
 import sys
 from pathlib import Path
 
 import uvicorn
 
 from .api import create_app
+from .deployment import serving_config
 from .recovery import backup_state, restore_state
 from .store import StoreError, initialize_state, migrate_state
 from .workspace import WorkspaceError
@@ -29,11 +32,45 @@ def _add_minikube_provisioning_command(subcommands: argparse._SubParsersAction) 
     command.add_argument("--journal", type=Path, help="local path for sanitized operation result")
 
 
+def _add_astra_setup_command(subcommands: argparse._SubParsersAction) -> None:
+    """Register the deliberately separate Astra operator setup command family."""
+    command = subcommands.add_parser("astra-setup", help="operator-only retained Kubernetes setup")
+    actions = command.add_subparsers(dest="astra_setup_action", required=True)
+    actions.add_parser("profiles", help="list setup profiles without host access")
+    for name in ("validate", "discover", "plan"):
+        action = actions.add_parser(name)
+        action.add_argument("--target", required=True, choices=["docker-desktop-kubernetes-v1"])
+        action.add_argument("--kubeconfig", required=True, type=Path)
+        action.add_argument("--context", required=True, choices=["docker-desktop"])
+        action.add_argument("--namespace", required=True)
+        action.add_argument("--image", required=True)
+        action.add_argument("--runtime-identity", required=True)
+        if name in ("discover", "plan"):
+            action.add_argument("--output", required=True, type=Path)
+    apply = actions.add_parser("apply", help="apply only an exact approved setup plan")
+    apply.add_argument("--plan", required=True, type=Path)
+    apply.add_argument("--approved-plan", required=True)
+    apply.add_argument("--journal", required=True, type=Path)
+    status = actions.add_parser("status", help="read selected setup resource status")
+    status.add_argument("--plan", required=True, type=Path)
+    status.add_argument("--journal", type=Path)
+    attach = actions.add_parser(
+        "attach", help="report that execution attachment remains unavailable"
+    )
+    attach.add_argument("--plan", required=True, type=Path)
+    export = actions.add_parser(
+        "export-live-v2", help="export provider-v2 prerequisites; never run them"
+    )
+    export.add_argument("--plan", required=True, type=Path)
+    export.add_argument("--output", required=True, type=Path)
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="tessera")
     subcommands = command.add_subparsers(dest="command", required=True)
     add_workspace_commands(subcommands)
     _add_minikube_provisioning_command(subcommands)
+    _add_astra_setup_command(subcommands)
     initialize = subcommands.add_parser("init")
     initialize.add_argument("--state-dir", required=True, type=Path)
     migrate = subcommands.add_parser("migrate")
@@ -47,6 +84,9 @@ def parser() -> argparse.ArgumentParser:
     serve = subcommands.add_parser("serve")
     serve.add_argument("--state-dir", required=True, type=Path)
     serve.add_argument("--port", required=True, type=int, choices=range(1, 65_536))
+    serve.add_argument("--bind-host", default="127.0.0.1")
+    serve.add_argument("--trusted-host", action="append")
+    serve.add_argument("--public-origin")
     return command
 
 
@@ -112,10 +152,142 @@ def _run_minikube_provisioning(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _write_operator_json(path: Path, value: object) -> None:
+    """Publish a non-secret plan/discovery only once, never following a symlink."""
+    if not path.is_absolute() or path.exists() or path.is_symlink():
+        raise ValueError("operator output must be a new absolute non-symlink path")
+    parent_stat = path.parent.stat(follow_symlinks=False)
+    if (
+        stat.S_ISLNK(parent_stat.st_mode)
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.getuid()
+        or parent_stat.st_mode & 0o077
+    ):
+        raise ValueError("operator output parent must be an existing private directory")
+    with path.open("x", encoding="utf-8") as output:
+        output.write(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        output.write("\n")
+    path.chmod(0o600)
+
+
+def _run_astra_setup(arguments: argparse.Namespace) -> int:
+    # This isolated import ensures ordinary local control paths never need kubectl.
+    from tessera_provisioner.astra_setup import (
+        AstraDockerDesktopSetup,
+        AstraSetupError,
+        SetupJournal,
+        SetupPlan,
+        SetupProfile,
+        plan_from_json,
+        plan_json,
+        profile_catalog,
+    )
+
+    try:
+        if arguments.astra_setup_action == "profiles":
+            print(json.dumps({"profiles": profile_catalog()}, sort_keys=True))
+            return 0
+        if arguments.astra_setup_action in {"validate", "discover", "plan"}:
+            profile = SetupProfile.docker_desktop(
+                arguments.namespace, arguments.image, arguments.runtime_identity
+            )
+            operator = AstraDockerDesktopSetup(arguments.kubeconfig, arguments.context)
+            if arguments.astra_setup_action == "validate":
+                print(json.dumps(operator.validate(profile), sort_keys=True))
+                return 0
+            discovery = operator.discover(profile)
+            if arguments.astra_setup_action == "discover":
+                _write_operator_json(arguments.output, discovery.payload())
+                print(
+                    json.dumps(
+                        {"state": "discovered", "output": str(arguments.output)}, sort_keys=True
+                    )
+                )
+                return 0
+            plan = SetupPlan.create(profile, discovery)
+            _write_operator_json(arguments.output, json.loads(plan_json(plan)))
+            print(
+                json.dumps(
+                    {
+                        "state": "planned",
+                        "plan_digest": plan.digest,
+                        "output": str(arguments.output),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        plan = plan_from_json(arguments.plan)
+        operator = AstraDockerDesktopSetup(Path(plan.discovery.kubeconfig), plan.discovery.context)
+        if arguments.astra_setup_action == "apply":
+            result = operator.apply(plan, arguments.approved_plan, SetupJournal(arguments.journal))
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if arguments.astra_setup_action == "status":
+            result = operator.status(plan)
+            if arguments.journal is not None:
+                SetupJournal(arguments.journal).record({"event": "status", **result})
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if arguments.astra_setup_action == "attach":
+            print(
+                json.dumps(
+                    {
+                        "state": "not_attached",
+                        "plan_digest": plan.digest,
+                        "message": (
+                            "Setup does not attach an execution target, enroll a worker, "
+                            "grant authority, or dispatch work."
+                        ),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if arguments.astra_setup_action == "export-live-v2":
+            export = {
+                "version": "astra-live-v2-export-v1",
+                "setup_plan_digest": plan.digest,
+                "target": {
+                    "context": plan.discovery.context,
+                    "server": plan.discovery.server,
+                    "ca_sha256": plan.discovery.ca_sha256,
+                    "cluster_uid": plan.discovery.cluster_uid,
+                    "namespace": plan.profile.namespace,
+                },
+                "image": plan.profile.image,
+                "runtime_identity": plan.profile.runtime_identity,
+                "state": "provider_effects_not_authorized",
+                "required_confirmation": (
+                    "external v2 runner preflight and one-use provider confirmation"
+                ),
+                "limitations": [
+                    (
+                        "export does not create a Secret, deployment, grant, worker, Job, "
+                        "provider call, or OAuth effect"
+                    ),
+                    "the existing external v2 runner owns provider preflight and confirmation",
+                ],
+            }
+            _write_operator_json(arguments.output, export)
+            print(
+                json.dumps({"state": "exported", "output": str(arguments.output)}, sort_keys=True)
+            )
+            return 0
+        raise AssertionError("unreachable Astra setup action")
+    except (AstraSetupError, ValueError, OSError) as error:
+        print(
+            json.dumps({"state": "failed", "message": str(error)}, sort_keys=True), file=sys.stderr
+        )
+        return 1
+
+
 def main() -> int:
     arguments = parser().parse_args()
     if arguments.command == "minikube-provision":
         return _run_minikube_provisioning(arguments)
+    if arguments.command == "astra-setup":
+        return _run_astra_setup(arguments)
     if arguments.command == "workspace":
         try:
             return run_workspace(arguments)
@@ -147,7 +319,17 @@ def main() -> int:
         print(header_path)
         return 0
     if arguments.command == "serve":
-        # No host option is intentional: this local mode must never bind publicly.
-        uvicorn.run(create_app(arguments.state_dir), host="127.0.0.1", port=arguments.port)
+        try:
+            deployment = serving_config(
+                arguments.bind_host, arguments.trusted_host, arguments.public_origin
+            )
+        except ValueError as error:
+            print(f"serve configuration error: {error}", file=sys.stderr)
+            return 2
+        uvicorn.run(
+            create_app(arguments.state_dir, deployment),
+            host=arguments.bind_host,
+            port=arguments.port,
+        )
         return 0
     raise AssertionError("unreachable")

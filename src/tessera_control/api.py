@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .deployment import DeploymentConfig, backend_status
 from .models import ApproveTask, CreateCredential, CreateProject, CreateTask, ReviseTaskPlan
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, _token_hash, canonical_digest
 
@@ -59,11 +60,15 @@ def worker_principal(
         _unauthorized()
 
 
-def create_app(state_dir: Path) -> FastAPI:
-    """Build a loopback-only local control API around an existing initialized state."""
+def create_app(state_dir: Path, deployment: DeploymentConfig | None = None) -> FastAPI:
+    """Build a control API with an explicit serving profile around initialized state."""
 
     from .artifact_api import router as artifact_router
     from .artifact_disposition_api import router as artifact_disposition_router
+    from .astra import AstraStore
+    from .astra_api import router as astra_router
+    from .astra_status import AstraStatusStore
+    from .astra_status_api import router as astra_status_router
     from .credential_lease_api import router as credential_lease_router
     from .credential_leases import _FakeSecretBackend
     from .execution import ExecutionStore
@@ -82,8 +87,54 @@ def create_app(state_dir: Path) -> FastAPI:
     from .snapshot_releases import SnapshotReleaseStore
     from .snapshots import SnapshotStore
 
-    store = Store(state_dir)
+    deployment = deployment or DeploymentConfig.local()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.deployment = deployment
+
+    @app.middleware("http")
+    async def readiness_gate(request: Request, call_next: Any) -> Any:
+        if request.url.path not in {"/health", "/health/live", "/health/ready"}:
+            status = backend_status(state_dir)
+            # A held recovery is intentionally served for authenticated forensics;
+            # Store rejects every mutation there. Schema/state failures admit no API.
+            if status["status"] != "ready" and status["reason"] != "recovery_hold":
+                return JSONResponse(
+                    status_code=503, content={"detail": "Control plane is not ready."}
+                )
+        return await call_next(request)
+
+    @app.get("/health/live")
+    def liveness() -> dict[str, str]:
+        return {"status": "live"}
+
+    @app.get("/health")
+    def legacy_health() -> dict[str, str]:
+        """Keep the established local Compose probe response stable."""
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def readiness() -> JSONResponse:
+        status = backend_status(state_dir)
+        payload = {
+            **status,
+            "deployment_profile": deployment.profile,
+            "public_origin": deployment.public_origin,
+        }
+        return JSONResponse(
+            status_code=200 if status["status"] == "ready" else 503, content=payload
+        )
+
+    try:
+        store = Store(state_dir)
+    except ValueError as error:
+        # An older/newer schema must keep a Pod alive long enough for its readiness
+        # probe to state the migration problem, while all authority remains closed.
+        if "schema version" not in str(error) and "requires an explicit" not in str(error):
+            raise
+        app.state.store = None
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(deployment.trusted_hosts))
+        app.add_middleware(RejectBrowserOriginsMiddleware)
+        return app
     app.state.store = store
     # Private in-memory development/test seam.  It has no persisted values or API
     # for inserting/resolving secret values.
@@ -100,15 +151,19 @@ def create_app(state_dir: Path) -> FastAPI:
     app.state.research = ResearchStore(state_dir)
     app.state.experiments = ExperimentStore(state_dir)
     app.state.interactions = InteractionStore(store)
+    app.state.astra = AstraStore(store)
+    app.state.astra_status = AstraStatusStore(store)
     snapshots = SnapshotStore(state_dir)
     app.include_router(research_router)
     app.include_router(experiments_router)
     app.include_router(interaction_router)
     app.include_router(interaction_worker_router)
+    app.include_router(astra_router)
+    app.include_router(astra_status_router)
     app.include_router(handoff_router)
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],
+        allowed_hosts=list(deployment.trusted_hosts),
     )
     app.add_middleware(RejectBrowserOriginsMiddleware)
 
@@ -127,10 +182,6 @@ def create_app(state_dir: Path) -> FastAPI:
         else:
             status = 400
         return JSONResponse(status_code=status, content={"detail": str(error)})
-
-    @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
 
     @app.get("/me")
     def me(actor: Annotated[dict[str, Any], Depends(principal)]) -> dict[str, Any]:
