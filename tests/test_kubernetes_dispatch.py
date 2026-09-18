@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from copy import deepcopy
@@ -15,8 +16,9 @@ from tessera_control.api import create_app
 from tessera_control.execution import ExecutionStore
 from tessera_control.workers import WorkerRegistryStore
 from tessera_worker.control_channel import ControlChannelError
-from tessera_worker.kubernetes_contracts import cluster_identity_digest
+from tessera_worker.kubernetes_contracts import KubernetesProviderIdentity, cluster_identity_digest
 from tessera_worker.kubernetes_dispatch_service import (
+    KubernetesClaimIntentJournal,
     KubernetesDispatchWorkerConfig,
     KubernetesDispatchWorkerService,
 )
@@ -44,6 +46,30 @@ class _ApiChannel:
             self.lose_claim_reply = False
             raise ConnectionError("synthetic lost claim reply")
         return response.json()
+
+
+class _ControlledClock:
+    """Advance wall and monotonic time only when a test schedules it."""
+
+    def __init__(self, wall: datetime) -> None:
+        self.wall = wall
+        self.elapsed = 0.0
+
+    def now(self) -> datetime:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def advance(self, seconds: float) -> None:
+        self.wall += timedelta(seconds=seconds)
+        self.elapsed += seconds
+
+    def move_to(self, wall: datetime) -> None:
+        delta = (wall - self.wall).total_seconds()
+        if delta < 0:
+            raise ValueError("controlled clock cannot move backward")
+        self.advance(delta)
 
 
 def _owner_headers(state) -> dict[str, str]:
@@ -76,18 +102,46 @@ def _dispatch(client: TestClient, state, response: dict, target: str) -> dict:
     return approved.json()
 
 
-def _service(tmp_path, client, dispatch, fake, cluster, *, lose_claim_reply=False, channel=None):
+def _service(
+    tmp_path,
+    client,
+    dispatch,
+    fake,
+    cluster,
+    *,
+    lose_claim_reply=False,
+    channel=None,
+    next_dispatch=False,
+    clock=None,
+):
     root = tmp_path / "worker"
     root.mkdir(mode=0o700, exist_ok=True)
     credential = tmp_path / "worker.credential"
     credential.write_text("worker-token")
     credential.chmod(0o600)
+    config = (
+        KubernetesDispatchWorkerConfig(
+            control_url="http://127.0.0.1:8765",
+            credential_file=credential,
+            workspace_root=root,
+        )
+        if next_dispatch
+        else KubernetesDispatchWorkerConfig(
+            "http://127.0.0.1:8765", dispatch["id"], credential, root
+        )
+    )
+    clock_options = (
+        {"now": clock.now, "monotonic": clock.monotonic, "sleep": clock.advance}
+        if clock is not None
+        else {}
+    )
     return KubernetesDispatchWorkerService(
-        KubernetesDispatchWorkerConfig("http://127.0.0.1:8765", dispatch["id"], credential, root),
+        config,
         cluster,
         fake.package.output,
         fake.adapter(root / "kubernetes.sqlite3"),
         channel=channel or _ApiChannel(client, lose_claim_reply=lose_claim_reply),
+        **clock_options,
     )
 
 
@@ -109,6 +163,422 @@ def test_approved_dispatch_claims_once_runs_control_package_and_exports_linkage(
     ).json()
     assert exported["kubernetes_dispatches"][0]["operation_id"] == first["operation_id"]
     assert exported["operations"][0]["experiment_attempt_id"] == first["admitted_attempt_id"]
+
+
+def test_worker_next_dispatch_claim_is_idle_without_an_eligible_dispatch(tmp_path):
+    _response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/worker/kubernetes-dispatches/next/claim",
+        json={
+            "target_digest": cluster_identity_digest(cluster),
+            "profile_version": cluster.profile,
+        },
+        headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "next-idle"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "dispatch": None,
+        "availability": "idle",
+        "execution_dispatched": False,
+    }
+    assert package.package["operation_id"]
+
+
+def test_worker_service_claims_next_dispatch_without_a_fixed_dispatch_id(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+
+    result = _service(tmp_path, client, dispatch, fake, cluster, next_dispatch=True).run(
+        max_cycles=1
+    )
+
+    assert result["dispatch_id"] == dispatch["id"]
+    assert fake.creates == 1
+    with sqlite3.connect(tmp_path / "worker" / "kubernetes-claims.sqlite3") as connection:
+        assert connection.execute("SELECT dispatch_id FROM dispatch_descriptors").fetchall() == [
+            (dispatch["id"],)
+        ]
+        assert (
+            connection.execute(
+                "SELECT dispatch_id FROM dispatch_descriptors WHERE dispatch_id='next'"
+            ).fetchall()
+            == []
+        )
+
+
+def test_next_claim_journal_advances_after_idle_and_isolates_operation_effects(tmp_path):
+    root = tmp_path / "worker"
+    root.mkdir(mode=0o700)
+    scanner = KubernetesClaimIntentJournal(root, "next")
+
+    # An idle response is acknowledged, so it cannot trap a later queued A
+    # behind its old idempotency key. A lost A acknowledgement instead leaves
+    # the pending key replayable until control returns that same A.
+    idle_key = scanner.key()
+    scanner.complete()
+    a_key = scanner.key()
+    assert a_key != idle_key
+
+    operation_a = KubernetesClaimIntentJournal(root, "dispatch-a")
+    operation_b = KubernetesClaimIntentJournal(root, "dispatch-b")
+    report_a, key_a, sequence_a = operation_a.report("a" * 32, {"state": "running"})
+    report_b, key_b, sequence_b = operation_b.report("b" * 32, {"state": "running"})
+
+    assert report_a == report_b == {"state": "running"}
+    assert key_a != key_b
+    operation_a.complete_report("a" * 32, sequence_a)
+    assert operation_a.pending_report("a" * 32) is None
+    assert operation_b.pending_report("b" * 32) == (report_b, key_b, sequence_b)
+
+
+def test_next_claim_journal_replays_a_legacy_lost_ack_before_advancing(tmp_path):
+    root = tmp_path / "worker"
+    root.mkdir(mode=0o700)
+    original = KubernetesClaimIntentJournal(root, "next")
+    legacy_key = "legacy-lost-ack"
+    with sqlite3.connect(original.path) as connection:
+        connection.execute("INSERT INTO claims VALUES (?,?,0)", ("next", legacy_key))
+
+    restarted = KubernetesClaimIntentJournal(root, "next")
+    assert restarted.key() == legacy_key
+    restarted.complete()
+    assert restarted.key() != legacy_key
+
+
+def test_next_claim_reclaims_a_stale_exact_worker_dispatch_without_new_authority(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client = TestClient(create_app(state))
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    claim_path = "/worker/kubernetes-dispatches/next/claim"
+    body = {"target_digest": cluster_identity_digest(cluster), "profile_version": cluster.profile}
+    headers = {"Authorization": "Bearer worker-token", "Idempotency-Key": "claim-a"}
+    first = client.post(claim_path, json=body, headers=headers)
+    assert first.status_code == 200
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE kubernetes_dispatches SET claimed_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(minutes=2)).isoformat(), dispatch["id"]),
+        )
+    reclaimed = client.post(
+        claim_path,
+        json=body,
+        headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "claim-a-reclaimed"},
+    )
+    assert reclaimed.status_code == 200
+    assert reclaimed.json()["dispatch"]["id"] == dispatch["id"]
+    assert reclaimed.json()["dispatch"]["claimed_at"] > first.json()["dispatch"]["claimed_at"]
+    assert reclaimed.json()["package"]["operation_id"] == package.operation_id
+
+
+@pytest.mark.parametrize(
+    ("authority_change", "expected_reason"),
+    (
+        ("grant_revocation", "authority_lost"),
+        ("credential_loss", "authority_lost"),
+        ("lease_expiry", "lease_expiry"),
+    ),
+)
+def test_queue_restart_recovers_unfinished_job_before_control_authority(
+    tmp_path, authority_change, expected_reason
+):
+    response, worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+
+    assert (
+        _service(tmp_path, client, dispatch, fake, cluster, next_dispatch=True).run(max_cycles=1)[
+            "status"
+        ]
+        == "running"
+    )
+    assert fake.jobs[package.binding.job_name]["metadata"]["uid"] == "job-fixture"
+
+    if authority_change == "grant_revocation":
+        revoked = client.post(
+            f"/execution-grants/{package.package['grant_id']}/revoke",
+            json={"expected_revision": 1},
+            headers=_owner_headers(state) | {"Idempotency-Key": "queue-restart-revoke"},
+        )
+        assert revoked.status_code == 200
+    elif authority_change == "credential_loss":
+        assert worker["credential_id"]
+        (tmp_path / "worker.credential").unlink()
+    else:
+        with sqlite3.connect(state / "tessera.sqlite3") as connection:
+            connection.execute(
+                "UPDATE execution_leases SET expires_at=? WHERE id=?",
+                (
+                    (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                    package.binding.lease_id,
+                ),
+            )
+
+    channel = None if authority_change == "credential_loss" else _ApiChannel(client)
+    if channel is None:
+        root = tmp_path / "worker"
+        restarted = KubernetesDispatchWorkerService(
+            KubernetesDispatchWorkerConfig(
+                control_url="http://127.0.0.1:8765",
+                credential_file=tmp_path / "worker.credential",
+                workspace_root=root,
+            ),
+            cluster,
+            package.output,
+            fake.adapter(root / "kubernetes.sqlite3"),
+        )
+    else:
+        restarted = _service(
+            tmp_path,
+            client,
+            dispatch,
+            fake,
+            cluster,
+            channel=channel,
+            next_dispatch=True,
+        )
+    if authority_change == "lease_expiry":
+        restarted.now = lambda: package.lease_expires_at + timedelta(seconds=1)
+    result = restarted.run(max_cycles=1)
+
+    assert result["status"] == "cancel_requested"
+    assert result["cancellation"]["reason"] == expected_reason
+    assert result["cancellation"]["job_uid"] == "job-fixture"
+    assert result["cancellation"]["termination_confirmed"] is True
+    assert fake.creates == 1
+    if channel is not None:
+        assert not any(
+            path == "/worker/kubernetes-dispatches/next/claim" for path, _ in channel.calls
+        )
+    else:
+        # The confirmed local stop is still unresolved because no credential
+        # could report it. A later restart must retain ownership, not say idle.
+        repeated = KubernetesDispatchWorkerService(
+            KubernetesDispatchWorkerConfig(
+                control_url="http://127.0.0.1:8765",
+                credential_file=tmp_path / "worker.credential",
+                workspace_root=tmp_path / "worker",
+            ),
+            cluster,
+            package.output,
+            fake.adapter(tmp_path / "worker" / "kubernetes.sqlite3"),
+        ).run(max_cycles=1)
+        assert repeated["status"] == "report_draining"
+        assert repeated["recovery_owner"] == "worker_report_delivery"
+        assert fake.creates == 1
+
+
+def test_queue_restart_control_outage_reconciles_then_cancels_original_job(tmp_path):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    assert (
+        _service(tmp_path, client, dispatch, fake, cluster, next_dispatch=True).run(max_cycles=1)[
+            "status"
+        ]
+        == "running"
+    )
+    now = [datetime.now(UTC)]
+
+    class Offline:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def post(self, path, _body, _key):
+            self.calls.append(path)
+            raise ConnectionError("control offline")
+
+    first_channel = Offline()
+    first = _service(
+        tmp_path,
+        client,
+        dispatch,
+        fake,
+        cluster,
+        channel=first_channel,
+        next_dispatch=True,
+    )
+    first.now = lambda: now[0]
+    first.control_outage_seconds = 1
+    assert first.run(max_cycles=1)["status"] == "running"
+
+    now[0] += timedelta(seconds=2)
+    restarted_channel = Offline()
+    restarted = _service(
+        tmp_path,
+        client,
+        dispatch,
+        fake,
+        cluster,
+        channel=restarted_channel,
+        next_dispatch=True,
+    )
+    restarted.now = lambda: now[0]
+    restarted.control_outage_seconds = 1
+    result = restarted.run(max_cycles=1)
+
+    assert result["status"] == "cancel_requested"
+    assert result["cancellation"]["reason"] == "control_outage"
+    assert result["cancellation"]["job_uid"] == "job-fixture"
+    assert fake.creates == 1
+    assert "/worker/kubernetes-dispatches/next/claim" not in (
+        first_channel.calls + restarted_channel.calls
+    )
+    repeated_channel = Offline()
+    repeated = _service(
+        tmp_path,
+        client,
+        dispatch,
+        fake,
+        cluster,
+        channel=repeated_channel,
+        next_dispatch=True,
+    )
+    repeated.now = lambda: now[0]
+    repeated.control_outage_seconds = 1
+    assert repeated.run(max_cycles=1)["status"] == "cancel_requested"
+    assert "/worker/kubernetes-dispatches/next/claim" not in repeated_channel.calls
+    assert fake.creates == 1
+
+
+def test_queue_sequential_dispatches_recover_a_before_claiming_b_without_duplicates(tmp_path):
+    response, _worker, package_a = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client = TestClient(create_app(state))
+    dispatch_a = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    response_a = deepcopy(response) | {"dispatch": dispatch_a | {"state": "claimed"}}
+
+    replacements = {
+        package_a.operation_id: "b" * 32,
+        package_a.binding.lease_id: "lease_b",
+        package_a.package["grant_id"]: "grant_b",
+        response["admitted_attempt_id"]: "admitted_attempt_b",
+    }
+
+    def replaced(value):
+        if isinstance(value, dict):
+            return {key: replaced(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replaced(item) for item in value]
+        return replacements.get(value, value)
+
+    response_b = replaced(response_a)
+    response_b["dispatch"]["id"] = "kubernetes_dispatch_b"
+    digest = hashlib.sha256(
+        json.dumps(response_b["package"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    response_b["package_digest"] = digest
+    response_b["operation"]["package_digest"] = digest
+    response_b["dispatch"]["package_digest"] = digest
+
+    class QueueChannel:
+        def __init__(self):
+            self.next_responses = [response_a, response_b]
+            self.by_dispatch = {
+                dispatch_a["id"]: response_a,
+                response_b["dispatch"]["id"]: response_b,
+            }
+            self.calls: list[str] = []
+
+        def post(self, path, _body, _key):
+            self.calls.append(path)
+            if path == "/worker/heartbeat":
+                return {"heartbeat_at": datetime.now(UTC).isoformat()}
+            if path == "/worker/observations":
+                return {}
+            if path == "/worker/kubernetes-dispatches/next/claim":
+                return self.next_responses.pop(0)
+            dispatch_id = path.removeprefix("/worker/kubernetes-dispatches/").removesuffix("/claim")
+            return self.by_dispatch[dispatch_id]
+
+    jobs: dict[str, dict] = {}
+    pods: dict[str, list[dict]] = {}
+    creates: list[str] = []
+
+    def create_job(manifest):
+        observed = deepcopy(manifest)
+        name = observed["metadata"]["name"]
+        uid = f"uid-{len(creates) + 1}"
+        observed["metadata"]["uid"] = uid
+        observed["status"] = {"active": 1}
+        jobs[name] = observed
+        pods[uid] = []
+        creates.append(name)
+
+    def delete_job(name, uid):
+        assert jobs[name]["metadata"]["uid"] == uid
+        jobs.pop(name)
+        pods.pop(uid, None)
+
+    root = tmp_path / "worker"
+    root.mkdir(mode=0o700)
+    credential = tmp_path / "worker.credential"
+    credential.write_text("worker-token")
+    credential.chmod(0o600)
+    channel = QueueChannel()
+
+    def service():
+        return KubernetesDispatchWorkerService(
+            KubernetesDispatchWorkerConfig(
+                control_url="http://127.0.0.1:8765",
+                credential_file=credential,
+                workspace_root=root,
+            ),
+            cluster,
+            package_a.output,
+            KubernetesExecutionAdapter(
+                root / "kubernetes.sqlite3",
+                cluster,
+                inspect_job=jobs.get,
+                create_job=create_job,
+                delete_job=delete_job,
+                observe_pods=lambda uid: pods[uid],
+            ),
+            channel=channel,
+        )
+
+    first = service().run(max_cycles=1)
+    assert first["operation_id"] == package_a.operation_id
+    name_a = creates[0]
+    uid_a = jobs[name_a]["metadata"]["uid"]
+    jobs[name_a]["status"] = {"succeeded": 1}
+    template = deepcopy(jobs[name_a]["spec"]["template"])
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": template["metadata"]
+        | {
+            "namespace": cluster.namespace,
+            "uid": "pod-a",
+            "ownerReferences": [{"kind": "Job", "uid": uid_a, "controller": True}],
+        },
+        "spec": template["spec"],
+        "status": {"phase": "Succeeded"},
+    }
+    pods[uid_a] = [pod]
+
+    calls_before_a_recovery = len(channel.calls)
+    recovered_a = service().run(max_cycles=1)
+    assert recovered_a["status"] == "succeeded"
+    assert "/worker/kubernetes-dispatches/next/claim" not in channel.calls[calls_before_a_recovery:]
+
+    second = service().run(max_cycles=1)
+    assert second["operation_id"] == "b" * 32
+    assert len(creates) == 2 and len(set(creates)) == 2
+    calls_before_b_recovery = len(channel.calls)
+    restarted_b = service().run(max_cycles=1)
+    assert restarted_b["operation_id"] == "b" * 32
+    assert restarted_b["status"] == "running"
+    assert len(creates) == 2
+    assert "/worker/kubernetes-dispatches/next/claim" not in channel.calls[calls_before_b_recovery:]
 
 
 def test_wrong_target_lost_claim_reply_and_revocation_fence_adapter_effects(tmp_path):
@@ -440,11 +910,15 @@ def test_restart_after_revocation_reconciles_then_cancels_without_a_create(tmp_p
     # The Job has disappeared before recovery, so the first reconciliation is
     # authoritative unknown.  Revocation must still reach the UID-scoped stop.
     fake.jobs.clear()
-    recovered = _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=2)
+    recovery_channel = _ApiChannel(client)
+    recovered = _service(tmp_path, client, dispatch, fake, cluster, channel=recovery_channel).run(
+        max_cycles=2
+    )
     assert recovered["status"] == "cancel_requested"
     assert recovered["cancellation"]["job_uid"] == "job-fixture"
     assert recovered["cancellation"]["termination_confirmed"] is True
     assert recovered["reconciliation_required"] is False
+    assert not any(path == "/worker/leases/renew" for path, _key in recovery_channel.calls)
     assert fake.creates == 1
 
 
@@ -500,14 +974,93 @@ def test_renewal_retries_its_exact_key_after_a_lost_reply(tmp_path):
     assert fake.creates == 1
 
 
-def test_restart_replays_lost_renewal_before_enforcing_cached_lease_expiry(tmp_path, monkeypatch):
+def test_renewal_runs_at_its_exact_schedule_boundary(tmp_path, monkeypatch):
     response, _worker, package = _admitted_package(tmp_path)
     state, cluster = tmp_path / "state", _cluster()
     client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
     dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
-    now = [package.lease_issued_at]
-    monkeypatch.setattr(ExecutionStore, "_now", staticmethod(lambda: now[0]))
-    monkeypatch.setattr(WorkerRegistryStore, "_now", staticmethod(lambda: now[0]))
+    clock = _ControlledClock(package.lease_issued_at)
+    monkeypatch.setattr(ExecutionStore, "_now", staticmethod(clock.now))
+    monkeypatch.setattr(WorkerRegistryStore, "_now", staticmethod(clock.now))
+
+    class CaptureRenewal(_ApiChannel):
+        def __init__(self, control):
+            super().__init__(control)
+            self.renewed_at: list[datetime] = []
+
+        def post(self, path, body, key):
+            if path == "/worker/leases/renew":
+                self.renewed_at.append(clock.now())
+            return super().post(path, body, key)
+
+    channel = CaptureRenewal(client)
+    service = _service(tmp_path, client, dispatch, fake, cluster, channel=channel, clock=clock)
+    service.poll_seconds = 60
+    service.renewal_seconds = 5
+    service.heartbeat_seconds = 120
+
+    result = service.run(max_cycles=2)
+
+    assert result["status"] == "running"
+    assert channel.renewed_at == [package.lease_issued_at + timedelta(seconds=5)]
+    assert service.claims.supervision()[0] > package.lease_expires_at
+    assert fake.creates == 1
+
+
+def test_delayed_heartbeat_reaching_lease_expiry_cancels_without_renewal(tmp_path, monkeypatch):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    clock = _ControlledClock(package.lease_issued_at)
+    monkeypatch.setattr(ExecutionStore, "_now", staticmethod(clock.now))
+    monkeypatch.setattr(WorkerRegistryStore, "_now", staticmethod(clock.now))
+
+    class DelayedHeartbeat(_ApiChannel):
+        def __init__(self, control):
+            super().__init__(control)
+            self.heartbeats = 0
+            self.renewals = 0
+
+        def post(self, path, body, key):
+            if path == "/worker/heartbeat":
+                self.heartbeats += 1
+                if self.heartbeats == 2:
+                    clock.move_to(package.lease_expires_at)
+            elif path == "/worker/leases/renew":
+                self.renewals += 1
+            return super().post(path, body, key)
+
+    channel = DelayedHeartbeat(client)
+    service = _service(tmp_path, client, dispatch, fake, cluster, channel=channel, clock=clock)
+    service.poll_seconds = 60
+    service.heartbeat_seconds = 1
+    service.renewal_seconds = 1
+
+    result = service.run(max_cycles=3)
+
+    assert result["status"] == "cancel_requested"
+    assert result["cancellation"]["reason"] == "lease_expiry"
+    assert clock.now() == package.lease_expires_at
+    assert channel.renewals == 0
+    assert fake.creates == 1
+
+
+@pytest.mark.parametrize(
+    ("replay_delay", "expected_status", "expected_reason"),
+    ((0.0, "running", None), (1.0, "cancel_requested", "control_outage")),
+    ids=("reply-before-renewed-expiry", "reply-at-renewed-expiry"),
+)
+def test_restart_replays_lost_renewal_before_enforcing_cached_lease_expiry(
+    tmp_path, monkeypatch, replay_delay, expected_status, expected_reason
+):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    clock = _ControlledClock(package.lease_issued_at)
+    monkeypatch.setattr(ExecutionStore, "_now", staticmethod(clock.now))
+    monkeypatch.setattr(WorkerRegistryStore, "_now", staticmethod(clock.now))
 
     class LostRenewal(_ApiChannel):
         def __init__(self, client):
@@ -524,26 +1077,30 @@ def test_restart_replays_lost_renewal_before_enforcing_cached_lease_expiry(tmp_p
                 if self.lost:
                     self.lost = False
                     raise ConnectionError("lost renewal reply before restart")
+                clock.advance(replay_delay)
             return result
 
     channel = LostRenewal(client)
-    first = _service(tmp_path, client, dispatch, fake, cluster, channel=channel)
-    first.now = lambda: now[0]
+    first = _service(tmp_path, client, dispatch, fake, cluster, channel=channel, clock=clock)
     first.renewal_seconds = 1
-    first.sleep = lambda _: now.__setitem__(0, now[0] + timedelta(seconds=2))
+    first.sleep = lambda _seconds: clock.advance(2)
     assert first.run(max_cycles=2)["status"] == "running"
 
     # The control mutation extended the lease, but the worker crashed with only
     # its older, now-expired cache. Recovery must replay the pending exact key
     # before treating that cache as authoritative.
-    now[0] = package.lease_expires_at + timedelta(seconds=1)
-    assert datetime.fromisoformat(channel.renewal_responses[0]["expires_at"]) > now[0]
-    restarted = _service(tmp_path, client, dispatch, fake, cluster, channel=channel)
-    restarted.now = lambda: now[0]
+    clock.move_to(package.lease_expires_at + timedelta(seconds=1))
+    assert datetime.fromisoformat(channel.renewal_responses[0]["expires_at"]) > clock.now()
+    restarted = _service(tmp_path, client, dispatch, fake, cluster, channel=channel, clock=clock)
     assert restarted.claims.pending_action("renew") is not None
     restarted_result = restarted.run(max_cycles=1)
-    assert restarted.claims.supervision()[0] > now[0]
-    assert restarted_result["status"] == "running", restarted_result
+    assert restarted_result["status"] == expected_status, restarted_result
+    if expected_reason is None:
+        assert restarted.claims.supervision()[0] > clock.now()
+        assert restarted.claims.pending_action("renew") is None
+    else:
+        assert restarted_result["cancellation"]["reason"] == expected_reason
+        assert restarted.claims.pending_action("renew") is not None
     assert channel.renewals[0] == channel.renewals[1]
     assert fake.creates == 1
 
@@ -627,6 +1184,136 @@ def test_pending_running_report_flushes_before_fresh_terminal_report(tmp_path):
         ("running", channel.reports[0][1]),
         ("exited", channel.reports[2][1]),
     ]
+
+
+@pytest.mark.parametrize("commit_before_loss", (False, True))
+def test_lost_terminal_report_remains_worker_owned_and_restart_replays_exactly(
+    tmp_path, commit_before_loss
+):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    assert (
+        _service(tmp_path, client, dispatch, fake, cluster, next_dispatch=True).run(max_cycles=1)[
+            "status"
+        ]
+        == "running"
+    )
+    fake.jobs[package.binding.job_name]["status"] = {"succeeded": 1}
+    pod = fake.pod("Succeeded")
+    template = fake.jobs[package.binding.job_name]["spec"]["template"]
+    pod["metadata"] = deepcopy(template["metadata"]) | {
+        "namespace": cluster.namespace,
+        "uid": "pod-fixture",
+        "ownerReferences": [{"kind": "Job", "uid": "job-fixture", "controller": True}],
+    }
+    pod["spec"] = deepcopy(template["spec"])
+    fake.pods = [pod]
+
+    class LoseTerminal(_ApiChannel):
+        def __init__(self, control):
+            super().__init__(control)
+            self.lost = False
+            self.terminal_reports: list[tuple[str, str]] = []
+
+        def post(self, path, body, key):
+            terminal = path == "/worker/observations" and body["observed_state"] == "exited"
+            if terminal:
+                self.terminal_reports.append(
+                    (json.dumps(body, sort_keys=True, separators=(",", ":")), key)
+                )
+                if not self.lost and not commit_before_loss:
+                    self.lost = True
+                    raise ConnectionError("terminal report lost before commit")
+            result = super().post(path, body, key)
+            if terminal and not self.lost:
+                self.lost = True
+                raise ConnectionError("terminal report reply lost after commit")
+            return result
+
+    channel = LoseTerminal(client)
+    terminal = _service(
+        tmp_path, client, dispatch, fake, cluster, channel=channel, next_dispatch=True
+    ).run(max_cycles=1)
+    provider_id = KubernetesProviderIdentity(
+        cluster.cluster_uid, cluster.namespace_uid, "job-fixture"
+    ).provider_id
+    assert terminal["status"] == "succeeded"
+    assert terminal["report_delivery_acknowledged"] is False
+    assert terminal["recovery_owner"] == "worker_report_delivery"
+    with sqlite3.connect(tmp_path / "worker" / "kubernetes-claims.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT resolved FROM dispatch_descriptors WHERE dispatch_id=?", (dispatch["id"],)
+        ).fetchone() == (0,)
+        pending = connection.execute(
+            "SELECT payload_json,key FROM dispatch_reports WHERE dispatch_id=? AND completed=0",
+            (dispatch["id"],),
+        ).fetchone()
+    pending_payload = json.loads(pending[0])
+    assert pending_payload["provider_id"] == provider_id
+    assert pending_payload["termination_confirmed"] is False
+    assert pending_payload["observed_state"] == "exited"
+
+    replayed = _service(
+        tmp_path, client, dispatch, fake, cluster, channel=channel, next_dispatch=True
+    ).run(max_cycles=1)
+    assert replayed["status"] == "report_delivered"
+    assert replayed["provider_id"] == provider_id
+    assert channel.terminal_reports[0] == channel.terminal_reports[1]
+    assert fake.creates == 1
+    with sqlite3.connect(tmp_path / "worker" / "kubernetes-claims.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT resolved FROM dispatch_descriptors WHERE dispatch_id=?", (dispatch["id"],)
+        ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    ("job_status", "pod_phase", "expected_status"),
+    (({"succeeded": 1}, "Succeeded", "succeeded"), ({"failed": 1}, "Failed", "failed")),
+)
+def test_normal_terminal_observation_retains_job_identity_without_claiming_termination(
+    tmp_path, job_status, pod_phase, expected_status
+):
+    response, _worker, package = _admitted_package(tmp_path)
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    _service(tmp_path, client, dispatch, fake, cluster).run(max_cycles=1)
+    fake.jobs[package.binding.job_name]["status"] = job_status
+    pod = fake.pod(pod_phase)
+    template = fake.jobs[package.binding.job_name]["spec"]["template"]
+    pod["metadata"] = deepcopy(template["metadata"]) | {
+        "namespace": cluster.namespace,
+        "uid": "pod-terminal",
+        "ownerReferences": [{"kind": "Job", "uid": "job-fixture", "controller": True}],
+    }
+    pod["spec"] = deepcopy(template["spec"])
+    fake.pods = [pod]
+
+    class Capture(_ApiChannel):
+        def __init__(self, control):
+            super().__init__(control)
+            self.observations: list[dict] = []
+
+        def post(self, path, body, key):
+            if path == "/worker/observations":
+                self.observations.append(deepcopy(body))
+            return super().post(path, body, key)
+
+    channel = Capture(client)
+    result = _service(tmp_path, client, dispatch, fake, cluster, channel=channel).run(max_cycles=1)
+    terminal = channel.observations[-1]
+    assert result["status"] == expected_status
+    assert (
+        terminal["provider_id"]
+        == KubernetesProviderIdentity(
+            cluster.cluster_uid, cluster.namespace_uid, "job-fixture"
+        ).provider_id
+    )
+    assert terminal["observed_state"] == "exited"
+    assert terminal["termination_confirmed"] is False
+    assert fake.creates == 1
 
 
 def test_cancellation_callback_uncertainty_retains_job_ownership_for_reconciliation(tmp_path):
@@ -1429,6 +2116,7 @@ def test_failed_lifecycle_actions_are_paced_and_reuse_their_pending_key(
     client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
     dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
     now = [package.lease_issued_at]
+    monotonic = [0.0]
     monkeypatch.setattr(ExecutionStore, "_now", staticmethod(lambda: now[0]))
     monkeypatch.setattr(WorkerRegistryStore, "_now", staticmethod(lambda: now[0]))
 
@@ -1454,10 +2142,16 @@ def test_failed_lifecycle_actions_are_paced_and_reuse_their_pending_key(
     channel = FailedLifecycleAction(client)
     service = _service(tmp_path, client, dispatch, fake, cluster, channel=channel)
     service.now = lambda: now[0]
+    service.monotonic = lambda: monotonic[0]
     service.poll_seconds = 0.5
     service.heartbeat_seconds = 2 if failed_action == "heartbeat" else 120
     service.renewal_seconds = 2 if failed_action == "renew" else 120
-    service.sleep = lambda seconds: now.__setitem__(0, now[0] + timedelta(seconds=seconds))
+
+    def advance(seconds):
+        now[0] += timedelta(seconds=seconds)
+        monotonic[0] += seconds
+
+    service.sleep = advance
 
     assert service.run(max_cycles=11)["status"] == "running"
     assert len(channel.failed) >= 2
