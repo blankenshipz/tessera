@@ -5,11 +5,11 @@ The control plane, bounded CPU execution components, desktop research records,
 and reasoned finding review are implemented in slices. See the
 [implementation status matrix](docs/implementation-progress.md#design-status-matrix)
 for what is implemented, partial, blocked, or deferred, with remaining acceptance
-work. The current remediation checkpoint hardens development-worker cancellation
-and restart behavior, schema-v24 project-object reconciliation/retention metadata,
-synthetic OpenCode authority/replay boundaries, and desktop draft fencing; none of
-those component guarantees constitutes pilot completion. README.md describes the
-runnable scope.
+work. Component guarantees do not constitute pilot completion. The latest bounded
+installed-candidate and native-slice evidence, together with its synthetic inputs
+and unresolved acceptance, is summarized in the
+[release evidence note](docs/release-evidence-intent9.md). README.md describes the
+runnable scope; the release checklist tracks the remaining release gates.
 This document defines the pilot, the contracts it must satisfy, and the order of
 implementation. “Required” describes intended behavior, not a verified guarantee.
 
@@ -287,9 +287,21 @@ submit/status/logs/cancel/accounting, with provider IDs and checkpoint limitatio
 Provisioning infrastructure is a separate approval from attaching a target.
 Pin tested versions; use conformance tests to grow the support matrix.
 
-#### Approved execution-target direction (planned)
+#### Remote agent execution routing
 
-`local-cpu` remains the primary first execution target. Kubernetes preparation
+Agent experiment routing is remote-only: explicit `kubernetes` or
+`salad_container`, with `salad_inference` reserved and non-executable. The desktop
+is control-only; desktop/local-process and local CPU aliases cannot be selected
+by this route. Local CPU/Docker profiles below remain explicit development and
+conformance fixtures, not fallbacks. The [offline implementation](docs/remote-agent-execution.md)
+adds exact human-reviewed tenant/plan/attempt/package/epoch/manifest-bound target
+selection, durable one-shot intents and provider-neutral receipts. It does not
+activate live Kubernetes enforcement or Salad effects. See
+[decision 0023](docs/decisions/0023-remote-agent-execution-routing.md).
+
+#### Historical development execution-target direction
+
+`local-cpu` remains an explicit development fixture target. Kubernetes preparation
 may proceed in parallel, but does not promote a cluster profile to supported or
 live execution. A future execution profile composes an `EnvironmentAdapter`
 (target identity, preflight, provisioning/attachment boundary, and credential
@@ -315,6 +327,21 @@ provisioning plan and its named resources. A human approves the exact plan diges
 before it is applied; a research-plan approval, worker, harness, or skill cannot
 approve it. No automatic destructive teardown is authorized; deletion requires a
 separate explicit human decision and remains planned.
+
+Minikube and Docker Desktop authenticated development conformance are not
+interchangeable target identities: the opt-in Docker Desktop fixture uses the
+existing admitted provider-disabled package and outbox, a fixed pinned local
+image and exact cluster/namespace UIDs. Its terminal Job/Pod observation is
+operational evidence only; cleanup acknowledgement is not namespace absence,
+and neither promotes the fixture to supported remote execution or scientific
+success.
+
+The constant-compute pilot narrows this contract to an operator-provisioned
+per-organization/project execution namespace, separate from control storage,
+restricted Pod admission and fail-closed Job/Pod policies. Named read-only
+cluster identity permissions do not authorize cluster administration. Policy
+readback and authorization dry runs are not NetworkPolicy or live execution
+evidence; see [decision 0017](docs/decisions/0017-pilot-workload-isolation.md).
 
 Credentials use pluggable store and delivery contracts. A local environment source
 is planned only for explicitly authorized local delivery. Kubernetes Secret
@@ -525,7 +552,19 @@ requests. Viewing, using, rotating, and granting a secret are separate permissio
 
 ### 5.1 Credentials and data transfer
 
-No secrets vendor is selected. The broker stores owner-scoped references and
+[Decision 0025](docs/decisions/0025-administration-workspace.md) adds a project-scoped
+administrative metadata workspace, synthetic-only secret lifecycle and exact
+administration-only delegation. Configuration review and local binding verification
+cannot activate providers or alter deployed policy. [Decision 0026](docs/decisions/0026-protected-secret-enrollment.md)
+adds one-shot protected native macOS Keychain enrollment for a same-host control
+database, with independent human review, versioned references and crash-safe claims.
+No secret value enters the renderer or HTTP API; remote/Windows/Linux enrollment,
+organization invitations and workload delegation remain unavailable. Principal-level
+review with local bearer credentials is not proof of independent human identity.
+The [administration runbook](docs/admin-setup.md) describes the enforced scope,
+transactional operator-ledger state, held recovery and remaining enablement gates.
+
+No remote secrets vendor is selected. The broker stores owner-scoped references and
 exchanges authenticated workload identity for narrowly scoped, short-lived access
 where the provider supports it. Prefer tool proxies/handles over revealing values.
 Record lease metadata, parent grant, audience, expiry, renewal and revocation state.
@@ -547,6 +586,14 @@ If raw credentials must enter an authorized process, disclose and isolate the
 exposure. Redaction is defense in depth. Reject execution profiles that cannot
 meet the task's credential or network requirements.
 
+[Decision 0024](docs/decisions/0024-salad-server-proxy-boundary.md) places Salad
+management authority in a server-only proxy with versioned opaque references and
+closed operation admission. Its live entry point blocks before secret resolution
+or network; only synthetic transport/resolver conformance is implemented. The
+[runbook](docs/salad-proxy.md) requires independent monitor, termination, cost and
+external artifact custody conformance before any live activation implementation.
+This boundary is not provider isolation or a trusted autonomous Salad sandbox.
+
 Local selection creates a classified source snapshot before external transfer.
 Check destination/recipient authorization and required secret, sensitive-data,
 and license restrictions inside an approved trust boundary. Unknown classification
@@ -562,11 +609,179 @@ restrictions until an authorized release decision.
 
 ### 5.2 Isolation and operational access
 
+[Decision 0020](docs/decisions/0020-bounded-computer-autonomy.md) adds bounded autonomy
+sessions over the existing capability authority. Agents author plans and checkpoints;
+humans review exact scope. Explicit capped public-prep policy may auto-approve a
+preparation step only within an already human-approved capability envelope. It cannot
+widen that envelope, create a grant or activate effects. Session/operation bindings,
+leases and receipts are durable; unknown work never authorizes replay. The implemented
+slice remains synthetic and provider-disabled, not unrestricted computer control.
+
+Artifact downloads and package installation require a separate immutable,
+human-approved capability declaration bound to the approved task plan revision
+and digest. It names exact destinations/ports, package managers/channels,
+registries, hash-pinned artifacts and lockfile (or explicitly supported install
+commands), byte/time budgets, sandbox filesystem roots, environment/image identity
+and opaque credential references. Agents may request but never grant or widen
+these capabilities. Host/control-PVC access and ambient credentials are denied.
+Use-time checks fence policy, grant, worker lease, epoch and revocation; every
+effect has a durable unique intent and an attributed actual hash/version receipt.
+Mismatches remain auditable, are quarantined and fence remaining authority.
+Current schema 49 implements the control-plane policy. The broker adds signed
+synthetic packages, stepwise checks, an append-only worker journal and reconciliation
+into project byte custody/audit; real effects remain disabled until independently
+verified isolation and enforcing transports exist. Worker journal schema 1 is
+separate from the control database; unknown effects never authorize replay.
+The [capability Kubernetes components](docs/capability-kubernetes-runner.md) add a
+strict profile, raw-observation inspector, fake-client lifecycle and bounded
+hook-free wheel installer. Object presence is not quota/network enforcement;
+real-client activation and control receipt integration remain blocked pending
+independent target conformance. These components do not widen signed authority.
+The [authenticated evidence collector](docs/capability-kubernetes-collector.md)
+binds explicit API/CA/cluster and tenant/plan identities, retains bounded raw API
+records and requires fresh one-use collection at activation. Operator-signed
+claims do not establish independence. Missing CNI/kernel/watchdog witnesses or
+any unknown check keeps activation blocked; API collection never enables effects.
+The [runtime witness boundary](docs/runtime-witnesses.md) adds four mandatory
+authenticated challenge/report gates, separate daemon supervision and one-use
+node-observation custody. CNI drops, kernel/filesystem quota exhaustion, external
+termination/no-continued-writes and actual admission/defaulting must agree for the
+exact operation. Unsupported node sensors/defaulting profiles remain unknown;
+the protocol and fake tests are not evidence of deployed runtime enforcement.
+The [target adapter contract](docs/runtime-witness-targets.md) adds explicit native
+profile and mTLS pins, raw native/API agreement and bounded target orchestration.
+Non-fake activation rejects legacy unpinned reports. Missing deployed native
+drivers or unreviewed Kubernetes defaults remain unknown, not an ambient fallback.
+See [the runtime boundary](docs/runtime-capability-broker.md). The declaration uses pinned locks,
+not arbitrary install commands. See [decision 0018](docs/decisions/0018-agent-capability-policy.md)
+and [the capability contract](docs/agent-capability-policy.md).
+
+The [local networkless Docker fixture](docs/local-networkless-docker-fixture.md)
+is a separate, explicitly opted-in closed conformance profile: prebuilt local image,
+fixed harmless programs/inputs, no host bind mounts or network, independent process
+supervision, exact nonce ownership and fixture-only quarantine. Unknown limits block
+workload release; unknown execution never authorizes retry. Its additive local
+journal evidence cannot activate capability downloads/installs, satisfy Kubernetes
+activation, publish control receipts, or release artifacts. It does not relax the
+persistent-output-storage or authenticated control-package contracts.
+
+[Decision 0022](docs/decisions/0022-transferable-execution-monitor.md) places a
+transferable monitor/guardian trust boundary at the execution target, never on the
+control host by necessity. Immutable signed assignments bind exact tenant/plan/
+package/operation/nonce/workload generation, adapter, privileges, limits and expiry.
+Authenticated challenge/response, independent deadlines, local signed receipts and
+stop-only recovery do not grant submit/restart authority. The control validates
+enrolled monitor evidence without host access. The opt-in closed Docker attachment
+and disabled Kubernetes/Salad contracts preserve unknown-as-blocking activation;
+see the [monitor deployment and reconciliation contract](docs/execution-monitor.md).
+
+[Decision 0021](docs/decisions/0021-independent-sandbox-supervision.md) selects only
+an opt-in external guardian for that closed local fixture, after rejecting unproven
+Kubernetes sandbox deployments. Reciprocal authenticated liveness and exact-owned
+first-stop reconciliation add supervisor-loss handling without retrying uncertain
+effects. The local live network witness still blocks; no authenticated autonomy
+execution backend or real control receipt authority is created.
+The [local namespace proof](docs/local-docker-namespace-proof.md) additionally
+requires independent daemon-host process/net/mount namespace and sandbox inode
+binding, namespace-local interface/address/route enumeration and bounded safe
+connectivity controls. Missing host observation, shared namespaces, ambiguous sysfs
+visibility, proxy uncertainty or unexpected connectivity block release; observer
+unavailability blocks before create. Workload capabilities are never widened.
+
+### 5.3 Governed agent identity, reasoning, and peer transports
+
+This is the contract for remote research agents; it does not assert that the
+integrated runtime is complete. Current implementation status and the runnable
+operator boundary are tracked in the [remote-agent installation runbook](docs/remote-agent-platform-install.md)
+and [implementation journal](docs/remote-agent-implementation-journal.md).
+
+An enrolled agent is a distinct authenticated principal, never a human session
+forwarded through a tool. A human with the required authority issues a bounded
+grant to the agent identity. The agent may request authority and consume only an
+active grant; it cannot issue, approve, widen, or self-reconcile one. Delegation
+is allowed only when the parent grant expressly permits it, and each child is a
+strict subset in actions, resources, audience/destination, expiry, budget, and
+delegation depth. Reserve parent budget atomically with child creation; retries
+with a different request body conflict rather than minting authority. At every
+use, enforce tenant and project scope, subject identity, grant revision/epoch,
+resource binding, destination/model, expiry, revocation, budget reservation, and
+idempotency in the authoritative control path. Approval remains a separately
+authenticated human operation; neither an MCP/A2A message nor agent-authored
+prose is approval.
+
+Agent actions, authority requests/consumption/delegation, messages, tools,
+observations, experiments, and results produce correlated, append-only,
+tenant-scoped provenance joined to the authorized notebook/export snapshot.
+Record actor and delegated actor, peer/session/task IDs, model/tool identity,
+permission decision references, revisions, correlation/causation IDs, and
+outcome/usage where known. Redact secrets and minimize payloads: do not persist
+credential values, unrestricted prompts, or private chain-of-thought. Explicitly
+represent denial, failure, timeout, and unknown; a missing provenance segment or
+watermark makes completeness false, never silently complete. Agent-submitted
+observations are attributed claims, not verified execution or scientific truth.
+
+Generated public research outputs use the additive
+`generated_public_research_output_v1` family and typed optional
+`AgentProvenanceRecord.generated_output` reference. The central registry records
+the actual author, immutable output bytes/digest, human disclosure/admission and
+recipient disclosure independently; registration is not a worker artifact
+manifest, Job receipt, execution grant or proof of reasoning. See the
+[public-capture contract](docs/public-capture-interface.md) and
+[generated-output registry contract](docs/generated-public-output-interface.md).
+The contract does not imply that the installed V2 harness/runtime emits or collects
+this family; that remains a separate acceptance boundary.
+
+Real model reasoning runs under a supervised, durable remote runtime with
+restart/reconnect behavior, bounded stop/expiry/usage fences, and explicit
+provider/model destination. It is distinct from the deterministic coordinator
+and provider-disabled paths, which remain useful for orchestration and testing
+but are not reasoning evidence. Provider use requires a separately authorized
+runtime credential reference and bounded grant/budget; no API-key fallback,
+automatic top-up, or unapproved spend. Closing the desktop does not transfer
+authority or stop a remote process; requested stop and confirmed termination
+remain distinct.
+
+The supported MCP integration is the official Python SDK in session-based stdio
+mode, launched beside the agent process. That process makes authenticated HTTPS
+requests to the control service using its own scoped credential reference; stdio
+is not a remotely exposed MCP HTTP endpoint. MCP exposes typed, permission-scoped
+research operations and redacted reads, not arbitrary database, shell, or
+filesystem access. Requests may propose work, request authority, consume an
+already-human-issued grant, report attributed observations, request human review,
+and read/export only authorized notebook data. Reconnect must reuse the same
+idempotency key and exact arguments after an uncertain response. The adapter
+transport is not itself an authorization boundary.
+
+A2A requires independently authenticated protocol peers, durable task/message/
+result identities, replay-safe exchanges, cancellation, and bounded delegation
+under the same Tessera authority checks. Peer discovery or protocol compatibility
+does not imply trust; peer content is untrusted input. Do not call an in-process
+fixture or two clients sharing one identity independent A2A. The selected wire
+profile and installed peer entrypoints must be documented and tested before
+claiming interoperability.
+
+Do not proxy an owner token, accept agent self-approval, widen grants, leak
+secrets or private reasoning, or substitute deterministic/mock events for live
+reasoning or independent peers. Local Docker Desktop remains laptop-local and
+does not establish off-host/laptop-off acceptance.
+
 Treat sources, skills, peer messages, tool outputs, and artifacts as untrusted.
 MCP/A2A are transport integrations, not authorization boundaries. Validate tool
 arguments and destinations, including redirects, private networks, metadata
 endpoints, arbitrary uploads, and shell escape paths. Sandboxes must not expose
 host sockets, broad credentials, or unapproved filesystem roots.
+
+The ordinary Docker worker is a typed, separately authenticated worker adapter,
+not remote shell or an owner-token/daemon proxy. It uses an explicit worker
+credential, verified control-service TLS, and an explicitly configured approved
+daemon endpoint (HTTPS Engine transport requires its configured CA). No ambient
+Docker context, arbitrary shell, or daemon/agent socket is exposed to the agent or
+research container. The
+[control](docs/ordinary-docker-control.md) and
+[HTTP binding](docs/ordinary-docker-http-binding.md) contracts describe its bounded
+API. Passing isolated HTTP/SQLite tests or having a CLI does not establish an
+approved guard image, installed worker, live container isolation, or off-host
+execution.
 
 Worker enrollment requires an authenticated owner/admin and bounded bootstrap.
 Record approved supervisor/harness builds, environment provenance, trust class,
@@ -650,6 +865,13 @@ unresolved/unknown, and worker-confirmed termination from immutable attributed
 observations. It does not infer provider termination, writer quiescence, charges,
 or scientific success from a local terminal state.
 
+For the provider-disabled Kubernetes development profile, a normal attributed
+terminal observation may confirm termination only after the bound Job and its
+nonempty observed owned-Pod set are terminal. Incomplete/contradictory observations
+remain unknown. Cancellation retains its separate fresh Job/Pod absence proof;
+see [decision 0015](docs/decisions/0015-normal-kubernetes-completion.md). Neither
+path automatically records a human outcome, settles charges, or accepts evidence.
+
 Schema v17 additionally records a bounded confirmed-stop workspace handoff: a human
 can bind one selected captured local baseline to a current grant/lease, request its
 cancellation/fence, and become recorded owner only after the matching attributed
@@ -675,6 +897,67 @@ Receipt/provider identity is immutable; stale authority, unknown observations,
 unknown exposure, and cancel uncertainty remain unresolved. This records
 fake-provider operational evidence, not real dispatch, accounting, Docker truth,
 artifact release, result acceptance, or scientific success.
+
+Schema v44 adds an empty tenant-scoped recovery reconciliation record keyed to
+the original grant, lease, epoch, operation, and worker identity. After that
+identity is revoked, expired, retired, or missing, a separately authenticated
+human reconciler can record bounded lookup/cancellation evidence for that exact
+operation. It cannot renew or report as the old worker, issue a replacement
+lease/package/operation, replay submission, or infer termination from a
+cancellation request. Only attributable confirmed terminal evidence or an
+explicit unknown observation closes recovery; evidence references remain
+auditable and credential-free in read projections.
+
+The original Kubernetes worker has a separate, narrower **never-submitted**
+reconciliation path. Only its intact exclusive journal can atomically establish
+cancel-requested with zero create intents and no Job UID for the exact frozen
+binding/manifest; fresh bound namespace-UID, deterministic Job-name and
+operation-labelled Job/Pod absence readbacks must then succeed. The authenticated
+worker reports this attestation against the cancelled grant/dispatch/lease/epoch;
+a human may release held exposure at zero settlement only while that report is
+fresh and no adverse operation observation or provider identity exists. This is
+not a termination confirmation, does not resurrect lost journals, and cannot
+be applied to any operation for which a create intent could have reached Kubernetes.
+The distinct `pre_manifest` branch covers a retained, exclusive adapter+Job
+journal with an exact cancelled adapter intent and **no** Job row: lack of the
+network-none witness rejected manifest rendering before any Job intent or create.
+It transactionally persists an insert-denying SQLite trigger on the original
+Job journal before provider absence reads, including for an older worker process.
+It records `manifest_not_generated`, never backfills a fabricated manifest/Job
+row, and rejects lost/replaced journals. The normal `bound_job_intent` branch
+still requires the pre-existing exact manifest and cancelled zero-create row.
+If that original worker credential has expired, the *original human grant
+creator* may instead make a separately typed `pre_manifest` owner attestation
+from the retained exclusive journal and fresh target-bound absence readbacks.
+Control checks the cancelled original dispatch/lease/epoch/target, absence of
+provider identity and anything beyond unconfirmed worker-unknown evidence, and
+commits that owner attribution, zero-settlement held release and distinct events
+in one revision/idempotency-fenced transaction. This is an explicitly
+owner-attested trust boundary: control cannot independently inspect the worker
+journal or Kubernetes from submitted booleans. It never renews or impersonates
+the expired worker or calls this provider termination.
+
+For a cancelled **never-claimed** dispatch, a distinct five-minute stop-only
+maintenance authorization supports expiry of the exact original worker credential.
+Only the separately authenticated original human grant issuer can issue and consume
+it, using that same human session. It binds the old principal/credential, grant,
+operation, dispatch, package, revision/epochs, actual namespace/target, exclusive
+stopped-workspace custody digest, and an existing authorized provider-read reference.
+This is an event-backed non-bearer authorization, not a worker credential: it grants
+no execute, renew, dispatch, spending, delegation, or Kubernetes RBAC permission.
+The expired bearer remains unauthorized. No migration or v51 table is changed.
+The collector uses the retained original journals and durable insert fences; any
+claim, descriptor, adapter/Job/helper intent, failure, observation, receipt or
+provider identity remains held. Fresh complete actual provider readbacks are
+mandatory, including operation-labelled Jobs/Pods and output helpers; a 403,
+incomplete list, wrong namespace or unknown state is not absence. The human submits
+a digest-bound proof against the exact unexpired maintenance authorization; control
+rechecks all history and commits once-only zero settlement, interruption and
+`not_executed` events atomically. Provenance names the actual human maintenance
+actor/session and issuer separately from the expired original worker identity.
+This remains explicitly human-attested journal/provider evidence, not independent
+inspection, provider termination or scientific validity. See the
+[stop-only maintenance runbook](docs/queued-dispatch-maintenance.md).
 
 Schema v20 adds an append-only, revision-fenced human bookkeeping ledger over a
 previously committed quarantined checkpoint. It rechecks the live reconciled
@@ -751,6 +1034,39 @@ query/reveal budgets, and hidden context. Domain-based human measurements requir
 sample identity, operator, procedure revision, raw-record linkage, timing, custody,
 instrument/calibration where applicable, and review state. Low-risk annotations
 use lighter schemas; required missing checks hold dependent confirmatory work.
+
+### Outcome program review profile
+
+The bounded Outcome 0/1 profile uses a project as the program container and a
+study as an outcome ledger. Typed `research_program` decision scopes retain a
+scientific brief, explicit selected/deferred condition accounting, source-use
+intent and go/no-go direction. These are review records, not execution grants.
+Proposal edits append a linked replacement; an agent suggestion or human rejection
+does not revoke a prior approved review. Approval of a replacement supersedes its
+review lane, while history remains visible. A changed evidence basis marks prior
+reviews stale and prevents resolving an old panel. Go checks registered variant
+accounting, accepted supported findings, current source-use review and explicit
+linked experiment termination; no-go can record an early stop recommendation.
+Neither direction stops jobs automatically. Use separate revocation/cancellation
+and verify termination. Full scientific protocols, data-rights verification,
+provider execution and later patent/physical-loop controls remain separate gates.
+Metadata-only Outcome 0/1 dataset snapshot declarations may retain caller-supplied
+digests, schemas, units, missingness, split/leakage, validation and source/license/
+provenance records for review, but never establish a download, content validation,
+rights verification, protected split, or execution authority.
+See [the requirements matrix and API workflow](docs/mixfm-interactions.md).
+
+Plans may additionally declare a versioned metric protocol and data/code/environment
+manifest identities. Evaluation decisions bind caller-reported observations to that
+immutable plan scope and protocol; deterministic threshold reports are retained
+with the request event. Missing evidence remains explicitly inconclusive. A go
+under such a protocol requires a passing current human-reviewed evaluation, not
+just a human acknowledgment of a failed/incomplete record. Legacy prose-only plans
+remain unevaluated. These checks grant no execution authority or scientific truth.
+The [evaluation and Salad contract](docs/mixfm-evaluation-and-salad-contract.md)
+also defines opt-in target validation and neutral capability/health discovery;
+Salad live operations remain unsupported and fail closed without credential access
+or network calls, even when configuration is provided.
 
 ## 8. Implementation sequence and acceptance
 

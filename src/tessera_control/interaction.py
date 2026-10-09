@@ -26,6 +26,7 @@ from .interaction_models import (
     ReportHarnessDelivery,
     ResolveDecision,
 )
+from .programs import program_context, validate_program_review
 from .store import Conflict, Forbidden, NotFound, Store, _connect, utc_now
 
 
@@ -821,6 +822,7 @@ class InteractionStore:
             ).fetchone()
             if pending:
                 return 200, self._decision_response(pending)
+            review_basis = validate_program_review(conn, live, project_id, kind, scope)
             if (
                 conn.execute(
                     """SELECT count(*) FROM decision_requests
@@ -861,7 +863,12 @@ class InteractionStore:
                 task_id,
                 "decision_requested",
                 expected_task_revision or 0,
-                {"decision_id": ident, "kind": kind, "scope_digest": _digest(scope)},
+                {"decision_id": ident, "kind": kind, "scope_digest": _digest(scope),
+                 **({"study_id": scope["study_id"], "program_action": scope["action"],
+                     "basis_digest": scope["basis_digest"], "supersedes_id": scope["supersedes_id"],
+                      "program_basis": review_basis["basis"],
+                      "evaluation_report": review_basis["evaluation_report"]}
+                    if scope.get("type") == "research_program" else {})},
             )
             created = {
                 "id": ident,
@@ -953,6 +960,13 @@ class InteractionStore:
                 task = self.store._task(conn, live, row["task_id"])
                 if row["expected_task_revision"] != task["revision"]:
                     raise Conflict("Decision task basis is stale.")
+            scope = json.loads(row["scope_json"])
+            if scope.get("type") == "research_program" and not rationale:
+                raise Conflict("Program reviews require a human rationale.")
+            validate_program_review(
+                conn, live, row["project_id"], row["kind"], scope,
+                resolving_id=decision_id, approve=decision == "approve",
+            )
             now = utc_now()
             status = {"approve": "approved", "reject": "rejected"}[decision]
             conn.execute(
@@ -971,6 +985,9 @@ class InteractionStore:
                     "decision_id": decision_id,
                     "decision": status,
                     "scope_digest": row["scope_digest"],
+                    **({"study_id": scope["study_id"], "program_action": scope["action"],
+                        "basis_digest": scope["basis_digest"]}
+                       if scope.get("type") == "research_program" else {}),
                 },
             )
             result = dict(row)
@@ -991,6 +1008,15 @@ class InteractionStore:
             _digest(payload),
             command,
         )
+
+    def program_context(self, actor, study_id):
+        conn = _connect(self.store.database_path)
+        try:
+            conn.execute("BEGIN")
+            actor = self.store._live_principal(conn, actor)
+            return program_context(conn, actor, study_id)
+        finally:
+            conn.close()
 
     def expire_decisions(self, actor, key, project_id):
         """Explicitly account for expired pending requests in one transaction."""

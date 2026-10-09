@@ -7,9 +7,18 @@ and project authorization boundary; this facade adds a narrower tool boundary.
 
 from __future__ import annotations
 
-from typing import Any, Literal, Protocol, TypeVar
+from typing import Annotated, Any, Literal, Protocol, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StringConstraints,
+    ValidationError,
+    model_serializer,
+    model_validator,
+)
 
 _MAX_PAGE_SIZE = 100
 _MAX_CONTROL_LIST_SIZE = 1_000
@@ -109,14 +118,41 @@ class TaskStatus(_StrictModel):
     plan_digest: str | None
 
 
+class DockerPlan(_StrictModel):
+    """Read-only approved target/resource pins, not container execution options."""
+
+    target_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+    target_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    cpu_millicores: int = Field(ge=100, le=2000)
+    memory_bytes: int = Field(ge=67108864, le=536870912)
+    pids_limit: int = Field(ge=16, le=128)
+    scratch_bytes: int = Field(ge=1048576, le=16777216)
+
+
 class ExecutionPlan(_StrictModel):
     argv: list[str] = Field(min_length=1, max_length=128)
     input_snapshot_digest: str
     pinned_skill_digests: list[str] = Field(max_length=128)
     output_paths: list[str] = Field(max_length=128)
-    profile: Literal["local-cpu", "kubernetes-opencode"]
+    profile: Literal["local-cpu", "kubernetes-opencode", "ordinary-docker"]
+    docker: DockerPlan | None = None
     network_enabled: Literal[False]
     max_output_bytes: int
+
+    @model_validator(mode="after")
+    def docker_is_explicit(self):
+        if (self.profile == "ordinary-docker") != (self.docker is not None):
+            raise ValueError("Docker profile requires explicit approved target/resource pins")
+        return self
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        value = handler(self)
+        if self.docker is None:
+            value.pop("docker", None)
+        return value
 
 
 class TaskPlan(_StrictModel):

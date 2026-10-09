@@ -15,6 +15,7 @@ from test_recovery_boundaries import _backup
 
 import tessera_control.recovery as recovery
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.store import StoreError, migrate_state
 
 
@@ -78,7 +79,7 @@ def test_restore_rejects_schema_outside_exact_current_allowlist(
 
 def test_supported_legacy_migration_can_be_backed_up_and_restored(tmp_path: Path):
     source = _legacy_state(tmp_path)
-    assert migrate_state(source) == 43
+    assert migrate_state(source) == LATEST_SCHEMA_VERSION
     backup = tmp_path / "backup"
     recovery.backup_state(source, backup)
     restored = tmp_path / "restored"

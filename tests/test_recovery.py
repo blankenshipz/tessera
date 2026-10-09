@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from test_credentials import owner_headers
 
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.store import initialize_state
 
@@ -24,7 +25,7 @@ def test_online_backup_restore_holds_writes_but_keeps_reads(tmp_path: Path) -> N
     backup = tmp_path / "backup"
     manifest = backup_state(source, backup)
     assert set(entry.name for entry in backup.iterdir()) == {"manifest.json", "snapshot.sqlite3"}
-    assert manifest["schema_version"] == 43
+    assert manifest["schema_version"] == LATEST_SCHEMA_VERSION
     restored = tmp_path / "restored"
     database, header = restore_state(backup, restored)
     assert database.name == "tessera.sqlite3" and header.stat().st_mode & 0o777 == 0o600
@@ -35,6 +36,14 @@ def test_online_backup_restore_holds_writes_but_keeps_reads(tmp_path: Path) -> N
     assert status.json()["recovery_hold"] is True
     assert status.json()["original_branch_fenced"] is False
     assert status.json()["unknown_post_backup_activity"] is True
+    assert status.json()["promotion"] == {
+        "supported": False,
+        "mode": "manual_fenced_rebuild_only",
+        "original_writer_fence_required": True,
+        "external_operation_reconciliation_required": True,
+        "fresh_enrollment_required": True,
+        "fresh_human_authorization_required": True,
+    }
     assert restored_client.get("/projects", headers=owner_headers(restored)).json()["projects"] == [
         project.json()
     ]
@@ -43,6 +52,22 @@ def test_online_backup_restore_holds_writes_but_keeps_reads(tmp_path: Path) -> N
     assert restored_client.post("/projects", headers=headers, json=body).status_code == 403
     assert restored_client.post("/projects", headers=headers, json=body).status_code == 403
     assert stat.S_IMODE(restored.stat().st_mode) == 0o700
+
+
+def test_held_restore_backup_does_not_change_database_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    initialize_state(source)
+    backup = tmp_path / "backup"
+    backup_state(source, backup)
+    restored = tmp_path / "restored"
+    database, _header = restore_state(backup, restored)
+    before = database.read_bytes()
+
+    held_backup = tmp_path / "held-backup"
+    backup_state(restored, held_backup)
+
+    assert database.read_bytes() == before
+    assert (held_backup / "snapshot.sqlite3").is_file()
 
 
 def test_restore_rejects_tampered_backup_and_existing_destination(tmp_path: Path) -> None:

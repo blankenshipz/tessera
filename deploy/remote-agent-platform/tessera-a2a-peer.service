@@ -1,0 +1,35 @@
+[Unit]
+Description=Tessera A2A 1.0 governed reference peer (manual start)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/tessera/a2a-peer.admitted
+
+[Service]
+Type=simple
+User=tessera-a2a
+Group=tessera-a2a
+UMask=0077
+StateDirectory=tessera-a2a
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/tessera-a2a
+LoadCredential=profile:/etc/tessera/a2a-peer.json
+LoadCredential=agent-token:/etc/tessera/credentials/a2a-control-agent-token
+ExecStart=/opt/tessera/venv/bin/python -m tessera_agent.service_startup a2a --state-dir /var/lib/tessera-a2a
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=5
+TimeoutStopSec=40
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/tessera-a2a
+# Deliberately no [Install]/WantedBy; this reference peer never performs inference.

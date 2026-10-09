@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from test_agent_authority import assert_empty_runtime_v55, strip_runtime_v55
 from test_execution import _grant_payload, _owner, _snapshot_release, _worker
 from test_goal_to_decision import _command, _design
 
@@ -20,6 +21,7 @@ from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.store import Store, canonical_digest, initialize_state, migrate_state
 from tessera_worker.kubernetes_contracts import (
     KubernetesClusterConfig,
+    KubernetesConnectivityEvidence,
     KubernetesContractError,
     KubernetesNetworkPolicyEvidence,
     job_manifest,
@@ -35,6 +37,7 @@ from tessera_worker.opencode_harness import TesseraBinding
 
 
 def _cluster(**changes: object) -> KubernetesClusterConfig:
+    now = datetime.now(UTC)
     values: dict[str, object] = {
         "kubeconfig": "/private/fixture/kubeconfig",
         "kubeconfig_sha256": "a" * 64,
@@ -47,11 +50,47 @@ def _cluster(**changes: object) -> KubernetesClusterConfig:
         "cluster_uid": "cluster-fixture",
         "namespace_uid": "namespace-fixture",
         "network_none_evidence": KubernetesNetworkPolicyEvidence(
-            "network-policy-enforced-v1", "tessera-deny-all", "policy-fixture", "f" * 64
+            "network-policy-enforced-v1",
+            "tessera-deny-all",
+            "policy-fixture",
+            "f" * 64,
+            "cluster-fixture",
+            "namespace-fixture",
+            now,
+            KubernetesConnectivityEvidence("allowed-pod", "server-pod", "allowed", 3, now),
+            KubernetesConnectivityEvidence("denied-pod", "server-pod", "denied", 3, now),
         ),
     }
     values.update(changes)
     return KubernetesClusterConfig(**values)  # type: ignore[arg-type]
+
+
+_PRE_V35_HISTORY = (
+    "principals",
+    "credentials",
+    "projects",
+    "events",
+    "idempotency",
+    "control_recovery",
+    "source_snapshots",
+    "snapshot_files",
+    "agent_authority_grants",
+)
+
+
+def _old_v35_state(state: Path):
+    """Disposable historical fixture: remove empty55 additions, not authority rows."""
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        strip_runtime_v55(connection)
+        connection.execute("DROP TRIGGER kubernetes_dispatches_fence_cancel")
+        connection.execute("DROP TABLE kubernetes_dispatches")
+        connection.execute("DROP TABLE execution_runtime_packages")
+        connection.execute("UPDATE schema_meta SET schema_version=35 WHERE singleton=1")
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 35
+        return {
+            table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            for table in _PRE_V35_HISTORY
+        }
 
 
 def _admitted_package(
@@ -60,16 +99,21 @@ def _admitted_package(
     migrate_from_v35: bool = False,
     max_duration_seconds: int = 300,
     grant_seconds: int | None = None,
+    argv: list[str] | None = None,
 ) -> tuple[dict, dict, KubernetesExecutionPackage]:
     state = tmp_path / "state"
     initialize_state(state)
+    before = None
     if migrate_from_v35:
-        with sqlite3.connect(state / "tessera.sqlite3") as connection:
-            connection.execute("DROP TRIGGER kubernetes_dispatches_fence_cancel")
-            connection.execute("DROP TABLE kubernetes_dispatches")
-            connection.execute("DROP TABLE execution_runtime_packages")
-            connection.execute("UPDATE schema_meta SET schema_version=35 WHERE singleton=1")
-    migrate_state(state)
+        before = _old_v35_state(state)
+    assert migrate_state(state) == 55
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        assert_empty_runtime_v55(connection)
+        if before is not None:
+            assert all(
+                connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() == rows
+                for table, rows in before.items()
+            )
     owner = _owner(state)
     store = Store(state)
     _, project = store.create_project(
@@ -96,7 +140,7 @@ def _admitted_package(
         "budget_cents": 100,
         "max_duration_seconds": max_duration_seconds,
         "execution_spec": {
-            "argv": ["opencode", "serve"],
+            "argv": argv if argv is not None else ["opencode", "serve"],
             "input_snapshot_digest": snapshot["digest"],
             "pinned_skill_digests": [],
             "output_paths": ["result.txt"],
@@ -210,7 +254,10 @@ class _FakeKubernetes:
             "status": {"phase": state},
         }
 
-    def delete(self, name: str, _uid: str) -> None:
+    def delete(self, name: str, uid: str) -> None:
+        current = self.jobs.get(name)
+        if current is None or current["metadata"]["uid"] != uid:
+            raise RuntimeError("Kubernetes UID precondition rejected replacement")
         self.jobs.pop(name, None)
         self.pods.clear()
 
@@ -246,6 +293,99 @@ def test_admitted_package_translates_only_allowlisted_fields_and_records_handoff
     assert adapter.reconcile(package).observed_state == "succeeded"
     handoff = adapter.artifact_collection_handoff(package)
     assert handoff.pvc_uid == "pvc-fixture" and handoff.output_paths == ("result.txt",)
+
+
+def test_submission_step_rejects_stale_authority_before_final_job_create(tmp_path):
+    _, _, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    adapter = fake.adapter(tmp_path / "jobs.sqlite3")
+    adapter._prepare_output = lambda _: None
+    generation = 0
+
+    def current():
+        nonlocal generation
+        generation += 1
+        if generation == 3:
+            raise PermissionError("cancelled/stale generation at final Job boundary")
+        return 2.0
+
+    # Journal conservatively records uncertain create intent before invoking the
+    # final authority fence; denial cannot be relabelled as a known native reply.
+    with pytest.raises(KubernetesUnresolvedError, match="inspect only"):
+        adapter.submit(package, before_step=current)
+    assert fake.creates == 0
+    assert adapter.failure_evidence(package)["stage"] == "job_create"
+
+
+def test_submission_step_timeout_resident_callback_never_overlaps_or_creates(tmp_path):
+    import threading
+
+    _, _, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    adapter = fake.adapter(tmp_path / "jobs.sqlite3")
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def resident(_):
+        calls.append("inspect")
+        entered.set()
+        release.wait(3)
+        return None
+
+    adapter._inspect_job = resident
+    try:
+        with pytest.raises(KubernetesExecutionError, match="deadline exceeded"):
+            adapter.submit(package, before_step=lambda: 0.02)
+        assert entered.is_set()
+        with pytest.raises(KubernetesExecutionError, match="still in progress"):
+            adapter.submit(package, before_step=lambda: 1.0)
+        assert calls == ["inspect"] and fake.creates == 0
+    finally:
+        release.set()
+        adapter._inflight.result(timeout=3)
+
+
+def test_submission_step_thread_start_failure_never_creates(tmp_path, monkeypatch):
+    import threading
+
+    _, _, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    adapter = fake.adapter(tmp_path / "jobs.sqlite3")
+
+    def unavailable(_):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(threading.Thread, "start", unavailable)
+    with pytest.raises(KubernetesExecutionError, match="callback is unavailable"):
+        adapter.submit(package, before_step=lambda: 2.0)
+    assert adapter._inflight is None and fake.creates == 0
+
+
+@pytest.mark.parametrize(
+    ("job_state", "pod_states"),
+    [
+        ("failed", []),
+        ("failed", ["Running"]),
+        ("failed", ["Failed", "Running"]),
+        ("running", ["Failed"]),
+        ("succeeded", ["Running"]),
+        ("succeeded", []),
+    ],
+)
+def test_incomplete_terminal_evidence_remains_unknown(tmp_path, job_state, pod_states):
+    _response, _worker, package = _admitted_package(tmp_path)
+    fake = _FakeKubernetes(package, _cluster())
+    adapter = fake.adapter(tmp_path / "kubernetes.sqlite3")
+    adapter.submit(package)
+    fake.jobs[package.binding.job_name] = fake.job(job_state)
+    fake.pods = [fake.pod(state) for state in pod_states]
+    # Distinct Pod identities make mixed running/failed observations realistic.
+    for index, pod in enumerate(fake.pods):
+        pod["metadata"]["uid"] = f"pod-{index}"
+    status = adapter.reconcile(package)
+    assert status.observed_state == "unknown"
+    assert status.termination_confirmed is False
+    assert fake.creates == 1
 
 
 def test_target_spec_identity_and_pod_ownership_fail_closed(tmp_path: Path) -> None:
@@ -370,10 +510,11 @@ def test_cancellation_rejects_a_replacement_job_uid(tmp_path: Path) -> None:
     adapter = fake.adapter(journal)
     assert adapter.submit(package).job is not None
 
-    def replace_on_delete(name: str, _uid: str) -> None:
+    def replace_on_delete(name: str, uid: str) -> None:
         replacement = fake.job()
         replacement["metadata"]["uid"] = "replacement-job"
         fake.jobs[name] = replacement
+        fake.delete(name, uid)
 
     cancelling = KubernetesExecutionAdapter(
         journal,
@@ -383,8 +524,9 @@ def test_cancellation_rejects_a_replacement_job_uid(tmp_path: Path) -> None:
         delete_job=replace_on_delete,
         observe_pods=lambda _uid: fake.pods,
     )
-    with pytest.raises(KubernetesContractError, match="UID conflicts"):
-        cancelling.cancel(package)
+    cancelled = cancelling.cancel(package)
+    assert cancelled.termination_confirmed is False
+    assert fake.jobs[package.binding.job_name]["metadata"]["uid"] == "replacement-job"
 
 
 def test_cancel_persists_both_fences_before_failed_inspection_and_restart(tmp_path: Path) -> None:

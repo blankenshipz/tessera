@@ -1,4 +1,4 @@
-"""Schema-v43 dispatch ledger recovery fixtures using only fake local state."""
+"""Historical v43 dispatch ledger recovery at current55; synthetic local resources."""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from test_agent_authority import assert_empty_runtime_v55
 from test_kubernetes_dispatch import _dispatch, _owner_headers
-from test_kubernetes_execution import _admitted_package, _cluster
+from test_kubernetes_execution import _admitted_package, _cluster, _old_v35_state
 
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from tessera_control.recovery import (
     BACKUP_DATABASE,
     BACKUP_MANIFEST,
@@ -21,7 +23,7 @@ from tessera_control.recovery import (
     backup_state,
     restore_state,
 )
-from tessera_control.store import StoreError, migrate_state
+from tessera_control.store import StoreError, initialize_state, migrate_state
 from tessera_worker.kubernetes_contracts import cluster_identity_digest
 
 _LEDGER_TABLES = (
@@ -56,10 +58,12 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
 ) -> None:
     response, _worker, _package = _admitted_package(tmp_path, migrate_from_v35=migrated)
     state = tmp_path / "state"
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert LATEST_SCHEMA_VERSION == 55
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
     with sqlite3.connect(state / DATABASE_NAME) as connection:
+        assert_empty_runtime_v55(connection)
         assert connection.execute(
             "SELECT name FROM sqlite_schema WHERE type='index' "
             "AND name='kubernetes_dispatches_by_worker'"
@@ -85,12 +89,16 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
     assert len(before["execution_runtime_packages"]) == len(before["kubernetes_dispatches"]) == 1
 
     backup = tmp_path / "backup"
-    assert backup_state(state, backup)["schema_version"] == 43
+    assert backup_state(state, backup)["schema_version"] == LATEST_SCHEMA_VERSION
     restored = tmp_path / "restored"
     restore_state(backup, restored)
     assert _ledger_rows(restored) == before
+    with sqlite3.connect(restored / DATABASE_NAME) as connection:
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert_empty_runtime_v55(connection)
 
     held = TestClient(create_app(restored))
+    assert held.get("/health/ready").status_code == 503
     assert (
         held.post(
             f"/experiment-admitted-attempts/{response['admitted_attempt_id']}/dispatch",
@@ -116,10 +124,66 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
     )
 
     repeated_backup = tmp_path / "repeated-backup"
+    held_database_bytes = (restored / DATABASE_NAME).read_bytes()
     backup_state(restored, repeated_backup)
+    # Backing up a held restore copies its immutable audit history; it must not
+    # append backup-health state to the held source as a side effect.
+    assert (restored / DATABASE_NAME).read_bytes() == held_database_bytes
     repeatedly_restored = tmp_path / "repeatedly-restored"
     restore_state(repeated_backup, repeatedly_restored)
     assert _ledger_rows(repeatedly_restored) == before
+    with sqlite3.connect(repeatedly_restored / DATABASE_NAME) as connection:
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert_empty_runtime_v55(connection)
+
+
+def test_v35_fixture_failed_upgrade_rolls_back_schema_and_prior_authority(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    initialize_state(state)
+    client = TestClient(create_app(state))
+    assert (
+        client.post(
+            "/projects",
+            json={"name": "Prior retained authority history"},
+            headers=_owner_headers(state) | {"Idempotency-Key": "retained-project"},
+        ).status_code
+        == 201
+    )
+    before = _old_v35_state(state)
+    assert TestClient(create_app(state)).get("/health/ready").status_code == 503
+    actual_v55 = MIGRATIONS[54]
+
+    def fail_after_additive_tables(connection):
+        actual_v55(connection)
+        raise sqlite3.OperationalError("synthetic post-v55 migration failure")
+
+    with monkeypatch.context() as patch:
+        patch.setitem(MIGRATIONS, 54, fail_after_additive_tables)
+        with pytest.raises(sqlite3.OperationalError, match="post-v55"):
+            migrate_state(state)
+    with sqlite3.connect(state / DATABASE_NAME) as connection:
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 35
+        for table in (
+            "runtime_policy_profiles",
+            "kubernetes_dispatches",
+            "execution_runtime_packages",
+        ):
+            assert (
+                connection.execute("SELECT 1 FROM sqlite_schema WHERE name=?", (table,)).fetchone()
+                is None
+            )
+        assert all(
+            connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() == rows
+            for table, rows in before.items()
+        )
+    assert migrate_state(state) == 55
+    assert migrate_state(state) == 55
+    with sqlite3.connect(state / DATABASE_NAME) as connection:
+        assert_empty_runtime_v55(connection)
+        assert all(
+            connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() == rows
+            for table, rows in before.items()
+        )
 
 
 def test_held_restore_rejects_an_altered_dispatch_cancellation_trigger(tmp_path: Path) -> None:

@@ -4,8 +4,8 @@
 This is deliberately not a control-plane dispatcher.  It accepts only an
 explicit ``docker-desktop`` kubeconfig/context/server target and creates a
 unique namespace owned by the caller.  It never reads a current context, prunes,
-or deletes a namespace.  The live runner is useful for proving the Job/PVC and
-post-exit collection seam while the control plane has no remote dispatch route.
+or deletes a namespace itself. The separate authenticated dispatch fixture uses
+the normal control outbox and this module's explicitly bound Kubernetes transport.
 """
 
 from __future__ import annotations
@@ -17,20 +17,24 @@ import io
 import json
 import re
 import shlex
+import socket
 import subprocess
 import tarfile
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from .kubernetes_contracts import (
     KubernetesClusterConfig,
     KubernetesJobBinding,
     KubernetesJobJournal,
-    KubernetesNetworkPolicyEvidence,
     canonical_json,
     parse_pod,
 )
@@ -38,6 +42,10 @@ from .kubernetes_contracts import (
 PROFILE = "development-kubernetes-conformance-v1"
 CONTEXT = "docker-desktop"
 RESULT_PATH = "/outputs/result.txt"
+_OUTPUT_PVC_LABELS = {
+    "app.kubernetes.io/managed-by": "tessera",
+    "tessera.io/output-role": "dedicated-pilot-output",
+}
 RESULT_BYTES = b"hello tessera kubernetes e2e\n"
 _MAX_OUTPUT = 64 * 1024
 _COMMAND_TIMEOUT = 120
@@ -89,6 +97,8 @@ class LiveKubernetesEvidence:
 
 def target_from_kubeconfig(kubeconfig: Path) -> DockerDesktopTarget:
     """Discover server/CA only through the caller's explicit kubeconfig/context."""
+    if not Path(kubeconfig).is_absolute():
+        raise LiveKubernetesError("Docker Desktop kubeconfig must be an explicit absolute path")
     path = Path(kubeconfig).resolve(strict=True)
     raw = _run(
         (
@@ -109,6 +119,8 @@ def target_from_kubeconfig(kubeconfig: Path) -> DockerDesktopTarget:
         config = json.loads(raw.stdout)
         contexts = config["contexts"]
         clusters = config["clusters"]
+        if len(contexts) != 1 or contexts[0]["name"] != CONTEXT:
+            raise ValueError("selected context does not match docker-desktop")
         context = contexts[0]["context"]
         cluster_name = context["cluster"]
         cluster = next(item["cluster"] for item in clusters if item["name"] == cluster_name)
@@ -136,7 +148,9 @@ def target_from_kubeconfig(kubeconfig: Path) -> DockerDesktopTarget:
     )
 
 
-def build_and_load_exact_image(repository_root: Path, nonce: str) -> ExactImage:
+def build_and_load_exact_image(
+    repository_root: Path, nonce: str, *, prebuilt_image_id: str | None = None
+) -> ExactImage:
     """Build amd64 OCI bytes, verify their manifest, then import that archive only.
 
     Docker Desktop Kubernetes is Kind-based here.  The node container is named
@@ -150,21 +164,33 @@ def build_and_load_exact_image(repository_root: Path, nonce: str) -> ExactImage:
     with TemporaryDirectory(prefix="tessera-kubernetes-image-") as temporary:
         archive = Path(temporary) / "image.oci.tar"
         docker_archive = Path(temporary) / "image.docker.tar"
-        _run(
-            (
-                "docker",
-                "build",
-                "--platform",
-                "linux/amd64",
-                "--build-arg",
-                f"TESSERA_E2E_NONCE={nonce}",
-                "--tag",
-                tag,
-                "--file",
-                str(repository_root / "examples" / "kubernetes-hello" / "Dockerfile"),
-                str(repository_root / "examples" / "kubernetes-hello"),
+        if prebuilt_image_id is None:
+            _run(
+                (
+                    "docker",
+                    "build",
+                    "--platform",
+                    "linux/amd64",
+                    "--build-arg",
+                    f"TESSERA_E2E_NONCE={nonce}",
+                    "--tag",
+                    tag,
+                    "--file",
+                    str(repository_root / "examples" / "kubernetes-hello" / "Dockerfile"),
+                    str(repository_root / "examples" / "kubernetes-hello"),
+                )
             )
-        )
+        else:
+            inspected = json.loads(_run(("docker", "image", "inspect", tag)).stdout)
+            if (
+                len(inspected) != 1
+                or inspected[0].get("Id") != prebuilt_image_id
+                or inspected[0].get("Os") != "linux"
+                or inspected[0].get("Architecture") != "amd64"
+                or inspected[0].get("Config", {}).get("Labels", {}).get("io.tessera.e2e-nonce")
+                != nonce
+            ):
+                raise LiveKubernetesError("prebuilt workload image identity changed before import")
         _run(("docker", "save", "--output", str(docker_archive), tag))
         _docker_archive_to_oci(docker_archive, archive, tag)
         image = _verify_oci_archive(archive, tag, node_repository)
@@ -441,7 +467,6 @@ class DockerDesktopKubernetesAdapter:
         namespace_uid = _uid(namespace_resource, "Namespace", namespace, None)
         self._create(_deny_all_policy(namespace), namespace)
         policy = self._get("networkpolicy", "deny-all", namespace)
-        policy_uid = _uid(policy, "NetworkPolicy", "deny-all", namespace)
         policy_spec = _mapping(policy.get("spec"), "network policy spec")
         expected_policy = _deny_all_policy(namespace)["spec"]
         if canonical_json(policy_spec) != canonical_json(expected_policy):
@@ -465,12 +490,6 @@ class DockerDesktopKubernetesAdapter:
                 self._get("namespace", "kube-system", None), "Namespace", "kube-system", None
             ),
             namespace_uid=namespace_uid,
-            network_none_evidence=KubernetesNetworkPolicyEvidence(
-                "network-policy-enforced-v1",
-                "deny-all",
-                policy_uid,
-                hashlib.sha256(canonical_json(policy_spec)).hexdigest(),
-            ),
         )
         operation_id = hashlib.sha256(f"tessera-e2e:{nonce}".encode()).hexdigest()[:32]
         binding = KubernetesJobBinding(
@@ -482,6 +501,7 @@ class DockerDesktopKubernetesAdapter:
             image=image.reference,
             command=("/hello", "--write", RESULT_PATH),
             active_deadline_seconds=60,
+            network_mode="cluster",
             output_pvc="outputs",
             output_mount_path="/outputs",
             output_pvc_uid=pvc_uid,
@@ -560,10 +580,7 @@ class DockerDesktopKubernetesAdapter:
         journal = KubernetesJobJournal(self.journal_path)
 
         def delete(name: str, uid: str) -> None:
-            current = self._get("job", name, cluster.namespace)
-            if _uid(current, "Job", name, cluster.namespace) != uid:
-                raise LiveKubernetesError("Job UID changed before cancellation")
-            self._kubectl("delete", "job", name, "--wait=false", namespace=cluster.namespace)
+            self._delete_job_uid_precondition(name, uid, cluster.namespace)
 
         return journal.request_cancel(
             binding,
@@ -572,6 +589,92 @@ class DockerDesktopKubernetesAdapter:
             delete,
             lambda job_uid: self._owned_pod_resources(job_uid, cluster.namespace),
         )
+
+    def _delete_job_uid_precondition(self, name: str, uid: str, namespace: str) -> None:
+        """Delete one Job through the API's UID precondition, never check-then-delete.
+
+        ``kubectl delete`` does not expose DeleteOptions.preconditions. A short
+        loopback proxy retains kubectl's explicit kubeconfig/context auth while
+        allowing the API request body to carry the immutable UID. A replacement
+        between inspection and this request therefore receives HTTP 409 rather
+        than being deleted by name.
+        """
+        self._delete_uid_precondition(
+            f"/apis/batch/v1/namespaces/{quote(namespace)}/jobs/{quote(name)}", uid
+        )
+
+    def delete_namespace_uid_precondition(self, name: str, uid: str) -> None:
+        """Remove only the exact owned fixture namespace, never a replacement."""
+        if not re.fullmatch(r"tessera-e2e-[a-z0-9-]{1,48}", name):
+            raise LiveKubernetesError("namespace is not an authenticated E2E fixture")
+        self._delete_uid_precondition(f"/api/v1/namespaces/{quote(name)}", uid)
+
+    def _delete_uid_precondition(self, path: str, uid: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", uid):
+            raise LiveKubernetesError("Kubernetes UID precondition is malformed")
+        self._require_unchanged_kubeconfig()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        command = (
+            "kubectl",
+            "--kubeconfig",
+            str(self.target.kubeconfig),
+            "--context",
+            self.target.context,
+            "proxy",
+            "--address=127.0.0.1",
+            f"--port={port}",
+            "--accept-hosts=^127\\.0\\.0\\.1$",
+            "--disable-filter=true",
+        )
+        proxy = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        )
+        url = f"http://127.0.0.1:{port}{path}"
+        payload = canonical_json(
+            {
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "preconditions": {"uid": uid},
+                "propagationPolicy": "Background",
+            }
+        )
+        deadline = time.monotonic() + 15
+        try:
+            while True:
+                try:
+                    with urlopen(  # noqa: S310 -- fixed loopback proxy URL
+                        Request(
+                            url,
+                            data=payload,
+                            method="DELETE",
+                            headers={"Content-Type": "application/json"},
+                        ),
+                        timeout=3,
+                    ):
+                        return
+                except HTTPError as error:
+                    if error.code == 409:
+                        raise LiveKubernetesError(
+                            "Kubernetes UID precondition rejected deletion"
+                        ) from error
+                    raise LiveKubernetesError(
+                        "Kubernetes UID-precondition delete was rejected"
+                    ) from error
+                except URLError as error:
+                    if time.monotonic() >= deadline or proxy.poll() is not None:
+                        raise LiveKubernetesError(
+                            "Kubernetes UID-precondition proxy did not become available"
+                        ) from error
+                    time.sleep(0.1)
+        finally:
+            proxy.terminate()
+            try:
+                proxy.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proxy.kill()
+                proxy.wait(timeout=3)
 
     def _owned_pods(
         self, binding: KubernetesJobBinding, cluster: KubernetesClusterConfig, job_uid: str
@@ -604,6 +707,168 @@ class DockerDesktopKubernetesAdapter:
                     "collector is not explicitly authorized by Kubernetes RBAC"
                 )
 
+    def dataset_client(self, cluster, output):
+        live = self
+
+        class DatasetClient:
+            def authorize(self, verb, admission=False):
+                live._require_unchanged_kubeconfig()
+                if (
+                    live._get("namespace", "kube-system", None).get("metadata", {}).get("uid")
+                    != cluster.cluster_uid
+                    or live._get("namespace", cluster.namespace, None)
+                    .get("metadata", {})
+                    .get("uid")
+                    != cluster.namespace_uid
+                ):
+                    raise LiveKubernetesError("Dataset cluster/namespace UID changed")
+                pvc = live._get("pvc", output.pvc_name, cluster.namespace)
+                if (
+                    _uid(pvc, "PersistentVolumeClaim", output.pvc_name, cluster.namespace)
+                    != output.pvc_uid
+                    or hashlib.sha256(canonical_json(pvc.get("spec"))).hexdigest()
+                    != output.pvc_spec_sha256
+                    or pvc.get("status", {}).get("phase") != "Bound"
+                ):
+                    raise LiveKubernetesError("Dataset output PVC identity/spec/binding changed")
+                evidence = cluster.network_none_evidence
+                if evidence is None or not evidence.is_bound_to(
+                    cluster.cluster_uid, cluster.namespace_uid
+                ):
+                    raise LiveKubernetesError("Dataset network evidence is missing")
+                if admission and not evidence.is_fresh_for(
+                    cluster.cluster_uid, cluster.namespace_uid
+                ):
+                    raise LiveKubernetesError("Dataset network admission evidence is stale")
+                policy = live._get("networkpolicy", evidence.policy_name, cluster.namespace)
+                if (
+                    policy.get("metadata", {}).get("uid") != evidence.policy_uid
+                    or hashlib.sha256(canonical_json(policy.get("spec"))).hexdigest()
+                    != evidence.policy_spec_sha256
+                ):
+                    raise LiveKubernetesError("Dataset network policy identity changed")
+                if (
+                    live._kubectl(
+                        "auth", "can-i", verb, "configmaps", namespace=cluster.namespace
+                    ).stdout
+                    != "yes\n"
+                ):
+                    raise LiveKubernetesError("Scoped ConfigMap RBAC denied")
+
+            def dataset_read(self, name):
+                self.authorize("get")
+                return live._dataset_resource(name, cluster.namespace)
+
+            def dataset_create(self, manifest):
+                if (
+                    manifest.get("kind") != "ConfigMap"
+                    or manifest.get("immutable") is not True
+                    or manifest.get("metadata", {}).get("namespace") != cluster.namespace
+                ):
+                    raise LiveKubernetesError("Dataset resource outside bound namespace/type")
+                self.authorize("create", admission=True)
+                value = live._dataset_resource(
+                    manifest["metadata"]["name"], cluster.namespace, manifest=manifest
+                )
+                self.authorize("get", admission=True)
+                return value
+
+            def dataset_delete(self, name, uid):
+                self.authorize("delete")
+                live._delete_uid_precondition(
+                    f"/api/v1/namespaces/{quote(cluster.namespace)}/configmaps/{quote(name)}", uid
+                )
+
+        return DatasetClient()
+
+    def _dataset_resource(self, name, namespace, *, manifest=None):
+        """Only immutable ConfigMap create/read may use the larger JSON bound.
+
+        Complete outputs remain in a unique private receipt, never in exception
+        messages or shared logs. Generic conformance commands retain 64KiB.
+        """
+        self._require_unchanged_kubeconfig()
+        if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?", name):
+            raise LiveKubernetesError("Dataset ConfigMap name is malformed")
+        data = None if manifest is None else canonical_json(manifest).decode()
+        if data is not None and len(data.encode()) > 1024 * 1024:
+            raise LiveKubernetesError("Dataset ConfigMap request exceeds 1MiB")
+        args = (
+            ("get", "configmap", name, "-o", "json")
+            if manifest is None
+            else ("create", "-f", "-", "-o", "json")
+        )
+        argv = (
+            "kubectl",
+            "--kubeconfig",
+            str(self.target.kubeconfig),
+            "--context",
+            self.target.context,
+            "--server",
+            self.target.server,
+            "--request-timeout=15s",
+            "--namespace",
+            namespace,
+            *args,
+        )
+        receipt = Path(mkdtemp(prefix="dataset-command-", dir=self.journal_path.parent))
+        receipt.chmod(0o700)
+        for filename in ("stdout", "stderr", "result.json"):
+            path = receipt / filename
+            path.touch(mode=0o600)
+        metadata = {
+            "argv": argv,
+            "action": args[0],
+            "resource": "configmap",
+            "name": name,
+            "namespace": namespace,
+            "stdout_limit": 1024 * 1024,
+            "stderr_limit": _MAX_OUTPUT,
+            "exit": None,
+        }
+        try:
+            with (receipt / "stdout").open("w") as stdout, (receipt / "stderr").open("w") as stderr:
+                completed = subprocess.run(
+                    argv,
+                    input=data,
+                    text=True,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=30,
+                    check=False,
+                )
+            metadata["exit"] = completed.returncode
+        except (subprocess.TimeoutExpired, OSError) as error:
+            metadata["failure"] = type(error).__name__
+            raise LiveKubernetesError(
+                f"Dataset command failed; private receipt: {receipt}"
+            ) from None
+        finally:
+            (receipt / "result.json").write_text(json.dumps(metadata, sort_keys=True))
+        if (receipt / "stdout").stat().st_size > 1024 * 1024 or (
+            receipt / "stderr"
+        ).stat().st_size > _MAX_OUTPUT:
+            raise LiveKubernetesError(
+                f"Dataset command output exceeds bound; private receipt: {receipt}"
+            )
+        stderr = (receipt / "stderr").read_text(errors="replace")
+        if completed.returncode:
+            if manifest is None and "Error from server (NotFound)" in stderr:
+                return None
+            raise LiveKubernetesError(f"Dataset command rejected; private receipt: {receipt}")
+        try:
+            value = _mapping(json.loads((receipt / "stdout").read_text()), "dataset response")
+            _uid(value, "ConfigMap", name, namespace)
+            if value.get("immutable") is not True or not isinstance(
+                value.get("binaryData"), Mapping
+            ):
+                raise LiveKubernetesError("Dataset response is not an immutable binary ConfigMap")
+        except (ValueError, LiveKubernetesError):
+            raise LiveKubernetesError(
+                f"Dataset command returned invalid resource; private receipt: {receipt}"
+            ) from None
+        return value
+
     def _create(
         self, manifest: Mapping[str, object], namespace: str | None
     ) -> Mapping[str, object]:
@@ -632,6 +897,7 @@ class DockerDesktopKubernetesAdapter:
     def _kubectl(
         self, *args: str, namespace: str | None, timeout: int = 30, input: str | None = None
     ) -> subprocess.CompletedProcess[str]:
+        self._require_unchanged_kubeconfig()
         argv = [
             "kubectl",
             "--kubeconfig",
@@ -645,6 +911,10 @@ class DockerDesktopKubernetesAdapter:
         if namespace is not None:
             argv.extend(("--namespace", namespace))
         return _run(tuple(argv) + args, timeout=timeout, input=input)
+
+    def _require_unchanged_kubeconfig(self) -> None:
+        if _sha256_file(self.target.kubeconfig) != self.target.kubeconfig_sha256:
+            raise LiveKubernetesError("explicit Docker Desktop kubeconfig changed after attachment")
 
 
 def _deny_all_policy(namespace: str) -> dict[str, object]:
@@ -663,7 +933,7 @@ def _pvc(namespace: str) -> dict[str, object]:
     return {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
-        "metadata": {"name": "outputs", "namespace": namespace},
+        "metadata": {"name": "outputs", "namespace": namespace, "labels": _OUTPUT_PVC_LABELS},
         "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "64Mi"}}},
     }
 
@@ -803,6 +1073,11 @@ def _verify_bound_pvc(
         raise LiveKubernetesError("PVC UID changed after workload scheduling")
     if _pvc_spec_sha256(resource) != expected_spec_sha256:
         raise LiveKubernetesError("PVC spec changed after workload scheduling")
+    labels = _mapping(resource.get("metadata"), "PVC metadata").get("labels")
+    if not isinstance(labels, Mapping) or any(
+        labels.get(key) != expected for key, expected in _OUTPUT_PVC_LABELS.items()
+    ):
+        raise LiveKubernetesError("PVC is not the dedicated Tessera output claim")
     if _mapping(resource.get("status"), "PVC status").get("phase") != "Bound":
         raise LiveKubernetesError("PVC did not bind after workload scheduling")
 

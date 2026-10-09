@@ -11,7 +11,7 @@ from test_artifact_manifests import _body, _completed_outputs
 
 from tessera_control.artifact_dispositions import ArtifactDispositionStore
 from tessera_control.artifact_manifests import ArtifactManifestStore
-from tessera_control.migrations import MIGRATIONS
+from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from tessera_control.store import (
     Conflict,
     Forbidden,
@@ -113,6 +113,9 @@ def test_v9_to_v10_migration_is_transactional_and_preserves_manifest(tmp_path: P
         from schema_fixtures import drop_empty_experiment_schema
 
         drop_empty_experiment_schema(connection)
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=9")
 
     def fail(connection):
@@ -136,8 +139,8 @@ def test_v9_to_v10_migration_is_transactional_and_preserves_manifest(tmp_path: P
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     assert _retained_records(state) == retained
     assert (state / "owner.header").read_bytes() == header
 

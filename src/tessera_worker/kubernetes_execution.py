@@ -22,9 +22,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from .execution_contracts import (
+    AccountingObservation,
+    CollectionHandoff,
+    ExecutionCapabilities,
+    ExecutionEnvelope,
+    Observation,
+    OperationHandle,
+    PreflightRequest,
+    PreflightResult,
+    TargetBinding,
+)
+from .execution_contracts import CancellationObservation as NeutralCancellationObservation
 from .kubernetes_contracts import (
     KubernetesCancellationObservation,
     KubernetesClusterConfig,
+    KubernetesContractError,
     KubernetesJobBinding,
     KubernetesJobJournal,
     KubernetesJobObservation,
@@ -42,22 +55,28 @@ MAX_PROVIDER_CALL_SECONDS = 30.0
 class KubernetesExecutionError(RuntimeError):
     """A package, identity, or durable adapter binding is not safe to use."""
 
+    def __init__(self, message, *, diagnostic_code=None):
+        super().__init__(message)
+        self.diagnostic_code = diagnostic_code
+
 
 @dataclass(frozen=True)
 class KubernetesOutputBinding:
-    """The explicit, observed PVC identity used only for collection handoff."""
+    """Observed PVC identity and optional per-operation output mount isolation."""
 
     pvc_name: str
     mount_path: str
     pvc_uid: str
     pvc_spec_sha256: str
+    operation_scoped: bool = False
 
-    def job_fields(self) -> dict[str, str]:
+    def job_fields(self) -> dict[str, Any]:
         return {
             "output_pvc": self.pvc_name,
             "output_mount_path": self.mount_path,
             "output_pvc_uid": self.pvc_uid,
             "output_pvc_spec_sha256": self.pvc_spec_sha256,
+            "output_operation_scoped": self.operation_scoped,
         }
 
 
@@ -73,10 +92,16 @@ class KubernetesExecutionPackage:
     lease_issued_at: datetime
     lease_expires_at: datetime
     hard_expires_at: datetime
+    dataset_resources: tuple[dict, ...] = ()
 
     @classmethod
     def from_admitted_package(
-        cls, response: Mapping[str, object], output: KubernetesOutputBinding
+        cls,
+        response: Mapping[str, object],
+        output: KubernetesOutputBinding,
+        *,
+        input_bundle: dict | None = None,
+        dataset_namespace: str | None = None,
     ) -> KubernetesExecutionPackage:
         package = response.get("package")
         package_digest = response.get("package_digest")
@@ -117,6 +142,44 @@ class KubernetesExecutionPackage:
         if set(workload) != {"active_deadline_seconds", "command", "network_mode"}:
             raise KubernetesExecutionError("Kubernetes package has unallowlisted workload fields.")
         command = workload["command"]
+        dataset_input, dataset_resources = None, ()
+        if isinstance(command, list) and command[:3] == ["python", "-m", "tessera_starter"]:
+            from .dataset_inputs import prepare_dataset_inputs
+
+            spec = plan.get("execution_spec")
+            if (
+                not isinstance(spec, Mapping)
+                or spec.get("input_snapshot_digest") != package.get("snapshot_digest")
+                or type(spec.get("max_output_bytes")) is not int
+                or not 1 <= spec["max_output_bytes"] <= 1024 * 1024
+                or len(command) != 11
+                or command[5] != "--manifest-digest"
+                or input_bundle is None
+                or dataset_namespace is None
+            ):
+                raise KubernetesExecutionError(
+                    "Dataset plan requires actual lease inputs and exact bounded execution."
+                )
+            try:
+                dataset_input, resources = prepare_dataset_inputs(
+                    input_bundle,
+                    snapshot_digest=_string(package, "snapshot_digest"),
+                    manifest_digest=command[6],
+                    lease_id=_string(package, "lease_id"),
+                    epoch=_positive_int(package, "epoch"),
+                    worker_id=_string(package, "worker_principal_id"),
+                    operation_id=_string(package, "operation_id"),
+                    namespace=dataset_namespace,
+                    grant_id=_string(package, "grant_id"),
+                    project_id=_string(package, "project_id"),
+                )
+                dataset_resources = tuple(resources)
+            except (TypeError, ValueError) as error:
+                raise KubernetesExecutionError(
+                    "Dataset lease input verification failed."
+                ) from error
+        elif input_bundle is not None:
+            raise KubernetesExecutionError("Dataset inputs supplied to a nonstarter workload.")
         output_paths = package.get("output_paths")
         if (
             not isinstance(command, list)
@@ -140,6 +203,7 @@ class KubernetesExecutionPackage:
                 command=tuple(command),
                 active_deadline_seconds=_positive_int(workload, "active_deadline_seconds"),
                 network_mode=_network_mode(workload),
+                dataset_input=dataset_input,
                 **output.job_fields(),
             )
             approved_duration_seconds = _positive_int(plan, "max_duration_seconds")
@@ -168,11 +232,33 @@ class KubernetesExecutionPackage:
             lease_issued_at,
             lease_expires_at,
             hard_expires_at,
+            dataset_resources,
         )
 
     @property
     def operation_id(self) -> str:
         return self.binding.operation_id
+
+    def execution_envelope(self, target: TargetBinding) -> ExecutionEnvelope:
+        """Translate this admitted package into the neutral frozen envelope.
+
+        The opaque payload intentionally remains this validated Kubernetes
+        package.  The neutral contract never learns Job, Pod, PVC, kubeconfig,
+        or network-policy fields from it.
+        """
+        return ExecutionEnvelope(
+            operation_id=self.operation_id,
+            package_digest=self.package_digest,
+            target=target,
+            lease_id=self.binding.lease_id,
+            epoch=self.binding.epoch,
+            deadline=min(
+                self.hard_expires_at,
+                self.lease_expires_at,
+                self.lease_issued_at + timedelta(seconds=self.approved_duration_seconds),
+            ),
+            payload=self,
+        )
 
 
 @dataclass(frozen=True)
@@ -181,6 +267,19 @@ class KubernetesExecutionStatus:
     job: KubernetesJobObservation | None
     pods: tuple[KubernetesPodObservation, ...]
     observed_state: Literal["pending", "running", "succeeded", "failed", "unknown"]
+    provider_id: str | None = None
+
+    @property
+    def termination_confirmed(self) -> bool:
+        """Normal completion proof, not cancellation/deletion or scientific success."""
+        return bool(
+            self.provider_id
+            and self.job is not None
+            and self.job.state in {"succeeded", "failed"}
+            and self.observed_state in {"succeeded", "failed"}
+            and self.pods
+            and all(pod.state in {"succeeded", "failed"} for pod in self.pods)
+        )
 
 
 @dataclass(frozen=True)
@@ -203,7 +302,7 @@ class ArtifactCollectionHandoff:
 
 
 class KubernetesExecutionAdapter:
-    """Reconcile one deterministic Job through injected fake-client callbacks."""
+    """Reconcile one deterministic Job through explicitly bound client callbacks."""
 
     def __init__(
         self,
@@ -214,35 +313,194 @@ class KubernetesExecutionAdapter:
         create_job: Callable[[Mapping[str, object]], Mapping[str, object] | None],
         delete_job: Callable[[str, str], object],
         observe_pods: Callable[[str], Sequence[Mapping[str, object]]],
+        prepare_output: Callable[[KubernetesExecutionPackage], None] | None = None,
+        collect_output: Callable[[ArtifactCollectionHandoff, KubernetesExecutionPackage], tuple]
+        | None = None,
+        release_output: Callable[[KubernetesExecutionPackage], None] | None = None,
+        fetch_inputs: Callable[[KubernetesExecutionPackage], dict] | None = None,
+        prepare_dataset_resources: Callable[[KubernetesExecutionPackage], None] | None = None,
+        dataset_client: object | None = None,
     ) -> None:
         self.cluster = cluster
         self._inspect_job = inspect_job
         self._create_job = create_job
         self._delete_job = delete_job
         self._observe_pods = observe_pods
+        self._prepare_output = prepare_output
+        self._collect_output = collect_output
+        self._release_output = release_output
+        self._fetch_inputs = fetch_inputs
+        self._prepare_dataset_resources = prepare_dataset_resources
+        self._prepare_dataset_steps = None
+        self.dataset_client = dataset_client
         self._journal = KubernetesJobJournal(journal_path)
         self._database = Path(journal_path)
         self._inflight: Future[Any] | None = None
         self._inflight_lock = threading.Lock()
         self._initialize()
+        from .kubernetes_failure_evidence import KubernetesFailureEvidence
+
+        self.failures = KubernetesFailureEvidence(self._database)
 
     def submit(
-        self, package: KubernetesExecutionPackage, *, timeout_seconds: float | None = None
+        self,
+        package: KubernetesExecutionPackage,
+        *,
+        timeout_seconds: float | None = None,
+        before_step: Callable[[], float] | None = None,
     ) -> KubernetesExecutionStatus:
         """Persist target intent, then inspect/create only the deterministic Job."""
         self._bind(package)
         deadline = self._operation_deadline(package, timeout_seconds)
+
+        def call(callback, *arguments):
+            # The ordinary supervisor may refresh authenticated authority between
+            # commands, never a running command's timeout or immutable hard bound.
+            current_deadline = (
+                self._operation_deadline(package, before_step())
+                if before_step is not None
+                else deadline
+            )
+            return self._call_before(current_deadline, callback, *arguments)
+
+        stage = "job_admission"
+        if package.binding.dataset_input is not None and (
+            self._fetch_inputs is None or self._prepare_dataset_resources is None
+        ):
+            raise KubernetesExecutionError(
+                "Dataset Job requires current authenticated input delivery."
+            )
+
+        def current_dataset():
+            if package.binding.dataset_input is None:
+                return
+            from .dataset_inputs import prepare_dataset_inputs
+
+            bundle = call(self._fetch_inputs, package)
+            descriptor, resources = prepare_dataset_inputs(
+                bundle,
+                snapshot_digest=package.package["snapshot_digest"],
+                manifest_digest=package.binding.dataset_input["manifest_digest"],
+                lease_id=package.binding.lease_id,
+                epoch=package.binding.epoch,
+                worker_id=package.package["worker_principal_id"],
+                operation_id=package.operation_id,
+                namespace=self.cluster.namespace,
+                grant_id=package.package["grant_id"],
+                project_id=package.package["project_id"],
+            )
+            if (
+                descriptor != package.binding.dataset_input
+                or tuple(resources) != package.dataset_resources
+            ):
+                raise KubernetesExecutionError("Current lease input differs from the frozen Job.")
+
+        def prepare():
+            nonlocal stage
+            stage = "preparation"
+            try:
+                current_dataset()
+                if package.binding.dataset_input is not None:
+                    if self._prepare_dataset_steps is None:
+                        call(self._prepare_dataset_resources, package)
+                    else:
+                        steps = self._prepare_dataset_steps(package)
+                        result = None
+                        try:
+                            while True:
+                                try:
+                                    callback, arguments = steps.send(result)
+                                except StopIteration:
+                                    break
+                                result = call(callback, *arguments)
+                        finally:
+                            steps.close()
+                call(self._prepare_output, package)
+            except Exception as error:
+                self.failures.record(package.operation_id, stage, error)
+                raise
+
+        def create(manifest):
+            nonlocal stage
+            stage = "job_create"
+            try:
+                current_dataset()
+                return call(self._create_job, manifest)
+            except Exception as error:
+                self.failures.record(package.operation_id, stage, error)
+                raise
+
         try:
             job = self._journal.reconcile_create(
                 package.binding,
                 self.cluster,
-                lambda name: self._call_before(deadline, self._inspect_job, name),
-                lambda manifest: self._call_before(deadline, self._create_job, manifest),
+                lambda name: call(self._inspect_job, name),
+                create,
+                prepare=prepare
+                if (self._prepare_output is not None or package.binding.dataset_input is not None)
+                else None,
             )
-            return self._record_status(package, job, deadline)
-        except Exception:
+            stage = "job_observation"
+            observation_deadline = (
+                self._operation_deadline(package, before_step())
+                if before_step is not None
+                else deadline
+            )
+            return self._record_status(package, job, observation_deadline)
+        except Exception as error:
+            self.failures.record(package.operation_id, stage, error)
             self._record_unknown(package)
             raise
+
+    def failure_evidence(self, package):
+        failure = self.failures.get(package.operation_id)
+        collector = getattr(self._prepare_output, "__self__", None)
+        if (
+            failure is not None
+            and failure["stage"] == "preparation"
+            and hasattr(collector, "failures")
+        ):
+            detail = collector.failures.get(package.operation_id)
+            if detail is not None and detail["occurred_at"] <= failure["occurred_at"]:
+                return detail
+        return failure
+
+    def no_start_recovery_candidate(self, package):
+        """A queue hint only; fresh original-journal attestation remains separate."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT j.binding_json,j.create_intent,j.cancellation_requested AS job_cancelled, "
+                "j.job_uid,a.job_uid AS adapter_job_uid,"
+                "a.cancellation_requested AS adapter_cancelled, "
+                "a.pod_uids_json,a.observed_state FROM kubernetes_jobs j "
+                "JOIN kubernetes_execution_bindings a "
+                "ON a.operation_id=j.operation_id WHERE j.operation_id=?",
+                (package.operation_id,),
+            ).fetchone()
+        return bool(
+            row is not None
+            and row["binding_json"] == canonical_json(package.binding.journal_fields).decode()
+            and row["create_intent"] == 0
+            and row["job_cancelled"] == row["adapter_cancelled"] == 1
+            and row["job_uid"] is None
+            and row["adapter_job_uid"] is None
+            and row["pod_uids_json"] == "[]"
+            and row["observed_state"] == "unknown"
+        )
+
+    def collect_outputs(self, package):
+        if self._collect_output is None:
+            raise KubernetesExecutionError("Output collector is not configured.")
+        handoff = self.artifact_collection_handoff(package)
+        return self._collect_output(handoff, package)
+
+    @property
+    def output_collection_enabled(self):
+        return self._collect_output is not None
+
+    def release_collector(self, package):
+        if self._release_output is not None:
+            self._release_output(package)
 
     def reconcile(
         self, package: KubernetesExecutionPackage, *, timeout_seconds: float | None = None
@@ -435,6 +693,8 @@ class KubernetesExecutionAdapter:
             job.state == "unknown"
             or "unknown" in states
             or (job.state == "succeeded" and (not pods or states != {"succeeded"}))
+            or (job.state == "failed" and (not pods or not states <= {"succeeded", "failed"}))
+            or ("failed" in states and job.state not in {"succeeded", "failed"})
         ):
             state: Literal["pending", "running", "succeeded", "failed", "unknown"] = "unknown"
         elif job.state == "failed" or "failed" in states:
@@ -472,7 +732,15 @@ class KubernetesExecutionAdapter:
                     package.operation_id,
                 ),
             )
-        return KubernetesExecutionStatus(package.operation_id, job, pods, state)
+        return KubernetesExecutionStatus(
+            package.operation_id,
+            job,
+            pods,
+            state,
+            KubernetesProviderIdentity(
+                self.cluster.cluster_uid, self.cluster.namespace_uid, job.job_uid
+            ).provider_id,
+        )
 
     def _record_job_identity(self, package: KubernetesExecutionPackage, job_uid: str) -> None:
         with self._connect() as connection:
@@ -508,7 +776,19 @@ class KubernetesExecutionAdapter:
                 != 1
             ):
                 raise KubernetesExecutionError("Kubernetes operation intent disappeared.")
-        return KubernetesExecutionStatus(package.operation_id, None, (), "unknown")
+            row = connection.execute(
+                "SELECT job_uid FROM kubernetes_execution_bindings WHERE operation_id=?",
+                (package.operation_id,),
+            ).fetchone()
+        job_uid = row["job_uid"] if row is not None else None
+        provider_id = (
+            KubernetesProviderIdentity(
+                self.cluster.cluster_uid, self.cluster.namespace_uid, job_uid
+            ).provider_id
+            if job_uid is not None
+            else None
+        )
+        return KubernetesExecutionStatus(package.operation_id, None, (), "unknown", provider_id)
 
     def _record_disappeared_job(
         self, package: KubernetesExecutionPackage, deadline: float
@@ -568,7 +848,15 @@ class KubernetesExecutionAdapter:
                 raise KubernetesExecutionError(
                     "Kubernetes Job UID conflicts with the durable operation."
                 )
-        return KubernetesExecutionStatus(package.operation_id, None, pods, "unknown")
+        return KubernetesExecutionStatus(
+            package.operation_id,
+            None,
+            pods,
+            "unknown",
+            KubernetesProviderIdentity(
+                self.cluster.cluster_uid, self.cluster.namespace_uid, job_uid
+            ).provider_id,
+        )
 
     def _operation_deadline(
         self, package: KubernetesExecutionPackage, timeout_seconds: float | None
@@ -599,10 +887,15 @@ class KubernetesExecutionAdapter:
         """Bound one injected provider call and never overlap a timed-out effect."""
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise KubernetesExecutionError("Kubernetes provider call deadline exceeded.")
+            raise KubernetesExecutionError(
+                "Kubernetes provider call deadline exceeded.", diagnostic_code="deadline_exceeded"
+            )
         with self._inflight_lock:
             if self._inflight is not None and not self._inflight.done():
-                raise KubernetesExecutionError("Kubernetes provider call is still in progress.")
+                raise KubernetesExecutionError(
+                    "Kubernetes provider call is still in progress.",
+                    diagnostic_code="callback_in_progress",
+                )
             future: Future[Any] = Future()
             self._inflight = future
             thread = threading.Thread(
@@ -620,7 +913,9 @@ class KubernetesExecutionAdapter:
         try:
             return future.result(timeout=remaining)
         except TimeoutError:
-            raise KubernetesExecutionError("Kubernetes provider call deadline exceeded.") from None
+            raise KubernetesExecutionError(
+                "Kubernetes provider call deadline exceeded.", diagnostic_code="callback_timeout"
+            ) from None
 
     def _mark_cancellation_requested(self, operation_id: str) -> None:
         with self._connect() as connection:
@@ -653,7 +948,7 @@ class KubernetesExecutionAdapter:
         target_digest = cluster_identity_digest(self.cluster)
         encoded = canonical_json(
             {
-                "binding": package.binding.__dict__,
+                "binding": package.binding.journal_fields,
                 "package_digest": package.package_digest,
                 "target_digest": target_digest,
             }
@@ -716,6 +1011,157 @@ class KubernetesExecutionAdapter:
         return connection
 
 
+class KubernetesExecutionProtocolAdapter:
+    """Translate the Kubernetes conformance adapter to neutral protocols.
+
+    This is intentionally a compatibility layer rather than a replacement for
+    :class:`KubernetesExecutionAdapter`: its calls preserve the existing local
+    intent journal, one-create fence, UID fencing, and collection handoff.
+    """
+
+    _capabilities = ExecutionCapabilities(
+        preflight=True,
+        submit=True,
+        observe=True,
+        cancel=True,
+        reconcile=True,
+        collect=True,
+        account=True,
+        limitations=(
+            "collection is a target-bound handoff, not byte transfer or result acceptance",
+            "accounting exposure is unknown in the provider-disabled Kubernetes fixture",
+            "unknown observations require reconciliation and never authorize resubmission",
+        ),
+    )
+
+    def __init__(self, adapter: KubernetesExecutionAdapter) -> None:
+        self.adapter = adapter
+        self.target = self.target_binding(adapter.cluster)
+
+    @staticmethod
+    def target_binding(cluster: KubernetesClusterConfig) -> TargetBinding:
+        return TargetBinding(
+            adapter_kind="kubernetes-job",
+            profile_version=cluster.profile,
+            identity_digest=cluster_identity_digest(cluster),
+        )
+
+    def capabilities(self, target: TargetBinding) -> ExecutionCapabilities:
+        self._require_target(target)
+        return self._capabilities
+
+    def preflight(self, request: PreflightRequest) -> PreflightResult:
+        try:
+            package = self._package(request.envelope)
+            self._require_target(request.target)
+            if request.envelope.deadline <= datetime.now(UTC):
+                return PreflightResult(
+                    request.target,
+                    self._capabilities,
+                    False,
+                    "execution deadline elapsed",
+                )
+            # This validates the adapter-owned target capability and policy
+            # without writing an intent or invoking an injected provider call.
+            from .kubernetes_contracts import job_manifest
+
+            job_manifest(package.binding, self.adapter.cluster)
+        except (KubernetesExecutionError, KubernetesContractError, ValueError):
+            return PreflightResult(
+                request.target,
+                self._capabilities,
+                False,
+                "target cannot admit the frozen execution envelope",
+            )
+        return PreflightResult(request.target, self._capabilities, True)
+
+    def submit(
+        self, envelope: ExecutionEnvelope, *, timeout_seconds: float | None = None
+    ) -> Observation:
+        package = self._package(envelope)
+        return self._observation(
+            envelope, self.adapter.submit(package, timeout_seconds=timeout_seconds)
+        )
+
+    def observe(
+        self, envelope: ExecutionEnvelope, *, timeout_seconds: float | None = None
+    ) -> Observation:
+        """Observe using the existing no-create reconciliation path."""
+        return self.reconcile(envelope, timeout_seconds=timeout_seconds)
+
+    def cancel(
+        self, envelope: ExecutionEnvelope, *, timeout_seconds: float | None = None
+    ) -> NeutralCancellationObservation:
+        package = self._package(envelope)
+        cancellation = self.adapter.cancel(package, timeout_seconds=timeout_seconds)
+        proof = self.adapter.cancellation_proof(package)
+        return NeutralCancellationObservation(
+            self._handle(envelope, proof.get("provider_id")),
+            cancellation.requested,
+            cancellation.termination_confirmed,
+            not cancellation.termination_confirmed,
+        )
+
+    def reconcile(
+        self, envelope: ExecutionEnvelope, *, timeout_seconds: float | None = None
+    ) -> Observation:
+        package = self._package(envelope)
+        return self._observation(
+            envelope, self.adapter.reconcile(package, timeout_seconds=timeout_seconds)
+        )
+
+    def collect(self, envelope: ExecutionEnvelope) -> CollectionHandoff:
+        package = self._package(envelope)
+        handoff = self.adapter.artifact_collection_handoff(package)
+        provider_id = KubernetesProviderIdentity(
+            self.adapter.cluster.cluster_uid,
+            self.adapter.cluster.namespace_uid,
+            handoff.job_uid,
+        ).provider_id
+        return CollectionHandoff(self._handle(envelope, provider_id), handoff.output_paths)
+
+    def account(self, envelope: ExecutionEnvelope) -> AccountingObservation:
+        self._package(envelope)
+        # The existing provider-disabled path must not manufacture billable usage.
+        return AccountingObservation(self._handle(envelope, None), "unknown")
+
+    def _package(self, envelope: ExecutionEnvelope) -> KubernetesExecutionPackage:
+        self._require_target(envelope.target)
+        package = envelope.payload
+        if not isinstance(package, KubernetesExecutionPackage):
+            raise KubernetesExecutionError(
+                "Kubernetes adapter received a foreign execution envelope."
+            )
+        if package.execution_envelope(self.target) != envelope:
+            raise KubernetesExecutionError(
+                "Kubernetes execution envelope conflicts with frozen intent."
+            )
+        return package
+
+    def _require_target(self, target: TargetBinding) -> None:
+        if target != self.target:
+            raise KubernetesExecutionError(
+                "Kubernetes execution target conflicts with the adapter binding."
+            )
+
+    @staticmethod
+    def _handle(envelope: ExecutionEnvelope, provider_id: object) -> OperationHandle:
+        return OperationHandle(
+            envelope.target,
+            envelope.operation_id,
+            provider_id if isinstance(provider_id, str) else None,
+        )
+
+    def _observation(
+        self, envelope: ExecutionEnvelope, status: KubernetesExecutionStatus
+    ) -> Observation:
+        return Observation(
+            self._handle(envelope, status.provider_id),
+            status.observed_state,
+            datetime.now(UTC),
+        )
+
+
 def _string(value: Mapping[str, object], field: str) -> str:
     result = value.get(field)
     if not isinstance(result, str):
@@ -752,6 +1198,7 @@ __all__ = [
     "KubernetesExecutionAdapter",
     "KubernetesExecutionError",
     "KubernetesExecutionPackage",
+    "KubernetesExecutionProtocolAdapter",
     "KubernetesExecutionStatus",
     "KubernetesOutputBinding",
 ]

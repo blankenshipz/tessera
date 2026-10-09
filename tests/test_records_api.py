@@ -3,10 +3,11 @@
 from datetime import UTC, datetime, timedelta
 from itertools import count
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tessera_control.api import create_app
-from tessera_control.store import initialize_state
+from tessera_control.store import Store, _connect, canonical_digest, initialize_state, plan_digest
 
 
 def setup(tmp_path):
@@ -215,6 +216,7 @@ def test_current_task_plan_detail_is_tenant_scoped_and_digest_verified(tmp_path)
             "profile": "local-cpu",
             "network_enabled": False,
             "max_output_bytes": 1024,
+            "docker": None,
         },
         "plan_digest": revised["plan_digest"],
         "created_at": None,
@@ -223,6 +225,77 @@ def test_current_task_plan_detail_is_tenant_scoped_and_digest_verified(tmp_path)
     assert isinstance(result["created_at"], str) and isinstance(result["actor_principal_id"], str)
     assert client.get(f"/tasks/{task['id']}/plans/{'0' * 64}", headers=headers).status_code == 409
     assert client.get(f"/tasks/{task['id']}/plans/{revised['plan_digest']}").status_code == 401
+
+
+@pytest.mark.parametrize("explicit_docker_null", [False, True])
+def test_plan_readback_preserves_stored_optional_docker_shape_and_digest(
+    tmp_path, explicit_docker_null
+):
+    state, client, headers = setup(tmp_path)
+    project = client.post(
+        "/projects",
+        json={"name": "Stored plan shape"},
+        headers=headers | {"Idempotency-Key": "project"},
+    ).json()
+    task = client.post(
+        f"/projects/{project['id']}/tasks",
+        json={
+            "title": "Stored",
+            "purpose": "Immutable historical plan",
+            "budget_cents": 0,
+            "max_duration_seconds": 90,
+        },
+        headers=headers | {"Idempotency-Key": "task"},
+    ).json()
+    spec = {
+        "argv": ["python", "-c", "print('fixture')"],
+        "input_snapshot_digest": "a" * 64,
+        "pinned_skill_digests": [],
+        "output_paths": ["output.txt"],
+        "profile": "local-cpu",
+        "network_enabled": False,
+        "max_output_bytes": 1024,
+    }
+    if explicit_docker_null:
+        spec["docker"] = None
+    payload = {
+        "expected_revision": task["revision"],
+        "title": "Stored command",
+        "purpose": "Immutable historical plan",
+        "budget_cents": 0,
+        "max_duration_seconds": 90,
+        "execution_spec": spec,
+    }
+    # Direct storage models the original persisted shape, without API normalization.
+    # New HTTP revisions intentionally normalize docker:null; old rows stay untouched.
+    store = Store(state)
+    owner = store.authenticate(headers["Authorization"].split()[1])
+    status, revised = store.revise_task_plan(
+        owner, task["id"], "stored-plan", canonical_digest(payload), payload
+    )
+    assert status == 200
+    digest = plan_digest(payload["title"], payload["purpose"], 0, 90, spec)
+    assert revised["plan_digest"] == digest
+    with _connect(store.database_path) as db:
+        before = dict(
+            db.execute(
+                "SELECT * FROM task_revisions WHERE task_id=? AND plan_digest=?",
+                (task["id"], digest),
+            ).fetchone()
+        )
+    for _ in range(2):
+        response = client.get(f"/tasks/{task['id']}/plans/{digest}", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["execution_spec"] == spec
+        assert response.json()["plan_digest"] == digest
+    with _connect(store.database_path) as db:
+        after = dict(
+            db.execute(
+                "SELECT * FROM task_revisions WHERE task_id=? AND plan_digest=?",
+                (task["id"], digest),
+            ).fetchone()
+        )
+    assert before == after
 
 
 def test_record_routes_enforce_project_scope_and_worker_audience(tmp_path):

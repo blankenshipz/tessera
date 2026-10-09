@@ -1,0 +1,45 @@
+# Separate namespace for explicitly admitted Kubernetes workloads. PVC object
+# references are namespace-local, but storage backend and admission restrictions
+# must still be verified before treating this as a workload-isolation boundary.
+# NetworkPolicy enforcement must be separately observed, not inferred here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tessera-workloads
+  labels:
+    app.kubernetes.io/part-of: tessera
+    tessera.io/workload-isolation: "true"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tessera-workloads
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: outputs
+  namespace: tessera-workloads
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Administrative ceilings, not per-dispatch spending or computation approval.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: bounded-workloads
+  namespace: tessera-workloads
+spec:
+  hard:
+    # Retained old Job/Pod + two variants + one transient helper. Recalculate
+    # for the actual owned history/probes; this is not per-dispatch approval.
+    count/jobs.batch: "3"
+    count/pods: "4"
+    requests.storage: 1Gi

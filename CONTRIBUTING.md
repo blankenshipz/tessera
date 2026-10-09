@@ -1,10 +1,10 @@
 # Contributing to Tessera
 
-Tessera is a source-only developer alpha. No license has been selected: do not
-assume redistribution rights, submit third-party material, or solicit outside
-contributions until the maintainer chooses release terms and reopens the policy.
-The maintainer has paused PRs; unsolicited contributions may be declined even
-when a technical change is useful.
+Tessera is licensed under the [MIT license](LICENSE). Outside contributions are
+welcome: discuss substantial design changes first, preserve explicit authority
+boundaries, and include focused tests. Only submit material you have the right to
+license under MIT. Acceptance is subject to maintainer review; this does not
+authorize an agent to open, merge, commit, or push without user instruction.
 
 ## Setup
 
@@ -22,12 +22,23 @@ state across container recreation; `docker compose down` preserves it. Rebuild
 after source changes. The test service has no network or control-state volume;
 it uses temporary state and runs lint, formatting checks, and pytest.
 Compose is only a developer workflow, not a deployment requirement.
+CI runs style checks separately and four disjoint file-based test shards to avoid
+the previously observed monolithic-suite timeout. Reproduce all shards locally:
+
+```sh
+for shard in 0 1 2 3; do
+  .venv/bin/python dev/pytest_shard.py --index "$shard" --count 4 -q || exit
+done
+```
+
+Every `tests/**/test_*.py` file belongs to exactly one shard; no test is deselected.
+This is a full-suite alternative, not permission to omit a failing shard.
 
 For native development, install [uv](https://docs.astral.sh/uv/getting-started/installation/)
 and Python 3.11 or newer:
 
 ```sh
-uv sync --locked
+uv sync --locked --extra mcp
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
 .venv/bin/pytest
@@ -39,6 +50,14 @@ Initialize once; initialization refuses existing directories. Native serving
 binds only to loopback. Keep the owner header private and never pass it to an
 agent: this first slice identifies a human by possession of that bearer token.
 It does not yet provide separate human-session verification or token rotation.
+For installing the Python distribution outside a checkout and operating separate
+services, see [installation and operations](docs/installation.md). Desktop remains
+a separate package; Python wheel installation does not install Electron.
+For the governed remote-agent identity, MCP stdio, and still-open A2A/reasoning
+acceptance boundaries, see the [design contract](DESIGN.md#53-governed-agent-identity-reasoning-and-peer-transports)
+and [remote-agent install/runbook](docs/remote-agent-platform-install.md). The
+runbook labels unavailable entrypoints and does not treat an installed client or
+synthetic fixture as a completed remote-agent workflow.
 
 `pyproject.toml` declares dependencies and `uv.lock` pins the resolved environment.
 Use `uv lock` after intentional dependency changes and rerun all checks. Docker
@@ -47,6 +66,22 @@ The ignored `.venv/` and `.tessera/` directories are for local development;
 credentials and runtime data must stay out of Git and image build contexts.
 
 ## Initial implementation workflow
+
+The [transferable execution-plane monitor](docs/execution-monitor.md) is separately
+opt-in: `.venv/bin/python -m tessera_monitor` and
+`.venv/bin/python scripts/check_execution_monitor.py` default to zero effects.
+`--check-prerequisites` on the latter is read-only. Never run its explicit single
+Docker case unless daemon-host native observation and the local pinned image are
+available; missing host privileges are a fail-closed prerequisite, not permission
+to install a universal privileged agent. Default tests use fake adapters/private
+sockets and do not run Docker, Kubernetes, Salad or paid workloads.
+
+The newer [closed networkless Docker Desktop fixture](docs/local-networkless-docker-fixture.md)
+runs with `.venv/bin/python scripts/check_local_docker_fixture.py` (zero effects by
+default). Its explicit `--run`, already-local digest image and fresh evidence path
+are separate from the older CPU fixtures below. It never pulls/builds images or
+installs dependencies; unknown enforcement or cleanup blocks conformance. Read
+its runbook for the independent supervisor, recovery and current live blocker.
 
 For an opt-in live CPU isolation/cancellation fixture, first fetch the exact
 development Python image, then run the script against your local Docker daemon:
@@ -354,3 +389,24 @@ packages only: heartbeat, opaque checkpoint, and reconnect/outage metadata remai
 operational evidence fenced to the original worker/lease/operation. It does not
 infer a run for existing operations, make held restores writable, authorize a
 replacement submit, or establish provider termination or laptop independence.
+
+Schema 44 adds empty operation-bound recovery reconciliation records. It does
+not infer worker identity loss, a provider lookup, cancellation delivery, or a
+terminal result for legacy operations; independent reconciler evidence remains
+separate from the original worker's identity and cannot create replacement work.
+
+Schema 45 adds empty Astra coordinator consumer leases and availability records.
+Schema 46 adds empty human artifact-read custody and immutable reproduction-bundle
+records without releasing historical quarantined artifacts. Schema 47 adds
+secret-free local-owner operator audit/health metadata and optional event lineage.
+Schema 48 adds empty metadata-only MixFM dataset snapshots, source/license/
+provenance declarations, and review proposals. It does not download or validate
+external data, infer a license/provenance record, or approve prior datasets.
+None of these migrations infers credentials, provider activity, artifact release,
+recovery authority, or scientific acceptance from older records.
+
+Schema 49 adds empty human-approved capability policies and unique action-intent/
+effect-report records. Migration infers no network/install authority and enables
+no execution adapter. It invalidates pre-upgrade backup freshness in active state;
+held restores remain immutable. See the [capability policy](docs/agent-capability-policy.md)
+for declaration limits and offline acceptance checks.

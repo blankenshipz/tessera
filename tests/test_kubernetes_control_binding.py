@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 
 from test_execution import _grant_payload, _owner, _snapshot_release, _task, _worker
@@ -14,6 +15,7 @@ from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.store import Store, canonical_digest, initialize_state, migrate_state
 from tessera_worker.kubernetes_contracts import (
     KubernetesClusterConfig,
+    KubernetesConnectivityEvidence,
     KubernetesJobBinding,
     KubernetesNetworkPolicyEvidence,
     domain_identifier_from_resource_name,
@@ -93,6 +95,7 @@ def test_control_issued_admitted_attempt_and_lease_bind_without_renaming(tmp_pat
         command=("opencode", "serve"),
         active_deadline_seconds=300,
     )
+    now = datetime.now(UTC)
     cluster = KubernetesClusterConfig(
         kubeconfig="/private/fixture/kubeconfig",
         kubeconfig_sha256="a" * 64,
@@ -105,7 +108,15 @@ def test_control_issued_admitted_attempt_and_lease_bind_without_renaming(tmp_pat
         cluster_uid="cluster-fixture",
         namespace_uid="namespace-fixture",
         network_none_evidence=KubernetesNetworkPolicyEvidence(
-            "network-policy-enforced-v1", "tessera-deny-all", "policy-fixture", "f" * 64
+            "network-policy-enforced-v1",
+            "tessera-deny-all",
+            "policy-fixture",
+            "f" * 64,
+            "cluster-fixture",
+            "namespace-fixture",
+            now,
+            KubernetesConnectivityEvidence("allowed-pod", "server-pod", "allowed", 3, now),
+            KubernetesConnectivityEvidence("denied-pod", "server-pod", "denied", 3, now),
         ),
     )
     manifest = job_manifest(binding, cluster)

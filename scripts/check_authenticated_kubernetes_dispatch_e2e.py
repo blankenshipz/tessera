@@ -1,4 +1,4 @@
-"""Run one retained, authenticated Docker Desktop Kubernetes dispatch conformance E2E.
+"""Run one cleanup-fenced authenticated Docker Desktop Kubernetes dispatch conformance E2E.
 
 This narrow, explicitly opt-in fixture uses a temporary loopback control service
 and normal authenticated human/worker routes. It never uses an ambient Kubernetes
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import secrets
 import socket
 import subprocess
@@ -32,6 +33,7 @@ from tessera_worker.docker_desktop_kubernetes import (
     _collector_manifest,
     _pvc,
     _pvc_spec_sha256,
+    _require_docker_desktop_node,
     _uid,
     _verify_bound_pvc,
     _verify_collector,
@@ -40,6 +42,7 @@ from tessera_worker.docker_desktop_kubernetes import (
 )
 from tessera_worker.kubernetes_contracts import (
     KubernetesClusterConfig,
+    KubernetesConnectivityEvidence,
     KubernetesNetworkPolicyEvidence,
     canonical_json,
     cluster_identity_digest,
@@ -96,6 +99,7 @@ def _emit_fixture_result(result: dict[str, Any], exit_code: int) -> int:
 
 
 def _run(argv: tuple[str, ...], *, timeout: int = 90) -> subprocess.CompletedProcess[str]:
+    """Run a local command and always return its CompletedProcess on success."""
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=True, timeout=timeout)
     except subprocess.CalledProcessError as error:
@@ -119,7 +123,10 @@ def _node_image(expected_reference: str) -> ExactImage:
         )
     ).stdout.splitlines()
     prefix = "docker.io/library/tessera-e2e-hello@sha256:"
-    if not expected_reference.startswith(prefix) or expected_reference not in listed:
+    if (
+        not re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", expected_reference)
+        or expected_reference not in listed
+    ):
         raise DispatchE2EUnavailable(
             "the requested node-resident pinned tessera-e2e-hello image is unavailable"
         )
@@ -242,28 +249,241 @@ def _adopt_snapshot(executable: Path, state: Path, project_id: str, workspace: P
     return snapshot
 
 
-def _cluster(live: DockerDesktopKubernetesAdapter, namespace: str):
-    live._create({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace}}, None)
+def _network_probe_pod(
+    namespace: str,
+    name: str,
+    role: str,
+    image: str,
+    args: list[str],
+    fixture_labels: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/managed-by": "tessera",
+                "tessera.io/connectivity-role": role,
+                **fixture_labels,
+            },
+        },
+        "spec": {
+            "automountServiceAccountToken": False,
+            "restartPolicy": "Never",
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": 65532,
+                "runAsGroup": 65532,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": "probe",
+                    "image": image,
+                    "imagePullPolicy": "Never",
+                    "args": args,
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                }
+            ],
+        },
+    }
+
+
+def _fixture_owned_manifest(
+    manifest: dict[str, Any], fixture_labels: dict[str, str]
+) -> dict[str, Any]:
+    """Copy a fixture manifest and add its unique ownership labels everywhere needed."""
+    owned = json.loads(json.dumps(manifest))
+    metadata = owned.setdefault("metadata", {})
+    metadata["labels"] = {**metadata.get("labels", {}), **fixture_labels}
+    template_metadata = owned.get("spec", {}).get("template", {}).get("metadata")
+    if isinstance(template_metadata, dict):
+        template_metadata["labels"] = {**template_metadata.get("labels", {}), **fixture_labels}
+    return owned
+
+
+def _fixture_labels(nonce: str) -> dict[str, str]:
+    return {
+        "app.kubernetes.io/managed-by": "tessera",
+        "tessera.io/fixture-id": f"authenticated-kubernetes-dispatch-{nonce}",
+    }
+
+
+def _require_cluster_binding(live: DockerDesktopKubernetesAdapter, cluster) -> None:
+    if (
+        _uid(live._get("namespace", "kube-system", None), "Namespace", "kube-system", None)
+        != cluster.cluster_uid
+        or _uid(
+            live._get("namespace", cluster.namespace, None), "Namespace", cluster.namespace, None
+        )
+        != cluster.namespace_uid
+    ):
+        raise DispatchE2EError("Docker Desktop cluster or fixture namespace identity changed")
+
+
+def _cluster(
+    live: DockerDesktopKubernetesAdapter,
+    namespace: str,
+    image: ExactImage,
+    fixture_labels: dict[str, str],
+):
+    if not re.fullmatch(r"tessera-e2e-[a-z0-9-]{1,48}", namespace):
+        raise DispatchE2EError("fixture namespace must be a bounded tessera-e2e name")
+    if live._maybe_get("namespace", namespace, None) is not None:
+        raise DispatchE2EError("refusing to adopt an existing fixture namespace")
+    live._create(
+        _fixture_owned_manifest(
+            {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace}},
+            fixture_labels,
+        ),
+        None,
+    )
     namespace_uid = _uid(live._get("namespace", namespace, None), "Namespace", namespace, None)
     policy_spec = {
         "podSelector": {"matchLabels": {"app.kubernetes.io/managed-by": "tessera"}},
         "policyTypes": ["Ingress", "Egress"],
     }
     live._create(
-        {
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "NetworkPolicy",
-            "metadata": {"name": "deny-all", "namespace": namespace},
-            "spec": policy_spec,
-        },
+        _fixture_owned_manifest(
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": "deny-all", "namespace": namespace},
+                "spec": policy_spec,
+            },
+            fixture_labels,
+        ),
         namespace,
     )
     policy = live._get("networkpolicy", "deny-all", namespace)
     policy_uid = _uid(policy, "NetworkPolicy", "deny-all", namespace)
     if canonical_json(policy.get("spec")) != canonical_json(policy_spec):
-        raise DispatchE2EError("created NetworkPolicy conflicts with the fixed network-none policy")
-    live._create(_pvc(namespace), namespace)
+        raise DispatchE2EError("created NetworkPolicy conflicts with the fixture policy")
+    server_labels = {
+        "app.kubernetes.io/managed-by": "tessera",
+        "tessera.io/connectivity-role": "server",
+    }
+    allowed_labels = {
+        "app.kubernetes.io/managed-by": "tessera",
+        "tessera.io/connectivity-role": "allowed",
+    }
+    for manifest in (
+        _fixture_owned_manifest(
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": "allow-probe-ingress", "namespace": namespace},
+                "spec": {
+                    "podSelector": {"matchLabels": server_labels},
+                    "policyTypes": ["Ingress"],
+                    "ingress": [
+                        {
+                            "from": [{"podSelector": {"matchLabels": allowed_labels}}],
+                            "ports": [{"protocol": "TCP", "port": 8080}],
+                        }
+                    ],
+                },
+            },
+            fixture_labels,
+        ),
+        _fixture_owned_manifest(
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": "allow-probe-egress", "namespace": namespace},
+                "spec": {
+                    "podSelector": {"matchLabels": allowed_labels},
+                    "policyTypes": ["Egress"],
+                    "egress": [
+                        {
+                            "to": [{"podSelector": {"matchLabels": server_labels}}],
+                            "ports": [{"protocol": "TCP", "port": 8080}],
+                        }
+                    ],
+                },
+            },
+            fixture_labels,
+        ),
+    ):
+        live._create(manifest, namespace)
+    server_name = "network-probe-server"
+    live._create(
+        _network_probe_pod(
+            namespace, server_name, "server", image.reference, ["--http-server"], fixture_labels
+        ),
+        namespace,
+    )
+    live._kubectl(
+        "wait",
+        "--for=condition=Ready",
+        f"pod/{server_name}",
+        "--timeout=30s",
+        namespace=namespace,
+        timeout=40,
+    )
+    server = live._get("pod", server_name, namespace)
+    server_uid = _uid(server, "Pod", server_name, namespace)
+    pod_ip = server.get("status", {}).get("podIP")
+    if not isinstance(pod_ip, str) or not pod_ip:
+        raise DispatchE2EError("network probe server has no attributed Pod IP")
+    probe_uids: dict[str, str] = {}
+    for expected in ("allowed", "denied"):
+        name = f"network-probe-{expected}"
+        role = "allowed" if expected == "allowed" else "denied"
+        live._create(
+            _network_probe_pod(
+                namespace,
+                name,
+                role,
+                image.reference,
+                ["--http-probe", f"{pod_ip}:8080", "allow" if expected == "allowed" else "deny"],
+                fixture_labels,
+            ),
+            namespace,
+        )
+        live._kubectl(
+            "wait",
+            "--for=jsonpath={.status.phase}=Succeeded",
+            f"pod/{name}",
+            "--timeout=30s",
+            namespace=namespace,
+            timeout=40,
+        )
+        probe = live._get("pod", name, namespace)
+        probe_uids[expected] = _uid(probe, "Pod", name, namespace)
+        log = live._kubectl("logs", name, namespace=namespace).stdout.strip()
+        expected_log = (
+            "allowed connection observed"
+            if expected == "allowed"
+            else "denied connection observed:"
+        )
+        if log != expected_log if expected == "allowed" else not log.startswith(expected_log):
+            raise DispatchE2EError(f"{expected} network connectivity was not observed")
+    live._create(_fixture_owned_manifest(_pvc(namespace), fixture_labels), namespace)
     target = live.target
+    cluster_uid = _uid(
+        live._get("namespace", "kube-system", None), "Namespace", "kube-system", None
+    )
+    observed_at = datetime.now(UTC)
+    network_evidence = KubernetesNetworkPolicyEvidence(
+        "network-policy-enforced-v1",
+        "deny-all",
+        policy_uid,
+        hashlib.sha256(canonical_json(policy_spec)).hexdigest(),
+        cluster_uid,
+        namespace_uid,
+        observed_at,
+        KubernetesConnectivityEvidence(
+            probe_uids["allowed"], server_uid, "allowed", 3, observed_at
+        ),
+        KubernetesConnectivityEvidence(probe_uids["denied"], server_uid, "denied", 3, observed_at),
+    )
     cluster = KubernetesClusterConfig(
         kubeconfig=str(target.kubeconfig),
         kubeconfig_sha256=target.kubeconfig_sha256,
@@ -273,40 +493,87 @@ def _cluster(live: DockerDesktopKubernetesAdapter, namespace: str):
         server_sha256=hashlib.sha256(target.server.encode()).hexdigest(),
         ca_sha256=target.ca_sha256,
         namespace=namespace,
-        cluster_uid=_uid(
-            live._get("namespace", "kube-system", None), "Namespace", "kube-system", None
-        ),
+        cluster_uid=cluster_uid,
         namespace_uid=namespace_uid,
-        network_none_evidence=KubernetesNetworkPolicyEvidence(
-            "network-policy-enforced-v1",
-            "deny-all",
-            policy_uid,
-            hashlib.sha256(canonical_json(policy_spec)).hexdigest(),
-        ),
+        network_none_evidence=network_evidence,
     )
     pvc = live._get("pvc", "outputs", namespace)
     return cluster, _uid(pvc, "PersistentVolumeClaim", "outputs", namespace), _pvc_spec_sha256(pvc)
 
 
+def _cleanup_fixture(
+    live: DockerDesktopKubernetesAdapter,
+    namespace: str,
+    expected_namespace_uid: str,
+    fixture_labels: dict[str, str],
+) -> dict[str, str]:
+    """Delete only this exact, wholly fixture-owned namespace.
+
+    Namespace deletion is deliberately refused rather than risk deleting a
+    replacement namespace or an unowned workload placed in the fixture name.
+    """
+    namespace_resource = live._maybe_get("namespace", namespace, None)
+    if namespace_resource is None:
+        return {"status": "already_absent"}
+    if _uid(namespace_resource, "Namespace", namespace, None) != expected_namespace_uid:
+        return {"status": "refused", "reason": "namespace_uid_mismatch"}
+    namespace_labels = namespace_resource.get("metadata", {}).get("labels", {})
+    if not isinstance(namespace_labels, dict) or any(
+        namespace_labels.get(key) != value for key, value in fixture_labels.items()
+    ):
+        return {"status": "refused", "reason": "namespace_ownership_missing"}
+    listing = json.loads(
+        live._kubectl(
+            "get", "all,networkpolicies,persistentvolumeclaims", "-o", "json", namespace=namespace
+        ).stdout
+    )
+    items = listing.get("items") if isinstance(listing, dict) else None
+    if not isinstance(items, list):
+        return {"status": "refused", "reason": "resource_inventory_malformed"}
+    for resource in items:
+        metadata = resource.get("metadata", {}) if isinstance(resource, dict) else {}
+        labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        if not isinstance(labels, dict) or any(
+            labels.get(key) != value for key, value in fixture_labels.items()
+        ):
+            return {"status": "refused", "reason": "unowned_resource_present"}
+    live.delete_namespace_uid_precondition(namespace, expected_namespace_uid)
+    return {"status": "deletion_requested", "namespace_uid": expected_namespace_uid}
+
+
 class _LiveAdapter:
     """The durable nonblocking adapter with only explicit Kubernetes callbacks."""
 
-    def __init__(self, live: DockerDesktopKubernetesAdapter, cluster, journal: Path) -> None:
+    def __init__(
+        self,
+        live: DockerDesktopKubernetesAdapter,
+        cluster,
+        journal: Path,
+        fixture_labels: dict[str, str],
+    ) -> None:
         self.live, self.cluster, self.package = live, cluster, None
+
+        def create_bound_job(manifest):
+            _require_cluster_binding(live, cluster)
+            return live._create(
+                _fixture_owned_manifest(manifest, fixture_labels), cluster.namespace
+            )
+
         self.adapter = KubernetesExecutionAdapter(
             journal,
             cluster,
             inspect_job=lambda name: live._maybe_get("job", name, cluster.namespace),
-            create_job=lambda manifest: live._create(manifest, cluster.namespace),
+            create_job=create_bound_job,
             delete_job=self._delete_job,
             observe_pods=lambda job_uid: live._owned_pod_resources(job_uid, cluster.namespace),
         )
 
     def _delete_job(self, name: str, uid: str) -> None:
-        current = self.live._get("job", name, self.cluster.namespace)
-        if _uid(current, "Job", name, self.cluster.namespace) != uid:
-            raise DispatchE2EError("Job UID changed before narrowly named deletion")
-        self.live._kubectl("delete", "job", name, "--wait=false", namespace=self.cluster.namespace)
+        try:
+            _require_cluster_binding(self.live, self.cluster)
+            self.live._delete_job_uid_precondition(name, uid, self.cluster.namespace)
+        except LiveKubernetesError as error:
+            raise DispatchE2EError("Job UID-precondition deletion was not accepted") from error
 
     def submit(self, package, *, timeout_seconds: float | None = None):
         self.package = package
@@ -359,6 +626,29 @@ def _workload(mode: str, seconds: int) -> tuple[str, ...]:
     if mode == "success":
         return ("/hello", "--write", "/outputs/result.txt")
     return ("/hello", "--sleep-write", str(seconds), "/outputs/result.txt")
+
+
+def _task_plan(
+    task: dict[str, Any], snapshot_digest: str, mode: str, workload_seconds: int, timeout: int
+) -> dict[str, Any]:
+    """Return the exact ordinary API request admitted by the fixed runner contract."""
+    return {
+        "expected_revision": task["revision"],
+        "title": task["title"],
+        "purpose": task["purpose"],
+        "budget_cents": 0,
+        "max_duration_seconds": timeout,
+        "execution_spec": {
+            "argv": list(_workload(mode, workload_seconds)),
+            "input_snapshot_digest": snapshot_digest,
+            "pinned_skill_digests": [],
+            "output_paths": ["result.txt"],
+            "profile": "kubernetes-opencode",
+            "docker": None,
+            "network_enabled": False,
+            "max_output_bytes": 1024,
+        },
+    }
 
 
 def _grant_id(package_response: dict[str, Any]) -> str:
@@ -432,14 +722,28 @@ def _report_rows(root: Path, dispatch_id: str, operation_id: str) -> list[dict[s
 def _main(args: argparse.Namespace) -> dict[str, Any]:
     nonce = new_nonce()
     target = target_from_kubeconfig(args.kubeconfig)
+    _require_docker_desktop_node()
     image = _node_image(args.image)
     journal = args.journal or Path("/tmp") / f"tessera-authenticated-kubernetes-e2e-{nonce}.sqlite3"
     if journal.exists():
         raise DispatchE2EError("refusing to reuse a local dispatch journal")
-    namespace = f"tessera-e2e-{nonce}"
+    namespace = args.namespace or f"tessera-e2e-{nonce}"
+    fixture_labels = _fixture_labels(nonce)
     live = DockerDesktopKubernetesAdapter(target, journal)
-    cluster, pvc_uid, pvc_spec = _cluster(live, namespace)
+    # Verify the named local node and cluster before the first mutating call.
+    nodes = json.loads(live._kubectl("get", "nodes", "-o", "json", namespace=None).stdout)
+    if not isinstance(nodes, dict) or not any(
+        item.get("metadata", {}).get("name") == "desktop-control-plane"
+        for item in nodes.get("items", [])
+        if isinstance(item, dict)
+    ):
+        raise DispatchE2EError("explicit cluster does not contain the Docker Desktop node")
+    _uid(live._get("namespace", "kube-system", None), "Namespace", "kube-system", None)
+    cluster, pvc_uid, pvc_spec = _cluster(live, namespace, image, fixture_labels)
+    _require_cluster_binding(live, cluster)
     target_digest = cluster_identity_digest(cluster)
+    cleanup_evidence: dict[str, str] = {}
+    completed_successfully = False
     # macOS /tmp is a symlink; workspace custody intentionally rejects a
     # symlinked ancestor, so use the verified physical temporary directory.
     with tempfile.TemporaryDirectory(
@@ -528,22 +832,13 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             task = owner.request(
                 "PUT",
                 f"/tasks/{task['id']}/plan",
-                {
-                    "expected_revision": task["revision"],
-                    "title": task["title"],
-                    "purpose": task["purpose"],
-                    "budget_cents": 0,
-                    "max_duration_seconds": args.timeout,
-                    "execution_spec": {
-                        "argv": list(_workload(args.mode, args.workload_seconds)),
-                        "input_snapshot_digest": snapshot["digest"],
-                        "pinned_skill_digests": [],
-                        "output_paths": ["result.txt"],
-                        "profile": "kubernetes-opencode",
-                        "network_enabled": False,
-                        "max_output_bytes": 1024,
-                    },
-                },
+                _task_plan(
+                    task,
+                    snapshot["digest"],
+                    args.mode,
+                    args.workload_seconds,
+                    args.timeout,
+                ),
                 key=_key(nonce, "task-plan"),
             )
             task = owner.request(
@@ -656,7 +951,7 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             credential_file = temporary_root / "worker.credential"
             credential_file.write_text(worker_token)
             credential_file.chmod(0o600)
-            adapter = _LiveAdapter(live, cluster, journal)
+            adapter = _LiveAdapter(live, cluster, journal, fixture_labels)
 
             def service(channel: Any | None = None) -> KubernetesDispatchWorkerService:
                 return KubernetesDispatchWorkerService(
@@ -829,7 +1124,12 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
                 raise DispatchE2EError("real Kubernetes Job lacks successful owned Pod evidence")
             live._require_collector_authorization(namespace)
             collector = f"tessera-collector-{adapter.package.operation_id}"
-            live._create(_collector_manifest(namespace, collector, image.reference), namespace)
+            live._create(
+                _fixture_owned_manifest(
+                    _collector_manifest(namespace, collector, image.reference), fixture_labels
+                ),
+                namespace,
+            )
             live._kubectl(
                 "wait",
                 "--for=jsonpath={.status.phase}=Succeeded",
@@ -859,6 +1159,7 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
                 or exported_dispatch["admitted_attempt_id"] != admitted["id"]
             ):
                 raise DispatchE2EError("experiment export does not retain control dispatch linkage")
+            completed_successfully = True
             return {
                 "state": "succeeded",
                 "context": CONTEXT,
@@ -892,16 +1193,14 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
                         worker_root, dispatch["id"], adapter.package.operation_id
                     )
                 ],
+                "cleanup": cleanup_evidence,
                 "journal": str(journal),
-                "retained": (
-                    "namespace, NetworkPolicy, PVC, Job, workload Pod, collector Pod, "
-                    "and local journal"
-                ),
+                "retained": "local journal; namespace deletion requested, absence unconfirmed",
                 "limitations": [
                     "provider-disabled deterministic fixture only",
                     "no OpenCode, model, provider, or credential delivery invocation",
                     "collection readback does not release an artifact or accept a result",
-                    "no namespace deletion, broad deletion, prune, or context switch was issued",
+                    "fixture cleanup deletes only a UID- and ownership-verified namespace",
                 ],
             }
         finally:
@@ -911,11 +1210,19 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             except subprocess.TimeoutExpired:
                 server.kill()
                 server.wait(timeout=10)
+            if completed_successfully:
+                cleanup_evidence.update(
+                    _cleanup_fixture(live, namespace, cluster.namespace_uid, fixture_labels)
+                )
+                if cleanup_evidence["status"] not in {"deletion_requested", "already_absent"}:
+                    raise DispatchE2EError(f"fixture cleanup refused: {cleanup_evidence['reason']}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", action="store_true", help="perform the retained live dispatch run")
+    parser.add_argument(
+        "--run", action="store_true", help="perform the cleanup-fenced live dispatch run"
+    )
     parser.add_argument(
         "--mode",
         default="success",
@@ -923,6 +1230,10 @@ def main() -> int:
     )
     parser.add_argument("--kubeconfig", type=Path, help="explicit absolute kubeconfig")
     parser.add_argument("--context", choices=[CONTEXT], default=CONTEXT)
+    parser.add_argument(
+        "--namespace",
+        help="explicit unique fixture namespace; an existing namespace is never adopted",
+    )
     parser.add_argument(
         "--image",
         help="exact existing node-resident tessera-e2e-hello@sha256 reference",

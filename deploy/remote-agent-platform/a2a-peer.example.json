@@ -1,0 +1,18 @@
+{
+  "agent_id": "ENROLLED_RECIPIENT_AGENT_ID",
+  "credential_id": "ENROLLED_RECIPIENT_CREDENTIAL_ID",
+  "destination": "EXACT_RECIPIENT_DESTINATION",
+  "model": "APPROVED_ATTRIBUTED_MODEL_ID",
+  "database": "/var/lib/tessera-a2a/peer.sqlite3",
+  "control_url": "http://127.0.0.1:8765",
+  "public_url": "http://127.0.0.1:8771",
+  "listen_port": 8771,
+  "control_token_env": "TESSERA_A2A_CONTROL_TOKEN",
+  "identities": {
+    "SHA256_OF_SEPARATELY_ISSUED_PEER_BEARER": {
+      "tenant": "EXACT_ORGANIZATION_ID",
+      "project_id": "EXACT_PROJECT_ID",
+      "agent_id": "ENROLLED_SENDER_AGENT_ID"
+    }
+  }
+}

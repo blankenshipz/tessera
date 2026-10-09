@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 from test_finding_reaffirmation import _fixture, _run
 
-from tessera_control.migrations import MIGRATIONS, migrate_v11_to_v12, migrate_v12_to_v13
+from tessera_control.migrations import (
+    LATEST_SCHEMA_VERSION,
+    MIGRATIONS,
+    migrate_v11_to_v12,
+    migrate_v12_to_v13,
+)
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.research import ResearchStore
 from tessera_control.store import Store, migrate_state
@@ -55,6 +60,9 @@ def _legacy(tmp_path: Path, version: int = 11):
         from schema_fixtures import drop_empty_experiment_schema
 
         drop_empty_experiment_schema(connection)
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=?", (version,))
     return state, owner, finding, before
 
@@ -66,8 +74,8 @@ def test_v12_preserves_finding_history_and_supports_held_restore(tmp_path: Path)
             connection.execute("UPDATE research_findings SET status='retracted'")
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     store = ResearchStore(state)
     assert store.export_study(owner, finding["study_id"]) == before
     retracted = _run(
@@ -130,7 +138,7 @@ def test_v13_migration_preserves_v12_records_and_rolls_back(
         with sqlite3.connect(database) as connection:
             assert list(connection.iterdump()) == snapshot
         return
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     store = ResearchStore(state)
     assert store.export_study(owner, finding["study_id"]) == before
     result = _run(

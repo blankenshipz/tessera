@@ -13,17 +13,23 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .astra_models import (
     CancelCoordinatorTurn,
     ClaimCoordinatorTurn,
     CompleteCoordinatorTurn,
+    ConsumerHeartbeat,
     FailCoordinatorTurn,
     RegisterProposalDesign,
     RequestCoordinatorTurn,
 )
 from .store import Conflict, Forbidden, NotFound, Store, _connect, utc_now
+
+_CLAIM_LEASE_SECONDS = 300
+_MAX_CLAIM_ATTEMPTS = 3
+_CONSUMER_HEALTH_SECONDS = 60
 
 
 def create_astra_schema(
@@ -112,6 +118,35 @@ def create_astra_schema(
         connection.execute(statement)
 
 
+def create_astra_consumer_schema(connection: sqlite3.Connection) -> None:
+    """Add lease/retry metadata without inferring a live ordinary consumer."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(astra_coordinator_turns)")}
+    if "claim_expires_at" not in columns:
+        connection.execute("ALTER TABLE astra_coordinator_turns ADD COLUMN claim_expires_at TEXT")
+    if "claim_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE astra_coordinator_turns ADD COLUMN claim_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS astra_coordinator_turns_claim_lease "
+        "ON astra_coordinator_turns(project_id,state,claim_expires_at,created_at,id)"
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS astra_consumer_health (
+        agent_principal_id TEXT PRIMARY KEY REFERENCES principals(id),
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        credential_id TEXT NOT NULL REFERENCES credentials(id),
+        heartbeat_at TEXT NOT NULL, last_outcome TEXT NOT NULL CHECK (
+            last_outcome IN ('idle','claimed','completed','retrying')),
+        updated_at TEXT NOT NULL)"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS astra_consumer_health_by_project "
+        "ON astra_consumer_health(project_id,heartbeat_at,agent_principal_id)"
+    )
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -153,7 +188,7 @@ class AstraStore:
     @staticmethod
     def _turn_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         value = dict(row)
-        return {"id": value["id"], "project_id": value["project_id"], "input_message_id": value["input_message_id"], "context_snapshot_id": value["context_snapshot_id"], "state": value["state"], "revision": value["revision"], "claimed_by_principal_id": value["claimed_by_principal_id"], "claimed_at": value["claimed_at"], "completion_message_id": value["completion_message_id"], "proposal_id": value["proposal_id"], "error_code": value["error_code"], "created_at": value["created_at"], "updated_at": value["updated_at"]}
+        return {"id": value["id"], "project_id": value["project_id"], "input_message_id": value["input_message_id"], "context_snapshot_id": value["context_snapshot_id"], "state": value["state"], "revision": value["revision"], "claimed_by_principal_id": value["claimed_by_principal_id"], "claimed_at": value["claimed_at"], "claim_expires_at": value.get("claim_expires_at"), "claim_attempts": value.get("claim_attempts", 0), "completion_message_id": value["completion_message_id"], "proposal_id": value["proposal_id"], "error_code": value["error_code"], "created_at": value["created_at"], "updated_at": value["updated_at"]}
 
     @staticmethod
     def _proposal_response(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -190,6 +225,100 @@ class AstraStore:
         if snapshot is None or conversation is None or snapshot["conversation_revision"] != conversation["revision"]:
             raise Conflict("Astra coordinator context is stale.")
 
+    @staticmethod
+    def _lease_expiry() -> str:
+        return (datetime.now(UTC) + timedelta(seconds=_CLAIM_LEASE_SECONDS)).isoformat()
+
+    @staticmethod
+    def _lease_is_live(turn: dict[str, Any]) -> bool:
+        expiry = turn.get("claim_expires_at")
+        if not isinstance(expiry, str):
+            return False
+        try:
+            return datetime.fromisoformat(expiry.replace("Z", "+00:00")) > datetime.now(UTC)
+        except ValueError:
+            return False
+
+    def _claim(self, conn: sqlite3.Connection, live: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any]:
+        if turn["claim_attempts"] >= _MAX_CLAIM_ATTEMPTS:
+            raise Conflict("Astra coordinator turn retry budget is exhausted.")
+        self._fresh_context(conn, turn)
+        now, expiry = utc_now(), self._lease_expiry()
+        conn.execute(
+            """UPDATE astra_coordinator_turns SET state='claimed',revision=revision+1,
+            claimed_by_principal_id=?,claimed_at=?,claim_expires_at=?,claim_attempts=claim_attempts+1,
+            updated_at=? WHERE id=?""",
+            (live["id"], now, expiry, now, turn["id"]),
+        )
+        turn.update(
+            state="claimed",
+            revision=turn["revision"] + 1,
+            claimed_by_principal_id=live["id"],
+            claimed_at=now,
+            claim_expires_at=expiry,
+            claim_attempts=turn["claim_attempts"] + 1,
+            updated_at=now,
+        )
+        self.store._event(
+            conn,
+            live,
+            turn["project_id"],
+            None,
+            "astra_coordinator_turn_claimed",
+            turn["revision"],
+            {
+                "turn_id": turn["id"],
+                "claim_attempt": turn["claim_attempts"],
+                "provider_disabled": True,
+            },
+        )
+        return turn
+
+    def _next_claimable_turn(self, conn: sqlite3.Connection, live: dict[str, Any]) -> dict[str, Any] | None:
+        """Return this agent's oldest request or safely reclaim its expired lease."""
+        project_id = live["project_id"]
+        if project_id is None:
+            raise Forbidden("A coordinator credential must be scoped to one project.")
+        now = utc_now()
+        rows = conn.execute(
+            """SELECT * FROM astra_coordinator_turns WHERE org_id=? AND project_id=? AND
+            NOT EXISTS (SELECT 1 FROM astra_status_discussions d WHERE d.turn_id=astra_coordinator_turns.id) AND
+            (state='requested' OR (state='claimed' AND claimed_by_principal_id=?) OR
+             (state='claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at<=?))
+            ORDER BY created_at,id LIMIT 17""",
+            (live["org_id"], project_id, live["id"], now),
+        ).fetchall()
+        for row in rows:
+            turn = dict(row)
+            if turn["state"] == "claimed":
+                if turn["claimed_by_principal_id"] == live["id"] and self._lease_is_live(turn):
+                    return turn
+                if turn["claim_attempts"] >= _MAX_CLAIM_ATTEMPTS:
+                    conn.execute(
+                        "UPDATE astra_coordinator_turns SET state='failed',revision=revision+1,"
+                        "error_code='claim_retry_exhausted',updated_at=? WHERE id=?",
+                        (now, turn["id"]),
+                    )
+                    self.store._event(conn, live, project_id, None, "astra_coordinator_turn_failed", turn["revision"] + 1, {"turn_id": turn["id"], "error_code": "claim_retry_exhausted", "provider_disabled": True})
+                    continue
+                conn.execute(
+                    "UPDATE astra_coordinator_turns SET state='requested',claimed_by_principal_id=NULL,"
+                    "claimed_at=NULL,claim_expires_at=NULL,updated_at=? WHERE id=? AND state='claimed'",
+                    (now, turn["id"]),
+                )
+                turn.update(state="requested", claimed_by_principal_id=None, claimed_at=None, claim_expires_at=None, updated_at=now)
+            try:
+                return self._claim(conn, live, turn)
+            except Conflict:
+                # A stale selected context is terminal for this deterministic run;
+                # it cannot be retried with a changed authority snapshot.
+                conn.execute(
+                    "UPDATE astra_coordinator_turns SET state='failed',revision=revision+1,"
+                    "error_code='stale_context',updated_at=? WHERE id=? AND state='requested'",
+                    (now, turn["id"]),
+                )
+        return None
+
     def request_turn(self, actor: dict[str, Any], key: str, project_id: str, **payload: Any):
         body = RequestCoordinatorTurn(**payload)
         payload = body.model_dump(mode="json")
@@ -213,7 +342,11 @@ class AstraStore:
             encoded = json.dumps(refs, sort_keys=True, separators=(",", ":"))
             conn.execute("INSERT INTO astra_conversation_messages VALUES (?,?,?,?,?,?,?,?,?)", (message_id, project_id, revision, "human", body.prompt, None, snapshot_id, now, live["id"]))
             conn.execute("INSERT INTO astra_selected_context_snapshots VALUES (?,?,?,?,?,?,?,?)", (snapshot_id, live["org_id"], project_id, revision, encoded, _digest(refs), now, live["id"]))
-            conn.execute("INSERT INTO astra_coordinator_turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (turn_id, live["org_id"], project_id, message_id, snapshot_id, "requested", 1, None, None, None, None, None, now, now, live["id"]))
+            conn.execute("""INSERT INTO astra_coordinator_turns
+                (id,org_id,project_id,input_message_id,context_snapshot_id,state,revision,
+                 claimed_by_principal_id,claimed_at,claim_expires_at,claim_attempts,
+                 completion_message_id,proposal_id,error_code,created_at,updated_at,created_by_principal_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (turn_id, live["org_id"], project_id, message_id, snapshot_id, "requested", 1, None, None, None, 0, None, None, None, now, now, live["id"]))
             conn.execute("UPDATE astra_project_conversations SET revision=? WHERE project_id=?", (revision, project_id))
             self.store._event(conn, live, project_id, None, "astra_coordinator_turn_requested", revision, {"turn_id": turn_id, "context_snapshot_id": snapshot_id, "provider_disabled": True})
             return 201, {"conversation": {**self._conversation_response(conversation), "revision": revision}, "input_message": self._message_response({"id": message_id, "project_id": project_id, "conversation_revision": revision, "sender_kind": "human", "body": body.prompt, "turn_id": None, "context_snapshot_id": snapshot_id, "created_at": now}), "context_snapshot": self._snapshot_response({"id": snapshot_id, "project_id": project_id, "conversation_revision": revision, "selected_context_json": encoded, "selected_context_digest": _digest(refs), "created_at": now}), "turn": self._turn_response({"id": turn_id, "project_id": project_id, "input_message_id": message_id, "context_snapshot_id": snapshot_id, "state": "requested", "revision": 1, "claimed_by_principal_id": None, "claimed_at": None, "completion_message_id": None, "proposal_id": None, "error_code": None, "created_at": now, "updated_at": now})}
@@ -230,14 +363,102 @@ class AstraStore:
                 raise Conflict("Explain status turns require the mediated status protocol.")
             if turn["state"] != "requested" or turn["revision"] != body.expected_revision:
                 raise Conflict("Astra coordinator turn is no longer claimable.")
-            self._fresh_context(conn, turn)
-            now = utc_now()
-            conn.execute("UPDATE astra_coordinator_turns SET state='claimed',revision=revision+1,claimed_by_principal_id=?,claimed_at=?,updated_at=? WHERE id=?", (live["id"], now, now, turn_id))
-            turn.update(state="claimed", revision=turn["revision"] + 1, claimed_by_principal_id=live["id"], claimed_at=now, updated_at=now)
-            self.store._event(conn, live, turn["project_id"], None, "astra_coordinator_turn_claimed", turn["revision"], {"turn_id": turn_id, "provider_disabled": True})
-            return 200, self._turn_response(turn)
+            return 200, self._turn_response(self._claim(conn, live, turn))
 
         return self._mutate(actor, key, "POST", f"/astra/turns/{turn_id}/claim", body.model_dump(mode="json"), command)
+
+    def claim_next_turn(self, actor: dict[str, Any], key: str):
+        """Atomically take the next project-scoped turn without a caller-supplied ID."""
+        def command(conn: sqlite3.Connection, live: dict[str, Any]):
+            self._require_agent(live)
+            turn = self._next_claimable_turn(conn, live)
+            if turn is None:
+                return 200, {"turn": None, "availability": "idle", "provider_disabled": True}
+            input_row = conn.execute("SELECT body FROM astra_conversation_messages WHERE id=?", (turn["input_message_id"],)).fetchone()
+            snapshot = conn.execute("SELECT selected_context_json FROM astra_selected_context_snapshots WHERE id=?", (turn["context_snapshot_id"],)).fetchone()
+            return 200, {"turn": self._turn_response(turn), "prompt": input_row["body"], "selected_context": json.loads(snapshot["selected_context_json"]), "availability": "claimed", "provider_disabled": True}
+        return self._mutate(actor, key, "POST", "/astra/turns/next-claim", {}, command)
+
+    def consumer_heartbeat(self, actor: dict[str, Any], key: str, **payload: Any):
+        ConsumerHeartbeat(**payload)
+        def command(conn: sqlite3.Connection, live: dict[str, Any]):
+            self._require_agent(live)
+            if live["project_id"] is None:
+                raise Forbidden("A coordinator credential must be scoped to one project.")
+            now = utc_now()
+            conn.execute("""INSERT INTO astra_consumer_health
+                (agent_principal_id,org_id,project_id,credential_id,heartbeat_at,last_outcome,updated_at)
+                VALUES (?,?,?,?,?,'idle',?) ON CONFLICT(agent_principal_id) DO UPDATE SET
+                credential_id=excluded.credential_id,heartbeat_at=excluded.heartbeat_at,
+                last_outcome='idle',updated_at=excluded.updated_at""", (live["id"], live["org_id"], live["project_id"], live["credential_id"], now, now))
+            return 200, {"availability": "available", "health": "healthy", "provider_disabled": True, "heartbeat_at": now}
+        return self._mutate(actor, key, "POST", "/astra/consumer/heartbeat", {}, command)
+
+    def consumer_status(self, actor: dict[str, Any], project_id: str) -> dict[str, Any]:
+        conn = _connect(self.store.database_path)
+        try:
+            live = self.store._live_principal(conn, actor)
+            self.store._project(conn, live, project_id)
+            # A durable heartbeat is not proof that the credential which made it
+            # is still valid. Join the exact recorded credential and principal so
+            # a revoked or expired consumer cannot be displayed as available.
+            rows = conn.execute(
+                """SELECT h.heartbeat_at,h.last_outcome,c.expires_at,c.revoked_at,
+                p.revoked_at AS principal_revoked_at
+                FROM astra_consumer_health h
+                JOIN credentials c ON c.id=h.credential_id
+                JOIN principals p ON p.id=h.agent_principal_id
+                WHERE h.org_id=? AND h.project_id=?
+                ORDER BY h.heartbeat_at DESC,h.agent_principal_id DESC LIMIT 100""",
+                (live["org_id"], project_id),
+            ).fetchall()
+            now = datetime.now(UTC)
+            observations: list[dict[str, Any]] = []
+            for row in rows:
+                freshness = "unknown"
+                try:
+                    fresh = datetime.fromisoformat(row["heartbeat_at"].replace("Z", "+00:00")) > now - timedelta(seconds=_CONSUMER_HEALTH_SECONDS)
+                    freshness = "fresh" if fresh else "stale"
+                except (AttributeError, ValueError):
+                    fresh = False
+                credential_status = "active"
+                if row["principal_revoked_at"] is not None or row["revoked_at"] is not None:
+                    credential_status = "revoked"
+                elif row["expires_at"] is not None:
+                    try:
+                        if datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00")) <= now:
+                            credential_status = "expired"
+                    except ValueError:
+                        credential_status = "unknown"
+                observations.append({
+                    "heartbeat_at": row["heartbeat_at"], "last_outcome": row["last_outcome"],
+                    "freshness": freshness, "credential_status": credential_status,
+                    "credential_expires_at": row["expires_at"],
+                })
+            usable = [item for item in observations if item["freshness"] == "fresh" and item["credential_status"] == "active"]
+            latest = observations[0] if observations else None
+            if usable:
+                availability, health = "available", "healthy"
+            elif latest is None:
+                availability, health = "unavailable", "unavailable"
+            elif latest["credential_status"] in {"revoked", "expired"}:
+                availability, health = "unavailable", latest["credential_status"]
+            elif latest["freshness"] == "stale":
+                availability, health = "unavailable", "stale"
+            else:
+                availability, health = "unavailable", "unknown"
+            return {
+                "availability": availability, "health": health,
+                "heartbeat_at": latest["heartbeat_at"] if latest else None,
+                "freshness": latest["freshness"] if latest else "unknown",
+                "credential_status": latest["credential_status"] if latest else "not_recorded",
+                "credential_expires_at": latest["credential_expires_at"] if latest else None,
+                "last_outcome": latest["last_outcome"] if latest else None,
+                "observed_consumers": len(observations),
+                "provider_disabled": True, "provider_enabled": False,
+            }
+        finally:
+            conn.close()
 
     def complete_turn(self, actor: dict[str, Any], key: str, turn_id: str, **payload: Any):
         body = CompleteCoordinatorTurn(**payload)
@@ -248,7 +469,7 @@ class AstraStore:
             turn = self._turn(conn, live, turn_id)
             if conn.execute("SELECT 1 FROM astra_status_discussions WHERE turn_id=?", (turn_id,)).fetchone():
                 raise Conflict("Explain status turns require the mediated status protocol.")
-            if turn["state"] != "claimed" or turn["claimed_by_principal_id"] != live["id"] or turn["revision"] != body.expected_revision:
+            if turn["state"] != "claimed" or turn["claimed_by_principal_id"] != live["id"] or turn["revision"] != body.expected_revision or not self._lease_is_live(turn):
                 raise Conflict("Astra coordinator turn is no longer completable.")
             self._fresh_context(conn, turn)
             now, message_revision = utc_now(), conn.execute("SELECT revision FROM astra_project_conversations WHERE project_id=?", (turn["project_id"],)).fetchone()["revision"] + 1
@@ -261,8 +482,8 @@ class AstraStore:
                  status_json,provider_disabled,authority_effect,design_json,created_at,created_by_principal_id)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (proposal_id, live["org_id"], turn["project_id"], message_revision, turn_id, body.proposal_type, body.proposal, body.recap, json.dumps(body.status, separators=(",", ":")), 1, "none", json.dumps(design, sort_keys=True, separators=(",", ":")) if design is not None else None, now, live["id"]))
             conn.execute("UPDATE astra_project_conversations SET revision=? WHERE project_id=?", (message_revision, turn["project_id"]))
-            conn.execute("UPDATE astra_coordinator_turns SET state='completed',revision=revision+1,completion_message_id=?,proposal_id=?,updated_at=? WHERE id=?", (message_id, proposal_id, now, turn_id))
-            turn.update(state="completed", revision=turn["revision"] + 1, completion_message_id=message_id, proposal_id=proposal_id, updated_at=now)
+            conn.execute("UPDATE astra_coordinator_turns SET state='completed',revision=revision+1,completion_message_id=?,proposal_id=?,claim_expires_at=NULL,updated_at=? WHERE id=?", (message_id, proposal_id, now, turn_id))
+            turn.update(state="completed", revision=turn["revision"] + 1, completion_message_id=message_id, proposal_id=proposal_id, claim_expires_at=None, updated_at=now)
             self.store._event(conn, live, turn["project_id"], None, "astra_coordinator_turn_completed", turn["revision"], {"turn_id": turn_id, "proposal_id": proposal_id, "provider_disabled": True, "authority_effect": "none"})
             return 200, {"turn": self._turn_response(turn), "proposal": self._proposal_response({"id": proposal_id, "project_id": turn["project_id"], "conversation_revision": message_revision, "turn_id": turn_id, "proposal_type": body.proposal_type, "body": body.proposal, "recap": body.recap, "status_json": json.dumps(body.status), "provider_disabled": 1, "authority_effect": "none", "design_json": json.dumps(design) if design is not None else None, "context_digest": _digest(json.loads(conn.execute("SELECT selected_context_json FROM astra_selected_context_snapshots WHERE id=?", (turn["context_snapshot_id"],)).fetchone()["selected_context_json"])), "created_at": now})}
 
@@ -287,12 +508,12 @@ class AstraStore:
             turn = self._turn(conn, live, turn_id)
             if conn.execute("SELECT 1 FROM astra_status_discussions WHERE turn_id=?", (turn_id,)).fetchone():
                 raise Conflict("Explain status turns require the mediated status protocol.")
-            permitted = turn["state"] == "claimed" and turn["claimed_by_principal_id"] == live["id"] if state == "failed" else turn["state"] in {"requested", "claimed"}
+            permitted = turn["state"] == "claimed" and turn["claimed_by_principal_id"] == live["id"] and self._lease_is_live(turn) if state == "failed" else turn["state"] in {"requested", "claimed"}
             if not permitted or turn["revision"] != expected_revision:
                 raise Conflict("Astra coordinator turn is no longer mutable.")
             now = utc_now()
-            conn.execute("UPDATE astra_coordinator_turns SET state=?,revision=revision+1,error_code=?,updated_at=? WHERE id=?", (state, error_code, now, turn_id))
-            turn.update(state=state, revision=turn["revision"] + 1, error_code=error_code, updated_at=now)
+            conn.execute("UPDATE astra_coordinator_turns SET state=?,revision=revision+1,error_code=?,claim_expires_at=NULL,updated_at=? WHERE id=?", (state, error_code, now, turn_id))
+            turn.update(state=state, revision=turn["revision"] + 1, error_code=error_code, claim_expires_at=None, updated_at=now)
             self.store._event(conn, live, turn["project_id"], None, f"astra_coordinator_turn_{state}", turn["revision"], {"turn_id": turn_id, "error_code": error_code, "provider_disabled": True})
             return 200, self._turn_response(turn)
 

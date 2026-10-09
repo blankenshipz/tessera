@@ -145,6 +145,74 @@ def _service(
     )
 
 
+@pytest.mark.parametrize(
+    "failure", [None, "renew_denied", "revoked", "expired", "hard_bound", "wrong_epoch"]
+)
+def test_serial_submission_renews_between_bounded_commands_without_background_authority(
+    tmp_path, monkeypatch, failure
+):
+    import threading
+
+    response, _, package = _admitted_package(tmp_path, max_duration_seconds=120)
+    clock = _ControlledClock(package.lease_issued_at)
+    monkeypatch.setattr(ExecutionStore, "_now", staticmethod(clock.now))
+    monkeypatch.setattr(WorkerRegistryStore, "_now", staticmethod(clock.now))
+    state, cluster = tmp_path / "state", _cluster()
+    client, fake = TestClient(create_app(state)), _FakeKubernetes(package, cluster)
+    dispatch = _dispatch(client, state, response, cluster_identity_digest(cluster))
+    supervisor_thread = threading.get_ident()
+
+    class Channel(_ApiChannel):
+        def post(self, path, body, key):
+            assert threading.get_ident() == supervisor_thread
+            if path == "/worker/leases/renew" and failure == "renew_denied":
+                raise ControlChannelError("renewal denied", 403)
+            value = super().post(path, body, key)
+            if path == "/worker/leases/renew" and failure == "wrong_epoch":
+                return value | {"epoch": value["epoch"] + 1}
+            return value
+
+    channel = Channel(client)
+    service = _service(tmp_path, client, dispatch, fake, cluster, clock=clock, channel=channel)
+    adapter = service.adapter
+    # Synthetic command scheduling exercises the same serial supervisor used by
+    # dataset steps; actual isolated control renewal/claim API remains unmocked.
+    adapter._prepare_dataset_steps = lambda _: iter(())
+    original_inspect = adapter._inspect_job
+    first = True
+
+    def inspect(name):
+        nonlocal first
+        if first:
+            first = False
+            clock.advance(12)
+        return original_inspect(name)
+
+    def prepare(_):
+        clock.advance(121 if failure == "hard_bound" else 31 if failure == "expired" else 24)
+        if failure == "revoked":
+            answer = client.post(
+                f"/execution-grants/{package.package['grant_id']}/revoke",
+                json={"expected_revision": 1},
+                headers=_owner_headers(state) | {"Idempotency-Key": "revoke-during-preparation"},
+            )
+            assert answer.status_code < 400, answer.text
+
+    adapter._inspect_job = inspect
+    adapter._prepare_output = prepare
+    result = service.run(max_cycles=1)
+    if failure is None:
+        assert fake.creates == 1
+        assert clock.elapsed >= 36
+        assert sum(path == "/worker/leases/renew" for path, _ in channel.calls) >= 2
+        assert service.claims.supervision()[0] > package.lease_expires_at
+    else:
+        assert fake.creates == 0
+        assert result["status"] == "cancel_requested"
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        assert db.execute("SELECT held_cents FROM execution_project_limits").fetchone()[0] > 0
+
+
 def test_approved_dispatch_claims_once_runs_control_package_and_exports_linkage(tmp_path):
     response, _worker, package = _admitted_package(tmp_path)
     state, cluster = tmp_path / "state", _cluster()
@@ -428,6 +496,19 @@ def test_queue_restart_control_outage_reconciles_then_cancels_original_job(tmp_p
     assert result["status"] == "cancel_requested"
     assert result["cancellation"]["reason"] == "control_outage"
     assert result["cancellation"]["job_uid"] == "job-fixture"
+    assert result["cancellation"]["termination_confirmed"] is True
+    journal_path = tmp_path / "worker" / "kubernetes-claims.sqlite3"
+    with sqlite3.connect(journal_path) as connection:
+        pending_before = connection.execute(
+            "SELECT payload_json,key FROM dispatch_reports WHERE dispatch_id=? AND completed=0 "
+            "ORDER BY sequence",
+            (dispatch["id"],),
+        ).fetchall()
+        assert connection.execute(
+            "SELECT resolved FROM dispatch_descriptors WHERE dispatch_id=?", (dispatch["id"],)
+        ).fetchone() == (0,)
+    assert json.loads(pending_before[0][0])["observed_state"] == "running"
+    assert json.loads(pending_before[-1][0])["termination_confirmed"] is True
     assert fake.creates == 1
     assert "/worker/kubernetes-dispatches/next/claim" not in (
         first_channel.calls + restarted_channel.calls
@@ -444,9 +525,27 @@ def test_queue_restart_control_outage_reconciles_then_cancels_original_job(tmp_p
     )
     repeated.now = lambda: now[0]
     repeated.control_outage_seconds = 1
-    assert repeated.run(max_cycles=1)["status"] == "cancel_requested"
+    assert repeated.run(max_cycles=1)["status"] == "report_draining"
     assert "/worker/kubernetes-dispatches/next/claim" not in repeated_channel.calls
     assert fake.creates == 1
+    with sqlite3.connect(journal_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT payload_json,key FROM dispatch_reports WHERE dispatch_id=? AND completed=0 "
+                "ORDER BY sequence",
+                (dispatch["id"],),
+            ).fetchall()
+            == pending_before
+        )
+        assert connection.execute(
+            "SELECT resolved FROM dispatch_descriptors WHERE dispatch_id=?", (dispatch["id"],)
+        ).fetchone() == (0,)
+    recovered = _service(tmp_path, client, dispatch, fake, cluster, next_dispatch=True)
+    assert recovered.run(max_cycles=1)["status"] == "report_delivered"
+    with sqlite3.connect(journal_path) as connection:
+        assert connection.execute(
+            "SELECT resolved FROM dispatch_descriptors WHERE dispatch_id=?", (dispatch["id"],)
+        ).fetchone() == (1,)
 
 
 def test_queue_sequential_dispatches_recover_a_before_claiming_b_without_duplicates(tmp_path):
@@ -887,8 +986,18 @@ def test_lost_observation_reply_replays_exact_body_key_and_dispatch_scope(tmp_pa
             "SELECT dispatch_id,operation_id,key FROM dispatch_reports "
             "ORDER BY dispatch_id,operation_id"
         ).fetchall()
-    assert len(rows) == 3 and {row[0] for row in rows} == {dispatch["id"], second_dispatch["id"]}
-    assert len({row[2] for row in rows}) == 3
+        original = connection.execute(
+            "SELECT payload_json,key,completed FROM dispatch_reports WHERE dispatch_id=?",
+            (dispatch["id"],),
+        ).fetchall()
+        assert connection.execute(
+            "SELECT resolved FROM dispatch_descriptors WHERE dispatch_id=?", (dispatch["id"],)
+        ).fetchone() == (0,)
+    # Replaying pending Running custody does not enqueue a duplicate observation
+    # of the same state, nor resolve this still-running execution descriptor.
+    assert original == [(lost.observations[0][0], lost.observations[0][1], 1)]
+    assert len(rows) == 2 and {row[0] for row in rows} == {dispatch["id"], second_dispatch["id"]}
+    assert len({row[2] for row in rows}) == 2
 
 
 def test_restart_after_revocation_reconciles_then_cancels_without_a_create(tmp_path):
@@ -1252,7 +1361,7 @@ def test_lost_terminal_report_remains_worker_owned_and_restart_replays_exactly(
         ).fetchone()
     pending_payload = json.loads(pending[0])
     assert pending_payload["provider_id"] == provider_id
-    assert pending_payload["termination_confirmed"] is False
+    assert pending_payload["termination_confirmed"] is True
     assert pending_payload["observed_state"] == "exited"
 
     replayed = _service(
@@ -1272,7 +1381,7 @@ def test_lost_terminal_report_remains_worker_owned_and_restart_replays_exactly(
     ("job_status", "pod_phase", "expected_status"),
     (({"succeeded": 1}, "Succeeded", "succeeded"), ({"failed": 1}, "Failed", "failed")),
 )
-def test_normal_terminal_observation_retains_job_identity_without_claiming_termination(
+def test_normal_terminal_observation_confirms_bound_job_and_owned_pod_completion(
     tmp_path, job_status, pod_phase, expected_status
 ):
     response, _worker, package = _admitted_package(tmp_path)
@@ -1312,7 +1421,7 @@ def test_normal_terminal_observation_retains_job_identity_without_claiming_termi
         ).provider_id
     )
     assert terminal["observed_state"] == "exited"
-    assert terminal["termination_confirmed"] is False
+    assert terminal["termination_confirmed"] is True
     assert fake.creates == 1
 
 

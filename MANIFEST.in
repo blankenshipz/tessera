@@ -1,0 +1,21 @@
+include README.md CONTRIBUTING.md DESIGN.md CHANGELOG.md SECURITY.md LICENSE uv.lock
+recursive-include docs *.md *.json *.yaml
+recursive-include deploy *.md *.yaml *.json
+recursive-include skills *.md
+recursive-include release/opencode-observer README.md LICENSE *.json *.patch
+include release/opencode-observer/baseline.tar.gz
+include release/opencode-observer/runtime-v8/baseline.json release/opencode-observer/runtime-v8/baseline.tar.gz release/opencode-observer/runtime-v8/observer.patch release/opencode-observer/runtime-v8/LICENSE
+include release/opencode-observer/runtime-v8/BASELINE.sha256 release/opencode-observer/runtime-v8/TARGET.sha256 release/opencode-observer/runtime-v8/origins.json release/opencode-observer/runtime-v8/README.md
+include release/opencode-observer/runtime-v8/reconstruct.py release/opencode-observer/runtime-v8/link_runtime.py release/opencode-observer/runtime-v8/verify_runtime.mjs release/opencode-observer/runtime-v8/verify_python.py
+include release/opencode-observer/runtime-v8/runtime-deps/package.json release/opencode-observer/runtime-v8/runtime-deps/bun.lock
+prune tests
+prune scripts
+prune dev
+prune desktop
+include desktop/EXECUTION.md
+recursive-include examples *.md *.py *.json *.yaml *.csv *.go Dockerfile
+include examples/tabular-starter/Dockerfile.dockerignore examples/tabular-starter/requirements.lock
+prune .agents
+prune .github
+prune .tessera
+global-exclude __pycache__ *.py[cod] .DS_Store

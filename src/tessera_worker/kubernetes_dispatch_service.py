@@ -13,6 +13,7 @@ import math
 import os
 import sqlite3
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -27,6 +28,7 @@ from .kubernetes_execution import (
     KubernetesExecutionStatus,
     KubernetesOutputBinding,
 )
+from .kubernetes_output_delivery import KubernetesOutputDelivery
 from .service import DevelopmentWorkerError, _private_directory, read_private_credential
 
 _CLOCK_ROLLBACK_TOLERANCE = timedelta(seconds=1)
@@ -40,18 +42,30 @@ class _ClockRollback(BaseException):
     """Escape broad adapter exception handlers when the authority clock regresses."""
 
 
+class _UnavailableControlChannel:
+    """Fail closed while still permitting durable local recovery work."""
+
+    def post(self, _path: str, _body: dict[str, Any], _key: str) -> dict[str, Any]:
+        raise ControlChannelError("worker credential unavailable", 401)
+
+
 @dataclass(frozen=True)
 class KubernetesDispatchWorkerConfig:
     control_url: str
-    dispatch_id: str
-    credential_file: Path
-    workspace_root: Path
+    dispatch_id: str | None = None
+    credential_file: Path | None = None
+    workspace_root: Path | None = None
 
     def __post_init__(self) -> None:
         if (
-            not isinstance(self.dispatch_id, str)
-            or not self.dispatch_id
-            or len(self.dispatch_id) > 200
+            self.dispatch_id is not None
+            and (
+                not isinstance(self.dispatch_id, str)
+                or not self.dispatch_id
+                or len(self.dispatch_id) > 200
+            )
+            or not isinstance(self.credential_file, Path)
+            or not isinstance(self.workspace_root, Path)
         ):
             raise KubernetesDispatchError("Kubernetes dispatch configuration is invalid.")
 
@@ -68,6 +82,30 @@ class KubernetesClaimIntentJournal:
                 dispatch_id TEXT PRIMARY KEY, key TEXT NOT NULL, completed INTEGER NOT NULL
                 CHECK (completed IN (0,1)))"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS claim_intents (
+                dispatch_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                key TEXT NOT NULL, completed INTEGER NOT NULL CHECK (completed IN (0,1)),
+                PRIMARY KEY (dispatch_id, sequence))"""
+            )
+            legacy_claim = connection.execute(
+                "SELECT key,completed FROM claims WHERE dispatch_id=?",
+                (self.dispatch_id,),
+            ).fetchone()
+            if (
+                legacy_claim is not None
+                and connection.execute(
+                    "SELECT 1 FROM claim_intents WHERE dispatch_id=?", (self.dispatch_id,)
+                ).fetchone()
+                is None
+            ):
+                # Preserve an earlier pending key across the journal-shape
+                # upgrade. A lost reply must still replay its exact claim rather
+                # than advancing the scanner to another dispatch.
+                connection.execute(
+                    "INSERT INTO claim_intents VALUES (?,?,?,?)",
+                    (self.dispatch_id, 1, legacy_claim[0], legacy_claim[1]),
+                )
             legacy = connection.execute(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name='reports'"
             ).fetchone()
@@ -98,8 +136,19 @@ class KubernetesClaimIntentJournal:
             )
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS dispatch_descriptors (
-                dispatch_id TEXT PRIMARY KEY, descriptor_json TEXT NOT NULL)"""
+                dispatch_id TEXT PRIMARY KEY, descriptor_json TEXT NOT NULL,
+                resolved INTEGER NOT NULL DEFAULT 0 CHECK (resolved IN (0,1)))"""
             )
+            descriptor_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(dispatch_descriptors)")
+            }
+            if "resolved" not in descriptor_columns:
+                # Existing descriptors predate queue-mode recovery discovery.  They
+                # must conservatively enter the unfinished set after an upgrade.
+                connection.execute(
+                    "ALTER TABLE dispatch_descriptors ADD COLUMN resolved INTEGER "
+                    "NOT NULL DEFAULT 0 CHECK (resolved IN (0,1))"
+                )
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS dispatch_supervision (
                 dispatch_id TEXT PRIMARY KEY, lease_expires_at TEXT NOT NULL,
@@ -115,24 +164,36 @@ class KubernetesClaimIntentJournal:
     def key(self) -> str:
         with sqlite3.connect(self.path) as connection:
             row = connection.execute(
-                "SELECT key FROM claims WHERE dispatch_id=?", (self.dispatch_id,)
+                """SELECT key FROM claim_intents WHERE dispatch_id=? AND completed=0
+                ORDER BY sequence LIMIT 1""",
+                (self.dispatch_id,),
             ).fetchone()
             if row is not None:
                 return row[0]
+            sequence = connection.execute(
+                "SELECT coalesce(max(sequence),0)+1 FROM claim_intents WHERE dispatch_id=?",
+                (self.dispatch_id,),
+            ).fetchone()[0]
             key = (
                 "kubernetes-dispatch-claim-"
-                + hashlib.sha256(f"v1:{self.dispatch_id}".encode()).hexdigest()
+                + hashlib.sha256(f"v2:{self.dispatch_id}:{sequence}".encode()).hexdigest()
             )
-            connection.execute("INSERT INTO claims VALUES (?,?,0)", (self.dispatch_id, key))
+            connection.execute(
+                "INSERT INTO claim_intents VALUES (?,?,?,0)",
+                (self.dispatch_id, sequence, key),
+            )
             return key
 
     def complete(self) -> None:
         with sqlite3.connect(self.path) as connection:
             connection.execute(
-                "UPDATE claims SET completed=1 WHERE dispatch_id=?", (self.dispatch_id,)
+                "UPDATE claim_intents SET completed=1 WHERE dispatch_id=? AND completed=0",
+                (self.dispatch_id,),
             )
 
-    def report(self, operation_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], str, int]:
+    def report(
+        self, operation_id: str, payload: dict[str, Any], *, enqueue: bool = False
+    ) -> tuple[dict[str, Any], str, int]:
         """Return the pending report verbatim, or durably create its next identity."""
         with sqlite3.connect(self.path) as connection:
             row = connection.execute(
@@ -141,8 +202,21 @@ class KubernetesClaimIntentJournal:
                 ORDER BY sequence ASC LIMIT 1""",
                 (self.dispatch_id, operation_id),
             ).fetchone()
-            if row is not None:
+            if row is not None and not enqueue:
                 return json.loads(row[1]), row[2], row[0]
+            if enqueue:
+                pending = connection.execute(
+                    "SELECT sequence,payload_json,key FROM dispatch_reports "
+                    "WHERE dispatch_id=? AND operation_id=? AND completed=0 ORDER BY sequence",
+                    (self.dispatch_id, operation_id),
+                ).fetchall()
+                for existing in pending:
+                    old = json.loads(existing[1])
+                    if (old.get("observed_state"), old.get("termination_confirmed")) == (
+                        payload.get("observed_state"),
+                        payload.get("termination_confirmed"),
+                    ):
+                        return old, existing[2], existing[0]
             sequence = connection.execute(
                 """SELECT coalesce(max(sequence),0)+1 FROM dispatch_reports
                 WHERE dispatch_id=? AND operation_id=?""",
@@ -180,6 +254,20 @@ class KubernetesClaimIntentJournal:
                 (self.dispatch_id, operation_id),
             ).fetchone()
         return (json.loads(row[1]), row[2], row[0]) if row is not None else None
+
+    def pending_terminal_report(self, operation_id: str) -> tuple[dict[str, Any], str, int] | None:
+        """Return an already-durable exited report without inventing new evidence."""
+        with sqlite3.connect(self.path) as connection:
+            rows = connection.execute(
+                "SELECT sequence,payload_json,key FROM dispatch_reports "
+                "WHERE dispatch_id=? AND operation_id=? AND completed=0 ORDER BY sequence",
+                (self.dispatch_id, operation_id),
+            ).fetchall()
+        for sequence, encoded, key in rows:
+            payload = json.loads(encoded)
+            if payload.get("observed_state") == "exited":
+                return payload, key, sequence
+        return None
 
     def action(self, action: str, payload: dict[str, Any]) -> tuple[dict[str, Any], str, int]:
         """Persist a retryable authority action before its control call."""
@@ -272,12 +360,50 @@ class KubernetesClaimIntentJournal:
             ).fetchone()
             if row is None:
                 connection.execute(
-                    "INSERT INTO dispatch_descriptors VALUES (?,?)", (self.dispatch_id, encoded)
+                    "INSERT INTO dispatch_descriptors (dispatch_id,descriptor_json) VALUES (?,?)",
+                    (self.dispatch_id, encoded),
                 )
             elif row[0] != encoded:
                 raise KubernetesDispatchError(
                     "Kubernetes execution descriptor conflicts with local intent."
                 )
+
+    def unfinished_dispatch_ids(self) -> tuple[str, ...]:
+        """Return durable operation descriptors in their original local order."""
+        with sqlite3.connect(self.path) as connection:
+            rows = connection.execute(
+                "SELECT d.dispatch_id FROM dispatch_descriptors d WHERE resolved=0 OR "
+                "EXISTS (SELECT 1 FROM dispatch_reports r WHERE r.dispatch_id=d.dispatch_id "
+                "AND r.completed=0) OR NOT EXISTS (SELECT 1 FROM dispatch_reports r "
+                "WHERE r.dispatch_id=d.dispatch_id AND r.completed=1 "
+                "AND json_extract(r.payload_json,'$.termination_confirmed')=1 "
+                "AND json_extract(r.payload_json,'$.observed_state')='exited') ORDER BY d.rowid"
+            ).fetchall()
+        return tuple(row[0] for row in rows)
+
+    def resolve_descriptor(self) -> bool:
+        """Remove a fully reported terminal operation from queue recovery work."""
+        with sqlite3.connect(self.path) as connection:
+            reports = connection.execute(
+                "SELECT payload_json,completed FROM dispatch_reports WHERE dispatch_id=?",
+                (self.dispatch_id,),
+            ).fetchall()
+            if any(not completed for _, completed in reports) or not any(
+                completed
+                and json.loads(encoded).get("observed_state") == "exited"
+                and json.loads(encoded).get("termination_confirmed") is True
+                for encoded, completed in reports
+            ):
+                return False
+            if (
+                connection.execute(
+                    "UPDATE dispatch_descriptors SET resolved=1 WHERE dispatch_id=?",
+                    (self.dispatch_id,),
+                ).rowcount
+                != 1
+            ):
+                raise KubernetesDispatchError("Kubernetes execution descriptor is not unfinished.")
+        return True
 
     def bind_supervision(self, lease_expires_at: datetime) -> None:
         encoded = lease_expires_at.astimezone(UTC).isoformat()
@@ -403,10 +529,21 @@ class KubernetesDispatchWorkerService:
         self.cluster = cluster
         self.output = output
         self.adapter = adapter
+        assert config.workspace_root is not None
+        assert config.credential_file is not None
         self.root = _private_directory(config.workspace_root)
-        self.channel = channel or HttpControlChannel(
-            config.control_url, read_private_credential(config.credential_file)
-        )
+        if channel is not None:
+            self.channel = channel
+        else:
+            try:
+                credential = read_private_credential(config.credential_file)
+            except DevelopmentWorkerError:
+                # Losing credential custody fences every control action, but it
+                # cannot erase a durable descriptor or prevent exact-UID local
+                # observation/cancellation during run().
+                self.channel = _UnavailableControlChannel()
+            else:
+                self.channel = HttpControlChannel(config.control_url, credential)
         if (
             not isinstance(poll_seconds, (int, float))
             or poll_seconds <= 0
@@ -425,7 +562,8 @@ class KubernetesDispatchWorkerService:
         self.control_outage_seconds = float(control_outage_seconds)
         self.now = now or (lambda: datetime.now(UTC))
         self.monotonic = monotonic
-        self.claims = KubernetesClaimIntentJournal(self.root, config.dispatch_id)
+        self.claims = KubernetesClaimIntentJournal(self.root, config.dispatch_id or "next")
+        self.deliveries = KubernetesOutputDelivery(self.root)
         self._clock_anchor_wall: datetime | None = None
         self._clock_anchor_monotonic: float | None = None
         self._clock_last_raw: datetime | None = None
@@ -437,6 +575,37 @@ class KubernetesDispatchWorkerService:
         self._active_dispatch: dict[str, Any] | None = None
         self._active_package: KubernetesExecutionPackage | None = None
         self._active_bounds: tuple[datetime, datetime, datetime | None] | None = None
+        if getattr(adapter, "dataset_client", None) is not None:
+            adapter._fetch_inputs = self._dataset_inputs
+            adapter._prepare_dataset_resources = lambda package: self._dataset_custody().prepare(
+                package
+            )
+            adapter._prepare_dataset_steps = lambda package: self._dataset_custody().prepare_steps(
+                package
+            )
+
+    def _dataset_custody(self):
+        from .kubernetes_dataset_custody import KubernetesDatasetCustody
+
+        client = getattr(self.adapter, "dataset_client", None)
+        if client is None:
+            raise KubernetesDispatchError("No bounded native dataset custody client configured.")
+        return KubernetesDatasetCustody(self.claims, self.cluster, client, self._dataset_inputs)
+
+    def _dataset_inputs(self, package):
+        deadline = package.hard_expires_at
+        if self._active_bounds is not None:
+            deadline = min(deadline, self._active_deadline(*self._active_bounds))
+        return self._post(
+            f"/worker/leases/{package.binding.lease_id}/inputs",
+            {"expected_epoch": package.binding.epoch},
+            "dataset-current-" + uuid.uuid4().hex,
+            deadline,
+        )
+
+    def _cleanup_dataset(self, package):
+        if package.binding.dataset_input is not None:
+            self._dataset_custody().cleanup(package)
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:
@@ -538,8 +707,13 @@ class KubernetesDispatchWorkerService:
         return response
 
     def _claim(self, target_digest: str, deadline: datetime | None = None) -> dict[str, Any]:
+        dispatch_id = self.claims.dispatch_id
         response = self._post(
-            f"/worker/kubernetes-dispatches/{self.config.dispatch_id}/claim",
+            (
+                f"/worker/kubernetes-dispatches/{dispatch_id}/claim"
+                if dispatch_id != "next"
+                else "/worker/kubernetes-dispatches/next/claim"
+            ),
             {"target_digest": target_digest, "profile_version": self.cluster.profile},
             self.claims.key(),
             deadline,
@@ -548,6 +722,15 @@ class KubernetesDispatchWorkerService:
         # this key and can neither claim another dispatch nor generate a new Job.
         self.claims.complete()
         return response
+
+    def _use_dispatch_journal(self, dispatch_id: object) -> None:
+        """Move next-claim work into the claimed operation's durable journal."""
+        if not isinstance(dispatch_id, str) or not dispatch_id:
+            raise KubernetesDispatchError(
+                "Control returned an invalid Kubernetes dispatch identity."
+            )
+        if self.claims.dispatch_id != dispatch_id:
+            self.claims = KubernetesClaimIntentJournal(self.root, dispatch_id)
 
     def _package(
         self, response: dict[str, Any], target_digest: str
@@ -560,7 +743,31 @@ class KubernetesDispatchWorkerService:
             or dispatch.get("state") != "claimed"
         ):
             raise KubernetesDispatchError("Control returned an invalid Kubernetes dispatch claim.")
-        package = KubernetesExecutionPackage.from_admitted_package(response, self.output)
+        raw_package = response.get("package")
+        workload = raw_package.get("kubernetes_workload") if isinstance(raw_package, dict) else None
+        command = workload.get("command") if isinstance(workload, dict) else None
+        if isinstance(command, list) and command[:3] == ["python", "-m", "tessera_starter"]:
+            self._use_dispatch_journal(dispatch["id"])
+            custody = self._dataset_custody()
+            raw = response["package"]
+            try:
+                bundle = self._post(
+                    f"/worker/leases/{raw['lease_id']}/inputs",
+                    {"expected_epoch": raw["epoch"]},
+                    "dataset-parse-" + uuid.uuid4().hex,
+                )
+            except (ConnectionError, ControlChannelError):
+                if self.claims.descriptor() is None:
+                    raise
+                # Durable bytes reconstruct observation/cancellation identity.
+                # New effects still require fresh delivery in adapter/custody.
+                bundle = custody.recovery_bundle(response)
+            package = KubernetesExecutionPackage.from_admitted_package(
+                response, self.output, input_bundle=bundle, dataset_namespace=self.cluster.namespace
+            )
+            custody.retain_bundle(response, bundle)
+        else:
+            package = KubernetesExecutionPackage.from_admitted_package(response, self.output)
         if package.operation_id != dispatch.get("operation_id"):
             raise KubernetesDispatchError(
                 "Claimed Kubernetes package operation conflicts with dispatch."
@@ -570,45 +777,106 @@ class KubernetesDispatchWorkerService:
     def _observation(
         self,
         package: KubernetesExecutionPackage,
-        status: str,
+        status: KubernetesExecutionStatus,
         cancellation: dict[str, object] | None = None,
     ) -> dict[str, Any]:
-        confirmed = bool(cancellation and cancellation.get("termination_confirmed"))
+        # Normal completion requires a bound terminal Job and its observed owned
+        # Pods. Cancellation still requires the adapter's separate absence proof;
+        # a terminal status must never upgrade a failed delete to a confirmed stop.
+        confirmed = (
+            bool(cancellation.get("termination_confirmed"))
+            if cancellation is not None
+            else status.termination_confirmed
+        )
+        provider_id = (
+            cancellation.get("provider_id") if cancellation is not None else status.provider_id
+        )
         return {
             "lease_id": package.package["lease_id"],
             "expected_epoch": package.binding.epoch,
             "operation_id": package.operation_id,
             "observed_state": (
                 "exited"
-                if status in {"succeeded", "failed"} or confirmed
+                if status.observed_state in {"succeeded", "failed"} or confirmed
                 else "unknown"
-                if status == "unknown"
+                if status.observed_state == "unknown"
                 else "running"
             ),
             "observed_at": self._clock_now().isoformat(),
             "termination_confirmed": confirmed,
-            **({"provider_id": cancellation["provider_id"]} if confirmed and cancellation else {}),
+            **({"provider_id": provider_id} if provider_id is not None else {}),
         }
 
     def _report(
         self,
         package: KubernetesExecutionPackage,
-        status: str,
+        status: KubernetesExecutionStatus,
         cancellation: dict[str, object] | None = None,
         deadline: datetime | None = None,
     ) -> None:
         # A terminal report must never jump over a lost earlier report.  Both
         # payloads were persisted before their calls and retain distinct keys.
-        pending = self.claims.pending_report(package.operation_id)
-        if pending is not None:
+        self.claims.report(
+            package.operation_id, self._observation(package, status, cancellation), enqueue=True
+        )
+        while (pending := self.claims.pending_report(package.operation_id)) is not None:
             payload, key, sequence = pending
             self._post("/worker/observations", payload, key, deadline)
             self.claims.complete_report(package.operation_id, sequence)
-        payload, key, sequence = self.claims.report(
-            package.operation_id, self._observation(package, status, cancellation)
-        )
-        self._post("/worker/observations", payload, key, deadline)
-        self.claims.complete_report(package.operation_id, sequence)
+
+    def _drain_terminal_report(
+        self, dispatch: dict[str, Any], package: KubernetesExecutionPackage
+    ) -> dict[str, Any] | None:
+        """Deliver a prior terminal intent before any authority or provider work.
+
+        A terminal provider observation survives a process crash independently of
+        its control acknowledgement.  While it is pending, this descriptor is a
+        report-delivery queue item: it must neither create nor re-observe a Job.
+        """
+        pending = self.claims.pending_terminal_report(package.operation_id)
+        if pending is None:
+            return None
+        payload, key, sequence = pending
+        try:
+            while (head := self.claims.pending_report(package.operation_id)) is not None:
+                report, report_key, report_sequence = head
+                self._post("/worker/observations", report, report_key)
+                self.claims.complete_report(package.operation_id, report_sequence)
+        except (ConnectionError, ControlChannelError):
+            return {
+                "dispatch_id": dispatch["id"],
+                "admitted_attempt_id": dispatch["admitted_attempt_id"],
+                "operation_id": package.operation_id,
+                "status": "report_draining",
+                "execution_dispatched": True,
+                "reconciliation_required": True,
+                "recovery_owner": "worker_report_delivery",
+                **(
+                    {"provider_id": payload["provider_id"]}
+                    if payload.get("provider_id") is not None
+                    else {}
+                ),
+            }
+        if payload.get("observed_state") == "succeeded" or self.deliveries.pending(package):
+            result = self._result(dispatch, package, "succeeded")
+            if result.get("output_delivery") != "completed":
+                return result
+        self._cleanup_dataset(package)
+        if not self.claims.resolve_descriptor():
+            return None
+        return {
+            "dispatch_id": dispatch["id"],
+            "admitted_attempt_id": dispatch["admitted_attempt_id"],
+            "operation_id": package.operation_id,
+            "status": "report_delivered",
+            "execution_dispatched": True,
+            "reconciliation_required": False,
+            **(
+                {"provider_id": payload["provider_id"]}
+                if payload.get("provider_id") is not None
+                else {}
+            ),
+        }
 
     def _result(
         self,
@@ -624,6 +892,12 @@ class KubernetesDispatchWorkerService:
             "status": status,
             "execution_dispatched": True,
         }
+        failure = self.adapter.failure_evidence(package)
+        if failure is not None:
+            result["failure_evidence"] = failure
+        if status == "cancel_requested" and self.adapter.no_start_recovery_candidate(package):
+            result["recovery_owner"] = "worker_no_start_attestation_then_human_reconciliation"
+            result["no_start_attestation_required"] = True
         if cancellation is not None:
             result["cancellation"] = cancellation
             result["reconciliation_required"] = bool(cancellation["reconciliation_required"])
@@ -633,9 +907,22 @@ class KubernetesDispatchWorkerService:
             result["reconciliation_required"] = True
             result["recovery_owner"] = "worker"
         if status == "succeeded":
-            # This is target-bound collection intent only. It neither reads bytes
-            # nor accepts an artifact/result.
+            # Preserve the target-bound handoff; a configured ordinary collector
+            # retains bytes separately. Quarantine never accepts a research result.
             result["artifact_handoff"] = self.adapter.artifact_collection_handoff(package).__dict__
+            if not self.adapter.output_collection_enabled:
+                result["output_delivery"] = "not_configured"
+                return result
+            try:
+                result["artifact_manifest"] = self.deliveries.deliver(
+                    package, self.adapter, self.channel
+                )
+                result["output_delivery"] = "completed"
+            except Exception as error:
+                result["output_delivery"] = "pending"
+                result["output_delivery_error"] = type(error).__name__
+                result["reconciliation_required"] = True
+                result["recovery_owner"] = "worker_output_delivery"
         return result
 
     def _heartbeat(
@@ -786,6 +1073,16 @@ class KubernetesDispatchWorkerService:
         self._active_dispatch = None
         self._active_package = None
         self._active_bounds = None
+        if self.config.dispatch_id is None:
+            scanner = KubernetesClaimIntentJournal(self.root, "next")
+            unfinished = scanner.unfinished_dispatch_ids()
+            # Durable local execution ownership precedes control availability and
+            # new queue work.  In particular, an invalid credential or revoked
+            # grant must not hide the exact Job UID that still needs observation
+            # and cancellation.
+            self.claims = KubernetesClaimIntentJournal(
+                self.root, unfinished[0] if unfinished else "next"
+            )
         self._start_clock()
         try:
             return self._run(max_cycles=max_cycles)
@@ -832,6 +1129,10 @@ class KubernetesDispatchWorkerService:
         if max_cycles is not None and (type(max_cycles) is not int or max_cycles < 1):
             raise KubernetesDispatchError("Kubernetes dispatch cycle limit is invalid.")
         target_digest = cluster_identity_digest(self.cluster)
+        # The next-claim scanner is intentionally separate from an operation
+        # journal.  Once it receives A, reports/actions for A cannot block a
+        # later scanner claim for B; an unacknowledged scanner key still replays
+        # the same A before that switch.
         descriptor = self.claims.descriptor()
         created = descriptor is None
         started_at = self._clock_now()
@@ -840,7 +1141,17 @@ class KubernetesDispatchWorkerService:
             # establish registry freshness before any executable claim response.
             self._heartbeat()
             response = self._claim(target_digest)
+            if response.get("dispatch") is None:
+                return {"status": "idle", "execution_dispatched": False, "provider_enabled": False}
             dispatch, package = self._package(response, target_digest)
+            self._use_dispatch_journal(dispatch["id"])
+            descriptor = self.claims.descriptor()
+            if descriptor is not None:
+                # A next-claim replay may arrive after the scanner journal was
+                # lost/recreated.  The operation journal remains the sole source
+                # of executable recovery identity.
+                self._start_clock()
+                return self._run(max_cycles=max_cycles)
             # Keep the exact control-issued execution descriptor private and
             # immutable before any injected Kubernetes create callback.
             hard_deadline = min(
@@ -912,6 +1223,16 @@ class KubernetesDispatchWorkerService:
                     binding=replace(package.binding, active_deadline_seconds=provider_seconds),
                 )
             supervision = self.claims.supervision()
+            drained = self._drain_terminal_report(dispatch, package)
+            if drained is not None:
+                return drained
+            if self.deliveries.pending(package):
+                result = self._result(dispatch, package, "succeeded")
+                if (
+                    result.get("output_delivery") == "completed"
+                    and self.claims.resolve_descriptor()
+                ):
+                    return result
             if supervision is None:
                 # An older descriptor did not retain mutable lease/outage bounds.
                 # Seed only from its control-issued response; never from restart time.
@@ -976,6 +1297,45 @@ class KubernetesDispatchWorkerService:
             provider_duration_available = True
         next_renewal = started_at + timedelta(seconds=self.renewal_seconds)
         next_heartbeat = started_at + timedelta(seconds=self.heartbeat_seconds)
+        submission_authority_lost = False
+
+        def supervise_submission_step():
+            nonlocal submission_authority_lost
+            try:
+                return before_submission_step()
+            except Exception:
+                submission_authority_lost = True
+                raise
+
+        def before_submission_step():
+            nonlocal dispatch, lease_deadline, next_renewal, next_heartbeat
+            # Only this supervising thread mutates clocks, authority and journals.
+            # No resource command or Job creation may use a stale renewal result.
+            reason = self._deadline_reason(
+                self._clock_now(), hard_deadline, lease_deadline, outage_deadline
+            )
+            if reason is not None:
+                raise KubernetesDispatchError("Preparation authority expired: " + reason)
+            active = self._active_deadline(hard_deadline, lease_deadline, outage_deadline)
+            if self._clock_now() >= next_heartbeat:
+                self._heartbeat(deadline=active)
+                next_heartbeat = self._clock_now() + timedelta(seconds=self.heartbeat_seconds)
+            if self._clock_now() >= next_renewal:
+                body, key, sequence = self.claims.action(
+                    "renew",
+                    {"lease_id": package.binding.lease_id, "expected_epoch": package.binding.epoch},
+                )
+                response = self._post("/worker/leases/renew", body, key, active)
+                lease_deadline = self._renewed_expiry(response, package, hard_deadline)
+                self.claims.complete_renewal(sequence, lease_deadline)
+                next_renewal = self._clock_now() + timedelta(seconds=self.renewal_seconds)
+            self._set_active_bounds(hard_deadline, lease_deadline, outage_deadline)
+            active = self._active_deadline(hard_deadline, lease_deadline, outage_deadline)
+            dispatch = self._refresh_claim(target_digest, package, active)
+            if package.binding.dataset_input is not None:
+                self._dataset_custody().current(package)
+            return max(0.0, (active - self._clock_now()).total_seconds())
+
         reason = self._deadline_reason(
             self._clock_now(), hard_deadline, lease_deadline, outage_deadline
         )
@@ -992,11 +1352,25 @@ class KubernetesDispatchWorkerService:
                 self.adapter.submit(
                     package,
                     timeout_seconds=max(0.0, (active_deadline - self._clock_now()).total_seconds()),
+                    **(
+                        {"before_step": supervise_submission_step}
+                        if getattr(self.adapter, "_prepare_dataset_steps", None) is not None
+                        else {}
+                    ),
                 )
                 if created
                 else self._reconcile(package, active_deadline)
             )
         except Exception:
+            if submission_authority_lost:
+                return self._cancel(
+                    dispatch,
+                    package,
+                    self._deadline_reason(
+                        self._clock_now(), hard_deadline, lease_deadline, outage_deadline
+                    )
+                    or "authority_lost",
+                )
             status = self._reconcile(package, active_deadline)
         if reason is not None:
             # Recovery remains observation-only before the already-owned Job is
@@ -1005,8 +1379,12 @@ class KubernetesDispatchWorkerService:
         cycles = 0
         while True:
             active_deadline = self._active_deadline(hard_deadline, lease_deadline, outage_deadline)
+            reported = False
+            if status.observed_state == "succeeded" and self.adapter.output_collection_enabled:
+                self.deliveries.begin(package)
             try:
-                self._report(package, status.observed_state, deadline=active_deadline)
+                self._report(package, status, deadline=active_deadline)
+                reported = True
             except (ConnectionError, ControlChannelError):
                 # Reporting can never delay local reconciliation or a stop.
                 pass
@@ -1017,7 +1395,24 @@ class KubernetesDispatchWorkerService:
             if reason is not None:
                 return self._cancel(dispatch, package, reason)
             if status.observed_state in {"succeeded", "failed"}:
-                return self._result(dispatch, package, status.observed_state)
+                # Only an acknowledged terminal delivery releases queue ownership.
+                # A lost response leaves the exact payload/key as report-draining
+                # work, even though this bounded caller can return the local state.
+                result = self._result(dispatch, package, status.observed_state)
+                if reported and result.get("output_delivery") != "pending":
+                    self._cleanup_dataset(package)
+                    self.claims.resolve_descriptor()
+                return result | {
+                    "report_delivery_acknowledged": reported,
+                    **(
+                        {
+                            "reconciliation_required": True,
+                            "recovery_owner": "worker_report_delivery",
+                        }
+                        if not reported
+                        else {}
+                    ),
+                }
             if status.observed_state == "unknown":
                 # Unknown is an authoritative adverse observation, not a reason to
                 # stop enforcing cancellation.  Recheck the same claim before a
@@ -1125,10 +1520,17 @@ class KubernetesDispatchWorkerService:
         except Exception:
             status = KubernetesExecutionStatus(package.operation_id, None, (), "unknown")
         proof = self.adapter.cancellation_proof(package) | {"reason": reason}
+        reported = False
         try:
-            self._report(package, status.observed_state, proof, stop_deadline)
+            self._report(package, status, proof, stop_deadline)
+            reported = True
         except (ConnectionError, ControlChannelError):
             pass
+        if reported and proof.get("termination_confirmed") is True:
+            # Unknown cancellation or an unreported confirmed stop remains owned
+            # by this worker and must be discovered again before a queue claim.
+            self._cleanup_dataset(package)
+            self.claims.resolve_descriptor()
         return self._result(dispatch, package, "cancel_requested", proof)
 
 

@@ -1,0 +1,15 @@
+**
+!src
+!src/tessera_starter
+!src/tessera_starter/*.py
+!src/tessera_control
+!src/tessera_control/dataset_snapshots.py
+!src/tessera_control/dataset_snapshot_models.py
+!src/tessera_control/workspace.py
+!src/tessera_worker
+!src/tessera_worker/inputs.py
+!src/tessera_worker/dataset_inputs.py
+!examples
+!examples/tabular-starter
+!examples/tabular-starter/portable_verifier.py
+!examples/tabular-starter/requirements.lock

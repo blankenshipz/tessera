@@ -12,7 +12,11 @@ from pydantic import (
     StringConstraints,
     ValidationInfo,
     field_validator,
+    model_validator,
 )
+
+from .request_limits import MAX_TOKEN_CHARS
+from .token_purpose import provider_key_shaped
 
 
 class StrictRequest(BaseModel):
@@ -43,14 +47,35 @@ class CreateTask(StrictRequest):
     max_duration_seconds: StrictDuration
 
 
+class DockerResources(StrictRequest):
+    cpu_millicores: int = Field(strict=True, ge=100, le=2000)
+    memory_bytes: int = Field(strict=True, ge=67108864, le=536870912)
+    pids_limit: int = Field(strict=True, ge=16, le=128)
+    scratch_bytes: int = Field(strict=True, ge=1048576, le=16777216)
+
+
+class DockerPlan(DockerResources):
+    target_id: NonBlank200
+    target_digest: Sha256Digest
+
+
 class ExecutionSpec(StrictRequest):
     argv: Annotated[list[RawString4000], Field(min_length=1, max_length=128)]
     input_snapshot_digest: Sha256Digest
     pinned_skill_digests: Annotated[list[Sha256Digest], Field(max_length=128)]
     output_paths: Annotated[list[RawString4000], Field(max_length=128)]
-    profile: Literal["local-cpu", "kubernetes-opencode"]
+    profile: Literal["local-cpu", "kubernetes-opencode", "ordinary-docker"]
+    docker: DockerPlan | None = None
     network_enabled: Literal[False] = False
-    max_output_bytes: StrictBytes
+    # Both currently supported runtime packages and quarantine cap total output
+    # at 16 MiB. Reject impossible new plans before approval/reservation.
+    max_output_bytes: Annotated[int, Field(strict=True, ge=1, le=16 * 1024 * 1024)]
+
+    @model_validator(mode="after")
+    def docker_is_explicit(self):
+        if (self.profile == "ordinary-docker") != (self.docker is not None):
+            raise ValueError("Docker profile requires its explicit approved target/resource pins")
+        return self
 
     @field_validator("argv")
     @classmethod
@@ -95,19 +120,69 @@ class ApproveTask(StrictRequest):
     expected_plan_digest: Sha256Digest | None = None
 
 
+class ExternalAgentScope(StrictRequest):
+    actions: Annotated[
+        list[
+            Literal[
+                "context:read",
+                "proposal:create",
+                "proposal:read",
+                "authority:request",
+                "authority:consume",
+                "observation:create",
+                "review:request",
+                "notebook:read",
+                "provenance:append",
+            ]
+        ],
+        Field(min_length=1, max_length=9),
+    ]
+    destination: NonBlank200
+
+    @field_validator("actions")
+    @classmethod
+    def unique_actions(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("actions must be unique")
+        return value
+
+
+class RenewWorkerCredential(StrictRequest):
+    expires_at: datetime
+
+    @field_validator("expires_at")
+    @classmethod
+    def offset_required(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("expires_at requires an offset")
+        return value
+
+
 class CreateCredential(StrictRequest):
     token: SecretStr
     kind: Literal["human_session", "agent", "worker"]
     audience: Literal["control", "worker"]
     project_id: str | None = None
     expires_at: datetime
+    external_agent: ExternalAgentScope | None = None
+
+    @field_validator("external_agent")
+    @classmethod
+    def external_scope_is_agent(cls, value: ExternalAgentScope | None, info: ValidationInfo):
+        if value is not None and info.data.get("kind") != "agent":
+            raise ValueError("external scopes require an agent credential")
+        return value
 
     @field_validator("token")
     @classmethod
     def token_is_urlsafe_and_long(cls, token: SecretStr) -> SecretStr:
         value = token.get_secret_value()
-        if len(value) < 43 or any(character not in URLSAFE_TOKEN_ALPHABET for character in value):
-            raise ValueError("token must be at least 43 URL-safe characters")
+        if provider_key_shaped(value):
+            raise ValueError("Provider keys are not Tessera authentication credentials")
+        if not 43 <= len(value) <= MAX_TOKEN_CHARS or any(
+            character not in URLSAFE_TOKEN_ALPHABET for character in value
+        ):
+            raise ValueError(f"token must be 43–{MAX_TOKEN_CHARS} URL-safe characters")
         return token
 
     @field_validator("expires_at")

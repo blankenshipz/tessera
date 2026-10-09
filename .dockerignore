@@ -2,8 +2,12 @@
 !pyproject.toml
 !uv.lock
 !README.md
+!LICENSE
+!MANIFEST.in
 !src/
 !src/**
+!skills/
+!skills/**
 !tests/
 !tests/**
 !scripts/

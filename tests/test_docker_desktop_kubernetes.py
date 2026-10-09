@@ -25,6 +25,8 @@ from tessera_worker.docker_desktop_kubernetes import (
     _verify_bound_pvc,
     _verify_collector,
     _verify_oci_archive,
+    build_and_load_exact_image,
+    target_from_kubeconfig,
 )
 
 _RUNNER_SPEC = importlib.util.spec_from_file_location(
@@ -35,6 +37,74 @@ assert _RUNNER_SPEC is not None and _RUNNER_SPEC.loader is not None
 _RUNNER = importlib.util.module_from_spec(_RUNNER_SPEC)
 _RUNNER_SPEC.loader.exec_module(_RUNNER)
 _LiveAdapter = _RUNNER._LiveAdapter
+
+
+def test_prebuilt_workload_refuses_changed_image_without_build_or_import(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "tessera_worker.docker_desktop_kubernetes._require_docker_desktop_node", lambda: None
+    )
+
+    def command(argv, **_kwargs):
+        calls.append(argv)
+        assert argv[:3] == ("docker", "image", "inspect")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                [
+                    {
+                        "Id": "sha256:" + "b" * 64,
+                        "Os": "linux",
+                        "Architecture": "amd64",
+                        "Config": {"Labels": {"io.tessera.e2e-nonce": "fixture"}},
+                    }
+                ]
+            ),
+            "",
+        )
+
+    monkeypatch.setattr("tessera_worker.docker_desktop_kubernetes._run", command)
+    with pytest.raises(LiveKubernetesError, match="identity changed"):
+        build_and_load_exact_image(tmp_path, "fixture", prebuilt_image_id="sha256:" + "a" * 64)
+    assert len(calls) == 1
+
+
+def test_docker_target_requires_absolute_path_and_selected_context(tmp_path, monkeypatch) -> None:
+    with pytest.raises(LiveKubernetesError, match="absolute path"):
+        target_from_kubeconfig(Path("config"))
+    config = tmp_path / "config"
+    config.write_text("fixture")
+    monkeypatch.setattr(
+        "tessera_worker.docker_desktop_kubernetes._run",
+        lambda *_args: subprocess.CompletedProcess(
+            (),
+            0,
+            json.dumps(
+                {"contexts": [{"name": "other", "context": {"cluster": "local"}}], "clusters": []}
+            ),
+            "",
+        ),
+    )
+    with pytest.raises(LiveKubernetesError, match="identity is malformed"):
+        target_from_kubeconfig(config)
+
+
+def test_changed_kubeconfig_blocks_before_any_kubectl_effect(tmp_path, monkeypatch) -> None:
+    from tessera_worker.docker_desktop_kubernetes import DockerDesktopTarget
+
+    config = tmp_path / "config"
+    config.write_text("changed")
+    target = DockerDesktopTarget(
+        config, "docker-desktop", "https://localhost:6443", "a" * 64, "b" * 64
+    )
+    live = DockerDesktopKubernetesAdapter(target, tmp_path / "journal.sqlite3")
+    monkeypatch.setattr(
+        "tessera_worker.docker_desktop_kubernetes._run",
+        lambda *_args, **_kwargs: pytest.fail("must not execute kubectl"),
+    )
+    with pytest.raises(LiveKubernetesError, match="changed after attachment"):
+        live._kubectl("get", "nodes", namespace=None)
 
 
 def _oci_archive(path: Path, tag: str, *, architecture: str = "amd64") -> tuple[str, str]:
@@ -190,7 +260,15 @@ def test_live_command_accepts_binary_oci_archive_stdin(monkeypatch: pytest.Monke
 def test_bound_pvc_must_keep_its_pre_schedule_identity() -> None:
     resource = {
         "kind": "PersistentVolumeClaim",
-        "metadata": {"name": "outputs", "namespace": "tessera-e2e-fixture", "uid": "pvc-uid"},
+        "metadata": {
+            "name": "outputs",
+            "namespace": "tessera-e2e-fixture",
+            "uid": "pvc-uid",
+            "labels": {
+                "app.kubernetes.io/managed-by": "tessera",
+                "tessera.io/output-role": "dedicated-pilot-output",
+            },
+        },
         "spec": {"accessModes": ["ReadWriteOnce"]},
         "status": {"phase": "Bound"},
     }
@@ -201,6 +279,10 @@ def test_bound_pvc_must_keep_its_pre_schedule_identity() -> None:
     _verify_bound_pvc(resource, "tessera-e2e-fixture", "pvc-uid", spec_sha256)
     resource["status"] = {"phase": "Pending"}
     with pytest.raises(LiveKubernetesError, match="did not bind"):
+        _verify_bound_pvc(resource, "tessera-e2e-fixture", "pvc-uid", spec_sha256)
+    resource["status"] = {"phase": "Bound"}
+    resource["metadata"]["labels"] = {}  # type: ignore[index]
+    with pytest.raises(LiveKubernetesError, match="dedicated Tessera"):
         _verify_bound_pvc(resource, "tessera-e2e-fixture", "pvc-uid", spec_sha256)
 
 

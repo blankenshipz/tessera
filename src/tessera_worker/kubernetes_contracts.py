@@ -14,6 +14,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -25,6 +26,7 @@ _UID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}\Z")
 _MOUNT_PATH = re.compile(r"/[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 _PROFILES = {"development-minikube-opencode-v1", "development-kubernetes-conformance-v1"}
+_NETWORK_EVIDENCE_MAX_AGE = timedelta(minutes=15)
 
 
 class KubernetesContractError(RuntimeError):
@@ -149,18 +151,46 @@ def _server(value: object) -> str:
 
 
 @dataclass(frozen=True)
-class KubernetesNetworkPolicyEvidence:
-    """Observed target evidence for the network-none enforcement policy.
+class KubernetesConnectivityEvidence:
+    """One bounded, attributed connection attempt used to prove enforcement."""
 
-    A Job annotation only records the requested mode.  Admission additionally
-    needs an explicit target capability and the identity/digest of the policy
-    which enforces it.
+    source_pod_uid: str
+    destination_pod_uid: str
+    outcome: Literal["allowed", "denied"]
+    timeout_seconds: int
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        _required_string(self.source_pod_uid, "connectivity source Pod UID", _UID)
+        _required_string(self.destination_pod_uid, "connectivity destination Pod UID", _UID)
+        if self.source_pod_uid == self.destination_pod_uid:
+            raise ValueError("connectivity probe source and destination must differ.")
+        if self.outcome not in {"allowed", "denied"}:
+            raise ValueError("connectivity probe outcome must be allowed or denied.")
+        if type(self.timeout_seconds) is not int or not 1 <= self.timeout_seconds <= 30:
+            raise ValueError("connectivity probe timeout must be between one and 30 seconds.")
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("connectivity probe observation time must be timezone-aware.")
+
+
+@dataclass(frozen=True)
+class KubernetesNetworkPolicyEvidence:
+    """Fresh target-bound declaration and observed NetworkPolicy enforcement.
+
+    A NetworkPolicy object is only a declaration. ``network-policy-enforced-v1``
+    is admissible only when one bounded labelled client reached the server and a
+    distinct labelled client was denied by the same target policy set.
     """
 
     capability: Literal["network-policy-enforced-v1"]
     policy_name: str
     policy_uid: str
     policy_spec_sha256: str
+    cluster_uid: str
+    namespace_uid: str
+    observed_at: datetime
+    allowed_connectivity: KubernetesConnectivityEvidence
+    denied_connectivity: KubernetesConnectivityEvidence
 
     def __post_init__(self) -> None:
         if self.capability != "network-policy-enforced-v1":
@@ -168,6 +198,51 @@ class KubernetesNetworkPolicyEvidence:
         _kubernetes_name(self.policy_name, "network policy name")
         _required_string(self.policy_uid, "network policy UID", _UID)
         _digest(self.policy_spec_sha256, "network policy spec digest")
+        _required_string(self.cluster_uid, "network policy cluster UID", _UID)
+        _required_string(self.namespace_uid, "network policy namespace UID", _UID)
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("network policy observation time must be timezone-aware.")
+        if not all(
+            isinstance(probe, KubernetesConnectivityEvidence)
+            for probe in (self.allowed_connectivity, self.denied_connectivity)
+        ):
+            raise ValueError("network policy evidence requires typed connectivity probes.")
+        if self.allowed_connectivity.outcome != "allowed":
+            raise ValueError("network policy evidence requires an allowed connectivity probe.")
+        if self.denied_connectivity.outcome != "denied":
+            raise ValueError("network policy evidence requires a denied connectivity probe.")
+        if (
+            self.allowed_connectivity.destination_pod_uid
+            != self.denied_connectivity.destination_pod_uid
+            or self.allowed_connectivity.source_pod_uid == self.denied_connectivity.source_pod_uid
+        ):
+            raise ValueError("network policy probes must use distinct clients and one destination.")
+        if any(
+            abs((probe.observed_at - self.observed_at).total_seconds())
+            > _NETWORK_EVIDENCE_MAX_AGE.total_seconds()
+            for probe in (self.allowed_connectivity, self.denied_connectivity)
+        ):
+            raise ValueError("network policy connectivity evidence is not fresh.")
+
+    def is_fresh_for(
+        self, cluster_uid: str, namespace_uid: str, now: datetime | None = None
+    ) -> bool:
+        """Return whether evidence remains fresh and names this exact target."""
+        moment = now or datetime.now(UTC)
+        return (
+            self.is_bound_to(cluster_uid, namespace_uid)
+            and self.observed_at <= moment
+            and moment - self.observed_at <= _NETWORK_EVIDENCE_MAX_AGE
+        )
+
+    def is_bound_to(self, cluster_uid: str, namespace_uid: str) -> bool:
+        """Return whether evidence names this exact target, irrespective of age.
+
+        Freshness admits a *new* network-none Job.  Target identity remains
+        necessary when observing or cancelling the already frozen Job after that
+        short admission window has elapsed.
+        """
+        return self.cluster_uid == cluster_uid and self.namespace_uid == namespace_uid
 
     def payload(self) -> dict[str, str]:
         return {
@@ -175,6 +250,12 @@ class KubernetesNetworkPolicyEvidence:
             "policy_name": self.policy_name,
             "policy_spec_sha256": self.policy_spec_sha256,
             "policy_uid": self.policy_uid,
+            "cluster_uid": self.cluster_uid,
+            "namespace_uid": self.namespace_uid,
+            "allowed_source_pod_uid": self.allowed_connectivity.source_pod_uid,
+            "allowed_destination_pod_uid": self.allowed_connectivity.destination_pod_uid,
+            "denied_source_pod_uid": self.denied_connectivity.source_pod_uid,
+            "denied_destination_pod_uid": self.denied_connectivity.destination_pod_uid,
         }
 
 
@@ -212,6 +293,10 @@ class KubernetesClusterConfig:
             self.network_none_evidence, KubernetesNetworkPolicyEvidence
         ):
             raise ValueError("network_none_evidence must be explicit policy evidence.")
+        if self.network_none_evidence is not None and not self.network_none_evidence.is_bound_to(
+            self.cluster_uid, self.namespace_uid
+        ):
+            raise ValueError("network_none_evidence must be bound to this cluster and namespace.")
 
 
 @dataclass(frozen=True)
@@ -234,8 +319,32 @@ class KubernetesJobBinding:
     output_mount_path: str | None = None
     output_pvc_uid: str | None = None
     output_pvc_spec_sha256: str | None = None
+    output_operation_scoped: bool = False
+    dataset_input: dict | None = None
 
     def __post_init__(self) -> None:
+        if self.dataset_input is not None:
+            from .dataset_inputs import validate_descriptor
+
+            validate_descriptor(self.dataset_input, self.operation_id)
+            if (
+                self.network_mode != "none"
+                or self.active_deadline_seconds > 120
+                or self.memory_mebibytes > 512
+            ):
+                raise ValueError("Dataset starter requires network-none and tighter resource caps")
+            command = self.command
+            if (
+                len(command) != 11
+                or command[:3] != ("python", "-m", "tessera_starter")
+                or command[3:5] != ("--snapshot-root", "/dataset")
+                or command[5:7] != ("--manifest-digest", self.dataset_input["manifest_digest"])
+                or command[7] != "--variant"
+                or command[8] not in {"constant", "linear", "half-slope", "zero-slope"}
+                or command[9] != "--output-root"
+                or command[10] != (self.output_mount_path or "/work")
+            ):
+                raise ValueError("Dataset command must bind the fixed input, variant and output")
         _required_string(self.operation_id, "operation_id", _OPERATION)
         kubernetes_resource_name(self.attempt_id, "attempt_id")
         kubernetes_resource_name(self.lease_id, "lease_id")
@@ -265,6 +374,10 @@ class KubernetesJobBinding:
             raise ValueError("ephemeral_storage_mebibytes is outside the fixture bound.")
         if self.network_mode not in {"none", "cluster"}:
             raise ValueError("network_mode must be explicit.")
+        if type(self.output_operation_scoped) is not bool or (
+            self.output_operation_scoped and self.output_pvc is None
+        ):
+            raise ValueError("operation-scoped output requires an explicit PVC.")
         if self.output_pvc is None and self.output_mount_path is not None:
             raise ValueError("output_mount_path requires output_pvc.")
         if self.output_pvc is None and (
@@ -292,6 +405,17 @@ class KubernetesJobBinding:
     @property
     def job_name(self) -> str:
         return f"tessera-op-{self.operation_id}"
+
+    @property
+    def journal_fields(self) -> dict:
+        # Existing handoff-only journals predate scoped output. Preserve their
+        # exact identity; new scoped operations carry the explicit true field.
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if (key != "output_operation_scoped" or value)
+            and (key != "dataset_input" or value is not None)
+        }
 
 
 @dataclass(frozen=True)
@@ -366,9 +490,33 @@ def job_manifest(
     binding: KubernetesJobBinding, cluster: KubernetesClusterConfig
 ) -> dict[str, object]:
     """Build the sole canonical Job shape for this conformance profile."""
-    if binding.network_mode == "none" and cluster.network_none_evidence is None:
+    return _job_manifest(binding, cluster, require_fresh_network_evidence=True)
+
+
+def _job_manifest(
+    binding: KubernetesJobBinding,
+    cluster: KubernetesClusterConfig,
+    *,
+    require_fresh_network_evidence: bool,
+) -> dict[str, object]:
+    """Render the frozen contract, optionally for observation-only recovery.
+
+    A stale network-policy probe cannot authorize another submit.  It must not
+    prevent exact identity validation or an exact-UID cancellation of the Job
+    that was admitted while the probe was fresh.
+    """
+    if binding.network_mode == "none" and (
+        cluster.network_none_evidence is None
+        or not cluster.network_none_evidence.is_bound_to(cluster.cluster_uid, cluster.namespace_uid)
+        or (
+            require_fresh_network_evidence
+            and not cluster.network_none_evidence.is_fresh_for(
+                cluster.cluster_uid, cluster.namespace_uid
+            )
+        )
+    ):
         raise KubernetesContractError(
-            "network_mode=none requires explicit target capability and enforcing-policy evidence."
+            "network_mode=none requires fresh target-bound enforcement evidence."
         )
     attempt_resource_name = kubernetes_resource_name(binding.attempt_id, "attempt_id")
     lease_resource_name = kubernetes_resource_name(binding.lease_id, "lease_id")
@@ -479,7 +627,11 @@ def job_manifest(
         volumes = manifest["spec"]["template"]["spec"]["volumes"]
         assert isinstance(container, dict) and isinstance(volumes, list)
         container["volumeMounts"].append(
-            {"mountPath": binding.output_mount_path, "name": "persistent-output"}
+            {
+                "mountPath": binding.output_mount_path,
+                "name": "persistent-output",
+                **({"subPath": binding.operation_id} if binding.output_operation_scoped else {}),
+            }
         )
         volumes.append(
             {
@@ -487,6 +639,58 @@ def job_manifest(
                 "persistentVolumeClaim": {"claimName": binding.output_pvc},
             }
         )
+    if binding.dataset_input is not None:
+        descriptor = binding.dataset_input
+        annotations["tessera.dev/input-snapshot-sha256"] = descriptor["snapshot_digest"]
+        annotations["tessera.dev/dataset-manifest-sha256"] = descriptor["manifest_digest"]
+        pod = manifest["spec"]["template"]["spec"]
+        pod["securityContext"]["fsGroup"] = 65532
+        container = pod["containers"][0]
+        container["volumeMounts"].append(
+            {"name": "dataset", "mountPath": "/dataset", "readOnly": True}
+        )
+        pod["volumes"].extend(
+            [
+                {"name": "dataset", "emptyDir": {"sizeLimit": "5Mi"}},
+                {
+                    "name": "dataset-parts",
+                    "projected": {
+                        "defaultMode": 292,
+                        "sources": [
+                            {
+                                "configMap": {
+                                    "name": p["name"],
+                                    "items": [{"key": p["key"], "path": p["key"]}],
+                                }
+                            }
+                            for p in descriptor["parts"]
+                        ],
+                    },
+                },
+            ]
+        )
+        pod["initContainers"] = [
+            {
+                "name": "verify-dataset",
+                "image": binding.image,
+                "imagePullPolicy": "Never",
+                "command": [
+                    "python",
+                    "-m",
+                    "tessera_starter.materialize",
+                    "--operation-id",
+                    binding.operation_id,
+                    "--descriptor",
+                    canonical_json(descriptor).decode(),
+                ],
+                "securityContext": dict(container["securityContext"]),
+                "resources": dict(container["resources"]),
+                "volumeMounts": [
+                    {"name": "dataset-parts", "mountPath": "/dataset-parts", "readOnly": True},
+                    {"name": "dataset", "mountPath": "/dataset"},
+                ],
+            }
+        ]
     annotations["tessera.dev/spec-sha256"] = job_manifest_digest(manifest)
     return manifest
 
@@ -670,6 +874,24 @@ def _validate_pod_spec(
         }
         for index, container in enumerate(containers)
     ]
+    if "initContainers" in expected_spec:
+        init_observed = observed_spec.get("initContainers")
+        init_expected = expected_spec["initContainers"]
+        if not isinstance(init_observed, list) or len(init_observed) != len(init_expected):
+            raise KubernetesContractError("Dataset init container count conflicts.")
+        normalized_init = []
+        for actual, intended in zip(init_observed, init_expected, strict=True):
+            actual = _mapping(actual, "init container")
+            _reject_unallowlisted_fields(
+                actual, set(intended) | set(_CONTAINER_DEFAULTS), "init container"
+            )
+            for name, value in _CONTAINER_DEFAULTS.items():
+                if name in actual and actual[name] != value:
+                    raise KubernetesContractError("Dataset init container default conflicts.")
+            normalized_init.append(
+                {k: v for k, v in actual.items() if k not in _CONTAINER_DEFAULTS}
+            )
+        normalized_spec["initContainers"] = normalized_init
     if not _matches_expected_exactly(normalized_expected, normalized_spec):
         raise KubernetesContractError(mismatch_message)
     return observed_spec
@@ -713,7 +935,7 @@ def parse_job(
 ) -> KubernetesJobObservation:
     """Validate immutable Job binding/spec and derive the provider identity from UIDs."""
     observed = _mapping(observed, "Job")
-    expected = job_manifest(binding, cluster)
+    expected = _job_manifest(binding, cluster, require_fresh_network_evidence=False)
     if (
         observed.get("apiVersion") != expected["apiVersion"]
         or observed.get("kind") != expected["kind"]
@@ -788,7 +1010,7 @@ def parse_pod(
     if observed.get("apiVersion") != "v1" or observed.get("kind") != "Pod":
         raise KubernetesContractError("Kubernetes Pod type conflicts with the operation binding.")
     metadata = _mapping(observed.get("metadata"), "Pod metadata")
-    expected = job_manifest(binding, cluster)
+    expected = _job_manifest(binding, cluster, require_fresh_network_evidence=False)
     template = _mapping(
         _mapping(expected["spec"], "expected spec")["template"], "expected template"
     )
@@ -868,17 +1090,25 @@ class KubernetesJobJournal:
         cluster: KubernetesClusterConfig,
         inspect: InspectJob,
         create: CreateJob,
+        *,
+        prepare: Callable[[], None] | None = None,
     ) -> KubernetesJobObservation:
-        manifest = job_manifest(binding, cluster)
+        # Inspect before fresh-evidence admission.  A previously created exact
+        # Job remains observable after evidence expires, but no absent Job can
+        # be submitted under that stale evidence.
+        manifest = _job_manifest(binding, cluster, require_fresh_network_evidence=False)
         self._bind(binding, manifest)
         self._reject_cancelled_create(binding.operation_id)
         found = inspect(binding.job_name)
         if found is not None:
             return self.reconcile_observation(binding, cluster, found)
+        job_manifest(binding, cluster)
         if self._create_intent(binding.operation_id):
             raise KubernetesUnresolvedError(
                 "Kubernetes Job create remains unresolved; inspect only."
             )
+        if prepare is not None:
+            prepare()
         self._mark_create_intent(binding.operation_id)
         try:
             created = create(manifest)
@@ -902,7 +1132,7 @@ class KubernetesJobJournal:
         metadata. Every normal observation path uses this fence before a status,
         Pod query, or collection handoff can identify the Job.
         """
-        manifest = job_manifest(binding, cluster)
+        manifest = _job_manifest(binding, cluster, require_fresh_network_evidence=False)
         self._bind(binding, manifest)
         return self._record_observation(parse_job(observed, binding, cluster), binding.operation_id)
 
@@ -919,7 +1149,10 @@ class KubernetesJobJournal:
         A deletion acknowledgement is deliberately discarded.  If either fresh
         observation fails, the cancellation remains unresolved.
         """
-        self._bind(binding, job_manifest(binding, cluster))
+        self._bind(
+            binding,
+            _job_manifest(binding, cluster, require_fresh_network_evidence=False),
+        )
         # This durable fence precedes every injected Kubernetes callback.  Create
         # admission checks the same row, including after a journal restart.
         self._mark_cancellation_requested(binding.operation_id)
@@ -960,8 +1193,289 @@ class KubernetesJobJournal:
         confirmed = fresh_job is None and not pods
         return KubernetesCancellationObservation(True, True, True, confirmed)
 
+    def attest_never_submitted(
+        self,
+        binding: KubernetesJobBinding,
+        cluster: KubernetesClusterConfig,
+        *,
+        inspect_namespace: Callable[[str], Mapping[str, object]],
+        inspect_job: InspectJob,
+        list_operation_jobs: Callable[[str], Sequence[Mapping[str, object]]],
+        list_operation_pods: Callable[[str], Sequence[Mapping[str, object]]],
+    ) -> dict[str, object]:
+        """Fence the *existing* journal before fresh, target-bound absence reads.
+
+        Only the exclusive original journal is meaningful here. Never _bind a
+        missing row: a recreated/empty journal is not evidence of no submission.
+        SQLite's write lock serializes this fence with _mark_create_intent. A
+        failed/partial provider read leaves the cancellation fence in place.
+        """
+        manifest = _job_manifest(binding, cluster, require_fresh_network_evidence=False)
+        encoded_binding = canonical_json(binding.journal_fields).decode("utf-8")
+        encoded_manifest = canonical_json(manifest).decode("utf-8")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM kubernetes_jobs WHERE operation_id=?", (binding.operation_id,)
+            ).fetchone()
+            if (
+                row is None
+                or row["binding_json"] != encoded_binding
+                or row["manifest_json"] != encoded_manifest
+                or row["create_intent"] != 0
+                or row["cancellation_requested"] != 1
+                or row["job_uid"] is not None
+            ):
+                raise KubernetesUnresolvedError(
+                    "Original cancelled zero-create journal is not intact."
+                )
+            # This fence stays durable even if subsequent readbacks fail.
+            connection.execute(
+                "UPDATE kubernetes_jobs SET cancellation_requested=1 WHERE operation_id=?",
+                (binding.operation_id,),
+            )
+        observed_at = self._never_submitted_readbacks(
+            binding,
+            cluster,
+            inspect_namespace,
+            inspect_job,
+            list_operation_jobs,
+            list_operation_pods,
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM kubernetes_jobs WHERE operation_id=?", (binding.operation_id,)
+            ).fetchone()
+            if (
+                row is None
+                or row["binding_json"] != encoded_binding
+                or row["manifest_json"] != encoded_manifest
+                or row["create_intent"] != 0
+                or row["cancellation_requested"] != 1
+                or row["job_uid"] is not None
+            ):
+                raise KubernetesUnresolvedError(
+                    "Original journal changed during absence readbacks."
+                )
+        return {
+            "proof_kind": "bound_job_intent",
+            "operation_id": binding.operation_id,
+            "observed_at": observed_at,
+            "lease_id": binding.lease_id,
+            "epoch": binding.epoch,
+            "package_digest": binding.package_sha256,
+            "target_digest": cluster_identity_digest(cluster),
+            "job_name": binding.job_name,
+            "namespace_uid": cluster.namespace_uid,
+            "journal_binding_digest": hashlib.sha256(encoded_binding.encode()).hexdigest(),
+            "journal_manifest_digest": hashlib.sha256(encoded_manifest.encode()).hexdigest(),
+            "manifest_not_generated": False,
+            "create_intent": False,
+            "cancellation_requested": True,
+            "job_uid": None,
+            "namespace_uid_checked": True,
+            "deterministic_job_absent": True,
+            "operation_jobs_absent": True,
+            "operation_pods_absent": True,
+        }
+
+    @staticmethod
+    def _never_submitted_readbacks(
+        binding: KubernetesJobBinding,
+        cluster: KubernetesClusterConfig,
+        inspect_namespace: Callable[[str], Mapping[str, object]],
+        inspect_job: InspectJob,
+        list_operation_jobs: Callable[[str], Sequence[Mapping[str, object]]],
+        list_operation_pods: Callable[[str], Sequence[Mapping[str, object]]],
+    ) -> str:
+        # Timestamp the *start* of the provider reads. Slow readbacks must
+        # never masquerade as a fresh absence in the subsequent control CAS.
+        observed_at = datetime.now(UTC).isoformat()
+        namespace = inspect_namespace(cluster.namespace)
+        if not isinstance(namespace, Mapping):
+            raise KubernetesUnresolvedError("Namespace readback is unavailable.")
+        metadata = namespace.get("metadata")
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("uid") != cluster.namespace_uid
+            or metadata.get("name") != cluster.namespace
+        ):
+            raise KubernetesUnresolvedError(
+                "Namespace UID readback does not match the bound target."
+            )
+        job = inspect_job(binding.job_name)
+        jobs = list_operation_jobs(binding.operation_id)
+        pods = list_operation_pods(binding.operation_id)
+        if not isinstance(jobs, (list, tuple)) or not isinstance(pods, (list, tuple)):
+            raise KubernetesUnresolvedError("Operation-labelled list readback is incomplete.")
+        if job is not None or jobs or pods:
+            raise KubernetesUnresolvedError("Job or operation-labelled workload may exist.")
+        return observed_at
+
+    def attest_pre_manifest_never_submitted(
+        self,
+        binding: KubernetesJobBinding,
+        cluster: KubernetesClusterConfig,
+        *,
+        inspect_namespace: Callable[[str], Mapping[str, object]],
+        inspect_job: InspectJob,
+        list_operation_jobs: Callable[[str], Sequence[Mapping[str, object]]],
+        list_operation_pods: Callable[[str], Sequence[Mapping[str, object]]],
+    ) -> dict[str, object]:
+        """Fence an intact *adapter* intent whose network witness blocked manifest creation.
+
+        This is not a fabricated kubernetes_jobs row: zero such rows means no
+        manifest and no create intent were generated. The same SQLite file holds
+        the durable adapter intent and the job journal. An on-disk trigger fences
+        even older running workers that attempt to insert a job row after our
+        read. The original exclusive journal must be retained, never restored
+        from a stale backup or recreated from a receipt.
+        """
+        if binding.network_mode != "none" or cluster.network_none_evidence is not None:
+            raise KubernetesUnresolvedError(
+                "Pre-manifest no-start needs the missing network witness."
+            )
+        target_digest = cluster_identity_digest(cluster)
+        encoded_intent = canonical_json(
+            {
+                "binding": binding.journal_fields,
+                "package_digest": binding.package_sha256,
+                "target_digest": target_digest,
+            }
+        ).decode("utf-8")
+        # Do not create an adapter intent, a manifest, or a kubernetes_jobs row.
+        # BEGIN IMMEDIATE serializes with every job _bind and _mark_create_intent
+        # on the same exclusive original database.
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise KubernetesUnresolvedError("Original worker journal failed integrity check.")
+            self._check_pre_manifest_row(connection, binding, cluster, encoded_intent)
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS kubernetes_pre_manifest_fences (
+                operation_id TEXT PRIMARY KEY, intent_sha256 TEXT NOT NULL,
+                fenced_at TEXT NOT NULL)"""
+            )
+            trigger = (
+                "CREATE TRIGGER IF NOT EXISTS kubernetes_pre_manifest_no_insert "
+                "BEFORE INSERT ON kubernetes_jobs "
+                "WHEN EXISTS (SELECT 1 FROM kubernetes_pre_manifest_fences "
+                "WHERE operation_id=NEW.operation_id) "
+                "BEGIN SELECT RAISE(ABORT, 'pre-manifest operation is fenced'); END"
+            )
+            connection.execute(trigger)
+            stored_trigger = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                ("kubernetes_pre_manifest_no_insert",),
+            ).fetchone()
+            if stored_trigger is None or stored_trigger["sql"] != trigger.replace(
+                "IF NOT EXISTS ", ""
+            ):
+                raise KubernetesUnresolvedError("Pre-manifest create fence trigger was altered.")
+            digest = hashlib.sha256(encoded_intent.encode()).hexdigest()
+            connection.execute(
+                """INSERT INTO kubernetes_pre_manifest_fences
+                (operation_id,intent_sha256,fenced_at) VALUES (?,?,?)
+                ON CONFLICT(operation_id) DO NOTHING""",
+                (binding.operation_id, digest, datetime.now(UTC).isoformat()),
+            )
+            fence = connection.execute(
+                "SELECT intent_sha256 FROM kubernetes_pre_manifest_fences WHERE operation_id=?",
+                (binding.operation_id,),
+            ).fetchone()
+            if fence is None or fence["intent_sha256"] != digest:
+                raise KubernetesUnresolvedError(
+                    "Pre-manifest fence conflicts with original intent."
+                )
+        observed_at = self._never_submitted_readbacks(
+            binding,
+            cluster,
+            inspect_namespace,
+            inspect_job,
+            list_operation_jobs,
+            list_operation_pods,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_pre_manifest_row(connection, binding, cluster, encoded_intent)
+            if connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                ("kubernetes_pre_manifest_no_insert",),
+            ).fetchone()["sql"] != trigger.replace("IF NOT EXISTS ", ""):
+                raise KubernetesUnresolvedError("Pre-manifest fence disappeared during readback.")
+            fence = connection.execute(
+                "SELECT intent_sha256 FROM kubernetes_pre_manifest_fences WHERE operation_id=?",
+                (binding.operation_id,),
+            ).fetchone()
+            if fence is None or fence["intent_sha256"] != digest:
+                raise KubernetesUnresolvedError("Pre-manifest fence disappeared during readback.")
+        return {
+            "proof_kind": "pre_manifest",
+            "operation_id": binding.operation_id,
+            "observed_at": observed_at,
+            "lease_id": binding.lease_id,
+            "epoch": binding.epoch,
+            "package_digest": binding.package_sha256,
+            "target_digest": target_digest,
+            "job_name": binding.job_name,
+            "namespace_uid": cluster.namespace_uid,
+            "journal_binding_digest": digest,
+            "journal_manifest_digest": None,
+            "manifest_not_generated": True,
+            "create_intent": False,
+            "cancellation_requested": True,
+            "job_uid": None,
+            "namespace_uid_checked": True,
+            "deterministic_job_absent": True,
+            "operation_jobs_absent": True,
+            "operation_pods_absent": True,
+        }
+
+    @staticmethod
+    def _check_pre_manifest_row(
+        connection: sqlite3.Connection,
+        binding: KubernetesJobBinding,
+        cluster: KubernetesClusterConfig,
+        encoded_intent: str,
+    ) -> None:
+        expected_tables = ("kubernetes_jobs", "kubernetes_execution_bindings")
+        for table in expected_tables:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                is None
+            ):
+                raise KubernetesUnresolvedError("Original worker journal table is missing.")
+        adapter = connection.execute(
+            "SELECT * FROM kubernetes_execution_bindings WHERE operation_id=?",
+            (binding.operation_id,),
+        ).fetchone()
+        job = connection.execute(
+            "SELECT 1 FROM kubernetes_jobs WHERE operation_id=?", (binding.operation_id,)
+        ).fetchone()
+        if (
+            adapter is None
+            or adapter["intent_json"] != encoded_intent
+            or adapter["target_digest"] != cluster_identity_digest(cluster)
+            or adapter["namespace"] != cluster.namespace
+            or adapter["namespace_uid"] != cluster.namespace_uid
+            or adapter["job_name"] != binding.job_name
+            or adapter["pvc_name"] != binding.output_pvc
+            or adapter["pvc_uid"] != binding.output_pvc_uid
+            or adapter["pvc_spec_sha256"] != binding.output_pvc_spec_sha256
+            or adapter["cancellation_requested"] != 1
+            or adapter["job_uid"] is not None
+            or adapter["pod_uids_json"] != "[]"
+            or adapter["observed_state"] != "unknown"
+            or job is not None
+        ):
+            raise KubernetesUnresolvedError(
+                "Original pre-manifest cancelled intent is missing or conflicted."
+            )
+
     def _bind(self, binding: KubernetesJobBinding, manifest: Mapping[str, object]) -> None:
-        encoded_binding = canonical_json(binding.__dict__).decode("utf-8")
+        encoded_binding = canonical_json(binding.journal_fields).decode("utf-8")
         encoded_manifest = canonical_json(manifest).decode("utf-8")
         with self._connect() as connection:
             row = connection.execute(
@@ -1082,6 +1596,7 @@ class KubernetesJobJournal:
 __all__ = [
     "KubernetesCancellationObservation",
     "KubernetesClusterConfig",
+    "KubernetesConnectivityEvidence",
     "KubernetesContractError",
     "KubernetesJobBinding",
     "KubernetesJobJournal",

@@ -15,6 +15,7 @@ from tessera_agent import (
     ExplainStatusMediator,
 )
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.store import _connect, initialize_state, migrate_state
 
@@ -231,10 +232,13 @@ def test_v41_to_v42_migration_is_empty_repeatable_and_recoverable(tmp_path: Path
             "astra_status_discussions",
         ):
             connection.execute(f"DROP TABLE {table}")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=41")
 
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with _connect(state / "tessera.sqlite3") as connection:
         for table in (
             "astra_status_discussions",
@@ -257,7 +261,7 @@ def test_v41_to_v42_migration_is_empty_repeatable_and_recoverable(tmp_path: Path
     assert output["state"] == "completed"
 
     backup, restored = tmp_path / "backup", tmp_path / "restored"
-    assert backup_state(state, backup)["schema_version"] == 43
+    assert backup_state(state, backup)["schema_version"] == LATEST_SCHEMA_VERSION
     restore_state(backup, restored)
     recovered = TestClient(create_app(restored)).get(
         f"/astra/explain-status-turns/{requested['turn_id']}",

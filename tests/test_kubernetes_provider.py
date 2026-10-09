@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import UTC, datetime
 
 import pytest
 
 from tessera_worker.kubernetes_provider import (
     ClusterIdentity,
     JobBinding,
+    KubernetesConnectivityEvidence,
     KubernetesContractError,
     KubernetesJobJournal,
     KubernetesNetworkPolicyEvidence,
@@ -22,6 +24,7 @@ from tessera_worker.kubernetes_provider import (
 
 
 def cluster() -> ClusterIdentity:
+    now = datetime.now(UTC)
     return ClusterIdentity(
         kubeconfig="/private/fixture/kubeconfig",
         kubeconfig_sha256="a" * 64,
@@ -34,7 +37,15 @@ def cluster() -> ClusterIdentity:
         cluster_uid="cluster-fixture",
         namespace_uid="namespace-fixture",
         network_none_evidence=KubernetesNetworkPolicyEvidence(
-            "network-policy-enforced-v1", "tessera-deny-all", "policy-fixture", "f" * 64
+            "network-policy-enforced-v1",
+            "tessera-deny-all",
+            "policy-fixture",
+            "f" * 64,
+            "cluster-fixture",
+            "namespace-fixture",
+            now,
+            KubernetesConnectivityEvidence("allowed-pod", "server-pod", "allowed", 3, now),
+            KubernetesConnectivityEvidence("denied-pod", "server-pod", "denied", 3, now),
         ),
     )
 

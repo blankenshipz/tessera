@@ -3,9 +3,14 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .api import idempotency_key, principal, worker_principal
+from .artifact_custody import (
+    ArtifactCustodyReleaseRequest,
+    ArtifactCustodyStore,
+    ReproductionBundleRequest,
+)
 from .artifact_manifests import ArtifactManifestStore, CreateArtifactManifest
 from .artifacts import (
     ArtifactStore,
@@ -54,6 +59,17 @@ def project_artifacts(request: Request) -> ProjectArtifactStore:
 
 
 ProjectArtifactStoreDependency = Annotated[ProjectArtifactStore, Depends(project_artifacts)]
+
+
+def custody(request: Request) -> ArtifactCustodyStore:
+    return getattr(
+        request.app.state,
+        "artifact_custody",
+        ArtifactCustodyStore(request.app.state.store.database_path.parent),
+    )
+
+
+CustodyStoreDependency = Annotated[ArtifactCustodyStore, Depends(custody)]
 
 
 @router.post("/worker/leases/{lease_id}/artifacts")
@@ -172,3 +188,74 @@ def list_manifests(
     limit: int = Query(default=100, ge=1, le=200),
 ):
     return {"artifact_manifests": store.list_manifests(actor, project_id, offset, limit)}
+
+
+@router.post("/artifact-manifests/{manifest_id}/custody-releases")
+def record_custody_release(
+    manifest_id: str,
+    body: ArtifactCustodyReleaseRequest,
+    actor: Actor,
+    key: Key,
+    store: CustodyStoreDependency,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    status, response = store.record_release(
+        actor, manifest_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.get("/artifact-manifests/{manifest_id}/released")
+def get_released_manifest(
+    manifest_id: str, actor: Actor, store: CustodyStoreDependency
+) -> dict[str, Any]:
+    return store.get_released_manifest(actor, manifest_id)
+
+
+@router.get("/artifact-manifests/{manifest_id}/artifacts/{artifact_id}/preview")
+def preview_released_artifact(
+    manifest_id: str,
+    artifact_id: str,
+    actor: Actor,
+    store: CustodyStoreDependency,
+    max_bytes: int = Query(default=4096, ge=1, le=64 * 1024),
+) -> dict[str, Any]:
+    return store.preview(actor, manifest_id, artifact_id, max_bytes)
+
+
+@router.get("/artifact-manifests/{manifest_id}/artifacts/{artifact_id}/content")
+def retrieve_released_artifact(
+    manifest_id: str, artifact_id: str, actor: Actor, store: CustodyStoreDependency
+) -> Response:
+    artifact = store.retrieve(actor, manifest_id, artifact_id)
+    return Response(
+        content=artifact["content"],
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": "attachment",
+            "X-Content-Type-Options": "nosniff",
+            "X-Tessera-Artifact-Sha256": artifact["sha256"],
+        },
+    )
+
+
+@router.post("/artifact-manifests/{manifest_id}/reproduction-bundles")
+def export_reproduction_bundle(
+    manifest_id: str,
+    body: ReproductionBundleRequest,
+    actor: Actor,
+    key: Key,
+    store: CustodyStoreDependency,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    status, response = store.export_bundle(
+        actor, manifest_id, key, canonical_digest(payload), payload
+    )
+    return JSONResponse(status_code=status, content=response)
+
+
+@router.get("/reproduction-bundles/{bundle_id}")
+def get_reproduction_bundle(
+    bundle_id: str, actor: Actor, store: CustodyStoreDependency
+) -> dict[str, Any]:
+    return store.get_bundle(actor, bundle_id)

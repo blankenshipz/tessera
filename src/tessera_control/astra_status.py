@@ -207,7 +207,11 @@ class AstraStatusStore:
             refs = [{"kind": "experiment", "record_id": body.experiment_id, "expected_revision": body.expected_design_revision}]; encoded = json.dumps(refs, sort_keys=True, separators=(",", ":"))
             conn.execute("INSERT INTO astra_conversation_messages VALUES (?,?,?,?,?,?,?,?,?)", (message_id, project_id, revision, "human", body.prompt, None, snapshot_id, now, live["id"]))
             conn.execute("INSERT INTO astra_selected_context_snapshots VALUES (?,?,?,?,?,?,?,?)", (snapshot_id, live["org_id"], project_id, revision, encoded, _digest(refs), now, live["id"]))
-            conn.execute("INSERT INTO astra_coordinator_turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (turn_id, live["org_id"], project_id, message_id, snapshot_id, "requested", 1, None, None, None, None, None, now, now, live["id"]))
+            conn.execute("""INSERT INTO astra_coordinator_turns
+                (id,org_id,project_id,input_message_id,context_snapshot_id,state,revision,
+                 claimed_by_principal_id,claimed_at,claim_expires_at,claim_attempts,
+                 completion_message_id,proposal_id,error_code,created_at,updated_at,created_by_principal_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (turn_id, live["org_id"], project_id, message_id, snapshot_id, "requested", 1, None, None, None, 0, None, None, None, now, now, live["id"]))
             conn.execute(
                 """INSERT INTO astra_status_discussions
                 (turn_id,org_id,project_id,experiment_id,design_revision,created_at,

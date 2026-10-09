@@ -118,12 +118,14 @@ class ProjectArtifactStore(ArtifactManifestStore):
 
         def admissible(connection: sqlite3.Connection, actor: dict[str, Any]) -> None:
             lease, grant = self._grant_for_upload(connection, actor, lease_id)
-            if body["expected_epoch"] != lease["epoch"] or body[
-                "operation_id"
-            ] != self._expected_operation(lease_id):
-                raise Conflict("Project artifact placement does not match the lease.")
+            self._validate_operation(connection, grant, lease, body)
             for entry in body["artifacts"]:
                 artifact = self._artifact(connection, lease_id, actor, entry)
+                if (
+                    artifact["operation_id"] != body["operation_id"]
+                    or artifact["epoch"] != lease["epoch"]
+                ):
+                    raise Conflict("Project artifact provenance does not match the operation.")
                 retention_record = connection.execute(
                     "SELECT state FROM project_artifact_retention WHERE artifact_id=?",
                     (artifact["id"],),
@@ -312,10 +314,7 @@ class ProjectArtifactStore(ArtifactManifestStore):
         try:
             connection.execute("BEGIN IMMEDIATE")
             lease, grant = self._grant_for_upload(connection, worker, lease_id)
-            if body["expected_epoch"] != lease["epoch"] or body[
-                "operation_id"
-            ] != self._expected_operation(lease_id):
-                raise Conflict("Project artifact placement does not match the lease.")
+            self._validate_operation(connection, grant, lease, body)
             tenant_id = connection.execute(
                 "SELECT org_id FROM projects WHERE id=?", (grant["project_id"],)
             ).fetchone()[0]
@@ -368,10 +367,7 @@ class ProjectArtifactStore(ArtifactManifestStore):
 
         def command(connection: sqlite3.Connection, actor: dict[str, Any]):
             lease, grant = self._grant_for_upload(connection, actor, lease_id)
-            if body["expected_epoch"] != lease["epoch"] or body[
-                "operation_id"
-            ] != self._expected_operation(lease_id):
-                raise Conflict("Project artifact placement does not match the lease.")
+            self._validate_operation(connection, grant, lease, body)
             now, response, inserted = utc_now(), [], False
             for operation in prepared["operations"]:
                 artifact_id = operation["artifact_id"]

@@ -95,6 +95,12 @@ class CreateDecision(InteractionRequest):
     @field_validator("scope")
     @classmethod
     def scope_is_bounded_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if value.get("type") == "research_program":
+            from .program_models import ProgramReview
+            from .research_models import _bounded_json
+
+            return _bounded_json(ProgramReview.model_validate(value).model_dump(mode="json"))
+
         def visit(item: Any, depth: int = 0) -> None:
             if depth > 4:
                 raise ValueError("scope JSON is too deep")

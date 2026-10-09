@@ -2,8 +2,8 @@
 
 Status: accepted for local schema-v26 development storage.
 
-The v26 status above is historical design evidence. In current schema v43 local
-recovery, committed filesystem objects are copied into a versioned backup object
+The v26 status above is historical design evidence. At the schema-50 local
+recovery milestone, committed filesystem objects were copied into a versioned backup object
 bundle with their exact bytes and custody/retention declarations. Restore verifies
 the bundle, places available objects in the restored project-artifact store, and
 marks their custody held in a permanently read-only history. This is inspection

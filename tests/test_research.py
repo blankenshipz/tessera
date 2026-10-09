@@ -308,6 +308,62 @@ def test_source_downgrade_flags_accepted_finding_idempotently_and_stale_write_ro
     assert still_flagged["revision"] == 3
 
 
+def test_variant_result_flags_accepted_finding_without_rewriting_evidence(tmp_path: Path) -> None:
+    _, store, owner = _setup(tmp_path)
+    project = _project(store, owner)
+    study = _study(store, owner, project["id"])
+    variant = _variant(store, owner, study["id"], "baseline")
+    unrelated = _variant(store, owner, study["id"], "other")
+    source = _assess(store, owner, _source(store, owner, study["id"]))
+    finding = _command(
+        store.create_finding,
+        owner,
+        study["id"],
+        payload={
+            "statement": "Pre-result interpretation of baseline.",
+            "source_ids": [source["id"]],
+            "variant_ids": [variant["id"]],
+        },
+    )
+    accepted = _command(
+        store.accept_finding, owner, finding["id"], payload={"expected_revision": 1}
+    )
+    body = {
+        "expected_revision": variant["revision"],
+        "status": "failed",
+        "reason": "Observed failure, not a verified execution receipt.",
+        "outcome": {"baseline_score": 0},
+        "provenance": "imported_unverified",
+    }
+    digest = canonical_digest(body)
+    first = store.record_variant_status(owner, variant["id"], "result-key", digest, body)
+    assert first == store.record_variant_status(owner, variant["id"], "result-key", digest, body)
+    exported = store.export_study(owner, study["id"])
+    flagged = next(item for item in exported["findings"] if item["id"] == finding["id"])
+    assert flagged["status"] == "needs_review"
+    assert flagged["revision"] == accepted["revision"] + 1
+    assert flagged["statement"] == accepted["statement"]
+    assert flagged["source_ids"] == [source["id"]]
+    assert flagged["variant_ids"] == [variant["id"]]
+    recorded = [
+        event for event in exported["events"] if event["event_type"] == "research.variant_recorded"
+    ]
+    assert len(recorded) == 1
+    assert recorded[0]["payload"]["dependent_findings_flagged"] == 1
+
+    _command(
+        store.record_variant_status,
+        owner,
+        unrelated["id"],
+        payload={"expected_revision": 1, "status": "completed", "outcome": {"score": 1}},
+    )
+    after = store.export_study(owner, study["id"])
+    assert after["events"][-1]["payload"]["dependent_findings_flagged"] == 0
+    with pytest.raises(Conflict, match="revision"):
+        store.record_variant_status(owner, variant["id"], "stale-result", digest, body)
+    assert store.export_study(owner, study["id"])["findings"] == after["findings"]
+
+
 def test_idempotency_revision_conflict_and_atomic_rollback(tmp_path: Path) -> None:
     _, store, owner = _setup(tmp_path)
     project = _project(store, owner)

@@ -130,10 +130,9 @@ class ArtifactManifestStore(ArtifactStore):
         try:
             actor = self._live_principal(connection, worker, audience="worker")
             lease, grant = self._grant_for_upload(connection, actor, lease_id)
+            self._validate_operation(connection, grant, lease, body)
             if (
-                body["expected_epoch"] != lease["epoch"]
-                or body["operation_id"] != self._expected_operation(lease_id)
-                or connection.execute(
+                connection.execute(
                     "SELECT 1 FROM project_storage_bindings WHERE project_id=?",
                     (grant["project_id"],),
                 ).fetchone()
@@ -158,7 +157,11 @@ class ArtifactManifestStore(ArtifactStore):
 
     @staticmethod
     def _canonical_payload(
-        lease: sqlite3.Row, grant: sqlite3.Row, actor: dict[str, Any], entries: list[dict[str, Any]]
+        lease: sqlite3.Row,
+        grant: sqlite3.Row,
+        actor: dict[str, Any],
+        entries: list[dict[str, Any]],
+        operation_id: str | None = None,
     ) -> dict[str, Any]:
         return {
             "version": 1,
@@ -168,7 +171,7 @@ class ArtifactManifestStore(ArtifactStore):
             "lease_id": lease["id"],
             "worker_principal_id": actor["id"],
             "epoch": lease["epoch"],
-            "operation_id": ArtifactStore._expected_operation(lease["id"]),
+            "operation_id": operation_id or ArtifactStore._expected_operation(lease["id"]),
             "plan_digest": grant["plan_digest"],
             "artifacts": entries,
         }
@@ -185,10 +188,7 @@ class ArtifactManifestStore(ArtifactStore):
 
         def command(connection: sqlite3.Connection, actor: dict[str, Any]):
             lease, grant = self._grant_for_upload(connection, actor, lease_id)
-            if body["expected_epoch"] != lease["epoch"]:
-                raise Conflict("Artifact manifest epoch does not match the issued lease.")
-            if body["operation_id"] != self._expected_operation(lease_id):
-                raise Conflict("Artifact manifest operation does not match the lease.")
+            self._validate_operation(connection, grant, lease, body)
             plan, _ = self._plan(connection, grant)
             spec = plan["execution_spec"]
             paths = [entry["relative_path"] for entry in body["artifacts"]]
@@ -205,7 +205,8 @@ class ArtifactManifestStore(ArtifactStore):
             remaining = limit
             for entry in entries:
                 row = connection.execute(
-                    """SELECT id, relative_path, sha256, size, length(content) AS content_length,
+                    """SELECT id, relative_path, operation_id, epoch, sha256, size,
+                    length(content) AS content_length,
                     typeof(content) AS content_type, late FROM artifacts
                     WHERE id=? AND lease_id=? AND worker_principal_id=? AND relative_path=?""",
                     (entry["id"], lease_id, actor["id"], entry["relative_path"]),
@@ -213,7 +214,9 @@ class ArtifactManifestStore(ArtifactStore):
                 if row is None:
                     raise NotFound("Quarantined artifact was not found.")
                 if (
-                    row["sha256"] != entry["sha256"]
+                    row["operation_id"] != body["operation_id"]
+                    or row["epoch"] != lease["epoch"]
+                    or row["sha256"] != entry["sha256"]
                     or row["size"] != entry["size"]
                     or row["content_type"] != "blob"
                     or row["content_length"] != row["size"]
@@ -253,7 +256,7 @@ class ArtifactManifestStore(ArtifactStore):
                     require_project_artifact_reference_admissible(
                         connection, grant["project_id"], entry["id"]
                     )
-            canonical = self._canonical_payload(lease, grant, actor, verified)
+            canonical = self._canonical_payload(lease, grant, actor, verified, body["operation_id"])
             manifest_digest = canonical_digest(canonical)
             existing = connection.execute(
                 """SELECT id, project_id, task_id, grant_id, lease_id, worker_principal_id,

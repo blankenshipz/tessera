@@ -22,7 +22,6 @@ from .kubernetes_contracts import (
     KubernetesContractError,
     KubernetesJobBinding,
     KubernetesJobJournal,
-    KubernetesNetworkPolicyEvidence,
     KubernetesUnresolvedError,
     canonical_json,
     job_manifest,
@@ -67,12 +66,6 @@ class PersistentOutputTarget:
             raise ValueError("pvc_uid must be a bounded Kubernetes UID.")
         if not isinstance(self.pvc_spec_sha256, str) or not _DIGEST.fullmatch(self.pvc_spec_sha256):
             raise ValueError("pvc_spec_sha256 must be a SHA-256 digest.")
-        KubernetesNetworkPolicyEvidence(
-            self.network_none_capability,
-            self.network_policy,
-            self.network_policy_uid,
-            self.network_policy_spec_sha256,
-        )
 
     def cluster_config(self) -> KubernetesClusterConfig:
         return KubernetesClusterConfig(
@@ -86,12 +79,6 @@ class PersistentOutputTarget:
             namespace=self.namespace,
             cluster_uid=self.cluster_uid,
             namespace_uid=self.namespace_uid,
-            network_none_evidence=KubernetesNetworkPolicyEvidence(
-                self.network_none_capability,
-                self.network_policy,
-                self.network_policy_uid,
-                self.network_policy_spec_sha256,
-            ),
         )
 
 
@@ -139,6 +126,7 @@ def hello_binding(
             f"cat {output_mount}/{HELLO_PATH}",
         ),
         active_deadline_seconds=60,
+        network_mode="cluster",
         output_pvc=output_pvc,
         output_mount_path=output_mount,
         output_pvc_uid=output_pvc_uid,

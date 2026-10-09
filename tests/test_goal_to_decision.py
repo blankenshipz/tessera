@@ -23,7 +23,12 @@ from tessera_control.external_operations import (
     create_external_operation_schema,
     current_operation_reconciliation,
 )
-from tessera_control.migrations import MIGRATIONS, migrate_v27_to_v28, migrate_v30_to_v31
+from tessera_control.migrations import (
+    LATEST_SCHEMA_VERSION,
+    MIGRATIONS,
+    migrate_v27_to_v28,
+    migrate_v30_to_v31,
+)
 from tessera_control.project_artifact_retention import ProjectArtifactRetentionStore
 from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.recovery import backup_state, restore_state
@@ -815,7 +820,7 @@ def test_admitted_success_requires_package_and_confirmed_exit(tmp_path: Path) ->
         )
 
 
-def _admitted_operation_with_confirmed_sources(tmp_path: Path):
+def _admitted_operation_with_confirmed_sources(tmp_path: Path, whole_second=False):
     state, execution, owner, worker, grant, lease = _delivery(tmp_path)
     records = ExperimentStore(state)
     experiment = _command(
@@ -837,6 +842,8 @@ def _admitted_operation_with_confirmed_sources(tmp_path: Path):
         worker, lease["id"], "combined-observation-package", canonical_digest(body), lease["epoch"]
     )[1]
     observed_at = datetime.now(UTC)
+    if whole_second:
+        observed_at = observed_at.replace(microsecond=0) + timedelta(seconds=1)
     receipt = {
         "lease_id": lease["id"],
         "expected_epoch": lease["epoch"],
@@ -987,7 +994,7 @@ def test_same_time_receipt_contradiction_is_fail_closed(tmp_path: Path) -> None:
     with _connect(_state / "tessera.sqlite3") as connection:
         reconciliation = current_operation_reconciliation(connection, operation_id)
     assert reconciliation is not None
-    assert reconciliation["source_order"] == ["receipt", "worker"]
+    assert reconciliation["source_order"] == ["receipt", "recovery_observer", "worker"]
     assert reconciliation["contradiction_state"] == "same_time_contradiction"
     with pytest.raises(Conflict, match="confirmed attributed terminal observation"):
         _command(
@@ -1002,28 +1009,35 @@ def test_same_time_receipt_contradiction_is_fail_closed(tmp_path: Path) -> None:
         )
 
 
-def test_newer_worker_running_blocks_reconciliation_and_exposure_release(tmp_path: Path) -> None:
+@pytest.mark.parametrize("whole_second", [False, True])
+@pytest.mark.parametrize("adverse_state", ["running", "unknown"])
+def test_newer_worker_running_blocks_reconciliation_and_exposure_release(
+    tmp_path: Path, whole_second: bool, adverse_state: str
+) -> None:
     (
         _state,
         execution,
-        _records,
+        records,
         owner,
         worker,
         grant,
         lease,
-        _admitted,
+        admitted,
         _operation_id,
         receipt,
         worker_exit,
-    ) = _admitted_operation_with_confirmed_sources(tmp_path)
+    ) = _admitted_operation_with_confirmed_sources(tmp_path, whole_second=whole_second)
     running = worker_exit | {
-        "observed_state": "running",
+        "observed_state": adverse_state,
         "observed_at": (
             datetime.fromisoformat(receipt["observed_at"]) + timedelta(milliseconds=1)
         ).isoformat(),
         "termination_confirmed": False,
     }
     _command(execution.report_execution_observation, worker, lease["id"], payload=running)
+    current = records.get_experiment(owner, admitted["experiment_id"])["admitted_attempts"][0]
+    assert current["operational_state"] == adverse_state
+    assert current["operational_observed_state"] == adverse_state
     with pytest.raises(Conflict, match="Current operation reconciliation"):
         _command(
             execution.reconcile_execution_grant,
@@ -1060,8 +1074,11 @@ def test_v35_receipt_sequence_migration_preserves_existing_receipt_state(tmp_pat
         connection.execute(
             "ALTER TABLE external_operation_receipts DROP COLUMN observation_sequence"
         )
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=34")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT observation_sequence FROM external_operation_receipts WHERE operation_id=?",
@@ -1301,6 +1318,9 @@ def test_v32_resolution_migration_preserves_legacy_outcomes_without_operational_
             "WHERE attempt_id=? AND sequence=2",
             (outcome, admitted["id"]),
         )
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=32")
         before = list(connection.iterdump())
     migrate = MIGRATIONS[32]
@@ -1315,14 +1335,14 @@ def test_v32_resolution_migration_preserves_legacy_outcomes_without_operational_
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.setitem(MIGRATIONS, 32, migrate)
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     migrated = records.get_experiment(owner, experiment["id"])["admitted_attempts"][0]
     assert migrated["outcome"] == outcome
     assert migrated["human_outcome"]["outcome"] == outcome
     assert migrated["operational_state"] == "legacy_unverified"
     assert migrated["operational_observed_state"] == "legacy_unverified"
     assert migrated["operational_termination_confirmed"] is None
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     assert records.get_experiment(owner, experiment["id"])["admitted_attempts"][0] == migrated
     fresh = tmp_path / "fresh"
     initialize_state(fresh)
@@ -1392,9 +1412,12 @@ def test_v33_observation_projection_migration_backfills_only_existing_latest_sam
         connection.execute(
             "ALTER TABLE research_experiment_admitted_attempts DROP COLUMN operational_observed_at"
         )
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=33")
 
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     migrated = ExperimentStore(state).get_experiment(owner, experiment["id"])["admitted_attempts"][
         0
     ]
@@ -1780,8 +1803,11 @@ def test_schema25_adds_empty_chain_tables_without_rewriting_existing_evidence(
             "research_experiments",
         ):
             connection.execute(f"DROP TABLE {table}")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=24")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
@@ -1954,6 +1980,9 @@ def _legacy_experiment_state(
             (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,NULL,?)""",
             (conclusion_id, attempt_id, measurement_id),
         )
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=25")
         if source_version >= 26:
             create_v26_experiment_evidence_retention_schema(connection)
@@ -2013,12 +2042,12 @@ def test_v25_through_v29_experiment_ledgers_upgrade_backup_restore_and_repeat_wi
         tmp_path, source_version
     )
 
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     records = ExperimentStore(state)
     exported = records.export_experiment(owner, experiment_id)
     reopened = ExperimentStore(state).get_experiment(owner, experiment_id)
     assert reopened == exported
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     assert ExperimentStore(state).get_experiment(owner, experiment_id) == exported
 
     fresh = tmp_path / "fresh"
@@ -2100,7 +2129,7 @@ def test_v27_to_v28_experiment_provenance_migration_rolls_back_complete_legacy_l
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
 
 def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path: Path) -> None:
@@ -2325,8 +2354,11 @@ def test_design_revisions_and_conclusions_retain_their_original_context(tmp_path
         )
         connection.execute("DROP TABLE migration_27_conclusion_evidence")
         connection.execute("DROP TABLE migration_27_conclusions")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=26")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     migrated = ExperimentStore(state).get_experiment(owner, first["id"])
     migrated_designs = {item["revision"]: item for item in migrated["designs"]}
     assert migrated_designs[1]["goal"] is None
@@ -2359,7 +2391,7 @@ def test_v30_to_v31_binding_repair_rolls_back_and_preserves_authentic_ledger(
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     monkeypatch.undo()
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
 
 def test_experiment_export_rejects_large_measurement_aggregate_before_materializing(

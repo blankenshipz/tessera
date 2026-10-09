@@ -174,7 +174,12 @@ class WorkerRegistryStore(Store):
         payload: dict[str, Any],
     ) -> tuple[int, dict[str, Any]]:
         payload = self._body(WorkerLifecycle, payload)
-        target = {"drain": "draining", "quarantine": "quarantined", "retire": "retired"}[action]
+        target = {
+            "drain": "draining",
+            "quarantine": "quarantined",
+            "retire": "retired",
+            "retire-stale": "retired",
+        }[action]
         path = f"/workers/{worker_id}/{action}"
 
         def command(
@@ -186,6 +191,17 @@ class WorkerRegistryStore(Store):
                 raise Conflict("Worker lifecycle revision is no longer current.")
             if row["lifecycle_state"] == "retired":
                 raise Conflict("Retired workers cannot change lifecycle state.")
+            if action == "retire-stale":
+                try:
+                    is_stale = _parse_utc(row["last_seen_at"]) < self._now() - HEARTBEAT_MAX_AGE
+                except (TypeError, ValueError) as error:
+                    raise Conflict(
+                        "Worker liveness metadata is invalid; it cannot be retired as stale."
+                    ) from error
+                if not is_stale:
+                    raise Conflict(
+                        "Worker heartbeat is still fresh and cannot be retired as stale."
+                    )
             now = utc_now()
             updated = dict(row)
             updated.update(lifecycle_state=target, revision=row["revision"] + 1)
@@ -201,6 +217,22 @@ class WorkerRegistryStore(Store):
                 WHERE id=:id AND revision=:expected""",
                 updated | {"expected": row["revision"]},
             )
+            if target == "retired":
+                # Retirement revokes the old credential and immediately records
+                # recovery exposure for each already-admitted original operation.
+                # This creates no replacement authority or provider action.
+                from .execution import ExecutionStore
+
+                operations = connection.execute(
+                    """SELECT o.* FROM external_operations o
+                    JOIN execution_grants g ON g.id=o.grant_id
+                    WHERE o.worker_principal_id=? AND o.org_id=? AND o.project_id=?
+                    AND g.status IN ('active','cancel_requested')""",
+                    (row["worker_principal_id"], live["org_id"], row["project_id"]),
+                ).fetchall()
+                execution = ExecutionStore(self.database_path.parent)
+                for operation in operations:
+                    execution._record_identity_loss(connection, live, operation, "worker_retired")
             self._event(
                 connection,
                 live,
@@ -212,6 +244,7 @@ class WorkerRegistryStore(Store):
                     "worker_id": worker_id,
                     "worker_principal_id": row["worker_principal_id"],
                     "credential_revoked": target == "retired",
+                    "retirement_reason": ("stale_heartbeat" if action == "retire-stale" else None),
                     "approved_metadata_only": True,
                 },
             )
@@ -288,9 +321,21 @@ class WorkerRegistryStore(Store):
         except ValueError:
             freshness = "unknown"
 
-        credential_status = "revoked" if row["credential_revoked_at"] is not None else "active"
+        if row["credential_revoked_at"] is not None:
+            credential_status = "revoked"
+        else:
+            try:
+                expires_at = _parse_utc(row["credential_expires_at"])
+            except (TypeError, ValueError):
+                credential_status = "expiry_unknown"
+            else:
+                credential_status = "expired" if expires_at <= cls._now() else "active"
         if credential_status == "revoked":
             admission, fence_reason = "fenced", "credential_revoked"
+        elif credential_status == "expired":
+            admission, fence_reason = "fenced", "credential_expired"
+        elif credential_status == "expiry_unknown":
+            admission, fence_reason = "fenced", "credential_expiry_unknown"
         elif row["lifecycle_state"] == "retired":
             admission, fence_reason = "fenced", "retired"
         elif row["lifecycle_state"] != "ready":
@@ -342,7 +387,8 @@ class WorkerRegistryStore(Store):
             live = self._live_principal(connection, actor)
             self._project(connection, live, project_id)
             rows = connection.execute(
-                """SELECT registry.*, credentials.revoked_at AS credential_revoked_at
+                """SELECT registry.*, credentials.revoked_at AS credential_revoked_at,
+                credentials.expires_at AS credential_expires_at
                 FROM worker_registry AS registry
                 JOIN credentials ON credentials.id = registry.credential_id
                 WHERE registry.org_id=? AND registry.project_id=?

@@ -1,0 +1,6 @@
+{
+  "org_id": "org_local",
+  "project_id": "project_REPLACE",
+  "control_namespace": "tessera-local-control-20260921",
+  "image": "registry.example.invalid/approved-python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

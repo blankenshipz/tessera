@@ -13,6 +13,7 @@ from .experiments_models import (
     ClaimKubernetesDispatch,
     CreateConclusion,
     CreateExperiment,
+    DeriveOutputMeasurement,
     DispatchAdmittedAttempt,
     LinkAttemptArtifacts,
     RecordAttempt,
@@ -103,6 +104,19 @@ def dispatch_admitted_attempt(
     )
 
 
+@router.post("/worker/kubernetes-dispatches/next/claim")
+def claim_next_kubernetes_dispatch(
+    body: ClaimKubernetesDispatch,
+    worker: Annotated[dict[str, Any], Depends(worker_principal)],
+    key: Key,
+    records: Experiments,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.claim_next_kubernetes_dispatch(worker, key, canonical_digest(payload), payload)
+    )
+
+
 @router.post("/worker/kubernetes-dispatches/{dispatch_id}/claim")
 def claim_kubernetes_dispatch(
     dispatch_id: str,
@@ -146,6 +160,18 @@ def measurement(
     payload = body.model_dump(mode="json")
     return response(
         records.record_measurement(actor, attempt_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/experiment-attempts/{attempt_id}/derived-measurements")
+def derived_measurement(
+    attempt_id: str, body: DeriveOutputMeasurement, actor: Actor, key: Key, records: Experiments
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.derive_output_measurement(
+            actor, attempt_id, key, canonical_digest(payload), payload
+        )
     )
 
 

@@ -8,6 +8,8 @@ import os
 import sqlite3
 import stat
 import sys
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import uvicorn
@@ -65,12 +67,107 @@ def _add_astra_setup_command(subcommands: argparse._SubParsersAction) -> None:
     export.add_argument("--output", required=True, type=Path)
 
 
+def _add_astra_installation_command(subcommands: argparse._SubParsersAction) -> None:
+    """Register a pure, offline Astra installation plan renderer."""
+    command = subcommands.add_parser(
+        "astra-installation", help="render an offline, non-applying Astra installation plan"
+    )
+    actions = command.add_subparsers(dest="astra_installation_action", required=True)
+    plan = actions.add_parser("plan", help="render a deterministic offline plan")
+    plan.add_argument("--mode", required=True, choices=["create", "observe", "adopt", "adapt"])
+    plan.add_argument("--installation-name", required=True)
+    plan.add_argument("--profile", required=True)
+    plan.add_argument("--kubeconfig-reference-sha256", required=True)
+    plan.add_argument("--context", required=True)
+    plan.add_argument("--server", required=True)
+    plan.add_argument("--ca-sha256", required=True)
+    plan.add_argument("--cluster-uid", required=True)
+    plan.add_argument("--namespace", required=True)
+    plan.add_argument("--namespace-uid", required=True)
+    plan.add_argument("--desired-spec-sha256")
+    plan.add_argument("--approval-expires-at", required=True)
+    plan.add_argument(
+        "--credential-reference",
+        action="append",
+        default=[],
+        metavar="KIND:REFERENCE",
+        help="sanitized credential-lease or external-reference handle; never a value",
+    )
+    plan.add_argument(
+        "--inspection-snapshot",
+        type=Path,
+        help="bounded offline-unverified inspection JSON; never queried or treated as live",
+    )
+    plan.add_argument("--observed-uid")
+    plan.add_argument("--observed-spec-sha256")
+    plan.add_argument("--observed-at")
+    inspect = actions.add_parser("inspect-live", help="run bounded read-only live inspection")
+    inspect.add_argument("--kubeconfig", required=True, type=Path)
+    inspect.add_argument("--context", required=True)
+    inspect.add_argument("--installation-name", required=True)
+    inspect.add_argument("--profile", required=True)
+    inspect.add_argument("--namespace", required=True)
+    inspect.add_argument("--installation-resource", required=True)
+    inspect.add_argument("--resource", action="append", default=[])
+    revalidate = actions.add_parser(
+        "revalidate-live", help="re-read and fence a plan; never applies or enables mutation"
+    )
+    revalidate.add_argument("--plan", required=True, type=Path)
+    revalidate.add_argument("--kubeconfig", required=True, type=Path)
+    revalidate.add_argument("--context", required=True)
+    revalidate.add_argument("--installation-resource", required=True)
+    revalidate.add_argument("--resource", action="append", default=[])
+
+
+def _add_astra_namespace_command(subcommands: argparse._SubParsersAction) -> None:
+    """Namespace-only operator path; it never installs a control plane."""
+    command = subcommands.add_parser(
+        "astra-namespace",
+        help="inspect/use or explicitly create one dedicated Namespace; never install Astra",
+        description="Namespace-only operator path; never install Astra or a control plane here.",
+    )
+    actions = command.add_subparsers(dest="astra_namespace_action", required=True)
+    inspect = actions.add_parser("inspect-existing", help="read one existing namespace; no writes")
+    inspect.add_argument("--kubeconfig", required=True, type=Path)
+    inspect.add_argument("--context", required=True)
+    inspect.add_argument("--namespace", required=True)
+    for name in ("plan-use-existing", "plan-create"):
+        action = actions.add_parser(name)
+        action.add_argument("--kubeconfig", required=True, type=Path)
+        action.add_argument("--context", required=True)
+        action.add_argument("--namespace", required=True)
+        action.add_argument("--approval-expires-at", required=True)
+        if name == "plan-create":
+            action.add_argument("--installation", required=True)
+            action.add_argument("--operation", required=True)
+    for name in ("create", "status", "reconcile"):
+        action = actions.add_parser(name)
+        action.add_argument("--plan", required=True, type=Path)
+        action.add_argument("--kubeconfig", required=True, type=Path)
+        action.add_argument("--context", required=True)
+        action.add_argument("--receipt", type=Path)
+        if name == "create":
+            action.add_argument(
+                "--approved-plan", required=True, help="exact human-approved plan digest"
+            )
+            action.add_argument(
+                "--receipt-output",
+                type=Path,
+                help="new private file for the UID/resourceVersion creation receipt",
+            )
+
+
 def parser() -> argparse.ArgumentParser:
+    from .connection_tunnel import add_connection_tunnel_command
+
     command = argparse.ArgumentParser(prog="tessera")
     subcommands = command.add_subparsers(dest="command", required=True)
+    add_connection_tunnel_command(subcommands)
     add_workspace_commands(subcommands)
     _add_minikube_provisioning_command(subcommands)
     _add_astra_setup_command(subcommands)
+    _add_astra_installation_command(subcommands)
+    _add_astra_namespace_command(subcommands)
     initialize = subcommands.add_parser("init")
     initialize.add_argument("--state-dir", required=True, type=Path)
     migrate = subcommands.add_parser("migrate")
@@ -87,6 +184,8 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--bind-host", default="127.0.0.1")
     serve.add_argument("--trusted-host", action="append")
     serve.add_argument("--public-origin")
+    serve.add_argument("--runtime-owner-config", type=Path)
+    serve.add_argument("--runtime-owner-sha256")
     return command
 
 
@@ -224,9 +323,10 @@ def _run_astra_setup(arguments: argparse.Namespace) -> int:
             print(json.dumps(result, sort_keys=True))
             return 0
         if arguments.astra_setup_action == "status":
-            result = operator.status(plan)
+            journal = SetupJournal(arguments.journal) if arguments.journal is not None else None
+            result = operator.status(plan, journal)
             if arguments.journal is not None:
-                SetupJournal(arguments.journal).record({"event": "status", **result})
+                journal.record({"event": "status", **result})
             print(json.dumps(result, sort_keys=True))
             return 0
         if arguments.astra_setup_action == "attach":
@@ -282,12 +382,216 @@ def _run_astra_setup(arguments: argparse.Namespace) -> int:
         return 1
 
 
+def _credential_reference(value: str):
+    from tessera_provisioner.astra_installation import AstraInstallationError, CredentialReference
+
+    kind, separator, reference = value.partition(":")
+    if not separator or ":" in reference:
+        raise AstraInstallationError("credential references must use KIND:REFERENCE.")
+    return CredentialReference(kind, reference)  # type: ignore[arg-type]
+
+
+def _run_astra_installation(arguments: argparse.Namespace) -> int:
+    """Render only caller-supplied offline facts; no host or Kubernetes access occurs."""
+    from tessera_provisioner.astra_installation import (
+        AstraInstallationError,
+        InstallationIdentity,
+        InstallationInspection,
+        InstallationPlan,
+        ObservedInstallation,
+        TargetIdentity,
+        inspection_from_json,
+        plan_json,
+    )
+
+    try:
+        if arguments.astra_installation_action in {"inspect-live", "revalidate-live"}:
+            from datetime import UTC, datetime
+
+            from tessera_provisioner.astra_live_inspection import (
+                LiveAstraInspector,
+                revalidate_plan,
+            )
+
+            if arguments.astra_installation_action == "revalidate-live":
+                from tessera_provisioner.astra_installation import plan_from_json
+
+                plan = plan_from_json(arguments.plan)
+                identity, namespace = plan.inspection.installation, plan.inspection.target.namespace
+            else:
+                identity = InstallationIdentity(arguments.installation_name, arguments.profile)
+                namespace = arguments.namespace
+                plan = None
+            evidence = LiveAstraInspector(arguments.kubeconfig, arguments.context).inspect(
+                identity, namespace, arguments.installation_resource, arguments.resource
+            )
+            if plan is not None:
+                revalidate_plan(plan, evidence, datetime.now(UTC))
+                evidence = {
+                    **evidence,
+                    "plan_digest": plan.digest,
+                    "state": "live_inspection_revalidated_not_apply_ready",
+                }
+            print(json.dumps(evidence, sort_keys=True, separators=(",", ":")))
+            return 0
+        identity = InstallationIdentity(arguments.installation_name, arguments.profile)
+        target = TargetIdentity(
+            kubeconfig_reference_sha256=arguments.kubeconfig_reference_sha256,
+            context=arguments.context,
+            server=arguments.server,
+            ca_sha256=arguments.ca_sha256,
+            cluster_uid=arguments.cluster_uid,
+            namespace=arguments.namespace,
+            namespace_uid=arguments.namespace_uid,
+        )
+        observation_inputs = (
+            arguments.observed_uid,
+            arguments.observed_spec_sha256,
+            arguments.observed_at,
+        )
+        if arguments.inspection_snapshot is not None:
+            if any(value is not None for value in observation_inputs):
+                raise AstraInstallationError(
+                    "an offline inspection snapshot cannot be merged with observed inputs."
+                )
+            inspection = inspection_from_json(arguments.inspection_snapshot)
+            if inspection.installation != identity or inspection.target != target:
+                raise AstraInstallationError(
+                    "offline inspection snapshot target or installation identity does not match "
+                    "explicit inputs."
+                )
+            inspection = replace(inspection, source="offline-snapshot")
+        else:
+            if any(value is not None for value in observation_inputs) and not all(
+                value is not None for value in observation_inputs
+            ):
+                raise AstraInstallationError(
+                    "observed UID, spec digest, and timestamp must be supplied together."
+                )
+            observation = (
+                ObservedInstallation(
+                    identity,
+                    target,
+                    arguments.observed_uid,
+                    arguments.observed_spec_sha256,
+                    arguments.observed_at,
+                )
+                if all(value is not None for value in observation_inputs)
+                else None
+            )
+            inspection = InstallationInspection(identity, target, observation)
+        references = tuple(_credential_reference(value) for value in arguments.credential_reference)
+        plan = InstallationPlan.create(
+            mode=arguments.mode,
+            inspection=inspection,
+            desired_spec_sha256=arguments.desired_spec_sha256,
+            credential_references=references,
+            approval_expires_at=arguments.approval_expires_at,
+        )
+        print(plan_json(plan))
+        return 0
+    except (AstraInstallationError, OSError, ValueError, RuntimeError) as error:
+        print(
+            json.dumps(
+                {
+                    "state": "failed",
+                    "message": str(error),
+                    "verification": (
+                        "live_inspection_not_apply_readiness"
+                        if arguments.astra_installation_action
+                        in {"inspect-live", "revalidate-live"}
+                        else "offline_unverified"
+                    ),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _run_astra_namespace(arguments: argparse.Namespace) -> int:
+    """Run the small explicit Namespace lifecycle without any installer behavior."""
+    from datetime import UTC, datetime
+
+    from tessera_provisioner.astra_live_inspection import LiveInspectionError
+    from tessera_provisioner.astra_namespace import (
+        NamespaceLifecycleError,
+        NamespaceOperator,
+        NamespacePlan,
+        plan_from_json,
+        receipt_from_json,
+    )
+
+    try:
+        if arguments.astra_namespace_action in {
+            "inspect-existing",
+            "plan-use-existing",
+            "plan-create",
+        }:
+            operator = NamespaceOperator(arguments.kubeconfig, arguments.context)
+            inspection = operator.inspect(arguments.namespace)
+            if arguments.astra_namespace_action == "inspect-existing":
+                print(json.dumps(inspection.payload(), sort_keys=True, separators=(",", ":")))
+                return 0
+            mode = (
+                "use-existing"
+                if arguments.astra_namespace_action == "plan-use-existing"
+                else "create-dedicated"
+            )
+            plan = NamespacePlan.create(
+                mode=mode,
+                inspection=inspection,
+                approval_expires_at=arguments.approval_expires_at,
+                installation=getattr(arguments, "installation", None),
+                operation=getattr(arguments, "operation", None),
+            )
+            print(
+                json.dumps(
+                    {**plan.payload(), "digest": plan.digest}, sort_keys=True, separators=(",", ":")
+                )
+            )
+            return 0
+        plan = plan_from_json(arguments.plan)
+        operator = NamespaceOperator(arguments.kubeconfig, arguments.context)
+        receipt = receipt_from_json(arguments.receipt) if arguments.receipt is not None else None
+        if arguments.astra_namespace_action == "create":
+            result = operator.create(plan, arguments.approved_plan, datetime.now(UTC))
+            payload = result.payload() if hasattr(result, "payload") else result
+            if arguments.receipt_output is not None:
+                if not hasattr(result, "payload"):
+                    raise NamespaceLifecycleError(
+                        "no receipt can be recorded until reconciliation resolves "
+                        "the create response"
+                    )
+                _write_operator_json(arguments.receipt_output, payload)
+        else:
+            # Reconcile is intentionally status-only.  It never retries a lost create
+            # response or adopts a same-named object without the original receipt.
+            payload = operator.status(plan, receipt)
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return 0
+    except (NamespaceLifecycleError, LiveInspectionError, OSError, ValueError) as error:
+        print(
+            json.dumps({"state": "failed", "message": str(error)}, sort_keys=True), file=sys.stderr
+        )
+        return 1
+
+
 def main() -> int:
     arguments = parser().parse_args()
+    if arguments.command == "connection-tunnel":
+        from .connection_tunnel import run_connection_tunnel
+
+        return run_connection_tunnel(arguments)
     if arguments.command == "minikube-provision":
         return _run_minikube_provisioning(arguments)
     if arguments.command == "astra-setup":
         return _run_astra_setup(arguments)
+    if arguments.command == "astra-installation":
+        return _run_astra_installation(arguments)
+    if arguments.command == "astra-namespace":
+        return _run_astra_namespace(arguments)
     if arguments.command == "workspace":
         try:
             return run_workspace(arguments)
@@ -319,17 +623,74 @@ def main() -> int:
         print(header_path)
         return 0
     if arguments.command == "serve":
+        owner = None
         try:
             deployment = serving_config(
                 arguments.bind_host, arguments.trusted_host, arguments.public_origin
             )
+            if arguments.runtime_owner_config is not None or arguments.runtime_owner_sha256:
+                from .runtime_composition import load_runtime_owner
+
+                owner = load_runtime_owner(
+                    arguments.runtime_owner_config,
+                    arguments.runtime_owner_sha256,
+                    state_dir=arguments.state_dir,
+                )
+                adapter = owner.control_adapter()
+            else:
+                adapter = None
         except ValueError as error:
             print(f"serve configuration error: {error}", file=sys.stderr)
             return 2
-        uvicorn.run(
-            create_app(arguments.state_dir, deployment),
-            host=arguments.bind_host,
-            port=arguments.port,
-        )
-        return 0
+        except Exception:
+            if owner is not None:
+                try:
+                    owner.close()
+                except Exception:
+                    pass
+            print("serve runtime owner configuration blocked", file=sys.stderr)
+            return 78
+        cleanup_failed = False
+
+        def close_owner():
+            nonlocal cleanup_failed
+            if owner is not None:
+                try:
+                    owner.close()
+                except Exception:
+                    cleanup_failed = True
+                    print("serve runtime owner shutdown blocked", file=sys.stderr)
+            return not cleanup_failed
+
+        try:
+            app = create_app(arguments.state_dir, deployment, runtime_binding_adapter=adapter)
+            if owner is not None:
+                previous_lifespan = app.router.lifespan_context
+
+                @asynccontextmanager
+                async def owner_lifespan(application):
+                    # Uvicorn re-raises SIGTERM before run() returns: release the
+                    # owner during ASGI shutdown, retaining the app's lifespan.
+                    primary_failed = False
+                    try:
+                        async with previous_lifespan(application) as state:
+                            yield state
+                    except BaseException:
+                        primary_failed = True
+                        raise
+                    finally:
+                        if not close_owner() and not primary_failed:
+                            raise RuntimeError("runtime owner shutdown failed") from None
+
+                app.router.lifespan_context = owner_lifespan
+            uvicorn.run(
+                app,
+                host=arguments.bind_host,
+                port=arguments.port,
+            )
+        finally:
+            # Also cover app construction, startup/bind failures and runners that
+            # never entered lifespan. RuntimeOwnerComposition.close is one-shot.
+            close_owner()
+        return 78 if cleanup_failed else 0
     raise AssertionError("unreachable")

@@ -1,4 +1,5 @@
 """Deterministic contracts for Astra's retained Docker Desktop setup boundary."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -66,6 +67,7 @@ class FakeKubectl:
                 "Namespace": "namespace",
                 "NetworkPolicy": "networkpolicy",
                 "PersistentVolumeClaim": "pvc",
+                "ResourceQuota": "resourcequota",
             }[kind]
             metadata = manifest["metadata"]
             namespace = metadata.get("namespace")
@@ -75,6 +77,7 @@ class FakeKubectl:
                     "name": metadata["name"],
                     "namespace": namespace,
                     "uid": f"{singular}-uid",
+                    "labels": metadata.get("labels", {}),
                 },
             }
             if "spec" in manifest:
@@ -121,14 +124,38 @@ def test_apply_records_created_and_replays_preexisting_resources(tmp_path: Path)
     replay = operator.status(plan, journal)
 
     assert first["state"] == "ready"
-    assert [resource["created"] for resource in first["resources"]] == [True, True, True]
+    assert [resource["created"] for resource in first["resources"]] == [True, True, True, True]
     assert replay["state"] == "ready"
     assert "not_proven" in str(replay["network_enforcement"])
-    assert "not_proven" in str(replay["storage_enforcement"])
+    assert replay["storage_enforcement"] == "admission_enforced_claim_count_and_request_only"
+    assert first["output_storage_contract"]["runtime_byte_bound"] == "unknown"
+    assert first["output_storage_contract"]["runtime_inode_bound"] == "unknown"
+    assert first["provider_billing_state"] == "operator_attested_unknown"
+    assert first["cost_semantics"] == "internal_grants_are_not_provider_billing_caps"
     assert not any(
         any(word in call for word in ("apply", "delete", "helm", "ssh")) for call in runner.calls
     )
-    assert len((tmp_path / "setup.journal").read_text().splitlines()) == 5
+    assert len((tmp_path / "setup.journal").read_text().splitlines()) == 6
+
+
+def test_output_pvc_is_dedicated_and_admission_bound_but_not_a_runtime_quota(
+    tmp_path: Path,
+) -> None:
+    operator, profile, _runner = _operator(tmp_path)
+    plan = SetupPlan.create(profile, operator.discover(profile))
+    manifests = operator._manifests(profile)
+    pvc = next(
+        manifest
+        for kind, _name, _namespace, manifest in manifests
+        if kind == "PersistentVolumeClaim"
+    )
+    quota = next(
+        manifest for kind, _name, _namespace, manifest in manifests if kind == "ResourceQuota"
+    )
+
+    assert pvc["metadata"]["labels"]["tessera.io/output-role"] == "dedicated-pilot-output"
+    assert quota["spec"]["hard"] == {"persistentvolumeclaims": "1", "requests.storage": "64Mi"}
+    assert plan.profile.pvc_storage == "64Mi"
 
 
 def test_bound_pvc_server_volume_name_and_defaults_do_not_conflict(tmp_path: Path) -> None:
@@ -160,7 +187,12 @@ def test_pvc_approved_storage_conflict_requires_reconciliation(tmp_path: Path) -
     status = operator.status(plan, journal)
 
     assert status["state"] == "reconciliation_required"
-    assert status["resources"][-1]["matches_plan"] is False
+    assert (
+        next(item for item in status["resources"] if item["kind"] == "PersistentVolumeClaim")[
+            "matches_plan"
+        ]
+        is False
+    )
 
 
 def test_status_distinguishes_same_named_replacement_from_custody(tmp_path: Path) -> None:
@@ -219,6 +251,7 @@ def test_plan_round_trip_rejects_tampering_and_invalid_image(tmp_path: Path) -> 
 def test_journal_requires_private_parent(tmp_path: Path) -> None:
     unsafe = tmp_path / "unsafe"
     unsafe.mkdir(mode=0o755)
+    unsafe.chmod(0o755)  # A restrictive process umask can otherwise make this private.
 
     with pytest.raises(AstraSetupError, match="private directory"):
         SetupJournal(unsafe / "journal")
@@ -238,4 +271,4 @@ def test_profiles_cli_is_read_only_and_requires_no_kubernetes(monkeypatch, capsy
 
     assert cli._run_astra_setup(arguments) == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["profiles"][0]["version"] == "astra-operator-setup-v2"
+    assert result["profiles"][0]["version"] == "astra-operator-setup-v3"

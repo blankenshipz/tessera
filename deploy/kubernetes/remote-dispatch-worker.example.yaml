@@ -1,0 +1,214 @@
+# Opt-in: replace image, Kubernetes API CIDR, TLS gateway and mount only an
+# operator-issued target binding with real network probe evidence. Do not apply
+# unchanged. Worker token is distinct from the coordinator's agent credential.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tessera-dispatch
+  namespace: tessera-lab
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tessera-dispatch-namespace-read
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    resourceNames: [kube-system, tessera-workloads]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tessera-dispatch-namespace-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tessera-dispatch-namespace-read
+subjects:
+  - kind: ServiceAccount
+    name: tessera-dispatch
+    namespace: tessera-lab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tessera-dispatch-workload
+  namespace: tessera-workloads
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    resourceNames: [outputs]
+    verbs: [get]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    resourceNames: [default-deny]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tessera-dispatch-workload
+  namespace: tessera-workloads
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tessera-dispatch-workload
+subjects:
+  - kind: ServiceAccount
+    name: tessera-dispatch
+    namespace: tessera-lab
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tessera-dispatch-worker
+  namespace: tessera-lab
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tessera-dispatch-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tessera-dispatch-worker
+        tessera.io/tls-control-client: "true"
+    spec:
+      serviceAccountName: tessera-dispatch
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: copy-worker-credential
+          image: registry.example.invalid/tessera-control:replace-me
+          command: ["/bin/sh", "-ec"]
+          args: ["umask 077; mkdir -p /worker/private; chmod 700 /worker/private; cp /run/secrets/tessera/worker-token /worker/private/worker-token; chmod 600 /worker/private/worker-token"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: worker-secret
+              mountPath: /run/secrets/tessera
+              readOnly: true
+            - name: worker-state
+              mountPath: /worker
+      containers:
+        - name: dispatch
+          image: registry.example.invalid/tessera-control:replace-me
+          command: ["python", "-m", "tessera_worker.kubernetes_remote_service"]
+          args:
+            - --control-url
+            - https://tessera-control-tls.tessera-lab.svc.cluster.local
+            - --target-file
+            - /run/secrets/tessera/target.json
+            - --ca-file
+            - /run/secrets/kubernetes/ca.crt
+            - --kubernetes-token-file
+            - /run/secrets/kubernetes/token
+            - --credential-file
+            - /worker/private/worker-token
+            - --control-ca-file
+            - /run/secrets/tessera/control-ca.crt
+            - --workspace
+            - /worker/private
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: worker-secret
+              mountPath: /run/secrets/tessera
+              readOnly: true
+            - name: kubernetes-identity
+              mountPath: /run/secrets/kubernetes
+              readOnly: true
+            - name: worker-state
+              mountPath: /worker
+      volumes:
+        - name: worker-state
+          persistentVolumeClaim:
+            claimName: tessera-dispatch-journal
+        - name: worker-secret
+          secret:
+            secretName: tessera-existing-dispatch-binding
+            defaultMode: 288
+            items:
+              - key: worker-token
+                path: worker-token
+              - key: target.json
+                path: target.json
+              - key: kubeconfig
+                path: kubeconfig
+              - key: ca.crt
+                path: ca.crt
+              - key: control-ca.crt
+                path: control-ca.crt
+        - name: kubernetes-identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tessera-dispatch-journal
+  namespace: tessera-lab
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# API server CIDR must be narrowed to the observed server, not a broad default.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dispatch-api-egress
+  namespace: tessera-lab
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tessera-dispatch-worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.1/32 # REPLACE with observed Kubernetes API server IP
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tessera-control-tls
+      ports:
+        - protocol: TCP
+          port: 443

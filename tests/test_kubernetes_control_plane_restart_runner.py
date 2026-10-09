@@ -31,7 +31,7 @@ def test_fixture_manifest_has_separate_kubernetes_documents(monkeypatch) -> None
     spec.loader.exec_module(module)
     manifest = module._manifest("tessera-control-e2e-fixture", "fixture", "fixture:image")
     documents = list(yaml.safe_load_all(manifest))
-    assert len(documents) == 8
+    assert len(documents) == 9
     assert {document["kind"] for document in documents} == {
         "Namespace",
         "ConfigMap",
@@ -59,6 +59,7 @@ def test_fixture_manifest_has_separate_kubernetes_documents(monkeypatch) -> None
         "default-deny",
         "allow-labelled-control-clients",
         "allow-labelled-control-client-egress",
+        "allow-tls-control-client-dns",
     }
 
 

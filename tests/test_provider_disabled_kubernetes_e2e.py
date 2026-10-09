@@ -7,19 +7,21 @@ claims an OpenCode/provider/model execution or scientific outcome.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from test_kubernetes_execution import _cluster, _FakeKubernetes
 from test_opencode_live_adapter import fixture as opencode_fixture
 
 from tessera_control.api import create_app
 from tessera_control.snapshots import SnapshotStore
-from tessera_control.store import Store, initialize_state
+from tessera_control.store import Store, initialize_state, utc_now
 from tessera_control.workspace import capture_workspace, inventory_digest
 from tessera_worker.control_channel import ControlChannelError
 from tessera_worker.kubernetes_contracts import cluster_identity_digest
@@ -83,8 +85,27 @@ def _instance_pin() -> OpenCodeHarnessInstancePin:
     )
 
 
+@pytest.mark.parametrize(
+    "no_start_case",
+    [
+        "ordinary",
+        "undispatched",
+        "outbox_race",
+        "claimed_race",
+        "no_package",
+        "no_package_cancelled",
+        "no_package_live",
+        "no_package_epoch",
+        "no_package_revision",
+        "no_package_worker",
+        "no_package_tenant",
+        "no_package_observation",
+        "no_package_race",
+    ],
+)
 def test_provider_disabled_fake_agent_delivery_and_kubernetes_dispatch_recover_end_to_end(
     tmp_path: Path,
+    no_start_case: str,
 ) -> None:
     state, source = tmp_path / "state", tmp_path / "source"
     source.mkdir()
@@ -279,6 +300,230 @@ def test_provider_disabled_fake_agent_delivery_and_kubernetes_dispatch_recover_e
         )
         call("POST", "/worker/heartbeat", {}, 200, worker=True)
         lease = call("POST", "/worker/leases", {"grant_id": grant["id"]}, 201, worker=True)
+        if no_start_case.startswith("no_package"):
+            path = f"/execution-grants/{grant['id']}/reconcile-expired-undispatched"
+            if no_start_case == "no_package_cancelled":
+                grant = call(
+                    "POST",
+                    f"/execution-grants/{grant['id']}/revoke",
+                    {"expected_revision": grant["revision"]},
+                    200,
+                )
+            with sqlite3.connect(state / "tessera.sqlite3") as db:
+                held_before = db.execute(
+                    "SELECT held_cents FROM execution_project_limits WHERE project_id=?",
+                    (grant["project_id"],),
+                ).fetchone()[0]
+                if no_start_case not in {"no_package_live", "no_package_cancelled"}:
+                    db.execute(
+                        "UPDATE execution_leases SET expires_at=? WHERE id=?",
+                        ((datetime.now(UTC) - timedelta(seconds=2)).isoformat(), lease["id"]),
+                    )
+                if no_start_case == "no_package_epoch":
+                    db.execute(
+                        "UPDATE execution_task_epochs SET epoch=epoch+1 WHERE task_id=?",
+                        (grant["task_id"],),
+                    )
+                if no_start_case == "no_package_tenant":
+                    db.execute(
+                        "INSERT INTO organizations(id,name,created_at) VALUES ('other','other',?)",
+                        (utc_now(),),
+                    )
+                    db.execute(
+                        "UPDATE projects SET org_id='other' WHERE id=?", (grant["project_id"],)
+                    )
+                if no_start_case == "no_package_observation":
+                    db.execute(
+                        "INSERT INTO execution_observations "
+                        "(id,grant_id,lease_id,worker_principal_id,"
+                        "epoch,desired_state,observed_state,observed_at,provider_id,termination_confirmed,"
+                        "recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            "uncertain",
+                            grant["id"],
+                            lease["id"],
+                            lease["worker_principal_id"],
+                            lease["epoch"],
+                            "admitted",
+                            "unknown",
+                            utc_now(),
+                            None,
+                            0,
+                            utc_now(),
+                        ),
+                    )
+            rejected = no_start_case in {
+                "no_package_live",
+                "no_package_epoch",
+                "no_package_revision",
+                "no_package_worker",
+                "no_package_tenant",
+                "no_package_observation",
+            }
+            body = {
+                "expected_revision": grant["revision"] + int(no_start_case == "no_package_revision")
+            }
+            if no_start_case == "no_package_race":
+                from concurrent.futures import ThreadPoolExecutor
+
+                requests = [
+                    (path, body, owner_headers, "race-recover-one"),
+                    (path, body, owner_headers, "race-recover-two"),
+                    (
+                        f"/worker/leases/{lease['id']}/package",
+                        {
+                            "expected_epoch": lease["epoch"],
+                            "execution_adapter": "kubernetes-job",
+                            "admitted_attempt_id": admitted["id"],
+                        },
+                        worker_headers,
+                        "race-package",
+                    ),
+                    (
+                        f"/experiment-admitted-attempts/{admitted['id']}/dispatch",
+                        {
+                            "expected_revision": admitted["revision"],
+                            "target_digest": cluster_identity_digest(_cluster()),
+                            "profile_version": _cluster().profile,
+                        },
+                        owner_headers,
+                        "race-dispatch",
+                    ),
+                ]
+
+                def send(request):
+                    route, payload, auth, key = request
+                    return client.post(route, json=payload, headers=auth | {"Idempotency-Key": key})
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    responses = list(pool.map(send, requests))
+                assert sorted(r.status_code for r in responses[:2]) == [200, 409]
+                assert [r.status_code for r in responses[2:]] == [409, 409]
+                winner = next(i for i, r in enumerate(responses[:2]) if r.status_code == 200)
+                again = send(requests[winner])
+                assert again.status_code == 200 and again.json() == responses[winner].json()
+                with sqlite3.connect(state / "tessera.sqlite3") as db:
+                    assert (
+                        db.execute(
+                            "SELECT held_cents FROM execution_project_limits WHERE project_id=?",
+                            (grant["project_id"],),
+                        ).fetchone()[0]
+                        == held_before - grant["max_exposure_cents"]
+                    )
+                    assert (
+                        db.execute(
+                            "SELECT count(*) FROM external_operations WHERE grant_id=?",
+                            (grant["id"],),
+                        ).fetchone()[0]
+                        == 0
+                    )
+                    assert (
+                        db.execute(
+                            "SELECT count(*) FROM kubernetes_dispatches WHERE grant_id=?",
+                            (grant["id"],),
+                        ).fetchone()[0]
+                        == 0
+                    )
+                return
+            response = client.post(
+                path,
+                json=body,
+                headers=(worker_headers if no_start_case == "no_package_worker" else owner_headers)
+                | {"Idempotency-Key": "no-package-reconcile"},
+            )
+            assert response.status_code == (
+                401
+                if no_start_case == "no_package_worker"
+                else 404
+                if no_start_case == "no_package_tenant"
+                else 409
+                if rejected
+                else 200
+            ), response.text
+            if rejected:
+                with sqlite3.connect(state / "tessera.sqlite3") as db:
+                    assert (
+                        db.execute(
+                            "SELECT held_cents FROM execution_project_limits WHERE project_id=?",
+                            (grant["project_id"],),
+                        ).fetchone()[0]
+                        == held_before
+                    )
+                return
+            replay = client.post(
+                path, json=body, headers=owner_headers | {"Idempotency-Key": "no-package-reconcile"}
+            )
+            assert replay.status_code == 200 and replay.json() == response.json()
+            call("POST", path, body, 409)
+            call(
+                "POST",
+                f"/experiment-variants/{baseline['id']}/admitted-attempts",
+                {
+                    "expected_variant_revision": baseline["revision"],
+                    "expected_design_revision": experiment["current_design_revision"],
+                    "grant_id": grant["id"],
+                },
+                409,
+            )
+            call(
+                "POST",
+                f"/worker/leases/{lease['id']}/package",
+                {
+                    "expected_epoch": lease["epoch"],
+                    "execution_adapter": "kubernetes-job",
+                    "admitted_attempt_id": admitted["id"],
+                },
+                409,
+                worker=True,
+            )
+            call(
+                "POST",
+                f"/experiment-admitted-attempts/{admitted['id']}/dispatch",
+                {
+                    "expected_revision": admitted["revision"],
+                    "target_digest": cluster_identity_digest(_cluster()),
+                    "profile_version": _cluster().profile,
+                },
+                409,
+            )
+            with sqlite3.connect(state / "tessera.sqlite3") as db:
+                assert (
+                    db.execute(
+                        "SELECT held_cents FROM execution_project_limits WHERE project_id=?",
+                        (grant["project_id"],),
+                    ).fetchone()[0]
+                    == held_before - grant["max_exposure_cents"]
+                )
+                assert (
+                    db.execute(
+                        "SELECT count(*) FROM external_operations WHERE grant_id=?", (grant["id"],)
+                    ).fetchone()[0]
+                    == 0
+                )
+                assert (
+                    db.execute(
+                        "SELECT count(*) FROM kubernetes_dispatches WHERE grant_id=?",
+                        (grant["id"],),
+                    ).fetchone()[0]
+                    == 0
+                )
+                attempt = db.execute(
+                    "SELECT state,outcome,operation_id,package_digest "
+                    "FROM research_experiment_admitted_attempts WHERE id=?",
+                    (admitted["id"],),
+                ).fetchone()
+                assert attempt == ("interrupted", None, None, None)
+                proof = json.loads(
+                    db.execute(
+                        "SELECT payload_json FROM events WHERE "
+                        "event_type='execution.expired_undispatched_grant_reconciled'"
+                    ).fetchone()[0]
+                )
+                assert (
+                    proof["outcome"] == "not_executed"
+                    and proof["provider_termination_inferred"] is False
+                )
+            return
         package = call(
             "POST",
             f"/worker/leases/{lease['id']}/package",
@@ -295,6 +540,92 @@ def test_provider_disabled_fake_agent_delivery_and_kubernetes_dispatch_recover_e
         admitted = next(
             item for item in exported["admitted_attempts"] if item["id"] == admitted["id"]
         )
+
+        if no_start_case != "ordinary":
+            if no_start_case in {"outbox_race", "claimed_race"}:
+                cluster = _cluster()
+                call(
+                    "POST",
+                    f"/experiment-admitted-attempts/{admitted['id']}/dispatch",
+                    {
+                        "expected_revision": admitted["revision"],
+                        "target_digest": cluster_identity_digest(cluster),
+                        "profile_version": cluster.profile,
+                    },
+                    201,
+                )
+                if no_start_case == "claimed_race":
+                    claimed = call(
+                        "POST",
+                        "/worker/kubernetes-dispatches/next/claim",
+                        {
+                            "target_digest": cluster_identity_digest(cluster),
+                            "profile_version": cluster.profile,
+                        },
+                        200,
+                        worker=True,
+                    )
+                    assert claimed["dispatch"]["state"] == "claimed"
+            # The fixture alone advances time in storage; the API has no expiry
+            # bypass, and the real endpoint must reject any queued outbox.
+            with sqlite3.connect(state / "tessera.sqlite3") as db:
+                past = (datetime.now(UTC) - timedelta(seconds=2)).isoformat()
+                db.execute(
+                    "UPDATE execution_grants SET expires_at=? WHERE id=?", (past, grant["id"])
+                )
+                db.execute(
+                    "UPDATE execution_leases SET expires_at=? WHERE id=?", (past, lease["id"])
+                )
+            path = f"/execution-grants/{grant['id']}/reconcile-expired-undispatched"
+            key = "same-undispatched-intent"
+            first = client.post(
+                path,
+                json={"expected_revision": grant["revision"]},
+                headers=owner_headers | {"Idempotency-Key": key},
+            )
+            if no_start_case in {"outbox_race", "claimed_race"}:
+                assert first.status_code == 409
+                assert (
+                    client.get(
+                        f"/execution-grants/{grant['id']}",
+                        headers=owner_headers,
+                    ).json()["status"]
+                    == "active"
+                )
+            else:
+                assert first.status_code == 200, first.text
+                assert first.json()["status"] == "reconciled"
+                replay = client.post(
+                    path,
+                    json={"expected_revision": grant["revision"]},
+                    headers=owner_headers | {"Idempotency-Key": key},
+                )
+                assert replay.status_code == 200 and replay.json() == first.json()
+                with sqlite3.connect(state / "tessera.sqlite3") as db:
+                    event = db.execute(
+                        "SELECT payload_json FROM events WHERE "
+                        "event_type='execution.expired_undispatched_grant_reconciled'"
+                    ).fetchone()
+                    assert event is not None
+                    assert json.loads(event[0])["provider_termination_inferred"] is False
+                    assert (
+                        db.execute(
+                            "SELECT count(*) FROM kubernetes_dispatches WHERE operation_id=?",
+                            (package["package"]["operation_id"],),
+                        ).fetchone()[0]
+                        == 0
+                    )
+                rejected = client.post(
+                    f"/experiment-admitted-attempts/{admitted['id']}/dispatch",
+                    json={
+                        "expected_revision": admitted["revision"],
+                        "target_digest": cluster_identity_digest(_cluster()),
+                        "profile_version": _cluster().profile,
+                    },
+                    headers=owner_headers | {"Idempotency-Key": "cannot-dispatch-reconciled"},
+                )
+                assert rejected.status_code == 409
+            return
 
         thread = call(
             "POST",

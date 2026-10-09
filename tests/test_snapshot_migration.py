@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tessera_control.migrations import MIGRATIONS
+from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from tessera_control.snapshots import create_snapshot_schema
 from tessera_control.store import Store, canonical_digest, initialize_state, migrate_state
 
@@ -56,6 +56,9 @@ def _v4_state(tmp_path: Path) -> tuple[Path, dict[str, object], dict[str, object
         from schema_fixtures import drop_empty_experiment_schema
 
         drop_empty_experiment_schema(connection)
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version = 4")
         connection.commit()
     return state, project, task
@@ -73,13 +76,13 @@ def test_v4_to_v5_requires_explicit_migration_and_preserves_records(tmp_path: Pa
     state, project, task = _v4_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     assert {"source_snapshots", "snapshot_files"}.issubset(_tables(state))
     store = Store(state)
     owner = _owner(state)
     assert store.get_project(owner, project["id"]) == project
     assert store.get_task(owner, task["id"])["id"] == task["id"]
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
 
 def test_v4_to_v5_rolls_back_snapshot_schema_on_failure(

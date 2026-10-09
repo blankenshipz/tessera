@@ -2,12 +2,14 @@
 
 from .coordinator import (
     ContextReference,
+    CoordinatorConsumerError,
     CoordinatorOutput,
     ExplainStatusCoordinator,
     ExplainStatusMediator,
     ExplainStatusMediatorError,
     ExplainStatusTurnProtocol,
     ProviderDisabledCoordinator,
+    ProviderDisabledCoordinatorConsumer,
     StaleContextError,
 )
 from .facade import (
@@ -30,10 +32,12 @@ __all__ = [
     "UnknownToolError",
     "ContextReference",
     "CoordinatorOutput",
+    "CoordinatorConsumerError",
     "ExplainStatusCoordinator",
     "ExplainStatusMediator",
     "ExplainStatusMediatorError",
     "ExplainStatusTurnProtocol",
     "ProviderDisabledCoordinator",
+    "ProviderDisabledCoordinatorConsumer",
     "StaleContextError",
 ]

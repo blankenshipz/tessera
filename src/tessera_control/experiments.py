@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -23,6 +24,7 @@ from .experiments_models import (
     ClaimKubernetesDispatch,
     CreateConclusion,
     CreateExperiment,
+    DeriveOutputMeasurement,
     DispatchAdmittedAttempt,
     ExportExperiment,
     LinkAttemptArtifacts,
@@ -38,11 +40,17 @@ from .project_artifact_retention import (
     admit_experiment_artifact_evidence_reference,
     validate_experiment_artifact_evidence_reference,
 )
+from .project_artifacts import (
+    FilesystemProjectArtifactBackend,
+    ProjectArtifactPlacement,
+    ProjectArtifactStorageError,
+)
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, _parse_utc, utc_now
 
 T = TypeVar("T", bound=BaseModel)
 EXPORT_RECORD_LIMIT = 1_000
 EXPORT_DEFAULT_BYTES = 1_000_000
+_KUBERNETES_DISPATCH_CLAIM_LEASE = timedelta(minutes=1)
 # The Electron connection refuses control responses larger than four MiB. Keep
 # complete experiment snapshots within that same transport boundary.
 EXPORT_MAX_BYTES = 4 * 1024 * 1024
@@ -685,6 +693,12 @@ def create_experiment_evidence_retention_schema(connection: sqlite3.Connection) 
 class ExperimentStore(Store):
     """Commands for one bounded design, evidence chain, and human review."""
 
+    def __init__(self, state_dir, backend=None) -> None:
+        super().__init__(state_dir)
+        self.backend = backend or FilesystemProjectArtifactBackend(
+            self.database_path.parent / "project-artifacts"
+        )
+
     @staticmethod
     def _body(model: type[T], payload: dict[str, Any] | T) -> dict[str, Any]:
         try:
@@ -882,6 +896,15 @@ class ExperimentStore(Store):
     ) -> tuple[int, dict[str, Any]]:
         body = self._body(CreateExperiment, payload)
 
+        def command(connection, actor):
+            self._human(actor)
+            return self._create_experiment_transaction(connection, actor, project_id, body)
+
+        return self._mutate(
+            principal, key, "POST", f"/projects/{project_id}/experiments", digest, command
+        )
+
+    def _create_experiment_transaction(self, connection, actor, project_id, body):
         def command(
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
@@ -920,9 +943,7 @@ class ExperimentStore(Store):
             )
             return 201, self._experiment_response(connection, experiment)
 
-        return self._mutate(
-            principal, key, "POST", f"/projects/{project_id}/experiments", digest, command
-        )
+        return command(connection, actor)
 
     def _insert_design(
         self,
@@ -1069,109 +1090,9 @@ class ExperimentStore(Store):
         """Create an immutable human-reviewed binding before any package is returned."""
         body = self._body(AdmitExperimentAttempt, payload)
 
-        def command(
-            connection: sqlite3.Connection, actor: dict[str, Any]
-        ) -> tuple[int, dict[str, Any]]:
+        def command(connection, actor):
             self._human(actor)
-            variant = self._variant(connection, actor, variant_id)
-            experiment = self._experiment(connection, actor, variant["experiment_id"])
-            if (
-                variant["revision"] != body["expected_variant_revision"]
-                or variant["design_revision"] != body["expected_design_revision"]
-                or experiment["current_design_revision"] != body["expected_design_revision"]
-            ):
-                raise Conflict("Experiment variant or design revision is no longer current.")
-            if variant["execution_task_id"] is None:
-                raise Conflict("Experiment variant does not declare an immutable execution plan.")
-            grant = connection.execute(
-                """SELECT g.* FROM execution_grants g JOIN projects p ON p.id=g.project_id
-                WHERE g.id=? AND p.org_id=? AND g.project_id=?""",
-                (body["grant_id"], actor["org_id"], experiment["project_id"]),
-            ).fetchone()
-            if grant is None:
-                raise NotFound("Execution grant was not found.")
-            if (
-                grant["status"] != "active"
-                or grant["task_id"] != variant["execution_task_id"]
-                or grant["plan_digest"] != variant["execution_plan_digest"]
-            ):
-                raise Conflict(
-                    "Execution grant does not match the immutable experiment variant plan."
-                )
-            if connection.execute(
-                "SELECT 1 FROM external_operations WHERE grant_id=?", (grant["id"],)
-            ).fetchone():
-                raise Conflict(
-                    "Execution grant already has an operation or package intent and cannot be admitted."
-                )
-            if connection.execute(
-                "SELECT 1 FROM research_experiment_admitted_attempts WHERE grant_id=?",
-                (grant["id"],),
-            ).fetchone():
-                raise Conflict(
-                    "Execution grant is already bound to an admitted experiment attempt."
-                )
-            now = utc_now()
-            row = {
-                "id": "experiment_admitted_attempt_" + uuid.uuid4().hex,
-                "experiment_id": experiment["id"],
-                "design_revision": variant["design_revision"],
-                "variant_id": variant["id"],
-                "task_id": variant["execution_task_id"],
-                "plan_digest": variant["execution_plan_digest"],
-                "grant_id": grant["id"],
-                "operation_id": None,
-                "package_digest": None,
-                "state": "admitted",
-                "operational_state": "admitted",
-                "operational_observed_state": "not_observed",
-                "operational_termination_confirmed": None,
-                "operational_observation_cursor": None,
-                "operational_observed_at": None,
-                "outcome": None,
-                "reason": None,
-                "revision": 1,
-                "created_at": now,
-                "updated_at": now,
-                "created_by_principal_id": actor["id"],
-                "resolved_by_principal_id": None,
-            }
-            connection.execute(
-                """INSERT INTO research_experiment_admitted_attempts
-                (id,experiment_id,design_revision,variant_id,task_id,plan_digest,grant_id,operation_id,
-                 package_digest,state,operational_state,operational_observed_state,
-                 operational_termination_confirmed,outcome,reason,revision,created_at,updated_at,
-                 created_by_principal_id,resolved_by_principal_id)
-                VALUES (:id,:experiment_id,:design_revision,:variant_id,:task_id,:plan_digest,:grant_id,
-                 :operation_id,:package_digest,:state,:operational_state,:operational_observed_state,
-                 :operational_termination_confirmed,:outcome,:reason,:revision,:created_at,:updated_at,
-                :created_by_principal_id,:resolved_by_principal_id)""",
-                row,
-            )
-            connection.execute(
-                """INSERT INTO research_experiment_admitted_attempt_states
-                (attempt_id,sequence,state,observed_state,reason,operation_id,recorded_at,actor_principal_id)
-                VALUES (?,1,'admitted',NULL,NULL,NULL,?,?)""",
-                (row["id"], now, actor["id"]),
-            )
-            self._event(
-                connection,
-                actor,
-                experiment,
-                "experiment.attempt_admitted",
-                1,
-                {
-                    "experiment_id": experiment["id"],
-                    "design_revision": row["design_revision"],
-                    "variant_id": row["variant_id"],
-                    "admitted_attempt_id": row["id"],
-                    "grant_id": row["grant_id"],
-                    "task_id": row["task_id"],
-                    "plan_digest": row["plan_digest"],
-                    "execution_dispatched": False,
-                },
-            )
-            return 201, row
+            return self._admit_attempt_transaction(connection, actor, variant_id, body)
 
         return self._mutate(
             principal,
@@ -1182,6 +1103,104 @@ class ExperimentStore(Store):
             command,
         )
 
+    def _admit_attempt_transaction(self, connection, actor, variant_id, body):
+        # Caller must be a human or a separately validated bounded-grant subject.
+        variant = self._variant(connection, actor, variant_id)
+        experiment = self._experiment(connection, actor, variant["experiment_id"])
+        if (
+            variant["revision"] != body["expected_variant_revision"]
+            or variant["design_revision"] != body["expected_design_revision"]
+            or experiment["current_design_revision"] != body["expected_design_revision"]
+        ):
+            raise Conflict("Experiment variant or design revision is no longer current.")
+        if variant["execution_task_id"] is None:
+            raise Conflict("Experiment variant does not declare an immutable execution plan.")
+        grant = connection.execute(
+            """SELECT g.* FROM execution_grants g JOIN projects p ON p.id=g.project_id
+            WHERE g.id=? AND p.org_id=? AND g.project_id=?""",
+            (body["grant_id"], actor["org_id"], experiment["project_id"]),
+        ).fetchone()
+        if grant is None:
+            raise NotFound("Execution grant was not found.")
+        if (
+            grant["status"] != "active"
+            or grant["task_id"] != variant["execution_task_id"]
+            or grant["plan_digest"] != variant["execution_plan_digest"]
+        ):
+            raise Conflict("Execution grant does not match the immutable experiment variant plan.")
+        if connection.execute(
+            "SELECT 1 FROM external_operations WHERE grant_id=?", (grant["id"],)
+        ).fetchone():
+            raise Conflict(
+                "Execution grant already has an operation or package intent and cannot be admitted."
+            )
+        if connection.execute(
+            "SELECT 1 FROM research_experiment_admitted_attempts WHERE grant_id=?",
+            (grant["id"],),
+        ).fetchone():
+            raise Conflict("Execution grant is already bound to an admitted experiment attempt.")
+        now = utc_now()
+        row = {
+            "id": "experiment_admitted_attempt_" + uuid.uuid4().hex,
+            "experiment_id": experiment["id"],
+            "design_revision": variant["design_revision"],
+            "variant_id": variant["id"],
+            "task_id": variant["execution_task_id"],
+            "plan_digest": variant["execution_plan_digest"],
+            "grant_id": grant["id"],
+            "operation_id": None,
+            "package_digest": None,
+            "state": "admitted",
+            "operational_state": "admitted",
+            "operational_observed_state": "not_observed",
+            "operational_termination_confirmed": None,
+            "operational_observation_cursor": None,
+            "operational_observed_at": None,
+            "outcome": None,
+            "reason": None,
+            "revision": 1,
+            "created_at": now,
+            "updated_at": now,
+            "created_by_principal_id": actor["id"],
+            "resolved_by_principal_id": None,
+        }
+        connection.execute(
+            """INSERT INTO research_experiment_admitted_attempts
+            (id,experiment_id,design_revision,variant_id,task_id,plan_digest,grant_id,operation_id,
+             package_digest,state,operational_state,operational_observed_state,
+             operational_termination_confirmed,outcome,reason,revision,created_at,updated_at,
+             created_by_principal_id,resolved_by_principal_id)
+            VALUES (:id,:experiment_id,:design_revision,:variant_id,:task_id,:plan_digest,:grant_id,
+             :operation_id,:package_digest,:state,:operational_state,:operational_observed_state,
+             :operational_termination_confirmed,:outcome,:reason,:revision,:created_at,:updated_at,
+            :created_by_principal_id,:resolved_by_principal_id)""",
+            row,
+        )
+        connection.execute(
+            """INSERT INTO research_experiment_admitted_attempt_states
+            (attempt_id,sequence,state,observed_state,reason,operation_id,recorded_at,actor_principal_id)
+            VALUES (?,1,'admitted',NULL,NULL,NULL,?,?)""",
+            (row["id"], now, actor["id"]),
+        )
+        self._event(
+            connection,
+            actor,
+            experiment,
+            "experiment.attempt_admitted",
+            1,
+            {
+                "experiment_id": experiment["id"],
+                "design_revision": row["design_revision"],
+                "variant_id": row["variant_id"],
+                "admitted_attempt_id": row["id"],
+                "grant_id": row["grant_id"],
+                "task_id": row["task_id"],
+                "plan_digest": row["plan_digest"],
+                "execution_dispatched": False,
+            },
+        )
+        return 201, row
+
     def dispatch_admitted_attempt(
         self,
         principal: dict[str, Any],
@@ -1190,6 +1209,22 @@ class ExperimentStore(Store):
         digest: str,
         payload: dict[str, Any] | DispatchAdmittedAttempt,
     ) -> tuple[int, dict[str, Any]]:
+        body = self._body(DispatchAdmittedAttempt, payload)
+
+        def command(connection, actor):
+            self._human(actor)
+            return self._dispatch_admitted_attempt_transaction(connection, actor, attempt_id, body)
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/experiment-admitted-attempts/{attempt_id}/dispatch",
+            digest,
+            command,
+        )
+
+    def _dispatch_admitted_attempt_transaction(self, connection, actor, attempt_id, payload):
         """Write the human dispatch outbox after, never before, package admission.
 
         The normal package endpoint intentionally remains the sole package issuer.
@@ -1197,12 +1232,10 @@ class ExperimentStore(Store):
         the named target; it makes no Kubernetes call.
         """
         body = self._body(DispatchAdmittedAttempt, payload)
-        path = f"/experiment-admitted-attempts/{attempt_id}/dispatch"
 
         def command(
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
-            self._human(actor)
             attempt_row = connection.execute(
                 """SELECT a.*,e.project_id,p.org_id FROM research_experiment_admitted_attempts a
                 JOIN research_experiments e ON e.id=a.experiment_id JOIN projects p ON p.id=e.project_id
@@ -1212,6 +1245,12 @@ class ExperimentStore(Store):
             if attempt_row is None:
                 raise NotFound("Admitted experiment attempt was not found.")
             attempt = dict(attempt_row)
+            if connection.execute(
+                "SELECT 1 FROM events WHERE org_id=? AND event_type='remote_execution.state' "
+                "AND json_extract(payload_json,'$.proposal.operation_id')=?",
+                (actor["org_id"], attempt["operation_id"]),
+            ).fetchone():
+                raise Conflict("Operation is reserved to remote routing; cannot dispatch twice.")
             if attempt["revision"] != body["expected_revision"]:
                 raise Conflict("Admitted experiment attempt revision is no longer current.")
             if attempt["outcome"] is not None or attempt["operation_id"] is None:
@@ -1306,23 +1345,32 @@ class ExperimentStore(Store):
             )
             return 201, row
 
-        return self._mutate(principal, key, "POST", path, digest, command)
+        return command(connection, actor)
 
     def claim_kubernetes_dispatch(
         self,
         principal: dict[str, Any],
-        dispatch_id: str,
+        dispatch_id: str | None,
         key: str,
         digest: str,
         payload: dict[str, Any] | ClaimKubernetesDispatch,
     ) -> tuple[int, dict[str, Any]]:
         """Return one exact package only to its enrolled target-bound worker."""
         body = self._body(ClaimKubernetesDispatch, payload)
-        path = f"/kubernetes-dispatches/{dispatch_id}/claim"
+        path = (
+            f"/kubernetes-dispatches/{dispatch_id}/claim"
+            if dispatch_id is not None
+            else "/kubernetes-dispatches/next/claim"
+        )
 
         def current(
-            connection: sqlite3.Connection, worker: dict[str, Any]
-        ) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row, sqlite3.Row, sqlite3.Row, dict[str, Any]]:
+            connection: sqlite3.Connection,
+            worker: dict[str, Any],
+            selected_id: str | None = dispatch_id,
+        ) -> (
+            tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row, sqlite3.Row, sqlite3.Row, dict[str, Any]]
+            | None
+        ):
             """Recheck the authority behind a claimed-package replay.
 
             Claim responses are executable material, unlike an ordinary mutation
@@ -1330,10 +1378,30 @@ class ExperimentStore(Store):
             it must never preserve authority after a revoke, expiry, or worker
             lifecycle change.
             """
-            dispatch = connection.execute(
-                "SELECT * FROM kubernetes_dispatches WHERE id=? AND org_id=?",
-                (dispatch_id, worker["org_id"]),
-            ).fetchone()
+            if selected_id is None:
+                dispatch = connection.execute(
+                    """SELECT d.* FROM kubernetes_dispatches d
+                    JOIN external_operations o ON o.operation_id=d.operation_id
+                    WHERE d.org_id=? AND d.worker_principal_id=?
+                    AND d.target_digest=? AND d.profile_version=? AND
+                    (d.state='queued' OR (d.state='claimed' AND d.claimed_by_principal_id=?
+                     AND o.observed_state != 'exited'))
+                    ORDER BY CASE WHEN d.state='claimed' THEN 0 ELSE 1 END,d.created_at,d.id LIMIT 1""",
+                    (
+                        worker["org_id"],
+                        worker["id"],
+                        body["target_digest"],
+                        body["profile_version"],
+                        worker["id"],
+                    ),
+                ).fetchone()
+            else:
+                dispatch = connection.execute(
+                    "SELECT * FROM kubernetes_dispatches WHERE id=? AND org_id=?",
+                    (selected_id, worker["org_id"]),
+                ).fetchone()
+            if dispatch is None and selected_id is None:
+                return None
             if dispatch is None or dispatch["worker_principal_id"] != worker["id"]:
                 raise NotFound("Kubernetes dispatch was not found.")
             if (
@@ -1401,17 +1469,46 @@ class ExperimentStore(Store):
         def command(
             connection: sqlite3.Connection, worker: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
-            dispatch, operation, lease, _grant, _package, package_value = current(
-                connection, worker
-            )
+            current_value = current(connection, worker)
+            if current_value is None:
+                return 200, {
+                    "dispatch": None,
+                    "availability": "idle",
+                    "execution_dispatched": False,
+                }
+            dispatch, operation, lease, _grant, _package, package_value = current_value
+            try:
+                claim_is_stale = (
+                    not isinstance(dispatch["claimed_at"], str)
+                    or _parse_utc(dispatch["claimed_at"])
+                    <= datetime.now(UTC) - _KUBERNETES_DISPATCH_CLAIM_LEASE
+                )
+            except ValueError as error:
+                raise Conflict("Kubernetes dispatch claim timestamp is invalid.") from error
+            if dispatch["state"] == "claimed" and claim_is_stale:
+                # The dispatch is still bound to this exact enrolled worker and
+                # immutable operation.  Reclaiming only refreshes its consumer
+                # lease; it cannot redirect the operation or mint a package.
+                now = utc_now()
+                connection.execute(
+                    """UPDATE kubernetes_dispatches SET state='queued',claimed_at=NULL,
+                    claimed_by_principal_id=NULL,updated_at=? WHERE id=? AND state='claimed'
+                    AND worker_principal_id=?""",
+                    (now, dispatch["id"], worker["id"]),
+                )
+                dispatch = connection.execute(
+                    "SELECT * FROM kubernetes_dispatches WHERE id=?", (dispatch["id"],)
+                ).fetchone()
+                if dispatch is None:
+                    raise Conflict("Kubernetes dispatch disappeared during reclaim.")
             if dispatch["state"] == "queued":
                 now = utc_now()
                 connection.execute(
                     "UPDATE kubernetes_dispatches SET state='claimed',claimed_at=?,claimed_by_principal_id=?,updated_at=? WHERE id=? AND state='queued'",
-                    (now, worker["id"], now, dispatch_id),
+                    (now, worker["id"], now, dispatch["id"]),
                 )
                 dispatch = connection.execute(
-                    "SELECT * FROM kubernetes_dispatches WHERE id=?", (dispatch_id,)
+                    "SELECT * FROM kubernetes_dispatches WHERE id=?", (dispatch["id"],)
                 ).fetchone()
                 self._event(
                     connection,
@@ -1420,7 +1517,7 @@ class ExperimentStore(Store):
                     "experiment.kubernetes_dispatch_claimed",
                     dispatch["epoch"],
                     {
-                        "dispatch_id": dispatch_id,
+                        "dispatch_id": dispatch["id"],
                         "admitted_attempt_id": dispatch["admitted_attempt_id"],
                         "operation_id": dispatch["operation_id"],
                         "execution_dispatched": True,
@@ -1441,13 +1538,26 @@ class ExperimentStore(Store):
         def replay_guard(
             connection: sqlite3.Connection, worker: dict[str, Any], response: dict[str, Any]
         ) -> None:
-            dispatch, _operation, _lease, _grant, _package, _package_value = current(
-                connection, worker
-            )
+            cached_dispatch = response.get("dispatch")
+            if dispatch_id is None and cached_dispatch is None:
+                # An idle receipt contains no executable authority. Queue changes
+                # cannot turn replay of that receipt into a claim (or an error).
+                return
+            if not isinstance(cached_dispatch, dict) or not isinstance(
+                cached_dispatch.get("id"), str
+            ):
+                raise Conflict("Kubernetes dispatch claim is no longer current.")
+            # Revalidate the exact prior claim, not whichever item is next now.
+            current_value = current(connection, worker, cached_dispatch["id"])
+            if current_value is None:
+                if response.get("dispatch") is None:
+                    return
+                raise Conflict("Kubernetes dispatch claim is no longer current.")
+            dispatch, _operation, _lease, _grant, _package, _package_value = current_value
             if (
                 dispatch["state"] != "claimed"
                 or dispatch["claimed_by_principal_id"] != worker["id"]
-                or response.get("dispatch", {}).get("id") != dispatch_id
+                or cached_dispatch["id"] != dispatch["id"]
             ):
                 raise Conflict("Kubernetes dispatch claim is no longer current.")
 
@@ -1461,6 +1571,16 @@ class ExperimentStore(Store):
             audience="worker",
             replay_guard=replay_guard,
         )
+
+    def claim_next_kubernetes_dispatch(
+        self,
+        principal: dict[str, Any],
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | ClaimKubernetesDispatch,
+    ) -> tuple[int, dict[str, Any]]:
+        """Claim the oldest eligible assigned dispatch without an ID from a caller."""
+        return self.claim_kubernetes_dispatch(principal, None, key, digest, payload)
 
     def resolve_admitted_attempt(
         self,
@@ -1920,6 +2040,207 @@ class ExperimentStore(Store):
             key,
             "POST",
             f"/experiment-attempts/{attempt_id}/measurements",
+            digest,
+            command,
+        )
+
+    def derive_output_measurement(
+        self,
+        principal: dict[str, Any],
+        attempt_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | DeriveOutputMeasurement,
+    ) -> tuple[int, dict[str, Any]]:
+        """Bind a numeric observation to verified, retained JSON output bytes.
+
+        This is a custody/derivation check, not scientific validation or a claim
+        that the producer measured the intended quantity correctly.
+        """
+        body = self._body(DeriveOutputMeasurement, payload)
+
+        def command(connection: sqlite3.Connection, actor: dict[str, Any]):
+            self._human(actor)
+            attempt = self._evidence_attempt(connection, actor, attempt_id)
+            if attempt["revision"] != body["expected_revision"]:
+                raise Conflict("Experiment attempt revision is no longer current.")
+            artifact_id = body["artifact_id"]
+            linked_table = (
+                "research_admitted_attempt_artifacts"
+                if attempt["attempt_kind"] == "admitted"
+                else "research_attempt_artifacts"
+            )
+            if connection.execute(
+                f"SELECT 1 FROM {linked_table} WHERE attempt_id=? AND artifact_id=?",
+                (attempt_id, artifact_id),
+            ).fetchone() is None or not self._artifact_matches_attempt_provenance(
+                connection, actor, attempt, artifact_id
+            ):
+                raise Conflict("Output artifact is not linked to this attempt provenance.")
+            validate_experiment_artifact_evidence_reference(
+                connection, attempt["project_id"], artifact_id
+            )
+            row = connection.execute(
+                """SELECT a.sha256,a.size,a.status,a.classification,a.late,
+                p.tenant_namespace,p.project_namespace,p.object_key,
+                p.sha256 AS placement_sha256,p.size AS placement_size,
+                p.backend_kind,r.state AS retention_state
+                FROM artifacts a JOIN project_artifact_placements p
+                ON p.artifact_id=a.id AND p.project_id=a.project_id
+                JOIN project_artifact_retention r ON r.artifact_id=a.id AND r.project_id=a.project_id
+                WHERE a.id=? AND a.project_id=?""",
+                (artifact_id, attempt["project_id"]),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "quarantined"
+                or row["classification"] != "unclassified"
+                or row["late"]
+                or row["retention_state"] != "active"
+                or row["backend_kind"] != self.backend.kind
+                or row["sha256"] != row["placement_sha256"]
+                or row["size"] != row["placement_size"]
+                or row["size"] > 1024 * 1024
+            ):
+                raise Conflict("Output has no eligible active retained placement.")
+            placement = ProjectArtifactPlacement(
+                row["tenant_namespace"],
+                row["project_namespace"],
+                row["object_key"],
+                row["sha256"],
+                row["size"],
+            )
+            try:
+                content = self.backend.read(
+                    actor["org_id"], attempt["project_id"], artifact_id, placement
+                )
+            except ProjectArtifactStorageError as error:
+                raise Conflict("Output custody integrity check failed.") from error
+
+            def unique_object(pairs):
+                result = {}
+                for name, value in pairs:
+                    if name in result:
+                        raise ValueError("duplicate JSON key")
+                    result[name] = value
+                return result
+
+            try:
+                document = json.loads(
+                    content.decode("utf-8"),
+                    object_pairs_hook=unique_object,
+                    parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")),
+                )
+                pointer = body["json_pointer"]
+                if pointer:
+                    if not pointer.startswith("/"):
+                        raise ValueError("invalid JSON pointer")
+                    for part in pointer[1:].split("/"):
+                        if "~" in part.replace("~0", "").replace("~1", ""):
+                            raise ValueError("invalid JSON pointer escape")
+                        token = part.replace("~1", "/").replace("~0", "~")
+                        if isinstance(document, dict):
+                            document = document[token]
+                        elif (
+                            isinstance(document, list)
+                            and token.isascii()
+                            and (token == "0" or (token.isdecimal() and not token.startswith("0")))
+                        ):
+                            document = document[int(token)]
+                        else:
+                            raise ValueError("JSON pointer does not identify a number")
+                if type(document) not in (int, float) or (
+                    isinstance(document, float) and not math.isfinite(document)
+                ):
+                    raise ValueError("JSON pointer does not identify a finite number")
+            except (UnicodeDecodeError, ValueError, KeyError, IndexError, TypeError) as error:
+                raise Conflict(
+                    "Retained output has no unambiguous finite numeric value at pointer."
+                ) from error
+            value = {
+                "number": document,
+                "derivation": "retained-json-number-v1",
+                "json_pointer": pointer,
+                "artifact_sha256": row["sha256"],
+            }
+            now, revision, ident = (
+                utc_now(),
+                attempt["revision"] + 1,
+                "measurement_" + uuid.uuid4().hex,
+            )
+            measurement = {
+                "id": ident,
+                "attempt_id": attempt_id,
+                "name": body["name"],
+                "value_json": json.dumps(value, sort_keys=True, separators=(",", ":")),
+                "artifact_id": artifact_id,
+                "created_at": now,
+                "created_by_principal_id": actor["id"],
+            }
+            table = (
+                "research_admitted_attempt_measurements"
+                if attempt["attempt_kind"] == "admitted"
+                else "research_attempt_measurements"
+            )
+            connection.execute(
+                f"INSERT INTO {table} (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id)",
+                measurement,
+            )
+            if attempt["attempt_kind"] == "admitted":
+                self._admit_bound_artifact_reference(
+                    connection,
+                    attempt,
+                    artifact_id,
+                    f"admitted_experiment_evidence_measurement_{ident}",
+                    "measurement_artifact",
+                    now,
+                    ident,
+                )
+                revision = _bump_admitted_attempt_revision(connection, attempt)
+            else:
+                admit_experiment_artifact_evidence_reference(
+                    connection,
+                    attempt["project_id"],
+                    artifact_id,
+                    attempt_id,
+                    f"experiment_evidence_measurement_{ident}",
+                    "measurement_artifact",
+                    now,
+                    ident,
+                )
+                if (
+                    connection.execute(
+                        "UPDATE research_experiment_attempts SET revision=? WHERE id=? AND revision=?",
+                        (revision, attempt_id, body["expected_revision"]),
+                    ).rowcount
+                    != 1
+                ):
+                    raise Conflict("Experiment attempt revision is no longer current.")
+            experiment = self._experiment(connection, actor, attempt["experiment_id"])
+            self._event(
+                connection,
+                actor,
+                experiment,
+                "experiment.measurement_derived",
+                revision,
+                {
+                    "experiment_id": experiment["id"],
+                    "attempt_id": attempt_id,
+                    "measurement_id": ident,
+                    "artifact_id": artifact_id,
+                    "scientific_validity": "not_assessed",
+                },
+            )
+            return 201, self._measurement_response(measurement) | {
+                "attempt_revision": revision,
+                "scientific_validity": "not_assessed",
+            }
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/experiment-attempts/{attempt_id}/derived-measurements",
             digest,
             command,
         )
@@ -2713,6 +3034,22 @@ class ExperimentStore(Store):
                 (experiment_id,),
             ):
                 append("conclusion_amendments", self._amendment_response(row))
+            from .agent_provenance import project_agent_notebook
+
+            if actor["kind"] in {"local_owner", "human_session"}:
+                result["agent_notebook"] = project_agent_notebook(
+                    connection,
+                    actor,
+                    experiment["project_id"],
+                    max_bytes=max(1024, body["max_bytes"]),
+                )
+            else:
+                # Historical resource/status reads do not grant project notebook disclosure.
+                result["agent_notebook"] = {
+                    "availability": "unavailable",
+                    "reason": "separate_project_notebook_authority_required",
+                    "completeness": "not_disclosed",
+                }
             if encoded_size(result) > body["max_bytes"]:
                 raise Conflict("Export exceeds the requested byte cap.")
             return result

@@ -75,6 +75,7 @@ def _profile_documents() -> list[dict[str, object]]:
         ("NetworkPolicy", "default-deny"),
         ("NetworkPolicy", "allow-labelled-control-clients"),
         ("NetworkPolicy", "allow-labelled-control-client-egress"),
+        ("NetworkPolicy", "allow-tls-control-client-dns"),
     }
     identities = {
         (
@@ -171,31 +172,35 @@ def _manifest(namespace: str, nonce: str, image: str) -> bytes:
     return yaml.safe_dump_all(documents, sort_keys=False).encode("utf-8")
 
 
-def _load_image(root: Path, nonce: str) -> str:
+def _load_image(root: Path, nonce: str, *, prebuilt_image_id: str | None = None) -> str:
     # Docker Desktop's kind node has an isolated k8s.io containerd namespace.
     # Load the one bounded local archive into that known node, rather than
     # assuming a host Docker image is visible to kubelet or using a registry.
     reference = f"docker.io/library/tessera-control-restart:{nonce}"
-    _run(
-        [
-            "docker",
-            "buildx",
-            "build",
-            "--load",
-            "--platform",
-            "linux/amd64",
-            "--target",
-            "lab",
-            "--tag",
-            reference,
-            str(root),
-        ]
-    )
+    if prebuilt_image_id is None:
+        _run(
+            [
+                "docker",
+                "buildx",
+                "build",
+                "--load",
+                "--platform",
+                "linux/amd64",
+                "--target",
+                "lab",
+                "--tag",
+                reference,
+                str(root),
+            ],
+            timeout=300,  # Pinned base manifest resolution can outlast the default.
+        )
     try:
         images = json.loads(_run(["docker", "image", "inspect", reference]))
         image = images[0]
         if len(images) != 1 or image.get("Os") != "linux" or image.get("Architecture") != "amd64":
             raise ValueError("loaded image is not linux/amd64")
+        if prebuilt_image_id is not None and image.get("Id") != prebuilt_image_id:
+            raise ValueError("prebuilt image identity changed before node import")
     except (IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise FixtureError(
             "Docker Desktop did not load one linux/amd64 fixture image into its containerd image store"

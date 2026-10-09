@@ -13,7 +13,7 @@ from test_input_delivery import _delivery
 from tessera_control.api import create_app
 from tessera_control.execution import ExecutionStore
 from tessera_control.handoffs import WorkspaceHandoffStore
-from tessera_control.migrations import MIGRATIONS
+from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.snapshots import SnapshotStore
 from tessera_control.store import (
@@ -447,8 +447,8 @@ def test_journaled_handoff_fences_cancellation_and_orders_confirmation(tmp_path,
 
 def test_open_handoff_survives_restart_and_repeatable_migration(tmp_path):
     state, _, owner, _, grant, _, operation, handoff, _ = _journaled_handoff(tmp_path)
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     restarted = WorkspaceHandoffStore(state).get_handoff(owner, handoff["id"])
     assert restarted["status"] == "stop_requested" and restarted["human_owner"] is False
     with _connect(state / "tessera.sqlite3") as connection:
@@ -490,6 +490,9 @@ def test_schema17_handoff_migration_is_explicit_transactional_and_repeatable(tmp
         from schema_fixtures import drop_empty_experiment_schema
 
         drop_empty_experiment_schema(connection)
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=16")
 
     with pytest.raises(ValueError, match="explicit"):
@@ -513,5 +516,5 @@ def test_schema17_handoff_migration_is_explicit_transactional_and_repeatable(tmp
             is None
         )
     monkeypatch.undo()
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION

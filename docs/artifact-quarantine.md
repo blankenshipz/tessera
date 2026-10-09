@@ -16,6 +16,28 @@ Schema v19 fake-provider receipt evidence is separate from these artifact record
 It neither releases quarantined bytes nor makes a manifest, provider observation,
 or synthetic output a result-acceptance or scientific-success record.
 
+Schema v46 adds a separate human **custody release** for researcher retrieval.
+It is available only after the current human disposition is
+`retain_quarantined`, and it is an append-only `released`/`revoked` decision
+fenced to the exact immutable manifest digest. A release permits a live,
+project-scoped human credential to retrieve an exact private placed object,
+read its released manifest, or request a bounded preview. It does not alter the
+manifest's `quarantined`/`unclassified` status, classify or publish bytes,
+accept a result, or release input data. Revocation fences subsequent manifest,
+preview, byte, and stored-bundle reads.
+
+`POST /artifact-manifests/{manifest_id}/reproduction-bundles` creates an
+immutable, digest-addressed, 4 MiB-or-smaller private reproduction snapshot
+from one released manifest. It includes verified released output bytes,
+manifest and custody/disposition history, frozen task plan references,
+operation-linked admitted-attempt outcomes (including failed, cancelled, and
+unknown/inconclusive outcomes), and linked measurements. Every export runs in
+one SQLite read snapshot and fails closed on missing, corrupt, deleted, or
+unreleased output custody. Inputs remain separately released/unclassified and
+are never copied into this export; the bundle declares them, skill material, and
+environment-image material as restricted or missing rather than implying a
+complete scientific reproduction.
+
 Schema v20's human result-bookkeeping ledger may reference an exact checkpoint
 only after it rechecks these bytes and their still-`quarantined`/
 `unclassified`, complete, non-late manifest. That append-only record does not
@@ -150,8 +172,8 @@ newer revision is appended, provided the credential and manifest access remain
 valid.
 
 This slice does not collect files automatically from containers, perform scientific
-result validation, release quarantine, publish evidence, or schedule retention and
-cleanup. The CPU runtime still needs a bounded output-storage contract: Docker
+result validation, publish evidence, or schedule retention and cleanup. A custody
+release is private read access, not a quarantine release. The CPU runtime still needs a bounded output-storage contract: Docker
 [removes tmpfs contents when a container stops](https://docs.docker.com/engine/storage/tmpfs/),
 so the current `/work` mount cannot provide post-exit artifact collection.
 Synthetic API/storage fixtures are not evidence of a

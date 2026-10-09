@@ -12,11 +12,13 @@ from tessera_agent import (
     AstraAgentFacade,
     ContextReference,
     ProviderDisabledCoordinator,
+    ProviderDisabledCoordinatorConsumer,
     StaleContextError,
 )
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.recovery import backup_state, restore_state
-from tessera_control.store import _connect, initialize_state, migrate_state
+from tessera_control.store import _connect, _token_hash, initialize_state, migrate_state
 
 
 def _headers(state: Path, key: str, token: str | None = None) -> dict[str, str]:
@@ -210,6 +212,151 @@ def test_provider_disabled_turn_is_idempotent_and_has_no_authority(tmp_path: Pat
             connection.execute("UPDATE astra_proposals SET body='mutated'")
 
 
+def test_ordinary_consumer_crash_before_and_after_claim_is_resumable_without_effects(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    initialize_state(state)
+    client = TestClient(create_app(state))
+    project = _project(client, state, "Ordinary consumer")
+    task = _task(client, state, str(project["id"]))
+    token, facade = _agent(client, state, str(project["id"]))
+
+    # A process that dies before the claim has no control-plane effect.
+    assert (
+        client.post(
+            "/astra/turns/next-claim", headers=_headers(state, "crash-before", token), json={}
+        ).json()["turn"]
+        is None
+    )
+    requested = _request(client, state, str(project["id"]), 0, task)
+    # A process that dies after its durable claim is resumed by the same scoped
+    # consumer; the resulting deterministic completion is still exactly one row.
+    claimed = client.post(
+        "/astra/turns/next-claim", headers=_headers(state, "crash-after", token), json={}
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()["turn"]["id"] == requested["turn"]["id"]
+    result = ProviderDisabledCoordinatorConsumer(client, token, facade).run_once()
+    assert result["turn"]["state"] == "completed"
+    with _connect(state / "tessera.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM astra_proposals").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM execution_grants").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM external_operations").fetchone()[0] == 0
+
+
+def test_ordinary_consumer_completion_replay_and_stale_claim_reclaim(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    initialize_state(state)
+    client = TestClient(create_app(state))
+    project = _project(client, state, "Ordinary replay")
+    task = _task(client, state, str(project["id"]))
+    first_token, first_facade = _agent(client, state, str(project["id"]))
+    second_token, _ = _agent(client, state, str(project["id"]), "b" * 43)
+    requested = _request(client, state, str(project["id"]), 0, task)
+    first = client.post(
+        "/astra/turns/next-claim", headers=_headers(state, "first-claim", first_token), json={}
+    ).json()
+    with _connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE astra_coordinator_turns SET claim_expires_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), requested["turn"]["id"]),
+        )
+    reclaimed = client.post(
+        "/astra/turns/next-claim", headers=_headers(state, "second-claim", second_token), json={}
+    )
+    assert reclaimed.status_code == 200
+    turn = reclaimed.json()["turn"]
+    assert turn["id"] == first["turn"]["id"]
+    assert turn["claim_attempts"] == 2
+    output = ProviderDisabledCoordinator(first_facade).assemble(
+        "Give a bounded status without taking action.",
+        [
+            ContextReference(
+                kind="task",
+                record_id=str(task["id"]),
+                expected_revision=int(task["revision"]),
+            )
+        ],
+    )
+    body = {"expected_revision": turn["revision"], **output.model_dump(mode="json")}
+    path = f"/astra/turns/{turn['id']}/complete"
+    completed = client.post(
+        path, headers=_headers(state, "reclaim-complete", second_token), json=body
+    )
+    replay = client.post(path, headers=_headers(state, "reclaim-complete", second_token), json=body)
+    assert completed.status_code == 200
+    assert replay.json() == completed.json()
+
+
+def test_ordinary_consumer_reports_unavailable_then_idle_when_no_work(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    initialize_state(state)
+    client = TestClient(create_app(state))
+    project = _project(client, state, "No consumer work")
+    token, facade = _agent(client, state, str(project["id"]))
+    before = client.get(
+        f"/astra/projects/{project['id']}/consumer-status", headers=_headers(state, "before")
+    )
+    assert before.json()["availability"] == "unavailable"
+    result = ProviderDisabledCoordinatorConsumer(client, token, facade).run_once()
+    assert result == {"availability": "idle", "provider_disabled": True, "provider_enabled": False}
+    after = client.get(
+        f"/astra/projects/{project['id']}/consumer-status", headers=_headers(state, "after")
+    )
+    assert after.json()["availability"] == "available"
+
+
+def test_consumer_status_never_treats_revoked_or_expired_heartbeat_as_available(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    initialize_state(state)
+    client = TestClient(create_app(state))
+    project = _project(client, state, "Consumer credential status")
+    token, facade = _agent(client, state, str(project["id"]))
+    ProviderDisabledCoordinatorConsumer(client, token, facade).run_once()
+
+    available = client.get(
+        f"/astra/projects/{project['id']}/consumer-status", headers=_headers(state, "available")
+    )
+    assert available.json()["credential_status"] == "active"
+    assert available.json()["freshness"] == "fresh"
+    assert available.json()["availability"] == "available"
+
+    with _connect(state / "tessera.sqlite3") as connection:
+        credential_id = connection.execute(
+            """SELECT c.id FROM credentials c JOIN principals p ON p.id=c.principal_id
+            WHERE p.token_hash=?""",
+            (_token_hash(token),),
+        ).fetchone()[0]
+    revoked = client.post(
+        f"/credentials/{credential_id}/revoke", headers=_headers(state, "revoke-consumer")
+    )
+    assert revoked.status_code == 200
+    status = client.get(
+        f"/astra/projects/{project['id']}/consumer-status", headers=_headers(state, "revoked")
+    ).json()
+    assert status["availability"] == "unavailable"
+    assert status["health"] == status["credential_status"] == "revoked"
+
+    # A different consumer credential can expire after its heartbeat. The old
+    # durable observation stays inspectable but cannot resurrect availability.
+    second, second_facade = _agent(client, state, str(project["id"]), "b" * 43)
+    ProviderDisabledCoordinatorConsumer(client, second, second_facade).run_once()
+    with _connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            """UPDATE credentials SET expires_at=? WHERE principal_id=(
+            SELECT id FROM principals WHERE token_hash=?)""",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), _token_hash(second)),
+        )
+    expired = client.get(
+        f"/astra/projects/{project['id']}/consumer-status", headers=_headers(state, "expired")
+    ).json()
+    assert expired["availability"] == "unavailable"
+    assert expired["health"] == expired["credential_status"] == "expired"
+
+
 def test_tenant_and_revision_fences_reject_stale_context(tmp_path: Path) -> None:
     state = tmp_path / "state"
     initialize_state(state)
@@ -393,7 +540,7 @@ def test_backup_restore_preserves_coordinator_proposal_and_registration_records(
         headers=_headers(state, "proposal-before-backup"),
     ).json()
     backup = tmp_path / "backup"
-    assert backup_state(state, backup)["schema_version"] == 43
+    assert backup_state(state, backup)["schema_version"] == LATEST_SCHEMA_VERSION
     restored = tmp_path / "restored"
     restore_state(backup, restored)
 
@@ -507,8 +654,11 @@ def test_v41_migration_adds_no_astra_records_or_authority(tmp_path: Path) -> Non
             "astra_project_conversations",
         ):
             connection.execute(f"DROP TABLE {table}")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=39")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with _connect(state / "tessera.sqlite3") as connection:
         conversation_count = connection.execute(
             "SELECT count(*) FROM astra_project_conversations"
@@ -577,9 +727,12 @@ def test_v40_to_v41_preserves_legacy_proposal_without_inventing_promotion(
         ).fetchone()
         connection.execute("DROP TABLE astra_proposal_design_registrations")
         connection.execute("ALTER TABLE astra_proposals DROP COLUMN design_json")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=40")
 
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with _connect(state / "tessera.sqlite3") as connection:
         migrated = connection.execute(
             "SELECT id,body,recap,status_json,created_at,created_by_principal_id "

@@ -3,9 +3,10 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
+from migration_fixture_helpers import strip_empty_runtime_v55
 from test_input_delivery import _delivery
 
-from tessera_control.migrations import MIGRATIONS
+from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from tessera_control.snapshot_releases import create_release_schema
 from tessera_control.snapshots import SnapshotStore
 from tessera_control.store import Store, initialize_state, migrate_state
@@ -58,6 +59,7 @@ def old_state(tmp_path):
         connection.execute("DROP TABLE artifact_dispositions")
         for table in AUTHORITY_TABLES:
             connection.execute(f"DROP TABLE {table}")
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=5")
     return state, actor, snapshot
 
@@ -66,10 +68,10 @@ def test_schema5_requires_migration_and_preserves_snapshot_bytes(tmp_path):
     state, actor, snapshot = old_state(tmp_path)
     with pytest.raises(ValueError, match="explicit"):
         Store(state)
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
     assert verified["integrity"] == "verified" and verified["digest"] == snapshot["digest"]
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
 
 def test_v13_worker_registry_migration_preserves_existing_records(tmp_path):
@@ -86,7 +88,7 @@ def test_v13_worker_registry_migration_preserves_existing_records(tmp_path):
         create_artifact_manifest_schema(connection)
         create_artifact_disposition_schema(connection)
         connection.execute("UPDATE schema_meta SET schema_version=13")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM worker_registry").fetchone()[0] == 0
     verified = SnapshotStore(state).verify_snapshot(actor, snapshot["id"])
@@ -117,7 +119,7 @@ def test_execution_schema_rollback_preserves_old_state(tmp_path, monkeypatch):
             ).fetchone()[0]
             == b"Retain exact bytes"
         )
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
 
 def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monkeypatch):
@@ -134,6 +136,7 @@ def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monk
         connection.execute("DROP TABLE skill_snapshots")
         for table in AUTHORITY_TABLES[14:]:
             connection.execute(f"DROP TABLE {table}")
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=7")
 
     def fail(connection):
@@ -154,8 +157,8 @@ def test_schema7_upload_migration_is_transactional_and_repeatable(tmp_path, monk
             ).fetchone()
             is None
         )
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
 
 def test_v17_operation_migration_never_backfills_legacy_leases_or_observations(tmp_path):
@@ -164,8 +167,9 @@ def test_v17_operation_migration_never_backfills_legacy_leases_or_observations(t
         connection.execute("DROP TABLE external_operations")
         for table in AUTHORITY_TABLES[14:]:
             connection.execute(f"DROP TABLE {table}")
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=17")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM external_operations").fetchone()[0] == 0
         assert (

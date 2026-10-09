@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tessera_agent import AgentCredential, AstraAgentFacade, ControlPlaneError, ForbiddenToolError
-from tessera_agent.facade import ToolInputError, UnknownToolError
+from tessera_agent.facade import ExecutionPlan, ProtocolError, ToolInputError, UnknownToolError
 from tessera_control.api import create_app
 from tessera_control.store import initialize_state
 from tessera_control.workspace import skill_manifest_digest
@@ -70,8 +70,10 @@ def facade(
     return agent, client, state_dir, project, other_project
 
 
+@pytest.mark.parametrize("profile", ["local-cpu", "kubernetes-opencode", "ordinary-docker"])
 def test_reads_task_and_current_plan_through_scoped_agent_api(
     facade: tuple[AstraAgentFacade, TestClient, Path, dict[str, object], dict[str, object]],
+    profile: str,
 ) -> None:
     agent, client, state_dir, project, _ = facade
     task = _task(client, state_dir, str(project["id"]))
@@ -90,11 +92,13 @@ def test_reads_task_and_current_plan_through_scoped_agent_api(
             "input_snapshot_digest": "1" * 64,
             "pinned_skill_digests": [],
             "output_paths": ["result.txt"],
-            "profile": "local-cpu",
+            "profile": profile,
             "network_enabled": False,
             "max_output_bytes": 1024,
         },
     }
+    if profile == "ordinary-docker":
+        plan["execution_spec"]["docker"] = _docker_pins()
     response = client.put(
         f"/tasks/{task['id']}/plan", headers=_owner_headers(state_dir, "plan"), json=plan
     )
@@ -103,6 +107,89 @@ def test_reads_task_and_current_plan_through_scoped_agent_api(
     assert read_plan.plan_digest == response.json()["plan_digest"]
     assert read_plan.execution_spec is not None
     assert read_plan.execution_spec.network_enabled is False
+    assert read_plan.execution_spec.model_dump() == plan["execution_spec"]
+    assert agent.provider_enabled is False
+    with pytest.raises(ForbiddenToolError):
+        agent.call("approve", {})
+
+
+def _docker_pins():
+    return {
+        "target_id": "approved-target",
+        "target_digest": "a" * 64,
+        "cpu_millicores": 1000,
+        "memory_bytes": 134217728,
+        "pids_limit": 32,
+        "scratch_bytes": 1048576,
+    }
+
+
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_legacy_execution_plan_preserves_shape_with_missing_or_null_docker(explicit_null):
+    plan = {
+        "argv": ["python"],
+        "input_snapshot_digest": "1" * 64,
+        "pinned_skill_digests": [],
+        "output_paths": [],
+        "profile": "local-cpu",
+        "network_enabled": False,
+        "max_output_bytes": 1024,
+    }
+    wire = {**plan, "docker": None} if explicit_null else plan
+    assert ExecutionPlan.model_validate(wire).model_dump() == plan
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "extra",
+        "missing",
+        "bool_cpu",
+        "cpu_range",
+        "memory_range",
+        "pids_range",
+        "scratch_range",
+        "digest",
+        "blank_target",
+        "missing_pins",
+        "wrong_profile",
+        "spec_extra",
+    ],
+)
+def test_facade_rejects_malformed_or_unbound_docker_plan(change):
+    plan = {
+        "argv": ["python"],
+        "input_snapshot_digest": "1" * 64,
+        "pinned_skill_digests": [],
+        "output_paths": [],
+        "profile": "ordinary-docker",
+        "network_enabled": False,
+        "max_output_bytes": 1024,
+        "docker": _docker_pins(),
+    }
+    mutations = {
+        "extra": ("privileged", True),
+        "bool_cpu": ("cpu_millicores", True),
+        "cpu_range": ("cpu_millicores", 2001),
+        "memory_range": ("memory_bytes", 1),
+        "pids_range": ("pids_limit", 129),
+        "scratch_range": ("scratch_bytes", 16777217),
+        "digest": ("target_digest", "not-a-digest"),
+        "blank_target": ("target_id", " "),
+    }
+    if change in mutations:
+        key, value = mutations[change]
+        plan["docker"][key] = value
+    elif change == "missing":
+        del plan["docker"]["target_digest"]
+    elif change == "missing_pins":
+        plan["docker"] = None
+    elif change == "wrong_profile":
+        plan["profile"] = "local-cpu"
+    else:
+        plan["container_options"] = {}
+    with pytest.raises(ProtocolError, match="outside the facade contract"):
+        AstraAgentFacade._model(ExecutionPlan, plan)
 
 
 def test_rejects_unknown_consequential_and_cross_project_reads(

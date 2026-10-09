@@ -34,6 +34,13 @@ unknown, foreign, or contradictory newer observations become authoritative
 `unknown` state and block collection; a succeeded Job additionally requires one
 or more explicitly observed owned Pods, all terminal `Succeeded`.
 
+`network_mode=none` requires fresh, target-bound `network-policy-enforced-v1`
+evidence: the declared policy name/UID/spec digest plus bounded probes showing a
+labelled allowed client can reach one server and a distinct labelled denied client
+cannot. A policy declaration, Pod phase, or requested network mode alone is not
+enforcement evidence. The evidence expires after 15 minutes and cannot be reused
+for another cluster or namespace.
+
 The local create-intent journal exists only to test lost-reply behavior. A caller
 persists intent before invoking its injected create callback; retry observes the
 same deterministic Job name rather than calling create again. Cancellation first
@@ -41,7 +48,10 @@ persists separate adapter and Job-journal desired-cancellation fences before any
 injected Kubernetes callback or inspection, including a failed inspection.
 Create admission rejects that fence across restart, including after a
 previously observed Job is deleted, so cancel-before-create invokes no create
-callback. Delete completion is never inferred from an acknowledgement: fresh
+callback. The real Docker Desktop callback uses the Kubernetes API UID
+precondition, so a name replacement between observation and delete is rejected;
+fake callbacks receive the same immutable `(name, uid)` requirement. Delete
+completion is never inferred from an acknowledgement: fresh
 injected reads must show both the Job and all owned Pods absent.
 
 ## Running the local unit contract

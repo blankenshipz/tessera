@@ -1,0 +1,88 @@
+name: tessera-remote-agent-platform
+
+x-service: &service
+  image: tessera-remote-agent-platform:reviewed
+  pull_policy: never
+  platform: linux/amd64
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  init: true
+  pids_limit: 64
+  cpus: 0.25
+  mem_limit: 384m
+  restart: unless-stopped
+  stop_grace_period: 40s
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1770,uid=65532,gid=65532"]
+  labels: {com.tessera.scope: remote-agent-platform}
+
+services:
+  control:
+    <<: *service
+    command: [tessera, serve, --state-dir, /state/control, --port, "8765", --bind-host, "0.0.0.0"]
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 128
+    networks: [private]
+    ports: ["127.0.0.1:18765:8765"]
+    volumes:
+      - type: bind
+        source: /srv/tessera-remote/control
+        target: /state/control
+        bind: {create_host_path: false}
+  peer-a:
+    <<: *service
+    network_mode: service:control
+    depends_on: [control]
+    command: [python, -m, tessera_agent.service_startup, a2a, --state-dir, /state/peer]
+    environment: {CREDENTIALS_DIRECTORY: /run/credentials/tessera}
+    volumes:
+      - type: bind
+        source: /srv/tessera-remote/peer-a/state
+        target: /state/peer
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/tessera-remote/peer-a/credentials
+        target: /run/credentials/tessera
+        read_only: true
+        bind: {create_host_path: false}
+  peer-b:
+    <<: *service
+    network_mode: service:control
+    depends_on: [control]
+    command: [python, -m, tessera_agent.service_startup, a2a, --state-dir, /state/peer]
+    environment: {CREDENTIALS_DIRECTORY: /run/credentials/tessera}
+    volumes:
+      - type: bind
+        source: /srv/tessera-remote/peer-b/state
+        target: /state/peer
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/tessera-remote/peer-b/credentials
+        target: /run/credentials/tessera
+        read_only: true
+        bind: {create_host_path: false}
+  research:
+    <<: *service
+    profiles: [research-admission-required]
+    restart: "no"
+    network_mode: service:control
+    depends_on: [control]
+    command: [python, -m, tessera_agent.service_startup, research, --state-dir, /state/research]
+    environment: {CREDENTIALS_DIRECTORY: /run/credentials/tessera}
+    volumes:
+      - type: bind
+        source: /srv/tessera-remote/research/state
+        target: /state/research
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/tessera-remote/research/credentials
+        target: /run/credentials/tessera
+        read_only: true
+        bind: {create_host_path: false}
+
+networks:
+  private:
+    internal: true
+    labels: {com.tessera.scope: remote-agent-platform}

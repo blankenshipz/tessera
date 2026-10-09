@@ -53,6 +53,12 @@ class ClaimCoordinatorTurn(AstraRequest):
     expected_revision: int = Field(ge=1)
 
 
+class ConsumerHeartbeat(AstraRequest):
+    """An ordinary coordinator's bounded, provider-disabled availability beat."""
+
+    pass
+
+
 class CompleteCoordinatorTurn(AstraRequest):
     expected_revision: int = Field(ge=1)
     status: Annotated[list[Body], Field(min_length=1, max_length=20)]

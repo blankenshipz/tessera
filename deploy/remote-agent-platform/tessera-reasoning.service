@@ -1,0 +1,40 @@
+[Unit]
+Description=Tessera admitted standalone reasoning supervisor (manual start only)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/tessera/reasoning.admitted
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=tessera-reasoning
+Group=tessera-reasoning
+UMask=0077
+StateDirectory=tessera-reasoning
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/tessera-reasoning
+LoadCredential=profile:/etc/tessera/reasoning.json
+LoadCredential=prompt:/etc/tessera/reasoning-prompt.txt
+LoadCredential=agent-token:/etc/tessera/credentials/reasoning-agent-token
+LoadCredential=harness-password:/etc/tessera/credentials/reasoning-harness-password
+ExecStart=/opt/tessera/venv/bin/python -m tessera_agent.service_startup reasoning --state-dir /var/lib/tessera-reasoning
+ExecStop=/opt/tessera/venv/bin/python -m tessera_agent.service_startup reasoning-stop --state-dir /var/lib/tessera-reasoning
+Restart=on-failure
+RestartPreventExitStatus=2 78
+RestartSec=5
+TimeoutStopSec=40
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/tessera-reasoning
+# Deliberately no [Install]/WantedBy: installing/enabling control cannot start inference.

@@ -39,6 +39,7 @@ def upload_artifact(
     expected_epoch: int,
     relative_path: str,
     content: bytes,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Transfer at most 16 MiB; a later call resumes after uncertain responses.
 
@@ -65,7 +66,10 @@ def upload_artifact(
     ):
         raise ArtifactTransferError("Invalid artifact path.")
     digest = hashlib.sha256(content).hexdigest()
-    operation_id = hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
+    if operation_id is None:
+        operation_id = hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        raise ArtifactTransferError("Invalid operation identity.")
     body = {
         "expected_epoch": expected_epoch,
         "operation_id": operation_id,
@@ -130,6 +134,7 @@ def upload_output_set(
     lease_id: str,
     expected_epoch: int,
     outputs: tuple[CollectedOutput, ...],
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Upload retained outputs and record a complete quarantined manifest.
 
@@ -148,6 +153,10 @@ def upload_output_set(
     ):
         raise ArtifactTransferError("Invalid lease identity or epoch.")
     seen: set[str] = set()
+    if operation_id is None:
+        operation_id = hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        raise ArtifactTransferError("Invalid operation identity.")
     total = 0
     for output in outputs:
         if (
@@ -172,6 +181,7 @@ def upload_output_set(
             expected_epoch=expected_epoch,
             relative_path=output.relative_path,
             content=output.content,
+            operation_id=operation_id,
         )
         artifact_id = receipt.get("id")
         if not isinstance(artifact_id, str) or not re.fullmatch(
@@ -186,7 +196,6 @@ def upload_output_set(
                 "size": len(output.content),
             }
         )
-    operation_id = hashlib.sha256(f"tessera-cpu-v1:{lease_id}".encode()).hexdigest()[:32]
     placement_body = {
         "expected_epoch": expected_epoch,
         "operation_id": operation_id,

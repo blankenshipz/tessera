@@ -58,6 +58,10 @@ class ProjectArtifactBackend(Protocol):
         self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
     ) -> ProjectArtifactPlacement | None: ...
 
+    def read(
+        self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
+    ) -> bytes: ...
+
     def delete(
         self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
     ) -> bool: ...
@@ -343,6 +347,49 @@ class FilesystemProjectArtifactBackend:
             raise ProjectArtifactStorageError("Project artifact placement is corrupt or conflicts.")
         return ProjectArtifactPlacement(tenant, project, object_key, sha256, size)
 
+    def read(
+        self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
+    ) -> bytes:
+        """Read one exact private object after its identity and bytes revalidate."""
+        observed = self.inspect(
+            tenant_id, project_id, artifact_id, placement.sha256, placement.size
+        )
+        if observed != placement:
+            raise ProjectArtifactStorageError("Project artifact placement is missing or conflicts.")
+        self._root()
+        namespace = self.root / placement.tenant_namespace / placement.project_namespace
+        self._directory(namespace)
+        target = namespace / placement.object_key
+        try:
+            descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or info.st_size != placement.size
+                ):
+                    raise ProjectArtifactStorageError(
+                        "Project artifact placement is corrupt or conflicts."
+                    )
+                content = bytearray()
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    content.extend(chunk)
+                    if len(content) > placement.size:
+                        raise ProjectArtifactStorageError(
+                            "Project artifact placement is corrupt or conflicts."
+                        )
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise ProjectArtifactStorageError(
+                "Project artifact placement is unavailable."
+            ) from error
+        result = bytes(content)
+        if len(result) != placement.size or hashlib.sha256(result).hexdigest() != placement.sha256:
+            raise ProjectArtifactStorageError("Project artifact placement is corrupt or conflicts.")
+        return result
+
     def delete(
         self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
     ) -> bool:
@@ -460,6 +507,16 @@ class FakeProjectArtifactBackend:
         self, tenant_id: str, project_id: str, artifact_id: str, sha256: str, size: int
     ) -> ProjectArtifactPlacement | None:
         return self.reconcile(tenant_id, project_id, artifact_id, sha256, size)
+
+    def read(
+        self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement
+    ) -> bytes:
+        observed = self.inspect(
+            tenant_id, project_id, artifact_id, placement.sha256, placement.size
+        )
+        if observed != placement:
+            raise ProjectArtifactStorageError("Project artifact placement is missing or conflicts.")
+        return self.objects[(tenant_id, project_id, artifact_id)]
 
     def delete(
         self, tenant_id: str, project_id: str, artifact_id: str, placement: ProjectArtifactPlacement

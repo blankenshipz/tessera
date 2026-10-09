@@ -190,6 +190,11 @@ class RemoteWorkflowStore(ExecutionStore):
             raise NotFound("Remote workflow was not found.")
         if row["lease_id"] != lease_id or row["epoch"] != epoch:
             raise Conflict("Remote workflow lease identity is no longer current.")
+        if connection.execute(
+            "SELECT 1 FROM execution_recovery_reconciliations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone():
+            raise Conflict("Original worker identity is fenced pending independent recovery.")
         grant = self._grant(connection, worker, row["grant_id"])
         if grant["status"] not in UNRESOLVED_GRANT_STATUSES:
             raise Conflict("Remote workflow authority has already been reconciled.")
@@ -203,8 +208,11 @@ class RemoteWorkflowStore(ExecutionStore):
         try:
             self._project(connection, actor, project_id)
             rows = connection.execute(
+                # Updated-at changes with ordinary observations and cannot be a
+                # pagination key: a heartbeat could otherwise move a row between
+                # offset pages and duplicate or hide it after reconnect.
                 """SELECT * FROM remote_workflow_runs WHERE project_id=?
-                ORDER BY updated_at DESC,operation_id DESC LIMIT ? OFFSET ?""",
+                ORDER BY created_at DESC,operation_id DESC LIMIT ? OFFSET ?""",
                 (project_id, limit, offset),
             ).fetchall()
             return [self._response(connection, row) for row in rows]

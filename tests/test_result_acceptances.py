@@ -366,7 +366,7 @@ def test_result_acceptance_rolls_back_record_event_and_replay(
 def test_v19_to_v20_result_acceptance_migration_is_empty_and_rolls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from tessera_control.migrations import MIGRATIONS
+    from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 
     state, _owner, _worker, _grant, _lease, manifest, first, checkpoint, _receipt_digest = (
         _checkpoint_with_receipt(tmp_path)
@@ -384,8 +384,11 @@ def test_v19_to_v20_result_acceptance_migration_is_empty_and_rolls_back(
             "execution_result_acceptances",
         ):
             connection.execute(f"DROP TABLE IF EXISTS {table}")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=19")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM execution_result_acceptances").fetchone()[0]
@@ -399,6 +402,7 @@ def test_v19_to_v20_result_acceptance_migration_is_empty_and_rolls_back(
         ).fetchone()
         assert connection.execute("SELECT id FROM artifacts WHERE id=?", (first["id"],)).fetchone()
         connection.execute("DROP TABLE execution_result_acceptances")
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=19")
 
     def fail(connection):

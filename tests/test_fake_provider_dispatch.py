@@ -11,6 +11,7 @@ from test_runtime import ApiChannel
 from test_supervisor import FakeAdapter
 
 from tessera_control.execution import ExecutionStore
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.store import Conflict, _connect, canonical_digest
 from tessera_worker.provider import FakeProvider
 from tessera_worker.runtime import CpuRuntime
@@ -122,8 +123,11 @@ def test_v18_to_v19_receipt_migration_does_not_invent_receipts(tmp_path):
             "external_operation_receipts",
         ):
             connection.execute(f"DROP TABLE IF EXISTS {table}")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=18")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM external_operation_receipts").fetchone()[0]
@@ -139,6 +143,9 @@ def test_v19_receipt_migration_rolls_back_without_a_partial_table(tmp_path, monk
     initialize_state(state)
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE external_operation_receipts")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=18")
 
     def fail(connection):

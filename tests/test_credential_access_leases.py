@@ -271,7 +271,7 @@ def test_foreign_worker_cannot_access_a_tenant_scoped_lease(tmp_path):
 
 
 def test_v20_migration_creates_no_credential_access_leases_and_rolls_back(tmp_path, monkeypatch):
-    from tessera_control.migrations import MIGRATIONS
+    from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
     from tessera_control.store import initialize_state
 
     state = tmp_path / "state"
@@ -281,8 +281,11 @@ def test_v20_migration_creates_no_credential_access_leases_and_rolls_back(tmp_pa
         from schema_fixtures import drop_empty_experiment_schema
 
         drop_empty_experiment_schema(connection)
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=20")
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert (
             connection.execute("SELECT count(*) FROM credential_access_leases").fetchone()[0] == 0
@@ -290,6 +293,7 @@ def test_v20_migration_creates_no_credential_access_leases_and_rolls_back(tmp_pa
 
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute("DROP TABLE credential_access_leases")
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=20")
 
     def fail(connection):

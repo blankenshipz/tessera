@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -29,6 +30,7 @@ MAX_BACKUP_OBJECTS = 1024
 MAX_PROJECT_OBJECT_BYTES = 16 * 1024 * 1024
 LEGACY_BACKUP_FORMAT_VERSION = 1
 BACKUP_FORMAT_VERSION = 2
+_LOG = logging.getLogger(__name__)
 
 
 def create_recovery_schema(connection: sqlite3.Connection) -> None:
@@ -487,7 +489,91 @@ def _validate_bundle_declaration(snapshot: Path, manifest: dict[str, Any], start
         raise StoreError("Backup project artifact declaration does not match its control snapshot.")
 
 
+def _record_backup_health(
+    state_dir: Path, *, manifest: dict[str, Any] | None, failure: bool
+) -> None:
+    """Best-effort local backup status without changing backup success semantics."""
+    try:
+        # Never open a supplied source read/write merely to report a backup
+        # outcome. In particular, a held copy and any unsafe path stay untouched.
+        if state_dir.is_symlink() or not state_dir.is_dir():
+            _LOG.warning(
+                "Backup health was not recorded because its source state directory is unsafe."
+            )
+            return
+        database = state_dir / DATABASE_NAME
+        info = database.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            _LOG.warning("Backup health was not recorded because its source database is unsafe.")
+            return
+        connection = sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=1)
+        connection.row_factory = sqlite3.Row
+        try:
+            recovery = connection.execute(
+                "SELECT state FROM control_recovery WHERE singleton=1"
+            ).fetchone()
+        finally:
+            connection.close()
+        if recovery is None:
+            return
+        if recovery[0] == "held_restore":
+            # A held restore is an immutable audit copy. Retain backup health in
+            # a sibling operational sink, not in the held database or directory.
+            from .observability import record_held_backup_health
+
+            record_held_backup_health(
+                state_dir,
+                backup_id=None if manifest is None else manifest["backup_id"],
+                failure=failure,
+            )
+            return
+        if recovery[0] != "active":
+            return
+        connection = _connect(database)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute(
+                    "SELECT state FROM control_recovery WHERE singleton=1"
+                ).fetchone()["state"]
+                != "active"
+            ):
+                connection.execute("ROLLBACK")
+                return
+            if failure:
+                connection.execute(
+                    """UPDATE operator_backup_health SET last_failure_at=?,
+                    last_failure_code='backup_failed' WHERE singleton=1""",
+                    (utc_now(),),
+                )
+            else:
+                assert manifest is not None
+                connection.execute(
+                    """UPDATE operator_backup_health SET last_success_at=?,last_backup_id=?,
+                    last_failure_at=NULL,last_failure_code=NULL WHERE singleton=1""",
+                    (utc_now(), manifest["backup_id"]),
+                )
+            connection.execute("COMMIT")
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        # A failed/unopenable source cannot reliably retain a health record. The
+        # caller still receives the original backup result and must alert externally.
+        _LOG.warning("Backup health could not be recorded.", exc_info=True)
+
+
 def backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
+    """Copy one SQLite-consistent snapshot and record best-effort backup health."""
+    try:
+        manifest = _backup_state(state_dir, output)
+    except StoreError:
+        _record_backup_health(state_dir, manifest=None, failure=True)
+        raise
+    _record_backup_health(state_dir, manifest=manifest, failure=False)
+    return manifest
+
+
+def _backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
     """Copy one SQLite-consistent snapshot; source state remains active."""
     if state_dir.is_symlink() or not state_dir.is_dir():
         raise StoreError("Source state directory is unsafe.")

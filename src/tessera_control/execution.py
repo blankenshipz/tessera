@@ -12,9 +12,14 @@ from pydantic import ValidationError
 
 from .execution_models import (
     AcquireExecutionLease,
+    AttestKubernetesNeverSubmitted,
     ConfigureProjectExecution,
     IssueExecutionGrant,
+    OwnerPreManifestNoStart,
+    ReconcileAttestedNeverSubmitted,
     ReconcileExecutionGrant,
+    ReconcileExpiredUnattemptedGrant,
+    RecoveryReconciliation,
     RenewExecutionLease,
     ReportExecutionObservation,
     ReportExternalOperationReceipt,
@@ -38,6 +43,37 @@ MAX_GRANT_LIFETIME = timedelta(hours=24)
 MAX_CENTS = 2**63 - 1
 MAX_OBSERVATION_FUTURE_SKEW = timedelta(seconds=5)
 UNRESOLVED_GRANT_STATUSES = ("active", "cancel_requested")
+
+
+def _only_unconfirmed_worker_unknown(connection: sqlite3.Connection, operation_id: str) -> bool:
+    """A pre-manifest no-start can coexist with the original worker's unknown reports.
+
+    Do not erase those reports or accept provider identity, running/exited evidence,
+    a receipt, or recovery-observer evidence as proof of never submitting a Job.
+    """
+    reconciliation = current_operation_reconciliation(connection, operation_id)
+    if reconciliation is None:
+        return True
+    sources = reconciliation.get("sources")
+    if (
+        reconciliation.get("observed_state") != "unknown"
+        or reconciliation.get("contradiction_state") != "unconfirmed_current_observation"
+        or not isinstance(sources, list)
+        or not sources
+        or any(
+            source.get("source") != "worker"
+            or source.get("observed_state") != "unknown"
+            or source.get("termination_confirmed") is not False
+            for source in sources
+        )
+    ):
+        return False
+    contradicted = connection.execute(
+        "SELECT count(*) FROM execution_observations WHERE operation_id=? "
+        "AND (observed_state!='unknown' OR termination_confirmed!=0 OR provider_id IS NOT NULL)",
+        (operation_id,),
+    ).fetchone()[0]
+    return contradicted == 0
 
 
 def create_execution_schema(connection: sqlite3.Connection) -> None:
@@ -220,6 +256,15 @@ class ExecutionStore(Store):
         value["execution_dispatched"] = False
         value["operational_only"] = True
         value["cancellation"] = self._cancellation_payload(connection, row)
+        recovery = connection.execute(
+            """SELECT id,state,revision,operation_id,identity_loss_reason,cancellation_requested,
+            created_at,updated_at,closed_at FROM execution_recovery_reconciliations
+            WHERE grant_id=? ORDER BY created_at,id LIMIT 1""",
+            (row["id"],),
+        ).fetchone()
+        value["recovery_reconciliation"] = (
+            self._recovery_response(connection, recovery) if recovery is not None else None
+        )
         return value
 
     @staticmethod
@@ -228,6 +273,136 @@ class ExecutionStore(Store):
         value["execution_dispatched"] = False
         value["operational_only"] = True
         return value
+
+    @staticmethod
+    def _recovery_response(
+        connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
+    ) -> dict[str, Any]:
+        """Expose recovery/evidence references without observer credentials."""
+        value = dict(row)
+        value["cancellation_requested"] = bool(value["cancellation_requested"])
+        observations = connection.execute(
+            """SELECT id,action,evidence_reference,evidence_digest,provider_id,observed_state,
+            observed_at,termination_confirmed,recorded_at FROM execution_recovery_observations
+            WHERE recovery_id=? ORDER BY recorded_at,id""",
+            (value["id"],),
+        ).fetchall()
+        value["evidence"] = [
+            {
+                **dict(observation),
+                "termination_confirmed": bool(observation["termination_confirmed"]),
+            }
+            for observation in observations
+        ]
+        value["operational_only"] = True
+        return value
+
+    def _identity_loss_reason(
+        self, connection: sqlite3.Connection, operation: sqlite3.Row | dict[str, Any]
+    ) -> str:
+        """Prove loss from durable identity state; never infer workload termination."""
+        principal = connection.execute(
+            "SELECT revoked_at FROM principals WHERE id=? AND org_id=?",
+            (operation["worker_principal_id"], operation["org_id"]),
+        ).fetchone()
+        if principal is None or principal["revoked_at"] is not None:
+            return "principal_revoked"
+        credential = connection.execute(
+            """SELECT revoked_at,expires_at FROM credentials WHERE principal_id=?
+            AND audience='worker'""",
+            (operation["worker_principal_id"],),
+        ).fetchone()
+        if credential is None or credential["revoked_at"] is not None:
+            return "credential_revoked"
+        try:
+            if _parse_utc(credential["expires_at"]) <= self._now():
+                return "credential_expired"
+        except (TypeError, ValueError):
+            return "credential_expired"
+        worker = connection.execute(
+            """SELECT lifecycle_state FROM worker_registry WHERE worker_principal_id=?
+            AND org_id=? AND project_id=?""",
+            (operation["worker_principal_id"], operation["org_id"], operation["project_id"]),
+        ).fetchone()
+        if worker is None:
+            return "registry_missing"
+        if worker["lifecycle_state"] == "retired":
+            return "worker_retired"
+        raise Conflict(
+            "Original worker identity remains live; independent recovery is not authorized."
+        )
+
+    def _record_identity_loss(
+        self,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        operation: sqlite3.Row | dict[str, Any],
+        reason: str,
+    ) -> sqlite3.Row:
+        existing = connection.execute(
+            "SELECT * FROM execution_recovery_reconciliations WHERE operation_id=?",
+            (operation["operation_id"],),
+        ).fetchone()
+        if existing is not None:
+            return existing
+        now = utc_now()
+        row = {
+            "id": "recovery_" + uuid.uuid4().hex,
+            "org_id": operation["org_id"],
+            "project_id": operation["project_id"],
+            "task_id": operation["task_id"],
+            "grant_id": operation["grant_id"],
+            "lease_id": operation["lease_id"],
+            "epoch": operation["epoch"],
+            "operation_id": operation["operation_id"],
+            "original_worker_principal_id": operation["worker_principal_id"],
+            "identity_loss_reason": reason,
+            "state": "identity_lost",
+            "revision": 1,
+            "cancellation_requested": 0,
+            "created_at": now,
+            "updated_at": now,
+            "closed_at": None,
+            "closed_by_principal_id": None,
+        }
+        connection.execute(
+            """INSERT INTO execution_recovery_reconciliations
+            (id,org_id,project_id,task_id,grant_id,lease_id,epoch,operation_id,
+             original_worker_principal_id,identity_loss_reason,state,revision,cancellation_requested,
+             created_at,updated_at,closed_at,closed_by_principal_id)
+            VALUES (:id,:org_id,:project_id,:task_id,:grant_id,:lease_id,:epoch,:operation_id,
+            :original_worker_principal_id,:identity_loss_reason,:state,:revision,
+            :cancellation_requested,:created_at,:updated_at,:closed_at,:closed_by_principal_id)""",
+            row,
+        )
+        self._event(
+            connection,
+            actor,
+            operation["project_id"],
+            operation["task_id"],
+            "execution.recovery_identity_lost",
+            1,
+            {
+                "recovery_id": row["id"],
+                "grant_id": row["grant_id"],
+                "lease_id": row["lease_id"],
+                "epoch": row["epoch"],
+                "operation_id": row["operation_id"],
+                "original_worker_principal_id": row["original_worker_principal_id"],
+                "identity_loss_reason": reason,
+                "operational_only": True,
+            },
+        )
+        return connection.execute(
+            "SELECT * FROM execution_recovery_reconciliations WHERE id=?", (row["id"],)
+        ).fetchone()
+
+    @staticmethod
+    def _fence_recovered_operation(connection: sqlite3.Connection, operation_id: str) -> None:
+        if connection.execute(
+            "SELECT 1 FROM execution_recovery_reconciliations WHERE operation_id=?", (operation_id,)
+        ).fetchone():
+            raise Conflict("Original worker identity is fenced pending independent recovery.")
 
     def _limit(
         self, connection: sqlite3.Connection, principal: dict[str, Any], project_id: str
@@ -508,7 +683,7 @@ class ExecutionStore(Store):
             except (TypeError, json.JSONDecodeError) as error:
                 raise Conflict("Task execution specification is invalid.") from error
             if (
-                spec.get("profile") not in {"local-cpu", "kubernetes-opencode"}
+                spec.get("profile") not in {"local-cpu", "kubernetes-opencode", "ordinary-docker"}
                 or spec.get("network_enabled") is not False
             ):
                 raise Conflict(
@@ -520,6 +695,15 @@ class ExecutionStore(Store):
             worker = self._worker(
                 connection, actor["org_id"], payload["worker_principal_id"], project_id
             )
+            docker_target_bounds = None
+            if spec["profile"] == "ordinary-docker":
+                from .ordinary_docker import OrdinaryDockerStore
+
+                _, docker_target_bounds = OrdinaryDockerStore(
+                    self.database_path.parent
+                ).validate_plan(
+                    connection, actor, project_id, worker["id"], spec, payload["pinned_image"]
+                )
             from .skills import authorize_skill_release
 
             skill_releases = [
@@ -530,6 +714,10 @@ class ExecutionStore(Store):
                 connection, actor, payload["snapshot_id"], worker["id"], expected_digest
             )
             expiry = self._parse_future(payload["expires_at"], MAX_GRANT_LIFETIME, "Grant expiry")
+            if docker_target_bounds is not None and expiry > _parse_utc(
+                docker_target_bounds["expires_at"]
+            ):
+                raise Conflict("Execution grant cannot outlive human Docker target enrollment.")
             try:
                 release_expiry = _parse_utc(release["expires_at"])
             except (KeyError, TypeError, ValueError) as error:
@@ -684,6 +872,229 @@ class ExecutionStore(Store):
         finally:
             connection.close()
 
+    def list_recovery_reconciliations(
+        self, principal: dict[str, Any], grant_id: str
+    ) -> list[dict[str, Any]]:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._live_principal(connection, principal)
+            grant = self._grant(connection, actor, grant_id)
+            rows = connection.execute(
+                """SELECT * FROM execution_recovery_reconciliations WHERE grant_id=?
+                ORDER BY created_at,id""",
+                (grant["id"],),
+            ).fetchall()
+            return [self._recovery_response(connection, row) for row in rows]
+        finally:
+            connection.close()
+
+    def reconcile_lost_worker_operation(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Record one independent, operation-bound recovery observation.
+
+        This command intentionally has no worker audience and cannot construct a
+        lease, package, dispatch, or replacement operation.  Its only external
+        effect is a durable desired cancellation fence when explicitly requested.
+        """
+        payload = self._body(RecoveryReconciliation, payload)
+        evidence_fields = (
+            "observed_state",
+            "observed_at",
+            "provider_id",
+            "evidence_reference",
+            "evidence_digest",
+        )
+        evidence_values = [payload[field] is not None for field in evidence_fields]
+        if any(evidence_values) and not all(evidence_values):
+            raise StoreError("Recovery evidence must be complete.")
+        if payload["termination_confirmed"] and not all(evidence_values):
+            raise StoreError("Recovery termination confirmation requires evidence.")
+        has_evidence = all(evidence_values)
+        path = f"/execution-grants/{grant_id}/recovery-reconciliations"
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._require_human(actor)
+            grant = self._grant(connection, actor, grant_id)
+            if grant["revision"] != payload["expected_grant_revision"]:
+                raise Conflict("Execution grant revision is no longer current.")
+            operation = connection.execute(
+                """SELECT * FROM external_operations WHERE operation_id=? AND grant_id=?
+                AND org_id=?""",
+                (payload["operation_id"], grant_id, actor["org_id"]),
+            ).fetchone()
+            if operation is None:
+                journaled = connection.execute(
+                    "SELECT 1 FROM external_operations WHERE grant_id=?", (grant_id,)
+                ).fetchone()
+                if journaled is None:
+                    raise Conflict(
+                        "Execution grant has no journaled external operation to recover."
+                    )
+                raise Conflict("Recovery operation identity does not match this execution grant.")
+            expected_identity = {
+                "project_id": grant["project_id"],
+                "task_id": grant["task_id"],
+                "worker_principal_id": grant["worker_principal_id"],
+            }
+            if any(operation[field] != value for field, value in expected_identity.items()):
+                raise Conflict("Journaled external operation authority does not match its grant.")
+            if has_evidence and (
+                operation["provider_id"] is None
+                or operation["provider_id"] != payload["provider_id"]
+            ):
+                raise Conflict(
+                    "Recovery evidence provider identity does not match the known external "
+                    "operation."
+                )
+            recovery = connection.execute(
+                "SELECT * FROM execution_recovery_reconciliations WHERE operation_id=?",
+                (operation["operation_id"],),
+            ).fetchone()
+            if recovery is None:
+                if payload["expected_recovery_revision"] != 0:
+                    raise Conflict(
+                        "Recovery reconciliation has not been created at the expected revision."
+                    )
+                recovery = self._record_identity_loss(
+                    connection, actor, operation, self._identity_loss_reason(connection, operation)
+                )
+            elif recovery["revision"] != payload["expected_recovery_revision"]:
+                raise Conflict("Recovery reconciliation revision is no longer current.")
+            if grant["status"] not in UNRESOLVED_GRANT_STATUSES:
+                raise Conflict("Execution authority has already been reconciled.")
+
+            updated_grant = grant
+            cancellation_requested = bool(recovery["cancellation_requested"])
+            if payload["request_cancellation"]:
+                cancellation_requested = True
+                if grant["status"] == "active":
+                    updated_grant, _operation_ids = self._request_grant_cancellation(
+                        connection, grant, grant["revision"]
+                    )
+
+            current_before = current_operation_reconciliation(connection, operation["operation_id"])
+            if has_evidence:
+                observed_at = _parse_utc(payload["observed_at"])
+                if observed_at < _parse_utc(operation["created_at"]):
+                    raise Conflict("Recovery evidence predates the external operation intent.")
+                if observed_at > self._now() + MAX_OBSERVATION_FUTURE_SKEW:
+                    raise Conflict("Recovery evidence timestamp is in the future.")
+                if current_before is not None:
+                    current_observed_at = _parse_utc(str(current_before["observed_at"]))
+                    if observed_at < current_observed_at:
+                        raise Conflict(
+                            "Recovery evidence predates the current operation reconciliation."
+                        )
+                    if (
+                        recovery["state"] in {"terminal_confirmed", "unresolved"}
+                        and observed_at <= current_observed_at
+                    ):
+                        raise Conflict(
+                            "A closed recovery requires a strictly newer explicit correction."
+                        )
+            elif recovery["state"] in {"terminal_confirmed", "unresolved"}:
+                raise Conflict("Recovery reconciliation is already closed.")
+            if has_evidence:
+                connection.execute(
+                    """INSERT INTO execution_recovery_observations
+                    (id,recovery_id,observer_principal_id,action,evidence_reference,evidence_digest,
+                     provider_id,observed_state,observed_at,termination_confirmed,recorded_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        "recovery_observation_" + uuid.uuid4().hex,
+                        recovery["id"],
+                        actor["id"],
+                        "cancel_lookup" if payload["request_cancellation"] else "lookup",
+                        payload["evidence_reference"],
+                        payload["evidence_digest"],
+                        payload["provider_id"],
+                        payload["observed_state"],
+                        _utc_string(observed_at),
+                        int(payload["termination_confirmed"]),
+                        utc_now(),
+                    ),
+                )
+                current = current_operation_reconciliation(connection, operation["operation_id"])
+                assert current is not None
+                if current["observed_state"] == "exited" and current["termination_confirmed"]:
+                    state, closed = "terminal_confirmed", True
+                elif current["observed_state"] == "unknown":
+                    state, closed = "unresolved", True
+                else:
+                    state, closed = "independently_observed", False
+            elif cancellation_requested:
+                state, closed = "cancel_requested", False
+            else:
+                state, closed = "reconciliation_required", False
+            now = utc_now()
+            revision = recovery["revision"] + 1
+            connection.execute(
+                """UPDATE execution_recovery_reconciliations SET state=?,revision=?,
+                cancellation_requested=?,updated_at=?,closed_at=?,closed_by_principal_id=?
+                WHERE id=? AND revision=?""",
+                (
+                    state,
+                    revision,
+                    int(cancellation_requested),
+                    now,
+                    now if closed else None,
+                    actor["id"] if closed else None,
+                    recovery["id"],
+                    recovery["revision"],
+                ),
+            )
+            current = current_operation_reconciliation(connection, operation["operation_id"])
+            if current is not None:
+                connection.execute(
+                    """UPDATE external_operations SET observed_state=?,updated_at=?
+                    WHERE operation_id=?""",
+                    (current["observed_state"], now, operation["operation_id"]),
+                )
+                from .remote_workflows import sync_remote_workflow_observation
+
+                sync_remote_workflow_observation(connection, operation["operation_id"])
+                from .experiments import record_admitted_attempt_observation
+
+                record_admitted_attempt_observation(connection, operation, actor)
+            row = connection.execute(
+                "SELECT * FROM execution_recovery_reconciliations WHERE id=?", (recovery["id"],)
+            ).fetchone()
+            assert row is not None
+            self._event(
+                connection,
+                actor,
+                grant["project_id"],
+                grant["task_id"],
+                f"execution.recovery_{state}",
+                revision,
+                {
+                    "recovery_id": recovery["id"],
+                    "grant_id": grant_id,
+                    "lease_id": operation["lease_id"],
+                    "epoch": operation["epoch"],
+                    "operation_id": operation["operation_id"],
+                    "request_cancellation": payload["request_cancellation"],
+                    "evidence_reference": payload["evidence_reference"],
+                    "evidence_digest": payload["evidence_digest"],
+                    "terminal_confirmed": state == "terminal_confirmed",
+                    "operational_only": True,
+                },
+            )
+            return 201, {
+                "recovery": self._recovery_response(connection, row),
+                "grant": self._grant_response(connection, updated_grant),
+            }
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
     def revoke_execution_grant(
         self,
         principal: dict[str, Any],
@@ -697,10 +1108,18 @@ class ExecutionStore(Store):
         )["expected_revision"]
         path = f"/execution-grants/{grant_id}/revoke"
 
+        def command(connection, actor):
+            self._require_human(actor)
+            return self._cancel_grant_transaction(connection, actor, grant_id, expected_revision)
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
+    def _cancel_grant_transaction(self, connection, actor, grant_id, expected_revision):
+        """Desired-state cancellation; caller has already admitted human or bounded authority."""
+
         def command(
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
-            self._require_human(actor)
             grant = self._grant(connection, actor, grant_id)
             if grant["revision"] != expected_revision:
                 raise Conflict("Execution grant revision is no longer current.")
@@ -728,7 +1147,7 @@ class ExecutionStore(Store):
             )
             return 200, self._grant_response(connection, updated)
 
-        return self._mutate(principal, key, "POST", path, digest, command)
+        return command(connection, actor)
 
     def _active_worker_grant(
         self, connection: sqlite3.Connection, worker: dict[str, Any], grant_id: str
@@ -741,6 +1160,9 @@ class ExecutionStore(Store):
         WorkerRegistryStore.require_ready_worker(connection, worker, grant["project_id"])
         if grant["status"] != "active":
             raise Conflict("Execution grant is not active for lease authority.")
+        from .agent_authority import require_execution_agent_authority
+
+        require_execution_agent_authority(connection, grant_id)
         now = self._now()
         try:
             expiry = _parse_utc(grant["expires_at"])
@@ -755,6 +1177,24 @@ class ExecutionStore(Store):
             or task["current_plan_digest"] != grant["plan_digest"]
         ):
             raise Conflict("Execution grant task basis is no longer current.")
+        spec_row = connection.execute(
+            "SELECT execution_spec_json FROM task_revisions WHERE task_id=? AND plan_digest=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (grant["task_id"], grant["plan_digest"]),
+        ).fetchone()
+        if spec_row is not None and spec_row[0] is not None:
+            spec = json.loads(spec_row[0])
+            if spec.get("profile") == "ordinary-docker":
+                from .ordinary_docker import OrdinaryDockerStore
+
+                OrdinaryDockerStore(self.database_path.parent).validate_plan(
+                    connection,
+                    worker,
+                    grant["project_id"],
+                    worker["id"],
+                    spec,
+                    grant["pinned_image"],
+                )
         issuer = self._live_principal(
             connection,
             {"id": grant["created_by_principal_id"], "org_id": worker["org_id"]},
@@ -1041,6 +1481,7 @@ class ExecutionStore(Store):
                 "SELECT * FROM external_operations WHERE lease_id=?", (lease_id,)
             ).fetchone()
             if operation is not None:
+                self._fence_recovered_operation(connection, operation["operation_id"])
                 expected_binding = {
                     "operation_id": payload.get("operation_id"),
                     "org_id": worker["org_id"],
@@ -1234,6 +1675,7 @@ class ExecutionStore(Store):
             ).fetchone()
             if operation is None or operation["worker_principal_id"] != worker["id"]:
                 raise NotFound("External operation was not found.")
+            self._fence_recovered_operation(connection, operation_id)
             if (
                 operation["org_id"] != worker["org_id"]
                 or operation["lease_id"] != payload["lease_id"]
@@ -1383,10 +1825,10 @@ class ExecutionStore(Store):
             leases = connection.execute(
                 "SELECT count(*) FROM execution_leases WHERE grant_id = ?", (grant_id,)
             ).fetchone()[0]
-            if leases:
-                operation = connection.execute(
-                    "SELECT operation_id FROM external_operations WHERE grant_id=?", (grant_id,)
-                ).fetchone()
+            operation = connection.execute(
+                "SELECT operation_id FROM external_operations WHERE grant_id=?", (grant_id,)
+            ).fetchone()
+            if leases or operation is not None:
                 if operation is not None:
                     reconciliation = current_operation_reconciliation(
                         connection, operation["operation_id"]
@@ -1411,8 +1853,11 @@ class ExecutionStore(Store):
                         or not observation["termination_confirmed"]
                     ):
                         raise Conflict("Authenticated worker termination confirmation is required.")
-            elif payload["settlement_cents"] != 0:
-                raise Conflict("An unleased execution grant may reconcile only zero settlement.")
+            else:
+                raise Conflict(
+                    "Unattempted authority requires expired zero-attempt reconciliation; "
+                    "provider termination is not inferred."
+                )
             limits = self._limit(connection, actor, grant["project_id"])
             if payload["settlement_cents"] > MAX_CENTS - limits["settled_cents"]:
                 raise Conflict("Settlement exceeds the supported durable ledger range.")
@@ -1464,6 +1909,765 @@ class ExecutionStore(Store):
                     "grant_id": grant_id,
                     "settlement_cents": payload["settlement_cents"],
                     "currency": limits["currency"],
+                    "operational_only": True,
+                },
+            )
+            return 200, self._grant_response(connection, updated)
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
+    def reconcile_expired_unattempted_grant(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Close only expired local authority with no admitted attempt.
+
+        This is an accounting/revocation action, not provider reconciliation.  A
+        durable lease or operation intent is enough to reject it, even when no
+        provider receipt exists: those records require the ordinary cancellation
+        and evidence path instead of a zero-settlement shortcut.
+        """
+        payload = self._body(ReconcileExpiredUnattemptedGrant, payload)
+        path = f"/execution-grants/{grant_id}/reconcile-expired-unattempted"
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._require_human(actor)
+            grant = self._grant(connection, actor, grant_id)
+            if grant["revision"] != payload["expected_revision"]:
+                raise Conflict("Execution grant revision is no longer current.")
+            if grant["status"] == "reconciled":
+                raise Conflict("Execution authority is already reconciled.")
+            try:
+                expired = _parse_utc(grant["expires_at"]) <= self._now()
+            except (TypeError, ValueError) as error:
+                raise Conflict("Execution grant expiry is invalid.") from error
+            if not expired:
+                raise Conflict("Execution grant has not expired.")
+            lease_count = connection.execute(
+                "SELECT count(*) FROM execution_leases WHERE grant_id=?", (grant_id,)
+            ).fetchone()[0]
+            operation_count = connection.execute(
+                "SELECT count(*) FROM external_operations WHERE grant_id=?", (grant_id,)
+            ).fetchone()[0]
+            if lease_count or operation_count:
+                raise Conflict(
+                    "Expired authority with a lease or operation requires "
+                    "evidence-based reconciliation."
+                )
+            self._limit(connection, actor, grant["project_id"])
+            now = utc_now()
+            next_revision = grant["revision"] + 1
+            changed = connection.execute(
+                """UPDATE execution_grants SET status='reconciled', revision=?, updated_at=?,
+                reconciled_at=?, reconciled_by_principal_id=?, settlement_cents=0
+                WHERE id=? AND revision=? AND status IN ('active','cancel_requested')""",
+                (next_revision, now, now, actor["id"], grant_id, grant["revision"]),
+            ).rowcount
+            if changed != 1:
+                raise Conflict("Execution authority is no longer unresolved.")
+            released = connection.execute(
+                """UPDATE execution_project_limits SET held_cents=held_cents-?,updated_at=?
+                WHERE project_id=? AND held_cents>=?""",
+                (
+                    grant["max_exposure_cents"],
+                    now,
+                    grant["project_id"],
+                    grant["max_exposure_cents"],
+                ),
+            ).rowcount
+            if released != 1:
+                raise Conflict(
+                    "Execution reservation ledger is inconsistent; authority remains held."
+                )
+            updated = dict(grant)
+            updated.update(
+                status="reconciled",
+                revision=next_revision,
+                updated_at=now,
+                reconciled_at=now,
+                reconciled_by_principal_id=actor["id"],
+                settlement_cents=0,
+            )
+            self._event(
+                connection,
+                actor,
+                grant["project_id"],
+                grant["task_id"],
+                "execution.expired_unattempted_grant_reconciled",
+                next_revision,
+                {
+                    "grant_id": grant_id,
+                    "expired_authority": True,
+                    "lease_count": 0,
+                    "operation_count": 0,
+                    "settlement_cents": 0,
+                    "provider_termination_inferred": False,
+                    "operational_only": True,
+                },
+            )
+            return 200, self._grant_response(connection, updated)
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
+    def reconcile_expired_undispatched_grant(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Release fenced no-package admission or expired undispatched authority.
+
+        This is a no-start accounting result, *not* a provider termination receipt.
+        A Kubernetes worker can receive an executable descriptor only through the
+        transactionally written dispatch outbox. Perform that absence check and
+        the reservation release in the same write transaction as dispatch admission.
+        Any claimed/queued outbox, provider identity, observation, or remote route
+        instead requires ordinary operation reconciliation.
+        A single bound admission with no operation/package may also be released
+        after lease expiry or human revocation. Append an operational interruption
+        and a not_executed proof; do not invent termination or a research conclusion.
+        """
+        body = self._body(ReconcileExpiredUnattemptedGrant, payload)
+        path = f"/execution-grants/{grant_id}/reconcile-expired-undispatched"
+
+        def command(connection: sqlite3.Connection, actor: dict[str, Any]):
+            self._require_human(actor)
+            grant = self._grant(connection, actor, grant_id)
+            if grant["revision"] != body["expected_revision"]:
+                raise Conflict("Execution grant revision is no longer current.")
+            if grant["status"] not in UNRESOLVED_GRANT_STATUSES:
+                raise Conflict("Execution authority is already reconciled.")
+            lease = connection.execute(
+                "SELECT * FROM execution_leases WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            operation = connection.execute(
+                "SELECT * FROM external_operations WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            no_package_attempt = None
+            if not operation:
+                # Package issuance, admission, dispatch and this proof all serialize
+                # through _mutate's write transaction. A missing operation alone is
+                # insufficient: reject any inconsistent package/effect evidence.
+                attempts = connection.execute(
+                    "SELECT * FROM research_experiment_admitted_attempts WHERE grant_id=?",
+                    (grant_id,),
+                ).fetchall()
+                epoch = connection.execute(
+                    "SELECT epoch FROM execution_task_epochs WHERE task_id=?", (grant["task_id"],)
+                ).fetchone()
+                if (
+                    len(lease) != 1
+                    or len(attempts) != 1
+                    or epoch is None
+                    or epoch["epoch"] != grant["epoch"]
+                    or lease[0]["epoch"]
+                    != grant["epoch"] - int(grant["status"] == "cancel_requested")
+                    or lease[0]["worker_principal_id"] != grant["worker_principal_id"]
+                    or (
+                        grant["status"] != "cancel_requested"
+                        and _parse_utc(lease[0]["expires_at"]) > self._now()
+                    )
+                    or attempts[0]["task_id"] != grant["task_id"]
+                    or attempts[0]["plan_digest"] != grant["plan_digest"]
+                    or attempts[0]["operation_id"] is not None
+                    or attempts[0]["package_digest"] is not None
+                    or attempts[0]["state"] != "admitted"
+                    or attempts[0]["outcome"] is not None
+                ):
+                    raise Conflict(
+                        "Lease/admission is not provably unexecuted at the current fence."
+                    )
+                for table in ("execution_observations", "kubernetes_dispatches"):
+                    if connection.execute(
+                        f"SELECT 1 FROM {table} WHERE grant_id=?", (grant_id,)
+                    ).fetchone():
+                        raise Conflict("Execution effects may have reached a worker.")
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM execution_runtime_packages WHERE "
+                        "json_extract(package_json,'$.grant_id')=? OR "
+                        "json_extract(package_json,'$.lease_id')=?",
+                        (grant_id, lease[0]["id"]),
+                    ).fetchone()
+                    or connection.execute(
+                        "SELECT 1 FROM artifacts WHERE lease_id=?", (lease[0]["id"],)
+                    ).fetchone()
+                    or connection.execute(
+                        "SELECT 1 FROM events WHERE org_id=? AND "
+                        "event_type IN ('execution.package_prepared','remote_execution.state') AND "
+                        "(json_extract(payload_json,'$.grant_id')=? OR "
+                        "json_extract(payload_json,'$.lease_id')=? OR task_id=?)",
+                        (actor["org_id"], grant_id, lease[0]["id"], grant["task_id"]),
+                    ).fetchone()
+                ):
+                    raise Conflict(
+                        "Package or remote execution evidence prevents no-start recovery."
+                    )
+                no_package_attempt = dict(attempts[0])
+            native_undispatched = (
+                len(operation) == 1
+                and operation[0]["adapter_version"] == "docker-container-v1"
+                and operation[0]["profile_version"] == "ordinary-docker-v1"
+            )
+            if no_package_attempt is None and (
+                (
+                    _parse_utc(grant["expires_at"]) > self._now()
+                    and not (native_undispatched and grant["status"] == "cancel_requested")
+                )
+                or len(lease) != 1
+                or len(operation) != 1
+                or (
+                    _parse_utc(lease[0]["expires_at"]) > self._now()
+                    and not (native_undispatched and grant["status"] == "cancel_requested")
+                )
+                or operation[0]["lease_id"] != lease[0]["id"]
+                or (
+                    not native_undispatched
+                    and (
+                        operation[0]["adapter_version"] != "kubernetes-job-v1"
+                        or operation[0]["profile_version"] != "development-minikube-opencode-v1"
+                    )
+                )
+                or operation[0]["provider_id"] is not None
+                or current_operation_reconciliation(connection, operation[0]["operation_id"])
+                is not None
+            ):
+                raise Conflict("Expired operation is not provably undispatched.")
+            operation_id = operation[0]["operation_id"] if operation else None
+            if (
+                connection.execute(
+                    "SELECT 1 FROM kubernetes_dispatches WHERE operation_id=?", (operation_id,)
+                ).fetchone()
+                or connection.execute(
+                    "SELECT 1 FROM ordinary_docker_dispatches WHERE operation_id=?", (operation_id,)
+                ).fetchone()
+                or connection.execute(
+                    "SELECT 1 FROM events WHERE event_type='docker.dispatch_queued' AND "
+                    "json_extract(payload_json,'$.operation_id')=?",
+                    (operation_id,),
+                ).fetchone()
+                or connection.execute(
+                    "SELECT 1 FROM events WHERE org_id=? AND event_type='remote_execution.state' "
+                    "AND json_extract(payload_json,'$.proposal.operation_id')=?",
+                    (actor["org_id"], operation_id),
+                ).fetchone()
+            ):
+                raise Conflict("Dispatch or remote routing may have reached a worker.")
+            self._limit(connection, actor, grant["project_id"])
+            now = utc_now()
+            revision = grant["revision"] + 1
+            changed = connection.execute(
+                """UPDATE execution_grants SET status='reconciled',revision=?,updated_at=?,
+                reconciled_at=?,reconciled_by_principal_id=?,settlement_cents=0
+                WHERE id=? AND revision=? AND status IN ('active','cancel_requested')""",
+                (revision, now, now, actor["id"], grant_id, grant["revision"]),
+            ).rowcount
+            if changed != 1:
+                raise Conflict("Execution authority changed during no-start reconciliation.")
+            released = connection.execute(
+                """UPDATE execution_project_limits SET held_cents=held_cents-?,updated_at=?
+                WHERE project_id=? AND held_cents>=?""",
+                (
+                    grant["max_exposure_cents"],
+                    now,
+                    grant["project_id"],
+                    grant["max_exposure_cents"],
+                ),
+            ).rowcount
+            if released != 1:
+                raise Conflict("Execution reservation ledger is inconsistent.")
+            if no_package_attempt is not None:
+                from .experiments import _append_admitted_attempt_state
+
+                _append_admitted_attempt_state(
+                    connection,
+                    no_package_attempt,
+                    "interrupted",
+                    actor["id"],
+                    reason="not_executed: lease fenced before package issuance; undispatched",
+                )
+            updated = dict(grant)
+            updated.update(
+                status="reconciled",
+                revision=revision,
+                updated_at=now,
+                reconciled_at=now,
+                reconciled_by_principal_id=actor["id"],
+                settlement_cents=0,
+            )
+            self._event(
+                connection,
+                actor,
+                grant["project_id"],
+                grant["task_id"],
+                "execution.expired_undispatched_grant_reconciled",
+                revision,
+                {
+                    "grant_id": grant_id,
+                    "operation_id": operation_id,
+                    "lease_id": lease[0]["id"],
+                    "outbox_absent": True,
+                    "package_absent": no_package_attempt is not None,
+                    "admitted_attempt_id": no_package_attempt["id"] if no_package_attempt else None,
+                    "outcome": "not_executed" if no_package_attempt else "undispatched",
+                    "provider_termination_inferred": False,
+                    "settlement_cents": 0,
+                    "operational_only": True,
+                },
+            )
+            return 200, self._grant_response(connection, updated)
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
+    def attest_kubernetes_preparation_not_submitted(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        from .preparation_recovery import attest
+
+        return attest(self, principal, grant_id, key, digest, payload)
+
+    def attest_kubernetes_never_claimed(self, principal, grant_id, key, digest, payload):
+        from .queued_recovery import attest
+
+        return attest(self, principal, grant_id, key, digest, payload)
+
+    def reconcile_attested_never_claimed(self, principal, grant_id, key, digest, payload):
+        from .queued_recovery import reconcile
+
+        return reconcile(self, principal, grant_id, key, digest, payload)
+
+    def issue_never_claimed_maintenance(self, principal, grant_id, key, digest, payload):
+        from .queued_maintenance import issue
+
+        return issue(self, principal, grant_id, key, digest, payload)
+
+    def reconcile_maintenance_never_claimed(self, principal, grant_id, key, digest, payload):
+        from .queued_maintenance import reconcile
+
+        return reconcile(self, principal, grant_id, key, digest, payload)
+
+    def reconcile_attested_preparation_not_submitted(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        from .preparation_recovery import reconcile
+
+        return reconcile(self, principal, grant_id, key, digest, payload)
+
+    def attest_kubernetes_never_submitted(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Record an original-worker attestation; do not release any authority yet.
+
+        The worker must call the matching journal method for proof_kind on its
+        original exclusive journal first. Pre-manifest means no Job manifest
+        was ever generated, not that one was retrospectively reconstructed.
+        This is attributed worker evidence, not a provider termination receipt.
+        """
+        body = self._body(AttestKubernetesNeverSubmitted, payload)
+        path = f"/worker/execution-grants/{grant_id}/attest-never-submitted"
+
+        def command(connection: sqlite3.Connection, actor: dict[str, Any]):
+            grant = self._grant(connection, actor, grant_id)
+            if (
+                actor["kind"] != "worker"
+                or actor["id"] != grant["worker_principal_id"]
+                or grant["status"] != "cancel_requested"
+                or grant["revision"] != body["expected_revision"]
+            ):
+                raise Conflict("Original cancelled worker authority is required.")
+            operation = connection.execute(
+                "SELECT * FROM external_operations WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            dispatch = connection.execute(
+                "SELECT * FROM kubernetes_dispatches WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            leases = connection.execute(
+                "SELECT * FROM execution_leases WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            if (
+                len(operation) != 1
+                or len(dispatch) != 1
+                or len(leases) != 1
+                or operation[0]["operation_id"] != body["operation_id"]
+                or operation[0]["lease_id"] != body["lease_id"]
+                or operation[0]["epoch"] != body["epoch"]
+                or operation[0]["package_digest"] != body["package_digest"]
+                or operation[0]["desired_state"] != "cancel_requested"
+                or operation[0]["provider_id"] is not None
+                or operation[0]["adapter_version"] != "kubernetes-job-v1"
+                or operation[0]["profile_version"] != "development-minikube-opencode-v1"
+                or leases[0]["id"] != body["lease_id"]
+                or leases[0]["epoch"] != body["epoch"]
+                or dispatch[0]["operation_id"] != body["operation_id"]
+                or dispatch[0]["lease_id"] != body["lease_id"]
+                or dispatch[0]["epoch"] != body["epoch"]
+                or dispatch[0]["package_digest"] != body["package_digest"]
+                or dispatch[0]["target_digest"] != body["target_digest"]
+                or dispatch[0]["worker_principal_id"] != actor["id"]
+                or dispatch[0]["claimed_by_principal_id"] != actor["id"]
+                or dispatch[0]["state"] != "cancel_requested"
+                or body["job_name"] != f"tessera-op-{body['operation_id']}"
+                or not _only_unconfirmed_worker_unknown(connection, body["operation_id"])
+            ):
+                raise Conflict(
+                    "No-start attestation conflicts with the original dispatch or observations."
+                )
+            observed_at = _parse_utc(body["observed_at"])
+            if (
+                not self._now() - timedelta(seconds=30)
+                <= observed_at
+                <= self._now() + MAX_OBSERVATION_FUTURE_SKEW
+            ):
+                raise Conflict("Kubernetes readbacks are not fresh.")
+            # The target digest is the frozen dispatch target, not a caller-supplied
+            # namespace selector; the worker attests an exact matching namespace UID.
+            from .store import canonical_digest
+
+            attestation_digest = canonical_digest(body)
+            self._event(
+                connection,
+                actor,
+                grant["project_id"],
+                grant["task_id"],
+                "execution.kubernetes_never_submitted_attested",
+                grant["revision"],
+                {
+                    "grant_id": grant_id,
+                    "operation_id": body["operation_id"],
+                    "worker_principal_id": actor["id"],
+                    "proof_kind": body["proof_kind"],
+                    "attestation_digest": attestation_digest,
+                    "attestation": body,
+                    "provider_termination_inferred": False,
+                    "operational_only": True,
+                },
+            )
+            return 201, {
+                "grant_id": grant_id,
+                "operation_id": body["operation_id"],
+                "attestation_digest": attestation_digest,
+                "authority_released": False,
+            }
+
+        return self._mutate(principal, key, "POST", path, digest, command, audience="worker")
+
+    def reconcile_attested_never_submitted(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Human settles only the exact fresh zero-create attestation at zero cost."""
+        body = self._body(ReconcileAttestedNeverSubmitted, payload)
+        path = f"/execution-grants/{grant_id}/reconcile-attested-never-submitted"
+
+        def command(connection: sqlite3.Connection, actor: dict[str, Any]):
+            self._require_human(actor)
+            grant = self._grant(connection, actor, grant_id)
+            if (
+                grant["status"] != "cancel_requested"
+                or grant["revision"] != body["expected_revision"]
+            ):
+                raise Conflict("Cancelled grant revision is no longer current.")
+            event = connection.execute(
+                "SELECT * FROM events WHERE org_id=? AND project_id=? "
+                "AND event_type='execution.kubernetes_never_submitted_attested' "
+                "AND json_extract(payload_json,'$.grant_id')=? "
+                "ORDER BY cursor DESC LIMIT 1",
+                (actor["org_id"], grant["project_id"], grant_id),
+            ).fetchone()
+            if event is None:
+                raise Conflict("Original worker no-start attestation is missing.")
+            report = json.loads(event["payload_json"])
+            attestation = report["attestation"]
+            if (
+                report["grant_id"] != grant_id
+                or report["operation_id"] != body["operation_id"]
+                or report["attestation_digest"] != body["attestation_digest"]
+                or report["worker_principal_id"] != grant["worker_principal_id"]
+                or report["proof_kind"] != attestation["proof_kind"]
+                or event["actor_principal_id"] != grant["worker_principal_id"]
+                or attestation["expected_revision"] != grant["revision"]
+                or self._now() - _parse_utc(attestation["observed_at"]) > timedelta(seconds=60)
+                or _parse_utc(attestation["observed_at"])
+                > self._now() + MAX_OBSERVATION_FUTURE_SKEW
+            ):
+                raise Conflict("Original worker no-start attestation is stale or mismatched.")
+            operation = connection.execute(
+                "SELECT * FROM external_operations WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            dispatch = connection.execute(
+                "SELECT * FROM kubernetes_dispatches WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            leases = connection.execute(
+                "SELECT * FROM execution_leases WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            if (
+                len(operation) != 1
+                or len(dispatch) != 1
+                or len(leases) != 1
+                or operation[0]["operation_id"] != body["operation_id"]
+                or operation[0]["provider_id"] is not None
+                or operation[0]["desired_state"] != "cancel_requested"
+                or operation[0]["lease_id"] != attestation["lease_id"]
+                or operation[0]["epoch"] != attestation["epoch"]
+                or operation[0]["package_digest"] != attestation["package_digest"]
+                or dispatch[0]["operation_id"] != body["operation_id"]
+                or dispatch[0]["state"] != "cancel_requested"
+                or dispatch[0]["claimed_by_principal_id"] != grant["worker_principal_id"]
+                or dispatch[0]["target_digest"] != attestation["target_digest"]
+                or leases[0]["id"] != attestation["lease_id"]
+                or leases[0]["epoch"] != attestation["epoch"]
+                or not _only_unconfirmed_worker_unknown(connection, body["operation_id"])
+            ):
+                raise Conflict("No-start evidence has been contradicted; reservation remains held.")
+            self._limit(connection, actor, grant["project_id"])
+            now = utc_now()
+            revision = grant["revision"] + 1
+            changed = connection.execute(
+                """UPDATE execution_grants SET status='reconciled',revision=?,updated_at=?,
+                reconciled_at=?,reconciled_by_principal_id=?,settlement_cents=0
+                WHERE id=? AND revision=? AND status='cancel_requested'""",
+                (revision, now, now, actor["id"], grant_id, grant["revision"]),
+            ).rowcount
+            released = connection.execute(
+                """UPDATE execution_project_limits SET held_cents=held_cents-?,updated_at=?
+                WHERE project_id=? AND held_cents>=?""",
+                (
+                    grant["max_exposure_cents"],
+                    now,
+                    grant["project_id"],
+                    grant["max_exposure_cents"],
+                ),
+            ).rowcount
+            if changed != 1 or released != 1:
+                raise Conflict("No-start accounting fence or reservation changed.")
+            updated = dict(grant)
+            updated.update(
+                status="reconciled",
+                revision=revision,
+                updated_at=now,
+                reconciled_at=now,
+                reconciled_by_principal_id=actor["id"],
+                settlement_cents=0,
+            )
+            self._event(
+                connection,
+                actor,
+                grant["project_id"],
+                grant["task_id"],
+                "execution.attested_never_submitted_reconciled",
+                revision,
+                {
+                    "grant_id": grant_id,
+                    "operation_id": body["operation_id"],
+                    "attestation_digest": body["attestation_digest"],
+                    "proof_kind": attestation["proof_kind"],
+                    "settlement_cents": 0,
+                    "provider_termination_inferred": False,
+                    "operational_only": True,
+                },
+            )
+            return 200, self._grant_response(connection, updated)
+
+        return self._mutate(principal, key, "POST", path, digest, command)
+
+    def reconcile_owner_pre_manifest_no_start(
+        self,
+        principal: dict[str, Any],
+        grant_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Owner-attested no-start after the original worker identity has expired.
+
+        Control verifies its own authority/evidence ledger atomically. It does
+        *not* claim to have inspected the external journal or Kubernetes: the
+        authenticated original grant owner explicitly attests those readbacks.
+        Do not accept running/exited/receipt/recovery evidence as a no-start.
+        """
+        body = self._body(OwnerPreManifestNoStart, payload)
+        path = f"/execution-grants/{grant_id}/reconcile-owner-pre-manifest-no-start"
+
+        def command(connection: sqlite3.Connection, actor: dict[str, Any]):
+            self._require_human(actor)
+            grant = self._grant(connection, actor, grant_id)
+            if actor["id"] != grant["created_by_principal_id"]:
+                raise Forbidden("Only the original human grant owner may attest no-start.")
+            if (
+                grant["status"] != "cancel_requested"
+                or grant["revision"] != body["expected_revision"]
+            ):
+                raise Conflict("Cancelled grant revision is no longer current.")
+            operations = connection.execute(
+                "SELECT * FROM external_operations WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            dispatches = connection.execute(
+                "SELECT * FROM kubernetes_dispatches WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            leases = connection.execute(
+                "SELECT * FROM execution_leases WHERE grant_id=?", (grant_id,)
+            ).fetchall()
+            if len(operations) != 1 or len(dispatches) != 1 or len(leases) != 1:
+                raise Conflict(
+                    "Owner no-start requires exactly one original operation, dispatch and lease."
+                )
+            op, dispatch, lease = operations[0], dispatches[0], leases[0]
+            original = connection.execute(
+                "SELECT revoked_at FROM principals WHERE id=? AND org_id=?",
+                (grant["worker_principal_id"], actor["org_id"]),
+            ).fetchone()
+            credentials = connection.execute(
+                "SELECT expires_at,revoked_at FROM credentials WHERE principal_id=? "
+                "AND audience='worker'",
+                (grant["worker_principal_id"],),
+            ).fetchall()
+            if original is None or original["revoked_at"] is not None or not credentials:
+                raise Conflict("Original worker identity is not an expired credential recovery.")
+            try:
+                expires = [
+                    _parse_utc(row["expires_at"])
+                    for row in credentials
+                    if row["revoked_at"] is None
+                ]
+            except (TypeError, ValueError) as error:
+                raise Conflict("Original worker credential expiry is malformed.") from error
+            if not expires or any(expiry > self._now() for expiry in expires):
+                raise Conflict("Original worker still has live authority; use its worker path.")
+            if (
+                op["operation_id"] != body["operation_id"]
+                or op["org_id"] != actor["org_id"]
+                or op["project_id"] != grant["project_id"]
+                or op["task_id"] != grant["task_id"]
+                or op["grant_id"] != grant_id
+                or op["worker_principal_id"] != grant["worker_principal_id"]
+                or op["lease_id"] != body["lease_id"]
+                or op["epoch"] != body["epoch"]
+                or op["package_digest"] != body["package_digest"]
+                or op["provider_id"] is not None
+                or op["desired_state"] != "cancel_requested"
+                or op["adapter_version"] != "kubernetes-job-v1"
+                or op["profile_version"] != "development-minikube-opencode-v1"
+                or lease["id"] != body["lease_id"]
+                or lease["worker_principal_id"] != grant["worker_principal_id"]
+                or lease["epoch"] != body["epoch"]
+                or dispatch["operation_id"] != body["operation_id"]
+                or dispatch["grant_id"] != grant_id
+                or dispatch["org_id"] != actor["org_id"]
+                or dispatch["project_id"] != grant["project_id"]
+                or dispatch["lease_id"] != body["lease_id"]
+                or dispatch["epoch"] != body["epoch"]
+                or dispatch["worker_principal_id"] != grant["worker_principal_id"]
+                or dispatch["claimed_by_principal_id"] != grant["worker_principal_id"]
+                or dispatch["package_digest"] != body["package_digest"]
+                or dispatch["target_digest"] != body["target_digest"]
+                or dispatch["state"] != "cancel_requested"
+                or body["job_name"] != f"tessera-op-{body['operation_id']}"
+                or not _only_unconfirmed_worker_unknown(connection, body["operation_id"])
+            ):
+                raise Conflict("Owner no-start contradicts the bound operation or evidence ledger.")
+            observed_at = _parse_utc(body["observed_at"])
+            if not (
+                self._now() - timedelta(seconds=30)
+                <= observed_at
+                <= self._now() + MAX_OBSERVATION_FUTURE_SKEW
+            ):
+                raise Conflict("Owner-attested target readbacks are not fresh.")
+            limits = self._limit(connection, actor, grant["project_id"])
+            from .store import canonical_digest
+
+            proof_digest = canonical_digest(body)
+            self._event(
+                connection,
+                actor,
+                grant["project_id"],
+                grant["task_id"],
+                "execution.owner_pre_manifest_no_start_attested",
+                grant["revision"],
+                {
+                    "grant_id": grant_id,
+                    "operation_id": body["operation_id"],
+                    "owner_principal_id": actor["id"],
+                    "original_worker_principal_id": grant["worker_principal_id"],
+                    "proof_kind": "pre_manifest",
+                    "proof_digest": proof_digest,
+                    "proof": body,
+                    "trust_boundary": "owner_attested_retained_journal_and_target_not_independent",
+                    "provider_termination_inferred": False,
+                    "operational_only": True,
+                },
+            )
+            now = utc_now()
+            revision = grant["revision"] + 1
+            changed = connection.execute(
+                """UPDATE execution_grants SET status='reconciled',revision=?,updated_at=?,
+                reconciled_at=?,reconciled_by_principal_id=?,settlement_cents=0
+                WHERE id=? AND revision=? AND status='cancel_requested'""",
+                (revision, now, now, actor["id"], grant_id, grant["revision"]),
+            ).rowcount
+            released = connection.execute(
+                """UPDATE execution_project_limits SET held_cents=held_cents-?,updated_at=?
+                WHERE project_id=? AND held_cents>=?""",
+                (
+                    grant["max_exposure_cents"],
+                    now,
+                    grant["project_id"],
+                    grant["max_exposure_cents"],
+                ),
+            ).rowcount
+            if changed != 1 or released != 1:
+                raise Conflict("Owner no-start accounting fence or reservation changed.")
+            updated = dict(grant)
+            updated.update(
+                status="reconciled",
+                revision=revision,
+                updated_at=now,
+                reconciled_at=now,
+                reconciled_by_principal_id=actor["id"],
+                settlement_cents=0,
+            )
+            self._event(
+                connection,
+                actor,
+                grant["project_id"],
+                grant["task_id"],
+                "execution.owner_pre_manifest_no_start_reconciled",
+                revision,
+                {
+                    "grant_id": grant_id,
+                    "operation_id": body["operation_id"],
+                    "proof_kind": "pre_manifest",
+                    "proof_digest": proof_digest,
+                    "settlement_cents": 0,
+                    "currency": limits["currency"],
+                    "provider_termination_inferred": False,
+                    "trust_boundary": "owner_attested_not_independent",
                     "operational_only": True,
                 },
             )

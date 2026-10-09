@@ -40,6 +40,14 @@ external export/move is a separately authorized future policy operation. There i
 no S3 SDK, cloud credential, public URL, or production/pilot activation.
 Backups fail closed if they would omit committed project objects.
 
+Schema v46 can read a committed `active` local object only through a live,
+human, project-scoped custody release for the exact quarantined manifest that
+contains it. Retrieval rereads and rehashes the private object; an unavailable,
+replaced, deleted, degraded, or mismatched object is not previewed or exported.
+The same boundary supplies private reproduction bundles with an explicit byte
+cap and missing-material declarations. It does not create an object URL, public
+download, input release, external export, or a change in artifact classification.
+
 This storage boundary is independent of planned Kubernetes Secret delivery and
 control-plane provisioning. A Secret is not an artifact store or project object,
 and no automatic destructive teardown/deletion follows target detachment.

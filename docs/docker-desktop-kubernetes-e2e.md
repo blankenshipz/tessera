@@ -24,6 +24,7 @@ For the real authenticated control-plane dispatch path, run:
   tests/test_kubernetes_provider.py tests/test_kubernetes_control_binding.py
 .venv/bin/python scripts/check_authenticated_kubernetes_dispatch_e2e.py --run \
   --kubeconfig "$HOME/.kube/config" --context docker-desktop \
+  --namespace "tessera-e2e-auth-dispatch-$(date +%s)" \
   --image 'docker.io/library/tessera-e2e-hello@sha256:EXACT_NODE_MANIFEST'
 ```
 
@@ -34,12 +35,23 @@ grant, lease, admitted attempt, immutable package, and human-approved dispatch
 outbox. The enrolled worker claims that outbox through the normal worker route;
 the unchanged control-issued package is handed to the same nonblocking durable
 adapter contract used by fake-callback tests; the runner never hides supervision
-inside a blocking Job wait. It retains one uniquely named
-namespace and its NetworkPolicy, PVC, Job/workload Pod and collector Pod. Its
-temporary control state (and credentials) is removed after the result is printed;
-its non-secret local adapter/claim journal is retained outside the repository.
+inside a blocking Job wait. It creates one uniquely named, fixture-labeled
+namespace and fixture-labeled NetworkPolicy, PVC, Job/workload Pod and collector
+Pod. Its temporary control state (and credentials) is removed after the result is
+printed; its non-secret local adapter/claim journal is retained outside the
+repository.
+The runner checks the pinned kubeconfig bytes before each kubectl request,
+requires the named Docker Desktop node in the explicitly selected cluster before
+creating a namespace, refuses an existing namespace, and rechecks cluster and
+namespace UIDs before workload creation. Success-path cleanup requests deletion
+with a Kubernetes namespace UID precondition after verifying fixture ownership;
+`deletion_requested` is an API acknowledgement, **not** proof that namespace
+and Pods are absent. Failed/recovery runs retain their fixture for explicit
+reconciliation instead of deleting uncertain running work. A failure during
+namespace construction may leave partial resources. No Kubernetes Secrets are
+inventoried or accessed by this fixture.
 The JSON evidence includes control IDs/package digest, target, resource UIDs,
-image digest, exact output/hash, and experiment-export linkage.
+image digest, exact output/hash, experiment-export linkage, and cleanup status.
 
 The authenticated runner accepts `--mode success` (the default), `--mode
 cancel`, `--mode restart`, and `--mode lost-report`. Recovery modes use the
@@ -77,8 +89,9 @@ tags and verifies a canonical local tag and exact
 reference with `imagePullPolicy: Never`. Build/load/digest
 verification failures stop before namespace creation.
 
-The run creates one unique `tessera-e2e-*` namespace, its deny-all
-NetworkPolicy, a 64 MiB PVC, one non-root `batch/v1` Job, and one non-root,
+The run creates one unique `tessera-e2e-*` namespace, a declared deny-all
+NetworkPolicy, a 64 MiB dedicated-output PVC (with Tessera ownership/role
+labels), one non-root `batch/v1` Job, and one non-root,
 read-only post-exit collector Pod. The Job writes exactly
 `/outputs/result.txt` containing `hello tessera kubernetes e2e\n`. Before
 collection, Kubernetes RBAC must explicitly allow `create pods`, `get pods`,
@@ -89,23 +102,39 @@ collector contract; the PVC UID/spec are rechecked before output logs are read.
 Success requires the exact bytes, byte hash, Job/Pod/PVC/namespace UIDs, Job
 spec/image checks, and collector image ID. The JSON result records these values.
 
+The PVC's 64 MiB request and the fixture's exact byte check are not a hard
+Docker Desktop write/inode quota. The adapter rechecks dedicated PVC labels and
+identity before collection, while the collector's bounded stdout only proves the
+declared two-byte artifact bound. Docker Desktop local-path byte and inode
+enforcement, as well as provider billing, remain unknown; this conformance run
+must not be used as pilot storage or cost evidence.
+
+The declared Docker Desktop policy is **not** evidence that a CNI enforced it.
+This runner does not claim `network-policy-enforced-v1` or `network_mode=none`:
+its workload uses `network_mode=cluster`. Use the separate opt-in Astra
+conformance probe to record both bounded allowed and denied connectivity before
+recording an enforced capability for its exact cluster and namespace.
+
 The standalone adapter persists a local Job create/cancel fence before Kubernetes calls;
-lost creates reconcile only by the deterministic Job name. Cancellation checks
-the observed Job UID again before the narrowly named Job delete, then confirms
-only fresh Job and owned-Pod absence. Kubernetes `kubectl delete` has no exposed
-UID precondition, so a hostile same-namespace writer between that check and the
-delete remains an enforcement limitation; the dedicated random namespace is the
-boundary for this conformance fixture. The standalone run does not create
+lost creates reconcile only by the deterministic Job name. Cancellation uses a
+Kubernetes `DeleteOptions.preconditions.uid` request for the observed Job UID,
+rather than a check-then-name-delete, then confirms only fresh Job and owned-Pod
+absence. Kubernetes `kubectl delete` has no exposed UID precondition; a
+replacement is rejected by the API and remains unresolved. The dedicated random
+namespace remains a fixture boundary, not a general tenant-isolation guarantee.
+The standalone run does not create
 authority through SQL, fabricate a receipt, call OpenCode/providers, accept an
 artifact or result, or claim pilot completion. The authenticated runner uses
 normal control authority but remains a narrow, provider-disabled development
 conformance fixture: it does not enable a supported Kubernetes target,
 provider/model execution, artifact release, result acceptance, or pilot
-completion. Both runners retain every created resource for manual inspection.
+completion. The authenticated runner verifies its exact namespace UID and unique
+fixture ownership labels, then inventories workload resources before deletion.
+It refuses cleanup on a UID/label mismatch or an unowned resource, preserving the
+namespace for reconciliation rather than deleting a replacement or unknown work.
+Inventory covers `all,networkpolicies,persistentvolumeclaims`, not every possible
+namespaced API type; it cannot prove arbitrary namespace ownership.
 
-Pass `--namespace EXISTING_RETAINED_NAMESPACE` only to use an explicitly named,
-already-existing retained namespace (for example one prepared by Astra operator
-setup). The runner verifies that namespace's UID and creates only its fixed
-Job/PVC/collector names there; it never creates or deletes the supplied
-namespace. Its `deny-all` policy and `outputs` PVC remain separate from Astra
-setup resources.
+Pass `--namespace UNIQUE_FIXTURE_NAMESPACE` to make the live fixture name visible
+in its command and output. The name must not already exist: the runner creates it
+with a fresh ownership label and will not adopt an existing namespace.

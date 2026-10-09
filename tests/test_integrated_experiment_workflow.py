@@ -33,6 +33,7 @@ from tessera_control.workspace import capture_workspace, inventory_digest
 from tessera_worker.kubernetes_provider import (
     ClusterIdentity,
     JobBinding,
+    KubernetesConnectivityEvidence,
     KubernetesContractError,
     KubernetesJobJournal,
     KubernetesNetworkPolicyEvidence,
@@ -129,6 +130,7 @@ class FakeKubernetes:
 
 
 def _cluster() -> ClusterIdentity:
+    now = datetime.now(UTC)
     return ClusterIdentity(
         kubeconfig="/private/synthetic/kubeconfig",
         kubeconfig_sha256="a" * 64,
@@ -145,6 +147,11 @@ def _cluster() -> ClusterIdentity:
             "synthetic-deny-all",
             "synthetic-policy",
             "d" * 64,
+            "synthetic-cluster",
+            "synthetic-namespace",
+            now,
+            KubernetesConnectivityEvidence("allowed-pod", "server-pod", "allowed", 3, now),
+            KubernetesConnectivityEvidence("denied-pod", "server-pod", "denied", 3, now),
         ),
     )
 
@@ -809,6 +816,53 @@ def test_synthetic_integrated_baseline_and_intervention_workflow(tmp_path: Path)
             worker=True,
         )
         assert manifest["status"] == "quarantined" and manifest["classification"] == "unclassified"
+        disposition = call(
+            "POST",
+            f"/artifact-manifests/{manifest['id']}/dispositions",
+            {
+                "expected_manifest_digest": manifest["manifest_digest"],
+                "expected_revision": 0,
+                "disposition": "retain_quarantined",
+                "rationale": "Retain synthetic output under quarantine for private review.",
+            },
+            201,
+        )
+        custody_release = call(
+            "POST",
+            f"/artifact-manifests/{manifest['id']}/custody-releases",
+            {
+                "expected_manifest_digest": manifest["manifest_digest"],
+                "expected_revision": 0,
+                "action": "release",
+                "rationale": "Allow the synthetic fixture owner to retrieve retained bytes.",
+            },
+            201,
+        )
+        retrieved = client.get(
+            f"/artifact-manifests/{manifest['id']}/artifacts/{artifact['id']}/content",
+            headers=owner_headers,
+        )
+        assert retrieved.status_code == 200
+        assert retrieved.content == artifact_bytes
+        assert retrieved.headers["X-Tessera-Artifact-Sha256"] == artifact["sha256"]
+        reproduction_bundle = call(
+            "POST",
+            f"/artifact-manifests/{manifest['id']}/reproduction-bundles",
+            {"max_bytes": 1024 * 1024},
+            201,
+        )
+        assert custody_release["state"] == "released"
+        assert disposition["disposition"] == "retain_quarantined"
+        assert reproduction_bundle["bundle"]["manifest"]["status"] == "quarantined"
+        assert reproduction_bundle["bundle"]["manifest"]["classification"] == "unclassified"
+        assert {
+            item["kind"]: item["reason"].split(":", 1)[0]
+            for item in reproduction_bundle["bundle"]["missing_materials"]
+        } == {
+            "input_bytes": "not_exported",
+            "skill_material": "restricted",
+            "environment_image": "missing",
+        }
         linked = call(
             "POST",
             f"/experiment-attempts/{baseline_attempt}/artifacts",

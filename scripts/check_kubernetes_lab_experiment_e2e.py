@@ -124,6 +124,74 @@ def _key(nonce: str, action: str) -> str:
     return f"lab-experiment-e2e-{nonce}-{action}"
 
 
+def _materialize_fixture_reproduction_bundle(bundle: dict[str, Any], workspace: Path) -> dict[str, Any]:
+    """Verify one export in a new fixture workspace without treating it as a result.
+
+    This is deliberately fixture-local rather than a product import path.  It
+    proves only that the immutable bundle's released output bytes can be
+    reconstructed under a fresh directory and that the deliberately absent or
+    restricted material remains visible to the operator.
+    """
+    outputs = bundle.get("outputs")
+    missing = bundle.get("missing_materials")
+    if not isinstance(outputs, list) or not isinstance(missing, list):
+        raise LabExperimentError("reproduction bundle lacks bounded output or material records")
+    required_material = {
+        "input_bytes": "not_exported",
+        "skill_material": "restricted",
+        "environment_image": "missing",
+    }
+    reasons = {
+        item.get("kind"): item.get("reason")
+        for item in missing
+        if isinstance(item, dict) and isinstance(item.get("kind"), str)
+    }
+    if any(
+        not isinstance(reasons.get(kind), str) or not reasons[kind].startswith(prefix)
+        for kind, prefix in required_material.items()
+    ):
+        raise LabExperimentError("reproduction bundle does not disclose required missing material")
+    workspace.mkdir(mode=0o700)
+    root = workspace.resolve()
+    written: list[dict[str, Any]] = []
+    for item in outputs:
+        if not isinstance(item, dict):
+            raise LabExperimentError("reproduction bundle output record is invalid")
+        relative_path = item.get("relative_path")
+        encoded = item.get("content_base64")
+        sha256 = item.get("sha256")
+        size = item.get("size")
+        relative = Path(relative_path) if isinstance(relative_path, str) else None
+        if (
+            relative is None
+            or relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or not isinstance(encoded, str)
+            or not isinstance(sha256, str)
+            or type(size) is not int
+        ):
+            raise LabExperimentError("reproduction bundle output path or metadata is invalid")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as error:
+            raise LabExperimentError("reproduction bundle output encoding is invalid") from error
+        target = workspace / relative
+        try:
+            target.resolve().relative_to(root)
+        except ValueError as error:
+            raise LabExperimentError("reproduction bundle output escapes the fresh workspace") from error
+        if len(content) != size or hashlib.sha256(content).hexdigest() != sha256:
+            raise LabExperimentError("reproduction bundle output integrity check failed")
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o600)
+        written.append({"relative_path": relative_path, "sha256": sha256, "size": size})
+    if not written:
+        raise LabExperimentError("reproduction bundle has no released outputs")
+    return {"outputs": written, "missing_material_kinds": sorted(required_material)}
+
+
 def _owner_token(kubeconfig: Path, namespace: str) -> str:
     header = _run(_kubectl(kubeconfig, namespace) + ["exec", "deploy/control", "--", "cat", "/state/control/owner.header"]).strip()
     if not header.startswith("Authorization: Bearer ") or not header.removeprefix("Authorization: Bearer "):
@@ -154,7 +222,7 @@ def _cluster(live: Any, namespace: str, contracts: Any, docker: Any):
     live._create(docker._pvc(namespace), namespace)
     pvc = live._get("pvc", "outputs", namespace)
     target = live.target
-    cluster = contracts.KubernetesClusterConfig(kubeconfig=str(target.kubeconfig), kubeconfig_sha256=target.kubeconfig_sha256, context=target.context, profile="development-minikube-opencode-v1", server=target.server, server_sha256=hashlib.sha256(target.server.encode()).hexdigest(), ca_sha256=target.ca_sha256, namespace=namespace, cluster_uid=docker._uid(live._get("namespace", "kube-system", None), "Namespace", "kube-system", None), namespace_uid=namespace_uid, network_none_evidence=contracts.KubernetesNetworkPolicyEvidence("network-policy-enforced-v1", "default-deny", policy_uid, hashlib.sha256(contracts.canonical_json(policy_spec)).hexdigest()))
+    cluster = contracts.KubernetesClusterConfig(kubeconfig=str(target.kubeconfig), kubeconfig_sha256=target.kubeconfig_sha256, context=target.context, profile="development-minikube-opencode-v1", server=target.server, server_sha256=hashlib.sha256(target.server.encode()).hexdigest(), ca_sha256=target.ca_sha256, namespace=namespace, cluster_uid=docker._uid(live._get("namespace", "kube-system", None), "Namespace", "kube-system", None), namespace_uid=namespace_uid)
     return cluster, docker._uid(pvc, "PersistentVolumeClaim", "outputs", namespace), docker._pvc_spec_sha256(pvc)
 
 
@@ -257,13 +325,40 @@ def _main(args: argparse.Namespace) -> dict[str, Any]:
             output = live._kubectl("logs", f"pod/{collector}", "--limit-bytes=1024", namespace=args.namespace).stdout.encode()
             if output != docker.RESULT_BYTES: raise LabExperimentError("collector output conflicts with the deterministic fixture result")
             output_sha256 = hashlib.sha256(output).hexdigest()
-            artifact = worker.request("POST", f"/worker/leases/{lease['id']}/artifacts", {"expected_epoch": lease["epoch"], "operation_id": binding.operation_id, "relative_path": "result.txt", "sha256": output_sha256, "content_base64": base64.b64encode(output).decode("ascii")}, key=_key(nonce, "artifact"))
+            upload = worker.request("POST", f"/worker/leases/{lease['id']}/artifact-uploads", {"expected_epoch": lease["epoch"], "operation_id": binding.operation_id, "relative_path": "result.txt", "sha256": output_sha256, "size": len(output)}, key=_key(nonce, "upload-begin"))
+            split = max(1, len(output) // 2)
+            worker.request("POST", f"/worker/leases/{lease['id']}/artifact-uploads/{upload['id']}/chunks", {"offset": 0, "content_base64": base64.b64encode(output[:split]).decode("ascii")}, key=_key(nonce, "upload-first-chunk"))
+            forward, transfer_restart_pod = _restart_control(restart, kubeconfig, args.namespace, after_pod, forward, port)
+            if after_pod.get("metadata", {}).get("uid") == transfer_restart_pod.get("metadata", {}).get("uid"):
+                raise LabExperimentError("interrupted transfer restart did not change the control Pod identity")
+            resumed = worker.request("POST", f"/worker/leases/{lease['id']}/artifact-uploads/{upload['id']}/status", {}, key=_key(nonce, "upload-status-after-restart"))
+            if resumed.get("received_bytes") != split:
+                raise LabExperimentError("interrupted transfer progress was not retained across control restart")
+            worker.request("POST", f"/worker/leases/{lease['id']}/artifact-uploads/{upload['id']}/chunks", {"offset": split, "content_base64": base64.b64encode(output[split:]).decode("ascii")}, key=_key(nonce, "upload-second-chunk"))
+            artifact = worker.request("POST", f"/worker/leases/{lease['id']}/artifact-uploads/{upload['id']}/complete", {}, key=_key(nonce, "upload-complete"))
             current = next(item for item in owner.request("GET", f"/experiments/{experiment['id']}")["admitted_attempts"] if item["id"] == admitted["id"])
             linked = owner.request("POST", f"/experiment-attempts/{admitted['id']}/artifacts", {"expected_revision": current["revision"], "artifact_ids": [artifact["id"]]}, key=_key(nonce, "link-artifact"))
             measurement = owner.request("POST", f"/experiment-attempts/{admitted['id']}/measurements", {"expected_revision": linked["revision"], "name": "deterministic output digest", "value": {"bytes": len(output), "sha256": output_sha256}, "artifact_id": artifact["id"]}, key=_key(nonce, "measurement"))
+        manifest = worker.request("POST", f"/worker/leases/{lease['id']}/artifact-manifest", {"expected_epoch": lease["epoch"], "operation_id": binding.operation_id, "artifacts": [{"id": artifact["id"], "relative_path": "result.txt", "sha256": artifact["sha256"], "size": artifact["size"]}]}, key=_key(nonce, "manifest"))
+        if manifest.get("status") != "quarantined" or manifest.get("classification") != "unclassified": raise LabExperimentError("output manifest was not retained under quarantine")
+        disposition = owner.request("POST", f"/artifact-manifests/{manifest['id']}/dispositions", {"expected_manifest_digest": manifest["manifest_digest"], "expected_revision": 0, "disposition": "retain_quarantined", "rationale": "Retain deterministic fixture output under quarantine."}, key=_key(nonce, "retain-quarantined"))
+        release = owner.request("POST", f"/artifact-manifests/{manifest['id']}/custody-releases", {"expected_manifest_digest": manifest["manifest_digest"], "expected_revision": 0, "action": "release", "rationale": "Allow fixture-owner retrieval of retained private output."}, key=_key(nonce, "custody-release"))
+        released = owner.request("GET", f"/artifact-manifests/{manifest['id']}/released")
+        if released.get("manifest", {}).get("status") != "quarantined" or released.get("manifest", {}).get("classification") != "unclassified": raise LabExperimentError("custody release changed output quarantine")
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/artifact-manifests/{manifest['id']}/artifacts/{artifact['id']}/content", headers={"Authorization": f"Bearer {owner.token}", "Host": FIXTURE_HOST}, method="GET")
+        try:
+            with owner.opener.open(request, timeout=10) as response:
+                retrieved_bytes = response.read()
+                retrieved_sha256 = response.headers.get("X-Tessera-Artifact-Sha256")
+        except (OSError, urllib.error.HTTPError) as error:
+            raise LabExperimentError("authorized fixture retrieval failed") from error
+        if retrieved_bytes != output or retrieved_sha256 != output_sha256: raise LabExperimentError("authorized retrieval bytes or digest conflict with collected output")
+        bundle = owner.request("POST", f"/artifact-manifests/{manifest['id']}/reproduction-bundles", {"max_bytes": 1024 * 1024}, key=_key(nonce, "reproduction-bundle"))
+        with tempfile.TemporaryDirectory(prefix="tessera-lab-reproduction-", dir="/private/tmp") as temporary:
+            reproduced = _materialize_fixture_reproduction_bundle(bundle["bundle"], Path(temporary) / "fresh-workspace")
         final = owner.request("GET", f"/experiments/{experiment['id']}"); exported_dispatch = next(item for item in final["kubernetes_dispatches"] if item["id"] == dispatch["id"])
         if exported_dispatch["operation_id"] != binding.operation_id or measurement["attempt_id"] != admitted["id"]: raise LabExperimentError("output measurement or dispatch linkage conflicts with the operation")
-        return {"state": "succeeded", "context": CONTEXT, "namespace": args.namespace, "namespace_uid": namespace_uid, "control_pod_uid_before": before_pod["metadata"]["uid"], "control_pod_uid_after": after_pod["metadata"]["uid"], "operation_id": binding.operation_id, "job": binding.job_name, "job_uid": job_uid, "job_count": len(jobs), "collector": collector, "collector_uid": collector_uid, "output_sha256": output_sha256, "artifact_id": artifact["id"], "measurement_id": measurement["id"], "admitted_attempt_id": admitted["id"], "kubernetes_dispatch_id": dispatch["id"], "baseline_and_intervention_registered": True, "approval_execution_granted": approved["execution_granted"], "retained": "fixture namespace, lab control PVC, output PVC, Job, Pods, images, and adapter journal", "limitations": ["provider-disabled deterministic fixture only", "output linkage does not accept an artifact or scientific result", "no Secret, provider, registry, namespace deletion, prune, or current-context fallback was used"]}
+        return {"state": "succeeded", "context": CONTEXT, "namespace": args.namespace, "namespace_uid": namespace_uid, "control_pod_uid_before": before_pod["metadata"]["uid"], "control_pod_uid_after": after_pod["metadata"]["uid"], "control_pod_uid_after_transfer_restart": transfer_restart_pod["metadata"]["uid"], "operation_id": binding.operation_id, "job": binding.job_name, "job_uid": job_uid, "job_count": len(jobs), "collector": collector, "collector_uid": collector_uid, "output_sha256": output_sha256, "artifact_id": artifact["id"], "manifest_id": manifest["id"], "manifest_digest": manifest["manifest_digest"], "custody_release_id": release["id"], "disposition_id": disposition["id"], "reproduction_bundle_id": bundle["id"], "reproduction_bundle_digest": bundle["bundle_digest"], "fresh_workspace_outputs": reproduced["outputs"], "fresh_workspace_missing_material_kinds": reproduced["missing_material_kinds"], "measurement_id": measurement["id"], "admitted_attempt_id": admitted["id"], "kubernetes_dispatch_id": dispatch["id"], "baseline_and_intervention_registered": True, "approval_execution_granted": approved["execution_granted"], "retained": "fixture namespace, lab control PVC, output PVC, Job, Pods, images, and adapter journal", "limitations": ["provider-disabled deterministic fixture only", "the fixture executes only the baseline; the intervention remains registered but unexecuted", "custody release is private human retrieval and preserves quarantined/unclassified output", "the fresh workspace verifies released fixture output only; input, skill, and environment material remain explicit missing/restricted records", "output linkage does not accept an artifact or scientific result", "no Secret, provider, registry, namespace deletion, prune, or current-context fallback was used"]}
     finally:
         restart._stop_port_forward(forward)
 

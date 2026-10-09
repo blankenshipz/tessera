@@ -1,7 +1,7 @@
 """Astra's narrow, operator-only Docker Desktop Kubernetes setup boundary.
 
 The module intentionally owns neither an execution target nor research authority.
-It accepts an explicit kubeconfig/context, creates only the three resources named
+It accepts an explicit kubeconfig/context, creates only the four resources named
 by a versioned profile, and leaves them retained for operator reconciliation.
 """
 
@@ -23,7 +23,7 @@ from typing import Any
 
 from .contracts import canonical_json
 
-SETUP_VERSION = "astra-operator-setup-v2"
+SETUP_VERSION = "astra-operator-setup-v3"
 DOCKER_DESKTOP_PROFILE = "docker-desktop-kubernetes-v1"
 DOCKER_DESKTOP_CONTEXT = "docker-desktop"
 _NAME = re.compile(r"[a-z]([-a-z0-9]{0,61}[a-z0-9])?\Z")
@@ -31,6 +31,11 @@ _IMAGE = re.compile(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}\Z")
 _RUNTIME = re.compile(r"[a-z][a-z0-9-]{0,62}\Z")
 _MAX_OUTPUT = 16_384
 _TIMEOUT = 30
+_OUTPUT_LABELS = {
+    "app.kubernetes.io/managed-by": "tessera",
+    "tessera.io/output-role": "dedicated-pilot-output",
+    "tessera.io/owner": "astra-operator-setup-v3",
+}
 
 
 class AstraSetupError(RuntimeError):
@@ -192,7 +197,7 @@ def profile_catalog() -> tuple[dict[str, object], ...]:
             "version": SETUP_VERSION,
             "name": DOCKER_DESKTOP_PROFILE,
             "context": DOCKER_DESKTOP_CONTEXT,
-            "resources": ["Namespace", "NetworkPolicy", "PersistentVolumeClaim"],
+            "resources": ["Namespace", "NetworkPolicy", "PersistentVolumeClaim", "ResourceQuota"],
             "mutations": (
                 "allowlisted create only; retained; no delete, Helm, SSH, cloud, Secret, "
                 "or workload"
@@ -388,7 +393,11 @@ class AstraDockerDesktopSetup:
                 "Namespace",
                 profile.namespace,
                 None,
-                {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": profile.namespace}},
+                {
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": profile.namespace, "labels": _OUTPUT_LABELS},
+                },
             ),
             (
                 "NetworkPolicy",
@@ -397,7 +406,11 @@ class AstraDockerDesktopSetup:
                 {
                     "apiVersion": "networking.k8s.io/v1",
                     "kind": "NetworkPolicy",
-                    "metadata": {"name": profile.network_policy, "namespace": profile.namespace},
+                    "metadata": {
+                        "name": profile.network_policy,
+                        "namespace": profile.namespace,
+                        "labels": _OUTPUT_LABELS,
+                    },
                     "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]},
                 },
             ),
@@ -408,13 +421,35 @@ class AstraDockerDesktopSetup:
                 {
                     "apiVersion": "v1",
                     "kind": "PersistentVolumeClaim",
-                    "metadata": {"name": profile.pvc, "namespace": profile.namespace},
+                    "metadata": {
+                        "name": profile.pvc,
+                        "namespace": profile.namespace,
+                        "labels": _OUTPUT_LABELS,
+                    },
                     "spec": {
                         "accessModes": ["ReadWriteOnce"],
                         "resources": {"requests": {"storage": profile.pvc_storage}},
                         "storageClassName": profile.pvc_storage_class,
                         "volumeMode": profile.pvc_volume_mode,
                     },
+                },
+            ),
+            (
+                "ResourceQuota",
+                "astra-output-admission",
+                profile.namespace,
+                {
+                    "apiVersion": "v1",
+                    "kind": "ResourceQuota",
+                    "metadata": {
+                        "name": "astra-output-admission",
+                        "namespace": profile.namespace,
+                        "labels": _OUTPUT_LABELS,
+                    },
+                    # Kubernetes API admission limits one claim and its requested
+                    # capacity. This intentionally does not claim a filesystem
+                    # write or inode quota on Docker Desktop local-path storage.
+                    "spec": {"hard": {"persistentvolumeclaims": "1", "requests.storage": "64Mi"}},
                 },
             ),
         )
@@ -447,6 +482,7 @@ class AstraDockerDesktopSetup:
                 "Namespace": "namespace",
                 "NetworkPolicy": "networkpolicy",
                 "PersistentVolumeClaim": "pvc",
+                "ResourceQuota": "resourcequota",
             }[kind]
             observed = self._get(singular, name, namespace)
             if observed is None:
@@ -458,9 +494,10 @@ class AstraDockerDesktopSetup:
                     f"retained {kind} identity was replaced; reconciliation is required"
                 )
             expected_spec = manifest.get("spec")
-            if expected_spec is not None and not self._spec_matches(
-                kind, expected_spec, observed.get("spec")
-            ):
+            if (
+                expected_spec is not None
+                and not self._spec_matches(kind, expected_spec, observed.get("spec"))
+            ) or observed.get("metadata", {}).get("labels") != manifest["metadata"]["labels"]:
                 raise AstraSetupError(f"retained {kind} spec conflicts with the approved plan")
 
     def apply(
@@ -491,6 +528,7 @@ class AstraDockerDesktopSetup:
                 "Namespace": "namespace",
                 "NetworkPolicy": "networkpolicy",
                 "PersistentVolumeClaim": "pvc",
+                "ResourceQuota": "resourcequota",
             }[kind]
             observed = self._get(singular, name, namespace)
             expected_spec = manifest.get("spec")
@@ -506,9 +544,10 @@ class AstraDockerDesktopSetup:
             if kind == "Namespace":
                 namespace_uid = uid
             actual_spec = observed.get("spec")
-            if expected_spec is not None and not self._spec_matches(
-                kind, expected_spec, actual_spec
-            ):
+            if (
+                expected_spec is not None
+                and not self._spec_matches(kind, expected_spec, actual_spec)
+            ) or observed.get("metadata", {}).get("labels") != manifest["metadata"]["labels"]:
                 raise AstraSetupError(f"pre-existing {kind} spec conflicts with the approved plan")
             resource = {
                 "kind": kind,
@@ -533,10 +572,21 @@ class AstraDockerDesktopSetup:
             "resources": resources,
             "readiness": "resource identities and declared specs observed",
             "network_enforcement": "declared_by_NetworkPolicy_not_proven",
-            "storage_enforcement": "PVC_bound_or_quota_not_proven",
+            "storage_enforcement": "admission_enforced_claim_count_and_request_only",
+            "output_storage_contract": {
+                "pvc": plan.profile.pvc,
+                "owner_labels": _OUTPUT_LABELS,
+                "admission_hard": {"persistentvolumeclaims": "1", "requests.storage": "64Mi"},
+                "runtime_byte_bound": "unknown",
+                "runtime_inode_bound": "unknown",
+                "live_execution": "blocked_pending_filesystem_quota_evidence",
+            },
+            "provider_billing_state": "operator_attested_unknown",
+            "cost_semantics": "internal_grants_are_not_provider_billing_caps",
             "uncertainty": [
                 "Kubernetes NetworkPolicy implementation is not tested by setup",
-                "PVC binding, capacity, quotas, and durability are not proven by setup",
+                "PVC binding, runtime byte/inode quotas, durability, and Docker Desktop billing "
+                "are not proven by setup",
             ],
             "retained": True,
         }
@@ -562,6 +612,7 @@ class AstraDockerDesktopSetup:
                 "Namespace": "namespace",
                 "NetworkPolicy": "networkpolicy",
                 "PersistentVolumeClaim": "pvc",
+                "ResourceQuota": "resourcequota",
             }[kind]
             observed = self._get(singular, name, namespace)
             expected_uid = custody[(kind, name, namespace)]
@@ -593,10 +644,14 @@ class AstraDockerDesktopSetup:
                     else None,
                     "matches_plan": expected_spec is None
                     or self._spec_matches(kind, expected_spec, observed.get("spec")),
+                    "matches_ownership_labels": observed.get("metadata", {}).get("labels")
+                    == manifest["metadata"]["labels"],
                 }
             )
         ready = all(
-            resource.get("matches_custody", False) and resource.get("matches_plan", False)
+            resource.get("matches_custody", False)
+            and resource.get("matches_plan", False)
+            and resource.get("matches_ownership_labels", False)
             for resource in resources
         )
         return {
@@ -604,7 +659,9 @@ class AstraDockerDesktopSetup:
             "plan_digest": plan.digest,
             "resources": resources,
             "network_enforcement": "declared_by_NetworkPolicy_not_proven",
-            "storage_enforcement": "PVC_bound_or_quota_not_proven",
+            "storage_enforcement": "admission_enforced_claim_count_and_request_only",
+            "provider_billing_state": "operator_attested_unknown",
+            "cost_semantics": "internal_grants_are_not_provider_billing_caps",
             "retained": True,
         }
 

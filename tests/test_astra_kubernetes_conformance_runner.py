@@ -69,6 +69,7 @@ def test_live_evidence_requires_a_private_non_symlink_operator_directory(
     args = _arguments(tmp_path)
     shared = tmp_path / "shared"
     shared.mkdir(mode=0o755)
+    shared.chmod(0o755)  # mkdir's mode is filtered by the process umask.
     args.evidence = str(shared / "evidence.json")
 
     with pytest.raises(runner_module.ConformanceError, match="private non-symlink"):
@@ -208,6 +209,37 @@ def test_network_policies_only_allow_the_labelled_allowed_client(runner_module) 
     assert egress["spec"]["podSelector"]["matchLabels"][role] == "network-allowed"
     destination_role = egress["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"][role]
     assert destination_role == "network-server"
+
+
+def test_network_enforcement_requires_observed_allowed_and_denied_connectivity(
+    runner_module,
+) -> None:
+    declaration = [{"name": "deny", "uid": "policy-1"}] * 3
+    server = {"uid": "server"}
+    allowed = {"uid": "allowed", "expected": "allow", "log": "allowed connection observed"}
+    denied = {
+        "uid": "denied",
+        "expected": "deny",
+        "log": "denied connection observed: i/o timeout",
+    }
+
+    evidence = runner_module.classify_network_enforcement(
+        declaration=declaration, server=server, allowed=allowed, denied=denied
+    )
+
+    assert evidence["declaration"]["classification"] == "declared"
+    assert evidence["enforcement"]["classification"] == "enforced"
+    with pytest.raises(runner_module.ConformanceError, match="denied connectivity"):
+        runner_module.classify_network_enforcement(
+            declaration=declaration,
+            server=server,
+            allowed=allowed,
+            denied={**denied, "log": "unexpected connection to denied destination: HTTP 200"},
+        )
+    with pytest.raises(runner_module.ConformanceError, match="declaration identities"):
+        runner_module.classify_network_enforcement(
+            declaration=[], server=server, allowed=allowed, denied=denied
+        )
 
 
 def test_pvc_probe_pod_uses_only_the_new_supplied_claim(

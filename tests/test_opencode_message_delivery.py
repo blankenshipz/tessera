@@ -14,6 +14,7 @@ from test_kubernetes_execution import _admitted_package
 
 from tessera_control.api import create_app
 from tessera_control.interaction import InteractionStore
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.store import (
     Conflict,
@@ -154,7 +155,7 @@ def test_enqueue_derives_destination_and_backup_restore_retains_binding_history(
     assert rejected.status_code == 422
 
     backup = tmp_path / "backup"
-    assert backup_state(state, backup)["schema_version"] == 43
+    assert backup_state(state, backup)["schema_version"] == LATEST_SCHEMA_VERSION
     restored = tmp_path / "restored"
     restore_state(backup, restored)
     restored_binding = InteractionStore(Store(restored)).get_harness_session_binding(
@@ -174,6 +175,9 @@ def test_v37_delivery_migration_preserves_rows_uniqueness_and_idempotency(tmp_pa
             "UPDATE interaction_message_deliveries SET harness_session_binding_id=NULL WHERE id=?",
             (delivery_id,),
         )
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=37")
         before = dict(
             connection.execute(
@@ -182,7 +186,7 @@ def test_v37_delivery_migration_preserves_rows_uniqueness_and_idempotency(tmp_pa
         )
         idempotency_count = connection.execute("SELECT count(*) FROM idempotency").fetchone()[0]
 
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with _connect(state / "tessera.sqlite3") as connection:
         migrated = dict(
             connection.execute(
@@ -208,7 +212,7 @@ def test_v37_delivery_migration_preserves_rows_uniqueness_and_idempotency(tmp_pa
         )
     first = interactions.enqueue_harness_delivery(owner, "post-migration-enqueue", **payload)
     assert interactions.enqueue_harness_delivery(owner, "post-migration-enqueue", **payload) == first
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
 
 def test_v39_session_binding_migration_is_empty_and_database_immutable(tmp_path: Path) -> None:
@@ -221,9 +225,12 @@ def test_v39_session_binding_migration_is_empty_and_database_immutable(tmp_path:
         connection.execute(
             "ALTER TABLE interaction_message_deliveries DROP COLUMN harness_session_binding_id"
         )
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=38")
 
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with _connect(state / "tessera.sqlite3") as connection:
         assert connection.execute(
             "SELECT count(*) FROM operation_harness_session_bindings"

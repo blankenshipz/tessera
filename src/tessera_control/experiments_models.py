@@ -145,6 +145,15 @@ class RecordMeasurement(ExperimentRequest):
     _value_is_bounded = field_validator("value")(_bounded_json)
 
 
+class DeriveOutputMeasurement(ExperimentRequest):
+    """Extract a numeric JSON value from a linked, retained output, not caller prose."""
+
+    expected_revision: Revision
+    name: NonBlank200
+    artifact_id: Identifier
+    json_pointer: Annotated[str, StringConstraints(max_length=512)]
+
+
 class EvidenceCitation(ExperimentRequest):
     attempt_id: Identifier
     artifact_ids: Annotated[list[Identifier], Field(max_length=128)] = []

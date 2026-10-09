@@ -213,20 +213,38 @@ def test_total_deadline_fences_a_blocked_request_without_spawning_more_threads()
     response = BlockingResponse()
     opener = FakeOpener(response)
     channel = HttpControlChannel(
-        "https://control.example", "worker-token", timeout_seconds=0.05, opener=opener
+        "https://control.example", "worker-token", timeout_seconds=0.5, opener=opener
     )
-    started = time.monotonic()
-    with pytest.raises(ControlChannelError, match="deadline") as raised:
-        channel.post("/worker/leases/lease/package", {}, "first")
-    assert time.monotonic() - started < 0.5
-    assert raised.value.reason == "control response deadline exceeded"
-    assert response.entered.wait(0.5)
-    with pytest.raises(ControlChannelError, match="in progress"):
-        channel.post("/worker/leases/lease/package", {}, "second")
-    assert len(opener.requests) == 1
-    response.release.set()
-    assert response.closed_event.wait(0.5)
-    channel._inflight.result(timeout=0.5)
+    result: list[ControlChannelError] = []
+    completed = threading.Event()
+
+    def post_blocked_request() -> None:
+        try:
+            channel.post("/worker/leases/lease/package", {}, "first")
+        except ControlChannelError as error:
+            result.append(error)
+        finally:
+            completed.set()
+
+    caller = threading.Thread(target=post_blocked_request)
+    caller.start()
+    try:
+        # Synchronize on the blocked read before observing the caller deadline.
+        # This proves the deadline returns while the sole transport thread remains
+        # in flight, without relying on a scheduler-sensitive elapsed-time bound.
+        assert response.entered.wait(2)
+        assert completed.wait(2)
+        caller.join(timeout=2)
+        assert not caller.is_alive()
+        assert [error.reason for error in result] == ["control response deadline exceeded"]
+        assert opener.requests[0][1] == 0.5
+        with pytest.raises(ControlChannelError, match="in progress"):
+            channel.post("/worker/leases/lease/package", {}, "second")
+        assert len(opener.requests) == 1
+    finally:
+        response.release.set()
+    assert response.closed_event.wait(2)
+    channel._inflight.result(timeout=2)
     assert channel.post("/worker/leases/lease/package", {}, "third") == {"ok": True}
     assert len(opener.requests) == 2
 

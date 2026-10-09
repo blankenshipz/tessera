@@ -9,10 +9,20 @@ from .api import idempotency_key, principal, worker_principal
 from .execution import ExecutionStore
 from .execution_models import (
     AcquireExecutionLease,
+    AttestKubernetesNeverClaimed,
+    AttestKubernetesNeverSubmitted,
+    AttestKubernetesPreparationNotSubmitted,
     ConfigureProjectExecution,
     IssueExecutionGrant,
+    IssueNeverClaimedMaintenance,
+    OwnerPreManifestNoStart,
     PrepareExecutionPackage,
+    ReconcileAttestedNeverSubmitted,
+    ReconcileAttestedPreparationNotSubmitted,
     ReconcileExecutionGrant,
+    ReconcileExpiredUnattemptedGrant,
+    ReconcileMaintenanceNeverClaimed,
+    RecoveryReconciliation,
     RenewExecutionLease,
     ReportExecutionObservation,
     ReportExternalOperationReceipt,
@@ -146,6 +156,27 @@ def get_grant(grant_id: str, actor: Actor, store: Authority) -> dict[str, Any]:
     return store.get_execution_grant(actor, grant_id)
 
 
+@router.get("/execution-grants/{grant_id}/recovery-reconciliations")
+def list_recovery_reconciliations(grant_id: str, actor: Actor, store: Authority) -> dict[str, Any]:
+    return {"recovery_reconciliations": store.list_recovery_reconciliations(actor, grant_id)}
+
+
+@router.post("/execution-grants/{grant_id}/recovery-reconciliations")
+def reconcile_lost_worker_operation(
+    grant_id: str,
+    body: RecoveryReconciliation,
+    actor: Actor,
+    key: Key,
+    store: Authority,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_lost_worker_operation(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
 @router.post("/execution-grants/{grant_id}/revoke")
 def revoke_grant(
     grant_id: str, body: RevokeExecutionGrant, actor: Actor, key: Key, store: Authority
@@ -165,6 +196,154 @@ def reconcile_grant(
     payload = body.model_dump(mode="json")
     return result(
         store.reconcile_execution_grant(actor, grant_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/execution-grants/{grant_id}/reconcile-expired-unattempted")
+def reconcile_expired_unattempted_grant(
+    grant_id: str,
+    body: ReconcileExpiredUnattemptedGrant,
+    actor: Actor,
+    key: Key,
+    store: Authority,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_expired_unattempted_grant(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/execution-grants/{grant_id}/reconcile-expired-undispatched")
+def reconcile_expired_undispatched_grant(
+    grant_id: str,
+    body: ReconcileExpiredUnattemptedGrant,
+    actor: Actor,
+    key: Key,
+    store: Authority,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_expired_undispatched_grant(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/worker/execution-grants/{grant_id}/attest-never-submitted")
+def attest_kubernetes_never_submitted(
+    grant_id: str, body: AttestKubernetesNeverSubmitted, actor: Worker, key: Key, store: Authority
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.attest_kubernetes_never_submitted(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/worker/execution-grants/{grant_id}/attest-never-claimed")
+def attest_kubernetes_never_claimed(
+    grant_id: str, body: AttestKubernetesNeverClaimed, actor: Worker, key: Key, store: Authority
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.attest_kubernetes_never_claimed(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/execution-grants/{grant_id}/reconcile-attested-never-claimed")
+def reconcile_attested_never_claimed(
+    grant_id: str, body: ReconcileAttestedNeverSubmitted, actor: Actor, key: Key, store: Authority
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_attested_never_claimed(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/worker/execution-grants/{grant_id}/attest-preparation-not-submitted")
+def attest_preparation_not_submitted(
+    grant_id: str,
+    body: AttestKubernetesPreparationNotSubmitted,
+    actor: Worker,
+    key: Key,
+    store: Authority,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.attest_kubernetes_preparation_not_submitted(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/execution-grants/{grant_id}/never-claimed-maintenance")
+def issue_never_claimed_maintenance(
+    grant_id: str, body: IssueNeverClaimedMaintenance, actor: Actor, key: Key, store: Authority
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.issue_never_claimed_maintenance(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/execution-grants/{grant_id}/reconcile-maintenance-never-claimed")
+def reconcile_maintenance_never_claimed(
+    grant_id: str, body: ReconcileMaintenanceNeverClaimed, actor: Actor, key: Key, store: Authority
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_maintenance_never_claimed(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/execution-grants/{grant_id}/reconcile-attested-preparation-not-submitted")
+def reconcile_preparation_not_submitted(
+    grant_id: str,
+    body: ReconcileAttestedPreparationNotSubmitted,
+    actor: Actor,
+    key: Key,
+    store: Authority,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_attested_preparation_not_submitted(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/execution-grants/{grant_id}/reconcile-attested-never-submitted")
+def reconcile_attested_never_submitted(
+    grant_id: str, body: ReconcileAttestedNeverSubmitted, actor: Actor, key: Key, store: Authority
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_attested_never_submitted(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/execution-grants/{grant_id}/reconcile-owner-pre-manifest-no-start")
+def reconcile_owner_pre_manifest_no_start(
+    grant_id: str, body: OwnerPreManifestNoStart, actor: Actor, key: Key, store: Authority
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_owner_pre_manifest_no_start(
+            actor, grant_id, key, canonical_digest(payload), payload
+        )
     )
 
 
@@ -236,6 +415,7 @@ def list_worker_discovery(
 @router.post("/workers/{worker_id}/drain")
 @router.post("/workers/{worker_id}/quarantine")
 @router.post("/workers/{worker_id}/retire")
+@router.post("/workers/{worker_id}/retire-stale")
 def lifecycle_worker(
     worker_id: str, body: WorkerLifecycle, actor: Actor, key: Key, store: Workers, request: Request
 ) -> JSONResponse:

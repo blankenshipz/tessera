@@ -209,6 +209,27 @@ def test_project_worker_discovery_is_safe_metadata_only_and_reports_fences(tmp_p
     assert revoked["lease_admission"]["fence_reason"] == "credential_revoked"
 
 
+def test_worker_discovery_fences_expired_credentials(tmp_path) -> None:
+    state, _, _, worker, project, _ = _setup(tmp_path)
+    with _connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "UPDATE credentials SET expires_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), worker["credential_id"]),
+        )
+    owner_token = (state / "owner.header").read_text().split("Bearer ", 1)[1].strip()
+    response = TestClient(create_app(state)).get(
+        f"/projects/{project['id']}/workers", headers={"Authorization": f"Bearer {owner_token}"}
+    )
+    assert response.status_code == 200
+    record = response.json()["workers"][0]
+    assert record["lifecycle"]["credential_status"] == "expired"
+    assert record["lease_admission"] == {
+        "registration_is_not_scheduling": True,
+        "status": "fenced",
+        "fence_reason": "credential_expired",
+    }
+
+
 def test_registration_is_metadata_not_scheduling_and_worker_package_reads_are_isolated(
     tmp_path,
 ) -> None:

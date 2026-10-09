@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75,<82"]
+requires = ["setuptools>=77,<82"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +8,31 @@ version = "0.1.0"
 description = "Local control-plane foundation for Tessera research workspaces"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Zach Blankenship"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+]
 dependencies = [
   "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
   "pydantic>=2,<3",
   "PyYAML>=6,<7",
   "uvicorn>=0.30,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/blankenshipz/tessera"
+Issues = "https://github.com/blankenshipz/tessera/issues"
+
+[project.optional-dependencies]
+a2a = ["a2a-sdk[http-server]==1.2.1"]
+mcp = [
+  "mcp==1.26.0",
+  "cryptography>=48.0.1,<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
 [dependency-groups]
@@ -21,9 +41,26 @@ dev = ["httpx>=0.27,<1", "pytest>=8,<10", "ruff>=0.9,<1"]
 [project.scripts]
 tessera = "tessera_control.cli:main"
 tessera-worker = "tessera_worker.cli:main"
+tessera-mcp = "tessera_mcp.server:main"
+tessera-reasoning = "tessera_agent.remote_reasoning_runtime:main"
+tessera-a2a-peer = "tessera_control.a2a_peer:main"
+
+[tool.setuptools.data-files]
+"share/tessera/skills/tessera-research-bench" = ["skills/tessera-research-bench/SKILL.md"]
+"share/tessera/docs" = ["docs/*.md", "README.md", "DESIGN.md", "CONTRIBUTING.md", "SECURITY.md", "desktop/EXECUTION.md"]
+"share/tessera/docs/decisions" = ["docs/decisions/*.md"]
+"share/tessera/docs/examples" = ["docs/examples/*.json", "docs/examples/*.yaml"]
+"share/tessera/examples/local-ledger" = ["examples/local-ledger/*.md"]
+"share/tessera/examples/kubernetes-hello" = ["examples/kubernetes-hello/*.go", "examples/kubernetes-hello/Dockerfile"]
+"share/tessera/examples/tabular-starter" = ["examples/tabular-starter/Dockerfile", "examples/tabular-starter/Dockerfile.dockerignore", "examples/tabular-starter/IMAGE.lock.json", "examples/tabular-starter/portable_verifier.py", "examples/tabular-starter/requirements.lock", "examples/tabular-starter/workflow.py"]
+"share/tessera/release/opencode-observer" = ["release/opencode-observer/README.md", "release/opencode-observer/*.json", "release/opencode-observer/*.patch", "release/opencode-observer/LICENSE*", "release/opencode-observer/baseline.tar.g[z]"]
+"share/tessera/release/opencode-observer/runtime-v8" = ["release/opencode-observer/runtime-v8/baseline.json", "release/opencode-observer/runtime-v8/baseline.tar.gz", "release/opencode-observer/runtime-v8/observer.patch", "release/opencode-observer/runtime-v8/LICENSE", "release/opencode-observer/runtime-v8/BASELINE.sha256", "release/opencode-observer/runtime-v8/TARGET.sha256", "release/opencode-observer/runtime-v8/origins.json", "release/opencode-observer/runtime-v8/README.md", "release/opencode-observer/runtime-v8/reconstruct.py", "release/opencode-observer/runtime-v8/link_runtime.py", "release/opencode-observer/runtime-v8/verify_runtime.mjs", "release/opencode-observer/runtime-v8/verify_python.py"]
+"share/tessera/release/opencode-observer/runtime-v8/runtime-deps" = ["release/opencode-observer/runtime-v8/runtime-deps/package.json", "release/opencode-observer/runtime-v8/runtime-deps/bun.lock"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["tessera_*"]
+namespaces = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

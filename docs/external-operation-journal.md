@@ -106,7 +106,8 @@ or an unconfirmed exit contradicts a confirmed exit and keeps the operation
 unresolved. A newer confirmed exit can supersede an older nonterminal sample, but
 a newer nonterminal sample blocks admitted success/cancellation resolution and
 grant reconciliation/exposure release. Reconciliation returns deterministic source
-presentation order (`receipt`, then `worker`) and an explicit contradiction state:
+presentation order (`receipt`, `recovery_observer`, then `worker`) and an explicit
+contradiction state:
 `same_time_contradiction`, `later_adverse_observation`,
 `unconfirmed_current_observation`, or `none`; presentation order never gives one
 source authority precedence. Human outcome rows remain immutable while the

@@ -1,0 +1,14 @@
+# Source-only experiment artifact; build/output digest needs separate human target
+# approval. No image is pulled or built by adding this file.
+FROM python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
+WORKDIR /opt/tessera
+COPY src/tessera_worker/ordinary_docker_guard.py /opt/tessera/tessera_worker/ordinary_docker_guard.py
+# Only the stdlib guard is packaged: no API server, OAuth, model client or Docker CLI.
+RUN touch /opt/tessera/tessera_worker/__init__.py && \
+    mkdir -p /scratch /outputs && chown 65532:65532 /scratch /outputs && \
+    chmod 0700 /scratch /outputs && chmod -R a+rX /opt/tessera
+ENV PYTHONPATH=/opt/tessera PYTHONDONTWRITEBYTECODE=1
+USER 65532:65532
+ENTRYPOINT ["python", "-m", "tessera_worker.ordinary_docker_guard"]
+# Runtime nonroot/readonly/network-none/cap-drop/tmpfs/resource bounds and immutable
+# package argv are supplied by the typed adapter. No host volume/socket defaults.

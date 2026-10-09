@@ -212,6 +212,16 @@ class ResearchStore(Store):
         body = self._payload(CreateStudy, payload)
         path = f"/projects/{project_id}/studies"
 
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            path,
+            digest,
+            lambda c, a: self._create_study_transaction(c, a, project_id, body),
+        )
+
+    def _create_study_transaction(self, connection, actor, project_id, body):
         def command(
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
@@ -247,7 +257,7 @@ class ResearchStore(Store):
             )
             return 201, study
 
-        return self._mutate(principal, key, "POST", path, digest, command)
+        return command(connection, actor)
 
     def list_studies(
         self, principal: dict[str, Any], project_id: str, offset: int = 0, limit: int = 100
@@ -434,6 +444,16 @@ class ResearchStore(Store):
                     body["expected_revision"],
                 ),
             )
+            # A registered variant can be cited before its result is known. Once its
+            # outcome is recorded, a previously accepted interpretation needs a
+            # human recheck; the historical finding and its citations stay intact.
+            flagged_findings = connection.execute(
+                """UPDATE research_findings SET status='needs_review',revision=revision+1,
+                updated_at=? WHERE id IN (
+                    SELECT finding_id FROM research_finding_variants WHERE variant_id=?
+                ) AND status='accepted'""",
+                (now, variant_id),
+            ).rowcount
             result = self._variant_response(
                 {
                     **variant,
@@ -463,6 +483,7 @@ class ResearchStore(Store):
                     "status": body["status"],
                     "provenance": result["outcome_provenance"],
                     "execution_receipt": None,
+                    "dependent_findings_flagged": flagged_findings,
                 },
             )
             return 200, result
@@ -1159,6 +1180,18 @@ class ResearchStore(Store):
             event_pattern = f'%"study_id":"{study_id}"%'
             bounded_queries = (
                 (
+                    "dataset_snapshots",
+                    "dataset_snapshots",
+                    "SELECT COUNT(*) FROM dataset_snapshots WHERE study_id=?",
+                    (study_id,),
+                ),
+                (
+                    "dataset_ingestion_proposals",
+                    "dataset_ingestion_proposals",
+                    "SELECT COUNT(*) FROM dataset_ingestion_proposals WHERE study_id=?",
+                    (study_id,),
+                ),
+                (
                     "variants",
                     "research_variants",
                     "SELECT COUNT(*) FROM research_variants WHERE study_id=?",
@@ -1197,6 +1230,8 @@ class ResearchStore(Store):
 
             result: dict[str, Any] = {
                 "study": study,
+                "dataset_snapshots": [],
+                "dataset_ingestion_proposals": [],
                 "variants": [],
                 "sources": [],
                 "findings": [],
@@ -1220,6 +1255,17 @@ class ResearchStore(Store):
                 if used > body["max_bytes"]:
                     raise Conflict("Export exceeds the requested byte cap.")
                 result[section].append(item)
+
+            for row in connection.execute(
+                "SELECT * FROM dataset_snapshots WHERE study_id=? ORDER BY created_at,id",
+                (study_id,),
+            ):
+                append("dataset_snapshots", self._dataset_snapshot_response(connection, dict(row)))
+            for row in connection.execute(
+                "SELECT * FROM dataset_ingestion_proposals WHERE study_id=? ORDER BY created_at,id",
+                (study_id,),
+            ):
+                append("dataset_ingestion_proposals", dict(row))
 
             for row in connection.execute(
                 "SELECT * FROM research_variants WHERE study_id=? ORDER BY created_at,id",
@@ -1252,6 +1298,18 @@ class ResearchStore(Store):
                 event["payload"] = json.loads(event.pop("payload_json"))
                 if event["payload"].get("study_id") == study_id:
                     append("events", event)
+            from .agent_provenance import project_agent_notebook
+
+            if actor["kind"] in {"local_owner", "human_session"}:
+                result["agent_notebook"] = project_agent_notebook(
+                    connection, actor, study["project_id"], max_bytes=max(1024, body["max_bytes"])
+                )
+            else:
+                result["agent_notebook"] = {
+                    "availability": "unavailable",
+                    "reason": "separate_project_notebook_authority_required",
+                    "completeness": "not_disclosed",
+                }
             encoded = json.dumps(
                 result, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             ).encode()
@@ -1271,6 +1329,27 @@ class ResearchStore(Store):
         response.pop("outcome_json", None)
         response["execution_receipt"] = None
         response["independence_status"] = "unavailable"
+        return response
+
+    @staticmethod
+    def _dataset_snapshot_response(
+        connection: sqlite3.Connection, row: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = dict(row)
+        response["schema"] = json.loads(response.pop("schema_json"))
+        response["validation_summary"] = json.loads(response.pop("validation_summary_json"))
+        response["split_strategy"] = json.loads(response.pop("split_strategy_json"))
+        response["sources"] = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT source_id,expected_source_revision,expected_content_digest,"
+                "license_expression,"
+                "license_status,provenance_kind,provenance_status FROM dataset_snapshot_sources "
+                "WHERE snapshot_id=? ORDER BY source_id",
+                (response["id"],),
+            )
+        ]
+        response["content_validation"] = "not_performed"
         return response
 
     @staticmethod

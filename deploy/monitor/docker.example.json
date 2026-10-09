@@ -1,0 +1,26 @@
+{
+  "enabled": false,
+  "identity": "fixture-monitor",
+  "journal": "/var/lib/tessera-monitor/one-operation",
+  "assignment_file": "/run/tessera-monitor/assignment.json",
+  "authority_key_file": "/run/tessera-monitor/assignment-key",
+  "channel_key_file": "/run/tessera-monitor/channel-key",
+  "evidence_key_file": "/run/tessera-monitor/evidence-key",
+  "allow_host_socket": false,
+  "fixture": {
+    "operation_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "nonce": "0000000000000000000000000000000000000000000000000000000000000000",
+    "image": "python@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "mode": "wait",
+    "runtime_seconds": 10
+  },
+  "tls": {
+    "address": "192.0.2.10",
+    "port": 9443,
+    "server_name": "control.example.invalid",
+    "ca": "/run/tessera-monitor/control-ca.pem",
+    "certificate": "/run/tessera-monitor/monitor-cert.pem",
+    "private_key": "/run/tessera-monitor/monitor-key.pem",
+    "peer_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

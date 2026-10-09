@@ -1,0 +1,40 @@
+{
+  "org_id": "fixture-tenant",
+  "project_id": "fixture-project",
+  "management": {"reference": "credential-ref:fixture-management", "version": 1},
+  "target": {
+    "selection": {
+      "target": "salad_container",
+      "target_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "resources": {
+        "cpu_millicores": 1000, "memory_mb": 1024, "gpu_class": null,
+        "gpu_count": 0, "disk_mb": 1024, "max_seconds": 60
+      },
+      "manifests": {
+        "image": "registry.example.invalid/fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "code": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "data": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "model": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "environment": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "salad": {
+        "organization": "fixture-salad-org", "project": "fixture-salad-project",
+        "group": "attempt-00000000000000000000000000000000", "country": "US",
+        "provider_trust": "broad_egress_ephemeral_reallocation_credit_not_hard_cap",
+        "execution": {
+          "platform": "linux/amd64", "command": "/tessera/bin/run", "argv": ["fixture"], "env": {},
+          "max_output_bytes": 1024, "max_output_files": 1,
+          "capability_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "network_policy": "provider_broad_egress_explicitly_accepted",
+          "data_policy": "public_released_only",
+          "artifact_destination": "artifact-ref:fixture-quarantine",
+          "checkpoint_destination": "checkpoint-ref:fixture-external",
+          "monitor_profile": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "watchdog_profile": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "max_cost_cents": 0,
+          "credit_exposure": "unknown_blocks_new_work_credit_not_hard_cap"
+        }
+      }
+    }
+  }
+}

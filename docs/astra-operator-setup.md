@@ -2,7 +2,7 @@
 
 `tessera astra-setup` is an operator-only, plan-driven preparation boundary for
 one retained Docker Desktop Kubernetes profile: `docker-desktop-kubernetes-v1`
-under setup contract `astra-operator-setup-v2`.
+under setup contract `astra-operator-setup-v3`.
 It is separate from Minikube bootstrap, target attachment, worker enrollment,
 research plans/grants, dispatch, credentials, Secrets, and provider activity.
 
@@ -13,7 +13,11 @@ fallback. The profile pins a namespace, an exact `repository@sha256:...` image
 identity, and a runtime identity even though setup does not start that image.
 
 The only apply allowlist is a named retained Namespace, deny-all NetworkPolicy,
-and 64 MiB PVC. It uses bounded, explicit `kubectl get`/`create -f -` calls and
+64 MiB dedicated-output PVC, and an exact ResourceQuota. The PVC and the other
+retained resources carry `app.kubernetes.io/managed-by=tessera`,
+`tessera.io/output-role=dedicated-pilot-output`, and an operator-setup owner
+label. The ResourceQuota admission-enforces at most one claim and a total
+`requests.storage=64Mi` in that dedicated namespace. It uses bounded, explicit `kubectl get`/`create -f -` calls and
 rejects a differing pre-existing spec or changed cluster identity. It does not
 accept generic manifests, Helm, SSH, cloud, install, reset, public exposure,
 Secrets, provider configuration, workload creation, delete, prune, or cleanup.
@@ -67,11 +71,18 @@ an operator-owned private directory.
   --journal "$PRIVATE_DIR/setup.journal"
 ```
 
-`ready` means only that the named resource identities match the recorded
-apply-time custody and their declared specs were observed. The command reports
-NetworkPolicy enforcement and PVC binding/capacity
-as **not proven**: neither network isolation nor storage durability/quota is
-established by object presence. Resources are retained. There is no teardown.
+`ready` means only that the named resource identities, owner labels, and declared
+specs were observed. The run record distinguishes the enforceable Kubernetes API
+admission bound (`persistentvolumeclaims=1`, `requests.storage=64Mi`) from
+runtime output storage: byte and inode write bounds are `unknown`, and live
+execution is blocked pending real filesystem-quota evidence. A PVC request, its
+capacity, free space, or a ResourceQuota does **not** prove that Docker Desktop
+will refuse a write or inode creation at that value. Docker Desktop cost/billing
+is recorded as `operator_attested_unknown`; that state blocks live execution. A
+zero-dollar Tessera grant is an internal reservation, never a provider billing
+cap, and cannot change either state.
+NetworkPolicy enforcement and storage durability remain unproven by object
+presence. Resources are retained. There is no teardown.
 
 ## Explicit in-cluster conformance probes
 

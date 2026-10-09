@@ -250,13 +250,13 @@ class ArtifactStore(Store):
             + hashlib.sha256(f"{lease_id}:{relative_path}".encode()).hexdigest()[:32]
         )
 
-    def _validate_declaration(
+    def _validate_operation(
         self,
         connection: sqlite3.Connection,
         grant: sqlite3.Row,
         lease: sqlite3.Row,
         body: dict[str, Any],
-    ) -> int:
+    ) -> None:
         if body["expected_epoch"] != lease["epoch"]:
             raise Conflict("Artifact epoch does not match the issued lease.")
         # Once control has issued an operation, its durable identity supersedes
@@ -280,6 +280,15 @@ class ArtifactStore(Store):
             or body["operation_id"] != operation["operation_id"]
         ):
             raise Conflict("Artifact operation does not match the control-issued lease operation.")
+
+    def _validate_declaration(
+        self,
+        connection: sqlite3.Connection,
+        grant: sqlite3.Row,
+        lease: sqlite3.Row,
+        body: dict[str, Any],
+    ) -> int:
+        self._validate_operation(connection, grant, lease, body)
         _portable_path(body["relative_path"])
         plan, _ = self._plan(connection, grant)
         spec = plan["execution_spec"]

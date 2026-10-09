@@ -155,6 +155,11 @@ def request_decision(body: CreateDecision, actor: Actor, key: Key, store: Record
     return response(store.request_decision(actor, key, **body.model_dump(mode="json")))
 
 
+@router.get("/studies/{study_id}/program-context")
+def program_context(study_id: str, actor: Actor, store: Records) -> dict[str, Any]:
+    return store.program_context(actor, study_id)
+
+
 @router.post("/decisions/resolve")
 def resolve_decision(body: ResolveDecision, actor: Actor, key: Key, store: Records) -> JSONResponse:
     return response(store.resolve_decision(actor, key, **body.model_dump(mode="json")))

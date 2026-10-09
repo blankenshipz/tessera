@@ -93,6 +93,8 @@ class SnapshotStore(Store):
         key: str,
         expected_digest: str,
         capture: CapturedWorkspace,
+        *,
+        replay_guard: Any | None = None,
     ) -> tuple[int, dict[str, Any]]:
         """Commit reviewed bytes, manifest, audit and replay atomically, locally."""
         manifest = _validate_capture(capture, expected_digest)
@@ -137,7 +139,13 @@ class SnapshotStore(Store):
             }
 
         return self._mutate(
-            actor, key, "POST", f"/projects/{project_id}/snapshots", expected_digest, command
+            actor,
+            key,
+            "POST",
+            f"/projects/{project_id}/snapshots",
+            expected_digest,
+            command,
+            replay_guard=replay_guard,
         )
 
     @staticmethod

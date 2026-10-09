@@ -12,7 +12,7 @@ from datetime import datetime
 
 # This order makes returned evidence deterministic. It is presentation order,
 # never authority precedence for evidence at an equal observed time.
-RECONCILIATION_SOURCE_ORDER = ("receipt", "worker")
+RECONCILIATION_SOURCE_ORDER = ("receipt", "recovery_observer", "worker")
 
 
 def create_external_operation_schema(connection: sqlite3.Connection) -> None:
@@ -164,12 +164,66 @@ def create_external_operation_receipt_schema(connection: sqlite3.Connection) -> 
     )
 
 
+def create_execution_recovery_schema(connection: sqlite3.Connection) -> None:
+    """Install empty, operation-bound loss recovery records.
+
+    Recovery evidence is intentionally separate from worker observations: the
+    original worker can no longer use its credential, and an observer must not
+    be represented as that worker.  One recovery row can exist only for the
+    original immutable operation identity.
+    """
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS execution_recovery_reconciliations (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        grant_id TEXT NOT NULL REFERENCES execution_grants(id),
+        lease_id TEXT NOT NULL REFERENCES execution_leases(id),
+        epoch INTEGER NOT NULL CHECK (epoch >= 1),
+        operation_id TEXT NOT NULL UNIQUE REFERENCES external_operations(operation_id),
+        original_worker_principal_id TEXT NOT NULL REFERENCES principals(id),
+        identity_loss_reason TEXT NOT NULL CHECK (identity_loss_reason IN
+            ('credential_revoked','credential_expired','principal_revoked','worker_retired','registry_missing')),
+        state TEXT NOT NULL CHECK (state IN ('identity_lost','reconciliation_required',
+            'cancel_requested','independently_observed','terminal_confirmed','unresolved')),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        cancellation_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancellation_requested IN (0,1)),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        closed_at TEXT, closed_by_principal_id TEXT REFERENCES principals(id)
+        )"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS execution_recovery_by_grant
+        ON execution_recovery_reconciliations(grant_id, created_at, id)"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS execution_recovery_observations (
+        id TEXT PRIMARY KEY,
+        recovery_id TEXT NOT NULL REFERENCES execution_recovery_reconciliations(id),
+        observer_principal_id TEXT NOT NULL REFERENCES principals(id),
+        action TEXT NOT NULL CHECK (action IN ('lookup','cancel_lookup')),
+        evidence_reference TEXT NOT NULL CHECK (length(evidence_reference) BETWEEN 1 AND 200),
+        evidence_digest TEXT NOT NULL CHECK (length(evidence_digest)=64
+            AND evidence_digest NOT GLOB '*[^0-9a-f]*'),
+        provider_id TEXT NOT NULL CHECK (length(provider_id) BETWEEN 1 AND 200),
+        observed_state TEXT NOT NULL CHECK (observed_state IN ('unknown','running','exited')),
+        observed_at TEXT NOT NULL, termination_confirmed INTEGER NOT NULL CHECK
+            (termination_confirmed IN (0,1)), recorded_at TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS execution_recovery_observations_by_recovery
+        ON execution_recovery_observations(recovery_id, recorded_at, id)"""
+    )
+
+
 def current_operation_reconciliation(
     connection: sqlite3.Connection, operation_id: str
 ) -> dict[str, object] | None:
     """Return the fail-closed current observation across worker and provider sources.
 
-    Each source is ordered by its reported ``observed_at`` and an opaque cursor:
+    Each source is ordered by its parsed ``observed_at`` and an opaque cursor:
     a worker cursor is its immutable observation ID, and a receipt cursor is its
     monotonically increasing receipt observation sequence.  Cross-source order is
     by ``observed_at`` only.  At the same timestamp no source is preferred: an
@@ -179,23 +233,30 @@ def current_operation_reconciliation(
     """
     worker = connection.execute(
         """SELECT id,observed_state,observed_at,termination_confirmed FROM execution_observations
-        WHERE operation_id=? ORDER BY observed_at DESC, rowid DESC LIMIT 1""",
+        WHERE operation_id=? ORDER BY rowid""",
         (operation_id,),
-    ).fetchone()
+    ).fetchall()
     receipt = connection.execute(
         """SELECT observed_state,observed_at,termination_confirmed,observation_sequence
         FROM external_operation_receipts WHERE operation_id=?""",
         (operation_id,),
     ).fetchone()
+    recovery = connection.execute(
+        """SELECT o.id,o.observed_state,o.observed_at,o.termination_confirmed
+        FROM execution_recovery_observations o
+        JOIN execution_recovery_reconciliations r ON r.id=o.recovery_id
+        WHERE r.operation_id=? ORDER BY o.rowid""",
+        (operation_id,),
+    ).fetchall()
     sources: list[dict[str, object]] = []
-    if worker is not None:
+    for observation in worker:
         sources.append(
             {
                 "source": "worker",
-                "cursor": f"observation:{worker['id']}",
-                "observed_state": worker["observed_state"],
-                "observed_at": worker["observed_at"],
-                "termination_confirmed": bool(worker["termination_confirmed"]),
+                "cursor": f"observation:{observation['id']}",
+                "observed_state": observation["observed_state"],
+                "observed_at": observation["observed_at"],
+                "termination_confirmed": bool(observation["termination_confirmed"]),
             }
         )
     if receipt is not None:
@@ -208,12 +269,38 @@ def current_operation_reconciliation(
                 "termination_confirmed": bool(receipt["termination_confirmed"]),
             }
         )
+    for observation in recovery:
+        sources.append(
+            {
+                "source": "recovery_observer",
+                "cursor": f"recovery-observation:{observation['id']}",
+                "observed_state": observation["observed_state"],
+                "observed_at": observation["observed_at"],
+                "termination_confirmed": bool(observation["termination_confirmed"]),
+            }
+        )
     if not sources:
         return None
 
     def observed_time(item: dict[str, object]) -> datetime:
         return datetime.fromisoformat(str(item["observed_at"]).replace("Z", "+00:00"))
 
+    def confirmed_exit(item: dict[str, object]) -> bool:
+        return item["observed_state"] == "exited" and bool(item["termination_confirmed"])
+
+    # Existing records contain variable precision and equivalent UTC offsets.
+    # TEXT MAX and SQLite floating-point Julian days both lose exact ordering.
+    # Parse history before selecting each source's latest instant; retain every
+    # equal-time sample so alternate encodings cannot hide contradictions.
+    latest_time = max(observed_time(item) for item in sources)
+    prior_confirmed_exit = any(
+        observed_time(item) < latest_time and confirmed_exit(item) for item in sources
+    )
+    source_times = {
+        source: max(observed_time(item) for item in sources if item["source"] == source)
+        for source in {str(item["source"]) for item in sources}
+    }
+    sources = [item for item in sources if observed_time(item) == source_times[str(item["source"])]]
     source_rank = {source: rank for rank, source in enumerate(RECONCILIATION_SOURCE_ORDER)}
     sources.sort(
         key=lambda item: (
@@ -222,19 +309,12 @@ def current_operation_reconciliation(
             str(item["cursor"]),
         )
     )
-    latest_time = max(observed_time(item) for item in sources)
     latest = [item for item in sources if observed_time(item) == latest_time]
     latest_at = str(latest[0]["observed_at"])
-
-    def confirmed_exit(item: dict[str, object]) -> bool:
-        return item["observed_state"] == "exited" and bool(item["termination_confirmed"])
 
     latest_confirmed_exit = all(confirmed_exit(item) for item in latest)
     adverse_latest = any(
         item["observed_state"] != "exited" or not item["termination_confirmed"] for item in latest
-    )
-    prior_confirmed_exit = any(
-        observed_time(item) < latest_time and confirmed_exit(item) for item in sources
     )
     if latest_confirmed_exit:
         observed_state, termination_confirmed = "exited", True

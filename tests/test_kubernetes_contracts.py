@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from tessera_worker.kubernetes_contracts import (
     KubernetesClusterConfig,
+    KubernetesConnectivityEvidence,
     KubernetesContractError,
     KubernetesJobBinding,
     KubernetesJobJournal,
@@ -21,6 +23,27 @@ from tessera_worker.kubernetes_contracts import (
 )
 
 
+def _network_evidence(**changes: object) -> KubernetesNetworkPolicyEvidence:
+    now = datetime.now(UTC)
+    values: dict[str, object] = {
+        "capability": "network-policy-enforced-v1",
+        "policy_name": "tessera-deny-all",
+        "policy_uid": "policy-fixture",
+        "policy_spec_sha256": "f" * 64,
+        "cluster_uid": "cluster-fixture",
+        "namespace_uid": "namespace-fixture",
+        "observed_at": now,
+        "allowed_connectivity": KubernetesConnectivityEvidence(
+            "allowed-pod", "server-pod", "allowed", 3, now
+        ),
+        "denied_connectivity": KubernetesConnectivityEvidence(
+            "denied-pod", "server-pod", "denied", 3, now
+        ),
+    }
+    values.update(changes)
+    return KubernetesNetworkPolicyEvidence(**values)  # type: ignore[arg-type]
+
+
 def _cluster() -> KubernetesClusterConfig:
     return KubernetesClusterConfig(
         kubeconfig="/private/fixture/kubeconfig",
@@ -33,9 +56,7 @@ def _cluster() -> KubernetesClusterConfig:
         namespace="tessera-fixture",
         cluster_uid="cluster-fixture",
         namespace_uid="namespace-fixture",
-        network_none_evidence=KubernetesNetworkPolicyEvidence(
-            "network-policy-enforced-v1", "tessera-deny-all", "policy-fixture", "f" * 64
-        ),
+        network_none_evidence=_network_evidence(),
     )
 
 
@@ -167,12 +188,89 @@ def test_network_none_requires_explicit_target_capability_and_policy_evidence() 
         **{**_cluster().__dict__, "network_none_evidence": None}
     )
 
-    with pytest.raises(KubernetesContractError, match="capability and enforcing-policy"):
+    with pytest.raises(KubernetesContractError, match="fresh target-bound"):
         job_manifest(_binding(), missing_evidence)
 
     manifest = job_manifest(_binding(), _cluster())
     assert manifest["metadata"]["annotations"]["tessera.dev/network-mode"] == "none"
     assert manifest["metadata"]["annotations"]["tessera.dev/network-policy-uid"] == "policy-fixture"
+
+
+def test_network_none_requires_fresh_target_bound_allowed_and_denied_evidence() -> None:
+    now = datetime.now(UTC)
+    stale_observed_at = now - timedelta(minutes=16)
+    stale = _network_evidence(
+        observed_at=stale_observed_at,
+        allowed_connectivity=KubernetesConnectivityEvidence(
+            "allowed-pod", "server-pod", "allowed", 3, stale_observed_at
+        ),
+        denied_connectivity=KubernetesConnectivityEvidence(
+            "denied-pod", "server-pod", "denied", 3, stale_observed_at
+        ),
+    )
+    stale_cluster = KubernetesClusterConfig(
+        **{**_cluster().__dict__, "network_none_evidence": stale}
+    )
+    with pytest.raises(KubernetesContractError, match="fresh target-bound"):
+        job_manifest(_binding(), stale_cluster)
+    wrong_target = _network_evidence(namespace_uid="other-namespace")
+    with pytest.raises(ValueError, match="bound"):
+        KubernetesClusterConfig(**{**_cluster().__dict__, "network_none_evidence": wrong_target})
+    with pytest.raises(ValueError, match="allowed connectivity"):
+        _network_evidence(
+            allowed_connectivity=KubernetesConnectivityEvidence(
+                "allowed-pod", "server-pod", "denied", 3, now
+            )
+        )
+
+
+def test_expired_network_evidence_fences_new_submission_but_allows_exact_job_observation_and_cancel(
+    tmp_path,
+) -> None:
+    binding = _binding()
+    stale_at = datetime.now(UTC) - timedelta(minutes=16)
+    stale_cluster = KubernetesClusterConfig(
+        **{
+            **_cluster().__dict__,
+            "network_none_evidence": _network_evidence(
+                observed_at=stale_at,
+                allowed_connectivity=KubernetesConnectivityEvidence(
+                    "allowed-pod", "server-pod", "allowed", 3, stale_at
+                ),
+                denied_connectivity=KubernetesConnectivityEvidence(
+                    "denied-pod", "server-pod", "denied", 3, stale_at
+                ),
+            ),
+        }
+    )
+    journal = KubernetesJobJournal(tmp_path / "journal.sqlite3")
+    jobs = {binding.job_name: _job(binding, uid="exact-job-uid")}
+    creates: list[object] = []
+
+    with pytest.raises(KubernetesContractError, match="fresh target-bound"):
+        journal.reconcile_create(
+            binding,
+            stale_cluster,
+            lambda _name: None,
+            lambda manifest: creates.append(manifest),
+        )
+    assert creates == []
+
+    observed = journal.reconcile_observation(binding, stale_cluster, jobs[binding.job_name])
+    assert observed.job_uid == "exact-job-uid"
+
+    deleted: list[tuple[str, str]] = []
+
+    def delete(name: str, uid: str) -> None:
+        deleted.append((name, uid))
+        assert uid == "exact-job-uid"
+        jobs.pop(name)
+
+    cancellation = journal.request_cancel(
+        binding, stale_cluster, jobs.get, delete, lambda uid: [] if uid == "exact-job-uid" else []
+    )
+    assert deleted == [(binding.job_name, "exact-job-uid")]
+    assert cancellation.termination_confirmed is True
 
 
 @pytest.mark.parametrize(

@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from .kubernetes_contracts import (
     KubernetesCancellationObservation,
     KubernetesClusterConfig,
+    KubernetesConnectivityEvidence,
     KubernetesContractError,
     KubernetesJobBinding,
     KubernetesJobJournal,
@@ -97,6 +98,7 @@ __all__ = [
     "JobBinding",
     "JobObservation",
     "KubernetesContractError",
+    "KubernetesConnectivityEvidence",
     "KubernetesJobJournal",
     "KubernetesNetworkPolicyEvidence",
     "KubernetesUnresolvedError",

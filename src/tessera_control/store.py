@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
 import stat
 import uuid
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,8 @@ SCHEMA_VERSION = LATEST_SCHEMA_VERSION
 DATABASE_NAME = "tessera.sqlite3"
 OWNER_HEADER_NAME = "owner.header"
 LOCAL_ORG_ID = "org_local"
+_EVENT_LINEAGE: ContextVar[tuple[str, str] | None] = ContextVar("event_lineage", default=None)
+_LOG = logging.getLogger(__name__)
 
 
 class StoreError(Exception):
@@ -82,7 +86,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 43);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 55);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -164,6 +168,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             resource_revision INTEGER NOT NULL,
             actor_principal_id TEXT NOT NULL REFERENCES principals(id),
             created_at TEXT NOT NULL,
+            correlation_id TEXT,
+            causation_id TEXT,
             payload_json TEXT NOT NULL
         );
         CREATE INDEX events_by_project_cursor ON events(project_id, cursor);
@@ -183,12 +189,18 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     # Imported only after Store itself is initialized to avoid schema helpers'
     # operation-layer imports forming a module cycle during startup.
+    from .agent_authority import create_agent_authority_schema
+    from .agent_provenance import create_agent_provenance_schema
+    from .agent_research import create_agent_research_schema
+    from .artifact_custody import create_artifact_custody_schema
     from .artifact_dispositions import create_artifact_disposition_schema
     from .artifact_manifests import create_artifact_manifest_schema
     from .artifacts import create_artifact_schema, create_artifact_upload_schema
-    from .astra import create_astra_schema
+    from .astra import create_astra_consumer_schema, create_astra_schema
     from .astra_status import create_astra_status_schema
+    from .capabilities import create_capability_schema
     from .credential_leases import create_credential_access_lease_schema
+    from .dataset_ingestion import create_dataset_ingestion_schema
     from .execution import create_execution_schema
     from .experiments import (
         create_admitted_attempt_evidence_schema,
@@ -198,7 +210,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         create_experiment_evidence_retention_schema,
         create_experiment_schema,
     )
+    from .external_agents import create_external_agent_schema
     from .external_operations import (
+        create_execution_recovery_schema,
         create_experiment_operation_binding_schema,
         create_external_operation_receipt_schema,
         create_external_operation_schema,
@@ -206,6 +220,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     from .handoffs import create_handoff_schema
     from .interaction import create_interaction_schema
+    from .observability import create_observability_schema
     from .project_artifact_retention import create_project_artifact_retention_schema
     from .project_artifact_store import create_project_artifact_storage_schema
     from .recovery import create_recovery_schema
@@ -219,6 +234,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .workers import create_worker_schema
 
     create_research_schema(connection)
+    create_external_agent_schema(connection)
+    create_dataset_ingestion_schema(connection)
     create_interaction_schema(connection)
     create_snapshot_schema(connection)
     create_release_schema(connection)
@@ -227,6 +244,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_artifact_upload_schema(connection)
     create_artifact_manifest_schema(connection)
     create_artifact_disposition_schema(connection)
+    create_artifact_custody_schema(connection)
     create_recovery_schema(connection)
     create_worker_schema(connection)
     create_result_checkpoint_schema(connection)
@@ -235,9 +253,11 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_external_operation_schema(connection)
     create_experiment_operation_binding_schema(connection)
     create_external_operation_receipt_schema(connection)
+    create_execution_recovery_schema(connection)
     create_kubernetes_dispatch_schema(connection)
     create_result_acceptance_schema(connection)
     create_credential_access_lease_schema(connection)
+    create_capability_schema(connection)
     create_project_artifact_storage_schema(connection)
     create_project_artifact_retention_schema(connection)
     create_experiment_schema(connection)
@@ -247,8 +267,22 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_admitted_attempt_observation_projection_schema(connection)
     create_admitted_attempt_evidence_schema(connection)
     create_astra_schema(connection)
+    create_astra_consumer_schema(connection)
     create_astra_status_schema(connection)
     create_remote_workflow_schema(connection)
+    create_observability_schema(connection)
+    create_agent_authority_schema(connection)
+    create_agent_provenance_schema(connection)
+    create_agent_research_schema(connection)
+    from .generated_outputs import create_generated_output_schema
+
+    create_generated_output_schema(connection)
+    from .ordinary_docker import create_ordinary_docker_schema
+
+    create_ordinary_docker_schema(connection)
+    from .runtime_bindings import create_runtime_binding_schema
+
+    create_runtime_binding_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
@@ -436,6 +470,20 @@ class Store:
                     expiry = _parse_utc(expires_at)
                 except ValueError as error:
                     raise Forbidden("Unauthorized") from error
+                if credential["kind"] == "worker":
+                    renewal = connection.execute(
+                        """SELECT renewed_at,expires_at FROM worker_credential_renewals
+                        WHERE credential_id=? ORDER BY renewed_at DESC,id DESC LIMIT 1""",
+                        (credential_id,),
+                    ).fetchone()
+                    if renewal is not None:
+                        try:
+                            renewed_at = _parse_utc(renewal["renewed_at"])
+                        except ValueError as error:
+                            raise Forbidden("Unauthorized") from error
+                        if renewal["expires_at"] != expires_at or renewed_at < created_at:
+                            raise Forbidden("Unauthorized")
+                        created_at = renewed_at
                 if expiry > created_at + timedelta(hours=24) or expiry <= datetime.now(UTC):
                     raise Forbidden("Unauthorized")
             credential_id = credential["parent_id"]
@@ -599,7 +647,8 @@ class Store:
             self._project(connection, principal, project_id)
             rows = connection.execute(
                 """SELECT cursor, project_id, task_id, event_type, resource_revision,
-                actor_principal_id, created_at, payload_json FROM events
+                actor_principal_id, created_at, correlation_id, causation_id,
+                payload_json FROM events
                 WHERE project_id = ? AND cursor > ? ORDER BY cursor LIMIT ?""",
                 (project_id, after, limit),
             ).fetchall()
@@ -612,6 +661,8 @@ class Store:
                     "resource_revision": row["resource_revision"],
                     "actor_principal_id": row["actor_principal_id"],
                     "created_at": row["created_at"],
+                    "correlation_id": row["correlation_id"],
+                    "causation_id": row["causation_id"],
                     "payload": json.loads(row["payload_json"]),
                 }
                 for row in rows
@@ -669,6 +720,14 @@ class Store:
                 },
                 "original_branch_fenced": False,
                 "unknown_post_backup_activity": row["state"] == "held_restore",
+                "promotion": {
+                    "supported": False,
+                    "mode": "manual_fenced_rebuild_only",
+                    "original_writer_fence_required": True,
+                    "external_operation_reconciliation_required": True,
+                    "fresh_enrollment_required": True,
+                    "fresh_human_authorization_required": True,
+                },
                 "unresolved_grants": {
                     "count": count,
                     "listed_count": len(grants),
@@ -745,6 +804,30 @@ class Store:
                     actor["id"],
                 ),
             )
+            if payload.get("external_agent") is not None:
+                from .models import ExternalAgentScope
+
+                if payload["kind"] != "agent":
+                    raise Forbidden("External scopes require an agent credential.")
+                scope = ExternalAgentScope.model_validate(payload["external_agent"])
+                connection.execute(
+                    "INSERT INTO external_agent_scopes VALUES (?, ?, ?)",
+                    (credential_id, json.dumps(scope.actions), scope.destination),
+                )
+            self._audit(
+                connection,
+                actor,
+                "credential.created",
+                "allowed",
+                {
+                    "credential_id": credential_id,
+                    "kind": payload["kind"],
+                    "audience": payload["audience"],
+                    "project_id": project_id,
+                    "expires_at": _utc_string(expires_at),
+                },
+                project_id=project_id,
+            )
             return 201, self._credential_response(
                 {
                     "credential_id": credential_id,
@@ -789,13 +872,101 @@ class Store:
                     (revoked_at, credential_id),
                 )
                 credential["revoked_at"] = revoked_at
+                self._audit(
+                    connection,
+                    actor,
+                    "credential.revoked",
+                    "allowed",
+                    {"credential_id": credential_id, "kind": credential["kind"]},
+                    project_id=credential["project_id"],
+                )
             return 200, self._credential_response(credential)
 
         return self._mutate(principal, key, "POST", path, digest, command)
 
+    def renew_worker_credential(
+        self,
+        principal: dict[str, Any],
+        credential_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Human renewal retains worker principal, token and operation-journal identity."""
+
+        def eligible(connection, actor):
+            if not self._is_root_owner(actor):
+                raise Forbidden("Only a local owner can renew worker credentials.")
+            row = connection.execute(
+                """SELECT p.id,p.org_id FROM credentials c JOIN principals p ON p.id=c.principal_id
+                WHERE c.id=? AND p.org_id=? AND c.kind='worker'""",
+                (credential_id, actor["org_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Worker credential was not found.")
+            # Expired/revoked credentials are never revived by renewal.
+            return self._live_principal(connection, dict(row), audience="worker")
+
+        def command(connection, actor):
+            worker = eligible(connection, actor)
+            expiry, now = _parse_utc(payload["expires_at"]), datetime.now(UTC)
+            if expiry <= now or expiry > now + timedelta(hours=24):
+                raise Conflict("Credential expiry must be within the next 24 hours.")
+            if expiry <= _parse_utc(worker["expires_at"]):
+                raise Conflict("Renewal must extend current expiry.")
+            parent = connection.execute(
+                "SELECT expires_at FROM credentials WHERE id=?", (worker["parent_id"],)
+            ).fetchone()
+            if parent["expires_at"] is not None and expiry > _parse_utc(parent["expires_at"]):
+                raise Forbidden("Renewal cannot outlive its parent credential.")
+            connection.execute(
+                "UPDATE credentials SET expires_at=? WHERE id=?",
+                (_utc_string(expiry), credential_id),
+            )
+            connection.execute(
+                "INSERT INTO worker_credential_renewals VALUES (?,?,?,?,?)",
+                (
+                    "renewal_" + uuid.uuid4().hex,
+                    credential_id,
+                    _utc_string(now),
+                    _utc_string(expiry),
+                    actor["id"],
+                ),
+            )
+            self._audit(
+                connection,
+                actor,
+                "credential.renewed",
+                "allowed",
+                {"credential_id": credential_id, "expires_at": _utc_string(expiry)},
+                project_id=worker["project_id"],
+            )
+            worker["expires_at"] = _utc_string(expiry)
+            return 200, self._credential_response(worker)
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/credentials/{credential_id}/renew",
+            digest,
+            command,
+            replay_guard=lambda c, a, _: eligible(c, a),
+        )
+
     def create_project(
         self, principal: dict[str, str], key: str, digest: str, payload: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            "/projects",
+            digest,
+            lambda c, a: self._create_project_transaction(c, a, payload),
+        )
+
+    def _create_project_transaction(self, connection, actor, payload):
         def command(
             connection: sqlite3.Connection, actor: dict[str, str]
         ) -> tuple[int, dict[str, Any]]:
@@ -823,7 +994,7 @@ class Store:
             )
             return 201, project
 
-        return self._mutate(principal, key, "POST", "/projects", digest, command)
+        return command(connection, actor)
 
     def create_task(
         self,
@@ -1082,12 +1253,16 @@ class Store:
         replay_guard: Any | None = None,
     ) -> tuple[int, dict[str, Any]]:
         connection = _connect(self.database_path)
+        live_principal: dict[str, Any] | None = None
+        lineage_token = None
+        recovery_state: str | None = None
         try:
             connection.execute("BEGIN IMMEDIATE")
             live_principal = self._live_principal(connection, principal, audience=audience)
             recovery = connection.execute(
                 "SELECT state FROM control_recovery WHERE singleton=1"
             ).fetchone()
+            recovery_state = recovery["state"] if recovery is not None else None
             if recovery is None or recovery["state"] != "active":
                 raise Forbidden("Control state is held after restore; mutations are disabled.")
             existing = connection.execute(
@@ -1104,6 +1279,8 @@ class Store:
                     replay_guard(connection, live_principal, response)
                 connection.execute("COMMIT")
                 return existing["response_status"], response
+            command_id = "command_" + uuid.uuid4().hex
+            lineage_token = _EVENT_LINEAGE.set((command_id, command_id))
             status, response = command(connection, live_principal)
             connection.execute(
                 """INSERT INTO idempotency
@@ -1124,11 +1301,26 @@ class Store:
             )
             connection.execute("COMMIT")
             return status, response
-        except Exception:
+        except Exception as error:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
+            if isinstance(error, Forbidden) and live_principal is not None:
+                self._record_denial(
+                    live_principal,
+                    method,
+                    path,
+                    held_recovery=recovery_state == "held_restore",
+                )
+            elif (
+                isinstance(error, Conflict)
+                and live_principal is not None
+                and live_principal.get("kind") == "agent"
+            ):
+                self._record_denial(live_principal, method, path, outcome="failed")
             raise
         finally:
+            if lineage_token is not None:
+                _EVENT_LINEAGE.reset(lineage_token)
             connection.close()
 
     @staticmethod
@@ -1147,7 +1339,11 @@ class Store:
 
     @staticmethod
     def _live_principal(
-        connection: sqlite3.Connection, principal: dict[str, Any], *, audience: str = "control"
+        connection: sqlite3.Connection,
+        principal: dict[str, Any],
+        *,
+        audience: str = "control",
+        external_allowed: bool = False,
     ) -> dict[str, Any]:
         row = connection.execute(
             """SELECT p.id, p.org_id, p.role, c.id AS credential_id, c.kind,
@@ -1156,7 +1352,16 @@ class Store:
             WHERE p.id = ? AND p.org_id = ? AND p.revoked_at IS NULL""",
             (principal["id"], principal["org_id"]),
         ).fetchone()
-        return Store._credential_principal(connection, row, audience)
+        actor = Store._credential_principal(connection, row, audience)
+        if (
+            not external_allowed
+            and connection.execute(
+                "SELECT 1 FROM external_agent_scopes WHERE credential_id=?",
+                (actor["credential_id"],),
+            ).fetchone()
+        ):
+            raise Forbidden("External agents must use scoped external-agent endpoints.")
+        return actor
 
     @staticmethod
     def _is_root_owner(principal: dict[str, Any]) -> bool:
@@ -1235,11 +1440,12 @@ class Store:
         revision: int,
         payload: dict[str, Any],
     ) -> None:
+        lineage = _EVENT_LINEAGE.get()
         connection.execute(
             """INSERT INTO events
             (org_id, project_id, task_id, event_type, resource_revision,
-             actor_principal_id, created_at, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              actor_principal_id, created_at, correlation_id, causation_id, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 principal["org_id"],
                 project_id,
@@ -1248,6 +1454,98 @@ class Store:
                 revision,
                 principal["id"],
                 utc_now(),
+                lineage[0] if lineage is not None else None,
+                lineage[1] if lineage is not None else None,
                 json.dumps(payload, separators=(",", ":"), sort_keys=True),
             ),
         )
+
+    @staticmethod
+    def _audit(
+        connection: sqlite3.Connection,
+        principal: dict[str, Any],
+        event_type: str,
+        decision: str,
+        payload: dict[str, Any],
+        *,
+        project_id: str | None = None,
+    ) -> None:
+        """Write a deliberately minimal audit record within its command transaction."""
+        lineage = _EVENT_LINEAGE.get()
+        connection.execute(
+            """INSERT INTO operator_audit_events
+            (org_id,project_id,event_type,decision,actor_principal_id,correlation_id,
+             causation_id,created_at,payload_json)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                principal["org_id"],
+                project_id,
+                event_type,
+                decision,
+                principal["id"],
+                lineage[0] if lineage is not None else None,
+                lineage[1] if lineage is not None else None,
+                utc_now(),
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            ),
+        )
+
+    def _record_denial(
+        self,
+        principal: dict[str, Any],
+        method: str,
+        path: str,
+        *,
+        held_recovery: bool = False,
+        outcome: str = "denied",
+    ) -> None:
+        """Persist an authenticated privileged denial after its failed transaction rolls back."""
+        if held_recovery:
+            # A held restore is permanently immutable. Its denial audit remains
+            # durable, but is operational metadata outside the restored history.
+            from .observability import record_held_denial
+
+            record_held_denial(self.database_path.parent, principal, method, path)
+            return
+        connection = _connect(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            command_id = "command_" + uuid.uuid4().hex
+            token = _EVENT_LINEAGE.set((command_id, command_id))
+            try:
+                self._audit(
+                    connection,
+                    principal,
+                    "privileged.command_" + outcome,
+                    "denied",
+                    {"method": method, "path": path},
+                    project_id=principal.get("project_id"),
+                )
+                if principal.get("kind") == "agent" and principal.get("project_id"):
+                    from .agent_provenance import record_agent_provenance
+
+                    record_agent_provenance(
+                        connection,
+                        principal,
+                        principal["project_id"],
+                        {
+                            "record_id": command_id + "_" + outcome,
+                            "kind": "permission",
+                            "outcome": outcome,
+                            "correlation_id": command_id,
+                            "error_code": "permission_denied"
+                            if outcome == "denied"
+                            else "invalid_request",
+                            "references": {},
+                        },
+                    )
+                connection.execute("COMMIT")
+            finally:
+                _EVENT_LINEAGE.reset(token)
+        except (sqlite3.Error, StoreError):
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            # An audit-storage outage must not turn a denial into an allow.
+            _LOG.warning("Privileged command denial could not be durably recorded.", exc_info=True)
+        finally:
+            connection.close()

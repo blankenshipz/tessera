@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 43
+LATEST_SCHEMA_VERSION = 55
 LOCAL_ORG_ID = "org_local"
 
 
@@ -777,6 +777,171 @@ def migrate_v42_to_v43(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version = 43 WHERE singleton = 1")
 
 
+def migrate_v43_to_v44(connection: sqlite3.Connection) -> None:
+    """Add empty lost-worker recovery records without inferring identity loss."""
+    from .external_operations import create_execution_recovery_schema
+
+    create_execution_recovery_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 44 WHERE singleton = 1")
+
+
+def migrate_v44_to_v45(connection: sqlite3.Connection) -> None:
+    """Add empty coordinator consumer leases and availability records."""
+    from .astra import create_astra_consumer_schema
+
+    create_astra_consumer_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 45 WHERE singleton = 1")
+
+
+def migrate_v45_to_v46(connection: sqlite3.Connection) -> None:
+    """Add empty human artifact-read custody and immutable bundle records.
+
+    Existing quarantined manifests remain unreleased. The migration neither
+    infers a custody decision nor exports bytes, inputs, or environment material.
+    """
+    from .artifact_custody import create_artifact_custody_schema
+
+    create_artifact_custody_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 46 WHERE singleton = 1")
+
+
+def migrate_v46_to_v47(connection: sqlite3.Connection) -> None:
+    """Add secret-free operator audit/health metadata and optional event lineage."""
+    from .observability import create_observability_schema
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+    if "correlation_id" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN correlation_id TEXT")
+    if "causation_id" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN causation_id TEXT")
+    create_observability_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version = 47 WHERE singleton = 1")
+
+
+def migrate_v47_to_v48(connection: sqlite3.Connection) -> None:
+    """Add empty, metadata-only MixFM dataset ingestion/provenance records.
+
+    The migration does not download datasets, validate prior bytes, infer licenses,
+    or create ingestion approvals from existing sources or artifacts.
+    """
+    from .dataset_ingestion import create_dataset_ingestion_schema
+
+    create_dataset_ingestion_schema(connection)
+    # A pre-upgrade backup cannot cover the new records and cannot be restored
+    # by this release. Do not carry its freshness claim into active v48 state.
+    # Keep failures visible and leave held audit history alone. This runs only
+    # on the version transition, not on an idempotent current-schema migration.
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version = 48 WHERE singleton = 1")
+
+
+def migrate_v48_to_v49(connection: sqlite3.Connection) -> None:
+    """Add empty capability policies/intents; never infer approval or enable execution."""
+    from .capabilities import create_capability_schema
+
+    create_capability_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version = 49 WHERE singleton = 1")
+
+
+def migrate_v49_to_v50(connection: sqlite3.Connection) -> None:
+    """Add empty external-agent scopes/proposals; infer no disclosure authority."""
+    from .external_agents import create_external_agent_schema
+
+    create_external_agent_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version = 50 WHERE singleton = 1")
+
+
+def migrate_v50_to_v51(connection: sqlite3.Connection) -> None:
+    """Install empty bounded agent authority/provenance; infer no existing grant."""
+    from .agent_authority import create_agent_authority_schema
+    from .agent_provenance import create_agent_provenance_schema
+    from .agent_research import create_agent_research_schema
+
+    create_agent_authority_schema(connection)
+    create_agent_provenance_schema(connection)
+    create_agent_research_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=51 WHERE singleton=1")
+
+
+def migrate_v51_to_v52(connection: sqlite3.Connection) -> None:
+    """Install empty output UID bindings; never infer historical provider identity."""
+    from .agent_provenance_outputs import create_output_provenance_schema
+
+    create_output_provenance_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=52 WHERE singleton=1")
+
+
+def migrate_v52_to_v53(connection: sqlite3.Connection) -> None:
+    """Admit public generated artifacts without any inferred execution identity."""
+    from .generated_outputs import create_generated_output_schema
+
+    create_generated_output_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=53 WHERE singleton=1")
+
+
+def migrate_v53_to_v54(connection: sqlite3.Connection) -> None:
+    """Empty explicit Docker target/outbox; infer no capability or execution grant."""
+    from .ordinary_docker import create_ordinary_docker_schema
+
+    create_ordinary_docker_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=54 WHERE singleton=1")
+
+
+def migrate_v54_to_v55(connection: sqlite3.Connection) -> None:
+    """Install empty runtime bindings; invalidate only active pre-upgrade freshness."""
+    from .runtime_bindings import create_runtime_binding_schema
+
+    create_runtime_binding_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=55 WHERE singleton=1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -820,6 +985,18 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     40: migrate_v40_to_v41,
     41: migrate_v41_to_v42,
     42: migrate_v42_to_v43,
+    43: migrate_v43_to_v44,
+    44: migrate_v44_to_v45,
+    45: migrate_v45_to_v46,
+    46: migrate_v46_to_v47,
+    47: migrate_v47_to_v48,
+    48: migrate_v48_to_v49,
+    49: migrate_v49_to_v50,
+    50: migrate_v50_to_v51,
+    51: migrate_v51_to_v52,
+    52: migrate_v52_to_v53,
+    53: migrate_v53_to_v54,
+    54: migrate_v54_to_v55,
 }
 
 

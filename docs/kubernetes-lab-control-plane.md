@@ -1,11 +1,90 @@
 # Kubernetes lab control plane
 
+## Local composition safety checkpoint (2026-09-29)
+
+The control, coordinator and dispatch-worker examples are **not** a deployable
+composition on an empty Docker Desktop cluster. Check a candidate pair of
+fresh, disposable names without creating or adopting anything:
+
+```sh
+.venv/bin/python scripts/check_local_kubernetes_composition.py \
+  --kubeconfig "$HOME/.kube/config" --context docker-desktop \
+  --control-namespace tessera-local-control-unique \
+  --workload-namespace tessera-local-workloads-unique
+```
+
+The command intentionally exits nonzero with `blocked_no_effects`: it only
+checks the selected local HTTPS/CA context, named namespace occupancy and
+unresolved manifest values. It neither prints Secrets nor treats an absent
+namespace as reserved. An existing namespace is never adopted or deleted.
+This is a preflight, **not** the requested bootstrap or a live integration
+result. The example manifests still need a source-built node-resident immutable
+image reference, a unique owned pair of namespaces, an operator-owned TLS
+gateway/CA, scoped project/worker credentials in Kubernetes Secrets, an exact
+workload binding, fresh positive and negative connectivity observations, and
+verified admission/storage isolation. Do not apply the examples or start the
+credential-bearing worker until those prerequisites are implemented and
+witnessed. Docker Desktop's presence of NetworkPolicy objects or a `kindnet`
+DaemonSet is not enforcement proof. Local source-image restart and deterministic
+Job fixtures below are independently useful but do **not** exercise this
+deployed coordinator/worker composition.
+
+An opt-in **read-only continuation gate** is available at
+`scripts/gate_local_kubernetes_network.py`. It requires exact retained namespace
+UIDs and ownership nonce, two separately provisioned running Python probe Pods
+in `tessera-lab` (one labelled `tessera.io/tls-control-client=true`, one without
+that label or control-hop), and the running `tessera-control-tls` gateway Pod.
+Supply an absolute CA path inside the allowed probe Pod. Example (replace Pod
+names and CA path with observed values; this command does not create Pods):
+
+```sh
+.venv/bin/python scripts/gate_local_kubernetes_network.py --run \
+  --causal \
+  --kubeconfig "$HOME/.kube/config" \
+  --control-uid 84ffd885-ed3e-4cf9-8941-59a5123cb3e1 \
+  --workload-uid 1869980f-998a-4ef9-a7ea-d500326150b5 \
+  --nonce 0a05eff73e29eabd9e99e081412c52e8 \
+  --allowed-pod OBSERVED_ALLOWED --denied-pod OBSERVED_DENIED \
+  --gateway-pod OBSERVED_GATEWAY --ca-path /run/tessera-ca/ca.crt
+```
+
+The gate uses explicit-context bounded `kubectl get` and `exec`, compares Pod
+and namespace identities before and after. With `--causal`, it brackets the
+negative TCP observation with CA-verified HTTPS `/health/ready`, then creates
+probe-only ingress/egress grants for the **same denied Pod and gateway IP/port**.
+It requires HTTPS success under those grants, denial after UID-preconditioned
+revocation, repeats the grant/revocation transition, and checks final allowed
+HTTPS and identity restoration. A negative timeout is accepted only within
+this controlled sequence; it alone proves nothing. Interrupted or ambiguous
+cleanup requires named UID reconciliation before proceeding. It exits nonzero
+on unknown or unexpected outcomes. Its output is a network/HTTPS observation,
+**not** an authenticated API operation, worker credential, target binding,
+policy enforcement certificate, or Job receipt. The denied client's own
+functionality and expected policy selection must be independently validated
+before asserting NetworkPolicy enforcement: TCP failure can have another cause.
+No worker deployment, authority creation or live Job is implemented by this stage.
+
+The analogous opt-in workload witness accepts `--causal` for temporary
+probe-only grants to the same server Pod/IP/8080, twice testing connected under
+the grants and denied after UID-preconditioned revocation. Existing workload
+ResourceQuota must have room for its three probe Pods; do not delete older Pods
+or raise a baseline quota merely to make this fixture pass.
+
 This profile is a **single-active, provider-disabled lab deployment**. It gives
 one control Pod durable SQLite state; it does not provide PostgreSQL, HA,
 automatic target enrollment, provider calls, federation, or an externally
 reachable production service. The separately opt-in fixture below joins it to
 the existing deterministic Kubernetes dispatch seam; it does not promote that
 seam to a supported execution target.
+
+Do not grant pilot Job-create authority in this control namespace: denying reads
+of its PVC does not prevent a Job mounting it. The constant-compute pilot requires
+the separate [project workload namespace/admission profile](pilot-workload-isolation.md).
+Existing synthetic same-namespace fixtures below are not a project isolation claim.
+
+The [single-active lab operations runbook](single-active-lab-operations.md)
+defines restart, PVC-loss, backup/held-restore, writer-fencing and RPO/RTO
+procedures. It does not turn this profile into HA or authorize provider work.
 
 Docker Compose explicitly builds the `dev` target for development and tests.
 Build the hardened `lab` target explicitly and replace both `image` values in
@@ -23,7 +102,8 @@ kubectl --kubeconfig /absolute/kubeconfig --context EXPLICIT_CONTEXT -n tessera-
 
 The manifest creates `tessera-lab`, `tessera-control-state`,
 `tessera-control`, `tessera-control`, `default-deny`, and
-`allow-labelled-control-clients`. The duplicate control name is a Deployment and
+`allow-labelled-control-clients`, `allow-labelled-control-client-egress`, and
+`allow-tls-control-client-dns`. The duplicate control name is a Deployment and
 Service. The PVC is `ReadWriteOnce` and the Deployment is `Recreate` with one
 replica; do not scale it or attach its volume to another writer.
 
@@ -34,11 +114,14 @@ identity. It does not authenticate a caller or disclose a bearer credential.
 Readiness being true is not proof that TLS, NetworkPolicy enforcement, storage
 durability, or research execution is working.
 
-The default-deny policy blocks all ingress and egress. Only Pods in the same
-namespace labelled `tessera.io/control-client: "true"` can call the Service;
-the paired labelled-client egress policy permits only TCP/8765 to the selected
-control Pods plus TCP/UDP 53 to labelled `kube-system` DNS Pods for Service-name
-lookup. No other application destination is opened by this profile.
+The default-deny policy blocks all ingress and egress. Only the operator-managed
+gateway Pod labelled `tessera.io/control-hop: "true"` may reach the plaintext
+control Pods on TCP/8765; that label must not be placed on credential-bearing
+clients. The paired gateway egress permits DNS lookup via labelled `kube-system`
+DNS Pods. Credential-bearing coordinator and dispatch Pods instead carry
+`tessera.io/tls-control-client: "true"`, which permits DNS lookup but not a
+plaintext control hop; their separate policies allow TCP/443 to the gateway.
+No other application destination is opened by this profile.
 NetworkPolicy enforcement, PVC backing/durability, and the selected storage
 class's single-writer behavior remain cluster capabilities the operator must
 verify. The manifest intentionally supplies no Ingress or TLS certificate.
@@ -81,11 +164,18 @@ docker info -f '{{ .DriverStatus }}'
 
 After focused fake checks, this retained live fixture renders the shipped profile
 into a **new fixture-owned namespace**, registers baseline and intervention,
-approves a task, separately admits execution, runs one real deterministic Job,
-links the collected output hash as a quarantined artifact measurement, restarts
-the control Pod, and reopens the worker journal to require the same operation
-and exactly one Job. It has no provider/model calls and does not print owner or
-worker credentials.
+approves a task, separately admits the baseline execution, runs one real
+deterministic Job, and links its collected output hash as a quarantined artifact
+measurement. It restarts the control Pod before worker reconciliation, then
+interrupts a resumable output transfer with a second control-Pod restart and
+requires the same upload progress and exactly one Job. The fixture records a
+human `retain_quarantined` disposition and a private custody release, retrieves
+the exact fixture bytes through the owner route, and exports a bounded bundle
+whose released output is verified in a fresh temporary workspace. Input bytes,
+skill material, and environment image material must remain explicit
+not-exported/restricted/missing records. It has no provider/model calls and does
+not print owner or worker credentials. The intervention is registered but not
+executed by this single-Job fixture.
 
 ```sh
 .venv/bin/pytest tests/test_kubernetes_lab_experiment_e2e_runner.py \
@@ -101,8 +191,9 @@ The command refuses an existing namespace and uses the explicit kubeconfig and
 fixture control and hello images into Docker Desktop's node containerd store,
 then retains the namespace, PVCs, Job, Pods, and non-secret adapter journal for
 inspection. It never deletes the namespace, uses a registry, reads a Secret, or
-falls back to the current context. A pass is operational evidence only: it does
-not release an artifact or accept a scientific result.
+falls back to the current context. A pass is operational evidence only: private
+custody release preserves quarantine/unclassified status and neither accepts an
+artifact as a result nor establishes scientific validity.
 
 ## Retained image-load fixture record (2026-09-17)
 

@@ -38,6 +38,7 @@ _MAX_OUTPUT = 32 * 1024
 _MAX_BYTE_QUOTA = 64 * 1024 * 1024
 _MAX_INODE_QUOTA = 10_000
 _QUOTA_ERRNOS = {28, 122}  # ENOSPC and EDQUOT on Linux.
+_NETWORK_TIMEOUT_SECONDS = 3
 
 
 class ConformanceError(RuntimeError):
@@ -300,6 +301,50 @@ def classify_quota_evidence(kind: str, record: Mapping[str, Any], bound: int) ->
         "actual": actual,
         "requested": requested,
         "record": dict(record),
+    }
+
+
+def classify_network_enforcement(
+    *,
+    declaration: Sequence[Mapping[str, str]],
+    server: Mapping[str, str],
+    allowed: Mapping[str, str],
+    denied: Mapping[str, str],
+) -> dict[str, object]:
+    """Distinguish declared policies from two bounded observed connections.
+
+    The probe image exits nonzero when an expected connection outcome is wrong,
+    but inspecting its bounded output here prevents a Pod phase alone from being
+    mislabelled as NetworkPolicy enforcement.
+    """
+    if len(declaration) != 3 or any(not item.get("uid") for item in declaration):
+        raise ConformanceError("NetworkPolicy declaration identities are incomplete")
+    if allowed.get("expected") != "allow" or allowed.get("log") != "allowed connection observed":
+        raise ConformanceError("allowed connectivity was not observed through the declared policy")
+    denied_log = denied.get("log")
+    if (
+        denied.get("expected") != "deny"
+        or not isinstance(denied_log, str)
+        or not denied_log.startswith("denied connection observed:")
+    ):
+        raise ConformanceError("denied connectivity was not observed through the declared policy")
+    for identity in (server, allowed, denied):
+        if not isinstance(identity.get("uid"), str) or not identity["uid"]:
+            raise ConformanceError("network connectivity evidence has no attributed Pod UID")
+    return {
+        "declaration": {
+            "classification": "declared",
+            "policies": [dict(item) for item in declaration],
+        },
+        "enforcement": {
+            "classification": "enforced",
+            "timeout_seconds": _NETWORK_TIMEOUT_SECONDS,
+            "server_pod_uid": server["uid"],
+            "allowed_client_pod_uid": allowed["uid"],
+            "denied_client_pod_uid": denied["uid"],
+            "allowed": "observed",
+            "denied": "observed",
+        },
     }
 
 
@@ -698,14 +743,17 @@ def live_run(args: argparse.Namespace) -> dict[str, object]:
             "pod", writer_name, run_id, writer_identity["uid"]
         )  # type: ignore[index]
         created.remove(("pod", writer_name, writer_identity["uid"], False))
+        network_declaration: list[dict[str, str]] = []
         for manifest in network_manifests(args.probe_namespace, run_id, prefix):
             name = str(manifest["metadata"]["name"])  # type: ignore[index]
             policy = kubectl.create(manifest)
+            identity = _identity(policy, "NetworkPolicy", name, args.probe_namespace)
+            network_declaration.append(identity)
             _add_created(
                 created,
                 result,
                 "networkpolicy",
-                _identity(policy, "NetworkPolicy", name, args.probe_namespace),
+                identity,
             )
         server_name = f"{prefix}-network-server"
         server = kubectl.create(
@@ -730,6 +778,7 @@ def live_run(args: argparse.Namespace) -> dict[str, object]:
         pod_ip = status.get("podIP") if isinstance(status, Mapping) else None
         if not isinstance(pod_ip, str) or not pod_ip:
             raise ConformanceError("ready network server did not report a Pod IP")
+        network_clients: dict[str, dict[str, str]] = {}
         for expectation in ("allow", "deny"):
             name = f"{prefix}-network-{expectation}"
             role = "network-allowed" if expectation == "allow" else "network-denied"
@@ -749,12 +798,18 @@ def live_run(args: argparse.Namespace) -> dict[str, object]:
                 "pod",
                 _identity(client, "Pod", name, args.probe_namespace),
             )
-            result[f"network_{expectation}"] = {
+            network_clients[expectation] = {
                 **_identity(_wait_for_pod(kubectl, name), "Pod", name, args.probe_namespace),
                 "expected": expectation,
                 "log": kubectl.logs(name).strip(),
             }
-        result["network_enforcement"] = "observed_allowed_connection_and_observed_denied_connection"
+            result[f"network_{expectation}"] = network_clients[expectation]
+        result["network_policy_evidence"] = classify_network_enforcement(
+            declaration=network_declaration,
+            server=result["network_server"],  # type: ignore[arg-type]
+            allowed=network_clients["allow"],
+            denied=network_clients["deny"],
+        )
         for kind, command in (
             ("byte", ["--probe-byte-quota", f"{root}/byte-payload", str(args.byte_quota_bytes)]),
             (

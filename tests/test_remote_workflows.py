@@ -13,7 +13,7 @@ from test_kubernetes_dispatch import _owner_headers
 from test_kubernetes_execution import _admitted_package
 
 from tessera_control.api import create_app
-from tessera_control.migrations import MIGRATIONS, migrate_v42_to_v43
+from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS, migrate_v42_to_v43
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.store import canonical_digest, migrate_state
 
@@ -35,6 +35,9 @@ def _v42_operation_state(tmp_path: Path) -> tuple[Path, dict[str, object], objec
         assert authority is not None
         connection.execute("DROP TABLE remote_workflow_checkpoints")
         connection.execute("DROP TABLE remote_workflow_runs")
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=42")
     return state, response, package
 
@@ -280,6 +283,74 @@ def test_remote_projection_equal_time_contradiction_fails_closed_and_retains_sam
         ).fetchone() == (1,)
 
 
+def test_stop_request_fences_new_work_but_only_confirmed_exit_resolves_remote_workflow(
+    tmp_path: Path,
+) -> None:
+    response, _worker, package = _admitted_package(tmp_path)
+    state = tmp_path / "state"
+    client = TestClient(create_app(state))
+    operation_id = package.operation_id
+    lease_id = response["package"]["lease_id"]
+    epoch = response["package"]["epoch"]
+    grant_id = response["package"]["grant_id"]
+
+    grant = client.get(f"/execution-grants/{grant_id}", headers=_owner_headers(state))
+    assert grant.status_code == 200
+    revoke_body = {"expected_revision": grant.json()["revision"]}
+    revoked = client.post(
+        f"/execution-grants/{grant_id}/revoke",
+        json=revoke_body,
+        headers=_owner_headers(state) | {"Idempotency-Key": "remote-stop"},
+    )
+    replay = client.post(
+        f"/execution-grants/{grant_id}/revoke",
+        json=revoke_body,
+        headers=_owner_headers(state) | {"Idempotency-Key": "remote-stop"},
+    )
+    assert revoked.status_code == replay.status_code == 200
+    assert revoked.json() == replay.json()
+    assert revoked.json()["status"] == "cancel_requested"
+
+    # The original worker can preserve an adverse observation after cancellation,
+    # but the desired stop is not a provider/harness termination receipt.
+    heartbeat_body = {"lease_id": lease_id, "expected_epoch": epoch, "observed_state": "running"}
+    heartbeat = client.post(
+        f"/worker/remote-workflows/{operation_id}/heartbeat",
+        json=heartbeat_body,
+        headers=_worker_headers("post-stop-heartbeat"),
+    )
+    assert heartbeat.status_code == 201
+    before_exit = client.get(
+        f"/remote-workflows/{operation_id}", headers=_owner_headers(state)
+    ).json()
+    assert before_exit["operation_desired_state"] == "cancel_requested"
+    assert before_exit["state"] == "running"
+    assert before_exit["reconciliation_required"] is True
+
+    confirmed = client.post(
+        "/worker/observations",
+        json={
+            "lease_id": lease_id,
+            "expected_epoch": epoch,
+            "operation_id": operation_id,
+            "observed_state": "exited",
+            "observed_at": response["operation"]["created_at"],
+            "provider_id": "synthetic-confirmed-stop",
+            "termination_confirmed": True,
+        },
+        headers=_worker_headers("confirmed-exit"),
+    )
+    assert confirmed.status_code == 201
+    after_exit = client.get(
+        f"/remote-workflows/{operation_id}", headers=_owner_headers(state)
+    ).json()
+    assert after_exit["operation_desired_state"] == "cancel_requested"
+    assert after_exit["state"] == after_exit["last_observed_state"] == "exited"
+    assert after_exit["reconciliation"]["termination_confirmed"] is True
+    assert after_exit["reconciliation_required"] is False
+    assert after_exit["operational_only"] is True
+
+
 def test_v42_to_v43_preserves_operation_evidence_without_inventing_remote_runs(
     tmp_path: Path,
 ) -> None:
@@ -293,8 +364,8 @@ def test_v42_to_v43_preserves_operation_evidence_without_inventing_remote_runs(
         ).fetchone()
         assert before is not None
 
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(database) as connection:
         after = connection.execute(
             """SELECT operation_id,grant_id,lease_id,worker_principal_id,epoch,
@@ -388,7 +459,7 @@ def test_remote_workflow_held_restore_preserves_records_and_blocks_new_evidence(
         ).fetchall()
 
     backup = tmp_path / "backup"
-    assert backup_state(state, backup)["schema_version"] == 43
+    assert backup_state(state, backup)["schema_version"] == LATEST_SCHEMA_VERSION
     restored = tmp_path / "restored"
     restore_state(backup, restored)
     with sqlite3.connect(restored / "tessera.sqlite3") as connection:

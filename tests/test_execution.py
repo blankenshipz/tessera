@@ -446,7 +446,7 @@ def test_cancellation_telemetry_is_derived_fenced_and_does_not_clear_unknown(
     assert reconciled["cancellation"]["state"] == "confirmed_termination"
 
 
-def test_unleased_cancel_reconciles_zero_and_event_failure_rolls_back(
+def test_unleased_cancel_requires_expired_zero_attempt_reconciliation_and_event_failure_rolls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, execution, owner, worker, project, task = _setup(tmp_path)
@@ -476,16 +476,29 @@ def test_unleased_cancel_reconciles_zero_and_event_failure_rolls_back(
         owner, project["id"], "grant", canonical_digest(payload), payload
     )
     _, cancelled = execution.revoke_execution_grant(owner, grant["id"], "cancel", "cancel", 1)
-    _, reconciled = execution.reconcile_execution_grant(
+    with pytest.raises(Conflict, match="Unattempted authority"):
+        execution.reconcile_execution_grant(
+            owner,
+            grant["id"],
+            "reconcile",
+            "reconcile",
+            {
+                "expected_revision": cancelled["revision"],
+                "settlement_cents": 0,
+                "provider_terminated": True,
+            },
+        )
+    with _connect(execution.database_path) as connection:
+        connection.execute(
+            "UPDATE execution_grants SET expires_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), grant["id"]),
+        )
+    _, reconciled = execution.reconcile_expired_unattempted_grant(
         owner,
         grant["id"],
         "reconcile",
         "reconcile",
-        {
-            "expected_revision": cancelled["revision"],
-            "settlement_cents": 0,
-            "provider_terminated": True,
-        },
+        {"expected_revision": cancelled["revision"]},
     )
     assert reconciled["status"] == "reconciled"
 

@@ -13,7 +13,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from tessera_control.api import create_app
-from tessera_control.deployment import DeploymentConfig, serving_config
+from tessera_control.deployment import DeploymentConfig, backend_status, serving_config
 from tessera_control.store import initialize_state
 
 
@@ -133,6 +133,18 @@ def test_recovery_hold_and_schema_mismatch_are_unready_and_gate_authority(tmp_pa
     assert mismatched.get("/projects").status_code == 503
 
 
+def test_readiness_refuses_a_symlinked_state_directory_after_restart(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    linked_state = tmp_path / "linked-state"
+    linked_state.symlink_to(state, target_is_directory=True)
+
+    assert backend_status(linked_state) == {
+        "status": "unready",
+        "reason": "state_unavailable",
+        "backend_identity": None,
+    }
+
+
 def test_lab_manifest_declares_single_writer_hardening_probes_and_client_policy() -> None:
     manifest = (Path(__file__).parents[1] / "deploy/kubernetes/lab-control-plane.yaml").read_text()
     for required in (
@@ -158,6 +170,16 @@ def test_lab_manifest_declares_single_writer_hardening_probes_and_client_policy(
     config = next(document for document in documents if document["kind"] == "ConfigMap")
     deployment = next(document for document in documents if document["kind"] == "Deployment")
     control = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert config["data"]["TESSERA_TRUSTED_HOST"] == "tessera-control.tessera-lab.svc.cluster.local"
+    gateway_host = "tessera-control-tls.tessera-lab.svc.cluster.local"
+    assert config["data"]["TESSERA_TLS_GATEWAY_HOST"] == gateway_host
+    assert config["data"]["TESSERA_PUBLIC_ORIGIN"] == f"https://{gateway_host}"
+    trusted_host_args = [
+        control["args"][index + 1]
+        for index, argument in enumerate(control["args"][:-1])
+        if argument == "--trusted-host"
+    ]
+    assert trusted_host_args == ["$(TESSERA_TRUSTED_HOST)", "$(TESSERA_TLS_GATEWAY_HOST)"]
     for probe in (control["readinessProbe"], control["livenessProbe"]):
         assert probe["httpGet"]["httpHeaders"] == [
             {"name": "Host", "value": config["data"]["TESSERA_TRUSTED_HOST"]}
@@ -173,7 +195,10 @@ def test_lab_manifest_declares_single_writer_hardening_probes_and_client_policy(
         "policyTypes": ["Ingress", "Egress"],
     }
     client_egress = policies["allow-labelled-control-client-egress"]["spec"]
-    assert client_egress["podSelector"] == {"matchLabels": {"tessera.io/control-client": "true"}}
+    assert client_egress["podSelector"] == {"matchLabels": {"tessera.io/control-hop": "true"}}
+    assert policies["allow-labelled-control-clients"]["spec"]["ingress"][0]["from"] == [
+        {"podSelector": {"matchLabels": {"tessera.io/control-hop": "true"}}}
+    ]
     assert client_egress["egress"] == [
         {
             "to": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "tessera-control"}}}],
@@ -191,6 +216,9 @@ def test_lab_manifest_declares_single_writer_hardening_probes_and_client_policy(
             "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
         },
     ]
+    dns = policies["allow-tls-control-client-dns"]["spec"]
+    assert dns["podSelector"] == {"matchLabels": {"tessera.io/tls-control-client": "true"}}
+    assert dns["egress"] == [client_egress["egress"][1]]
 
 
 def test_compose_explicitly_uses_dev_target_and_lab_remains_opt_in() -> None:
@@ -202,3 +230,6 @@ def test_compose_explicitly_uses_dev_target_and_lab_remains_opt_in() -> None:
     assert " AS dev\n" in dockerfile
     assert " AS lab\n" in dockerfile
     assert dockerfile.index(" AS lab\n") < dockerfile.index(" AS dev\n")
+    # The source checkout may contain private-mode untracked modules. The lab
+    # runtime drops root, so normalize copied source readability at build time.
+    assert "chmod -R a+rX /app/src" in dockerfile.split(" AS dev\n", 1)[0]

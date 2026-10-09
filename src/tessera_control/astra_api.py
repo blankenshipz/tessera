@@ -49,6 +49,21 @@ def claim_turn(
     return response(store.claim_turn(actor, key, turn_id, **body.model_dump(mode="json")))
 
 
+@router.post("/turns/next-claim")
+def claim_next_turn(actor: Actor, key: Key, store: Records) -> JSONResponse:
+    return response(store.claim_next_turn(actor, key))
+
+
+@router.post("/consumer/heartbeat")
+def consumer_heartbeat(actor: Actor, key: Key, store: Records) -> JSONResponse:
+    return response(store.consumer_heartbeat(actor, key))
+
+
+@router.get("/projects/{project_id}/consumer-status")
+def consumer_status(project_id: str, actor: Actor, store: Records) -> dict[str, Any]:
+    return store.consumer_status(actor, project_id)
+
+
 @router.post("/turns/{turn_id}/complete")
 def complete_turn(
     turn_id: str, body: CompleteCoordinatorTurn, actor: Actor, key: Key, store: Records

@@ -29,6 +29,15 @@ func main() {
 	switch os.Args[1] {
 	case "--write":
 		write(os.Args[2])
+	case "--cpu-sum-squares":
+		if len(os.Args) != 4 {
+			fail(fmt.Errorf("usage: /hello --cpu-sum-squares iterations /outputs/result.txt"))
+		}
+		iterations, err := strconv.ParseInt(os.Args[2], 10, 64)
+		if err != nil || iterations < 1 || iterations > 100000 {
+			fail(fmt.Errorf("iterations must be between 1 and 100000"))
+		}
+		writeSumSquares(iterations, os.Args[3])
 	case "--sleep-write":
 		if len(os.Args) != 4 {
 			fail(fmt.Errorf("usage: /hello --sleep-write seconds /outputs/result.txt"))
@@ -98,6 +107,28 @@ func main() {
 		probeInodeQuota(os.Args[2], limit)
 	default:
 		fail(fmt.Errorf("unsupported mode"))
+	}
+}
+
+// writeSumSquares performs bounded deterministic CPU work and stores its actual
+// computed result in a compact JSON record suitable for downstream measurement.
+func writeSumSquares(iterations int64, path string) {
+	var sum int64
+	for i := int64(1); i <= iterations; i++ {
+		sum += i * i
+	}
+	encoded, err := json.Marshal(struct {
+		Iterations int64 `json:"iterations"`
+		SumSquares int64 `json:"sum_squares"`
+	}{iterations, sum})
+	if err != nil {
+		fail(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		fail(err)
+	}
+	if err := ioutil.WriteFile(path, append(encoded, '\n'), 0644); err != nil {
+		fail(err)
 	}
 }
 

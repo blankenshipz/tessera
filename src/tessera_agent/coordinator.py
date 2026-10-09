@@ -81,6 +81,94 @@ class ProviderDisabledCoordinator:
         )
 
 
+class CoordinatorConsumerError(RuntimeError):
+    """The ordinary coordinator could not complete a durable control transition."""
+
+
+class _CoordinatorHttpResponse(Protocol):
+    status_code: int
+
+    def json(self) -> Any: ...
+
+
+class _CoordinatorHttpClient(Protocol):
+    def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
+    ) -> _CoordinatorHttpResponse: ...
+
+
+class ProviderDisabledCoordinatorConsumer:
+    """One ordinary, restart-safe provider-disabled coordinator consumer.
+
+    The control plane owns queue selection, lease expiry, retry limits, and result
+    idempotency.  This process holds no authority beyond its existing scoped agent
+    credential and never invokes a provider, tool, shell, skill, approval, grant,
+    or dispatch path.
+    """
+
+    provider_enabled = False
+
+    def __init__(
+        self,
+        client: _CoordinatorHttpClient,
+        token: SecretStr | str,
+        facade: AstraAgentFacade,
+    ) -> None:
+        self._client = client
+        self._token = token.get_secret_value() if isinstance(token, SecretStr) else token
+        if not isinstance(self._token, str) or not self._token:
+            raise ValueError("Coordinator consumer requires an agent token.")
+        self._coordinator = ProviderDisabledCoordinator(facade)
+
+    def _post(self, path: str, body: dict[str, Any], key: str) -> dict[str, Any]:
+        response = self._client.post(
+            path,
+            headers={"Authorization": f"Bearer {self._token}", "Idempotency-Key": key},
+            json=body,
+        )
+        if not 200 <= response.status_code < 300:
+            raise CoordinatorConsumerError(
+                f"Coordinator control command was rejected ({response.status_code})."
+            )
+        value = response.json()
+        if not isinstance(value, dict):
+            raise CoordinatorConsumerError("Coordinator control response is not an object.")
+        return value
+
+    def run_once(self) -> dict[str, Any]:
+        """Heartbeat, claim exactly one next turn, and settle it deterministically."""
+        self._post("/astra/consumer/heartbeat", {}, f"astra-consumer-heartbeat-{uuid.uuid4().hex}")
+        claimed = self._post(
+            "/astra/turns/next-claim", {}, f"astra-consumer-next-{uuid.uuid4().hex}"
+        )
+        turn = claimed.get("turn")
+        if turn is None:
+            return {"availability": "idle", "provider_disabled": True, "provider_enabled": False}
+        if not isinstance(turn, dict) or not isinstance(claimed.get("prompt"), str):
+            raise CoordinatorConsumerError("Coordinator claim response is invalid.")
+        try:
+            context = [
+                ContextReference.model_validate(item) for item in claimed["selected_context"]
+            ]
+            output = self._coordinator.assemble(claimed["prompt"], context)
+        except Exception as error:
+            # The durable lease/retry budget remains authoritative.  A deterministic
+            # failure is recorded once; a lost acknowledgement can replay this key.
+            key = f"astra-consumer-fail-{turn['id']}-{turn['revision']}"
+            self._post(
+                f"/astra/turns/{turn['id']}/fail",
+                {"expected_revision": turn["revision"], "error_code": "consumer_error"},
+                key,
+            )
+            raise CoordinatorConsumerError("Coordinator assembly failed.") from error
+        payload = {"expected_revision": turn["revision"], **output.model_dump(mode="json")}
+        return self._post(
+            f"/astra/turns/{turn['id']}/complete",
+            payload,
+            f"astra-consumer-complete-{turn['id']}-{turn['revision']}",
+        )
+
+
 class ExplainStatusTurnProtocol(Protocol):
     """Durable protocol boundary for the one provider-disabled status tool.
 

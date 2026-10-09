@@ -12,9 +12,10 @@ metadata:
   name: tessera-control-remote
   namespace: tessera-lab
 data:
-  # This name must be accepted by the TLS endpoint that clients actually use.
+  # Internal probes use the control Service; callers use the TLS gateway.
   TESSERA_TRUSTED_HOST: tessera-control.tessera-lab.svc.cluster.local
-  TESSERA_PUBLIC_ORIGIN: https://tessera-control.tessera-lab.svc.cluster.local
+  TESSERA_TLS_GATEWAY_HOST: tessera-control-tls.tessera-lab.svc.cluster.local
+  TESSERA_PUBLIC_ORIGIN: https://tessera-control-tls.tessera-lab.svc.cluster.local
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -84,6 +85,8 @@ spec:
             - 0.0.0.0
             - --trusted-host
             - $(TESSERA_TRUSTED_HOST)
+            - --trusted-host
+            - $(TESSERA_TLS_GATEWAY_HOST)
             - --public-origin
             - $(TESSERA_PUBLIC_ORIGIN)
           envFrom:
@@ -103,7 +106,7 @@ spec:
               port: http
               httpHeaders:
                 # Kubernetes does not expand container environment variables in
-                # probe headers. Keep this literal equal to the ConfigMap value.
+                # probe headers. Keep this literal equal to the internal host.
                 - name: Host
                   value: tessera-control.tessera-lab.svc.cluster.local
             initialDelaySeconds: 2
@@ -156,8 +159,8 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# Explicitly labelled in-namespace clients may use the Service; no broad namespace,
-# node, or Internet ingress is allowed by this profile.
+# Only the operator-managed TLS gateway may make the plaintext control hop.
+# Credential-bearing clients must never carry this label.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -172,13 +175,12 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              tessera.io/control-client: "true"
+              tessera.io/control-hop: "true"
       ports:
         - protocol: TCP
           port: 8765
 ---
-# The namespace-wide deny also blocks client egress. Permit only explicitly
-# labelled clients to reach the selected control Pods on the Service port.
+# Permit only the gateway to reach the selected control Pods on the Service port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -187,7 +189,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      tessera.io/control-client: "true"
+      tessera.io/control-hop: "true"
   policyTypes: [Egress]
   egress:
     - to:
@@ -199,6 +201,31 @@ spec:
           port: 8765
     # Service-name lookup is required for the in-namespace Service; this does
     # not permit arbitrary external DNS or application egress.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# TLS clients need Service-name lookup, not a route to the plaintext control Pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-tls-control-client-dns
+  namespace: tessera-lab
+spec:
+  podSelector:
+    matchLabels:
+      tessera.io/tls-control-client: "true"
+  policyTypes: [Egress]
+  egress:
     - to:
         - namespaceSelector:
             matchLabels:

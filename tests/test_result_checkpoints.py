@@ -13,7 +13,7 @@ from test_artifact_manifests import _body, _completed_outputs, _operation
 from tessera_control.api import create_app
 from tessera_control.artifact_manifests import ArtifactManifestStore
 from tessera_control.execution import ExecutionStore
-from tessera_control.migrations import MIGRATIONS
+from tessera_control.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.result_checkpoints import ResultCheckpointStore
 from tessera_control.store import (
@@ -284,6 +284,9 @@ def test_v14_to_v15_checkpoint_migration_preserves_v14_evidence_and_rolls_back(
         from schema_fixtures import drop_empty_experiment_schema
 
         drop_empty_experiment_schema(connection)
+        from migration_fixture_helpers import strip_empty_runtime_v55
+
+        strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=14")
 
     def fail(connection):
@@ -302,5 +305,5 @@ def test_v14_to_v15_checkpoint_migration_preserves_v14_evidence_and_rolls_back(
         assert connection.execute(
             "SELECT id FROM artifact_manifests WHERE id=?", (manifest["id"],)
         ).fetchone()
-    assert migrate_state(state) == 43
-    assert migrate_state(state) == 43
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
