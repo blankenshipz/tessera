@@ -4,9 +4,17 @@
   "private": true,
   "type": "module",
   "main": "main.mjs",
+  "files": [
+    "*.mjs",
+    "*.cjs",
+    "*.html",
+    "*.css"
+  ],
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check main.mjs && node --check renderer.mjs && node --check connection.mjs && node --check control-credential.mjs",
+    "test:native-screen": "electron test/electron-screen-smoke.cjs"
   },
   "devDependencies": {
     "electron": "44.2.0"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -336,7 +337,7 @@ def main() -> None:
             state, owner_token, project["id"], experiment_snapshot
         )
 
-        def run_smoke(endpoint: str, header: Path, held: bool) -> None:
+        def run_smoke(endpoint: str, header: Path, held: bool) -> dict[str, object]:
             fixture = root / ("held-fixture.json" if held else "fixture.json")
             export_path = root / ("held-study.json" if held else "study.json")
             fixture.write_text(
@@ -350,6 +351,7 @@ def main() -> None:
                         "studyId": research_snapshot["study"]["id"],
                         "coordinatorProposal": workbench["proposal"],
                         "statusAnswer": workbench["answer"],
+                        "uiCreatedProjectName": "Synthetic UI-created project",
                         "held": held,
                         "exportPath": str(export_path),
                         "authoredExportPath": str(root / "authored-study.json"),
@@ -373,7 +375,7 @@ def main() -> None:
                 start_new_session=True,
             )
             try:
-                _stdout, stderr = process.communicate(timeout=35)
+                stdout, stderr = process.communicate(timeout=70)
             except subprocess.TimeoutExpired:
                 # The npm Electron launcher owns a child process. Stop this
                 # fixture's whole process group so a failed launch cannot leak it.
@@ -381,12 +383,47 @@ def main() -> None:
                 process.communicate(timeout=5)
                 raise
             if process.returncode:
-                raise RuntimeError(f"Desktop control fixture failed: {stderr[-2000:]}")
+                # Preserve the initiating error, not only teardown request noise.
+                # These are synthetic fixtures; redact credential-shaped fields
+                # anyway before retaining or displaying diagnostic evidence.
+                safe_stderr = re.sub(
+                    r"(?i)(Bearer\s+)[A-Za-z0-9_-]{43,4096}", r"\1[REDACTED]", stderr
+                )
+                safe_stdout = re.sub(
+                    r"(?i)(Bearer\s+)[A-Za-z0-9_-]{43,4096}", r"\1[REDACTED]", stdout
+                )
+                evidence = Path("/private/tmp/opencode/tessera-desktop-control-failure.log")
+                evidence.write_text(f"STDOUT\n{safe_stdout}\nSTDERR\n{safe_stderr}")
+                evidence.chmod(0o600)
+                raise RuntimeError(
+                    f"Desktop control fixture failed; sanitized evidence: {evidence}\n"
+                    f"First error:\n{safe_stderr[:2000]}\nLast error:\n{safe_stderr[-1000:]}"
+                )
             assert json.loads(export_path.read_text()) == research_snapshot
+            observation = json.loads(stdout)
+            if held:
+                assert observation["planRegression"] is None
+            else:
+                assert observation["planRegression"] == {
+                    "nullSpecEditable": True,
+                    "profile": "local-cpu",
+                    "taskRevision": 3,
+                    "planRevision": 2,
+                    "approvedEditorAvailable": True,
+                    "implicitExecution": False,
+                    "reconnected": True,
+                }
+            return observation
 
         with serve(state) as endpoint:
-            run_smoke(endpoint, state / "owner.header", held=False)
+            active_observation = run_smoke(endpoint, state / "owner.header", held=False)
             research = ResearchStore(state)
+            ui_created_projects = [
+                candidate
+                for candidate in store.list_projects(owner, 0, 100)
+                if candidate["name"] == "Synthetic UI-created project"
+            ]
+            assert len(ui_created_projects) == 1
             authored = [
                 study
                 for study in research.list_studies(owner, project["id"])
@@ -521,6 +558,9 @@ def main() -> None:
                         "provider_disabled_workbench_reconnected_unchanged": True,
                         "study_exports_match": True,
                         "execution_started": False,
+                        "native_plan_regression": active_observation["planRegression"],
+                        "picker": "synthetic native-dialog selection stub",
+                        "provider_execution": "not exercised",
                     }
                 )
             )

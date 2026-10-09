@@ -38,11 +38,11 @@ async function main() {
     throw new Error('Application isolation settings are missing.');
   }
   const result = await window.webContents.executeJavaScript(`(async () => {
-    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId, experimentId: fixture.experimentId, studyId: fixture.studyId, coordinatorProposal: fixture.coordinatorProposal, statusAnswer: fixture.statusAnswer, held: Boolean(fixture.held) })};
+    const expected = ${JSON.stringify({ endpoint: fixture.endpoint, projectId: fixture.projectId, decisionId: fixture.decisionId, experimentId: fixture.experimentId, studyId: fixture.studyId, coordinatorProposal: fixture.coordinatorProposal, statusAnswer: fixture.statusAnswer, uiCreatedProjectName: fixture.uiCreatedProjectName, held: Boolean(fixture.held) })};
     const waitFor = async predicate => {
       const deadline = Date.now() + 10000;
       while (!predicate()) {
-        if (Date.now() > deadline) throw new Error('UI condition timed out: ' + document.querySelector('#notice').textContent);
+        if (Date.now() > deadline) throw new Error('UI condition timed out at ' + predicate.toString() + '; notice: ' + document.querySelector('#notice').textContent);
         await new Promise(resolve => setTimeout(resolve, 25));
       }
     };
@@ -55,6 +55,52 @@ async function main() {
     const project = [...document.querySelectorAll('#projects button')].find(button => button.dataset.projectId === expected.projectId);
     if (!project) throw new Error('Expected synthetic project is missing.');
     project.click();
+    if (!expected.held) {
+      document.querySelector('#project-new').click();
+      const projectForm = document.querySelector('#project-form');
+      projectForm.elements.name.value = expected.uiCreatedProjectName;
+      projectForm.requestSubmit();
+      await waitFor(() => [...document.querySelectorAll('#projects button')].some(button => button.textContent === expected.uiCreatedProjectName));
+      const createdProject = [...document.querySelectorAll('#projects button')].find(button => button.textContent === expected.uiCreatedProjectName);
+      createdProject.click();
+      await waitFor(() => document.querySelector('#project-title').textContent === expected.uiCreatedProjectName && !document.querySelector('#workspace').hidden);
+      const originalProject = [...document.querySelectorAll('#projects button')].find(button => button.dataset.projectId === expected.projectId);
+      if (!originalProject) throw new Error('Original synthetic project is missing after UI project creation.');
+      originalProject.click();
+    }
+    let planRegression = null;
+    if (!expected.held) {
+      await waitFor(() => !document.querySelector('#task-new').disabled);
+      document.querySelector('#task-new').click();
+      const draft = document.querySelector('#task-form');
+      draft.elements.title.value = 'Synthetic desktop revised plan';
+      draft.elements.purpose.value = 'Native regression only: never grant, admit or execute.';
+      draft.elements.budget.value = '0'; draft.elements.duration.value = '30';
+      draft.requestSubmit();
+      const planCard = () => [...document.querySelectorAll('#tasks article')].find(node => node.textContent.includes('Synthetic desktop revised plan'));
+      await waitFor(() => planCard()?.textContent.includes('Not yet supplied'));
+      [...planCard().querySelectorAll('button')].find(button => button.textContent === 'Revise this proposal').click();
+      const revision = document.querySelector('#task-revise-form');
+      if (!document.querySelector('#task-revise-dialog').open || revision.elements.input_snapshot_digest.value !== '') throw new Error('Null-spec draft editor unavailable or invented input digest.');
+      revision.elements.argv.value = '["/usr/bin/true"]';
+      revision.elements.input_snapshot_digest.value = 'a'.repeat(64);
+      revision.elements.pinned_skill_digests.value = '[]';
+      revision.elements.output_paths.value = '[]';
+      revision.elements.profile.value = 'local-cpu';
+      revision.elements.max_output_bytes.value = '1';
+      revision.requestSubmit();
+      await waitFor(() => planCard()?.textContent.includes('draft · task revision 2 · plan revision 2'));
+      if (!planCard().textContent.includes('Execution destination: local-cpu')) throw new Error('Strict CPU specification was not displayed.');
+      [...planCard().querySelectorAll('button')].find(button => button.textContent === 'Approve this plan').click();
+      await waitFor(() => planCard()?.textContent.includes('approved · task revision 3 · plan revision 2'));
+      const approved = [...planCard().querySelectorAll('button')].find(button => button.textContent === 'Plan approved');
+      if (!approved?.disabled) throw new Error('Approved plan offered duplicate approval.');
+      await waitFor(() => document.querySelector('#notice').textContent.includes('No execution was started'));
+      [...planCard().querySelectorAll('button')].find(button => button.textContent === 'Revise this proposal').click();
+      if (revision.elements.argv.value !== '["/usr/bin/true"]' || !document.querySelector('#task-revise-review').textContent.includes('revision 2')) throw new Error('Post-approval editor lost immutable plan basis.');
+      document.querySelector('#task-revise-dialog').close();
+      planRegression = { nullSpecEditable: true, profile: 'local-cpu', taskRevision: 3, planRevision: 2, approvedEditorAvailable: true, implicitExecution: false };
+    }
     await waitFor(() => document.querySelector('#events').textContent.includes(expected.coordinatorProposal) &&
       document.querySelector('#events').textContent.includes(expected.statusAnswer));
     if (!document.querySelector('#message-form button').textContent.includes('Record conversation') ||
@@ -267,7 +313,11 @@ async function main() {
     const reconnectedExperimentHistory = await inspectExperiment();
     if (reconnectedExperimentHistory !== originalExperimentHistory) throw new Error('Experiment history changed across reconnect.');
     if (typeof window.require !== 'undefined') throw new Error('Node is exposed to renderer.');
-    return { href: location.href, decisionRemoved: !expected.held, held: expected.held, researchVariants: 80, experimentReconnected: true, workbenchReconnected: true };
+    if (planRegression) {
+      await waitFor(() => document.querySelector('#tasks').textContent.includes('approved · task revision 3 · plan revision 2'));
+      planRegression.reconnected = true;
+    }
+    return { href: location.href, decisionRemoved: !expected.held, held: expected.held, researchVariants: 80, experimentReconnected: true, workbenchReconnected: true, planRegression };
   })()`, true);
   if (result.href !== 'tessera://app/index.html' || errors.length) throw new Error('Unexpected renderer state.');
   console.log(JSON.stringify(result));
@@ -276,7 +326,9 @@ async function main() {
   let status = 0;
   try {
     await Promise.race([main(), new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Desktop control smoke timed out.')), 25000);
+      // The plan regression adds three persisted mutations and full project
+      // reloads to the existing research/export/reconnect sequence.
+      timer = setTimeout(() => reject(new Error('Desktop control smoke timed out.')), 60000);
     })]);
   } catch (error) {
     console.error(error.stack || error); status = 1;

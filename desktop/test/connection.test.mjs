@@ -7,6 +7,25 @@ const tokenB = 'b'.repeat(43);
 const config = (id = 'one', token = tokenA) => ({ id, token, name: id, endpoint: `http://127.0.0.1:${id === 'one' ? 8765 : 8766}` });
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
 
+test('API maximum token authenticates and rejected lengths never reach transport', async () => {
+  let calls = 0;
+  const connection = new ControlConnection(async () => { calls++; return json({ principal_id: 'human', org_id: 'org' }); });
+  await connection.connect(config('one', 'a'.repeat(4096)));
+  assert.equal(calls, 1);
+  for (const length of [32, 42, 4097]) await assert.rejects(connection.connect(config('one', 'a'.repeat(length))), /credentials/);
+  assert.equal(calls, 1);
+});
+
+test('safe status errors explain next actions without exposing response bodies', async () => {
+  for (const [status, hint] of [[401, /Reconnect/], [403, /scope/], [409, /revision and history/], [422, /form fields/], [503, /readiness and schema/]]) {
+    const connection = new ControlConnection(async url => url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ detail: 'PRIVATE_SERVER_SENTINEL' }, status));
+    await connection.connect(config());
+    await assert.rejects(connection.projects(), error => {
+      assert.match(error.message, hint); assert.doesNotMatch(error.message, /PRIVATE_SERVER_SENTINEL/); return true;
+    });
+  }
+});
+
 test('connection metadata never returns bearer credentials', async () => {
   const connection = new ControlConnection(async () => json({ principal_id: 'human', org_id: 'org', role: 'human' }));
   const status = await connection.connect(config());
@@ -41,6 +60,25 @@ test('harness-context routes use only a server-derived binding and an explicit c
   assert.throws(() => connection.cancelHarnessDelivery('../delivery', { expected_revision: 2 }, 'key'));
 });
 
+test('program-review context and proposal commands use only the typed interaction contract', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org' } : { study_id: 'study_1' });
+  });
+  await connection.connect(config());
+  const body = { project_id: 'project_1', task_id: null, kind: 'direction', scope: { type: 'research_program' }, expires_at: '2030-01-01T00:00:00Z', priority: 50 };
+  await connection.programContext('study_1');
+  await connection.createDecision(body, 'program-review-command');
+  assert.match(calls[1].url, /\/interaction\/studies\/study_1\/program-context$/);
+  assert.equal(calls[1].options.method, 'GET');
+  assert.equal(calls[1].options.headers['Idempotency-Key'], undefined);
+  assert.match(calls[2].url, /\/interaction\/decisions$/);
+  assert.deepEqual(JSON.parse(calls[2].options.body), body);
+  assert.equal(calls[2].options.headers['Idempotency-Key'], 'program-review-command');
+  assert.throws(() => connection.programContext('../study'));
+});
+
 test('worker discovery is a bounded project-scoped read with no command key', async () => {
   const calls = [];
   const connection = new ControlConnection(async (url, options) => {
@@ -69,6 +107,30 @@ test('an unavailable request marks the connection offline without replaying a co
     context_revision: 1, intent: 'question', body: 'Context' }, 'context-command'), /outcome is unknown/);
   assert.equal(connection.status().health, 'offline');
   assert.equal(commands, 1);
+});
+
+test('a readiness or backend-incompatibility 503 never remains online', async () => {
+  const connection = new ControlConnection(async url =>
+    url.endsWith('/me') ? json({ principal_id: 'human', org_id: 'org' }) : json({ detail: 'not ready' }, 503));
+  await connection.connect(config());
+  await assert.rejects(connection.projects(), /unavailable or not ready \(503\)/);
+  assert.equal(connection.status().health, 'offline');
+});
+
+test('a timed-out command aborts once, reports an unknown outcome, and never retries itself', async () => {
+  let aborts = 0; let commands = 0;
+  const connection = new ControlConnection(async (url, options) => {
+    if (url.endsWith('/me')) return json({ principal_id: 'human', org_id: 'org' });
+    commands++;
+    return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => {
+      aborts++; reject(new Error('aborted by bounded timeout'));
+    }, { once: true }));
+  }, 5);
+  await connection.connect(config());
+  await assert.rejects(connection.createProject({ name: 'Timed out' }, 'timeout-command'), /outcome is unknown/);
+  assert.equal(commands, 1);
+  assert.equal(aborts, 1);
+  assert.equal(connection.status().health, 'offline');
 });
 
 test('only the freshest request in an active connection generation can change health', async () => {
@@ -255,6 +317,56 @@ test('provider-disabled coordinator routes use bounded reads and an explicit hum
   assert.throws(() => connection.requestCoordinatorTurn('../project', body, 'key'));
 });
 
+test('human disposition facade is a closed retain-quarantined command, never an endpoint proxy', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => { calls.push({url,options}); return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org', role: 'human' } : { dispositions: [] }); });
+  await connection.connect(config());
+  const body = { expected_manifest_digest: 'a'.repeat(64), expected_revision: 0, disposition: 'retain_quarantined', rationale: 'Human operational output review only.' };
+  await connection.artifactDispositions('manifest_1', { offset: 0, limit: 100 });
+  await connection.recordArtifactDisposition('manifest_1', body, 'human-review');
+  assert.match(calls.at(-1).url, /\/artifact-manifests\/manifest_1\/dispositions$/);
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), body);
+  const count = calls.length;
+  for (const patch of [{ disposition: 'reject' }, { disposition: 'accept' }, { action: 'release' }, { expected_revision: -1 }, { expected_manifest_digest: 'not-a-digest' }, { rationale: '' }, { rationale: 'x'.repeat(8001) }]) assert.throws(() => connection.recordArtifactDisposition('manifest_1', { ...body, ...patch }, 'key'));
+  assert.throws(() => connection.recordArtifactDisposition('../other', body, 'key'));
+  assert.equal(calls.length, count);
+  assert.throws(() => connection.assertActive('wrong-connection'), /another context/);
+  connection.disconnect();
+  assert.throws(() => connection.recordArtifactDisposition('manifest_1', body, 'key'), /connection/i);
+  const agent = new ControlConnection(async () => json({principal_id:'agent',org_id:'org',role:'agent'}));
+  await agent.connect(config());
+  assert.throws(() => agent.recordArtifactDisposition('manifest_1', body, 'key'), /Human artifact disposition/);
+});
+
+test('consumer status, custody, bundle, and recovery routes stay narrow and explicit', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org' } : { id: 'recorded' });
+  });
+  await connection.connect(config());
+  const custody = { expected_manifest_digest: 'a'.repeat(64), expected_revision: 2, action: 'release', rationale: 'Review bounded output.' };
+  const bundle = { max_bytes: 4096 };
+  const recovery = { expected_grant_revision: 3, expected_recovery_revision: 2, operation_id: 'b'.repeat(32), request_cancellation: true };
+  await connection.coordinatorConsumerStatus('project_1');
+  await connection.recordArtifactCustodyRelease('manifest_1', custody, 'custody-command');
+  await connection.exportReproductionBundle('manifest_1', bundle, 'bundle-command');
+  await connection.reproductionBundle('bundle_1');
+  await connection.recoveryReconciliations('grant_1');
+  await connection.reconcileLostWorkerOperation('grant_1', recovery, 'recovery-command');
+  assert.match(calls[1].url, /\/astra\/projects\/project_1\/consumer-status$/);
+  assert.match(calls[2].url, /\/artifact-manifests\/manifest_1\/custody-releases$/);
+  assert.deepEqual(JSON.parse(calls[2].options.body), custody);
+  assert.match(calls[3].url, /\/artifact-manifests\/manifest_1\/reproduction-bundles$/);
+  assert.match(calls[4].url, /\/reproduction-bundles\/bundle_1$/);
+  assert.match(calls[5].url, /\/execution-grants\/grant_1\/recovery-reconciliations$/);
+  assert.match(calls[6].url, /\/execution-grants\/grant_1\/recovery-reconciliations$/);
+  for (const index of [2, 3, 6]) assert.ok(calls[index].options.headers['Idempotency-Key']);
+  for (const index of [1, 4, 5]) assert.equal(calls[index].options.headers['Idempotency-Key'], undefined);
+  assert.throws(() => connection.coordinatorConsumerStatus('../project'));
+  assert.throws(() => connection.reconcileLostWorkerOperation('../grant', recovery, 'key'));
+});
+
 test('human design registration is a separate coordinator command, never an approval or run command', async () => {
   const calls = [];
   const connection = new ControlConnection(async (url, options) => {
@@ -320,6 +432,47 @@ test('goal-to-decision routes are scoped authenticated reads without command key
   assert.throws(() => connection.experiments('../project'));
   assert.throws(() => connection.experiment('../experiment'));
   assert.throws(() => connection.experiments('project_1', { limit: 201 }));
+});
+
+test('researcher journey routes preserve separate design, admission, dispatch, evidence, and conclusion authority', async () => {
+  const calls = [];
+  const connection = new ControlConnection(async (url, options) => {
+    calls.push({ url, options });
+    return json(url.endsWith('/me') ? { principal_id: 'human', org_id: 'org' } : { id: 'recorded' });
+  });
+  await connection.connect(config());
+  await connection.reviseTaskPlan('task_1', { expected_revision: 2, title: 'Revised proposal', purpose: 'Bounded', budget_cents: 0, max_duration_seconds: 60,
+    execution_spec: { argv: ['python'], input_snapshot_digest: 'b'.repeat(64), pinned_skill_digests: [], output_paths: [], profile: 'local-cpu', network_enabled: false, max_output_bytes: 0 } }, 'proposal-revision-command');
+  const design = { expected_revision: 2, goal: 'Goal', success_criterion: 'Criterion', protocol: 'Protocol', variants: [] };
+  const admission = { expected_variant_revision: 1, expected_design_revision: 2, grant_id: 'grant_1' };
+  const dispatch = { expected_revision: 3, target_digest: 'a'.repeat(64), profile_version: 'development-minikube-opencode-v1' };
+  const evidence = { expected_revision: 4, artifact_ids: ['artifact_1'] };
+  const conclusion = { statement: 'Human interpretation.', design_revision: 2, evidence: [{ attempt_id: 'attempt_1', artifact_ids: ['artifact_1'], measurement_ids: [] }] };
+  await connection.reviseExperiment('experiment_1', design, 'design-command');
+  await connection.admitExperimentAttempt('variant_1', admission, 'admit-command');
+  await connection.dispatchAdmittedAttempt('attempt_1', dispatch, 'dispatch-command');
+  await connection.linkAttemptArtifacts('attempt_1', evidence, 'evidence-command');
+  await connection.createConclusion('experiment_1', conclusion, 'conclusion-command');
+  await connection.updateConclusion('conclusion_1', { ...conclusion, expected_revision: 1 }, 'update-command');
+  await connection.reviewConclusion('conclusion_1', { expected_revision: 2, design_revision: 2 }, 'review-command');
+  await connection.amendConclusion('conclusion_1', { expected_revision: 3, expected_design_revision: 2, relation: 'retracts', reason: 'Corrected evidence.' }, 'amend-command');
+  await connection.artifacts('project_1', { offset: 0, limit: 100 });
+  await connection.artifactPreview('manifest_1', 'artifact_1');
+  assert.match(calls[1].url, /\/tasks\/task_1\/plan$/); assert.equal(calls[1].options.method, 'PUT');
+  assert.match(calls[2].url, /\/experiments\/experiment_1\/designs$/);
+  assert.match(calls[3].url, /\/experiment-variants\/variant_1\/admitted-attempts$/);
+  assert.match(calls[4].url, /\/experiment-admitted-attempts\/attempt_1\/dispatch$/);
+  assert.match(calls[5].url, /\/experiment-attempts\/attempt_1\/artifacts$/);
+  assert.match(calls[6].url, /\/experiments\/experiment_1\/conclusions$/);
+  assert.equal(calls[7].options.method, 'PUT');
+  assert.match(calls[8].url, /\/conclusions\/conclusion_1\/review$/);
+  assert.match(calls[9].url, /\/conclusions\/conclusion_1\/amendments$/);
+  assert.match(calls[10].url, /\/projects\/project_1\/artifacts\?offset=0&limit=100$/);
+  assert.match(calls[11].url, /\/artifact-manifests\/manifest_1\/artifacts\/artifact_1\/preview\?max_bytes=4096$/);
+  for (const call of calls.slice(1, 10)) assert.ok(call.options.headers['Idempotency-Key']);
+  assert.equal(calls[10].options.headers['Idempotency-Key'], undefined);
+  assert.throws(() => connection.artifactPreview('manifest_1', 'artifact_1', 0));
+  assert.throws(() => connection.reviseExperiment('../experiment', design, 'key'));
 });
 
 test('immutable task-plan detail is a digest-addressed authenticated read', async () => {

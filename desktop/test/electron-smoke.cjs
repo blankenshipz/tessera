@@ -1,6 +1,6 @@
 'use strict';
 
-const { spawn } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const { randomBytes } = require('node:crypto');
 const { mkdtempSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
@@ -10,6 +10,7 @@ const electron = require('electron');
 
 const timeoutMs = 15_000;
 const userDataDir = mkdtempSync(join(tmpdir(), 'tessera-electron-smoke-'));
+const packageDir = mkdtempSync(join(tmpdir(), 'tessera-electron-package-'));
 let timeout;
 let child;
 let output = '';
@@ -41,8 +42,20 @@ async function main() {
   const { ELECTRON_RUN_AS_NODE: _ignored, ...environment } = process.env;
   const smokeToken = randomBytes(32).toString('hex');
   environment.TESSERA_ELECTRON_SMOKE_TOKEN = smokeToken;
-  child = spawn(electron, ['.', `--user-data-dir=${userDataDir}`], {
-    cwd: join(__dirname, '..'), env: environment, stdio: ['ignore', 'pipe', 'pipe'],
+  environment.TESSERA_ELECTRON_SMOKE_HIDDEN = '1';
+  const source = join(__dirname, '..');
+  const packed = JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', packageDir], {
+    cwd: source, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  if (!Array.isArray(packed) || packed.length !== 1 || !packed[0]?.filename) {
+    throw new Error('npm pack did not produce one desktop package.');
+  }
+  execFileSync('tar', ['-xzf', join(packageDir, packed[0].filename), '-C', packageDir], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const packagedApp = join(packageDir, 'package');
+  child = spawn(electron, [packagedApp, `--user-data-dir=${userDataDir}`], {
+    cwd: packagedApp, env: environment, stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stderr.on('data', chunk => { output = (output + chunk).slice(-16_384); });
   const windowObservation = new Promise((resolve, reject) => {
@@ -78,14 +91,14 @@ async function main() {
   if (!state.statusIsNull) throw new Error('Unexpected renderer IPC status response.');
   if (!state.connectionButton) throw new Error('Connection button was not rendered.');
   if (state.nodeRequire !== 'undefined') throw new Error(`Renderer exposes require: ${state.nodeRequire}`);
-  if (state.visibilityState !== 'visible') throw new Error(`Renderer is not visible: ${state.visibilityState}`);
+  if (state.visibilityState !== 'visible') throw new Error(`Unexpected renderer visibility: ${state.visibilityState}`);
   if (!isolation.sandbox || !isolation.contextIsolation || isolation.nodeIntegration) {
     throw new Error(`Application isolation settings are missing: ${JSON.stringify(isolation)}`);
   }
   if (rendererErrors.length) throw new Error(`Renderer errors: ${rendererErrors.map(error => error.message).join('; ')}`);
-  if (!nativeWindow.visible || nativeWindow.minimized || nativeWindow.nativeHandleBytes <= 0 ||
+  if (nativeWindow.visible || nativeWindow.minimized || nativeWindow.nativeHandleBytes <= 0 ||
       nativeWindow.bounds.width <= 0 || nativeWindow.bounds.height <= 0) {
-    throw new Error(`Application window is not visible on screen: ${JSON.stringify(nativeWindow)}`);
+    throw new Error(`Hidden native application window is invalid: ${JSON.stringify(nativeWindow)}`);
   }
   const teardown = await stopChild();
   if (!teardown || (teardown.exitCode === null && teardown.signalCode === null)) {
@@ -108,5 +121,6 @@ async function main() {
     clearTimeout(timeout);
     await stopChild();
     rmSync(userDataDir, { recursive: true, force: true });
+    rmSync(packageDir, { recursive: true, force: true });
   }
 })();

@@ -8,12 +8,20 @@ function interactionReadIsCurrent({
 }
 
 const api = window.tessera;
+let adminView = 'setup';
+let adminState = null;
+let adminPending = null;
+let adminRead = 0;
+let adminBusy = false;
+let adminEditing = null;
 const $ = id => document.getElementById(id);
 let epoch = 0;
 let connectionId = null;
 let recoveryHeld = true;
 let connectionOnline = false;
 let connectionState = null;
+let namespaceContext = null;
+let namespaceRequest = 0;
 let activeProject = null;
 let activeExperiment = null;
 let activeExperimentLedger = null;
@@ -21,13 +29,26 @@ let activeLedger = null;
 let outcomeContext = null;
 let closeContext = null;
 const evidenceContexts = new Map();
+let experimentCommandContext = null;
+let conclusionContext = null;
+let amendmentContext = null;
+let artifactReviewContext = null;
+let artifactDispositionContext = null;
+let artifactDispositionRead = 0;
+let artifactPreviewRequest = 0;
+let recoveryCommandContext = null;
+let taskRevisionContext = null;
 let projectOffset = 0;
 let taskOffset = 0;
 let workerOffset = 0;
+let artifactOffset = 0;
 let eventCursor = 0;
 let workbenchView = 'conversation';
 let workbenchEntries = [];
 let coordinatorConversationRevision = 0;
+let coordinatorAvailable = false;
+let coordinatorBusy = null;
+let coordinatorConsumerDetail = null;
 const selectedCoordinatorContext = [];
 let coordinatorMessageOffset = 0;
 let proposalOffset = 0;
@@ -40,33 +61,375 @@ let decisionOffset = 0;
 let studyOffset = 0;
 let experimentOffset = 0;
 let remoteWorkflowOffset = 0;
+const remoteWorkflowIds = new Set();
+const artifactIds = new Set();
 let messageOffset = 0;
 let activeThread = null;
 let threadEpoch = 0;
 let activeHarnessBinding = null;
 let activeStudy = null;
 let studyEpoch = 0;
+let activeProgramContext = null;
+let programAuthorInputs = null;
+let programContextRequest = 0;
+let pendingProgramReview = null;
 const pendingKeys = new Map();
 const pendingDecisionResolutions = new Map();
 const loading = new Set();
-const readVersion = { workers: 0, threads: 0, messages: 0, binding: 0, decisions: 0, experiments: 0, experiment: 0, remoteWorkflows: 0, studies: 0, study: 0, workbench: 0 };
+const readVersion = { workers: 0, artifacts: 0, threads: 0, messages: 0, binding: 0, decisions: 0, experiments: 0, experiment: 0, remoteWorkflows: 0, studies: 0, study: 0, program: 0, workbench: 0 };
 
 function notice(message = '') { $('notice').textContent = message; }
 function canMutate() { return !recoveryHeld && connectionOnline; }
+const unavailableControls = new WeakMap();
+function availabilityBasis() {
+  return [epoch, activeProject, activeExperimentLedger, activeLedger, activeProgramContext,
+    artifactReviewContext, artifactDispositionContext, artifactDispositionRead, taskRevisionContext, readVersion.decisions, readVersion.workbench,
+    readVersion.remoteWorkflows];
+}
+function applyAvailability(control, unavailable) {
+  if (unavailable) {
+    if (!unavailableControls.has(control)) unavailableControls.set(control, { disabled: control.disabled, basis: availabilityBasis() });
+    control.disabled = true;
+  } else if (unavailableControls.has(control)) {
+    const saved = unavailableControls.get(control); const basis = availabilityBasis();
+    // Availability is an overlay, never a replacement for the record's eligibility
+    // or a busy flag. Changed contexts need a fresh projection before re-enabling.
+    control.disabled = saved.disabled || !saved.basis.every((value, index) => value === basis[index]);
+    unavailableControls.delete(control);
+  }
+}
+function clearAdmin() {
+  adminRead++; adminState = null; adminPending = null; adminBusy = false; adminEditing = null;
+  $('admin-workspace').hidden = true; $('admin-preview').hidden = true;
+  $('admin-preview-body').textContent = ''; $('admin-records').replaceChildren();
+  $('admin-status').textContent = 'Select an authenticated project. Configuration is not readiness.';
+  for (const id of ['admin-configuration-form', 'admin-secret-form', 'admin-delegation-form']) $(id).reset();
+}
+function adminCurrent(context) {
+  return context.epoch === epoch && context.connectionId === connectionId && context.projectId === activeProject?.id;
+}
+function adminContext() { return { epoch, connectionId, projectId: activeProject?.id }; }
+function adminPreview(body, record = null) {
+  if (!canMutate() || !adminState || adminState.held || adminBusy) throw new Error('Administration is held, stale or unavailable.');
+  adminPending = { ...adminContext(), body, recordId: record?.id ?? null };
+  $('admin-preview-body').textContent = JSON.stringify({ record_id: record?.id ?? null, ...body }, null, 2);
+  $('admin-preview').hidden = false; $('admin-confirm').disabled = false;
+}
+function renderAdmin() {
+  const state = adminState;
+  $('admin-configuration-editor').hidden = !['setup', 'targets'].includes(adminView);
+  $('admin-secret-editor').hidden = adminView !== 'secrets' || connectionState?.role !== 'human';
+  $('admin-delegation-editor').hidden = adminView !== 'delegations';
+  for (const view of ['setup', 'targets', 'secrets', 'delegations', 'readiness', 'audit']) {
+    $(`admin-${view}`).setAttribute('aria-pressed', String(view === adminView));
+  }
+  const explanations = {
+    setup: 'Desired deployment metadata only. Use Connect to select a running service. Saving here never changes the current connection or deploys a control plane.',
+    targets: 'Kubernetes, local fixture and Salad profiles remain unverified. Digests and configured limits are not proof of enforcement.',
+    secrets: 'Protected enrollment: propose exact provider/purpose/project scope, obtain independent root-human approval, then enter once in the native hidden prompt. macOS Keychain and same-host native control database only; remote, Windows and Linux enrollment unavailable. No renderer token field or secret-read grant. Provider live activation stays disabled.',
+    delegations: 'Exact project / target / provider / action scope. Independent root-human review required; no self-approval. Existing credentials are not proof of independent organization members. Worker, proxy and monitor identity enrollment is unavailable.',
+    readiness: 'Configure → human review → local verification → BLOCKED. Verification makes no network calls. Live enablement needs deployed secret custody, independent monitor/termination, cost accounting, artifact custody and separately authorized conformance. No enable switch is available.',
+    audit: 'Attributed metadata command history. Denials remain in the existing owner-only /operator/audit ledger; no request bodies or secret values in command summaries.',
+  };
+  $('admin-explanation').textContent = explanations[adminView];
+  if (!state) return;
+  $('admin-status').textContent = `Principal ${connectionState?.principalId ?? 'unknown'} · project ${activeProject?.id ?? 'unknown'} · control database: ${state.control_status ?? 'unknown'} · observed ${state.observed_at ?? 'unknown'} · ${state.held ? 'held/read-only' : 'metadata workspace'} · provider DISABLED · native custody requires explicit same-host setup. Refresh to observe changes.`;
+  $('admin-records').replaceChildren();
+  $('admin-more').hidden = state.next_offset === null || adminView === 'audit';
+  if (adminView === 'audit') return;
+  const records = state.records.filter(record => {
+    if (adminView === 'secrets') return record.spec.kind === 'secret';
+    if (adminView === 'delegations') return record.spec.kind === 'delegation';
+    if (record.spec.kind !== 'configuration') return false;
+    return adminView === 'readiness' || (adminView === 'setup' ? record.spec.component === 'control_plane' : record.spec.component !== 'control_plane');
+  });
+  if (!records.length) $('admin-records').append(element('p', 'No visible records in this page. Nothing is implicitly configured or enabled.', 'muted'));
+  for (const record of records) {
+    const card = element('article', undefined, 'card');
+    card.append(element('h3', `${record.spec.kind} · ${record.spec.provider} · ${record.state}`),
+      element('p', `${record.id} · revision ${record.revision} · version ${record.version}`),
+      element('p', `Health ${record.health} · verification ${record.verification} · live disabled · last used ${record.last_used_at ?? 'unknown / never observed'}`));
+    if (record.spec.kind === 'delegation') card.append(element('p', `Effective administration scope: ${record.effective ? 'active' : 'not active'} · no execution or secret-read permission`));
+    const detail = element('details'); detail.append(element('summary', 'Inspect exact scope / metadata'), element('pre', JSON.stringify(record.spec, null, 2)));
+    if (record.versions?.length) detail.append(element('pre', JSON.stringify(record.versions, null, 2)));
+    card.append(detail);
+    const action = (label, name, extra = {}) => {
+      const button = element('button', label); button.type = 'button';
+      button.disabled = !canMutate() || state.held || adminBusy;
+      button.addEventListener('click', () => guarded(async () => adminPreview({ expected_revision: record.revision, action: name, ...extra }, record)));
+      card.append(button);
+    };
+    if (state.root_admin && record.state === 'proposed' && record.proposed_by !== connectionState?.principalId && record.spec.subject_id !== connectionState?.principalId) {
+      action('Review approval', 'approve'); action('Review rejection', 'reject');
+    }
+    if (record.spec.kind === 'configuration' && record.state === 'approved') action('Verify local bindings (live remains blocked)', 'verify');
+    if (record.spec.kind === 'configuration') {
+      if (!['revoked', 'expired', 'deleted', 'rejected'].includes(record.state)) {
+        const edit = element('button', 'Revise configuration proposal'); edit.type = 'button';
+        edit.disabled = !canMutate() || state.held || adminBusy;
+        edit.addEventListener('click', () => {
+          adminEditing = { ...adminContext(), record };
+          adminPending = null; $('admin-preview').hidden = true;
+          for (const [key, value] of Object.entries(record.spec)) {
+            const input = $('admin-configuration-form').elements.namedItem(key);
+            if (input) input.value = value ?? '';
+          }
+          $('admin-configuration-editor').hidden = false;
+          $('admin-configuration-editor').open = true;
+          $('admin-status').textContent = `Editing exact record ${record.id} at revision ${record.revision}. Preview before submission; approval will be invalidated.`;
+        });
+        card.append(edit);
+      }
+      const enable = element('button', 'Enable live — unavailable'); enable.disabled = true; card.append(enable);
+    }
+    if (state.root_admin && !['deleted', 'expired', 'revoked', 'rejected'].includes(record.state)) {
+      action('Review revocation', 'revoke'); action('Review immediate expiry', 'expire');
+      if (record.spec.kind === 'secret' && record.spec.backend === 'fake') action('Review synthetic rotation (+60 minutes)', 'rotate', { expires_at: new Date(Date.now() + 3600000).toISOString() });
+    }
+    if (record.spec.backend === 'os_keychain') {
+      card.append(element('p', `Custody: ${record.custody ?? 'not enrolled'} · cleanup ${record.cleanup_pending ? 'pending — revoke uncertain enrollment, then purge' : 'not pending'}. Approval expires after five minutes; cancelled/uncertain enrollment cannot replay.`, 'muted'));
+      if (!state.root_admin && connectionState?.principalId === record.proposed_by && record.state === 'active') action('Propose rotation (+60 minutes; invalidates old version)', 'rotate', { expires_at: new Date(Date.now() + 3600000).toISOString() });
+      const nativeAction = (label, operation) => {
+        const button = element('button', label); button.type = 'button';
+        button.disabled = !canMutate() || state.held || adminBusy;
+        button.addEventListener('click', () => guarded(async () => {
+          const context = adminContext();
+          if (adminBusy || !adminCurrent(context)) return;
+          adminBusy = true;
+          try {
+            const result = await api.protectedSecret(context.connectionId, { project_id: context.projectId,
+              record_id: record.id, expected_revision: record.revision, enrollment_id: record.enrollment_id, operation });
+            if (!adminCurrent(context)) return;
+            await loadAdmin();
+            if (adminCurrent(context)) $('admin-status').textContent = `Protected operation: ${result.state ?? (result.available ? 'available' : 'unavailable')} · version ${result.version} · provider DISABLED. Metadata only; no value returned.`;
+          } finally { if (adminCurrent(context)) adminBusy = false; }
+        }));
+        card.append(button);
+      };
+      if (state.root_admin && record.enrollment_id) {
+        if (record.state === 'approved') { nativeAction('Enroll secret — native hidden prompt', 'enroll'); nativeAction('Import existing secret — native hidden prompt', 'import'); }
+        nativeAction('Check local OS store (boolean only)', 'health');
+        if (record.cleanup_pending && ['active', 'revoked', 'expired', 'deleted'].includes(record.state)) nativeAction('Purge inaccessible OS-store versions', 'purge');
+      }
+    }
+    if (state.root_admin && record.spec.kind === 'secret' && ['revoked', 'expired'].includes(record.state)) action('Review metadata tombstone', 'delete');
+    $('admin-records').append(card);
+  }
+}
+async function loadAdmin(append = false) {
+  if (!activeProject || !connectionId) { $('admin-status').textContent = 'Select an authenticated project first.'; return; }
+  const context = adminContext(), request = ++adminRead;
+  const offset = append ? adminState?.next_offset : 0;
+  if (offset === null) return;
+  $('admin-status').textContent = 'Refreshing; previous observations may be stale.';
+  try {
+    const result = await api.adminWorkspace(connectionId, activeProject.id, { offset, limit: 100 });
+    if (!adminCurrent(context) || request !== adminRead) return;
+    adminState = { ...result, records: append ? [...adminState.records, ...result.records] : result.records };
+    adminEditing = null;
+    adminPending = null; $('admin-preview').hidden = true; $('admin-preview-body').textContent = '';
+    renderAdmin();
+    if (adminView === 'audit' && result.root_admin) {
+      const audit = await api.adminAudit(context.connectionId, context.projectId);
+      if (!adminCurrent(context) || request !== adminRead || adminView !== 'audit') return;
+      $('admin-records').append(element('pre', JSON.stringify(audit.events, null, 2)), element('p', 'First 100 command summaries. Use the paginated audit API for complete history.', 'muted'));
+    }
+  } catch (error) {
+    if (adminCurrent(context) && request === adminRead) {
+      adminState = null; adminPending = null; $('admin-preview').hidden = true;
+      $('admin-preview-body').textContent = ''; $('admin-records').replaceChildren();
+      $('admin-status').textContent = 'Unknown / stale: administrative state unavailable. No commands were replayed.';
+    }
+    throw error;
+  }
+}
+async function confirmAdmin() {
+  const pending = adminPending;
+  if (!pending || !adminCurrent(pending) || !canMutate() || adminBusy || adminState?.held) return;
+  adminBusy = true; $('admin-confirm').disabled = true;
+  try {
+    const key = await api.commandId();
+    if (!adminCurrent(pending) || pending !== adminPending || !canMutate() || !adminState || adminState.held) return;
+    if (pending.recordId) await api.adminCommand(pending.connectionId, pending.projectId, pending.recordId, pending.body, key);
+    else await api.adminCreate(pending.connectionId, pending.projectId, pending.body, key);
+    if (adminCurrent(pending)) { adminPending = null; await loadAdmin(); }
+  } catch (error) {
+    if (adminCurrent(pending)) {
+      // Do not mint a second intent after an uncertain response. Inspect history first.
+      adminPending = null; adminState = null; $('admin-preview').hidden = true;
+      $('admin-preview-body').textContent = ''; $('admin-records').replaceChildren();
+      $('admin-status').textContent = 'Command failed or outcome unknown. Refresh history before another command; nothing was replayed.';
+    }
+    throw error;
+  } finally {
+    if (adminCurrent(pending)) {
+      adminBusy = false;
+      if (adminState && adminView !== 'audit') renderAdmin();
+    }
+  }
+}
+function renderOnboarding() {
+  const connectedWithoutProject = Boolean(connectionId && connectionOnline && !activeProject);
+  $('welcome-heading').textContent = connectedWithoutProject ? 'Connected. Start your first project.' : 'Start your local workspace.';
+  $('welcome-copy').textContent = connectedWithoutProject ?
+    'This control plane is connected but has no selected project. Create a project to begin a separate research workspace.' :
+    'Start the installed local control service below, or Connect to an existing endpoint supplied by its operator.';
+  $('local-control-start').hidden = Boolean(connectionId && connectionOnline);
+  $('welcome-project-new').hidden = !connectedWithoutProject;
+  $('welcome-project-new').disabled = !canMutate();
+  $('namespace-setup').disabled = !api?.namespaceSelectKubeconfig;
+  $('journey-next').textContent = !connectionId ?
+    'Next: Follow the init-once and serve commands below, then Connect with the endpoint and private owner.header file. For an existing service, use its operator-supplied endpoint and header. Kubernetes setup is optional.' :
+    !connectionOnline ? 'Next: Reconnect with a current credential, then refresh history. Do not replay uncertain commands.' :
+    recoveryHeld ? 'Next: Inspect recovered history. Mutations stay disabled until an operator resolves the recovery hold.' :
+    !activeProject ? 'Next: Select an existing project or create one. Connection switching is not project import or migration.' :
+    'Next: Draft a plan, then revise it to declare an execution specification. Review the exact digest before approval; admission and dispatch are separate actions.';
+}
+function namespaceIsCurrent(context) { return context === namespaceContext && context?.epoch === epoch; }
+function renderNamespaceInspection(inspection) {
+  const target = inspection.target;
+  const conflicts = inspection.state === 'terminating' ?
+    'Conflict: this namespace is terminating and cannot be used or created.' :
+    inspection.state === 'absent' ? 'No name conflict observed: the named namespace is absent.' :
+    'Name conflict for dedicated creation: the named namespace already exists.';
+  $('namespace-detail').replaceChildren(
+    element('p', `Identity: ${target.context} · ${target.server} · cluster UID ${target.clusterUid}`),
+    element('p', `Namespace: ${target.namespace} · ${inspection.state}${inspection.uid ? ` · UID ${inspection.uid}` : ''}`),
+    element('p', `Kubeconfig reference digest: ${target.kubeconfigReferenceSha256} · CA digest: ${target.caSha256}`, 'muted'),
+    element('p', 'Ownership: not inferred. The namespace-only contract does not expose arbitrary labels or read Secrets.', 'muted'),
+    element('p', conflicts, inspection.state === 'terminating' ? 'error' : 'muted'),
+    element('p', 'Inspection is read-only: zero Kubernetes writes have occurred; no control plane is installed.', 'muted'),
+  );
+}
+function clearNamespaceSetup({ clearMain = true } = {}) {
+  namespaceRequest++;
+  namespaceContext = null;
+  $('namespace-dialog').close(); $('namespace-confirm-dialog').close();
+  $('namespace-form').reset(); $('namespace-confirm-form').reset();
+  $('namespace-selection').textContent = 'Select a kubeconfig through the native file picker. Its path and contents are not shown here.';
+  $('namespace-detail').replaceChildren(element('p', 'No namespace selected.', 'muted'));
+  for (const id of ['namespace-use-existing', 'namespace-create-plan', 'namespace-reconcile']) $(id).disabled = true;
+  if (clearMain && api?.namespaceClear) void api.namespaceClear().catch(() => {});
+}
+function namespaceFailure(error) {
+  const message = error?.message || 'Namespace operation failed.';
+  if (/forbidden|denied|RBAC/i.test(message)) return 'Namespace access is forbidden. Check the selected context and Kubernetes RBAC; no write was retried.';
+  if (/expired/i.test(message)) return 'Namespace plan expired. Inspect and create a fresh plan; no create was sent.';
+  if (/unknown|timed out|unavailable/i.test(message)) return `${message} Reconcile read-only before any new plan.`;
+  return message;
+}
+async function namespaceWork(work) {
+  notice();
+  try { await work(); } catch (error) { notice(namespaceFailure(error)); }
+}
+async function selectNamespaceKubeconfig() {
+  const request = ++namespaceRequest;
+  const selection = await api.namespaceSelectKubeconfig();
+  if (request !== namespaceRequest) return;
+  if (!selection || selection.state === 'cancelled') { notice('Kubeconfig selection cancelled; no Kubernetes request was made.'); return; }
+  if (selection.state !== 'selected' || typeof selection.reference !== 'string' || typeof selection.name !== 'string') throw new Error('Native kubeconfig selection was incomplete.');
+  namespaceContext = { epoch, request, reference: selection.reference, name: selection.name, inspection: null, plan: null };
+  $('namespace-selection').textContent = `Selected kubeconfig: ${selection.name}. Its path and contents remain in the main process.`;
+  notice('Kubeconfig selected. Enter its explicit context and one namespace name.');
+}
+function namespaceRequestFromForm(form) {
+  const fields = new FormData(form);
+  const context = String(fields.get('context') ?? '').trim(); const namespace = String(fields.get('namespace') ?? '').trim();
+  if (!namespaceContext || !namespaceIsCurrent(namespaceContext)) throw new Error('Kubeconfig selection changed; choose it again.');
+  if (!context || !namespace) throw new Error('Enter an explicit context and namespace.');
+  return { reference: namespaceContext.reference, context, namespace };
+}
+async function inspectNamespace() {
+  const context = namespaceContext; const request = namespaceRequestFromForm($('namespace-form'));
+  const inspection = await api.namespaceInspect(request);
+  if (!namespaceIsCurrent(context)) return;
+  context.request = request; context.inspection = inspection; context.plan = null;
+  renderNamespaceInspection(inspection);
+  $('namespace-use-existing').disabled = inspection.state !== 'present';
+  $('namespace-create-plan').disabled = inspection.state !== 'absent';
+  $('namespace-reconcile').disabled = true;
+  notice('Namespace inspected with zero writes. Choose a separate explicit next action.');
+}
+async function planNamespace(mode) {
+  const context = namespaceContext;
+  if (!namespaceIsCurrent(context) || !context.inspection) throw new Error('Inspect the current namespace before planning.');
+  const plan = mode === 'use-existing' ? await api.namespacePlanUseExisting(context.request) : await api.namespacePlanCreate(context.request);
+  if (!namespaceIsCurrent(context)) return;
+  if (!plan || !/^[0-9a-f]{64}$/.test(plan.digest) || typeof plan.planId !== 'string' || typeof plan.expiresAt !== 'string' || plan.mode !== mode) throw new Error('Namespace plan was incomplete.');
+  context.plan = plan;
+  $('namespace-confirm-heading').textContent = mode === 'use-existing' ? 'Confirm existing namespace' : 'Confirm dedicated namespace creation';
+  $('namespace-confirm-detail').replaceChildren(
+    element('p', `Namespace-only plan digest: ${plan.digest}`),
+    element('p', `Approval expires: ${plan.expiresAt}`),
+    element('p', mode === 'use-existing' ? 'This confirms use of the displayed existing namespace. It performs zero writes.' : 'This may create exactly one Namespace after confirmation. It installs no control plane.'),
+  );
+  $('namespace-confirm-form').reset(); $('namespace-confirm-dialog').showModal();
+}
+async function confirmNamespace() {
+  const context = namespaceContext; const plan = context?.plan;
+  if (!namespaceIsCurrent(context) || !plan) throw new Error('Namespace plan changed; inspect and plan again.');
+  if (plan.mode === 'use-existing') {
+    $('namespace-confirm-dialog').close();
+    $('namespace-detail').append(element('p', 'Connected to namespace; control plane not installed.', 'tag'));
+    notice('Connected to namespace; control plane not installed. Choosing an existing namespace made zero writes.');
+    return;
+  }
+  const submit = $('namespace-confirm-submit');
+  if (submit.disabled) return;
+  submit.disabled = true;
+  try {
+    const outcome = await api.namespaceCreate({ planId: plan.planId, approvedDigest: plan.digest });
+    if (!namespaceIsCurrent(context)) return;
+    $('namespace-confirm-dialog').close(); $('namespace-reconcile').disabled = false;
+    if (outcome?.state === 'namespace_created_control_plane_not_installed') {
+      $('namespace-detail').append(element('p', `Namespace created; control plane not installed. Receipt UID ${outcome.uid} · resourceVersion ${outcome.resourceVersion}.`, 'tag'));
+      notice('Namespace created; control plane not installed. The creation receipt is held in the main process for read-only reconciliation.');
+    } else {
+      $('namespace-detail').append(element('p', 'Namespace create outcome is unknown. Reconciliation is required; this desktop will not retry create.', 'error'));
+      notice('Namespace create outcome is unknown. Reconcile read-only; create will not be replayed.');
+    }
+  } finally { if (namespaceIsCurrent(context)) submit.disabled = false; }
+}
+async function reconcileNamespace() {
+  const context = namespaceContext; const plan = context?.plan;
+  if (!namespaceIsCurrent(context) || !plan) throw new Error('No current namespace plan is available for reconciliation.');
+  const result = await api.namespaceReconcile({ planId: plan.planId });
+  if (!namespaceIsCurrent(context)) return;
+  $('namespace-detail').append(element('p', result.state === 'namespace_created_control_plane_not_installed' ?
+    `Reconciled: namespace created; control plane not installed. UID ${result.uid ?? 'not returned'}.` :
+    `Reconciliation result: ${result.state}. No create was retried.`, result.state === 'namespace_created_control_plane_not_installed' ? 'tag' : 'muted'));
+  notice('Namespace reconciliation is read-only and did not replay create.');
+}
 function applyConnectionHealth(state) {
   if (state) connectionState = state;
   connectionOnline = state?.health === 'online';
   const unavailable = !canMutate();
-  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'variant-new', 'study-close', 'source-new', 'finding-new']) $(id).disabled = unavailable;
-  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form', 'message-form', 'context-form', 'coordinator-form']) {
-    $(id).querySelector('button[type="submit"]').disabled = unavailable;
+  applyAvailability($('artifact-disposition'), unavailable || connectionState?.role !== 'human');
+  applyAvailability($('artifact-disposition-form').querySelector('button[type="submit"]'), unavailable || connectionState?.role !== 'human');
+  $('admin-confirm').disabled = unavailable || adminBusy || !adminPending;
+  for (const button of document.querySelectorAll('#admin-records button')) applyAvailability(button, unavailable);
+  if (unavailable) {
+    $('admin-status').textContent = 'Read-only or offline; administrative observations may be stale. Refresh before changes.';
   }
-  for (const button of document.querySelectorAll('#tasks button, #decisions button, #events button, #message-form button, #context-form button, #remote-workflows button')) button.disabled = unavailable;
+  for (const id of ['project-new', 'task-new', 'thread-new', 'study-new', 'experiment-new', 'artifact-custody']) $(id).disabled = unavailable;
+  for (const id of ['variant-new', 'study-close', 'source-new', 'finding-new', 'experiment-revise', 'conclusion-new']) applyAvailability($(id), unavailable);
+  $('welcome-project-new').disabled = unavailable;
+  // Reviewing already released bytes is a read path and remains available on a
+  // held restore; recording a release or bundle remains fenced as a mutation.
+  $('artifact-review').disabled = !connectionOnline;
+  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form', 'message-form', 'context-form', 'coordinator-form', 'experiment-form', 'admission-form', 'dispatch-form', 'attempt-resolution-form', 'measurement-form', 'attempt-artifacts-form', 'conclusion-form', 'conclusion-amendment-form', 'artifact-form']) {
+    const submit = $(id).querySelector('button[type="submit"]');
+    if (id === 'coordinator-form') {
+      submit.disabled = unavailable || !coordinatorAvailable || (coordinatorBusy?.project === activeProject && coordinatorBusy?.version === epoch);
+    } else applyAvailability(submit, id === 'artifact-form' ? !connectionOnline : unavailable);
+  }
+  for (const button of document.querySelectorAll('#tasks button, #decisions button, #events button, #message-form button, #context-form button, #remote-workflows button')) applyAvailability(button, unavailable);
+  applyAvailability($('artifact-download'), !connectionOnline);
+  applyAvailability($('artifact-bundle'), unavailable);
+  $('artifacts-more').disabled = !connectionOnline;
   // Study-detail controls have additional source, accounting, and revision fences.
   // Going offline disables them all; coming back online must not undo those fences.
-  if (unavailable) {
-    for (const button of document.querySelectorAll('#study-detail button')) button.disabled = true;
-  }
+  for (const button of document.querySelectorAll('#study-detail button')) applyAvailability(button, unavailable);
   // Connection health must not loosen the authoritative study-ledger fences that
   // were applied after the current complete study read.
   if (activeLedger?.study) {
@@ -80,8 +443,13 @@ function applyConnectionHealth(state) {
     const suffix = connectionOnline ? 'online' : 'offline — displayed data may be stale; consequential actions are disabled';
     $('connection-status').textContent = `${state.name}\n${state.endpoint}\n${state.organizationId}\n${suffix}`;
   }
-  $('coordinator-health').textContent = connectionOnline ?
-    'Coordinator status: provider disabled. Proposals require separate human review; no approval, grant, dispatch, or execution is authorized.' :
+  renderOnboarding();
+  const coordinatorDetail = coordinatorConsumerDetail;
+  const consumerStatus = coordinatorDetail ? (coordinatorAvailable ?
+    `Coordinator consumer available · heartbeat ${coordinatorDetail.heartbeat_at} · credential active. Provider disabled; no approval, grant, dispatch, or execution authority.` :
+    `Coordinator consumer unavailable · health ${coordinatorDetail.health} · freshness ${coordinatorDetail.freshness} · credential ${coordinatorDetail.credential_status}${coordinatorDetail.credential_expires_at ? ` (${coordinatorDetail.credential_expires_at})` : ''}. Existing records may be stale; new coordinator requests are disabled.`) :
+    'Coordinator consumer: unavailable or not yet verified. New coordinator requests are disabled; existing records may be stale.';
+  $('coordinator-health').textContent = connectionOnline ? consumerStatus :
     'Coordinator status: offline — displayed context may be stale; consequential actions are disabled.';
 }
 function applyRecoveryStatus(status) {
@@ -135,11 +503,15 @@ function contextStateLabel(state) {
   }[state] ?? 'Context delivery state is unrecognized';
 }
 function resetAuthoringForms() {
-  outcomeContext = closeContext = null; evidenceContexts.clear();
+  artifactDispositionContext = null;
+  artifactDispositionRead++;
+  $('artifact-disposition-form').reset(); $('artifact-disposition-dialog').close();
+  $('artifact-disposition-form').querySelector('button[type="submit"]').disabled = true;
+  outcomeContext = closeContext = experimentCommandContext = conclusionContext = amendmentContext = artifactReviewContext = recoveryCommandContext = taskRevisionContext = null; programAuthorInputs = null; pendingProgramReview = null; artifactPreviewRequest++; evidenceContexts.clear();
   for (const id of ['assessment-source', 'correction-original', 'finding-review', 'finding-sources', 'finding-variants', 'finding-retract-review', 'finding-revise-original', 'finding-revise-sources', 'finding-revise-variants']) {
     $(id).replaceChildren();
   }
-  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) {
+  for (const id of ['project-form', 'task-form', 'thread-form', 'study-form', 'program-review-form', 'variant-form', 'outcome-form', 'study-close-form', 'source-form', 'assessment-form', 'correction-form', 'finding-form', 'finding-accept-form', 'finding-retract-form', 'finding-revise-form']) {
     const form = $(id); form.reset(); $(id.replace('form', 'dialog')).close();
     form.querySelector('button[type="submit"]').disabled = !canMutate();
   }
@@ -147,7 +519,10 @@ function resetAuthoringForms() {
 function resetConnectionForm() {
   const form = $('connection-form'); form.reset(); $('connection-dialog').close();
 }
-function clearContext() {
+function clearContext({ preserveConnectionForm = false } = {}) {
+  if (connectionId && api.secretContext) void api.secretContext(connectionId, null).catch(() => {});
+  clearAdmin();
+  clearNamespaceSetup();
   epoch++;
   connectionId = null;
   recoveryHeld = true;
@@ -155,32 +530,35 @@ function clearContext() {
   connectionState = null;
   $('recovery-banner').hidden = true;
   activeProject = null;
-  projectOffset = taskOffset = workerOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = remoteWorkflowOffset = studyOffset = messageOffset = 0;
+  projectOffset = taskOffset = workerOffset = artifactOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = remoteWorkflowOffset = studyOffset = messageOffset = 0;
+  artifactIds.clear();
   coordinatorMessageOffset = proposalOffset = statusTurnOffset = 0;
   coordinatorMessagesMore = proposalsMore = statusTurnsMore = true;
-  activeThread = null; threadEpoch++; activeHarnessBinding = null; readVersion.binding++; activeStudy = null; activeLedger = null; studyEpoch++;
+  activeThread = null; threadEpoch++; activeHarnessBinding = null; readVersion.binding++; activeStudy = null; activeLedger = null; activeProgramContext = null; pendingProgramReview = null; programContextRequest++; readVersion.program++; studyEpoch++;
   pendingKeys.clear();
   pendingDecisionResolutions.clear();
   activeExperiment = null; activeExperimentLedger = null;
-  workbenchEntries = []; coordinatorConversationRevision = 0; selectedCoordinatorContext.splice(0); readVersion.workbench++;
-  for (const name of ['projects', 'tasks', 'workers', 'events', 'threads', 'messages', 'decisions', 'experiments', 'experiment-detail', 'remote-workflows', 'studies', 'study-detail']) $(name).replaceChildren();
+  workbenchEntries = []; coordinatorConversationRevision = 0; coordinatorAvailable = false; coordinatorConsumerDetail = null; selectedCoordinatorContext.splice(0); readVersion.workbench++;
+  for (const name of ['projects', 'tasks', 'workers', 'artifacts', 'events', 'threads', 'messages', 'decisions', 'experiments', 'experiment-detail', 'remote-workflows', 'studies', 'study-detail', 'program-review-detail']) $(name).replaceChildren();
   $('project-title').textContent = 'Start with a question.';
   $('welcome').hidden = false;
   $('workspace').hidden = true;
+  renderOnboarding();
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;
-  for (const name of ['projects-more', 'tasks-more', 'workers-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'remote-workflows-more', 'studies-more']) $(name).hidden = true;
+  for (const name of ['projects-more', 'tasks-more', 'workers-more', 'artifacts-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'remote-workflows-more', 'studies-more']) $(name).hidden = true;
   $('experiments-more').hidden = true;
   $('experiment-title').textContent = 'Select an experiment';
-  $('study-title').textContent = 'Select a study'; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
+  $('experiment-revise').disabled = $('conclusion-new').disabled = true;
+  $('study-title').textContent = 'Select a study'; $('program-review').hidden = true; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
-  resetConnectionForm();
+  if (!preserveConnectionForm) resetConnectionForm();
   $('study-export').hidden = true;
   $('message-form').hidden = true; $('message-form').reset(); $('harness-context').hidden = true; $('binding-form').reset(); $('context-form').reset(); $('binding-detail').textContent = 'No server-derived harness binding loaded.'; $('thread-title').textContent = 'Select a thread';
   $('coordinator-form').reset(); renderCoordinatorContext();
   loading.clear();
 }
-async function guarded(work) {
+async function guarded(work, { preserveConnectionForm = false } = {}) {
   notice();
   try {
     await work();
@@ -190,7 +568,7 @@ async function guarded(work) {
     notice(error.message || 'The request could not be completed.');
     const state = api && await api.status();
     if (!state) {
-      clearContext();
+      clearContext({ preserveConnectionForm });
       $('connection-status').textContent = 'Not connected';
     } else {
       applyConnectionHealth(state);
@@ -233,23 +611,30 @@ async function loadProjects(reset = false) {
   $('projects-more').hidden = response.projects.length < 100;
 }
 async function selectProject(project) {
+  const secretSelectionUpdate = connectionId && api.secretContext ? api.secretContext(connectionId, project.id) : Promise.resolve();
+  clearAdmin();
+  clearNamespaceSetup();
   epoch++;
   if (activeProject?.id !== project.id) pendingDecisionResolutions.clear();
   activeProject = project;
-  taskOffset = workerOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = remoteWorkflowOffset = studyOffset = messageOffset = 0;
+  // Selection is already known even when remote reads are slow or unavailable.
+  renderOnboarding();
+  taskOffset = workerOffset = artifactOffset = eventCursor = threadOffset = decisionOffset = experimentOffset = remoteWorkflowOffset = studyOffset = messageOffset = 0;
+  remoteWorkflowIds.clear(); artifactIds.clear(); coordinatorAvailable = false; coordinatorConsumerDetail = null;
   coordinatorMessageOffset = proposalOffset = statusTurnOffset = 0;
   coordinatorMessagesMore = proposalsMore = statusTurnsMore = true;
-  activeThread = null; threadEpoch++; activeHarnessBinding = null; readVersion.binding++; activeStudy = null; activeLedger = null; studyEpoch++;
+  activeThread = null; threadEpoch++; activeHarnessBinding = null; readVersion.binding++; activeStudy = null; activeLedger = null; activeProgramContext = null; pendingProgramReview = null; programContextRequest++; readVersion.program++; studyEpoch++;
   const selectionUpdate = api.studySelection(connectionId, null, studyEpoch, null);
   activeExperiment = null; activeExperimentLedger = null;
   workbenchEntries = []; coordinatorConversationRevision = 0; selectedCoordinatorContext.splice(0); readVersion.workbench++;
-  for (const name of ['workers-more', 'threads-more', 'messages-more', 'decisions-more', 'experiments-more', 'remote-workflows-more', 'studies-more']) $(name).hidden = true;
-  $('tasks').replaceChildren(); $('workers').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('experiments').replaceChildren(); $('experiment-detail').replaceChildren(); $('remote-workflows').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren();
+  for (const name of ['workers-more', 'artifacts-more', 'threads-more', 'messages-more', 'decisions-more', 'experiments-more', 'remote-workflows-more', 'studies-more']) $(name).hidden = true;
+  $('tasks').replaceChildren(); $('workers').replaceChildren(); $('artifacts').replaceChildren(); $('events').replaceChildren(); $('threads').replaceChildren(); $('messages').replaceChildren(); $('decisions').replaceChildren(); $('experiments').replaceChildren(); $('experiment-detail').replaceChildren(); $('remote-workflows').replaceChildren(); $('studies').replaceChildren(); $('study-detail').replaceChildren(); $('program-review-detail').replaceChildren();
   $('message-form').hidden = true; $('message-form').reset(); $('harness-context').hidden = true; clearHarnessBinding(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
   $('experiment-title').textContent = 'Select an experiment';
+  $('experiment-revise').disabled = $('conclusion-new').disabled = true;
   $('study-export').hidden = true;
-  $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
+  $('program-review').hidden = true; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
   $('coordinator-form').reset(); renderCoordinatorContext();
   $('project-title').textContent = project.name;
@@ -258,7 +643,7 @@ async function selectProject(project) {
     if (button.dataset.projectId === project.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   }
-  await Promise.all([selectionUpdate, loadTasks(), loadWorkers(true), loadWorkbench(true), loadThreads(true), loadDecisions(true), loadExperiments(true), loadRemoteWorkflows(true), loadStudies(true)]);
+  await Promise.all([secretSelectionUpdate, selectionUpdate, loadTasks(), loadWorkers(true), loadArtifacts(true), loadWorkbench(true), loadThreads(true), loadDecisions(true), loadExperiments(true), loadRemoteWorkflows(true), loadStudies(true)]);
 }
 async function loadTasks() {
   const version = epoch;
@@ -338,15 +723,59 @@ async function loadWorkers(reset = false) {
     if (version === epoch && project === activeProject && requestVersion === readVersion.workers) $('workers-more').disabled = false;
   }
 }
+function validArtifactSummary(artifact, project) {
+  return artifact && isIdentifier(artifact.id) && artifact.project_id === project.id &&
+    isText(artifact.relative_path) && isDigest(artifact.sha256) && Number.isSafeInteger(artifact.size) && artifact.size >= 0 &&
+    isText(artifact.status) && isText(artifact.classification);
+}
+async function loadArtifacts(reset = false) {
+  const version = epoch; const project = activeProject;
+  if (reset) { artifactOffset = 0; artifactIds.clear(); readVersion.artifacts++; $('artifacts').replaceChildren(element('p', 'Loading project artifact metadata…', 'muted')); }
+  const requestVersion = readVersion.artifacts;
+  const loadingKey = `artifacts:${version}:${requestVersion}`;
+  if (loading.has(loadingKey)) return;
+  loading.add(loadingKey);
+  try {
+    const response = await api.artifacts(connectionId, project.id, { offset: artifactOffset, limit: 100 });
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.artifacts) return;
+    if (!response || !Array.isArray(response.artifacts) || !response.artifacts.every(artifact => validArtifactSummary(artifact, project))) {
+      throw new Error('The control plane did not return a safe project artifact projection.');
+    }
+    if (reset) $('artifacts').replaceChildren();
+    for (const artifact of response.artifacts) {
+      if (artifactIds.has(artifact.id)) continue;
+      artifactIds.add(artifact.id);
+      const card = element('article', undefined, 'card');
+      card.append(element('h3', artifact.relative_path));
+      card.append(element('p', `Artifact ${artifact.id} · ${artifact.size} bytes · ${artifact.sha256}`, 'muted'));
+      card.append(element('p', `Custody status: ${artifact.status} · classification: ${artifact.classification}. Artifact metadata is not evidence acceptance.`, 'muted'));
+      $('artifacts').append(card);
+    }
+    artifactOffset += response.artifacts.length;
+    $('artifacts-more').hidden = response.artifacts.length < 100 || artifactOffset > 100000;
+    if (!artifactOffset) $('artifacts').append(element('p', 'No project artifacts recorded.', 'muted'));
+  } catch (error) {
+    if (version === epoch && project === activeProject && requestVersion === readVersion.artifacts) {
+      if (reset) $('artifacts').replaceChildren(element('p', 'Could not load project artifacts. Use Refresh to retry.', 'muted'));
+      throw error;
+    }
+  } finally {
+    loading.delete(loadingKey);
+    if (version === epoch && project === activeProject && requestVersion === readVersion.artifacts) $('artifacts-more').disabled = !connectionOnline;
+  }
+}
 function validTaskPlan(plan, task, project) {
   return plan && plan.task_id === task.id && plan.project_id === project.id &&
-    plan.plan_digest === task.plan_digest && plan.revision === task.revision &&
-    plan.execution_spec && typeof plan.execution_spec === 'object' &&
+    /^[a-f0-9]{64}$/.test(plan.plan_digest) && plan.plan_digest === task.plan_digest &&
+    Number.isSafeInteger(plan.revision) && plan.revision >= 1 &&
+    plan.revision === task.revision - (task.status === 'approved' ? 1 : 0) &&
+    (plan.execution_spec === null || (plan.execution_spec && typeof plan.execution_spec === 'object' &&
     Array.isArray(plan.execution_spec.argv) && Array.isArray(plan.execution_spec.pinned_skill_digests) &&
-    Array.isArray(plan.execution_spec.output_paths);
+    Array.isArray(plan.execution_spec.output_paths)));
 }
 function specificationLines(plan) {
   const spec = plan.execution_spec;
+  if (spec === null) return [['Execution specification', 'Not yet supplied. Revise this proposal to declare command, inputs, outputs and limits before execution.']];
   return [
     ['Command / package identity', spec.argv.join(' ')],
     ['Input snapshot', spec.input_snapshot_digest],
@@ -358,26 +787,115 @@ function specificationLines(plan) {
     ['Budget / duration', `${plan.budget_cents} cents / ${plan.max_duration_seconds} seconds`],
   ];
 }
+async function loadAutonomy(panel, task, version, project) {
+  try {
+    const response = await api.autonomySessions(connectionId, task.id);
+    if (version !== epoch || project !== activeProject || !panel.isConnected) return;
+    if (!Array.isArray(response.sessions) || response.sessions.length > 32 || response.sessions.some(s =>
+      s.task_id !== task.id || s.project_id !== project.id || s.org_id !== connectionState?.organizationId ||
+      s.execution_enabled !== false || s.provider_enabled !== false || s.live_activation !== 'blocked' ||
+      !Number.isSafeInteger(s.revision) || !/^[a-f0-9]{64}$/.test(s.plan_digest) ||
+      !Array.isArray(s.actions) || !Array.isArray(s.blocked_reasons))) throw new Error('Invalid autonomy projection.');
+    panel.replaceChildren(element('p', 'Bounded autonomy · synthetic only · billing unknown · scientific validity not assessed', 'muted'));
+    for (const session of response.sessions) {
+      const detail = element('details');
+      detail.append(element('summary', `${session.state} · revision ${session.revision} · ${session.pending_approval ? 'Human review pending' : 'No pending review'}`));
+      detail.append(element('p', `Blocked: ${session.blocked_reasons.join(', ') || 'Live activation remains blocked'}`));
+      detail.append(element('p', `Checkpoint: ${session.checkpoint?.question ?? 'None'} · Resume is API-first, human-reviewed, and unavailable for unknown actions.`));
+      // Untrusted plans/receipts are text only, never HTML, links or executable previews.
+      detail.append(element('pre', JSON.stringify(session, null, 2)));
+      panel.append(detail);
+    }
+    if (!response.sessions.length) panel.append(element('p', 'No autonomy sessions.'));
+  } catch {
+    if (version === epoch && project === activeProject && panel.isConnected) {
+      panel.replaceChildren(element('p', 'Autonomy state unavailable. No authority or termination inferred.', 'muted'));
+    }
+  }
+}
+async function loadRemoteExecutions(panel, task, version, project) {
+  try {
+    const response = await api.remoteExecutions(connectionId, task.id);
+    if (version !== epoch || project !== activeProject || !panel.isConnected) return;
+    if (!Array.isArray(response.routes) || response.routes.length > 32 || response.routes.some(r =>
+      r.task_id !== task.id || r.project_id !== project.id || r.org_id !== connectionState?.organizationId ||
+      r.provider_enabled !== false || r.live_activation !== 'blocked' ||
+      !['kubernetes', 'salad_container', 'salad_inference'].includes(r.proposal?.selection?.target) ||
+      !Number.isSafeInteger(r.revision) || !/^[a-f0-9]{64}$/.test(r.proposal_digest))) {
+      throw new Error('Invalid remote route projection.');
+    }
+    panel.replaceChildren(element('p', 'Desktop: control only. Closing/disconnecting does not stop remote work. Offline effects only; live activation blocked.', 'muted'));
+    for (const route of response.routes) {
+      const detail = element('details');
+      detail.append(element('summary', `${route.proposal.selection.target} · ${route.state} · cancellation ${route.cancellation}`));
+      detail.append(element('p', `Provider: ${route.provider_status} · go/no-go: ${route.go_no_go} · cost: ${route.cost_cents ?? 'unknown'}`));
+      if (route.proxy_safety) {
+        detail.append(element('p', `Salad proxy blocked: ${route.proxy_safety.blocked_reasons.join(', ')}. Required: ${route.proxy_safety.safety_prerequisites.join(', ')}. Not an isolation witness or trusted autonomous sandbox.`, 'muted'));
+      }
+      detail.append(element('p', 'Pause requests stop/hold, not process suspension. Unknown effects require reconciliation, not automatic retry. Logs/checkpoints/artifacts below are evidence references; custody and scientific acceptance remain separate.'));
+      detail.append(element('pre', JSON.stringify(route, null, 2)));
+      for (const [choice, label, allowed] of [
+        ['approve', 'Review and approve exact remote proposal', route.state === 'proposed'],
+        ['start', 'Queue reviewed remote work (offline only)', route.state === 'reviewed'],
+        ['pause', 'Pause: request remote stop/hold', route.desired !== 'stop'],
+        ['cancel', 'Request remote cancellation', route.desired !== 'stop'],
+      ]) {
+        const button = element('button', label); button.type = 'button'; button.disabled = !canMutate() || !allowed;
+        button.addEventListener('click', () => guarded(async () => {
+          if (version !== epoch || project !== activeProject || !canMutate()) return;
+          const body = { expected_revision: route.revision, proposal_digest: route.proposal_digest, command: choice };
+          await command(`remote:${route.id}:${choice}`, body, (id, key) => api.remoteExecutionCommand(id, route.id, body, key));
+          await loadRemoteExecutions(panel, task, version, project);
+        }));
+        detail.append(button);
+      }
+      panel.append(detail);
+    }
+    if (!response.routes.length) panel.append(element('p', 'No remote proposals. Structured proposal authoring is API-first.'));
+  } catch {
+    if (version === epoch && project === activeProject && panel.isConnected) {
+      panel.replaceChildren(element('p', 'Remote state unavailable. Reconnect and inspect; no cancellation or termination inferred.', 'muted'));
+    }
+  }
+}
 async function loadTaskPlan(card, task, version, project) {
   try {
     const plan = await api.taskPlan(connectionId, task.id, task.plan_digest);
     if (version !== epoch || project !== activeProject || !card.isConnected) return;
     if (!validTaskPlan(plan, task, project)) throw new Error('The control plane returned an unverified plan.');
-    card.replaceChildren(element('span', `${task.status} · plan revision ${plan.revision}`, 'tag'),
+    card.replaceChildren(element('span', `${task.status} · task revision ${task.revision} · plan revision ${plan.revision}`, 'tag'),
       element('h3', plan.title), element('p', plan.purpose));
     for (const [label, value] of specificationLines(plan)) {
       card.append(element('p', `${label}: ${value}`));
     }
     card.append(element('p', `Verified immutable plan digest: ${plan.plan_digest}`, 'muted'));
+    if (['draft', 'approved'].includes(task.status)) {
+      const revise = element('button', 'Revise this proposal'); revise.type = 'button'; revise.disabled = !canMutate();
+      revise.addEventListener('click', () => guarded(async () => {
+        if (version !== epoch || project !== activeProject) throw new Error('Refresh the selected project before revising this proposal.');
+        taskRevisionContext = { task, plan, project, version };
+        const form = $('task-revise-form'); form.reset();
+        const set = (name, value) => { if (form.elements?.[name]) form.elements[name].value = value; else { form.fields ??= {}; form.fields[name] = value; } };
+        set('title', plan.title); set('purpose', plan.purpose); set('budget_cents', plan.budget_cents);
+        const spec = plan.execution_spec;
+        set('max_duration_seconds', plan.max_duration_seconds); set('argv', JSON.stringify(spec?.argv ?? []));
+        set('input_snapshot_digest', spec?.input_snapshot_digest ?? ''); set('pinned_skill_digests', JSON.stringify(spec?.pinned_skill_digests ?? []));
+        set('output_paths', JSON.stringify(spec?.output_paths ?? [])); set('profile', spec?.profile ?? 'kubernetes-opencode');
+        set('max_output_bytes', spec?.max_output_bytes ?? 1);
+        $('task-revise-review').textContent = `Current proposal revision ${plan.revision} · immutable digest ${plan.plan_digest}. Saving invalidates this approval basis.`;
+        $('task-revise-dialog').showModal();
+      }));
+      card.append(revise);
+    }
     const context = element('button', 'Include plan in coordinator context'); context.type = 'button';
     context.disabled = !connectionOnline || recoveryHeld;
-    context.addEventListener('click', () => toggleCoordinatorContext({ kind: 'task', record_id: task.id, expected_revision: plan.revision }));
+    context.addEventListener('click', () => toggleCoordinatorContext({ kind: 'task', record_id: task.id, expected_revision: task.revision }));
     card.append(context);
     const button = element('button', task.status === 'approved' ? 'Plan approved' : 'Approve this plan');
     button.disabled = !canMutate() || task.status !== 'draft';
     button.addEventListener('click', () => guarded(async () => {
       button.disabled = true;
-      const body = { expected_revision: plan.revision, expected_plan_digest: plan.plan_digest };
+      const body = { expected_revision: task.revision, expected_plan_digest: plan.plan_digest };
       try {
         if (version !== epoch || project !== activeProject) return;
         await command(`approve:${task.id}`, body, (id, key) => api.approve(id, task.id, body, key));
@@ -385,6 +903,14 @@ async function loadTaskPlan(card, task, version, project) {
       } finally { if (button.isConnected) button.disabled = !canMutate() || task.status !== 'draft'; }
     }));
     card.append(button);
+    const autonomy = element('button', 'Inspect autonomy sessions'); autonomy.type = 'button';
+    const autonomyPanel = element('section');
+    autonomy.addEventListener('click', () => loadAutonomy(autonomyPanel, task, version, project));
+    card.append(autonomy, autonomyPanel);
+    const remote = element('button', 'Inspect / reconnect remote execution'); remote.type = 'button';
+    const remotePanel = element('section');
+    remote.addEventListener('click', () => loadRemoteExecutions(remotePanel, task, version, project));
+    card.append(remote, remotePanel);
   } catch (error) {
     if (version === epoch && project === activeProject && card.isConnected) {
       card.replaceChildren(element('p', 'Could not verify the immutable execution specification. Approval is unavailable; use Refresh to retry.', 'muted'));
@@ -509,6 +1035,15 @@ async function loadDecisions(reset = false) {
       const card = element('article', undefined, 'card');
       card.append(element('span', `${decision.kind} · pending`, 'tag'));
       card.append(element('h3', `Decision ${decision.id}`));
+      const researchReview = decision.scope?.type === 'research_program';
+      if (researchReview) {
+        const scope = decision.scope;
+        card.append(element('h3', `${scope.outcome} · ${scope.action}${scope.recommendation ? ` · ${scope.recommendation}` : ''}`));
+        card.append(element('p', `Study ${scope.study_id} · evidence basis ${scope.basis_digest}`, 'muted'));
+        card.append(element('p', `Proposal reason: ${scope.reason}`));
+        if (scope.supersedes_id) card.append(element('p', `Proposed replacement for ${scope.supersedes_id}. Existing human review is not reversed by an agent suggestion.`, 'muted'));
+        card.append(element('p', 'Review only: source-use approval is not a byte release; go/no-go is not execution or proof of scientific success. The server rechecks evidence and proposal freshness.', 'muted'));
+      }
       card.append(element('p', `Scope: ${JSON.stringify(decision.scope)}`));
       card.append(element('p', `Reviewer: ${decision.reviewer_principal_id} · expires ${decision.expires_at}`, 'muted'));
       card.append(element('p', `Task: ${decision.task_id ?? 'Project-level'} · task basis revision ${decision.expected_task_revision ?? 'none'}`, 'muted'));
@@ -518,7 +1053,7 @@ async function loadDecisions(reset = false) {
       const rationale = document.createElement('textarea');
       rationale.maxLength = 8000; rationale.rows = 3;
       rationale.setAttribute('aria-label', `Rationale for decision ${decision.id}`);
-      rationale.placeholder = 'Optional rationale';
+      rationale.placeholder = researchReview ? 'Required human rationale' : 'Optional rationale';
       const retry = pendingDecisionResolutions.get(decision.id);
       if (retry?.projectId === project.id && retry.revision === decision.revision) {
         rationale.value = retry.body.rationale ?? '';
@@ -539,6 +1074,10 @@ async function loadDecisions(reset = false) {
         const decisionProject = project;
         const existing = pendingDecisionResolutions.get(decision.id);
         const text = String(rationale.value ?? '').trim();
+        if (researchReview && !text && !existing) {
+          approve.disabled = reject.disabled = !canMutate();
+          throw new Error('A research-program review requires a human rationale.');
+        }
         const retryRecord = existing?.projectId === decisionProject.id && existing.revision === decision.revision ? existing : {
           projectId: decisionProject.id,
           revision: decision.revision,
@@ -558,6 +1097,9 @@ async function loadDecisions(reset = false) {
           if (version === epoch && decisionProject === activeProject) {
             try {
               await loadDecisions(true);
+              if (researchReview && activeLedger?.study?.id === decision.scope.study_id) {
+                void loadProgramContext(researchContext(activeLedger)).catch(() => {});
+              }
               if (version === epoch && decisionProject === activeProject) {
                 notice(`Decision ${choice === 'approve' ? 'approval' : 'rejection'} recorded. This is an intent record; no grant or execution started.`);
               }
@@ -838,9 +1380,83 @@ function artifactWarnings(artifact) {
   if (states.includes('legacy_unplaced')) warnings.push('Warning: legacy-unplaced evidence has no recorded project-storage custody.');
   return warnings;
 }
+function experimentContext(ledger = activeExperimentLedger) {
+  return { ledger, experiment: activeExperiment, project: activeProject, version: epoch, experimentVersion: readVersion.experiment };
+}
+function currentExperimentContext(context) {
+  return context && !recoveryHeld && connectionOnline && context.version === epoch &&
+    context.project === activeProject && context.experiment === activeExperiment &&
+    context.ledger === activeExperimentLedger && context.experimentVersion === readVersion.experiment;
+}
+async function refreshExperimentContext(context) {
+  if (!currentExperimentContext(context)) return;
+  await Promise.all([selectExperiment(context.experiment), loadArtifacts(true), loadRemoteWorkflows(true)]);
+}
+function designFormBody(form, expectedRevision = null) {
+  const fields = new FormData(form);
+  const variants = ['baseline', 'intervention'].map(kind => {
+    let metadata;
+    try { metadata = JSON.parse(String(fields.get(`${kind}_metadata`) ?? '')); } catch { throw new Error(`${kind} metadata must be a JSON object.`); }
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new Error(`${kind} metadata must be a JSON object.`);
+    const taskId = String(fields.get(`${kind}_task_id`) ?? '').trim() || null;
+    const planDigest = String(fields.get(`${kind}_plan_digest`) ?? '').trim() || null;
+    if ((taskId === null) !== (planDigest === null)) throw new Error(`${kind} execution task and immutable plan digest must be supplied together.`);
+    return { kind, name: fields.get(`${kind}_name`), method_digest: fields.get(`${kind}_method_digest`),
+      input_digest: fields.get(`${kind}_input_digest`), metadata, execution_task_id: taskId, execution_plan_digest: planDigest };
+  });
+  return { ...(expectedRevision === null ? {} : { expected_revision: expectedRevision }),
+    goal: fields.get('goal'), success_criterion: fields.get('success_criterion'), protocol: fields.get('protocol'), variants };
+}
+function fillExperimentForm(design) {
+  const form = $('experiment-form'); form.reset();
+  form.fields ??= {};
+  const set = (name, value) => { if (form.elements?.[name]) form.elements[name].value = value ?? ''; else form.fields[name] = value ?? ''; };
+  set('goal', design?.goal); set('success_criterion', design?.success_criterion); set('protocol', design?.protocol);
+  for (const kind of ['baseline', 'intervention']) {
+    const variant = design?.variants?.find(item => item.kind === kind);
+    for (const field of ['name', 'method_digest', 'input_digest']) set(`${kind}_${field}`, variant?.[field]);
+    set(`${kind}_metadata`, JSON.stringify(variant?.metadata ?? {}));
+    set(`${kind}_task_id`, variant?.execution_task_id); set(`${kind}_plan_digest`, variant?.execution_plan_digest);
+  }
+}
+function openConclusionForm(context, conclusion = null) {
+  if (!currentExperimentContext(context)) throw new Error('Select a current complete experiment ledger first.');
+  conclusionContext = { ...context, conclusion };
+  const form = $('conclusion-form'); form.reset();
+  const fields = form.elements;
+  if (fields?.statement) fields.statement.value = conclusion?.statement ?? '';
+  $('conclusion-form-title').textContent = conclusion ? `Revise draft conclusion ${conclusion.id}` : 'Author conclusion';
+  form.querySelector('button[type="submit"]').textContent = conclusion ? 'Save revised draft' : 'Save draft';
+  const choices = $('conclusion-evidence'); choices.replaceChildren();
+  const selected = new Set((conclusion?.evidence ?? []).map(item => `${item.attempt_id}:${item.artifact_id ?? item.measurement_id}`));
+  for (const attempt of [...context.ledger.attempts, ...context.ledger.admitted_attempts]) {
+    for (const link of context.ledger.artifact_links.filter(item => item.attempt_id === attempt.id)) {
+      const key = `${attempt.id}:${link.artifact_id}`; const label = element('label'); const input = element('input'); input.type = 'checkbox'; input.checked = selected.has(key); input.dataset.conclusionAttemptId = attempt.id; input.dataset.conclusionArtifactId = link.artifact_id;
+      label.append(input, element('span', `Attempt ${attempt.id} · artifact ${link.artifact_id}`)); choices.append(label);
+    }
+    for (const measurement of context.ledger.measurements.filter(item => item.attempt_id === attempt.id)) {
+      const key = `${attempt.id}:${measurement.id}`; const label = element('label'); const input = element('input'); input.type = 'checkbox'; input.checked = selected.has(key); input.dataset.conclusionAttemptId = attempt.id; input.dataset.conclusionMeasurementId = measurement.id;
+      label.append(input, element('span', `Attempt ${attempt.id} · measurement ${measurement.id}: ${measurement.name}`)); choices.append(label);
+    }
+  }
+  $('conclusion-review').textContent = `Design snapshot revision ${context.ledger.experiment.current_design_revision}. Evidence must already be linked to its attempt.`;
+  $('conclusion-dialog').showModal();
+}
+function selectedConclusionEvidence() {
+  const citations = new Map();
+  for (const input of document.querySelectorAll('#conclusion-evidence input')) {
+    if (!input.checked) continue;
+    const attemptId = input.dataset.conclusionAttemptId;
+    if (!citations.has(attemptId)) citations.set(attemptId, { attempt_id: attemptId, artifact_ids: [], measurement_ids: [] });
+    if (input.dataset.conclusionArtifactId) citations.get(attemptId).artifact_ids.push(input.dataset.conclusionArtifactId);
+    if (input.dataset.conclusionMeasurementId) citations.get(attemptId).measurement_ids.push(input.dataset.conclusionMeasurementId);
+  }
+  return [...citations.values()];
+}
 function renderExperimentLedger(ledger) {
   const detail = $('experiment-detail'); detail.replaceChildren();
   const experiment = ledger.experiment;
+  const context = experimentContext(ledger);
   const summary = element('article', undefined, 'card');
   summary.append(element('span', `Current design revision ${experiment.current_design_revision}`, 'tag'));
   summary.append(element('p', `Current goal: ${experiment.goal}`));
@@ -867,6 +1483,17 @@ function renderExperimentLedger(ledger) {
         `Registered execution reference: task ${variant.execution_task_id} · plan digest ${variant.execution_plan_digest}`, 'muted'));
       card.append(element('p', `Registered metadata: ${ledgerText(variant.metadata)}`, 'muted'));
       if (!attemptsByVariant.get(variant.id).length) card.append(element('p', 'No attempts recorded for this registered variant.', 'muted'));
+      if (design.revision === experiment.current_design_revision && variant.execution_task_id !== null) {
+        const admit = element('button', 'Review separate execution admission'); admit.type = 'button'; admit.disabled = !canMutate();
+        admit.addEventListener('click', () => guarded(async () => {
+          if (!currentExperimentContext(context)) throw new Error('Refresh the selected experiment before admission.');
+          experimentCommandContext = { ...context, variant };
+          $('admission-form').reset();
+          $('admission-review').textContent = `Variant ${variant.name} · design revision ${design.revision} · task ${variant.execution_task_id} · immutable plan ${variant.execution_plan_digest}`;
+          $('admission-dialog').showModal();
+        }));
+        card.append(admit);
+      }
     }
     return card;
   });
@@ -920,7 +1547,9 @@ function renderExperimentLedger(ledger) {
     } else {
       card.append(element('p', `Operation link: ${attempt.operation_id} · package digest ${attempt.package_digest}`));
     }
-    if (['unknown', 'interrupted', 'restart_pending'].includes(operationalState)) {
+    if (operationalState === 'interrupted') {
+      card.append(element('p', 'Interrupted is a control operational label, not proof of workload failure. A reported exit may map to this label; inspect the attributed termination observation, original Job/provider state and retained-output timing separately. Scientific outcome is not inferred.', 'muted'));
+    } else if (['unknown', 'restart_pending'].includes(operationalState)) {
       card.append(element('p', `State ${operationalState} is unresolved; external execution and exposure remain visible.`, 'muted'));
     }
     if (operationalState === 'legacy_unverified') card.append(element('p', 'Legacy operational detail was not reconstructed; the historical labels below remain unchanged.', 'muted'));
@@ -933,6 +1562,44 @@ function renderExperimentLedger(ledger) {
       const decision = attempt.human_outcome;
       card.append(element('p', `Human-recorded outcome: ${attempt.outcome}${attempt.reason ? ` · reason: ${attempt.reason}` : ''}${decision ? ` · actor ${decision.decided_by_principal_id} · recorded ${decision.decided_at}` : ''}`));
     }
+    if (attempt.outcome === null) {
+      const resolve = element('button', 'Record human outcome'); resolve.type = 'button'; resolve.disabled = !canMutate();
+      resolve.addEventListener('click', () => guarded(async () => {
+        if (!currentExperimentContext(context)) throw new Error('Refresh the selected experiment before recording an outcome.');
+        experimentCommandContext = { ...context, attempt };
+        $('attempt-resolution-form').reset();
+        $('attempt-resolution-review').textContent = `Attempt ${attempt.id} · current revision ${attempt.revision} · operational state ${operationalState}. Unknown remains available when evidence is incomplete.`;
+        $('attempt-resolution-dialog').showModal();
+      }));
+      card.append(resolve);
+    }
+    if (attempt.operation_id !== null && attempt.package_digest !== null && attempt.outcome === null) {
+      const dispatch = element('button', 'Review Kubernetes dispatch'); dispatch.type = 'button'; dispatch.disabled = !canMutate();
+      dispatch.addEventListener('click', () => guarded(async () => {
+        if (!currentExperimentContext(context)) throw new Error('Refresh the selected experiment before dispatch review.');
+        experimentCommandContext = { ...context, attempt };
+        $('dispatch-form').reset();
+        $('dispatch-review').textContent = `Attempt ${attempt.id} · package ${attempt.package_digest} · revision ${attempt.revision}. A target-bound dispatch is separate from admission and from execution.`;
+        $('dispatch-dialog').showModal();
+      }));
+      card.append(dispatch);
+    }
+    const measurement = element('button', 'Record measurement'); measurement.type = 'button'; measurement.disabled = !canMutate();
+    measurement.addEventListener('click', () => guarded(async () => {
+      if (!currentExperimentContext(context)) throw new Error('Refresh the selected experiment before recording a measurement.');
+      experimentCommandContext = { ...context, attempt };
+      $('measurement-form').reset(); $('measurement-review').textContent = `Attempt ${attempt.id} · revision ${attempt.revision}. An optional artifact must already be linked to this attempt.`;
+      $('measurement-dialog').showModal();
+    }));
+    card.append(measurement);
+    const linkArtifacts = element('button', 'Link retained artifact evidence'); linkArtifacts.type = 'button'; linkArtifacts.disabled = !canMutate();
+    linkArtifacts.addEventListener('click', () => guarded(async () => {
+      if (!currentExperimentContext(context)) throw new Error('Refresh the selected experiment before linking artifact evidence.');
+      experimentCommandContext = { ...context, attempt }; $('attempt-artifacts-form').reset();
+      $('attempt-artifacts-review').textContent = `Attempt ${attempt.id} · revision ${attempt.revision}. Review project artifact metadata and released custody separately before linking.`;
+      $('attempt-artifacts-dialog').showModal();
+    }));
+    card.append(linkArtifacts);
     card.append(element('p', `Semantic state history (${attempt.state_history.length})`, 'muted'));
     for (const entry of attempt.state_history) {
       card.append(element('p', `#${entry.sequence}: ${entry.state} · observed ${entry.observed_state ?? 'not recorded'} · actor ${entry.actor_principal_id}${entry.reason ? ` · reason: ${entry.reason}` : ''}`, 'muted'));
@@ -951,6 +1618,7 @@ function renderExperimentLedger(ledger) {
     card.append(element('p', `Retention state: ${artifact.retention_state}`, 'muted'));
     card.append(element('p', `Custody state: ${artifact.custody_state}`, 'muted'));
     for (const warning of artifactWarnings(artifact)) card.append(element('p', warning, 'muted'));
+    card.append(element('p', 'To inspect bytes, use an already released manifest in Input and artifact review. Listing this record does not release custody.', 'muted'));
     return card;
   });
   section('Measurements', ledger.measurements, measurement => {
@@ -972,6 +1640,25 @@ function renderExperimentLedger(ledger) {
       card.append(element('p', `Conclusion lineage revision ${amendment.lineage_revision}: ${amendment.relation} · reason: ${amendment.reason} · actor: ${amendment.actor_principal_id} · recorded: ${amendment.created_at}`, 'muted'));
     }
     card.append(element('p', `Scientific validity: ${conclusion.scientific_validity}. Human review records an interpretation; it does not establish scientific success.`, 'muted'));
+    if (conclusion.status === 'draft') {
+      const revise = element('button', 'Revise draft conclusion'); revise.type = 'button'; revise.disabled = !canMutate();
+      revise.addEventListener('click', () => guarded(async () => openConclusionForm(context, conclusion)));
+      const review = element('button', 'Review conclusion'); review.type = 'button'; review.disabled = !canMutate();
+      review.addEventListener('click', () => guarded(async () => {
+        const body = { expected_revision: conclusion.revision, design_revision: conclusion.design_revision };
+        await command(`review-conclusion:${conclusion.id}`, body, (id, key) => api.reviewConclusion(id, conclusion.id, body, key), () => currentExperimentContext(context));
+        await refreshExperimentContext(context); notice('Human conclusion review recorded. It does not establish scientific success.');
+      }));
+      card.append(revise, review);
+    } else if (conclusion.status === 'reviewed' && !conclusion.lineage.length) {
+      const amend = element('button', 'Amend reviewed conclusion'); amend.type = 'button'; amend.disabled = !canMutate();
+      amend.addEventListener('click', () => guarded(async () => {
+        amendmentContext = { ...context, conclusion }; $('conclusion-amendment-form').reset();
+        $('conclusion-amendment-review').textContent = `Conclusion ${conclusion.id} · revision ${conclusion.revision} · design revision ${conclusion.design_revision}. The original will remain immutable.`;
+        $('conclusion-amendment-dialog').showModal();
+      }));
+      card.append(amend);
+    }
     return card;
   });
 }
@@ -987,6 +1674,14 @@ function validRemoteWorkflow(workflow, project) {
     (workflow.experiment_id === null || isIdentifier(workflow.experiment_id)) &&
     (workflow.experiment_design_revision === null || isPositiveInteger(workflow.experiment_design_revision)) &&
     (workflow.experiment_variant_id === null || isIdentifier(workflow.experiment_variant_id)) &&
+    (workflow.last_heartbeat_at === null || isText(workflow.last_heartbeat_at)) &&
+    isPositiveInteger(workflow.last_checkpoint_sequence + 1) &&
+    (workflow.last_checkpoint_cursor === null || isText(workflow.last_checkpoint_cursor)) &&
+    (workflow.last_checkpoint_digest === null || isDigest(workflow.last_checkpoint_digest)) &&
+    (workflow.last_reconnected_at === null || isText(workflow.last_reconnected_at)) &&
+    (workflow.control_outage_at === null || isText(workflow.control_outage_at)) &&
+    (workflow.last_observed_at === null || isText(workflow.last_observed_at)) &&
+    (workflow.last_observed_state === null || operationObservedStates.has(workflow.last_observed_state)) &&
     (reconciliation === null || (reconciliation && operationObservedStates.has(reconciliation.observed_state) &&
       isText(reconciliation.observed_at) && typeof reconciliation.termination_confirmed === 'boolean' &&
       isText(reconciliation.cursor) && Array.isArray(reconciliation.sources) &&
@@ -996,7 +1691,9 @@ function remoteWorkflowStateText(workflow) {
   if (workflow.state === 'prepared') return 'Execution admission/package intent is recorded; no run observation is recorded.';
   if (workflow.state === 'running') return 'A remote run observation is recorded; it is not a result, evidence, or conclusion.';
   if (workflow.state === 'unknown') return 'Remote state is unknown; execution, cost exposure, and termination require reconciliation.';
-  if (workflow.reconciliation?.termination_confirmed) return 'Termination is confirmed by attributed operational evidence only; evidence and conclusions remain separate.';
+  if (workflow.reconciliation?.termination_confirmed) return workflow.operation_desired_state === 'cancel_requested' ?
+    'Requested stop has confirmed cancellation from attributed operational evidence only; evidence and conclusions remain separate.' :
+    'Termination is confirmed by attributed operational evidence only; evidence and conclusions remain separate.';
   return 'An exit is observed but termination is not confirmed; reconciliation remains required.';
 }
 function renderRemoteWorkflow(workflow, project, version, requestVersion) {
@@ -1008,12 +1705,41 @@ function renderRemoteWorkflow(workflow, project, version, requestVersion) {
     'No stop request is recorded in control.'));
   card.append(element('p', `Task ${workflow.task_id} · lease epoch ${workflow.epoch} · worker ${workflow.worker_principal_id}`, 'muted'));
   card.append(element('p', remoteWorkflowStateText(workflow), 'muted'));
+  card.append(element('p', `Freshness: heartbeat ${workflow.last_heartbeat_at ?? 'not recorded'} · latest observation ${workflow.last_observed_state ?? 'not recorded'} at ${workflow.last_observed_at ?? 'not recorded'}`, 'muted'));
+  card.append(element('p', workflow.last_checkpoint_sequence > 0 ?
+    `Latest checkpoint: #${workflow.last_checkpoint_sequence} · cursor ${workflow.last_checkpoint_cursor} · digest ${workflow.last_checkpoint_digest}` :
+    'Latest checkpoint: none recorded.', 'muted'));
+  if (workflow.control_outage_at !== null || workflow.last_reconnected_at !== null) {
+    card.append(element('p', `Control outage: ${workflow.control_outage_at ?? 'not recorded'} · last reconnect: ${workflow.last_reconnected_at ?? 'not recorded'}. Reconnection does not replay work.`, 'muted'));
+  }
   const reconciliation = workflow.reconciliation;
   if (reconciliation) {
-    card.append(element('p', `Reconciled observation: ${reconciliation.observed_state} · ${reconciliation.termination_confirmed ? 'termination confirmed' : 'termination unconfirmed'} · ${reconciliation.observed_at}`, 'muted'));
+    const termination = reconciliation.termination_confirmed ?
+      (workflow.operation_desired_state === 'cancel_requested' ? 'cancellation confirmed' : 'termination confirmed') :
+      'termination unconfirmed';
+    card.append(element('p', `Reconciled observation: ${reconciliation.observed_state} · ${termination} · ${reconciliation.observed_at}`, 'muted'));
     card.append(element('p', `Reconciliation cursor: ${reconciliation.cursor} · ${reconciliation.contradiction_state}`, 'muted'));
   } else card.append(element('p', 'No attributed worker/provider observation has been reconciled yet.', 'muted'));
   if (workflow.reconciliation_required) card.append(element('p', 'Reconciliation required. Do not treat a stop request, reconnect, or displayed exit as confirmed termination.', 'muted'));
+  const recovery = element('button', 'Inspect lost-worker recovery'); recovery.type = 'button'; recovery.disabled = !connectionOnline;
+  recovery.addEventListener('click', () => guarded(async () => {
+    const records = await api.recoveryReconciliations(connectionId, workflow.grant_id);
+    if (version !== epoch || project !== activeProject || requestVersion !== readVersion.remoteWorkflows) return;
+    if (!records || !Array.isArray(records.recovery_reconciliations)) throw new Error('The control plane did not return recovery records.');
+    const record = records.recovery_reconciliations.find(item => item.operation_id === workflow.operation_id);
+    if (!record) {
+      notice('No lost-worker recovery record is present for this operation. The normal workflow projection remains read-only.');
+      return;
+    }
+    if (!isPositiveInteger(record.revision) || !['identity_lost', 'cancel_requested', 'terminal_confirmed', 'unresolved'].includes(record.state)) {
+      throw new Error('The control plane returned an unrecognized recovery record.');
+    }
+    recoveryCommandContext = { project, version, requestVersion, workflow, record };
+    $('recovery-review').textContent = `Operation ${workflow.operation_id} · grant revision ${record.grant_revision ?? 'not recorded'} · recovery revision ${record.revision} · state ${record.state}.`;
+    $('recovery-form').querySelector('button[type="submit"]').disabled = !canMutate() || ['terminal_confirmed', 'unresolved'].includes(record.state);
+    $('recovery-dialog').showModal();
+  }));
+  card.append(recovery);
   const inspect = element('button', 'Refresh reconciled operation');
   inspect.addEventListener('click', () => guarded(async () => {
     const detail = await api.remoteWorkflow(connectionId, workflow.operation_id);
@@ -1030,7 +1756,7 @@ function renderRemoteWorkflow(workflow, project, version, requestVersion) {
       try {
         const grant = await api.executionGrant(connectionId, workflow.grant_id);
         if (version !== epoch || project !== activeProject || requestVersion !== readVersion.remoteWorkflows ||
-            !grant || grant.id !== workflow.grant_id || !isPositiveInteger(grant.revision) ||
+            !grant || grant.id !== workflow.grant_id || grant.project_id !== project.id || !isPositiveInteger(grant.revision) ||
             !['active', 'cancel_requested'].includes(grant.status)) {
           throw new Error('The current execution grant cannot be used for a stop request. Refresh the workflow projection.');
         }
@@ -1054,7 +1780,7 @@ function renderRemoteWorkflow(workflow, project, version, requestVersion) {
 }
 async function loadRemoteWorkflows(reset = false) {
   const version = epoch; const project = activeProject;
-  if (reset) { remoteWorkflowOffset = 0; readVersion.remoteWorkflows++; $('remote-workflows').replaceChildren(element('p', 'Loading reconciled remote workflows…', 'muted')); }
+  if (reset) { remoteWorkflowOffset = 0; remoteWorkflowIds.clear(); readVersion.remoteWorkflows++; $('remote-workflows').replaceChildren(element('p', 'Loading reconciled remote workflows…', 'muted')); }
   const requestVersion = readVersion.remoteWorkflows;
   const loadingKey = `remote-workflows:${version}:${requestVersion}`;
   if (loading.has(loadingKey)) return;
@@ -1066,7 +1792,11 @@ async function loadRemoteWorkflows(reset = false) {
       throw new Error('The control plane did not return a safe reconciled remote-workflow projection.');
     }
     if (reset) $('remote-workflows').replaceChildren();
-    for (const workflow of response.remote_workflows) $('remote-workflows').append(renderRemoteWorkflow(workflow, project, version, requestVersion));
+    for (const workflow of response.remote_workflows) {
+      if (remoteWorkflowIds.has(workflow.operation_id)) continue;
+      remoteWorkflowIds.add(workflow.operation_id);
+      $('remote-workflows').append(renderRemoteWorkflow(workflow, project, version, requestVersion));
+    }
     remoteWorkflowOffset += response.remote_workflows.length;
     $('remote-workflows-more').hidden = response.remote_workflows.length < 100 || remoteWorkflowOffset > 100000;
     if (!remoteWorkflowOffset) $('remote-workflows').append(element('p', 'No admitted remote operation has a workflow projection yet.', 'muted'));
@@ -1117,6 +1847,7 @@ async function selectExperiment(experiment) {
   // experiment's cards before the next read settles, rather than showing them
   // as context for the newly selected experiment.
   activeExperimentLedger = null;
+  $('experiment-revise').disabled = $('conclusion-new').disabled = true;
   workbenchEntries = workbenchEntries.filter(item => item.source !== 'projection');
   renderWorkbenchEntries();
   $('experiment-title').textContent = `Experiment ${experiment.id}`;
@@ -1133,17 +1864,119 @@ async function selectExperiment(experiment) {
     Object.assign(experiment, ledger.experiment);
     activeExperimentLedger = ledger;
     renderExperimentLedger(ledger);
+    $('experiment-revise').disabled = !canMutate();
+    $('conclusion-new').disabled = !canMutate();
     workbenchEntries = [...workbenchEntries.filter(item => item.source !== 'projection'), ...workbenchEvidenceEntries(ledger)];
     renderWorkbenchEntries();
     $('experiment-detail').setAttribute('aria-busy', 'false');
   } catch (error) {
     if (version === epoch && project === activeProject && experiment === activeExperiment && requestVersion === readVersion.experiment) {
       $('experiment-detail').replaceChildren(element('p', 'Could not load a complete current experiment ledger. Partial, stale, or digest-inconsistent records are not shown; use Refresh to retry.', 'muted'));
+      $('experiment-revise').disabled = $('conclusion-new').disabled = true;
       $('experiment-detail').setAttribute('aria-busy', 'false');
       throw error;
     }
   }
 }
+function programReviewCurrent(context) {
+  return context && context === activeProgramContext && context.version === epoch &&
+    context.project === activeProject && context.study === activeStudy &&
+    context.selection === studyEpoch && context.ledger === activeLedger;
+}
+function programChoice(label, id, detail = '') {
+  const input = element('input'); input.type = 'checkbox'; input.dataset.programChoiceId = id;
+  const row = element('label'); row.append(input, element('span', `${id}${detail ? ` · ${detail}` : ''}`));
+  return { input, id, row };
+}
+function renderProgramReview(context) {
+  const { program } = context; const detail = $('program-review-detail'); detail.replaceChildren();
+  const summary = element('article', undefined, 'card');
+  summary.append(element('h3', 'Outcome 0/1 program review'));
+  summary.append(element('p', `Current immutable evidence basis: ${program.basis_digest}`, 'muted'));
+  summary.append(element('p', 'This is a planning and human-review record. It is not a model output, source-byte release, compute reservation, execution grant, dispatch, result, or scientific validity assessment.', 'muted'));
+  summary.append(element('p', `Execution authority: ${program.execution_granted ? 'granted' : 'not granted'} · scientific validity: ${program.scientific_validity}`, 'muted'));
+  detail.append(summary);
+  const reviews = Array.isArray(program.reviews) ? program.reviews : [];
+  detail.append(element('h4', `Requester / agent proposals (${reviews.length})`));
+  if (!reviews.length) detail.append(element('p', 'No program proposal has been recorded. Agent proposals, if submitted through the API, appear here as requester records; authoring does not invent an agent recommendation.', 'muted'));
+  for (const review of reviews) {
+    const scope = review.scope ?? {}; const proposal = element('article', undefined, 'card');
+    proposal.append(element('span', `${scope.outcome ?? 'unknown outcome'} · ${scope.action ?? 'unknown action'} · proposal`, 'tag'));
+    proposal.append(element('p', `Requester: ${review.requester_principal_id ?? 'not recorded'} · proposal ${review.id}`));
+    proposal.append(element('p', `Reason: ${scope.reason ?? 'not recorded'}`));
+    proposal.append(element('p', `Basis at proposal: ${scope.basis_digest ?? 'not recorded'}`, 'muted'));
+    if (scope.supersedes_id) proposal.append(element('p', `Replacement proposal for ${scope.supersedes_id}; earlier review remains historical until a human approves this replacement.`, 'muted'));
+    if (scope.brief) proposal.append(element('p', `Objective: ${scope.brief.objective}\nHypothesis: ${scope.brief.hypothesis}\nGates: success — ${scope.brief.success_gate}; failure — ${scope.brief.failure_gate}; stop — ${scope.brief.stop_gate}`));
+    if (scope.action === 'go_no_go') proposal.append(element('p', `Requested direction: ${scope.recommendation} · findings: ${(scope.finding_ids ?? []).join(', ') || 'none'}`));
+    proposal.append(element('p', review.basis_current ? 'Evidence basis is current.' : 'STALE EVIDENCE: this proposal basis no longer matches the current study context. It remains historical and cannot be resolved as current.', review.basis_current ? 'muted' : 'error'));
+    detail.append(proposal);
+  }
+  detail.append(element('h4', 'Human decisions'));
+  if (!reviews.length) detail.append(element('p', 'No human approval, rejection, or supersession has been recorded.', 'muted'));
+  for (const review of reviews) {
+    const human = element('article', undefined, 'card'); const scope = review.scope ?? {};
+    human.append(element('span', `${review.status ?? 'unknown'}${review.is_effective_review ? ' · current effective review' : ''}`, 'tag'));
+    human.append(element('p', `Proposal ${review.id} · human resolver: ${review.resolved_by_principal_id ?? 'pending'}`));
+    human.append(element('p', review.status === 'pending' ? 'Awaiting an eligible human decision. An agent suggestion cannot approve, reject, or supersede this review.' : `Human ${review.status}: ${review.rationale ?? 'no rationale recorded'}`));
+    if (scope.supersedes_id) human.append(element('p', `Lineage: replaces ${scope.supersedes_id}; historical decisions are retained.`, 'muted'));
+    if (!review.basis_current) human.append(element('p', 'Marked stale against current evidence. Reinspect before authoring or resolving a replacement.', 'error'));
+    detail.append(human);
+  }
+}
+async function loadProgramContext(research) {
+  const request = ++programContextRequest; const version = epoch;
+  activeProgramContext = null;
+  $('program-review-detail').replaceChildren(element('p', 'Loading complete program-review context…', 'muted'));
+  try {
+    const program = await api.programContext(connectionId, research.study.id);
+    if (request !== programContextRequest || version !== epoch || !currentResearchContext(research)) return;
+    if (!program || program.study_id !== research.study.id || program.project_id !== research.project.id ||
+        !isDigest(program.basis_digest) || !Array.isArray(program.reviews) || !program.condition_catalog || !program.basis) {
+      throw new Error('The control plane did not return a complete program-review context.');
+    }
+    const context = { ...research, program, version, request };
+    activeProgramContext = context; renderProgramReview(context);
+    $('program-review').hidden = false; $('program-review').disabled = !canMutate();
+  } catch (error) {
+    if (request === programContextRequest && version === epoch && currentResearchContext(research)) {
+      $('program-review-detail').replaceChildren(element('p', 'Could not load complete program-review history. Partial history is not shown; use Refresh to retry.', 'muted'));
+      $('program-review').hidden = true;
+      throw error;
+    }
+  }
+}
+function renderProgramAuthoring(context) {
+  const program = context.program; const form = $('program-review-form'); form.reset();
+  $('program-review-basis').textContent = `Study ${program.study_id} · current basis ${program.basis_digest}. A new request is fenced to this exact basis and latest lane head.`;
+  const sources = program.basis.sources ?? []; const variants = program.basis.variants ?? []; const findings = program.basis.findings ?? [];
+  const planSources = sources.map(source => programChoice('data source', source.id, `${source.verdict} · ${source.uri}`));
+  const useSources = sources.map(source => programChoice('source use', source.id, `${source.verdict} · ${source.uri}`));
+  const findingChoices = findings.map(finding => programChoice('finding', finding.id, finding.status));
+  const conditions = {};
+  $('program-data-sources').replaceChildren(element('h3', 'Data sources for this plan'), ...planSources.map(choice => choice.row));
+  $('program-use-sources').replaceChildren(element('h3', 'Sources requiring human use review'), ...useSources.map(choice => choice.row));
+  $('program-findings').replaceChildren(element('h3', 'Finding evidence for go'), ...findingChoices.map(choice => choice.row));
+  $('program-conditions').replaceChildren();
+  for (const [outcome, keys] of Object.entries(program.condition_catalog)) {
+    const section = element('section'); section.dataset.programOutcome = outcome; section.append(element('h3', `${outcome} condition coverage`));
+    for (const key of keys) {
+      const disposition = element('select'); disposition.value = 'selected';
+      const selected = element('option', 'Selected'); selected.value = 'selected'; const deferred = element('option', 'Deferred'); deferred.value = 'deferred'; disposition.append(selected, deferred);
+      const rationale = element('textarea'); rationale.rows = 2; rationale.placeholder = 'Required condition rationale';
+      const choices = variants.map(variant => programChoice('variant', variant.id, `${variant.status} · ${variant.name}`));
+      const card = element('article', undefined, 'card'); card.append(element('h4', key), disposition, rationale, ...choices.map(choice => choice.row)); section.append(card);
+      conditions[key] = { outcome, disposition, rationale, choices };
+    }
+    $('program-conditions').append(section);
+  }
+  programAuthorInputs = { context, planSources, useSources, findingChoices, conditions };
+  updateProgramAuthoringAction();
+}
+function updateProgramAuthoringAction() {
+  const action = $('program-review-form').fields?.action ?? $('program-review-form').querySelector?.('[name="action"]')?.value;
+  $('program-plan-fields').hidden = action !== 'plan'; $('program-source-use-fields').hidden = action !== 'source_use'; $('program-go-fields').hidden = action !== 'go_no_go';
+}
+function chosenProgramIds(choices) { return choices.filter(choice => choice.input.checked).map(choice => choice.id); }
 function renderStudyLedger(ledger) {
   const { study, variants, sources, findings, corrections, events } = ledger;
   const detail = $('study-detail'); detail.replaceChildren();
@@ -1334,11 +2167,11 @@ async function loadStudies(reset = false) {
 async function selectStudy(study) {
   const version = epoch; const project = activeProject; const selection = ++studyEpoch;
   const requestVersion = ++readVersion.study;
-  activeStudy = study; activeLedger = null;
+  activeStudy = study; activeLedger = null; activeProgramContext = null; pendingProgramReview = null; programContextRequest++; readVersion.program++;
   // A list row's status is advisory until the complete authoritative ledger
   // arrives. Keep authoring disabled while that read is pending or failed.
   study.status = null;
-  $('study-export').hidden = true; $('study-export').disabled = false;
+  $('study-export').hidden = true; $('study-export').disabled = false; $('program-review').hidden = true; $('program-review').disabled = true;
   $('study-title').textContent = `Study ${study.id}`;
   $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true; $('variant-new').disabled = true;
   $('variant-dialog').close(); resetAuthoringForms();
@@ -1367,6 +2200,7 @@ async function selectStudy(study) {
     $('study-export').hidden = false;
     $('variant-new').hidden = ledger.study.status !== 'open';
     $('variant-new').disabled = !canMutate();
+    void loadProgramContext(researchContext(ledger)).catch(() => {});
   } catch (error) {
     if (studyReadIsCurrent(version, project, selection, study, requestVersion)) {
       $('study-detail').replaceChildren(element('p', 'Could not load a complete study ledger. Partial records are not shown as complete; use Refresh to retry.', 'muted'));
@@ -1725,6 +2559,31 @@ function renderWorkbenchEntries() {
   $('conversation-view').setAttribute('aria-pressed', String(workbenchView === 'conversation'));
   $('labbook-view').setAttribute('aria-pressed', String(workbenchView === 'labbook'));
 }
+function validCoordinatorConsumerStatus(status) {
+  return status && status.provider_disabled === true && status.provider_enabled === false &&
+    ['available', 'unavailable'].includes(status.availability) &&
+    ['healthy', 'stale', 'revoked', 'expired', 'unknown', 'unavailable'].includes(status.health) &&
+    ['fresh', 'stale', 'unknown'].includes(status.freshness) &&
+    ['active', 'revoked', 'expired', 'unknown', 'not_recorded'].includes(status.credential_status) &&
+    (status.heartbeat_at === null || isText(status.heartbeat_at)) &&
+    (status.credential_expires_at === null || isText(status.credential_expires_at)) &&
+    (status.last_outcome === null || ['idle', 'claimed', 'completed', 'retrying'].includes(status.last_outcome)) &&
+    Number.isSafeInteger(status.observed_consumers) && status.observed_consumers >= 0 && status.observed_consumers <= 100;
+}
+function applyCoordinatorConsumerStatus(status, project, version, requestVersion) {
+  if (version !== epoch || project !== activeProject || requestVersion !== readVersion.workbench) return;
+  if (!validCoordinatorConsumerStatus(status)) {
+    coordinatorAvailable = false;
+    coordinatorConsumerDetail = null;
+    $('coordinator-health').textContent = 'Coordinator consumer status is incomplete or unrecognized. New coordinator requests are disabled.';
+    applyConnectionHealth(connectionState);
+    throw new Error('The control plane did not return a safe coordinator consumer status.');
+  }
+  coordinatorAvailable = status.availability === 'available' && status.health === 'healthy' &&
+    status.freshness === 'fresh' && status.credential_status === 'active';
+  coordinatorConsumerDetail = status;
+  applyConnectionHealth(connectionState);
+}
 async function loadWorkbench(reset = false) {
   const version = epoch; const project = activeProject;
   if (reset) {
@@ -1740,16 +2599,18 @@ async function loadWorkbench(reset = false) {
   if (loading.has(loadingKey)) return;
   loading.add(loadingKey); $('events-more').disabled = true;
   try {
-    const [conversation, proposals, statusTurns, labbook] = await Promise.all([
+    const [conversation, proposals, statusTurns, labbook, consumer] = await Promise.all([
       messagePage ? api.astraConversation(connectionId, project.id, messagePage) : Promise.resolve({ messages: [] }),
       proposalPage ? api.astraProposals(connectionId, project.id, proposalPage) : Promise.resolve({ proposals: [] }),
       statusTurnPage ? api.explainStatusTurns(connectionId, project.id, statusTurnPage) : Promise.resolve({ turns: [] }),
       api.labbook(connectionId, project.id, eventCursor),
+      api.coordinatorConsumerStatus(connectionId, project.id),
     ]);
     if (version !== epoch || project !== activeProject || requestVersion !== readVersion.workbench) return;
     if (!conversation || !Array.isArray(conversation.messages) || !Array.isArray(proposals.proposals) || !Array.isArray(statusTurns.turns) || !Array.isArray(labbook.events)) {
       throw new Error('The control plane did not return a complete coordinator projection.');
     }
+    applyCoordinatorConsumerStatus(consumer, project, version, requestVersion);
     const messages = conversation.messages.filter(message => message.project_id === project.id &&
       ['human', 'coordinator'].includes(message.sender_kind) && isIdentifier(message.id) && isText(message.body)).map(message => ({
       id: `message:${message.id}`, source: 'conversation', type: message.sender_kind === 'human' ? 'scientist-message' : 'coordinator-reply', created_at: message.created_at, message,
@@ -1801,48 +2662,118 @@ async function loadEvents() { return loadWorkbench(false); }
 for (const button of document.querySelectorAll('[data-close]')) {
   button.addEventListener('click', () => button.closest('dialog').close());
 }
+$('admin-open').addEventListener('click', () => guarded(async () => {
+  $('admin-workspace').hidden = false; renderAdmin(); await loadAdmin();
+}));
+$('admin-refresh').addEventListener('click', () => guarded(() => loadAdmin()));
+$('admin-more').addEventListener('click', () => guarded(() => loadAdmin(true)));
+for (const view of ['setup', 'targets', 'secrets', 'delegations', 'readiness', 'audit']) {
+  $(`admin-${view}`).addEventListener('click', () => guarded(async () => {
+    adminView = view; adminPending = null; $('admin-preview').hidden = true;
+    $('admin-preview-body').textContent = ''; renderAdmin(); await loadAdmin();
+  }));
+}
+$('admin-confirm').addEventListener('click', () => guarded(confirmAdmin));
+$('admin-cancel').addEventListener('click', () => {
+  adminPending = null; $('admin-preview').hidden = true; $('admin-preview-body').textContent = '';
+});
+$('admin-configuration-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const fields = new FormData(event.target);
+    const spec = { kind: 'configuration', custody_policy: 'quarantine_only', data_policy: 'public_released_only' };
+    for (const name of ['component', 'provider', 'deployment', 'network_policy']) spec[name] = fields.get(name);
+    for (const name of ['endpoint', 'namespace', 'salad_organization', 'salad_project', 'country', 'cluster_identity', 'ca_digest', 'kubeconfig_secret_id', 'management_secret_id', 'gateway_secret_id', 'artifact_secret_id', 'image_digest', 'artifact_profile_digest', 'monitor_profile_digest']) spec[name] = fields.get(name) || null;
+    for (const name of ['max_cpu', 'max_gpu', 'max_memory_mib', 'max_seconds', 'max_output_bytes']) spec[name] = Number(fields.get(name));
+    if (adminEditing && adminCurrent(adminEditing)) {
+      adminPreview({ expected_revision: adminEditing.record.revision, action: 'revise', configuration: spec }, adminEditing.record);
+    } else adminPreview({ expected_revision: 0, spec });
+  });
+});
+$('admin-secret-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const fields = new FormData(event.target), purpose = fields.get('purpose');
+    const [provider, audience] = { salad_management: ['salad', 'server_proxy'], ai_gateway: ['ai_gateway', 'gateway'], kubeconfig: ['kubernetes', 'operator'], artifact_store: ['artifact_store', 'artifact_service'], monitor: ['none', 'monitor'] }[purpose];
+    adminPreview({ expected_revision: 0, spec: { kind: 'secret', backend: fields.get('backend') || 'fake', purpose, provider, audience, expires_at: new Date(Date.now() + Number(fields.get('minutes')) * 60000).toISOString() } });
+  });
+});
+$('admin-delegation-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const fields = new FormData(event.target);
+    adminPreview({ expected_revision: 0, spec: { kind: 'delegation', subject_id: fields.get('subject_id'), subject_role: fields.get('subject_role'), target_id: fields.get('target_id'), provider: fields.get('provider'), resource: 'configuration', actions: [fields.get('action')], expires_at: new Date(Date.now() + Number(fields.get('minutes')) * 60000).toISOString() } });
+  });
+});
 $('connection-open').addEventListener('click', () => $('connection-dialog').showModal());
-$('project-new').addEventListener('click', () => $('project-dialog').showModal());
-$('task-new').addEventListener('click', () => $('task-dialog').showModal());
-$('thread-new').addEventListener('click', () => $('thread-dialog').showModal());
-$('study-new').addEventListener('click', () => $('study-dialog').showModal());
-$('variant-new').addEventListener('click', () => $('variant-dialog').showModal());
+function openCreationDialog(kind) {
+  const dialog = $(`${kind}-dialog`);
+  if (dialog.open) return; // A repeated open cannot undo an in-flight submission.
+  $(`${kind}-form`).querySelector('button[type="submit"]').disabled = !canMutate();
+  dialog.showModal();
+}
+$('project-new').addEventListener('click', () => openCreationDialog('project'));
+$('welcome-project-new').addEventListener('click', () => openCreationDialog('project'));
+$('task-new').addEventListener('click', () => openCreationDialog('task'));
+$('thread-new').addEventListener('click', () => openCreationDialog('thread'));
+$('study-new').addEventListener('click', () => openCreationDialog('study'));
+$('variant-new').addEventListener('click', () => openCreationDialog('variant'));
 $('disconnect').addEventListener('click', () => guarded(async () => {
   clearContext(); await api.disconnect(); $('connection-status').textContent = 'Not connected';
 }));
+let connectionPending = false;
 $('connection-form').addEventListener('submit', event => {
   event.preventDefault();
+  if (connectionPending) return;
+  const button = event.target.querySelector('button[type="submit"]');
+  connectionPending = true;
+  button.disabled = true;
   guarded(async () => {
-    const fields = new FormData(event.target);
-    const settings = { name: fields.get('name'), endpoint: fields.get('endpoint') };
-    clearContext();
-    const version = epoch;
-    const state = await api.connect(settings);
-    if (version !== epoch) return;
-    if (!state) { $('connection-status').textContent = 'Not connected'; return; }
-    connectionId = state.id;
-    applyConnectionHealth(state);
-    $('disconnect').hidden = false;
-    let recovery;
-    try { recovery = await api.recovery(connectionId); } catch (error) {
+    try {
+      const fields = new FormData(event.target);
+      const settings = { name: fields.get('name'), endpoint: fields.get('endpoint') };
+      // Failed enrollment must discard the previous connection context, but the
+      // operator's endpoint and name are safe retry inputs and should remain.
+      clearContext({ preserveConnectionForm: true });
+      const version = epoch;
+      const state = await api.connect(settings);
       if (version !== epoch) return;
-      throw error;
-    }
-    if (version !== epoch) return;
-    applyRecoveryStatus(recovery);
-    $('refresh').disabled = false;
-    await loadProjects(true);
-  });
+      if (!state) { $('connection-status').textContent = 'Not connected'; return; }
+      connectionId = state.id;
+      applyConnectionHealth(state);
+      $('connection-dialog').close();
+      $('disconnect').hidden = false;
+      let recovery;
+      try { recovery = await api.recovery(connectionId); } catch (error) {
+        if (version !== epoch) return;
+        throw error;
+      }
+      if (version !== epoch) return;
+      applyRecoveryStatus(recovery);
+      $('refresh').disabled = false;
+      await loadProjects(true);
+    } finally { connectionPending = false; button.disabled = false; }
+  }, { preserveConnectionForm: true });
 });
 $('project-form').addEventListener('submit', event => {
   event.preventDefault();
   guarded(async () => {
+    const form = event.target;
+    const button = form.querySelector('button[type="submit"]');
+    if (button.disabled) return;
     const version = epoch;
-    const body = { name: new FormData(event.target).get('name') };
-    const project = await command('project', body, (id, key) => api.createProject(id, body, key));
-    if (version !== epoch) return;
-    $('project-dialog').close(); event.target.reset();
-    await loadProjects(true); await selectProject(project);
+    const selectedConnection = connectionId;
+    const body = { name: new FormData(form).get('name') };
+    button.disabled = true;
+    try {
+      const project = await command('project', body, (id, key) => api.createProject(id, body, key),
+        () => version === epoch && selectedConnection === connectionId);
+      if (version !== epoch || selectedConnection !== connectionId) return;
+      $('project-dialog').close(); form.reset();
+      await loadProjects(true);
+      if (version === epoch && selectedConnection === connectionId) await selectProject(project);
+    } finally {
+      if (version === epoch && selectedConnection === connectionId && form.isConnected) {
+        button.disabled = !canMutate();
+      }
+    }
   });
 });
 $('task-form').addEventListener('submit', event => {
@@ -1857,6 +2788,30 @@ $('task-form').addEventListener('submit', event => {
     await command(`task:${projectId}`, body, (id, key) => api.createTask(id, projectId, body, key));
     if (version !== epoch) return;
     $('task-dialog').close(); event.target.reset(); await selectProject(activeProject);
+  });
+});
+$('task-revise-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = taskRevisionContext; const form = event.target; const button = form.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    if (!context || context.version !== epoch || context.project !== activeProject) throw new Error('Project context changed; refresh the proposal before revising it.');
+    const fields = new FormData(form);
+    const array = (name) => {
+      let value; try { value = JSON.parse(String(fields.get(name) ?? '')); } catch { throw new Error(`${name} must be a JSON array.`); }
+      if (!Array.isArray(value)) throw new Error(`${name} must be a JSON array.`); return value;
+    };
+    const body = { expected_revision: context.task.revision, title: fields.get('title'), purpose: fields.get('purpose'),
+      budget_cents: Number(fields.get('budget_cents')), max_duration_seconds: Number(fields.get('max_duration_seconds')),
+      execution_spec: { argv: array('argv'), input_snapshot_digest: fields.get('input_snapshot_digest'),
+        pinned_skill_digests: array('pinned_skill_digests'), output_paths: array('output_paths'), profile: fields.get('profile'),
+        network_enabled: false, max_output_bytes: Number(fields.get('max_output_bytes')) } };
+    button.disabled = true;
+    try {
+      await command(`revise-task:${context.task.id}`, body, (id, key) => api.reviseTaskPlan(id, context.task.id, body, key),
+        () => context.version === epoch && context.project === activeProject);
+      $('task-revise-dialog').close(); form.reset(); await selectProject(context.project);
+      notice('Proposal revision recorded. The prior approval basis is invalidated; no admission, dispatch, or run occurred.');
+    } finally { if (context.version === epoch && context.project === activeProject) button.disabled = !canMutate(); }
   });
 });
 $('thread-form').addEventListener('submit', event => {
@@ -1900,6 +2855,356 @@ $('study-form').addEventListener('submit', event => {
       await loadStudies(true);
       if (version === epoch && project === activeProject) await selectStudy(study);
     } finally { if (version === epoch && project === activeProject) button.disabled = !canMutate(); }
+  });
+});
+$('experiment-new').addEventListener('click', () => guarded(async () => {
+  experimentCommandContext = null; fillExperimentForm(null); $('experiment-form-title').textContent = 'Register experiment design';
+  $('experiment-form').querySelector('button[type="submit"]').textContent = 'Record design'; $('experiment-dialog').showModal();
+}));
+$('experiment-revise').addEventListener('click', () => guarded(async () => {
+  const context = experimentContext();
+  if (!currentExperimentContext(context)) throw new Error('Select a complete current experiment before revising its design.');
+  experimentCommandContext = context; fillExperimentForm(context.ledger.experiment.design);
+  $('experiment-form-title').textContent = `Revise experiment design revision ${context.ledger.experiment.current_design_revision}`;
+  $('experiment-form').querySelector('button[type="submit"]').textContent = 'Record revised design'; $('experiment-dialog').showModal();
+}));
+$('experiment-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const form = event.target; const button = form.querySelector('button[type="submit"]'); if (button.disabled) return;
+    const context = experimentCommandContext; const project = activeProject;
+    if (!project || (context && !currentExperimentContext(context))) throw new Error('Refresh the selected project before recording this design.');
+    const body = designFormBody(form, context ? context.ledger.experiment.current_design_revision : null); button.disabled = true;
+    try {
+      const result = await command(context ? `revise-experiment:${context.experiment.id}` : `create-experiment:${project.id}`, body,
+        (id, key) => context ? api.reviseExperiment(id, context.experiment.id, body, key) : api.createExperiment(id, project.id, body, key),
+        () => context ? currentExperimentContext(context) : project === activeProject);
+      $('experiment-dialog').close(); form.reset(); await loadExperiments(true);
+      if (context) await selectExperiment(context.experiment); else await selectExperiment(result);
+      notice('Experiment design recorded. A design revision does not approve, admit, dispatch, or run work.');
+    } finally { button.disabled = !canMutate(); }
+  });
+});
+$('admission-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = experimentCommandContext; const variant = context?.variant;
+    if (!currentExperimentContext(context) || !variant || !isPositiveInteger(variant.revision)) throw new Error('Refresh the selected variant before admission.');
+    const body = { expected_variant_revision: variant.revision, expected_design_revision: context.ledger.experiment.current_design_revision,
+      grant_id: new FormData(event.target).get('grant_id') };
+    await command(`admit-attempt:${variant.id}`, body, (id, key) => api.admitExperimentAttempt(id, variant.id, body, key), () => currentExperimentContext(context));
+    $('admission-dialog').close(); await refreshExperimentContext(context);
+    notice('Execution admission recorded. No package was returned, dispatch authorized, or run started.');
+  });
+});
+$('dispatch-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = experimentCommandContext; const attempt = context?.attempt;
+    if (!currentExperimentContext(context) || !attempt) throw new Error('Refresh the admitted attempt before dispatch review.');
+    const body = { expected_revision: attempt.revision, target_digest: new FormData(event.target).get('target_digest'), profile_version: 'development-minikube-opencode-v1' };
+    await command(`dispatch-attempt:${attempt.id}`, body, (id, key) => api.dispatchAdmittedAttempt(id, attempt.id, body, key), () => currentExperimentContext(context));
+    $('dispatch-dialog').close(); await refreshExperimentContext(context);
+    notice('Kubernetes dispatch authorization recorded. It does not prove that a worker claimed or ran the package.');
+  });
+});
+$('attempt-resolution-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = experimentCommandContext; const attempt = context?.attempt; const fields = new FormData(event.target);
+    if (!currentExperimentContext(context) || !attempt) throw new Error('Refresh the admitted attempt before recording an outcome.');
+    const outcome = fields.get('outcome'); const reason = String(fields.get('reason') ?? '').trim() || null;
+    if (outcome !== 'succeeded' && !reason) throw new Error('Unknown, failed, and cancelled outcomes require a reason.');
+    const body = { expected_revision: attempt.revision, outcome, reason };
+    await command(`resolve-attempt:${attempt.id}`, body, (id, key) => api.resolveAdmittedAttempt(id, attempt.id, body, key), () => currentExperimentContext(context));
+    $('attempt-resolution-dialog').close(); await refreshExperimentContext(context);
+    notice('Human admitted-attempt outcome recorded. It does not establish scientific success.');
+  });
+});
+$('measurement-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = experimentCommandContext; const attempt = context?.attempt; const fields = new FormData(event.target);
+    if (!currentExperimentContext(context) || !attempt) throw new Error('Refresh the attempt before recording a measurement.');
+    let value; try { value = JSON.parse(String(fields.get('value') ?? '')); } catch { throw new Error('Measurement value must be a JSON object.'); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Measurement value must be a JSON object.');
+    const body = { expected_revision: attempt.revision, name: fields.get('name'), value, artifact_id: String(fields.get('artifact_id') ?? '').trim() || null };
+    await command(`measurement:${attempt.id}`, body, (id, key) => api.recordMeasurement(id, attempt.id, body, key), () => currentExperimentContext(context));
+    $('measurement-dialog').close(); await refreshExperimentContext(context);
+    notice('Measurement recorded as evidence metadata. It does not establish scientific validity.');
+  });
+});
+$('attempt-artifacts-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = experimentCommandContext; const attempt = context?.attempt;
+    if (!currentExperimentContext(context) || !attempt) throw new Error('Refresh the attempt before linking artifact evidence.');
+    let artifactIds; try { artifactIds = JSON.parse(String(new FormData(event.target).get('artifact_ids') ?? '')); } catch { throw new Error('Artifact IDs must be a JSON array.'); }
+    if (!Array.isArray(artifactIds) || !artifactIds.length || artifactIds.some(id => !isIdentifier(id)) || new Set(artifactIds).size !== artifactIds.length) {
+      throw new Error('Provide one or more unique artifact IDs.');
+    }
+    const body = { expected_revision: attempt.revision, artifact_ids: artifactIds };
+    await command(`link-attempt-artifacts:${attempt.id}`, body, (id, key) => api.linkAttemptArtifacts(id, attempt.id, body, key), () => currentExperimentContext(context));
+    $('attempt-artifacts-dialog').close(); await refreshExperimentContext(context);
+    notice('Artifact evidence links recorded. Bytes remain subject to separate released-manifest custody.');
+  });
+});
+$('conclusion-new').addEventListener('click', () => guarded(async () => openConclusionForm(experimentContext())));
+$('conclusion-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = conclusionContext; const conclusion = context?.conclusion;
+    if (!currentExperimentContext(context)) throw new Error('Refresh the complete experiment ledger before authoring a conclusion.');
+    const evidence = selectedConclusionEvidence(); if (!evidence.length) throw new Error('Select linked artifact or measurement evidence for the conclusion.');
+    const fields = new FormData(event.target); const body = { statement: fields.get('statement'), evidence,
+      design_revision: conclusion?.design_revision ?? context.ledger.experiment.current_design_revision,
+      ...(conclusion ? { expected_revision: conclusion.revision } : {}) };
+    await command(conclusion ? `update-conclusion:${conclusion.id}` : `create-conclusion:${context.experiment.id}`, body,
+      (id, key) => conclusion ? api.updateConclusion(id, conclusion.id, body, key) : api.createConclusion(id, context.experiment.id, body, key),
+      () => currentExperimentContext(context));
+    $('conclusion-dialog').close(); await refreshExperimentContext(context);
+    notice('Conclusion draft recorded with linked evidence. It remains distinct from execution and scientific validity.');
+  });
+});
+$('conclusion-amendment-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = amendmentContext; const conclusion = context?.conclusion; const fields = new FormData(event.target);
+    if (!currentExperimentContext(context) || !conclusion) throw new Error('Refresh the reviewed conclusion before amendment.');
+    const body = { expected_revision: conclusion.lineage_revision, expected_design_revision: conclusion.design_revision, relation: fields.get('relation'), reason: fields.get('reason') };
+    await command(`amend-conclusion:${conclusion.id}`, body, (id, key) => api.amendConclusion(id, conclusion.id, body, key), () => currentExperimentContext(context));
+    $('conclusion-amendment-dialog').close(); await refreshExperimentContext(context);
+    notice('Conclusion amendment recorded. The reviewed conclusion and evidence remain preserved.');
+  });
+});
+  $('artifact-custody').addEventListener('click', () => guarded(async () => {
+    if (!activeProject) throw new Error('Select a project before recording custody release.');
+    $('artifact-custody-form').reset(); $('artifact-custody-dialog').showModal();
+  }));
+  $('artifact-custody-form').addEventListener('submit', event => {
+    event.preventDefault(); guarded(async () => {
+      const project = activeProject; const version = epoch; const fields = new FormData(event.target);
+      if (!project) throw new Error('Select a project before recording custody release.');
+      const revision = Number(fields.get('expected_revision'));
+      if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('Custody revision must be a non-negative integer.');
+      const manifestId = String(fields.get('manifest_id') ?? '').trim();
+      const body = { expected_manifest_digest: String(fields.get('expected_manifest_digest') ?? '').trim(),
+        expected_revision: revision, action: fields.get('action'), rationale: String(fields.get('rationale') ?? '').trim() };
+      if (!isIdentifier(manifestId) || !isDigest(body.expected_manifest_digest) || !['release', 'revoke'].includes(body.action) || !body.rationale) {
+        throw new Error('Enter a manifest ID, exact digest, current revision, action, and rationale.');
+      }
+      await command(`artifact-custody:${manifestId}`, body,
+        (id, key) => api.recordArtifactCustodyRelease(id, manifestId, body, key),
+        () => version === epoch && project === activeProject);
+      if (version === epoch && project === activeProject) {
+        $('artifact-custody-dialog').close(); event.target.reset();
+        notice(`Artifact custody ${body.action} recorded. This does not classify, accept, publish, or alter evidence.`);
+      }
+    });
+  });
+  $('artifact-disposition').addEventListener('click', () => guarded(async () => {
+    if (!activeProject || !canMutate() || connectionState?.role !== 'human') throw new Error('Select an online human project for disposition review.');
+    artifactDispositionContext = null;
+    artifactDispositionRead++;
+    $('artifact-disposition-form').reset(); $('artifact-disposition-detail').textContent = 'Load an exact manifest from this project before reviewing.';
+    $('artifact-disposition-form').querySelector('button[type="submit"]').disabled = true;
+    $('artifact-disposition-dialog').showModal();
+  }));
+  $('artifact-disposition-load').addEventListener('click', () => guarded(async () => {
+    const form = $('artifact-disposition-form');
+    const manifestId = String(new FormData(form).get('manifest_id') ?? '').trim();
+    const project = activeProject; const version = epoch; const read = ++artifactDispositionRead;
+    artifactDispositionContext = null; form.querySelector('button[type="submit"]').disabled = true;
+    if (!project || !isIdentifier(manifestId)) throw new Error('Enter a manifest ID from the selected project.');
+    let manifest = null;
+    for (let offset = 0; offset < 1000 && !manifest; offset += 100) {
+      const page = await api.artifactManifests(connectionId, project.id, { offset, limit: 100 });
+      if (version !== epoch || project !== activeProject || read !== artifactDispositionRead) return;
+      if (!Array.isArray(page?.artifact_manifests)) throw new Error('Manifest metadata is incomplete.');
+      manifest = page.artifact_manifests.find(item => item.id === manifestId);
+      if (page.artifact_manifests.length < 100) break;
+    }
+    if (!manifest || manifest.project_id !== project.id || manifest.status !== 'quarantined' || !isDigest(manifest.manifest_digest) || !Array.isArray(manifest.artifacts) || !manifest.artifacts.every(a => isIdentifier(a.id) && isDigest(a.sha256) && isText(a.relative_path) && Number.isSafeInteger(a.size) && a.size >= 0)) throw new Error('No eligible exact quarantine manifest was found in this project.');
+    const rows = [];
+    for (let offset = 0; offset < 1000; offset += 100) {
+      const page = await api.artifactDispositions(connectionId, manifestId, { offset, limit: 100 });
+      if (version !== epoch || project !== activeProject || read !== artifactDispositionRead) return;
+      if (!Array.isArray(page?.dispositions) || !page.dispositions.every(row => row.manifest_id === manifestId && row.manifest_digest === manifest.manifest_digest && isPositiveInteger(row.revision))) throw new Error('Disposition metadata is incomplete.');
+      rows.push(...page.dispositions);
+      if (page.dispositions.length < 100) break;
+      if (offset === 900) throw new Error('Disposition history exceeds the bounded review; use the operator API.');
+    }
+    if (!$('artifact-disposition-dialog').open || read !== artifactDispositionRead) return;
+    const revision = Math.max(0, ...rows.map(row => row.revision));
+    artifactDispositionContext = { project, version, manifest, revision };
+    const set = (name, value) => { if (form.elements?.[name]) form.elements[name].value = value; else { form.fields ??= {}; form.fields[name] = value; } };
+    set('expected_manifest_digest', manifest.manifest_digest); set('expected_revision', revision);
+    $('artifact-disposition-detail').textContent = `Manifest ${manifest.id} · digest ${manifest.manifest_digest} · quarantine ${manifest.status} · classification ${manifest.classification} · late ${manifest.late}. Outputs: ${manifest.artifacts.map(a => `${a.relative_path} · ${a.id} · ${a.size} bytes · sha256 ${a.sha256}`).join('; ')}. Scientific validity: not assessed.`;
+    form.querySelector('button[type="submit"]').disabled = !canMutate() || connectionState?.role !== 'human';
+  }));
+  $('artifact-disposition-form').addEventListener('submit', event => {
+    event.preventDefault(); guarded(async () => {
+      const context = artifactDispositionContext; const form = event.target; const fields = new FormData(form);
+      if (!context || !$('artifact-disposition-dialog').open || context.project !== activeProject || context.version !== epoch || !canMutate() || connectionState?.role !== 'human' || form.querySelector('button[type="submit"]').disabled) throw new Error('Refresh the exact human disposition review before recording.');
+      if (fields.get('manifest_id') !== context.manifest.id || fields.get('expected_manifest_digest') !== context.manifest.manifest_digest || Number(fields.get('expected_revision')) !== context.revision) throw new Error('Reviewed manifest basis changed; reload exact metadata.');
+      const rationale = String(fields.get('rationale') ?? '').trim();
+      if (!rationale || rationale.length > 8000) throw new Error('Enter a bounded human review rationale.');
+      const body = { expected_manifest_digest: context.manifest.manifest_digest, expected_revision: context.revision, disposition: 'retain_quarantined', rationale };
+      const button = form.querySelector('button[type="submit"]'); button.disabled = true;
+      try {
+        await command(`artifact-disposition:${context.manifest.id}`, body, (id, key) => api.recordArtifactDisposition(id, context.manifest.id, body, key), () => context.project === activeProject && context.version === epoch);
+        $('artifact-disposition-dialog').close(); artifactDispositionContext = null;
+        notice('Human retain-quarantined disposition recorded. Bytes remain quarantined; separately review custody release. No classification, scientific acceptance, publication or agent disclosure.');
+      } finally { if (artifactDispositionContext === context) button.disabled = !canMutate(); }
+    });
+  });
+  $('artifact-review').addEventListener('click', () => guarded(async () => {
+    if (!activeProject) throw new Error('Select a project before inspecting a released artifact.');
+    artifactReviewContext = { project: activeProject, version: epoch, request: ++artifactPreviewRequest };
+    $('artifact-form').reset(); $('artifact-review-detail').textContent = 'Enter an already released manifest and one artifact ID.';
+    $('artifact-download').disabled = true; $('artifact-bundle').disabled = true; $('artifact-dialog').showModal();
+  }));
+$('artifact-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = artifactReviewContext; const fields = new FormData(event.target); const manifestId = String(fields.get('manifest_id') ?? '').trim(); const artifactId = String(fields.get('artifact_id') ?? '').trim();
+    if (!context || context.project !== activeProject || context.version !== epoch) throw new Error('Project context changed; reopen artifact review.');
+    if (!isIdentifier(manifestId) || !isIdentifier(artifactId)) throw new Error('Enter an already released manifest ID and artifact ID.');
+    const request = ++artifactPreviewRequest;
+    const previewContext = { ...context, request };
+    artifactReviewContext = previewContext;
+    $('artifact-download').disabled = true; $('artifact-bundle').disabled = true;
+    const submit = event.target.querySelector('button[type="submit"]'); submit.disabled = true;
+    try {
+    const [released, preview] = await Promise.all([api.releasedArtifactManifest(connectionId, manifestId), api.artifactPreview(connectionId, manifestId, artifactId, 4096)]);
+    if (artifactReviewContext !== previewContext || context.project !== activeProject || context.version !== epoch) return;
+    if (!released?.manifest || released.manifest.id !== manifestId || released.manifest.project_id !== context.project.id ||
+        preview?.artifact_id !== artifactId || !isText(preview.relative_path) || !isDigest(preview.sha256) ||
+        !Number.isSafeInteger(preview.size) || preview.size < 0 || !Number.isSafeInteger(preview.preview_bytes) ||
+        preview.preview_bytes < 0 || preview.preview_bytes > preview.size || typeof preview.truncated !== 'boolean' ||
+        typeof preview.preview_base64 !== 'string' || preview.status !== 'quarantined' || preview.classification !== 'unclassified') {
+      throw new Error('The control plane did not return a released quarantined artifact preview for this project.');
+    }
+    let text = '(binary preview omitted)';
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(preview.preview_base64), char => char.charCodeAt(0))); } catch {}
+    $('artifact-review-detail').textContent = `Released manifest ${released.manifest.id ?? manifestId} · artifact ${preview.relative_path} · ${preview.preview_bytes}/${preview.size} bytes${preview.truncated ? ' (truncated)' : ''} · digest ${preview.sha256}\n${text}`;
+    artifactReviewContext = { ...previewContext, manifestId, artifactId, sha256: preview.sha256 }; $('artifact-download').disabled = !connectionOnline; $('artifact-bundle').disabled = !canMutate();
+    } finally {
+      if (artifactReviewContext === previewContext && context.project === activeProject && context.version === epoch) submit.disabled = !connectionOnline;
+    }
+  });
+});
+$('artifact-download').addEventListener('click', () => guarded(async () => {
+  const context = artifactReviewContext; if (!context?.manifestId || !context?.artifactId || context.project !== activeProject || context.version !== epoch) throw new Error('Load a current released artifact preview first.');
+  const button = $('artifact-download');
+  if (button.disabled) return;
+  const current = () => artifactReviewContext === context && context.project === activeProject && context.version === epoch;
+  button.disabled = true;
+  try {
+    const result = await api.saveReleasedArtifact(connectionId, context.manifestId, context.artifactId);
+    if (!current() || result.status === 'stale') return;
+    if (result.status === 'cancelled') { notice('Artifact retrieval cancelled.'); return; }
+    if (result.status !== 'saved' || result.sha256 !== context.sha256) throw new Error('Released artifact retrieval integrity check failed.');
+    notice(`Saved exact released artifact bytes: ${result.basename}`);
+  } catch (error) {
+    if (current()) throw error;
+  } finally {
+    if (current()) {
+      // Finish the busy state before caching current eligibility under offline health.
+      unavailableControls.delete(button);
+      button.disabled = false;
+      applyAvailability(button, !connectionOnline);
+    }
+  }
+}));
+$('artifact-bundle').addEventListener('click', () => guarded(async () => {
+    const context = artifactReviewContext;
+    if (!context?.manifestId || context.project !== activeProject || context.version !== epoch) throw new Error('Load a current released artifact preview first.');
+    const body = { max_bytes: 4 * 1024 * 1024 };
+    const exported = await command(`reproduction-bundle:${context.manifestId}`, body,
+      (id, key) => api.exportReproductionBundle(id, context.manifestId, body, key),
+      () => context.project === activeProject && context.version === epoch && artifactReviewContext === context);
+    if (context.project === activeProject && context.version === epoch && artifactReviewContext === context) {
+      if (!exported || !isIdentifier(exported.id) || !isDigest(exported.bundle_digest) || !exported.bundle) throw new Error('The control plane did not return a bounded reproduction bundle record.');
+      notice(`Reproduction bundle record exported: ${exported.id} · digest ${exported.bundle_digest}. Review its missing or restricted material before relying on it.`);
+    }
+  }));
+$('program-review').addEventListener('click', () => guarded(async () => {
+  const context = activeProgramContext;
+  if (!programReviewCurrent(context)) throw new Error('Load the current complete program-review context before authoring.');
+  renderProgramAuthoring(context); $('program-review-dialog').showModal();
+}));
+$('program-review-form').addEventListener('change', event => {
+  if (event.target?.name === 'action') updateProgramAuthoringAction();
+});
+$('program-review-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const button = event.target.querySelector('button[type="submit"]'); if (button.disabled) return;
+    const inputs = programAuthorInputs; const context = inputs?.context;
+    if (!programReviewCurrent(context)) throw new Error('Program evidence changed or the selected study is no longer current. Reopen program review.');
+    const fields = new FormData(event.target); const text = name => String(fields.get(name) ?? '').trim();
+    const outcome = text('outcome'); const action = text('action'); const reason = text('reason');
+    if (!['outcome_0', 'outcome_1'].includes(outcome) || !['plan', 'source_use', 'go_no_go'].includes(action) || !reason) {
+      throw new Error('Choose an outcome and action, and provide a proposal reason.');
+    }
+    const scope = { type: 'research_program', version: 1, study_id: context.study.id, outcome, action,
+      basis_digest: context.program.basis_digest, supersedes_id: null, reason };
+    const lane = context.program.reviews.filter(review => review.scope?.outcome === outcome && review.scope?.action === action);
+    const head = lane.find(review => review.is_proposal_head) ?? lane.at(-1);
+    if (head) scope.supersedes_id = head.id;
+    if (action === 'plan') {
+      const required = ['objective', 'hypothesis', 'success_gate', 'failure_gate', 'stop_gate', 'target_domain', 'provenance_policy', 'resources', 'dataset_recommendation', 'representation_recommendation', 'split_recommendation', 'metric_recommendation', 'uncertainty'];
+      const missing = required.filter(name => !text(name));
+      const sourceIds = chosenProgramIds(inputs.planSources);
+      const budget = Number(text('budget_cents')); const wall = Number(text('max_wall_seconds')); const gpu = Number(text('max_gpu_hours'));
+      if (missing.length || !sourceIds.length || !Number.isSafeInteger(budget) || budget < 0 || !Number.isSafeInteger(wall) || wall < 1 || !Number.isFinite(gpu) || gpu < 0) {
+        throw new Error('Complete every scientific-brief field, select registered data sources, and provide valid declared compute limits.');
+      }
+      const conditions = {};
+      for (const [key, item] of Object.entries(inputs.conditions)) {
+        if (item.outcome !== outcome) continue;
+        const disposition = item.disposition.value; const rationale = String(item.rationale.value ?? '').trim(); const variantIds = chosenProgramIds(item.choices);
+        if (!rationale || !['selected', 'deferred'].includes(disposition) || (disposition === 'selected') !== Boolean(variantIds.length)) {
+          throw new Error(`Condition ${key} needs a rationale and selected conditions need registered variants while deferred conditions need none.`);
+        }
+        conditions[key] = { disposition, rationale, variant_ids: variantIds };
+      }
+      const expected = context.program.condition_catalog[outcome] ?? [];
+      if (Object.keys(conditions).length !== expected.length) throw new Error('The complete selected Outcome condition catalog is required.');
+      scope.brief = { objective: text('objective'), hypothesis: text('hypothesis'), success_gate: text('success_gate'), failure_gate: text('failure_gate'), stop_gate: text('stop_gate'), target_domain: text('target_domain'), provenance_policy: text('provenance_policy'), data_source_ids: sourceIds,
+        compute: { budget_cents: budget, max_wall_seconds: wall, max_gpu_hours: gpu, target: text('target'), resources: text('resources') }, dataset_recommendation: text('dataset_recommendation'), representation_recommendation: text('representation_recommendation'), split_recommendation: text('split_recommendation'), metric_recommendation: text('metric_recommendation'), uncertainty: text('uncertainty'), missing_prerequisites: text('missing_prerequisites').split('\n').map(value => value.trim()).filter(Boolean) };
+      scope.conditions = conditions;
+    } else if (action === 'source_use') {
+      const sourceIds = chosenProgramIds(inputs.useSources); const intendedUse = text('intended_use');
+      if (!sourceIds.length || !intendedUse) throw new Error('Select the registered sources and state the intended use.');
+      scope.source_ids = sourceIds; scope.intended_use = intendedUse;
+    } else {
+      const recommendation = text('recommendation'); const findingIds = chosenProgramIds(inputs.findingChoices);
+      if (!['go', 'no_go'].includes(recommendation) || (recommendation === 'go' && !findingIds.length)) {
+        throw new Error('Choose go or no-go; go requires selected human-reviewed finding evidence.');
+      }
+      scope.recommendation = recommendation; scope.finding_ids = findingIds;
+    }
+    const body = { project_id: context.project.id, task_id: null, kind: action === 'source_use' ? 'access' : 'direction', scope,
+      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(), priority: 50 };
+    const retry = pendingProgramReview?.context === context && pendingProgramReview.outcome === outcome && pendingProgramReview.action === action ? pendingProgramReview : null;
+    const commandBody = retry?.body ?? body;
+    if (!retry) pendingProgramReview = { context, outcome, action, body: commandBody };
+    button.disabled = true;
+    try {
+      await command(`program-review:${context.study.id}:${outcome}:${action}`, commandBody,
+        (id, key) => api.createDecision(id, commandBody, key), () => programReviewCurrent(context));
+      if (!programReviewCurrent(context)) return;
+      pendingProgramReview = null;
+      $('program-review-dialog').close(); event.target.reset();
+      try {
+        await loadProgramContext(context); await loadDecisions(true);
+        notice('Program review request recorded for human review. It grants no data release, execution, or scientific conclusion.');
+      } catch {
+        notice('Program review request was recorded, but its refreshed history is unavailable. Refresh before authoring or resolving another review.');
+      }
+    } catch (error) {
+      if (/\(409\)/.test(error.message)) {
+        pendingProgramReview = null;
+        throw new Error('Program evidence or proposal lineage is stale. Reinspect and author a complete replacement.');
+      }
+      if (/outcome is unknown/i.test(error.message)) {
+        throw new Error('Program-review outcome is unknown. Reopen or retry this same request after inspecting current history; its command identifier and immutable basis are retained.');
+      }
+      pendingProgramReview = null;
+      throw error;
+    } finally { if (programReviewCurrent(context)) button.disabled = !canMutate(); }
   });
 });
 $('variant-form').addEventListener('submit', event => {
@@ -2017,6 +3322,7 @@ $('coordinator-form').addEventListener('submit', event => {
       prompt, experiment_id: statusReference.record_id, expected_design_revision: statusReference.expected_revision } :
       { expected_conversation_revision: coordinatorConversationRevision,
         prompt: `[${mode}]\n${prompt}`, selected_context: selectedCoordinatorContext.map(reference => ({ ...reference })) };
+    const busy = { version, project }; coordinatorBusy = busy;
     button.disabled = true;
     try {
       await command(`coordinator:${project.id}:${mode}`, body,
@@ -2031,7 +3337,10 @@ $('coordinator-form').addEventListener('submit', event => {
         throw new Error('The selected coordinator context or conversation revision is stale. Refresh before requesting another turn.');
       }
       throw error;
-    } finally { if (version === epoch && project === activeProject) button.disabled = !canMutate(); }
+    } finally {
+      if (coordinatorBusy === busy) coordinatorBusy = null;
+      if (version === epoch && project === activeProject) button.disabled = !canMutate() || !coordinatorAvailable;
+    }
   });
 });
 $('conversation-view').addEventListener('click', () => { workbenchView = 'conversation'; renderWorkbenchEntries(); });
@@ -2039,9 +3348,31 @@ $('labbook-view').addEventListener('click', () => { workbenchView = 'labbook'; r
 $('refresh').addEventListener('click', () => guarded(async () => {
   await loadProjects(true); if (activeProject) await selectProject(activeProject);
 }));
+$('recovery-form').addEventListener('submit', event => {
+  event.preventDefault(); guarded(async () => {
+    const context = recoveryCommandContext;
+    if (!context || context.version !== epoch || context.project !== activeProject || context.requestVersion !== readVersion.remoteWorkflows) {
+      throw new Error('Remote workflow context changed; inspect recovery again.');
+    }
+    const grant = await api.executionGrant(connectionId, context.workflow.grant_id);
+    if (!grant || grant.id !== context.workflow.grant_id || grant.project_id !== context.project.id || !isPositiveInteger(grant.revision)) {
+      throw new Error('The current grant does not match this project recovery record.');
+    }
+    const body = { expected_grant_revision: grant.revision, expected_recovery_revision: context.record.revision,
+      operation_id: context.workflow.operation_id, request_cancellation: true };
+    await command(`recovery-cancel:${context.workflow.operation_id}`, body,
+      (id, key) => api.reconcileLostWorkerOperation(id, context.workflow.grant_id, body, key),
+      () => context.version === epoch && context.project === activeProject && context.requestVersion === readVersion.remoteWorkflows);
+    if (context.version === epoch && context.project === activeProject) {
+      $('recovery-dialog').close(); await loadRemoteWorkflows(true);
+      notice('Recovery cancellation requested. Termination and exposure remain unresolved until independently reconciled evidence is recorded.');
+    }
+  });
+});
 $('projects-more').addEventListener('click', () => guarded(() => loadProjects()));
 $('tasks-more').addEventListener('click', () => guarded(() => loadTasks()));
 $('workers-more').addEventListener('click', () => guarded(() => loadWorkers()));
+$('artifacts-more').addEventListener('click', () => guarded(() => loadArtifacts()));
 $('events-more').addEventListener('click', () => guarded(() => loadEvents()));
 $('threads-more').addEventListener('click', () => guarded(() => loadThreads()));
 $('messages-more').addEventListener('click', () => guarded(() => loadMessages()));
@@ -2049,6 +3380,19 @@ $('decisions-more').addEventListener('click', () => guarded(() => loadDecisions(
 $('experiments-more').addEventListener('click', () => guarded(() => loadExperiments()));
 $('remote-workflows-more').addEventListener('click', () => guarded(() => loadRemoteWorkflows()));
 $('studies-more').addEventListener('click', () => guarded(() => loadStudies()));
+ $('namespace-setup').addEventListener('click', () => {
+   clearNamespaceSetup(); $('namespace-dialog').showModal();
+ });
+ $('namespace-kubeconfig-select').addEventListener('click', () => namespaceWork(selectNamespaceKubeconfig));
+ $('namespace-form').addEventListener('submit', event => {
+   event.preventDefault(); namespaceWork(inspectNamespace);
+ });
+ $('namespace-use-existing').addEventListener('click', () => namespaceWork(() => planNamespace('use-existing')));
+ $('namespace-create-plan').addEventListener('click', () => namespaceWork(() => planNamespace('create-dedicated')));
+ $('namespace-confirm-form').addEventListener('submit', event => {
+   event.preventDefault(); namespaceWork(confirmNamespace);
+ });
+ $('namespace-reconcile').addEventListener('click', () => namespaceWork(reconcileNamespace));
 if (!api) {
   $('connection-open').disabled = true;
   notice('Open this workspace in the Tessera desktop application.');

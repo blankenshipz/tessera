@@ -30,24 +30,506 @@ function fixture(overrides = {}) {
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
     harnessSessionBinding: async () => null, enqueueHarnessDelivery: async () => ({ id: 'message' }), cancelHarnessDelivery: async () => ({}),
     astraConversation: async () => ({ conversation: null, messages: [] }), astraProposals: async () => ({ proposals: [] }),
+    coordinatorConsumerStatus: async () => ({ availability: 'available', health: 'healthy', freshness: 'fresh', credential_status: 'active', credential_expires_at: null, heartbeat_at: '2026-01-01T00:00:00Z', last_outcome: 'idle', observed_consumers: 1, provider_disabled: true, provider_enabled: false }),
     explainStatusTurns: async () => ({ turns: [] }), requestCoordinatorTurn: async () => ({}), requestExplainStatusTurn: async () => ({}),
     registerProposalDesign: async () => ({ execution_authorized: false }),
+    namespaceSelectKubeconfig: async () => ({ state: 'selected', reference: '1'.repeat(8) + '-1111-4111-8111-111111111111', name: 'kubeconfig' }),
+    namespaceInspect: async () => ({ state: 'absent', uid: null, resourceVersion: null, target: { kubeconfigReferenceSha256: 'a'.repeat(64), context: 'team/admin@prod', server: 'https://cluster.test', caSha256: 'b'.repeat(64), clusterUid: 'cluster-uid', namespace: 'astra-system' } }),
+    namespacePlanUseExisting: async () => ({ planId: 'plan-existing', mode: 'use-existing', digest: 'c'.repeat(64), expiresAt: '2030-01-01T00:00:00Z' }),
+    namespacePlanCreate: async () => ({ planId: 'plan-create', mode: 'create-dedicated', digest: 'c'.repeat(64), expiresAt: '2030-01-01T00:00:00Z' }),
+    namespaceCreate: async () => ({ state: 'namespace_created_control_plane_not_installed', uid: 'namespace-uid', resourceVersion: '9' }),
+    namespaceReconcile: async () => ({ state: 'namespace_created_control_plane_not_installed', uid: 'namespace-uid', resourceVersion: '9' }),
+    namespaceClear: async () => {},
     studySelection: async () => {},
-    recovery: async () => ({ state: 'active', recovery_hold: false }),
-    decisions: async () => ({ decisions: [] }), experiments: async () => ({ experiments: [] }), remoteWorkflows: async () => ({ remote_workflows: [] }), remoteWorkflow: async () => null, executionGrant: async () => ({ id: 'grant_1', revision: 1, status: 'active' }), revokeExecutionGrant: async () => ({}), studies: async () => ({ studies: [] }),
+    recovery: async () => ({ state: 'active', recovery_hold: false }), artifacts: async () => ({ artifacts: [] }),
+    decisions: async () => ({ decisions: [] }), programContext: async (_connection, studyId) => ({ study_id: studyId, project_id: 'p1', basis_digest: 'a'.repeat(64), basis: { sources: [], variants: [], findings: [] }, reviews: [], condition_catalog: { outcome_0: ['direct_property_language'], outcome_1: ['unified_mixture_schema'] }, execution_granted: false, scientific_validity: 'not_assessed' }), experiments: async () => ({ experiments: [] }), remoteWorkflows: async () => ({ remote_workflows: [] }), remoteWorkflow: async () => null, executionGrant: async () => ({ id: 'grant_1', revision: 1, status: 'active' }), revokeExecutionGrant: async () => ({}), studies: async () => ({ studies: [] }),
     createStudy: async () => ({ id: 's-created', purpose: 'Created', protocol: 'Protocol', mode: 'exploratory', status: 'open', revision: 1, project_id: 'p1' }),
     registerVariant: async () => ({ id: 'v-created' }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
-  const context = vm.createContext({ window: { tessera: api },
-    document: { getElementById: get, createElement: tag => new Element(tag), querySelectorAll: () => [] },
+  const context = vm.createContext({ window: { tessera: api }, atob: globalThis.atob, TextDecoder, Uint8Array,
+    document: { getElementById: get, createElement: tag => new Element(tag), querySelectorAll: selector => {
+      if (selector === '#conclusion-evidence input') return findAll(get('conclusion-evidence'), node => node.tagName === 'input');
+      return selector.split(',').flatMap(part => {
+        const match = /^#([a-z-]+) button$/.exec(part.trim());
+        return match ? findAll(get(match[1]), node => node.tagName === 'button') : [];
+      });
+    } },
     FormData: class { constructor(form) { this.fields = { ...form.fields }; } get(name) { return this.fields[name]; } },
   });
   const source = readFileSync(new URL('../renderer.mjs', import.meta.url), 'utf8');
-  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, applyConnectionHealth, guarded, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadExperiments, selectExperiment, loadRemoteWorkflows, loadStudies, selectStudy, loadEvents, loadWorkbench, renderWorkbenchEntries, clearContext, state: () => ({ activeProject, activeThread, activeExperiment, activeStudy, activeHarnessBinding, coordinatorConversationRevision, selectedCoordinatorContext: [...selectedCoordinatorContext] }) };', context);
+  vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, applyConnectionHealth, guarded, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadExperiments, selectExperiment, loadRemoteWorkflows, loadStudies, selectStudy, loadEvents, loadWorkbench, renderWorkbenchEntries, clearContext, clearNamespaceSetup, namespaceWork, selectNamespaceKubeconfig, inspectNamespace, planNamespace, confirmNamespace, reconcileNamespace, state: () => ({ activeProject, activeThread, activeExperiment, activeStudy, activeHarnessBinding, namespaceContext, coordinatorConversationRevision, selectedCoordinatorContext: [...selectedCoordinatorContext] }) };', context);
   return { ...context.hooks, get, api, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
 }
 const thread = id => ({ id, title: id });
 const project = id => ({ id, name: id });
+
+test('pending Connect ignores duplicate submissions without invalidating the first result', async () => {
+  const pending = deferred(); const calls = []; const recoveries = [];
+  const ui = fixture({ status: async () => null,
+    connect: async settings => { calls.push(settings); return pending.promise; },
+    recovery: async id => { recoveries.push(id); return { state: 'active', recovery_hold: false }; },
+    projects: async () => ({ projects: [] }) });
+  await flush();
+  ui.get('connection-form').fields = { name: 'Local', endpoint: 'http://127.0.0.1:60310' };
+  ui.submit('connection-form'); ui.submit('connection-form'); await flush();
+  assert.equal(calls.length, 1);
+  assert.equal(ui.get('connection-form').querySelector().disabled, true);
+  pending.resolve({ id: 'accepted', name: 'Local', endpoint: calls[0].endpoint, organizationId: 'org', health: 'online' });
+  await flush();
+  assert.deepEqual(recoveries, ['accepted']);
+  assert.equal(ui.get('disconnect').hidden, false);
+  assert.equal(ui.get('connection-form').querySelector().disabled, false);
+  assert.equal(ui.get('welcome-project-new').hidden, false);
+});
+
+for (const outcome of ['cancelled', 'failed']) {
+  test(`Connect restores retained inputs and allows retry after ${outcome}`, async () => {
+    const pending = deferred(); let calls = 0;
+    const ui = fixture({ status: async () => null, projects: async () => ({ projects: [] }),
+      connect: async () => { calls++; return calls === 1 ? pending.promise : { id: 'retry', name: 'Local', endpoint: 'http://127.0.0.1:60310', organizationId: 'org', health: 'online' }; } });
+    await flush();
+    const fields = { name: 'Local', endpoint: 'http://127.0.0.1:60310' };
+    ui.get('connection-form').fields = fields;
+    ui.submit('connection-form'); ui.submit('connection-form'); await flush();
+    if (outcome === 'failed') pending.reject(new Error('Connection failed.')); else pending.resolve(null);
+    await flush();
+    assert.equal(calls, 1);
+    assert.equal(ui.get('connection-form').querySelector().disabled, false);
+    assert.deepEqual(ui.get('connection-form').fields, fields);
+    ui.submit('connection-form'); await flush();
+    assert.equal(calls, 2);
+    assert.equal(ui.get('welcome-project-new').hidden, false);
+  });
+}
+
+async function artifactSaveFixture(saveReleasedArtifact) {
+  const ui = fixture({ saveReleasedArtifact,
+    releasedArtifactManifest: async () => ({ manifest: { id: 'manifest_1', project_id: 'p1' } }),
+    artifactPreview: async () => ({ artifact_id: 'artifact_1', relative_path: 'result.txt', sha256: 'a'.repeat(64),
+      size: 1, preview_base64: 'eA==', preview_bytes: 1, truncated: false, status: 'quarantined', classification: 'unclassified' }) });
+  await ui.selectProject(project('p1'));
+  ui.get('artifact-review').listeners.click(); await flush();
+  ui.get('artifact-form').fields = { manifest_id: 'manifest_1', artifact_id: 'artifact_1' };
+  ui.submit('artifact-form'); await flush();
+  return ui;
+}
+
+for (const change of ['project', 'disconnect']) {
+  for (const outcome of ['saved', 'cancelled', 'stale', 'rejected']) {
+    test(`artifact save ${outcome} stays quiet after ${change} changes`, async () => {
+      const pending = deferred(); let calls = 0;
+      const ui = await artifactSaveFixture(async () => { calls++; return pending.promise; });
+      ui.get('artifact-download').listeners.click(); ui.get('artifact-download').listeners.click(); await flush();
+      assert.equal(calls, 1);
+      assert.equal(ui.get('artifact-download').disabled, true);
+      if (change === 'project') await ui.selectProject(project('p2')); else ui.clearContext();
+      const notice = ui.get('notice').textContent;
+      if (outcome === 'rejected') pending.reject(new Error('Old request failed.'));
+      else pending.resolve({ status: outcome, sha256: 'b'.repeat(64), basename: 'old-result.txt' });
+      await flush();
+      assert.equal(ui.get('notice').textContent, notice);
+      assert.equal(ui.get('artifact-download').disabled, true);
+    });
+  }
+}
+
+for (const outcome of ['saved', 'cancelled', 'stale', 'rejected']) {
+  test(`artifact save ${outcome} restores eligibility after offline completion and reconnect`, async () => {
+    const pending = deferred(); let calls = 0;
+    const ui = await artifactSaveFixture(async () => { calls++; return pending.promise; });
+    let health = 'online';
+    const state = () => ({ id: 'connection', name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health });
+    ui.api.status = async () => state();
+    ui.get('artifact-download').listeners.click(); await flush();
+    health = 'offline'; ui.applyConnectionHealth(state());
+    assert.equal(ui.get('artifact-download').disabled, true);
+    if (outcome === 'rejected') pending.reject(new Error('Current request failed.'));
+    else pending.resolve({ status: outcome, sha256: 'a'.repeat(64), basename: 'result.txt' });
+    await flush();
+    assert.equal(ui.get('artifact-download').disabled, true, 'offline overlay must remain');
+    health = 'online'; ui.applyConnectionHealth(state());
+    assert.equal(ui.get('artifact-download').disabled, false, 'completed busy state must not survive reconnect');
+    ui.get('artifact-download').listeners.click(); await flush();
+    assert.equal(calls, 2, 'current preview can be saved again without reload');
+  });
+}
+
+test('artifact reconnect cannot enable a still-pending save', async () => {
+  const pending = deferred(); let calls = 0;
+  const ui = await artifactSaveFixture(async () => { calls++; return pending.promise; });
+  ui.get('artifact-download').listeners.click(); await flush();
+  const state = { id: 'connection', name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org' };
+  ui.applyConnectionHealth({ ...state, health: 'offline' });
+  ui.applyConnectionHealth({ ...state, health: 'online' });
+  assert.equal(ui.get('artifact-download').disabled, true);
+  ui.get('artifact-download').listeners.click(); await flush();
+  assert.equal(calls, 1);
+  pending.resolve({ status: 'cancelled' }); await flush();
+  assert.equal(ui.get('artifact-download').disabled, false);
+});
+
+test('offline artifact completion cannot restore eligibility for a different project', async () => {
+  const pending = deferred();
+  const ui = await artifactSaveFixture(async () => pending.promise);
+  ui.get('artifact-download').listeners.click(); await flush();
+  const state = { id: 'connection', name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org' };
+  ui.applyConnectionHealth({ ...state, health: 'offline' });
+  await ui.selectProject(project('p2'));
+  pending.resolve({ status: 'saved', sha256: 'a'.repeat(64), basename: 'old-result.txt' }); await flush();
+  ui.applyConnectionHealth({ ...state, health: 'online' });
+  assert.equal(ui.get('artifact-download').disabled, true);
+  assert.doesNotMatch(ui.get('notice').textContent, /Saved exact released/);
+});
+
+for (const outcome of ['saved', 'cancelled', 'stale', 'mismatch', 'rejected']) {
+  test(`current artifact save handles ${outcome} and restores its button`, async () => {
+    const pending = deferred(); let calls = 0;
+    const ui = await artifactSaveFixture(async () => { calls++; return pending.promise; });
+    const notice = ui.get('notice').textContent;
+    ui.get('artifact-download').listeners.click(); ui.get('artifact-download').listeners.click(); await flush();
+    assert.equal(calls, 1);
+    if (outcome === 'rejected') pending.reject(new Error('Current request failed.'));
+    else pending.resolve({ status: outcome === 'mismatch' ? 'saved' : outcome,
+      sha256: (outcome === 'mismatch' ? 'b' : 'a').repeat(64), basename: 'result.txt' });
+    await flush();
+    assert.equal(ui.get('artifact-download').disabled, false);
+    if (outcome === 'saved') assert.match(ui.get('notice').textContent, /Saved exact released artifact bytes: result.txt/);
+    if (outcome === 'cancelled') assert.match(ui.get('notice').textContent, /Artifact retrieval cancelled/);
+    if (outcome === 'stale') assert.equal(ui.get('notice').textContent, notice);
+    if (outcome === 'mismatch') assert.match(ui.get('notice').textContent, /integrity check failed/);
+    if (outcome === 'rejected') assert.match(ui.get('notice').textContent, /Current request failed/);
+  });
+}
+
+test('disconnected onboarding gives local commands and treats namespace setup as optional', async () => {
+  const ui = fixture({ status: async () => null }); await flush();
+  assert.equal(ui.get('local-control-start').hidden, false);
+  assert.match(ui.get('journey-next').textContent, /init-once and serve.*owner.header.*optional/);
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /tessera init --state-dir &quot;|tessera init --state-dir "/);
+  assert.match(html, /tessera serve --state-dir "\$HOME\/\.local\/state\/tessera-alpha" --port 8765/);
+  assert.match(html, /On later launches, run only serve/);
+  assert.match(html, /id="journey-next"[^>]*>Next: Follow the init-once and serve/);
+  assert.match(html, /Optional advanced setup: Kubernetes namespace/);
+  assert.match(html, /does not start a backend automatically or grant execution authority/);
+});
+
+async function adminFixture(overrides = {}) {
+  const identity = { id: 'connection', name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', principalId: 'human', role: 'human', health: 'online' };
+  const ui = fixture({ connect: async () => identity, status: async () => identity,
+    projects: async () => ({ projects: [] }),
+    adminWorkspace: async () => ({ records: [], next_offset: null, held: false, root_admin: true, control_status: 'ready', observed_at: '2026-09-23T00:00:00Z' }),
+    adminAudit: async () => ({ events: [] }), ...overrides });
+  ui.get('connection-form').fields = { name: 'Fixture', endpoint: identity.endpoint };
+  ui.submit('connection-form'); await flush();
+  await ui.selectProject(project('p1'));
+  ui.get('admin-open').listeners.click(); await flush();
+  return ui;
+}
+
+test('admin secret form previews only fake metadata and requires explicit confirmation', async () => {
+  const calls = [];
+  const ui = await adminFixture({ adminCreate: async (...args) => { calls.push(args); return {}; } });
+  ui.get('admin-secrets').listeners.click(); await flush();
+  ui.get('admin-secret-form').fields = { purpose: 'salad_management', minutes: '15' };
+  ui.submit('admin-secret-form'); await flush();
+  assert.equal(calls.length, 0);
+  assert.equal(ui.get('admin-preview').hidden, false);
+  const preview = JSON.parse(ui.get('admin-preview-body').textContent);
+  assert.equal(preview.spec.backend, 'fake');
+  assert.equal(preview.spec.audience, 'server_proxy');
+  assert.equal(preview.spec.provider, 'salad');
+  assert.equal('value' in preview.spec, false);
+  ui.get('admin-confirm').listeners.click(); await flush();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], 'connection'); assert.equal(calls[0][1], 'p1');
+  assert.equal(calls[0][3], 'command');
+  assert.equal(ui.get('admin-preview').hidden, true);
+  assert.equal(ui.get('admin-preview-body').textContent, '');
+  assert.match(ui.get('admin-status').textContent, /provider DISABLED/);
+});
+
+test('protected enrollment renderer passes metadata only, no secret field, and discards stale confirmation', async () => {
+  const reply = deferred(), calls = [], contexts = [];
+  const record = { id: 'admin_' + 'a'.repeat(32), project_id: 'p1', revision: 2, version: 1,
+    enrollment_id: 'b'.repeat(32), spec: { kind: 'secret', backend: 'os_keychain', provider: 'salad', purpose: 'salad_management', audience: 'server_proxy' },
+    state: 'approved', proposed_by: 'different_human', health: 'unknown', versions: [] };
+  const ui = await adminFixture({ secretContext: async (...args) => contexts.push(args),
+    adminWorkspace: async () => ({ records: [record], next_offset: null, root_admin: true, held: false }),
+    protectedSecret: (...args) => { calls.push(args); return reply.promise; } });
+  ui.get('admin-secrets').listeners.click(); await flush();
+  find(ui.get('admin-records'), n => n.textContent === 'Enroll secret — native hidden prompt').listeners.click(); await flush();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Object.keys(calls[0][1]).sort(), ['enrollment_id', 'expected_revision', 'operation', 'project_id', 'record_id']);
+  assert.equal(calls[0][1].operation, 'enroll');
+  await ui.selectProject(project('p2'));
+  reply.resolve({ state: 'active', version: 1, providerEnabled: false }); await flush();
+  assert.equal(ui.get('admin-records').children.length, 0);
+  assert.doesNotMatch(ui.get('admin-status').textContent, /Protected operation: active/);
+  assert.deepEqual(contexts.at(-1), ['connection', 'p2']);
+  ui.clearContext(); await flush();
+  assert.deepEqual(contexts.at(-1), ['connection', null]);
+});
+
+test('protected proposal renderer binds purpose and provider without capturing input value', async () => {
+  const ui = await adminFixture();
+  ui.get('admin-secret-form').fields = { backend: 'os_keychain', purpose: 'ai_gateway', minutes: '15' };
+  ui.submit('admin-secret-form'); await flush();
+  const preview = JSON.parse(ui.get('admin-preview-body').textContent);
+  assert.equal(preview.spec.backend, 'os_keychain');
+  assert.equal(preview.spec.purpose, 'ai_gateway'); assert.equal(preview.spec.provider, 'ai_gateway');
+  assert.equal(preview.spec.audience, 'gateway');
+  assert.deepEqual(Object.keys(preview.spec).sort(), ['audience', 'backend', 'expires_at', 'kind', 'provider', 'purpose']);
+});
+
+test('admin approval is exact-revision, no self-review and readiness stays blocked', async () => {
+  const calls = [];
+  const record = { id: 'admin_1', project_id: 'p1', spec: { kind: 'configuration', component: 'execution_target', provider: 'salad' }, state: 'proposed', proposed_by: 'agent', revision: 3, version: 0, health: 'unknown', verification: 'unknown' };
+  const ui = await adminFixture({ adminWorkspace: async () => ({ records: [record], next_offset: null, root_admin: true, held: false }), adminCommand: async (...args) => { calls.push(args); record.state = 'approved'; record.revision++; return record; } });
+  ui.get('admin-targets').listeners.click(); await flush();
+  assert.equal(calls.length, 0);
+  find(ui.get('admin-records'), n => n.textContent === 'Review approval').listeners.click(); await flush();
+  assert.equal(calls.length, 0);
+  ui.get('admin-confirm').listeners.click(); await flush();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0][3])), { expected_revision: 3, action: 'approve' });
+  assert.equal(find(ui.get('admin-records'), n => n.textContent === 'Enable live — unavailable').disabled, true);
+  assert.ok(find(ui.get('admin-records'), n => n.textContent.includes('verification unknown')));
+  record.state = 'proposed'; record.proposed_by = 'human';
+  ui.get('admin-refresh').listeners.click(); await flush();
+  assert.equal(find(ui.get('admin-records'), n => n.textContent === 'Review approval'), null);
+});
+
+test('admin pending key, stale reads, disconnect and held recovery cannot dispatch', async () => {
+  const calls = [], key = deferred(), read = deferred();
+  const ui = await adminFixture({ commandId: () => key.promise, adminCreate: async (...args) => calls.push(args) });
+  ui.get('admin-secret-form').fields = { purpose: 'ai_gateway', minutes: '15' };
+  ui.submit('admin-secret-form'); await flush();
+  ui.get('admin-confirm').listeners.click(); await flush();
+  await ui.selectProject(project('p2'));
+  key.resolve('key'); await flush();
+  assert.equal(calls.length, 0); assert.equal(ui.get('admin-preview-body').textContent, '');
+  ui.api.adminWorkspace = () => read.promise;
+  ui.get('admin-open').listeners.click(); await flush();
+  ui.clearContext();
+  read.resolve({ records: [{ id: 'wrong-context' }] }); await flush();
+  assert.equal(ui.get('admin-records').children.length, 0);
+  assert.equal(ui.get('admin-workspace').hidden, true);
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  ui.get('admin-secret-form').fields = { purpose: 'ai_gateway', minutes: '15' };
+  ui.submit('admin-secret-form'); await flush();
+  assert.equal(calls.length, 0);
+  assert.equal(ui.get('admin-preview').hidden, true);
+});
+
+test('admin uncertain submission is not replayed and clears the preview', async () => {
+  let calls = 0;
+  const ui = await adminFixture({ adminCreate: async () => { calls++; throw new Error('Command outcome is unknown.'); } });
+  ui.get('admin-secret-form').fields = { purpose: 'monitor', minutes: '15' };
+  ui.submit('admin-secret-form'); await flush();
+  ui.get('admin-confirm').listeners.click(); await flush();
+  ui.get('admin-confirm').listeners.click(); await flush();
+  assert.equal(calls, 1);
+  assert.equal(ui.get('admin-preview-body').textContent, '');
+  assert.match(ui.get('admin-status').textContent, /Refresh history/);
+});
+
+test('null-spec draft stays visible and editable without inventing an execution specification', async () => {
+  const task = { id: 'task_1', project_id: 'p1', plan_digest: 'a'.repeat(64), revision: 1, status: 'draft' };
+  const plan = { ...task, task_id: task.id, title: 'Draft question', purpose: 'Purpose', budget_cents: 0, max_duration_seconds: 120, execution_spec: null };
+  const calls = [];
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan, reviseTaskPlan: async (...args) => { calls.push(args); return {}; } });
+  ui.applyConnectionHealth(await ui.api.status());
+  await ui.selectProject(project('p1')); await flush();
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('Not yet supplied')));
+  const revise = find(ui.get('tasks'), n => n.textContent === 'Revise this proposal');
+  assert.ok(revise); revise.listeners.click(); await flush();
+  assert.equal(ui.get('task-revise-dialog').open, true);
+  const form = ui.get('task-revise-form');
+  assert.equal(form.fields.input_snapshot_digest, ''); assert.equal(form.fields.argv, '[]');
+  assert.equal(form.fields.max_output_bytes, 1);
+  form.fields = { ...form.fields, argv: '["fixture"]', input_snapshot_digest: 'b'.repeat(64), output_paths: '["result.json"]' };
+  ui.submit('task-revise-form'); await flush();
+  assert.equal(calls.length, 1); assert.equal(calls[0][2].expected_revision, 1);
+  assert.equal(calls[0][2].execution_spec.network_enabled, false);
+  assert.match(ui.get('notice').textContent, /no admission, dispatch, or run/);
+});
+
+test('approved task revision 3 retains immutable plan revision 2; wrong digest or revision fails closed', async () => {
+  const task = { id: 'task_1', project_id: 'p1', plan_digest: 'a'.repeat(64), revision: 3, status: 'approved' };
+  const plan = { ...task, revision: 2, task_id: task.id, title: 'Reviewed plan', purpose: 'Purpose', execution_spec: {
+    argv: ['fixture'], pinned_skill_digests: [], output_paths: [], network_enabled: false,
+  } };
+  const revisions = [];
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan, reviseTaskPlan: async (...args) => { revisions.push(args); return {}; } });
+  ui.applyConnectionHealth(await ui.api.status());
+  await ui.selectProject(project('p1')); await flush();
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('task revision 3 · plan revision 2')));
+  assert.equal(find(ui.get('tasks'), n => n.textContent === 'Plan approved').disabled, true);
+  find(ui.get('tasks'), n => n.textContent === 'Include plan in coordinator context').listeners.click(); await flush();
+  assert.equal(ui.state().selectedCoordinatorContext[0].expected_revision, 3);
+  find(ui.get('tasks'), n => n.textContent === 'Revise this proposal').listeners.click(); await flush();
+  ui.submit('task-revise-form'); await flush();
+  assert.equal(revisions.length, 1);
+  assert.equal(revisions[0][2].expected_revision, 3);
+  for (const invalid of [{ ...plan, revision: 3 }, { ...plan, plan_digest: 'b'.repeat(64) }]) {
+    ui.api.taskPlan = async () => invalid;
+    await ui.selectProject(project('p1')); await flush();
+    assert.equal(find(ui.get('tasks'), n => n.textContent === 'Plan approved'), null);
+    assert.ok(find(ui.get('tasks'), n => n.textContent.includes('Approval is unavailable')));
+  }
+});
+
+test('health ticks preserve approved task3/plan2 authority fences and recover eligible edit controls', async () => {
+  const task = { id: 'task_1', project_id: 'p1', plan_digest: 'a'.repeat(64), revision: 3, status: 'approved' };
+  const plan = { ...task, revision: 2, task_id: task.id, title: 'Reviewed plan', purpose: 'Purpose', execution_spec: null };
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan });
+  const online = await ui.api.status(); ui.applyConnectionHealth(online);
+  await ui.selectProject(project('p1')); await flush();
+  const approved = find(ui.get('tasks'), n => n.textContent === 'Plan approved');
+  const revise = find(ui.get('tasks'), n => n.textContent === 'Revise this proposal');
+  assert.equal(approved.disabled, true); assert.equal(revise.disabled, false);
+  ui.applyConnectionHealth(online);
+  assert.equal(approved.disabled, true); assert.equal(revise.disabled, false);
+  ui.applyConnectionHealth({ ...online, health: 'offline' });
+  assert.equal(approved.disabled, true); assert.equal(revise.disabled, true);
+  ui.applyConnectionHealth(online);
+  assert.equal(approved.disabled, true); assert.equal(revise.disabled, false);
+  revise.listeners.click(); await flush();
+  assert.equal(ui.get('task-revise-dialog').open, true);
+  assert.equal(ui.get('task-revise-form').fields.input_snapshot_digest, '');
+  assert.equal(approved.disabled, true);
+});
+
+test('health availability cannot loosen expired, read-only, ineligible or busy action states', async () => {
+  const ui = fixture(); const online = await ui.api.status(); ui.applyConnectionHealth(online);
+  await ui.selectProject(project('p1')); await flush();
+  const controls = [];
+  for (const id of ['tasks', 'decisions', 'events', 'admin-records', 'remote-workflows', 'study-detail']) {
+    const ineligible = new Element('button'); ineligible.disabled = true; ineligible.textContent = 'Read-only or expired';
+    const eligible = new Element('button'); eligible.disabled = false; eligible.textContent = 'Eligible';
+    ui.get(id).append(ineligible, eligible); controls.push({ ineligible, eligible });
+  }
+  const busy = ui.get('task-form').querySelector('button[type="submit"]'); busy.disabled = true;
+  ui.applyConnectionHealth(online);
+  for (const { ineligible, eligible } of controls) { assert.equal(ineligible.disabled, true); assert.equal(eligible.disabled, false); }
+  assert.equal(busy.disabled, true);
+  ui.applyConnectionHealth({ ...online, health: 'offline' });
+  for (const { ineligible, eligible } of controls) { assert.equal(ineligible.disabled, true); assert.equal(eligible.disabled, true); }
+  ui.applyConnectionHealth(online);
+  for (const { ineligible, eligible } of controls) { assert.equal(ineligible.disabled, true); assert.equal(eligible.disabled, false); }
+  assert.equal(busy.disabled, true);
+});
+
+test('verified coordinator availability recovers eligibility without releasing an in-flight composer', async () => {
+  const pending = deferred(); let calls = 0;
+  const ui = fixture({ requestCoordinatorTurn: async () => { calls++; return pending.promise; } });
+  const online = await ui.api.status(); ui.applyConnectionHealth(online);
+  await ui.selectProject(project('p1')); await flush();
+  const form = ui.get('coordinator-form'); const submit = form.querySelector('button[type="submit"]');
+  assert.equal(submit.disabled, false);
+  form.fields = { mode: 'Discuss', prompt: 'Keep this proposal-only.' };
+  ui.submit('coordinator-form'); await flush();
+  assert.equal(calls, 1); assert.equal(submit.disabled, true);
+  ui.applyConnectionHealth(online); ui.submit('coordinator-form'); await flush();
+  assert.equal(submit.disabled, true); assert.equal(calls, 1);
+  pending.resolve({}); await flush();
+  assert.equal(submit.disabled, false);
+});
+
+test('offline control snapshots cannot enable actions in a changed context', async () => {
+  const task = { id: 'task_1', project_id: 'p1', plan_digest: 'a'.repeat(64), revision: 1, status: 'draft' };
+  const plan = { ...task, task_id: task.id, title: 'Draft', purpose: 'Purpose', execution_spec: null };
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan });
+  const online = await ui.api.status(); ui.applyConnectionHealth(online);
+  await ui.selectProject(project('p1')); await flush();
+  const approve = find(ui.get('tasks'), n => n.textContent === 'Approve this plan');
+  assert.equal(approve.disabled, false);
+  ui.applyConnectionHealth({ ...online, health: 'offline' });
+  await ui.selectProject(project('p1')); await flush();
+  ui.applyConnectionHealth(online);
+  assert.equal(find(ui.get('tasks'), n => n.textContent === 'Approve this plan').disabled, true);
+  await ui.selectProject(project('p1')); await flush();
+  assert.equal(find(ui.get('tasks'), n => n.textContent === 'Approve this plan').disabled, false);
+});
+
+test('workflow guide tracks disconnected, connected, project and held contexts truthfully', async () => {
+  const ui = fixture();
+  ui.clearContext();
+  assert.match(ui.get('journey-next').textContent, /init-once and serve.*Connect with/);
+  await connectFixture(ui);
+  assert.match(ui.get('journey-next').textContent, /Select an existing project/);
+  const selection = ui.selectProject(project('p1'));
+  assert.match(ui.get('journey-next').textContent, /admission and dispatch are separate/);
+  await selection; await flush();
+  assert.match(ui.get('journey-next').textContent, /admission and dispatch are separate/);
+  ui.applyRecoveryStatus({ state: 'held_restore', recovery_hold: true });
+  assert.match(ui.get('journey-next').textContent, /recovery hold/);
+});
+
+test('autonomy task projection shows unknown and receipts as text, discards stale reads', async () => {
+  const task = { id: 'task_1', project_id: 'p1', plan_digest: 'a'.repeat(64), revision: 1, status: 'draft' };
+  const plan = { ...task, task_id: task.id, title: 'Task', purpose: 'Purpose', execution_spec: {
+    argv: ['fixture'], pinned_skill_digests: [], output_paths: [], network_enabled: false,
+  } };
+  const response = { sessions: [{ id: 'autonomy_1', task_id: task.id, project_id: 'p1', org_id: 'org',
+    revision: 4, plan_digest: 'b'.repeat(64), state: 'unknown', pending_approval: false,
+    execution_enabled: false, provider_enabled: false, live_activation: 'blocked', actions: [],
+    blocked_reasons: ['unknown'], checkpoint: { question: '<script>never execute</script>' } }] };
+  const pending = deferred(); let calls = 0;
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan,
+    autonomySessions: async () => ++calls === 1 ? response : pending.promise });
+  ui.applyConnectionHealth(await ui.api.status());
+  await ui.selectProject(project('p1')); await flush();
+  const button = find(ui.get('tasks'), n => n.textContent === 'Inspect autonomy sessions');
+  assert.ok(button);
+  await button.listeners.click(); await flush();
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('unknown · revision 4')));
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('<script>never execute</script>')));
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('billing unknown')));
+  const late = button.listeners.click();
+  await ui.selectProject(project('p2')); await flush();
+  pending.resolve(response); await late;
+  assert.equal(find(ui.get('tasks'), n => n.textContent.includes('unknown · revision 4')), null);
+});
+test('remote execution panel reviews exact target, reports pending cancellation and fences stale reads', async () => {
+  const task = { id: 'task_1', project_id: 'p1', plan_digest: 'a'.repeat(64), revision: 1, status: 'draft' };
+  const plan = { ...task, task_id: task.id, title: 'Remote task', purpose: 'Fixture', execution_spec: {
+    argv: ['fixture'], pinned_skill_digests: [], output_paths: [], network_enabled: false,
+  } };
+  const route = { id: 'route_1', task_id: task.id, project_id: 'p1', org_id: 'org', revision: 1,
+    proposal_digest: 'b'.repeat(64), proposal: { selection: { target: 'salad_container' } },
+    provider_enabled: false, live_activation: 'blocked', state: 'proposed', desired: 'hold',
+    provider_status: 'not_queried', cancellation: 'not_requested', go_no_go: 'no_go_live_activation_blocked',
+    receipts: [{ log: '<script>not executable</script>' }], cost_cents: null };
+  const calls = []; const pending = deferred(); let stale = false;
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan,
+    remoteExecutions: async () => stale ? pending.promise : { routes: [route] },
+    remoteExecutionCommand: async (...args) => { calls.push(args); route.revision++; route.state = 'reviewed'; return route; } });
+  ui.applyConnectionHealth(await ui.api.status());
+  await ui.selectProject(project('p1')); await flush();
+  const inspect = find(ui.get('tasks'), n => n.textContent === 'Inspect / reconnect remote execution');
+  await inspect.listeners.click(); await flush();
+  assert.equal(calls.length, 0);
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('salad_container · proposed')));
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('<script>not executable</script>')));
+  const approve = find(ui.get('tasks'), n => n.textContent === 'Review and approve exact remote proposal');
+  assert.equal(approve.disabled, false);
+  approve.listeners.click(); await flush();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1], 'route_1');
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0][2])), { expected_revision: 1, proposal_digest: 'b'.repeat(64), command: 'approve' });
+  route.state = 'unknown'; route.cancellation = 'pending'; route.desired = 'stop'; route.provider_status = 'unknown';
+  await inspect.listeners.click(); await flush();
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('cancellation pending')));
+  assert.ok(find(ui.get('tasks'), n => n.textContent.includes('cost: unknown')));
+  stale = true;
+  const late = inspect.listeners.click();
+  await ui.selectProject(project('p2')); await flush();
+  pending.resolve({ routes: [route] }); await late;
+  assert.equal(find(ui.get('tasks'), n => n.textContent.includes('cancellation pending')), null);
+  assert.equal(calls.length, 1);
+});
 const remoteWorkflow = (state = 'unknown') => ({
   operation_id: 'a'.repeat(32), org_id: 'org', project_id: 'p1', task_id: 'task_1', grant_id: 'grant_1',
   lease_id: 'lease_1', worker_principal_id: 'worker_1', epoch: 2, experiment_attempt_id: 'attempt_1',
@@ -77,6 +559,55 @@ function findAll(node, predicate, result = []) {
 const pendingDecision = (id = 'd1', projectId = 'p1') => ({
   id, project_id: projectId, task_id: 't1', kind: 'spending', scope: { budget_cents: 100, access: 'public-data' },
   expires_at: '2030-01-01T00:00:00Z', expected_task_revision: 3, reviewer_principal_id: 'human', revision: 4,
+});
+
+test('research program inbox explains review-only scope and requires a human rationale', async () => {
+  const calls = [];
+  const decision = { ...pendingDecision(), task_id: null, kind: 'direction', scope: {
+    type: 'research_program', outcome: 'outcome_1', action: 'go_no_go', recommendation: 'no_go',
+    study_id: 's1', basis_digest: 'a'.repeat(64), supersedes_id: 'prior-review', reason: 'Unknown execution',
+  } };
+  const ui = fixture({ decisions: async () => ({ decisions: [decision] }),
+    resolveDecision: async (...args) => { calls.push(args); return {}; } });
+  await ui.selectProject(project('p1')); await flush();
+  const panel = ui.get('decisions');
+  assert.ok(find(panel, node => node.textContent.includes('outcome_1 · go_no_go · no_go')));
+  assert.ok(find(panel, node => node.textContent.includes('not a byte release')));
+  assert.ok(find(panel, node => node.textContent.includes('not reversed by an agent suggestion')));
+  const rationale = find(panel, node => node.tagName === 'textarea');
+  const approve = find(panel, node => node.textContent === 'Approve');
+  assert.equal(rationale.placeholder, 'Required human rationale');
+  approve.listeners.click(); await flush();
+  assert.equal(calls.length, 0);
+  assert.equal(approve.disabled, false);
+  rationale.value = 'Stop while termination remains unknown.';
+  approve.listeners.click(); await flush();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1].rationale, rationale.value);
+});
+test('program review authors a complete Outcome 0 plan from current records and keeps proposals, human decisions, and stale evidence distinct', async () => {
+  const calls = []; const source = { id: 'source_1', verdict: 'supported', uri: 'https://example.test/source' };
+  const variant = { id: 'variant_1', status: 'registered', name: 'Declared arm' };
+  const current = studyId => ({ study_id: studyId, project_id: 'p1', basis_digest: 'a'.repeat(64), basis: { sources: [source], variants: [variant], findings: [] },
+    reviews: [{ id: 'old_1', requester_principal_id: 'agent_1', status: 'approved', resolved_by_principal_id: 'human_1', rationale: 'Earlier human review.', basis_current: false, is_proposal_head: true, is_effective_review: false,
+      scope: { outcome: 'outcome_0', action: 'plan', basis_digest: 'b'.repeat(64), reason: 'Earlier proposal', supersedes_id: null } }],
+    condition_catalog: { outcome_0: ['direct_property_language'], outcome_1: ['unified_mixture_schema'] }, execution_granted: false, scientific_validity: 'not_assessed' });
+  const ui = fixture({ study: async () => ledger('s1', [variant]), programContext: async (_connection, studyId) => current(studyId),
+    createDecision: async (...args) => { calls.push(args); return { id: 'new_review' }; } });
+  await ui.selectProject(project('p1')); await ui.selectStudy({ id: 's1', project_id: 'p1', status: 'open' }); await flush();
+  const history = JSON.stringify(ui.get('program-review-detail'));
+  assert.match(history, /agent proposals/); assert.match(history, /Human decisions/); assert.match(history, /STALE EVIDENCE/);
+  ui.get('program-review').listeners.click(); await flush();
+  const form = ui.get('program-review-form');
+  form.fields = { outcome: 'outcome_0', action: 'plan', reason: 'Prespecify the bounded review.', objective: 'Measure a declared property.', hypothesis: 'The declared arm changes the property.', success_gate: 'A prespecified threshold.', failure_gate: 'A null or inconclusive result.', stop_gate: 'Stop at the declared limit.', target_domain: 'Declared domain.', provenance_policy: 'Retain source and method provenance.', budget_cents: '0', max_wall_seconds: '60', max_gpu_hours: '0', target: 'local_cpu', resources: 'One bounded CPU.', dataset_recommendation: 'Declared data only.', representation_recommendation: 'Declared representation.', split_recommendation: 'Hold out before review.', metric_recommendation: 'Record calibration.', uncertainty: 'Unknown external validity.', missing_prerequisites: '' };
+  for (const input of [...findAll(ui.get('program-data-sources'), node => node.dataset?.programChoiceId === 'source_1'), ...findAll(ui.get('program-conditions'), node => node.dataset?.programChoiceId === 'variant_1')]) input.checked = true;
+  const rationale = find(ui.get('program-conditions'), node => node.placeholder === 'Required condition rationale'); rationale.value = 'Selected as the declared test arm.';
+  ui.submit('program-review-form'); await flush();
+  assert.equal(calls.length, 1);
+  const body = calls[0][1]; assert.equal(body.kind, 'direction'); assert.equal(body.scope.supersedes_id, 'old_1');
+  assert.deepEqual(JSON.parse(JSON.stringify(body.scope.brief.data_source_ids)), ['source_1']);
+  assert.deepEqual(JSON.parse(JSON.stringify(body.scope.conditions.direct_property_language.variant_ids)), ['variant_1']);
+  assert.equal(body.scope.basis_digest, 'a'.repeat(64));
 });
 const ledger = (studyId = 's1', variants = []) => ({
   completeness: 'complete_in_scope_study_ledger',
@@ -140,6 +671,185 @@ const experimentLedger = (id = 'e1', projectId = 'p1') => {
   };
 };
 
+async function connectFixture(ui, projects = []) {
+  ui.api.connect = async () => ({ id: 'connection', name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health: 'online' });
+  ui.api.recovery = async () => ({ state: 'active', recovery_hold: false });
+  ui.api.projects = async () => ({ projects });
+  ui.get('connection-form').fields = { name: 'Fixture', endpoint: 'http://127.0.0.1:8765' };
+  ui.submit('connection-form');
+  await flush();
+}
+
+test('onboarding keeps disconnected and connected-without-project states distinct', async () => {
+  const ui = fixture();
+  ui.clearContext();
+  assert.equal(ui.get('project-new').disabled, true);
+  assert.equal(ui.get('workspace').hidden, true);
+  assert.equal(ui.state().activeProject, null);
+
+  await connectFixture(ui);
+  assert.match(ui.get('connection-status').textContent, /Fixture[\s\S]*online/);
+  assert.equal(ui.get('project-new').disabled, false);
+  assert.equal(ui.get('workspace').hidden, true);
+  assert.equal(ui.get('projects').children.length, 0);
+  assert.match(ui.get('welcome-heading').textContent, /Connected\. Start your first project/);
+  assert.equal(ui.get('welcome-project-new').hidden, false);
+  assert.equal(ui.get('welcome-project-new').disabled, false);
+  ui.get('welcome-project-new').listeners.click();
+  assert.equal(ui.get('project-dialog').open, true);
+});
+
+test('namespace onboarding exposes only target facts, makes existing use a zero-write confirmation, and never claims installation', async () => {
+  const calls = [];
+  const inspected = { state: 'present', uid: 'existing-uid', resourceVersion: '4', target: { kubeconfigReferenceSha256: 'a'.repeat(64), context: 'team/admin@prod', server: 'https://cluster.test', caSha256: 'b'.repeat(64), clusterUid: 'cluster-uid', namespace: 'astra-system' } };
+  const ui = fixture({ namespaceInspect: async request => { calls.push(['inspect', request]); return inspected; },
+    namespacePlanUseExisting: async request => { calls.push(['plan', request]); return { planId: 'existing-plan', mode: 'use-existing', digest: 'c'.repeat(64), expiresAt: '2030-01-01T00:00:00Z' }; } });
+  await ui.selectNamespaceKubeconfig();
+  ui.get('namespace-form').fields = { context: 'team/admin@prod', namespace: 'astra-system' };
+  await ui.inspectNamespace();
+  assert.equal(ui.get('namespace-use-existing').disabled, false);
+  assert.match(JSON.stringify(ui.get('namespace-detail')), /zero Kubernetes writes/);
+  assert.doesNotMatch(JSON.stringify(ui.get('namespace-detail')), /private kubeconfig bytes|\/Users\//);
+  await ui.planNamespace('use-existing');
+  assert.equal(ui.get('namespace-confirm-dialog').open, true);
+  await ui.confirmNamespace();
+  assert.equal(calls.length, 2);
+  assert.match(ui.get('notice').textContent, /Connected to namespace; control plane not installed/);
+  assert.match(JSON.stringify(ui.get('namespace-detail')), /Connected to namespace; control plane not installed/);
+});
+
+test('namespace dedicated plan displays digest and expiry, creates once, and reconciles unknown results without replay', async () => {
+  const creates = []; const reconciles = [];
+  const ui = fixture({ namespaceCreate: async request => { creates.push(request); return { state: 'reconciliation_required' }; },
+    namespaceReconcile: async request => { reconciles.push(request); return { state: 'reconciliation_required', uid: null, resourceVersion: null }; } });
+  await ui.selectNamespaceKubeconfig();
+  ui.get('namespace-form').fields = { context: 'team/admin@prod', namespace: 'astra-system' };
+  await ui.inspectNamespace(); await ui.planNamespace('create-dedicated');
+  assert.match(JSON.stringify(ui.get('namespace-confirm-detail')), new RegExp('c'.repeat(64)));
+  assert.match(JSON.stringify(ui.get('namespace-confirm-detail')), /2030-01-01/);
+  const first = ui.confirmNamespace(); const duplicate = ui.confirmNamespace(); await Promise.all([first, duplicate]);
+  assert.equal(creates.length, 1);
+  assert.match(ui.get('notice').textContent, /unknown.*Reconcile read-only/i);
+  await ui.reconcileNamespace();
+  assert.equal(reconciles.length, 1);
+  assert.match(ui.get('notice').textContent, /did not replay create/);
+});
+
+test('namespace cancellation, conflicts, expiry, and stale context fence old UI and do not replay', async () => {
+  const late = deferred(); let clears = 0; let creates = 0;
+  const ui = fixture({ namespaceSelectKubeconfig: async () => ({ state: 'cancelled' }), namespaceClear: async () => { clears++; },
+    namespaceInspect: async () => late.promise, namespaceCreate: async () => { creates++; throw new Error('Namespace expired: namespace plan approval has expired'); } });
+  await ui.selectNamespaceKubeconfig();
+  assert.match(ui.get('notice').textContent, /cancelled/);
+  ui.api.namespaceSelectKubeconfig = async () => ({ state: 'selected', reference: '2'.repeat(8) + '-2222-4222-8222-222222222222', name: 'selected-config' });
+  await ui.selectNamespaceKubeconfig();
+  ui.get('namespace-form').fields = { context: 'team/admin@prod', namespace: 'astra-system' };
+  const pending = ui.inspectNamespace(); await flush();
+  ui.clearContext(); late.resolve({ state: 'terminating', uid: 'old', resourceVersion: '1', target: { kubeconfigReferenceSha256: 'a'.repeat(64), context: 'team/admin@prod', server: 'https://cluster.test', caSha256: 'b'.repeat(64), clusterUid: 'cluster', namespace: 'astra-system' } });
+  await pending;
+  assert.equal(ui.state().namespaceContext, null);
+  assert.equal(ui.get('namespace-use-existing').disabled, true);
+  assert.ok(clears >= 1);
+  assert.equal(creates, 0);
+});
+
+test('namespace forbidden, unavailable, terminating conflict, and expired-plan messages remain fenced and truthful', async () => {
+  const terminating = { state: 'terminating', uid: 'terminating-uid', resourceVersion: '7', target: { kubeconfigReferenceSha256: 'a'.repeat(64), context: 'team/admin@prod', server: 'https://cluster.test', caSha256: 'b'.repeat(64), clusterUid: 'cluster', namespace: 'astra-system' } };
+  const ui = fixture({ namespaceInspect: async () => terminating });
+  await ui.selectNamespaceKubeconfig(); ui.get('namespace-form').fields = { context: 'team/admin@prod', namespace: 'astra-system' };
+  await ui.inspectNamespace();
+  assert.equal(ui.get('namespace-use-existing').disabled, true); assert.equal(ui.get('namespace-create-plan').disabled, true);
+  assert.match(JSON.stringify(ui.get('namespace-detail')), /terminating/);
+  await ui.namespaceWork(async () => { throw new Error('Namespace forbidden: Kubernetes RBAC denied'); });
+  assert.match(ui.get('notice').textContent, /forbidden.*no write was retried/i);
+  await ui.namespaceWork(async () => { throw new Error('Namespace command is unavailable.'); });
+  assert.match(ui.get('notice').textContent, /Reconcile read-only/);
+  await ui.namespaceWork(async () => { throw new Error('Namespace expired: namespace plan approval has expired'); });
+  assert.match(ui.get('notice').textContent, /expired.*fresh plan/i);
+});
+
+test('failed connection keeps endpoint inputs visible for correction and retry', async () => {
+  const ui = fixture({ connect: async () => { throw new Error('Control plane is unavailable or not ready (503).'); }, status: async () => null });
+  ui.get('connection-dialog').showModal();
+  ui.get('connection-form').fields = { name: 'Existing team endpoint', endpoint: 'https://control.example' };
+  ui.submit('connection-form'); await flush();
+  assert.equal(ui.get('connection-dialog').open, true);
+  assert.deepEqual(ui.get('connection-form').fields, { name: 'Existing team endpoint', endpoint: 'https://control.example' });
+  assert.match(ui.get('notice').textContent, /not ready \(503\)/);
+});
+
+test('project onboarding creates, selects, and fences duplicate and stale submissions', async () => {
+  const pending = deferred(); const created = project('created'); const calls = []; const visible = [];
+  const ui = fixture({ commandId: async () => 'create-project-command',
+    createProject: async (_connection, body, key) => { calls.push({ body, key }); return pending.promise; },
+    projects: async () => ({ projects: visible }),
+  });
+  await connectFixture(ui, visible);
+  ui.get('project-new').listeners.click();
+  ui.get('project-form').fields = { name: 'Created project' };
+  ui.submit('project-form'); ui.submit('project-form'); await flush();
+  assert.equal(calls.length, 1);
+  visible.push(created); pending.resolve(created); await flush();
+  assert.equal(JSON.stringify(calls[0]), JSON.stringify({ body: { name: 'Created project' }, key: 'create-project-command' }));
+  assert.equal(ui.state().activeProject.id, 'created');
+  assert.equal(ui.get('project-title').textContent, 'created');
+  assert.equal(ui.get('workspace').hidden, false);
+  assert.equal(ui.get('project-dialog').open, false);
+
+  const late = deferred();
+  ui.api.createProject = async () => late.promise;
+  ui.get('project-new').listeners.click();
+  ui.get('project-form').fields = { name: 'Created in old context' };
+  ui.submit('project-form'); await flush();
+  await ui.selectProject(project('B'));
+  late.resolve(project('late-A')); await flush();
+  assert.equal(ui.state().activeProject.id, 'B');
+  assert.equal(ui.get('project-title').textContent, 'B');
+  assert.equal(ui.get('project-form').querySelector('button[type="submit"]').disabled, false);
+});
+
+test('project creation preserves a failed draft, while authorization loss clears context', async () => {
+  const rejected = fixture({ createProject: async () => { throw new Error('Control request failed (409).'); } });
+  await connectFixture(rejected);
+  rejected.get('project-new').listeners.click();
+  rejected.get('project-form').fields = { name: 'Stale project' };
+  rejected.submit('project-form'); await flush();
+  assert.equal(rejected.get('project-dialog').open, true);
+  assert.deepEqual(rejected.get('project-form').fields, { name: 'Stale project' });
+  assert.equal(rejected.get('project-form').querySelector('button[type="submit"]').disabled, false);
+  assert.match(rejected.get('notice').textContent, /409/);
+
+  const unauthorized = fixture({ createProject: async () => { throw new Error('Control request failed (401).'); }, status: async () => null });
+  await connectFixture(unauthorized);
+  unauthorized.get('project-new').listeners.click();
+  unauthorized.get('project-form').fields = { name: 'Unauthorized project' };
+  unauthorized.submit('project-form'); await flush();
+  assert.equal(unauthorized.get('connection-status').textContent, 'Not connected');
+  assert.equal(unauthorized.get('project-new').disabled, true);
+  assert.equal(unauthorized.get('project-dialog').open, false);
+});
+
+test('populated workspace keeps local coordinator, remote operations, and human outcomes separate', async () => {
+  const data = experimentLedger();
+  const ui = fixture({
+    astraConversation: async () => ({ conversation: { project_id: 'p1', revision: 1 }, messages: [
+      { id: 'local-reply', project_id: 'p1', sender_kind: 'coordinator', body: 'Local coordinator recap.', created_at: '2026-01-01T00:00:00Z' },
+    ] }),
+    remoteWorkflows: async () => ({ remote_workflows: [{ ...remoteWorkflow('running'), reconciliation_required: false }] }),
+    experiment: async () => data,
+  });
+  await ui.selectProject(project('p1')); await ui.selectExperiment({ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 });
+  const workbench = JSON.stringify(ui.get('events'));
+  const remote = JSON.stringify(ui.get('remote-workflows'));
+  const experiment = JSON.stringify(ui.get('experiment-detail'));
+  assert.match(workbench, /Deterministic local coordinator reply/);
+  assert.match(workbench, /Provider disabled\. This reply has no approval, grant, dispatch, tool, shell, or skill-loading authority/);
+  assert.match(remote, /A remote run observation is recorded; it is not a result, evidence, or conclusion/);
+  assert.doesNotMatch(remote, /Human-recorded outcome/);
+  assert.match(experiment, /Human-reported observation: A human recorded the current baseline observation/);
+  assert.match(experiment, /Attempt-recorded outcome is not scientific success/);
+});
+
 test('worker discovery renders only the safe project projection and labels stale workers fenced', async () => {
   const calls = [];
   const worker = {
@@ -177,7 +887,7 @@ test('remote workflow projection keeps admission, unknown state, reconciliation,
     calls.push({ projectId, page }); return { remote_workflows: [record] };
   }, remoteWorkflow: async (_connection, operationId) => {
     assert.equal(operationId, record.operation_id); return record;
-  }, executionGrant: async () => ({ id: record.grant_id, revision: 4, status: 'active' }),
+  }, executionGrant: async () => ({ id: record.grant_id, project_id: 'p1', revision: 4, status: 'active' }),
   revokeExecutionGrant: async (_connection, grantId, body, key) => { stops.push({ grantId, body, key }); return {}; } });
   await ui.selectProject(project('p1'));
   assert.equal(JSON.stringify(calls), JSON.stringify([{ projectId: 'p1', page: { offset: 0, limit: 100 } }]));
@@ -185,6 +895,8 @@ test('remote workflow projection keeps admission, unknown state, reconciliation,
   assert.match(rendered, /Execution admission\/package intent is recorded|Remote state is unknown/);
   assert.match(rendered, /Reconciliation required/);
   assert.match(rendered, /Do not treat a stop request, reconnect, or displayed exit as confirmed termination/);
+  assert.match(rendered, /Freshness: heartbeat not recorded · latest observation unknown at 2026-01-01T00:00:00Z/);
+  assert.match(rendered, /Latest checkpoint: none recorded/);
   assert.ok(!rendered.includes('scientific success'));
   const refresh = find(ui.get('remote-workflows'), node => node.textContent === 'Refresh reconciled operation');
   refresh.listeners.click(); await flush();
@@ -195,6 +907,290 @@ test('remote workflow projection keeps admission, unknown state, reconciliation,
   assert.equal(stops.length, 1);
   assert.equal(JSON.stringify(stops[0].body), JSON.stringify({ expected_revision: 4 }));
   assert.match(ui.get('notice').textContent, /does not confirm termination/);
+});
+
+test('remote workflow labels requested stop, confirmed cancellation, and unknown as separate states', async () => {
+  const requested = remoteWorkflow('unknown');
+  requested.operation_desired_state = 'cancel_requested';
+  const confirmed = { ...remoteWorkflow('exited'), operation_id: 'b'.repeat(32), operation_desired_state: 'cancel_requested', reconciliation_required: false,
+    reconciliation: { observed_state: 'exited', observed_at: '2026-01-01T00:00:03Z', termination_confirmed: true,
+      cursor: 'observation:synthetic-confirmed', sources: ['worker'], source_order: ['worker'], contradiction_state: 'none' } };
+  const ui = fixture({ remoteWorkflows: async () => ({ remote_workflows: [requested, confirmed] }) });
+  await ui.selectProject(project('p1'));
+  const rendered = JSON.stringify(ui.get('remote-workflows'));
+  assert.match(rendered, /Stop requested in control\. This is not confirmed termination/);
+  assert.match(rendered, /Remote state is unknown; execution, cost exposure, and termination require reconciliation/);
+  assert.match(rendered, /Requested stop has confirmed cancellation from attributed operational evidence only/);
+  assert.match(rendered, /Reconciled observation: exited · cancellation confirmed/);
+  assert.doesNotMatch(rendered, /stopped|successful/i);
+});
+
+test('remote workflow pagination deduplicates live rows and never revokes a cross-project grant', async () => {
+  const record = remoteWorkflow('unknown'); const calls = []; const stops = [];
+  const ui = fixture({ remoteWorkflows: async (_connection, projectId, page) => {
+    calls.push({ projectId, page });
+    return page.offset === 0 ? { remote_workflows: Array.from({ length: 100 }, (_, index) => ({ ...record, operation_id: index === 0 ? record.operation_id : index.toString(16).padStart(32, '0') })) } :
+      { remote_workflows: [{ ...record }, { ...record, operation_id: 'f'.repeat(32) }] };
+  }, executionGrant: async () => ({ id: record.grant_id, project_id: 'p2', revision: 4, status: 'active' }),
+  revokeExecutionGrant: async () => { stops.push(true); return {}; } });
+  await ui.selectProject(project('p1'));
+  await ui.loadRemoteWorkflows();
+  assert.equal(calls[1].page.offset, 100);
+  assert.equal(findAll(ui.get('remote-workflows'), node => node.dataset?.remoteWorkflowOperationId === record.operation_id).length, 1);
+  const stop = find(ui.get('remote-workflows'), node => node.textContent === 'Request stop');
+  stop.listeners.click(); await flush();
+  assert.equal(stops.length, 0);
+  assert.match(ui.get('notice').textContent, /current execution grant cannot be used/);
+});
+
+test('late remote-workflow reads cannot replace a newer project projection', async () => {
+  const late = deferred(); const old = remoteWorkflow('unknown'); const current = { ...remoteWorkflow('running'), project_id: 'p2', operation_id: 'b'.repeat(32) };
+  const ui = fixture({ remoteWorkflows: async (_connection, projectId) => projectId === 'p1' ? late.promise : { remote_workflows: [current] } });
+  const stale = ui.selectProject(project('p1'));
+  await flush();
+  await ui.selectProject(project('p2'));
+  late.resolve({ remote_workflows: [old] });
+  await stale;
+  assert.equal(ui.state().activeProject.id, 'p2');
+  const rendered = JSON.stringify(ui.get('remote-workflows'));
+  assert.match(rendered, new RegExp(current.operation_id));
+  assert.doesNotMatch(rendered, new RegExp(old.operation_id));
+});
+
+test('consumer availability labels revoked credentials and blocks new coordinator turns', async () => {
+  const ui = fixture({ coordinatorConsumerStatus: async () => ({ availability: 'unavailable', health: 'revoked', freshness: 'fresh', credential_status: 'revoked', credential_expires_at: '2030-01-01T00:00:00Z', heartbeat_at: '2026-01-01T00:00:00Z', last_outcome: 'idle', observed_consumers: 1, provider_disabled: true, provider_enabled: false }) });
+  await ui.selectProject(project('p1'));
+  assert.match(ui.get('coordinator-health').textContent, /credential revoked/);
+  assert.equal(ui.get('coordinator-form').querySelector('button[type="submit"]').disabled, true);
+});
+
+test('human disposition reviews exact metadata before retention and never implicitly releases custody', async () => {
+  const calls = []; const manifest = { id: 'manifest_1', project_id: 'p1', manifest_digest: 'a'.repeat(64), status: 'quarantined', classification: 'unclassified', late: false,
+    artifacts: [{ id: 'artifact_1', relative_path: 'result.txt', size: 36, sha256: 'b'.repeat(64) }] };
+  const ui = fixture({ status: async () => ({ id: 'connection', role: 'human', health: 'online' }), artifactManifests: async () => ({ artifact_manifests: [manifest] }),
+    artifactDispositions: async () => ({ dispositions: [] }), recordArtifactDisposition: async (...args) => { calls.push(args); return {}; }, recordArtifactCustodyRelease: async () => { throw new Error('Implicit custody release forbidden'); } });
+  ui.applyConnectionHealth(await ui.api.status()); await ui.selectProject(project('p1')); await flush();
+  ui.get('artifact-disposition').listeners.click(); await flush();
+  const form = ui.get('artifact-disposition-form');
+  assert.equal(form.querySelector('button[type="submit"]').disabled, true);
+  ui.applyConnectionHealth(await ui.api.status()); assert.equal(form.querySelector('button[type="submit"]').disabled, true);
+  form.fields = { manifest_id: manifest.id };
+  ui.get('artifact-disposition-load').listeners.click(); await flush();
+  assert.match(ui.get('artifact-disposition-detail').textContent, /36 bytes.*sha256/);
+  assert.equal(form.querySelector('button[type="submit"]').disabled, false);
+  form.fields.rationale = 'Human review of operational toy output, not scientific acceptance.';
+  ui.submit('artifact-disposition-form'); await flush();
+  assert.equal(calls.length, 1); assert.equal(calls[0][1], manifest.id);
+  assert.equal(calls[0][2].disposition, 'retain_quarantined'); assert.equal(calls[0][2].expected_revision, 0);
+  assert.match(ui.get('notice').textContent, /separately review custody release/);
+});
+
+test('human disposition refuses unloaded, tampered, held, offline and changed-project review bases', async () => {
+  let writes = 0; const manifest = { id: 'manifest_1', project_id: 'p1', manifest_digest: 'a'.repeat(64), status: 'quarantined', artifacts: [], classification: 'unclassified', late: false };
+  const ui = fixture({ status: async () => ({ id: 'connection', role: 'human', health: 'online' }), artifactManifests: async () => ({ artifact_manifests: [manifest] }), artifactDispositions: async () => ({ dispositions: [] }), recordArtifactDisposition: async () => { writes++; } });
+  ui.applyConnectionHealth(await ui.api.status()); await ui.selectProject(project('p1')); await flush();
+  ui.get('artifact-disposition').listeners.click(); await flush();
+  const form = ui.get('artifact-disposition-form'); form.fields = { manifest_id: manifest.id, rationale: 'Review.' };
+  ui.submit('artifact-disposition-form'); await flush(); assert.equal(writes, 0);
+  ui.get('artifact-disposition-load').listeners.click(); await flush();
+  form.fields.expected_manifest_digest = 'c'.repeat(64); ui.submit('artifact-disposition-form'); await flush(); assert.equal(writes, 0);
+  form.fields.expected_manifest_digest = manifest.manifest_digest;
+  ui.get('artifact-disposition-dialog').close(); ui.submit('artifact-disposition-form'); await flush(); assert.equal(writes, 0);
+  ui.get('artifact-disposition-dialog').showModal();
+  ui.applyRecoveryStatus({state:'held_restore',recovery_hold:true}); ui.submit('artifact-disposition-form'); await flush(); assert.equal(writes, 0);
+  ui.applyRecoveryStatus({state:'active',recovery_hold:false});
+  ui.api.status = async () => ({id:'connection',role:'human',health:'offline'}); ui.applyConnectionHealth(await ui.api.status()); ui.submit('artifact-disposition-form'); await flush(); assert.equal(writes, 0);
+  ui.api.status = async () => ({id:'connection',role:'human',health:'online'}); await ui.selectProject(project('p2')); ui.submit('artifact-disposition-form'); await flush(); assert.equal(writes, 0);
+});
+
+test('human disposition cannot load a foreign-project manifest or enable an ineligible principal', async () => {
+  const ui = fixture({status:async()=>({id:'connection',role:'human',health:'online'}), artifactManifests:async()=>({artifact_manifests:[{id:'manifest_1',project_id:'p2',manifest_digest:'a'.repeat(64),status:'quarantined',artifacts:[]}]}),artifactDispositions:async()=>({dispositions:[]})});
+  ui.applyConnectionHealth(await ui.api.status()); await ui.selectProject(project('p1')); await flush();
+  ui.get('artifact-disposition').listeners.click(); await flush();
+  ui.get('artifact-disposition-form').fields={manifest_id:'manifest_1'};
+  ui.get('artifact-disposition-load').listeners.click(); await flush();
+  assert.equal(ui.get('artifact-disposition-form').querySelector('button[type="submit"]').disabled,true);
+  assert.match(ui.get('notice').textContent,/No eligible exact quarantine manifest/);
+  ui.api.status=async()=>({id:'connection',role:'agent',health:'online'});
+  ui.applyConnectionHealth(await ui.api.status());
+  assert.equal(ui.get('artifact-disposition').disabled,true);
+  ui.get('artifact-disposition').listeners.click(); await flush();
+  assert.match(ui.get('notice').textContent,/online human project/);
+});
+
+test('desktop keeps admission, dispatch, evidence-linked conclusion, and human review as distinct revision-fenced commands', async () => {
+  const calls = []; const ledger = experimentLedger('e1');
+  for (const variant of ledger.variants) variant.revision = 1;
+  for (const design of ledger.designs) for (const variant of design.variants) variant.revision = 1;
+  const experiment = { id: 'e1', project_id: 'p1', goal: 'Current goal.', success_criterion: 'Current criterion.', current_design_revision: 2 };
+  const ui = fixture({ experiment: async () => ledger,
+    admitExperimentAttempt: async (_connection, variantId, body, key) => { calls.push({ type: 'admit', variantId, body, key }); return {}; },
+    dispatchAdmittedAttempt: async (_connection, attemptId, body, key) => { calls.push({ type: 'dispatch', attemptId, body, key }); return {}; },
+    linkAttemptArtifacts: async (_connection, attemptId, body, key) => { calls.push({ type: 'link', attemptId, body, key }); return {}; },
+    createConclusion: async (_connection, experimentId, body, key) => { calls.push({ type: 'conclusion', experimentId, body, key }); return {}; },
+  });
+  await ui.selectProject(project('p1')); await ui.selectExperiment(experiment);
+  const admission = find(ui.get('experiment-detail'), node => node.textContent === 'Review separate execution admission');
+  assert.ok(admission); admission.listeners.click(); await flush();
+  ui.get('admission-form').fields = { grant_id: 'grant_1' }; ui.submit('admission-form'); await flush();
+  assert.ok(calls.length, ui.get('notice').textContent); assert.equal(calls[0].type, 'admit');
+  assert.equal(calls[0].body.expected_design_revision, 2);
+  assert.equal(calls[0].body.expected_variant_revision, 1);
+  assert.equal(calls[0].body.grant_id, 'grant_1');
+  const dispatch = find(ui.get('experiment-detail'), node => node.textContent === 'Review Kubernetes dispatch');
+  assert.ok(dispatch); dispatch.listeners.click(); await flush();
+  ui.get('dispatch-form').fields = { target_digest: 'f'.repeat(64) }; ui.submit('dispatch-form'); await flush();
+  assert.equal(calls[1].type, 'dispatch'); assert.equal(calls[1].attemptId, 'attempt-admitted-unknown');
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)), {
+    expected_revision: 4, target_digest: 'f'.repeat(64), profile_version: 'development-minikube-opencode-v1',
+  });
+  const link = find(ui.get('experiment-detail'), node => node.textContent === 'Link retained artifact evidence');
+  assert.ok(link); link.listeners.click(); await flush();
+  ui.get('attempt-artifacts-form').fields = { artifact_ids: '["artifact-legacy"]' }; ui.submit('attempt-artifacts-form'); await flush();
+  assert.equal(calls[2].type, 'link'); assert.equal(calls[2].body.expected_revision, 4);
+  const author = ui.get('conclusion-new'); author.listeners.click(); await flush();
+  const evidence = findAll(ui.get('conclusion-evidence'), node => node.dataset?.conclusionArtifactId);
+  assert.ok(evidence.length); evidence[0].checked = true;
+  ui.get('conclusion-form').fields = { statement: 'A bounded human interpretation.' }; ui.submit('conclusion-form'); await flush();
+  assert.ok(calls.length > 3, ui.get('notice').textContent); assert.equal(calls[3].type, 'conclusion');
+  assert.equal(calls[3].body.design_revision, 2);
+  assert.equal(JSON.stringify(calls[3].body.evidence), JSON.stringify([{ attempt_id: 'attempt-old-failed', artifact_ids: ['artifact-legacy'], measurement_ids: [] }]));
+  assert.match(ui.get('notice').textContent, /distinct from execution and scientific validity/);
+});
+
+test('disconnect and reconnect re-read fake workflow effects without replaying dispatch or stop', async () => {
+  const workflow = remoteWorkflow('unknown'); const projectRecord = project('p1');
+  let workflowReads = 0; let mutations = 0;
+  const ui = fixture({ disconnect: async () => {}, remoteWorkflows: async (_connection, projectId) => {
+    assert.equal(projectId, 'p1'); workflowReads++; return { remote_workflows: [workflow] };
+  }, dispatchAdmittedAttempt: async () => { mutations++; }, revokeExecutionGrant: async () => { mutations++; } });
+  await connectFixture(ui, [projectRecord]);
+  ui.get('projects').children[0].listeners.click(); await flush();
+  const firstTimeline = JSON.stringify(ui.get('remote-workflows'));
+  ui.get('disconnect').listeners.click(); await flush();
+  assert.equal(ui.state().activeProject, null);
+  await connectFixture(ui, [projectRecord]);
+  ui.get('projects').children[0].listeners.click(); await flush();
+  assert.equal(workflowReads, 2);
+  assert.equal(JSON.stringify(ui.get('remote-workflows')), firstTimeline);
+  assert.equal(mutations, 0);
+});
+
+test('a pending dispatch command is fenced by project and connection changes', async () => {
+  const projectKey = deferred(); const connectionKey = deferred(); const keys = [projectKey, connectionKey]; const ledger = experimentLedger(); let dispatches = 0;
+  const ui = fixture({ commandId: () => keys.shift().promise, experiment: async () => ledger,
+    dispatchAdmittedAttempt: async () => { dispatches++; } });
+  await ui.selectProject(project('p1'));
+  await ui.selectExperiment({ id: 'e1', goal: ledger.experiment.goal, current_design_revision: 2 });
+  find(ui.get('experiment-detail'), node => node.textContent === 'Review Kubernetes dispatch').listeners.click(); await flush();
+  ui.get('dispatch-form').fields = { target_digest: 'f'.repeat(64) }; ui.submit('dispatch-form'); await flush();
+  await ui.selectProject(project('p2'));
+  projectKey.resolve('project-dispatch-command'); await flush();
+  assert.equal(dispatches, 0);
+  assert.equal(ui.state().activeProject.id, 'p2');
+  await ui.selectProject(project('p1'));
+  await ui.selectExperiment({ id: 'e1', goal: ledger.experiment.goal, current_design_revision: 2 });
+  find(ui.get('experiment-detail'), node => node.textContent === 'Review Kubernetes dispatch').listeners.click(); await flush();
+  ui.get('dispatch-form').fields = { target_digest: 'e'.repeat(64) }; ui.submit('dispatch-form'); await flush();
+  ui.clearContext();
+  connectionKey.resolve('connection-dispatch-command'); await flush();
+  assert.equal(dispatches, 0);
+  assert.equal(ui.state().activeProject, null);
+});
+
+test('conclusion drafting, review, and amendment use separate revision-fenced human commands', async () => {
+  const data = experimentLedger('e1');
+  data.conclusions[0].lineage = [];
+  data.conclusions[0].lineage_revision = data.conclusions[0].revision;
+  data.conclusion_amendments = [];
+  data.conclusions[1].design_revision = 2;
+  data.conclusions[1].design_snapshot = data.designs[1];
+  const calls = [];
+  const ui = fixture({ experiment: async () => data,
+    updateConclusion: async (_connection, id, body, key) => { calls.push({ type: 'update', id, body, key }); return {}; },
+    reviewConclusion: async (_connection, id, body, key) => { calls.push({ type: 'review', id, body, key }); return {}; },
+    amendConclusion: async (_connection, id, body, key) => { calls.push({ type: 'amend', id, body, key }); return {}; },
+  });
+  await ui.selectProject(project('p1')); await ui.selectExperiment({ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 });
+  find(ui.get('experiment-detail'), node => node.textContent === 'Revise draft conclusion').listeners.click(); await flush();
+  const choice = find(ui.get('conclusion-evidence'), node => node.dataset?.conclusionArtifactId === 'artifact-legacy');
+  choice.checked = true;
+  ui.get('conclusion-form').fields = { statement: 'A narrowed human interpretation.' };
+  ui.submit('conclusion-form'); await flush();
+  find(ui.get('experiment-detail'), node => node.textContent === 'Review conclusion').listeners.click(); await flush();
+  find(ui.get('experiment-detail'), node => node.textContent === 'Amend reviewed conclusion').listeners.click(); await flush();
+  ui.get('conclusion-amendment-form').fields = { relation: 'retracts', reason: 'The human review narrowed the claim.' };
+  ui.submit('conclusion-amendment-form'); await flush();
+  assert.deepEqual(calls.map(call => call.type), ['update', 'review', 'amend']);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].body)), { statement: 'A narrowed human interpretation.', evidence: [
+    { attempt_id: 'attempt-old-failed', artifact_ids: ['artifact-legacy', 'artifact-degraded'], measurement_ids: [] },
+  ], design_revision: 2, expected_revision: 1 });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)), { expected_revision: 1, design_revision: 2 });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[2].body)), { expected_revision: 2, expected_design_revision: 1,
+    relation: 'retracts', reason: 'The human review narrowed the claim.' });
+  assert.match(ui.get('notice').textContent, /reviewed conclusion and evidence remain preserved/);
+});
+
+test('artifact inventory paginates without duplicate cards and disables its read control offline', async () => {
+  const calls = [];
+  const artifact = index => ({ id: `artifact_${index}`, project_id: 'p1', relative_path: `results/${index}.txt`,
+    sha256: index.toString(16).padStart(64, '0'), size: index, status: 'quarantined', classification: 'unclassified' });
+  const first = Array.from({ length: 100 }, (_, index) => artifact(index));
+  const ui = fixture({ artifacts: async (_connection, projectId, page) => {
+    calls.push({ projectId, page });
+    return { artifacts: page.offset === 0 ? first : [first[0], artifact(100)] };
+  } });
+  await ui.selectProject(project('p1'));
+  assert.equal(ui.get('artifacts').children.length, 100);
+  assert.equal(ui.get('artifacts-more').hidden, false);
+  ui.applyConnectionHealth({ name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health: 'offline' });
+  assert.equal(ui.get('artifacts-more').disabled, true);
+  ui.applyConnectionHealth({ name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health: 'online' });
+  ui.get('artifacts-more').listeners.click(); await flush();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    { projectId: 'p1', page: { offset: 0, limit: 100 } },
+    { projectId: 'p1', page: { offset: 100, limit: 100 } },
+  ]);
+  assert.equal(ui.get('artifacts').children.length, 101);
+  assert.equal(ui.get('artifacts-more').hidden, true);
+  assert.match(JSON.stringify(ui.get('artifacts')), /Artifact metadata is not evidence acceptance/);
+});
+
+test('released artifact previews require the exact current manifest and render untrusted content as text', async () => {
+  const digest = 'a'.repeat(64); const calls = [];
+  const ui = fixture({
+    releasedArtifactManifest: async (_connection, manifestId) => ({ manifest: { id: manifestId, project_id: 'p1' } }),
+    artifactPreview: async (_connection, manifestId, artifactId, maxBytes) => {
+      calls.push({ manifestId, artifactId, maxBytes });
+      return { artifact_id: artifactId, relative_path: '<img src=x onerror=alert(1)>.txt', sha256: digest,
+        size: 22, preview_base64: 'PHNjcmlwdD5pbmVydDwvc2NyaXB0Pg==', preview_bytes: 22, truncated: false,
+        status: 'quarantined', classification: 'unclassified' };
+    },
+  });
+  await ui.selectProject(project('p1'));
+  ui.get('artifact-review').listeners.click(); await flush();
+  ui.get('artifact-form').fields = { manifest_id: 'manifest_1', artifact_id: 'artifact_1' };
+  ui.submit('artifact-form'); await flush();
+  assert.deepEqual(calls, [{ manifestId: 'manifest_1', artifactId: 'artifact_1', maxBytes: 4096 }]);
+  assert.match(ui.get('artifact-review-detail').textContent, /<img src=x onerror=alert\(1\)>\.txt/);
+  assert.match(ui.get('artifact-review-detail').textContent, /<script>inert<\/script>/);
+  assert.equal(findAll(ui.get('artifact-review-detail'), node => ['img', 'script'].includes(node.tagName)).length, 0);
+  assert.equal(ui.get('artifact-download').disabled, false);
+  await ui.selectProject(project('p2'));
+  ui.get('artifact-download').listeners.click(); await flush();
+  assert.match(ui.get('notice').textContent, /Load a current released artifact preview first/);
+
+  const mismatched = fixture({
+    releasedArtifactManifest: async () => ({ manifest: { id: 'other_manifest', project_id: 'p1' } }),
+    artifactPreview: async () => ({ artifact_id: 'artifact_1', relative_path: 'result.txt', sha256: digest,
+      size: 1, preview_base64: 'eA==', preview_bytes: 1, truncated: false, status: 'quarantined', classification: 'unclassified' }),
+  });
+  await mismatched.selectProject(project('p1'));
+  mismatched.get('artifact-review').listeners.click(); await flush();
+  mismatched.get('artifact-form').fields = { manifest_id: 'manifest_1', artifact_id: 'artifact_1' };
+  mismatched.submit('artifact-form'); await flush();
+  assert.equal(mismatched.get('artifact-download').disabled, true);
+  assert.match(mismatched.get('notice').textContent, /released quarantined artifact preview/);
 });
 
 test('renderer keeps earlier pages, removes loading markers, and deduplicates concurrent More reads', async () => {
@@ -275,6 +1271,23 @@ test('approval stays unavailable when plan detail does not match the requested d
   }) });
   await ui.selectProject(project('p1')); await flush();
   assert.match(ui.get('tasks').children[0].children[0].textContent, /Approval is unavailable/);
+});
+
+test('proposal revision uses the verified immutable plan revision and does not become approval or execution', async () => {
+  const calls = []; const digest = 'a'.repeat(64);
+  const task = { id: 'task-1', status: 'draft', revision: 3, plan_digest: digest };
+  const plan = { task_id: 'task-1', project_id: 'p1', revision: 3, plan_digest: digest, title: 'Original proposal', purpose: 'Bounded purpose', budget_cents: 50, max_duration_seconds: 120,
+    execution_spec: { argv: ['python', '-m', 'fixture'], input_snapshot_digest: 'b'.repeat(64), pinned_skill_digests: [], output_paths: ['results/out.json'], profile: 'local-cpu', network_enabled: false, max_output_bytes: 4096 } };
+  const ui = fixture({ tasks: async () => ({ tasks: [task] }), taskPlan: async () => plan,
+    reviseTaskPlan: async (_connection, taskId, body, key) => { calls.push({ taskId, body, key }); return {}; } });
+  await ui.selectProject(project('p1')); await flush();
+  const revise = find(ui.get('tasks'), node => node.textContent === 'Revise this proposal'); assert.ok(revise);
+  revise.listeners.click(); await flush();
+  ui.get('task-revise-form').fields = { title: 'Revised proposal', purpose: 'Narrower bounded purpose', budget_cents: '50', max_duration_seconds: '120', argv: '["python","-m","fixture"]', input_snapshot_digest: 'b'.repeat(64), pinned_skill_digests: '[]', output_paths: '["results/out.json"]', profile: 'local-cpu', max_output_bytes: '4096' };
+  ui.submit('task-revise-form'); await flush();
+  assert.equal(calls.length, 1); assert.equal(calls[0].taskId, 'task-1'); assert.equal(calls[0].body.expected_revision, 3);
+  assert.equal(calls[0].body.execution_spec.network_enabled, false);
+  assert.match(ui.get('notice').textContent, /prior approval basis is invalidated/);
 });
 
 test('renderer ignores thread and message replies from a previous context and clears drafts', async () => {
@@ -559,6 +1572,11 @@ test('admitted outcomes, late observations, migrated labels, evidence and retrac
     assert.ok(card);
     assert.match(JSON.stringify(card), new RegExp(`Human-recorded outcome: ${outcome}`));
     assert.match(JSON.stringify(card), new RegExp(`Admitted-attempt operational state: ${operationalState}`));
+    if (operationalState === 'interrupted') {
+      assert.match(JSON.stringify(card), /Interrupted is a control operational label, not proof of workload failure/);
+      assert.match(JSON.stringify(card), /inspect the attributed termination observation, original Job\/provider state and retained-output timing separately/);
+      assert.doesNotMatch(JSON.stringify(card), /State interrupted is unresolved/);
+    }
     assert.match(JSON.stringify(card), /Linked measurements: measurement-admitted/);
     assert.match(JSON.stringify(card), /Linked artifacts: artifact-legacy/);
     assert.match(JSON.stringify(detail), /Conclusion lineage revision 3: retracts/);
