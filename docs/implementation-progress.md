@@ -1,10 +1,230 @@
 # Implementation progress
 
-This file tracks executable evidence against DESIGN.md. Tessera is a source-only
-developer alpha: initial development uses logical commits on main and PRs remain
-paused. The full design and real research pilot are not complete. It has no
-production remote/provider/OpenCode/Kubernetes support claim; schema v43 is the
+## Current source and installed-artifact boundary (2026-10-07)
+
+The current source migration ceiling is schema **55** (`migrations.py`); schema
+54-to-55 is explicit and adds runtime-binding tables. Local v7 backend, API,
+native-owner and cold-source checkpoints are recorded in the
+[implementation journal](remote-agent-implementation-journal.md) and its linked
+handoffs. They use synthetic upstream identity/private-resource inputs and do not
+establish production enrollment or an installed runtime.
+
+The latest installed platform receipt remains the dated schema-52 local Docker
+journey below. No schema-55 wheel/image, current full-source gate, final protocol
+rebind, live provider/research, independent-host or laptop-off acceptance is claimed.
+Schema values in dated sections below describe those historical artifacts, not the
+current source version.
+
+## Final client/doc convergence (2026-10-04)
+
+Subsequent product-gap acceptance: `tessera connection-tunnel` is now an installed
+foreground operator command with explicit namespace/Deployment UID and public-CA
+references; the final module's 31 isolated cases passed, plus nine existing CLI
+regressions. Installed default-selection authenticated connect/reconnect passed
+on module `446bb827b882a7eb0586ddd4bb3d92a1749657f8f0882a6290a7c5fac063f4a3`.
+The fresh native Kubernetes plan/admit/dispatch-to-new-Job journey also passed,
+distinct from earlier native history-review receipts: actual retained spec and
+task revision 3 / plan 2, exact separate human grant/worker package, new ordinary
+Job and timely 385 / 36-byte automatic output, native quarantine disposition,
+separate release/save/export/reconnect without redispatch. Science remains null.
+The final desktop revision passed 192 tests plus separate focused guard evidence
+(not an invented 196-test total). See [connection tunnel](connection-tunnel.md)
+and [native/operator execution](../desktop/EXECUTION.md), plus the
+[actionable handoff](research-bench-handoff.md). Actual OS selection remains
+unverified after labelled fallback; GitHub reporting is still unauthenticated.
+
+The final native receipt records actual bench TLS draft/revision/approval,
+quarantined 36/37-byte outputs, reproduction export and reconnect; a separate
+health-refresh repair passed its native regression and all 178 Node tests. The
+OS picker was invoked but timed out at eight seconds without human selection;
+the labelled file fallback is not proof of that actual selection step.
+Installed/deployed Python SDK 1.26.0 and TypeScript SDK 1.32.0 MCP clients passed
+real artifact/resource/proposal, reconnect, expiry/revocation/destination-denial,
+no-self-approval and separate human draft-promotion acceptance. Public-CA file
+references preserve verified TLS; protocol remains session-based 2025-11-25.
+
+Native review identifies a 29-byte late artifact with hash
+`79e9e44fe379d350f50b6d52d47fb545c32137a775c063a89ba280d788f8b12c`;
+read-only reconciliation confirmed it is the same retained artifact: operation
+`8530373cfa9c246927c740afad5bf409`, manifest
+`artifact_manifest_48751aef7bfed4adf615a662e8a63225`, artifact
+`artifact_cc8d0811e3d76b5e7bed0642c689a269`. Original receipts and current bytes agree
+on 29 bytes including the trailing newline. The historical 28-byte summary omitted
+that newline and is retained as a corrected summary, not erased. Science outcome remains
+null. The gateway repair passed bounded incomplete-handshake handling, concurrent
+reads and same-Pod reconnect. The supervised route expires (07:23 UTC receipt),
+not permanent external ingress or independent-host acceptance.
+
+The broad affected 345-test checkpoint exposed seven stale guard/outbox tests
+after 338 passes. The backend owner repaired tests only and reports 86 tests
+across four files passing; earlier failures remain recorded. Final coverage
+combines affected receipts and unchanged file/dependency-bound historical tests,
+not an invented one-shot clean full-suite run. Final package hashes and dependency/
+license inventories are retained in the external release receipts, not inferred
+from earlier builds. GitHub private-reporting enablement remains unverified
+(unauthenticated CLI and disconnected browser); neither probe is retried here.
+
+## Ordinary installed bench checkpoint (2026-10-04)
+
+The protected checkpoint reports ready installed-image generation 4, schema 50,
+195 source files and a ready ordinary worker. Generation-2 automatic retained
+baseline 385/36 bytes and intervention 2870/37 bytes, provenance/quarantine and
+Job-UID-preserving stop/restart remain its evidence. Generation 3 retained distinct
+29-byte late quarantine/hash (the historical 28-byte summary omitted its trailing
+newline); generation 4 replayed Running and confirmed Exited
+ACKs and separately human-reconciled the grant. Scientific outcome remains null.
+Earlier missing-original-UID proof and scoped no-start Job-list 403 history is
+preserved as unavailable/unknown. See [ordinary collection](ordinary-worker-collection.md)
+for collector image, helper RBAC/quota, witness/credential lifetimes and recovery
+conditions. This does not replace the prior failed fixture/package receipts.
+
+This is owned laptop-local Docker Desktop, not independent-host acceptance or
+permanent ingress. HTTPS API connect/review/export/reconnect passed on the current
+image; bounded forwarding is temporary. Native and deployed-MCP lanes retain their
+own acceptance, not inferred from API tests. GitHub private-reporting enablement
+still needs an authenticated maintainer session; no repeat unauthenticated probe.
+Final package and affected regression evidence must bind the changed source.
+
+## Packaging/install checkpoint (2026-10-03, pre-convergence)
+
+MIT terms and accepting outside contributions are maintainer-selected; LICENSE
+uses the author/year verified in Git history. The selected GitHub private
+reporting setting remains unverified: both repository/status API calls failed
+because the local `gh` session is unauthenticated. No visibility change occurred.
+
+Preliminary source/wheel builds installed into separate credential-free private
+venvs outside the checkout. Both passed inventory/license checks, `pip check`,
+installed CLI help, private fresh initialization, a real installed loopback
+service, 401 for an unauthenticated project read, authenticated project creation,
+backup and held restore. Both observed schema 50. This predates final MCP
+dependency convergence and is not evidence for a shipped revision, Docker,
+Kubernetes output collection, desktop screens, renewal or independent-host use.
+The reproducible check is `python dev/check_distribution.py ARTIFACT`.
+
+CI now separates style checks and four deterministic file-based pytest shards.
+Partition verification assigned all 158 current test files once (40/49/34/35),
+including recursive-discovery coverage; no suite rerun is claimed here. A separate
+CI distribution job builds the wheel from sdist and checks both installations.
+At this checkpoint shell Node references resolved to 22.2.0, below desktop's
+required >=22.12.0. Subsequent integration inspection found the pinned Electron
+embeds Node 24.20.0 (`ELECTRON_RUN_AS_NODE=1`), usable for repository checks;
+this mode does not launch a native UI.
+
+The optional MCP packaging now pins SDK 1.26.0, installs `tessera-mcp`, and
+bundles the portable research skill in wheel/sdist. Intel macOS additionally
+constrains cryptography to its 48.0.1 universal-wheel line: 49/50 have no Intel
+macOS wheel, causing the first unbounded compatible install to bootstrap Rust
+and time out. Binary-only dependencies repair that install boundary. The changed
+wheel installed with `pip check` passing but stopped at `tessera-mcp --help`
+(exit 2; adapter main lacked argv/help parsing). The MCP lane subsequently fixed
+credential-free help and verified bounded artifact reads with two real SDK clients.
+Those failed distribution receipts remain historical; final artifacts must be
+rebuilt and checked after source convergence. No successful final distribution
+receipt is implied by the earlier build.
+
+## Local Docker Desktop composition preflight (2026-09-29)
+
+The read-only `scripts/check_local_kubernetes_composition.py` explicitly pins a
+CA-verified loopback `docker-desktop` context, refuses occupied named namespaces
+and lists unresolved executable example placeholders. It always fails closed
+without image build, Kubernetes mutations, Secret access or cleanup. This is
+safe preliminary tooling, **not** a local bootstrap, target binding, live
+coordinator/worker run or enforcement evidence. The TLS gateway, local
+project/worker identities and their Secret delivery, exact worker binding and
+fresh connectivity/admission/storage observations remain to be implemented
+before that composition can be deployed. Do not substitute an existing
+control-restart or synthetic Job fixture for the pending integration run.
+
+## Docker Desktop authenticated dispatch fixture hardening (2026-09-28)
+
+The opt-in provider-disabled normal Kubernetes dispatch runner retains its
+existing authenticated admission/outbox/worker path. Target preflight now rejects
+relative or changed kubeconfigs and mismatched context, verifies the named local
+node before namespace creation, refuses an occupied fixture namespace, and
+rechecks cluster/namespace identity before Job creation. Successful cleanup uses
+a UID-preconditioned namespace deletion request; response is not proof of
+deletion. Failure/recovery fixtures are retained for reconciliation. This is not
+generic Kubernetes support, scientific acceptance, or a live result; see the
+[fixture runbook](docker-desktop-kubernetes-e2e.md) for limits and live evidence.
+Scoped verification: 107 dispatch/adapter tests passed (two dependency warnings),
+and 25 runner/target tests passed after additional failure-case checks; scoped
+Ruff lint/format and `git diff --check` passed. Read-only kubeconfig context
+listing showed `docker-desktop`, but `docker version` could not connect to the
+local Docker socket; no cluster requests, namespace creation or live Job run
+occurred. The retained image and cluster identity remain unverified.
+
+This file tracks executable evidence against DESIGN.md. Tessera remains a
+developer alpha; outside contributions are welcome under CONTRIBUTING.md.
+Commit, push and merge still require separate authorization. The full design and
+real research pilot are not complete. It has no production
+remote/provider/OpenCode/Kubernetes support claim; schema v50 is the
 current local schema.
+
+## MixFM program-review checkpoint (2026-09-21)
+
+The [Outcome 0/1 requirements matrix and interaction workflow](mixfm-interactions.md)
+adds a typed scientific brief, full selected/deferred condition accounting,
+evidence-digest-fenced plan/source-use/go-no-go reviews and append-only replacement
+lineage to existing study/decision storage. Agents propose; humans resolve with a
+rationale. Complete registered accounting, support/review and linked execution
+termination are checked for go; no-go remains available for an early stop direction.
+Desktop pending-review labels preserve the distinction from execution. Schema stays
+47 for that program-review checkpoint; no provider/Salad adapter, billing
+enforcement or model output is added.
+The source PDF was unavailable; coverage is against the explicit user requirements,
+not a page-level PDF acceptance. See the workflow note for verification and gaps.
+Scoped verification: 108 isolated Python tests and all 131 default desktop Node
+tests passed, scoped Ruff lint/format passed for six Python files, and
+`git diff --check` passed. Two existing dependency deprecation warnings remain;
+full Python integration and native/live gates were not run.
+
+## MixFM local dataset-ingestion checkpoint (2026-09-21)
+
+Schema v48 adds a bounded, tenant-scoped metadata layer for immutable MixFM
+Outcome 0/1 dataset snapshot declarations. It records caller-provided snapshot
+and calculated schema-record digests, typed columns/units/missingness, declared
+split/leakage and validation summaries, and source-linked license/provenance
+records. A human can approve or reject an immutable ingestion proposal only while
+the cited source revision/digest remains current and supported and the declared
+license/provenance status is not unsupported. Study exports include every snapshot
+and proposal in their bounded complete-in-scope accounting.
+
+This is not a data transfer, download, external source/license/provenance check,
+schema/unit/missingness/split validation, protected-evaluation implementation, or
+execution authorization. It deliberately reuses research-source IDs rather than
+admitting unclassified dataset bytes as worker artifacts. Scoped isolated tests
+cover malformed schemas, source digest/revision mismatch, unsupported declared
+license/provenance, duplicate snapshots, and complete export accounting.
+
+## Local API comparison checkpoint (2026-09-21)
+
+The [local comparison workflow and F1–F9 remediation gates](local-api-workflow.md)
+now connect ordinary CLI/API registration, two distinct immutable plans, human
+approval and separate admission/dispatch, the queue-consuming worker, retained
+artifact/measurement evidence, and human conclusion review. Default tests inject
+only external Kubernetes effects and synthetic output bytes. They cover both
+variants and success/failure/cancelled/unknown outcomes, service recreation,
+private custody retrieval, and no replacement create. No fixture posts a terminal
+observation or seeds execution authority directly in storage.
+
+Normal terminal reporting requires verified Job/owned-Pod evidence; incomplete
+failure observations stay unknown. Project placement and manifests now reuse
+the journal-aware upload identity checks instead of requiring a CPU-derived ID.
+Claim replay preserves idle receipts and revalidates the exact prior dispatch.
+Schema remains 47; historical evidence is not backfilled. Verification for this
+checkpoint is scoped task acceptance, not a new full-integration or live pass.
+Automatic collection, real target/provider activation, scientific validity,
+and the desktop/remote walkthroughs remain unaccepted; decision 0015 records the
+narrow behavior change.
+
+Scoped evidence on this dirty working tree: 140 tests passed in the eleven
+non-dispatch suites listed in the workflow note; all 62 dispatch tests passed
+separately. Ruff lint and formatting passed for the nine changed Python files;
+`git diff --check` passed. An initial combined 202-test run timed out at 300
+seconds without a failure report; the five nearby dispatch cases passed in a
+bounded diagnostic rerun, then both split suites passed. The aggregate timeout
+was not reproduced or explained. Full Python/desktop integration and live gates
+were not run; no release/remote readiness follows from this checkpoint.
 
 ## Redirected next milestone (planned)
 
@@ -32,7 +252,10 @@ relabeled as live validation.
 
 ## Design status matrix
 
-Reviewed 2026-09-15 against current schema v43, including the schema-v43
+Reviewed 2026-09-21 against current schema v48, including schema-v48 metadata-only
+MixFM dataset snapshot/source/license/provenance/proposal records, schema-v47 secret-free
+local-owner operator audit/health projections and optional event lineage, schema-v46
+human artifact-read custody and immutable bundle records, the schema-v43
 operation-bound remote workflow lifecycle records, and the dated 2026-09-13
 schema v42 bounded provider-disabled Astra Explain
 status turn (one read-only mediated experiment-status facade call, durable

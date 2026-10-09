@@ -1,5 +1,30 @@
 # Tessera
 
+New to the local macOS alpha? Start with the [quickstart](docs/quickstart.md) for
+the supported service → desktop → project/design → review/export path and its
+explicit execution and acceptance boundaries.
+
+The [administrative workspace](docs/admin-setup.md) adds Setup, Targets, Secrets,
+Delegations, Readiness and Audit panels with typed project-scoped metadata commands.
+Secret lifecycle includes [protected native macOS Keychain enrollment](docs/protected-secret-enrollment.md)
+for a same-host native control database, plus explicit synthetic fixtures. Values
+never enter the renderer or HTTP API. Remote/Windows/Linux enrollment remains
+unavailable; delegation governs metadata, not execution or secret reads.
+Organizational invitations and live provider enablement remain unavailable.
+Configuration and successful enrollment are not readiness.
+
+[Remote agent execution routing](docs/remote-agent-execution.md) adds typed
+Kubernetes/Salad proposals, human review, durable offline dispatch and desktop
+control/status. Desktop/local-process targets are rejected by this route. Default
+targets and live effects remain disabled; fake receipts are not live execution,
+custody, cost settlement or scientific acceptance evidence.
+
+The [Salad server proxy boundary](docs/salad-proxy.md) adds proxy-only credential
+interfaces, strict admission and fake transport tests. Its live entry point remains
+blocked before secret resolution/network. The opt-in local validator is
+`.venv/bin/python -m tessera_control.salad_proxy_cli`; it performs no network and
+does not establish provider isolation or an autonomous sandbox.
+
 Tessera is a workspace for turning a research goal into a bounded experiment
 design, remote execution, linked evidence, and a human decision. A researcher
 works with a desktop agent to plan an investigation, run experiments on approved
@@ -21,7 +46,7 @@ being pursued in parallel. MLflow, Databricks, Spark, and similar systems are
 optional integrations, never the authority for Tessera plans, attempts, evidence,
 or human conclusions.
 
-**Status: source-only developer alpha.** This repository is for local developer
+**Status: usable bounded local research bench; developer alpha.** This repository is for local developer
 evaluation, not a production release or hosted service. The local API supports scoped credentials, versioned task plans,
 human approval records, durable conversations and decisions, and a research
 ledger with complete study exports and source corrections. Approval records intent
@@ -31,7 +56,148 @@ CPU isolation fixtures pass. Live experiment dispatch and the full pilot remain
 incomplete. See
 [implementation progress](docs/implementation-progress.md) for acceptance limits.
 
+For the bounded supported-workflow matrix, enforced HTTP/output limits, and
+remaining production authentication, spending, storage and release prerequisites,
+see [launch readiness](docs/launch-readiness.md). Local safeguards do not enable a
+provider or establish production support.
+
+[Bounded autonomy](docs/bounded-autonomy.md) adds durable agent-authored preparation
+plans, exact human review, checkpoints, session leases and synthetic broker receipt
+projections. Public auto-approval is explicit and capped within an existing approved
+capability envelope. Real computer-use/download/install effects remain blocked;
+session approval is neither execution authority nor scientific acceptance.
+
+The opt-in [execution-plane monitor](docs/execution-monitor.md) runs beside the
+execution target while the control plane runs anywhere, without host namespace or
+Docker socket access. Signed assignments, independent process deadlines, durable
+monitor receipts and exact-owned stop/reconciliation have offline conformance tests.
+The closed Docker adapter requires explicit host privileges and native observations;
+Kubernetes/Salad monitor adapters and real autonomy activation remain disabled.
+
+The [MixFM Outcome 0/1 interaction slice](docs/mixfm-interactions.md) adds typed,
+evidence-fenced program-plan, source-use and go/no-go reviews to the existing
+decision inbox. Agents can propose; only humans resolve. Structured authoring and
+review history are API-first; the desktop explains and resolves pending reviews.
+This is research bookkeeping, not generated scientific advice, model training,
+Salad support, or permission to execute.
+
+[MixFM evaluation and the future Salad contract](docs/mixfm-evaluation-and-salad-contract.md)
+add caller-reported metrics, immutable declared thresholds, deterministic
+pass/fail/inconclusive reports and human go/no-go gating. An opt-in validated
+Salad GPU target contract offers local discovery and rejecting preflight only;
+it performs no credential lookup or network calls and cannot execute jobs.
+
+The [local API comparison workflow](docs/local-api-workflow.md) integrates two
+registered baseline/intervention plans, explicit approval and admission, normal
+worker dispatch, retained evidence, and human review in default fake-effect
+tests. Normal terminal Job/owned-Pod reports now reach the admitted-attempt
+ledger; success, failure, confirmed cancellation and unknown outcomes remain
+distinct. A bounded, opt-in Docker Desktop fixture has additionally recorded a
+real two-Job baseline/intervention run (see below); that narrow fixture result is
+not general Kubernetes support or a completed scientific experiment.
+
+**Dated live evidence (2026-10-03):** the opt-in
+[`check_kubernetes_lab_two_variant_e2e.py`](scripts/check_kubernetes_lab_two_variant_e2e.py)
+Local record IDs below identify retained local history; they are not links to
+downloadable artifacts or independent public proof.
+The retained local evidence record `LOCAL-TWO-VARIANT-2026-10-03` records two
+succeeded Jobs on the owned Docker Desktop Kubernetes cluster. Distinct retained,
+non-late, hash-linked outputs yielded API-derived `sum_squares` values 385
+(baseline) and 2870 (intervention); grants reconciled with zero settlement. Both
+artifacts remain quarantined and scientific review is pending; validity is
+`not_assessed`. This deterministic operational fixture does not establish
+scientific validity, provider execution, laptop-off operation, portability to a
+second environment, agent acceptance, production readiness, or researcher review.
+The earlier unknown and late-upload attempts remain distinct in that local record and
+are not erased by this run. See [the implementation roadmap](IMPLEMENTATION_TASKS.md)
+for the evidence ledger and remaining gates. The current verification checkpoint
+reports repo-wide Ruff lint/format success and 3,043 passing tests across four
+disjoint pytest shards after schema 49; a monolithic full-suite run timed out
+previously, so the sharded pass is the recorded suite evidence, not a claim that
+the monolithic invocation completed.
+
+An [opt-in comparison compute pilot](docs/comparison-pilot.md) now connects those
+ordinary admission/dispatch contracts to one explicitly configured remote
+Kubernetes target for two constant CPU probes. It retains private audit journals
+and observed stdout artifacts, leaves human review pending, and keeps model
+providers disabled. Offline tests only: no live pilot or selected-target cost,
+credential, isolation, or deployment acceptance is claimed.
+
+**Ordinary-service evidence (2026-10-04):** the installed control/worker on the
+owned Docker Desktop bench now collect output without harness uploads. The
+[ordinary worker runbook](docs/ordinary-worker-collection.md) records generation-2
+baseline 385 / 36 bytes and intervention 2870 / 37 bytes, preserved Job UID on
+stop/restart, generation-3 late 29-byte quarantine, and generation-4
+terminal-report acknowledgements plus separate human grant reconciliation. Native
+review and read-only identity reconciliation confirm the same 29-byte late
+artifact including its trailing newline. The earlier 28-byte summary omitted
+that newline and is preserved as a correction, not erased history.
+Earlier missing-UID proof and Job-list 403 histories remain unresolved rather
+than erased. Scientific outcome remains null. This is laptop-local selected-target
+evidence, with a supervised expiring route rather than permanent external ingress.
+Separate native and two-SDK deployed-MCP client receipts pass their bounded
+journeys; actual human OS-picker selection and independent-host acceptance remain
+unverified. A separate fresh native Kubernetes plan/admit/dispatch-to-new-Job
+journey now passed: exact human grant and worker package, an ordinary new Job,
+automatic timely 385 / 36-byte output, native `retain_quarantined` review followed
+by separate custody release/save, reproduction export and reconnect without
+redispatch. Scientific outcome remains null; OS dialogs used a labelled fallback,
+so actual human selection is still unverified. Follow [the native/operator handoff](desktop/EXECUTION.md).
+Normal client connectivity now has an installed operator entry point,
+[`tessera connection-tunnel`](docs/connection-tunnel.md), rather than requiring
+the historical private route launcher. Installed default-selection authenticated
+connect/reconnect passed against the owned gateway, separately from unit/help
+checks. See the runbook and [actionable handoff](docs/research-bench-handoff.md)
+for start/restart commands and limits.
+
+The pilot requires a [dedicated project workload namespace and admission
+boundary](docs/pilot-workload-isolation.md). Offline manifest rendering and opt-in
+local authorization/admission dry runs are available; they neither apply resources
+nor attest NetworkPolicy, filesystem quota, or live pilot success.
+
 ## Run the foundation
+
+The [agent capability policy](docs/agent-capability-policy.md) supports exact,
+human-approved model/data/package declarations, lease/epoch/revocation fencing,
+and transactional requested/approved/actual-effect audit records (schema 49).
+Agents cannot grant themselves capabilities. Existing runtime adapters still
+return **execution disabled** for these effects: the trusted download/install
+broker now has an [offline runtime and durable journal](docs/runtime-capability-broker.md),
+but local/Kubernetes real-effect activation is blocked pending isolation enforcement.
+Host/control-PVC/ambient-credential access remains denied. Verification is offline;
+no live download/install support or trusted sandbox is claimed.
+
+Strict activation-candidate, pinned-HTTPS and watchdog-protocol primitives now have
+[offline tests and a blocked-activation runbook](docs/capability-sandbox-activation.md).
+An independent [local networkless Docker fixture](docs/local-networkless-docker-fixture.md)
+adds opt-in, closed harmless conformance with a separate supervisor and quarantined
+fixture evidence. Default invocation has zero effects; it does not enable capability
+downloads/installs or Kubernetes. Docker start now passes; live conformance remains
+blocked by the pre-workload runtime-limit probe.
+The opt-in [independent sandbox supervision gate](docs/independent-sandbox-supervision.md)
+adds a reciprocal external guardian and a one-case kill conformance command. Its
+single live attempt still blocked at the network witness, before workload release;
+exact cleanup was confirmed, but autonomy activation remains disabled.
+The [namespace-bound proof](docs/local-docker-namespace-proof.md) now blocks before
+create when independent daemon-host procfs observations are unavailable. Its one
+follow-up invocation on macOS/LinuxKit launched zero cases; activation stays blocked.
+The [capability Kubernetes runner and installer](docs/capability-kubernetes-runner.md)
+add an exact profile, raw-observation inspection, fake-client lifecycle and bounded
+hook-free wheel materialization. These are offline components, not a validated
+live activation path; real effects remain blocked.
+
+An [authenticated Kubernetes evidence collector](docs/capability-kubernetes-collector.md)
+adds explicit target/credential binding, bounded API readback and dry runs, signed
+raw custody and one-use activation inspection. Its opt-in API-only CLI remains
+blocked without independent runtime witnesses; collection is not live enforcement.
+The [runtime witness protocol and runbook](docs/runtime-witnesses.md) add four
+mandatory authenticated CNI/quota/watchdog/admission gates, daemon-side probe
+programs and an opt-in `check_capability_runtime_witnesses.py` command. Default
+tests use explicit fakes. The [target-specific adapter layer](docs/runtime-witness-targets.md)
+adds Docker Desktop preflight, native mTLS/HMAC channels, Linux/watchdog primitives
+and real API admission with `--live --target`. Complete native drivers, a reviewed
+fixture image and defaulting compatibility are still required; live conformance
+has not been demonstrated and real execution remains blocked.
 
 Docker Compose is the development/test workflow; uv manages the Python lockfile.
 
@@ -57,7 +223,8 @@ rmdir "$credential_dir"
 
 Stop with `docker compose down`; the named volume retains the database and owner
 credential. See [CONTRIBUTING.md](./CONTRIBUTING.md) for native uv setup and the development
-workflow. Compose is not required for deployment. No license has been selected.
+workflow. Compose is not required for deployment; see
+[installed service operations](docs/installation.md). Tessera is MIT licensed.
 
 The API exposes projects, task plans, revision history, approval, and labbook
 reads. `PUT /tasks/{id}/plan` creates an immutable plan revision and invalidates
@@ -73,6 +240,17 @@ Provider spending enforcement and dispatch integration remain incomplete.
 Browser origins are rejected; the owner credential is for trusted local human
 clients. It is not production organization authentication.
 
+Provider activation and shared-organization collaboration are explicit future
+gates, not enabled alpha features. The default remains provider-disabled with
+unknown usage/billing, no API-key or billing fallback, and one local owner; see
+[provider activation and collaboration gates](docs/provider-activation-and-collaboration.md).
+
+The operator-only `tessera astra-namespace` command can inspect/use an explicit
+existing namespace with zero writes, or create one separately approved dedicated
+namespace and stop at `namespace_created_control_plane_not_installed`. It never
+installs a control plane or creates workloads, credentials, policies, RBAC, or
+storage; see [Astra namespace lifecycle](docs/astra-namespace-lifecycle.md).
+
 The [desktop shell](desktop/README.md) connects to this API and keeps bearer
 credentials in its main process. It supports projects, draft plans, approval
 records, labbook reading, attributed conversation threads, and a pending decision
@@ -84,12 +262,15 @@ reaffirmation, terminal retraction, and linked narrowing/supersession. These rec
 history; browsing never starts work or accepts findings.
 
 Existing databases require an explicit `tessera migrate --state-dir PATH` before
-startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v43
+startup; see the backup and migration instructions in CONTRIBUTING.md. Schema v49
 includes credential metadata, immutable plans, research/interaction tables and
 retained local input snapshots, execution admission records, artifact quarantine
 and resumable upload sessions with complete output manifests. Human manifest
 dispositions append digest-bound review history while preserving quarantine;
 they do not release data, accept scientific results, or settle execution costs.
+An additional human custody release can authorize private project-scoped artifact
+manifest/byte retrieval and bounded reproduction-bundle export without changing
+quarantine, input-release, result-acceptance, or publication state.
 Migration retains an unambiguous local bootstrap owner and revokes other legacy
 principals, which must be enrolled again as scoped, expiring credentials.
 
@@ -97,6 +278,19 @@ Schema v14 also records owner-approved worker registration metadata and bounded
 lifecycle/heartbeat admission. It does not attest builds or capabilities, broker
 credentials, dispatch providers, accept results, or fence restores; see
 [worker lifecycle](docs/worker-lifecycle.md).
+
+Schema v47 adds local-owner-only `/operator/health` and `/operator/audit`
+projections. They expose secret-free credential-admin audit records, command
+lineage where a command event exists, stale-worker/reconciliation/backup alerts,
+and configured project resource budgets; they do not account provider usage or
+create recovery authority. See the [single-active lab operations runbook](docs/single-active-lab-operations.md).
+
+Schema v48 adds metadata-only dataset provenance and ingestion reviews. Upgrading
+active v47 state invalidates the old backup-freshness claim; take and verify a new
+backup after recording the new data. Follow the
+[historical schema-50 held-restore gate](docs/recovery.md#historical-schema-50-post-migration-verification-gate-does-not-cover-schema-55),
+including for already-migrated v48 labs. A fresh backup timestamp is not proof of
+a verified restore, and the drill cannot promote recovered history to writable state.
 
 Schema v27 freezes goal and success criterion into each new immutable experiment
 design revision and attaches every new conclusion/review to one complete design
@@ -136,6 +330,10 @@ Schema v36 adds a human-approved, provider-disabled Kubernetes dispatch/outbox
 ledger. Schemas v37-v39 add context-only OpenCode delivery and immutable
 operation-to-session binding records; none activates a Kubernetes client,
 OpenCode provider, model, credential delivery, or artifact collection.
+An exact reviewed Kubernetes remote route now queues that existing outbox in the
+same transaction as its start command. A separately started fake worker can claim
+and reconcile it durably; route state alone does not report worker completion.
+This is offline composition, not remote deployment or provider enablement.
 
 Schemas v40-v41 add provider-disabled Astra conversation, proposal, and
 human proposal-to-design registration records. Registration creates no approval,
@@ -295,6 +493,16 @@ workflow is currently supported:
 - **Organization-managed:** planned; no production remote control-plane claim.
 - **Tessera-hosted:** planned; no hosted offering exists.
 
+An opt-in [Kubernetes coordinator and dispatch sample](deploy/kubernetes/README.md)
+adds a provider-disabled coordinator process and a separately opt-in dispatch
+service. It is an operator-provisioned composition, not a self-contained lab
+deployment: it requires a pinned image, scoped credentials, target binding, an
+operator-provided TLS gateway, and real allowed/denied network probes. It does
+not prove laptop-independent operation, provider execution, or deployment across
+diverse environments. Research corrections are recorded atomically; when a
+variant result is recorded, the finding is marked `needs_review` for human review.
+That ledger behavior is not scientific validation or proof of a result.
+
 Each project has one authoritative control plane. Organization isolation covers
 data, credentials, and operations; a Kubernetes namespace alone is not sufficient.
 Switching desktop connections does not move projects or transfer credentials.
@@ -308,6 +516,62 @@ authority boundaries. Node setup/enrollment is separate from research control.
 Synthetic adapter POC and local HTTP/SSE seam fixtures are implemented, but no
 real OpenCode compatibility result or provider activation exists; the pilot is
 not complete. See the [compatibility matrix](docs/compatibility-matrix.md).
+
+### Governed remote agents: contract versus available proof
+
+The [design contract](DESIGN.md#53-governed-agent-identity-reasoning-and-peer-transports)
+defines distinct agent identity, human-issued bounded grants, subset-only
+delegation, correlated notebook provenance, supervised real reasoning, session
+stdio MCP, and independent A2A peers. The installed Python distribution exposes
+`tessera-mcp` with the official SDK pinned to 1.26.0; see the
+[remote-agent install/runbook](docs/remote-agent-platform-install.md) for the
+actual local stdio-to-control-service arrangement and prerequisites.
+
+These interfaces do not by themselves mean the integrated platform is accepted.
+The latest full integrated remote-agent journey receipt reports schema 52 on a fresh owned Docker
+Desktop namespace/project: all 16 configured workflow assertions passed, an
+on-time ordinary Job reached supported control `succeeded`, its 36-byte output
+was proven and joined in the notebook, and two installed reference peers each
+drained four records. Public journey details are in the
+[installed runbook](docs/remote-agent-platform-install.md)
+(evidence identifier `REMOTE-AGENT-PLATFORM-2026-10-04`).
+The output remains human-quarantined with custody released; scientific validity
+was not assessed. This is local installed evidence, not real critic reasoning,
+independent-host/laptop-off, Linux/systemd, or native-picker proof. The receipt
+keeps `reasoning_verified`, `independent_host_verified`, `laptop_off_verified`,
+and `integrated_acceptance_verified` false. Historical cancelled/quarantined and
+quota-denied/unknown attempts remain preserved; the successful fresh project does
+not reconcile or erase them. The earlier 3,454-pass/1-skip baseline belongs to an
+older digest; the later candidate's exact source gate is summarized in the
+[release evidence note](docs/release-evidence-intent9.md). A deterministic/
+provider-disabled coordinator is not reasoning evidence. See the
+[implementation journal](docs/remote-agent-implementation-journal.md) and
+[installed journey record](docs/remote-agent-platform-journey.md) for check-by-check
+status and remaining acceptance.
+
+Subsequent schema-53/54 source checkpoints add the typed generated-public-output
+registry/capture family and a bounded ordinary-Docker worker HTTP/service/CLI
+adapter; see the [generated-output contract](docs/generated-public-output-interface.md),
+[public-capture boundary](docs/public-capture-interface.md), and
+[ordinary-Docker HTTP binding](docs/ordinary-docker-http-binding.md). Those source
+tests did not establish a schema-54 installed image, generated model reasoning, or
+live garage-host deployment. The later schema-55 `0.1.0rc2` candidate passed its
+own exact-source gate, as summarized below; the current changed tree still needs a
+fresh freeze and full-source gate. The ordinary Docker worker is not a host-shell or
+owner-token proxy. The journal records the remaining integration gaps.
+
+The schema-55 `0.1.0rc2` candidate has a fresh installed-wheel and local native
+slice. Its exact source/archive/wheel hashes, source-gate results, synthetic-data
+limits, and unverified acceptance boundaries are in the
+[sanitized candidate evidence note](docs/release-evidence-intent9.md). This supersedes
+the schema-52 installed receipt above only for the bounded checks described there;
+it does not establish production enrollment, real model reasoning, scientific
+validity, or off-host/device acceptance. Ongoing CLI/factory and documentation work
+requires a fresh candidate inventory/build and affected gates. See the
+[release checklist](docs/release-checklist.md) and
+[runtime-admission contract](docs/runtime-admission-v2.md). Operator bootstrap and
+upgrade limits are in [runtime operator setup](docs/runtime-operator-setup.md); the
+bounded tabular workload is described in [tabular starter](docs/tabular-starter.md).
 
 Closing Electron does not stop the separately running control plane. If its
 machine sleeps or becomes unreachable, workers follow their disconnect and
@@ -375,15 +639,17 @@ failure handling, and release tests.
 
 ## Developer-alpha boundaries
 
-Start with the [local ledger quickstart](docs/quickstart.md) and its synthetic
-example. Schema v43 is the current local schema, but the documented component and
+Start with the [local alpha quickstart](docs/quickstart.md). Schema 55 is the
+current source/installed-candidate schema, but the documented component and
 synthetic evidence does not make a production workflow. There is no supported
-remote control plane, real provider integration, OpenCode compatibility result,
-or Kubernetes execution path. The tested developer environments are locked Python
+production remote-control offering, real model-provider integration or OpenCode
+compatibility result. The selected ordinary Kubernetes bench above is not general
+Kubernetes/production support. The tested developer environments are locked Python
 3.11+ and Docker Compose/native fixtures; no production OS support matrix is
 declared. Local object-bundle backups copy committed project bytes and restore
 them into a permanently read-only held history. Backup/restore do not provide
 retention automation, owner/account recovery, operational failover, or fencing of
 the original service/workers/jobs. See [privacy](docs/privacy.md),
 [support](docs/support.md), [release checklist](docs/release-checklist.md), and
-[SECURITY.md](SECURITY.md). No license has been selected.
+[SECURITY.md](SECURITY.md). See [LICENSE](LICENSE) for MIT terms; outside
+contributions are welcome under [CONTRIBUTING.md](CONTRIBUTING.md).

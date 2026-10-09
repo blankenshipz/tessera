@@ -6,6 +6,22 @@ on:
 permissions:
   contents: read
 jobs:
+  python-distributions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned build tool
+        run: python -m pip install uv==0.12.10
+      - name: Build wheel from clean source distribution
+        run: uv build --out-dir "$RUNNER_TEMP/tessera-dist"
+      - name: Install wheel and source; exercise ordinary service
+        run: |
+          python dev/check_distribution.py "$RUNNER_TEMP"/tessera-dist/*.whl
+          python dev/check_distribution.py "$RUNNER_TEMP"/tessera-dist/*.tar.gz
   desktop-boundaries:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -16,12 +32,25 @@ jobs:
           node-version: '22'
       - name: Test desktop connection and IPC boundaries
         run: npm test --prefix desktop
-  control:
+  control-style:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Build development image
         run: docker compose build
-      - name: Lint, format, and isolated tests
-        run: docker compose run --rm test
+      - name: Lint and format
+        run: docker compose run --rm test sh -c 'ruff check . && ruff format --check .'
+  control-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build development image
+        run: docker compose build test
+      - name: Isolated disjoint pytest shard
+        run: docker compose run --rm test python dev/pytest_shard.py --index ${{ matrix.shard }} --count 4 -q

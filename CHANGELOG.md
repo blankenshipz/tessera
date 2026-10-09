@@ -8,11 +8,12 @@ commitments.
 
 - Documentation now states the release-readiness boundaries, local-ledger
   quickstart, recovery limits, and synthetic-example scope.
-- Current local schema: v43. Schema v43 records operation-bound remote workflow
-  heartbeat, checkpoint, and reconnect/outage metadata for new packages only; it
-  does not enable remote execution or operational failover. See [implementation progress](docs/implementation-progress.md)
-  and the [compatibility matrix](docs/compatibility-matrix.md) for evidence and
-  remaining gates.
+- Current local schema: v47. Schemas v43-v47 add operation-bound remote-workflow
+  and recovery records, Astra coordinator consumer availability, human artifact-read
+  custody and immutable reproduction bundles, and secret-free local-owner operator
+  audit/health metadata. They do not enable remote execution or operational failover.
+  See [implementation progress](docs/implementation-progress.md) and the
+  [compatibility matrix](docs/compatibility-matrix.md) for evidence and remaining gates.
 - Local backups include committed project bytes in a versioned object bundle;
   restore remains permanently read-only held history and does not fence the
   original service, workers, or external jobs.
