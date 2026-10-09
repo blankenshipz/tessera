@@ -1,0 +1,1660 @@
+--- /dev/null
++++ b/harness/plugins/v2/guard-check-publisher.mjs
+@@ -0,0 +1,101 @@
++import { createHash } from 'node:crypto';
++
++const hash = value => createHash('sha256').update(value).digest('hex');
++const digest = /^[a-f0-9]{64}$/;
++const isDigest = value => typeof value === 'string' && digest.test(value);
++const identifier = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
++const get = (object, key) => {
++  const entry = object && Object.getOwnPropertyDescriptor(object, key);
++  if (!entry || !Object.hasOwn(entry, 'value')) throw new Error('Guard publisher: unsafe field.');
++  return entry.value;
++};
++const closed = (object, fields) => {
++  if (!object || typeof object !== 'object' || Object.keys(object).sort().join(',') !== [...fields].sort().join(','))
++    throw new Error('Guard publisher: closed fields required.');
++  return Object.fromEntries(fields.map(key => [key, get(object, key)]));
++};
++const time = value => {
++  if (typeof value !== 'string' || value.length > 40 || !Number.isFinite(Date.parse(value)))
++    throw new Error('Guard publisher: timestamp invalid.');
++  return Date.parse(value);
++};
++const contextFields = ['nonce', 'session_ref', 'proof_ref', 'order_revision', 'sequence'];
++export function completedGuardChecks({ event, executed_phase, executed_at, financial, quota, routeVerified }) {
++  if (!['model.request', 'http.request', 'experimental.ws.handshake'].includes(executed_phase))
++    throw new Error('Guard publisher: execution phase invalid.');
++  const session = get(event, 'sessionID');
++  const model = get(get(event, 'model'), 'id');
++  if (typeof session !== 'string' || !/^ses_[A-Za-z0-9_-]{1,196}$/.test(session) ||
++      typeof model !== 'string' || !identifier.test(model))
++    throw new Error('Guard publisher: session/model invalid.');
++  const descriptor = Object.getOwnPropertyDescriptor(event, 'phaseContext');
++  if (descriptor && !Object.hasOwn(descriptor, 'value')) throw new Error('Guard publisher: unsafe context.');
++  let context = descriptor?.value ? closed(descriptor.value, contextFields) : null;
++  if (context && (!isDigest(context.nonce) || !isDigest(context.session_ref) ||
++      !isDigest(context.proof_ref) || context.session_ref !== hash(session) ||
++      !Number.isSafeInteger(context.order_revision) || context.order_revision < 1 ||
++      !Number.isSafeInteger(context.sequence) || context.sequence < 1))
++    throw new Error('Guard publisher: context binding invalid.');
++  if (typeof quota !== 'string' || quota.length > 2048) throw new Error('Guard publisher: quota receipt missing.');
++  const check = closed(JSON.parse(quota), ['evidence_class', 'outcome', 'checked_at', 'snapshot_checked_at', 'valid_until']);
++  const at = time(executed_at), snapshot = time(check.snapshot_checked_at), checked = time(check.checked_at), until = time(check.valid_until);
++  if (check.evidence_class !== 'local_measured_enforcement' || check.outcome !== 'passed' ||
++      !(snapshot <= checked && checked <= at && at < until && until <= snapshot + 30000 && until > checked))
++    throw new Error('Guard publisher: quota receipt not fresh passed checks.');
++  const verifiedAt = get(financial, 'verified_at');
++  if (typeof verifiedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T[^\s]{1,30})?$/.test(verifiedAt) || !Number.isFinite(Date.parse(verifiedAt)))
++    throw new Error('Guard publisher: financial attestation date invalid.');
++  return Object.freeze({ executed_phase, executed_at, model_id: model,
++    session_ref: hash(session), phase_context: context ? Object.freeze(context) : null,
++    local_checks: Object.freeze({ evidence_class: 'local_measured_enforcement', openai_only: 'passed',
++      chatgpt_route: routeVerified ? 'passed' : 'unknown', chatgpt_oauth_method: 'passed',
++      account_match: 'passed', api_key_overrides_absent: 'passed' }), quota: Object.freeze(check),
++    financial_settings: Object.freeze({ evidence_class: 'operator_attested_financial_settings',
++      auto_top_up_off: get(financial, 'auto_top_up_off') === true,
++      automatic_reload_off: get(financial, 'automatic_reload_off') === true,
++      purchased_credit_balance_zero: get(financial, 'purchased_credit_balance_ui') === 0,
++      verified_at: verifiedAt, freshness: 'unknown' }),
++    provider_facts: Object.freeze({ evidence_class: 'provider_unknown', entitlement: 'unknown', billing_guarantee: 'unknown' }) });
++}
++
++// Must be independently approved and invoked by the trusted embedding. This
++// publishes completed native guard operations, not independent auth or entitlement.
++export function createGuardCheckPublisher({ publisher_ref, issuer_origin, now = () => Date.now() }) {
++  if (typeof issuer_origin !== 'string') throw new Error('Guard publisher: origin string required.');
++  const origin = new URL(issuer_origin);
++  if (!isDigest(publisher_ref) || origin.protocol !== 'https:' || origin.username || origin.password ||
++      origin.search || origin.hash || origin.pathname !== '/') throw new Error('Guard publisher: trust pins required.');
++  const pending = new Map(), consumed = new Set();
++  return Object.freeze({
++    onChecks(checks) {
++      const context = checks.phase_context;
++      if (!context) return; // Actual check completed, but no supervised order binding.
++      if (pending.size >= 512) throw new Error('Guard publisher: record bound.');
++      pending.set(context.nonce, checks);
++    },
++    publishOwnerChecks(phase) {
++      const nonce = get(phase, 'nonce');
++      const checks = pending.get(nonce);
++      if (!checks || consumed.has(nonce)) throw new Error('Guard publisher: no completed bound checks or replay.');
++      const context = checks.phase_context;
++      if (get(phase, 'protocol') !== 'opencode-model-hook-phase-v1' || get(phase, 'phase') !== 'post-model-request-hooks' ||
++          get(phase, 'complete') !== false || get(phase, 'ordering_enforced') !== false ||
++          get(phase, 'phase_finality') !== 'unproven' || get(phase, 'issuer_origin') !== origin.origin ||
++          contextFields.some(key => get(phase, key) !== context[key])) throw new Error('Guard publisher: phase binding drift.');
++      const projection = get(phase, 'projection');
++      if (get(projection, 'model_id') !== checks.model_id || !isDigest(get(projection, 'fingerprint')))
++        throw new Error('Guard publisher: model/fingerprint invalid.');
++      const at = now(), guardAt = time(checks.executed_at), phaseAt = time(get(phase, 'observed_at'));
++      const expires = Math.min(time(checks.quota.valid_until), guardAt + 30000, time(get(phase, 'valid_until')));
++      if (!(guardAt <= at && phaseAt <= at && at < expires)) throw new Error('Guard publisher: stale/future checks.');
++      consumed.add(nonce); pending.delete(nonce);
++      if (consumed.size > 4096) throw new Error('Guard publisher: replay bound.');
++      return JSON.stringify({ protocol: 'tessera-owner-guard-checks-v1', publisher_ref,
++        issuer_origin: origin.origin, ...context, phase: 'post-model-request-hooks',
++        executed_phase: checks.executed_phase, projection_fingerprint: get(projection, 'fingerprint'),
++        model_id: checks.model_id, executed_at: checks.executed_at, valid_until: new Date(expires).toISOString(),
++        local_checks: checks.local_checks, quota: checks.quota,
++        financial_settings: checks.financial_settings, provider_facts: checks.provider_facts });
++    },
++  });
++}
+--- a/harness/plugins/v2/subscription-guard.mjs
++++ b/harness/plugins/v2/subscription-guard.mjs
+@@ -7,6 +7,7 @@
+ import { validateFinancial } from '../../config/guard-validation.mjs';
+ import { configuredCodexHome, managedConfigRoot, packageRoot, statePath } from './paths.mjs';
+ import { recordCompletion as persistCompletion } from './completion-ledger.mjs';
++import { completedGuardChecks } from './guard-check-publisher.mjs';
+ 
+ const quotaEnvironment = env => Object.fromEntries([
+   'HOME', 'PATH', 'LANG', 'HARNESS_STATE_DIR', 'CODEX_HOME', 'HARNESS_CODEX_BIN', 'HARNESS_PYTHON',
+@@ -83,11 +84,11 @@
+     appendFileSync(path.join(telemetry, `${file}.jsonl`), JSON.stringify(value) + '\n', { mode: 0o600 });
+   }, env = process.env, now = () => new Date().toISOString(), recordCompletion = value => persistCompletion({
+     database: statePath('telemetry', 'completions.sqlite3'), value, python: env.HARNESS_PYTHON || 'python3', env,
+-  }) } = {}) {
++   }), onChecks } = {}) {
+   async function quota(operation) {
+     const started = performance.now();
+     try {
+-      return await runQuota([operation === 'check' ? '--check' : '--json'], {
++      return await runQuota(operation === 'check' ? (onChecks ? ['--check', '--receipt'] : ['--check']) : ['--json'], {
+         env: quotaEnvironment(env), timeout: quotaDeadline, encoding: 'utf8', stdio: 'pipe',
+       });
+     } catch (error) {
+@@ -125,8 +126,10 @@
+     if (codex.auth_mode !== 'chatgpt' || !credential.metadata?.accountID ||
+         credential.metadata.accountID !== codex.tokens?.account_id)
+       throw new Error('Subscription guard: OpenCode and quota telemetry must use the same ChatGPT account.');
+-    validateFinancial(readJSON(path.join(managedConfigRoot, 'financial-verification.json')));
+-    await quota('check');
++    const financial = readJSON(path.join(managedConfigRoot, 'financial-verification.json'));
++    validateFinancial(financial);
++    const checked = await quota('check');
++    return { financial, checked };
+   }
+   return {
+     id: 'subscription.guard',
+@@ -150,7 +153,10 @@
+       }));
+       await ctx.session.hook('model.request', async event => {
+         if (event.baseURL !== undefined) verifyEndpoint(event.baseURL);
+-        await verify(ctx, event);
++        const checked = await verify(ctx, event);
++        if (onChecks) await onChecks(completedGuardChecks({ event, executed_phase: 'model.request',
++          executed_at: now(), financial: checked.financial, quota: checked.checked,
++          routeVerified: event.baseURL !== undefined }));
+         append('requests', { checked_at: now(), session: event.sessionID, agent: event.agent,
+           model: event.model.id, provider: event.model.providerID,
+           variant: event.model.variant ?? null, reasoning_effort: null });
+@@ -158,12 +164,16 @@
+       // Validate the resolved transport as well: a later plugin or provider setting can
+       // rewrite baseURL after model.request. HTTP and WS are both possible in V2.
+       await ctx.session.hook('http.request', async event => {
+-        await verify(ctx, event);
++        const checked = await verify(ctx, event);
+         verifyEndpoint(event.request.url);
++        if (onChecks) await onChecks(completedGuardChecks({ event, executed_phase: 'http.request',
++          executed_at: now(), financial: checked.financial, quota: checked.checked, routeVerified: true }));
+       });
+       await ctx.session.hook('experimental.ws.handshake', async event => {
+-        await verify(ctx, event);
++        const checked = await verify(ctx, event);
+         verifyEndpoint(event.url.replace(/^wss:/, 'https:'));
++        if (onChecks) await onChecks(completedGuardChecks({ event, executed_phase: 'experimental.ws.handshake',
++          executed_at: now(), financial: checked.financial, quota: checked.checked, routeVerified: true }));
+       });
+       const controller = new AbortController();
+       void (async () => {
+--- a/harness/src/codex_quota.py
++++ b/harness/src/codex_quota.py
+@@ -302,7 +302,10 @@
+     p.add_argument("--json", action="store_true")
+     p.add_argument("--refresh", action="store_true")
+     p.add_argument("--check", action="store_true")
++    p.add_argument("--receipt", action="store_true")
+     args = p.parse_args(argv)
++    if args.receipt and not args.check:
++        p.error("--receipt requires --check")
+     try:
+         data, cached = read_quota(refresh=args.refresh)
+     except Exception as exc:
+@@ -315,6 +318,14 @@
+         return 2
+     if args.check:
+         denied = admission_denied(data)
++        if args.receipt:
++            from quota_check_receipt import make_check_receipt
++            try:
++                receipt = make_check_receipt(data, denied=denied, now=datetime.now(timezone.utc))
++            except (ValueError, TypeError, KeyError):
++                print(json.dumps({"outcome": "unavailable"}))
++                return 2
++            print(json.dumps(receipt, sort_keys=True))
+         return 1 if denied else 0
+     if args.json:
+         print(json.dumps(data, sort_keys=True))
+--- /dev/null
++++ b/harness/src/quota_check_receipt.py
+@@ -0,0 +1,20 @@
++"""Safe metadata for the exact snapshot used by the existing admission check."""
++
++from datetime import datetime, timedelta, timezone
++
++
++def make_check_receipt(snapshot, *, denied, now):
++    checked = datetime.fromisoformat(snapshot["checked_at"].replace("Z", "+00:00"))
++    if (
++        checked.tzinfo is None
++        or now.tzinfo is None
++        or not 0 <= (now - checked).total_seconds() < 30
++    ):
++        raise ValueError("quota receipt snapshot age unknown")
++    return {
++        "evidence_class": "local_measured_enforcement",
++        "outcome": "denied" if denied else "passed",
++        "checked_at": now.astimezone(timezone.utc).isoformat(),
++        "snapshot_checked_at": checked.isoformat(),
++        "valid_until": (checked + timedelta(seconds=30)).isoformat(),
++    }
+--- /dev/null
++++ b/harness/tests/guard-check-publisher.test.mjs
+@@ -0,0 +1,200 @@
++import { test, expect } from 'bun:test';
++import { createHash } from 'node:crypto';
++import { spawnSync } from 'node:child_process';
++import { accessSync, constants, statSync } from 'node:fs';
++import { isAbsolute, join } from 'node:path';
++import { Effect } from 'effect';
++import { createV2Guard } from '../plugins/v2/subscription-guard.mjs';
++import { createGuardCheckPublisher, completedGuardChecks } from '../plugins/v2/guard-check-publisher.mjs';
++import { ModelPhaseOrder } from '../../packages/core/src/plugin/model-phase.ts';
++
++const sha = x => createHash('sha256').update(x).digest('hex');
++const session = 'ses_synthetic_guard';
++const at = Date.parse('2030-01-01T00:00:00Z');
++const context = { nonce: 'a'.repeat(64), session_ref: sha(session), proof_ref: 'c'.repeat(64), order_revision: 1, sequence: 1 };
++const challenge = { nonce: context.nonce, session_ref: context.session_ref,
++  proof_ref: context.proof_ref, issuer_origin: 'https://guard.example.test' };
++const quota = { evidence_class: 'local_measured_enforcement', outcome: 'passed', checked_at: new Date(at).toISOString(),
++  snapshot_checked_at: new Date(at - 1000).toISOString(), valid_until: new Date(at + 29000).toISOString() };
++
++async function setup(change, onChecks) {
++  const hooks = new Map(), calls = [], checks = [];
++  const financial = { auto_top_up_off: true, automatic_reload_off: true, purchased_credit_balance_ui: 0,
++    verified_at: '2029-12-01', PRIVATE: 'must-not-export' };
++  const credential = { type: 'oauth', methodID: 'chatgpt-browser', metadata: { accountID: 'synthetic-private-account' },
++    PRIVATE: 'must-not-export' };
++  const provider = { package: '@opencode/ai/providers/openai', settings: {}, headers: {} };
++  const ctx = {
++    provider: { transform: async fn => fn({ get: () => ({ provider }), remove: () => calls.push('removed') }),
++      get: async () => { calls.push('provider'); return { data: provider }; } },
++    model: { list: async () => ({ data: [{ providerID: 'openai', settings: {}, headers: {} }] }) },
++    integration: { connection: { active: async () => ({ type: 'credential', method: 'oauth' }),
++      resolve: async () => { calls.push('resolve'); return credential; } } },
++    tool: { transform: async fn => fn({ add: () => {} }) },
++    session: { hook: async (name, callback) => hooks.set(name, callback) },
++    event: { subscribe: async function* () {} },
++  };
++  const guard = createV2Guard({ env: {}, now: () => new Date(at).toISOString(),
++    readJSON: name => { calls.push('read'); return name.endsWith('auth.json')
++      ? { auth_mode: 'chatgpt', tokens: { account_id: 'synthetic-private-account' } } : financial; },
++    runQuota: async args => { calls.push('quota');
++      expect(args).toEqual(onChecks === false ? ['--check'] : ['--check', '--receipt']);
++      if (change === 'quota-failure') throw Object.assign(new Error('PRIVATE'), { code: 'ENOENT' });
++      return onChecks === false ? '' : JSON.stringify({ ...quota,
++        ...(change === 'stale-quota' ? { snapshot_checked_at: new Date(at - 31000).toISOString(), valid_until: new Date(at - 1000).toISOString() } : {}) });
++    },
++    append: () => calls.push('append'), recordCompletion: () => { throw new Error('unexpected ledger'); },
++    ...(onChecks === false ? {} : { onChecks: async safe => { calls.push('published'); checks.push(safe); if (onChecks) await onChecks(safe); } }),
++  });
++  if (change === 'api-key') provider.settings.apiKey = 'synthetic';
++  if (change === 'account') credential.metadata.accountID = 'synthetic-other';
++  if (change === 'financial') financial.auto_top_up_off = false;
++  const dispose = await guard.setup(ctx);
++  return { hooks, calls, checks, dispose };
++}
++const event = () => ({ sessionID: session, agent: 'research', model: { providerID: 'openai', id: 'model' },
++  baseURL: 'https://chatgpt.com/backend-api/codex', phaseContext: context });
++
++test('safe projector rejects coercion and getters without traversing unsafe objects', () => {
++  let touched = false;
++  const hostile = { toString() { touched = true; throw new Error('unsafe'); } };
++  const financial = { verified_at: '2029-12-01', auto_top_up_off: true,
++    automatic_reload_off: true, purchased_credit_balance_ui: 0 };
++  const project = input => completedGuardChecks({ event: input, executed_phase: 'model.request',
++    executed_at: new Date(at).toISOString(), financial, quota: JSON.stringify(quota), routeVerified: true });
++  const model = event(); model.model.id = hostile;
++  expect(() => project(model)).toThrow();
++  const refs = event(); refs.phaseContext = { ...context, nonce: hostile };
++  expect(() => project(refs)).toThrow();
++  const getter = event(); Object.defineProperty(getter, 'phaseContext', { get() { touched = true; throw new Error('unsafe'); } });
++  expect(() => project(getter)).toThrow();
++  expect(touched).toBe(false);
++});
++
++test('actual public guard publishes only after completed native checks and no private objects', async () => {
++  const fixture = await setup();
++  try {
++    const input = event();
++    let touched = false;
++    for (const key of ['headers', 'prompt', 'body', 'accountID'])
++      Object.defineProperty(input, key, { get() { touched = true; throw new Error('PRIVATE'); } });
++    await fixture.hooks.get('model.request')(input);
++    expect(fixture.calls.indexOf('published')).toBeGreaterThan(fixture.calls.indexOf('quota'));
++    expect(fixture.calls.indexOf('published')).toBeGreaterThan(fixture.calls.indexOf('resolve'));
++    expect(fixture.checks.length).toBe(1);
++    const safe = fixture.checks[0];
++    expect(safe.local_checks.account_match).toBe('passed');
++    expect(safe.financial_settings.evidence_class).toBe('operator_attested_financial_settings');
++    expect(safe.financial_settings.verified_at).toBe('2029-12-01');
++    expect(safe.financial_settings.freshness).toBe('unknown');
++    expect(safe.provider_facts.entitlement).toBe('unknown');
++    const text = JSON.stringify(safe);
++    for (const token of ['synthetic-private-account', 'must-not-export', session, 'accountID', 'headers', 'prompt'])
++      expect(text).not.toContain(token);
++    expect(touched).toBe(false);
++  } finally { fixture.dispose(); }
++});
++
++for (const change of ['api-key', 'account', 'financial', 'quota-failure', 'stale-quota'])
++  test(`failed native guard or receipt ${change} never publishes successful outcomes`, async () => {
++    const fixture = await setup(change);
++    try { await expect(fixture.hooks.get('model.request')(event())).rejects.toThrow();
++      expect(fixture.checks.length).toBe(0); }
++    finally { fixture.dispose(); }
++  });
++
++test('existing guard mode retains quiet check and no receipt reads/publishing', async () => {
++  const fixture = await setup(null, false);
++  try { await fixture.hooks.get('model.request')(event()); expect(fixture.checks.length).toBe(0); }
++  finally { fixture.dispose(); }
++});
++
++for (const phase of ['http.request', 'experimental.ws.handshake'])
++  test(`actual guard ${phase} callback follows endpoint verification`, async () => {
++    const fixture = await setup();
++    try {
++      const input = { ...event(), request: { url: 'https://chatgpt.com/backend-api/codex/responses' },
++        url: 'wss://chatgpt.com/backend-api/codex/responses' };
++      await fixture.hooks.get(phase)(input);
++      expect(fixture.checks[0].executed_phase).toBe(phase);
++      input.request.url = 'https://other.invalid'; input.url = 'wss://other.invalid';
++      await expect(fixture.hooks.get(phase)(input)).rejects.toThrow();
++      expect(fixture.checks.length).toBe(1);
++    } finally { fixture.dispose(); }
++  });
++
++test('missing model route proof is unknown, never substituted with source/options', async () => {
++  const fixture = await setup();
++  try { const input = event(); delete input.baseURL; await fixture.hooks.get('model.request')(input);
++    expect(fixture.checks[0].local_checks.chatgpt_route).toBe('unknown'); }
++  finally { fixture.dispose(); }
++});
++
++test('actual ordered core executor binds actual guard completions to the same nonce/order', async () => {
++  const publisher = createGuardCheckPublisher({ publisher_ref: 'd'.repeat(64), issuer_origin: challenge.issuer_origin, now: () => at });
++  const fixture = await setup(null, publisher.onChecks);
++  try {
++    const order = new ModelPhaseOrder(), input = event(); delete input.phaseContext;
++    const result = await Effect.runPromise(order.execute(input, [evt => Effect.promise(() => fixture.hooks.get('model.request')(evt))], challenge));
++    const lease = order.capture(result.ticket, challenge, () => ({ provider: 'openai', model_id: 'model', tools: [] }), () => at);
++    const phase = lease.consume();
++    const receipt = JSON.parse(publisher.publishOwnerChecks(phase));
++    expect(receipt.protocol).toBe('tessera-owner-guard-checks-v1');
++    expect(receipt.order_revision).toBe(result.ticket.revision);
++    expect(receipt.sequence).toBe(result.ticket.sequence);
++    expect(receipt.executed_phase).toBe('model.request');
++    expect(receipt.quota.snapshot_checked_at).toBe(quota.snapshot_checked_at);
++    expect(() => publisher.publishOwnerChecks(lease.receipt)).toThrow('replay');
++    const script = `import sys,json
++from datetime import datetime,timezone
++from tessera_mcp.guard_phase_evidence import GuardPhaseExpectation,CorePhaseContext,parse_core_model_hook_phase
++from tessera_mcp.guard_phase_join import OwnerPublisherTrust,join_owner_guard_checks
++p=json.load(sys.stdin);r=p['phase'];o=p['owner']
++e=GuardPhaseExpectation(issuer_origin=r['issuer_origin'],**{k:r[k] for k in ['nonce','session_ref','proof_ref','order_revision','sequence']},**{k:r['projection'][k] for k in ['model_id','provider_sha256','model_sha256','tool_policy_sha256']})
++c=CorePhaseContext(bound_origin=r['issuer_origin'],enrollment_ref='e'*64,adapter_ref='f'*64,**{k:r[k] for k in ['nonce','session_ref','proof_ref']})
++now=datetime(2030,1,1,tzinfo=timezone.utc)
++core=parse_core_model_hook_phase(json.dumps(r).encode(),expected=e,context=c,now=now)
++joined=join_owner_guard_checks(core,json.dumps(o).encode(),trust=OwnerPublisherTrust(issuer_origin='https://guard.example.test',publisher_ref='d'*64),now=now)
++assert not joined.admission_allowed and not joined.production_verified
++print('native join remains non-admitting')`;
++    // Explicit test-only read-only source references; no discovery or auth resolution.
++    const python = process.env.TESSERA_PHASE_TEST_PYTHON;
++    const sourceRoot = process.env.TESSERA_PHASE_TEST_SOURCE_ROOT;
++    if (!python || !sourceRoot || !isAbsolute(python) || !isAbsolute(sourceRoot))
++      throw new Error('Native join test requires explicit absolute TESSERA_PHASE_TEST_PYTHON and TESSERA_PHASE_TEST_SOURCE_ROOT references (read-only source test mode).');
++    try {
++      accessSync(python, constants.X_OK);
++      if (!statSync(sourceRoot).isDirectory() ||
++          !statSync(join(sourceRoot, 'tessera_mcp', 'guard_phase_evidence.py')).isFile() ||
++          !statSync(join(sourceRoot, 'tessera_mcp', 'guard_phase_join.py')).isFile()) throw new Error('source missing');
++    } catch {
++      throw new Error('Native join test prerequisite unavailable: executable Python and read-only Tessera parser source required by explicit test references.');
++    }
++    const parsed = spawnSync(python, ['-B', '-c', script], {
++      encoding: 'utf8', input: JSON.stringify({ phase, owner: receipt }),
++      env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1', PYTHONPATH: sourceRoot },
++    });
++    if (parsed.error || parsed.status !== 0)
++      throw new Error('Native join test failed: supplied Python must support the explicit Tessera parser source and its dependencies; no test skipped or synthetic pass substituted.');
++    expect(parsed.status).toBe(0);
++    expect(parsed.stdout.trim()).toBe('native join remains non-admitting');
++  } finally { fixture.dispose(); }
++});
++
++for (const change of ['nonce', 'sequence', 'stale', 'future'])
++  test(`publisher rejects ${change} instead of replaying checks`, async () => {
++    let clock = at;
++    const publisher = createGuardCheckPublisher({ publisher_ref: 'd'.repeat(64), issuer_origin: challenge.issuer_origin, now: () => clock });
++    const fixture = await setup(null, publisher.onChecks);
++    try {
++      const order = new ModelPhaseOrder(), input = event(); delete input.phaseContext;
++      const result = await Effect.runPromise(order.execute(input, [evt => Effect.promise(() => fixture.hooks.get('model.request')(evt))], challenge));
++      const phase = order.capture(result.ticket, challenge, () => ({ provider: 'openai', model_id: 'model', tools: [] }), () => at).consume();
++      const altered = { ...phase };
++      if (change === 'nonce') altered.nonce = 'e'.repeat(64);
++      if (change === 'sequence') altered.sequence++;
++      if (change === 'stale') clock += 30000;
++      if (change === 'future') clock--;
++      expect(() => publisher.publishOwnerChecks(altered)).toThrow();
++    } finally { fixture.dispose(); }
++  });
+--- /dev/null
++++ b/harness/tests/test_quota_check_receipt.py
+@@ -0,0 +1,71 @@
++import contextlib
++import io
++import json
++import sys
++import unittest
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from unittest.mock import patch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
++import codex_quota
++
++
++class ReceiptTests(unittest.TestCase):
++    def snapshot(self):
++        return {
++            "checked_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
++            "credit_risk": "none",
++            "buckets": [
++                {
++                    "windows": [
++                        {"reset": "known", "remaining_percent": 50, "target_used_percent": 50}
++                    ]
++                }
++            ],
++            "PRIVATE": "not-exported",
++        }
++
++    def call(self, snapshot, flags):
++        output = io.StringIO()
++        with (
++            patch.object(codex_quota, "read_quota", return_value=(snapshot, True)),
++            contextlib.redirect_stdout(output),
++        ):
++            status = codex_quota.main(flags)
++        return status, output.getvalue()
++
++    def test_same_actual_native_policy_and_snapshot_metadata(self):
++        data = self.snapshot()
++        status, output = self.call(data, ["--check", "--receipt"])
++        self.assertEqual(status, 0)
++        receipt = json.loads(output)
++        self.assertEqual(receipt["snapshot_checked_at"], data["checked_at"])
++        self.assertEqual(receipt["outcome"], "passed")
++        self.assertNotIn("PRIVATE", output)
++        self.assertNotIn("buckets", output)
++
++    def test_native_denial_not_relabelled_passed(self):
++        data = self.snapshot()
++        data["credit_risk"] = "purchased"
++        status, output = self.call(data, ["--check", "--receipt"])
++        self.assertEqual(status, 1)
++        self.assertEqual(json.loads(output)["outcome"], "denied")
++
++    def test_stale_and_future_snapshot_receipt_unavailable(self):
++        for seconds in [-31, 10]:
++            data = self.snapshot()
++            data["checked_at"] = (
++                datetime.now(timezone.utc) + timedelta(seconds=seconds)
++            ).isoformat()
++            status, output = self.call(data, ["--check", "--receipt"])
++            self.assertEqual(status, 2)
++            self.assertEqual(json.loads(output), {"outcome": "unavailable"})
++
++    def test_existing_check_stays_quiet(self):
++        status, output = self.call(self.snapshot(), ["--check"])
++        self.assertEqual((status, output), (0, ""))
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/packages/core/src/plugin/hooks.ts
++++ b/packages/core/src/plugin/hooks.ts
+@@ -9,6 +9,8 @@
+ import { Context, Effect, Layer, Scope } from "effect"
+ import { makeLocationNode } from "@opencode/util/effect/app-node"
+ import { State } from "../state.js"
++import { ModelPhaseOrder } from "./model-phase.js"
++import type { Challenge } from "./model-phase.js"
+ 
+ export interface Domains {
+   readonly aisdk: AISDKHooks
+@@ -40,6 +42,14 @@
+ }
+ 
+ export interface Interface {
++  readonly modelPhaseOrder: ModelPhaseOrder
++  readonly triggerModelRequest: (
++    event: Domains["session"]["model.request"],
++    challenge?: Challenge,
++  ) => Effect.Effect<{
++    event: Domains["session"]["model.request"]
++    ticket: { revision: number; sequence: number }
++  }>
+   readonly requiredPlugins: readonly string[]
+   readonly setRequiredPluginCheck: (check: Effect.Effect<void>) => Effect.Effect<void>
+   readonly assertRequiredPlugins: Effect.Effect<void>
+@@ -63,7 +73,7 @@
+ 
+ export class Service extends Context.Service<Service, Interface>()("@opencode/PluginHooks") {}
+ 
+-const layer = Layer.effect(
++export const layer = Layer.effect(
+   Service,
+   Effect.gen(function* () {
+     const requiredPlugins = (process.env.OPENCODE_REQUIRED_PLUGINS ?? "")
+@@ -72,6 +82,7 @@
+       .filter(Boolean)
+     let requiredPluginCheck: Effect.Effect<void> | undefined
+     const callbacks = new Map<string, Entry[]>()
++    const modelPhaseOrder = new ModelPhaseOrder()
+     const key = (domain: keyof Domains, name: PropertyKey) => `${domain}.${String(name)}`
+ 
+     const register: Interface["register"] = Effect.fn("PluginHooks.register")(
+@@ -81,9 +92,11 @@
+         let active = true
+         const entry = { callback, options }
+         callbacks.set(id, [...(callbacks.get(id) ?? []), entry])
++        modelPhaseOrder.changed()
+         const dispose = Effect.sync(() => {
+           if (!active) return
+           active = false
++          modelPhaseOrder.changed()
+           const next = (callbacks.get(id) ?? []).filter((item) => item !== entry)
+           if (next.length === 0) callbacks.delete(id)
+           else callbacks.set(id, next)
+@@ -101,6 +114,17 @@
+       }
+       return event
+     })
++
++    const triggerModelRequest: Interface["triggerModelRequest"] = (event, challenge) =>
++      modelPhaseOrder.execute(
++        event,
++        (callbacks.get(key("session", "model.request")) ?? [])
++          .filter(
++            (entry) => entry.options?.providerID === undefined || entry.options.providerID === eventProviderID(event),
++          )
++          .map((entry) => (input) => entry.callback(input)),
++        challenge,
++      )
+ 
+     const has: Interface["has"] = (domain, name, providerID) =>
+       Effect.sync(() =>
+@@ -121,7 +145,16 @@
+       })
+     })
+ 
+-    return Service.of({ requiredPlugins, setRequiredPluginCheck, assertRequiredPlugins, has, register, trigger })
++    return Service.of({
++      modelPhaseOrder,
++      triggerModelRequest,
++      requiredPlugins,
++      setRequiredPluginCheck,
++      assertRequiredPlugins,
++      has,
++      register,
++      trigger,
++    })
+   }),
+ )
+ 
+--- /dev/null
++++ b/packages/core/src/plugin/model-phase.ts
+@@ -0,0 +1,211 @@
++import { createHash } from "node:crypto"
++import { Effect } from "effect"
++
++// Only explicitly public structural policy fields; never serialize a request,
++// headers/options/body/account/connection identifiers, descriptions or defaults.
++const value = (object: unknown, key: string): unknown => {
++  if (object === null || typeof object !== "object") throw new Error("phase projection invalid")
++  const descriptor = Object.getOwnPropertyDescriptor(object, key)
++  if (!descriptor || !("value" in descriptor)) throw new Error("phase projection accessor denied")
++  return descriptor.value
++}
++const id = (input: unknown) => {
++  if (typeof input !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(input))
++    throw new Error("phase identifier invalid")
++  return input
++}
++// Called only with freshly constructed public projection objects above, not raw
++// requests. Sorted-key canonical JSON matches the Tessera phase fingerprint.
++const canonical = (input: unknown): unknown => {
++  if (Array.isArray(input)) return input.map(canonical)
++  if (input !== null && typeof input === "object")
++    return Object.fromEntries(
++      Object.keys(input)
++        .sort()
++        .map((key) => [key, canonical(value(input, key))]),
++    )
++  return input
++}
++const digest = (input: unknown) =>
++  createHash("sha256")
++    .update(JSON.stringify(canonical(input)))
++    .digest("hex")
++const schemaPolicy = (input: unknown, depth = 0): unknown => {
++  if (depth > 8) throw new Error("phase schema bound")
++  const type = value(input, "type")
++  if (!["object", "array", "string", "number", "integer", "boolean", "null"].includes(type as string))
++    throw new Error("phase schema type unknown")
++  if (type === "object") {
++    const fields = value(input, "properties")
++    if (!fields || typeof fields !== "object") throw new Error("phase properties unknown")
++    const keys = Object.keys(fields).sort()
++    if (keys.length > 128) throw new Error("phase properties bound")
++    return { type, properties: keys.map((key) => [id(key), schemaPolicy(value(fields, key), depth + 1)]) }
++  }
++  if (type === "array") return { type, items: schemaPolicy(value(input, "items"), depth + 1) }
++  return { type }
++}
++
++export type Challenge = {
++  nonce: string
++  session_ref: string
++  proof_ref: string
++  issuer_origin: string
++}
++export type SafeInput = { provider: unknown; model_id: unknown; tools: unknown }
++export type Lease = ReturnType<ModelPhaseOrder["capture"]>
++
++export class ModelPhaseOrder {
++  private revision = 1
++  private sequence = 0
++  private nonces = new Set<string>()
++  changed() {
++    this.revision += 1
++  }
++
++  // This is the core ordered executor, not a plugin-reported ordering assertion.
++  // Hook registration/disposal while an execution is suspended invalidates it.
++  execute<T, R = never>(
++    event: T,
++    hooks: readonly ((event: T) => Effect.Effect<void, never, R>)[],
++    challenge?: Challenge,
++  ) {
++    const order = this
++    return Effect.gen(function* () {
++      const revision = order.revision
++      const sequence = ++order.sequence
++      if (challenge) {
++        const refs = Object.fromEntries(
++          ["nonce", "session_ref", "proof_ref"].map((key) => {
++            const ref = value(challenge, key)
++            if (typeof ref !== "string" || !/^[a-f0-9]{64}$/.test(ref)) throw new Error("phase challenge invalid")
++            return [key, ref]
++          }),
++        )
++        Object.defineProperty(event, "phaseContext", {
++          value: Object.freeze({ ...refs, order_revision: revision, sequence }),
++          writable: false,
++          configurable: false,
++        })
++      }
++      const snapshot = [...hooks]
++      for (const hook of snapshot) {
++        yield* hook(event)
++        if (revision !== order.revision || sequence !== order.sequence) throw new Error("model hook order drift")
++      }
++      return { event, ticket: Object.freeze({ revision, sequence }) }
++    })
++  }
++
++  capture(
++    ticket: { revision: number; sequence: number },
++    challenge: Challenge,
++    read: () => SafeInput,
++    clock = () => Date.now(),
++  ) {
++    const hash = /^[a-f0-9]{64}$/
++    for (const field of ["nonce", "session_ref", "proof_ref"] as const)
++      if (typeof value(challenge, field) !== "string" || !hash.test(value(challenge, field) as string))
++        throw new Error("phase challenge invalid")
++    const originValue = value(challenge, "issuer_origin")
++    if (typeof originValue !== "string") throw new Error("phase origin invalid")
++    const origin = new URL(originValue)
++    if (
++      origin.protocol !== "https:" ||
++      origin.username ||
++      origin.password ||
++      origin.search ||
++      origin.hash ||
++      origin.pathname !== "/"
++    )
++      throw new Error("phase origin invalid")
++    if (this.nonces.has(challenge.nonce) || this.nonces.size >= 4096) throw new Error("phase nonce replay or bound")
++    this.nonces.add(challenge.nonce)
++    const project = () => {
++      const input = read()
++      const provider = id(value(input, "provider"))
++      if (provider !== "openai") throw new Error("phase provider unknown")
++      const model_id = id(value(input, "model_id"))
++      const tools = value(input, "tools")
++      if (!Array.isArray(tools) || tools.length > 128) throw new Error("phase tools bound")
++      const policy = Array.from({ length: tools.length }, (_, index) => value(tools, String(index)))
++        .map((tool) => ({ name: id(value(tool, "name")), schema: schemaPolicy(value(tool, "inputSchema")) }))
++        .sort((a, b) => a.name.localeCompare(b.name))
++      if (new Set(policy.map((tool) => tool.name)).size !== policy.length) throw new Error("phase duplicate tools")
++      const projection = {
++        provider,
++        model_id,
++        provider_sha256: digest({ provider }),
++        model_sha256: digest({ provider, model_id }),
++        tool_policy_sha256: digest(policy),
++      }
++      return {
++        ...projection,
++        fingerprint: digest({
++          phase: "post-model-request-hooks",
++          order_revision: ticket.revision,
++          sequence: ticket.sequence,
++          ...projection,
++        }),
++      }
++    }
++    if (ticket.revision !== this.revision || ticket.sequence !== this.sequence) throw new Error("phase ticket drift")
++    const observed = clock()
++    const projection = Object.freeze(project())
++    const receipt = Object.freeze({
++      protocol: "opencode-model-hook-phase-v1",
++      phase: "post-model-request-hooks",
++      complete: false,
++      // The stage's executor is ordered, but no final HTTP/transport claim exists.
++      phase_finality: "unproven",
++      ordering_enforced: false,
++      nonce: challenge.nonce,
++      session_ref: challenge.session_ref,
++      proof_ref: challenge.proof_ref,
++      issuer_origin: origin.origin,
++      order_revision: ticket.revision,
++      sequence: ticket.sequence,
++      observed_at: new Date(observed).toISOString(),
++      valid_until: new Date(observed + 30000).toISOString(),
++      projection,
++      local_enforcement: Object.freeze({
++        evidence_class: "local_measured_enforcement",
++        model_request_hook_executor: "ordered_snapshot",
++        scope: "model-request-hook-stage-only",
++      }),
++      financial_settings: Object.freeze({
++        evidence_class: "operator_attested_financial_settings",
++        observation: "not_supplied",
++        freshness: "unknown",
++      }),
++      provider_facts: Object.freeze({
++        evidence_class: "provider_unknown",
++        entitlement: "unknown",
++        billing_guarantee: "unknown",
++      }),
++    })
++    let consumed = false
++    const readReceipt = () => {
++      const now = clock()
++      if (
++        consumed ||
++        now < observed ||
++        now >= observed + 30000 ||
++        ticket.revision !== this.revision ||
++        ticket.sequence !== this.sequence ||
++        project().fingerprint !== projection.fingerprint
++      )
++        throw new Error("phase receipt invalidated")
++      return receipt
++    }
++    return Object.freeze({
++      receipt,
++      read: readReceipt,
++      consume: () => {
++        readReceipt()
++        consumed = true
++        return receipt
++      },
++    })
++  }
++}
+--- /dev/null
++++ b/packages/core/src/session/model-phase-channel.ts
+@@ -0,0 +1,93 @@
++import { Context, Effect } from "effect"
++import type { Challenge, Lease } from "../plugin/model-phase.js"
++import { SessionModelRequest } from "./model-request.js"
++
++// Required trusted adapter to existing authenticated server/session ownership.
++// No default authorization, bearer parsing, caller approval boolean or new port.
++export class ModelPhaseAuthority extends Context.Service<
++  ModelPhaseAuthority,
++  {
++    authorizeSession: (sessionID: string) => Effect.Effect<{
++      principal: object
++      session_ref: string
++    }>
++  }
++>()("@opencode/ModelPhaseAuthority") {}
++
++export function makeModelPhaseChannel() {
++  const pending = new Map<
++    string,
++    { sessionID: string; principal: object; lease: Lease; prepared: SessionModelRequest.Prepared }
++  >()
++  const used = new Set<string>()
++  const authorize = (sessionID: string) =>
++    Effect.gen(function* () {
++      const authority = yield* ModelPhaseAuthority
++      return yield* authority.authorizeSession(sessionID)
++    })
++  const find = (sessionID: string, nonce: string) =>
++    Effect.gen(function* () {
++      const owner = yield* authorize(sessionID)
++      const entry = pending.get(nonce)
++      if (
++        !entry ||
++        entry.sessionID !== sessionID ||
++        entry.principal !== owner.principal ||
++        entry.lease.receipt.session_ref !== owner.session_ref
++      )
++        throw new Error("phase channel unauthorized or absent")
++      return entry
++    })
++  return Object.freeze({
++    prepare: (sessionID: string, challenge: Challenge, input: SessionModelRequest.Input) =>
++      Effect.gen(function* () {
++        const owner = yield* authorize(sessionID)
++        const fields = ["nonce", "session_ref", "proof_ref", "issuer_origin"]
++        if (
++          Object.keys(challenge).length !== fields.length ||
++          fields.some((field) => {
++            const descriptor = Object.getOwnPropertyDescriptor(challenge, field)
++            return !descriptor || !("value" in descriptor) || typeof descriptor.value !== "string"
++          })
++        )
++          throw new Error("phase channel challenge closed fields required")
++        if (
++          input.session.id !== sessionID ||
++          challenge.session_ref !== owner.session_ref ||
++          !/^[a-f0-9]{64}$/.test(challenge.nonce)
++        )
++          throw new Error("phase channel session binding invalid")
++        if (used.has(challenge.nonce) || used.size >= 4096) throw new Error("phase channel nonce replay or bound")
++        used.add(challenge.nonce)
++        const service = yield* SessionModelRequest.Service
++        const prepared = yield* service.primary({ ...input, phaseChallenge: challenge })
++        const current = yield* authorize(sessionID)
++        if (
++          current.principal !== owner.principal ||
++          current.session_ref !== owner.session_ref ||
++          !prepared.phaseEvidence
++        )
++          throw new Error("phase channel ownership changed")
++        const receipt = prepared.phaseEvidence.read()
++        pending.set(challenge.nonce, { sessionID, principal: owner.principal, lease: prepared.phaseEvidence, prepared })
++        return receipt
++      }),
++    read: (sessionID: string, nonce: string) => find(sessionID, nonce).pipe(Effect.map((entry) => entry.lease.read())),
++    // Receipt APIs never return the native request. Only a privileged in-process
++    // continuation receives it after current live-order consumption succeeds.
++    consume: (
++      sessionID: string,
++      nonce: string,
++      continuePrepared?: (prepared: SessionModelRequest.Prepared) => Effect.Effect<void>,
++    ) =>
++      Effect.gen(function* () {
++        const entry = yield* find(sessionID, nonce)
++        pending.delete(nonce)
++        const receipt = entry.lease.consume()
++        if (continuePrepared) yield* continuePrepared(entry.prepared)
++        return receipt
++      }),
++  })
++}
++
++export type ModelPhaseChannel = ReturnType<typeof makeModelPhaseChannel>
+--- a/packages/core/src/session/model-request.ts
++++ b/packages/core/src/session/model-request.ts
+@@ -29,6 +29,7 @@
+ import { App } from "../app.js"
+ import { Permission } from "../permission.js"
+ import { PluginHooks } from "../plugin/hooks.js"
++import type { Challenge, Lease } from "../plugin/model-phase.js"
+ import { QuestionTool } from "../tool/plugin/question.js"
+ import { Tool } from "../tool.js"
+ import { SessionModelTransport } from "./model-transport.js"
+@@ -49,6 +50,7 @@
+ export type ExecuteError = Tool.Error | Permission.DeclinedError | QuestionTool.CancelledError
+ 
+ export interface Prepared<Event = SessionRequest> {
++  readonly phaseEvidence?: Lease
+   readonly event: Event
+   readonly request: LLMRequest
+   readonly options: StreamOptions
+@@ -60,6 +62,8 @@
+ }
+ 
+ export interface Input {
++  /** Explicit supervisor challenge only; not a plugin admission override. */
++  readonly phaseChallenge?: Challenge
+   readonly session: SessionSchema.Info
+   readonly agent: Agent.ID
+   readonly model: SessionRunnerModel.Resolved
+@@ -260,11 +264,15 @@
+ 
+       const baseURL = base.model.route.endpoint.baseURL
+       yield* hooks.assertRequiredPlugins
+-      const modelHook = yield* hooks.trigger("session", "model.request", {
+-        ...scope,
+-        baseURL: typeof baseURL === "string" ? baseURL : undefined,
+-        headers: { ...base.http?.headers },
+-      })
++      const modelPhase = yield* hooks.triggerModelRequest(
++        {
++          ...scope,
++          baseURL: typeof baseURL === "string" ? baseURL : undefined,
++          headers: { ...base.http?.headers },
++        },
++        input.phaseChallenge,
++      )
++      const modelHook = modelPhase.event
+       const route =
+         modelHook.baseURL !== undefined && modelHook.baseURL !== baseURL
+           ? base.model.route.with({ endpoint: { baseURL: modelHook.baseURL } })
+@@ -277,6 +285,13 @@
+           query: base.http?.query,
+         }),
+       })
++      const phaseEvidence = input.phaseChallenge
++        ? hooks.modelPhaseOrder.capture(modelPhase.ticket, input.phaseChallenge, () => ({
++            provider: model.ref.providerID,
++            model_id: model.ref.id,
++            tools: request.tools ?? [],
++          }))
++        : undefined
+       // History selects native windows against the catalog route before hooks run. A newly installed
+       // routing hook must not send an existing opaque window to another deployment; `prepare` has no
+       // error channel, so like hook failures this surfaces as a defect.
+@@ -358,6 +373,7 @@
+           : undefined
+ 
+       return {
++        phaseEvidence,
+         event: shaped,
+         request,
+         options: { ...(http ? { http } : {}), ...(webSocket ? { webSocket } : {}) },
+--- /dev/null
++++ b/packages/core/test/model-phase-service.test.ts
+@@ -0,0 +1,411 @@
++import { afterAll, expect, test, mock, spyOn } from "bun:test"
++import { Context, Effect, Layer, Scope } from "effect"
++import { createHash } from "node:crypto"
++
++// Only upstream AI/resource primitives are synthetic. Actual PluginHooks layer,
++// SessionModelRequest layer/prepare and channel below execute unchanged functions.
++// All dispatch entry points fail if called; this is preparation-only acceptance.
++let dispatches = 0
++let latestRequest: any
++const forbidden = () => {
++  dispatches++
++  throw new Error("provider dispatch forbidden")
++}
++const fetchGuard = spyOn(globalThis, "fetch").mockImplementation(forbidden)
++afterAll(() => fetchGuard.mockRestore())
++class Metadata extends Context.Service<Metadata, object>()("FixtureApp") {}
++class Transport extends Context.Service<Transport, { bind: typeof forbidden }>()("FixtureTransport") {}
++const local = (relative: string, exports: () => object) =>
++  mock.module(new URL(relative, import.meta.url).pathname, exports)
++mock.module("@opencode/ai", () => ({
++  GenerationOptions: { fields: {} },
++  HttpOptions: class {
++    constructor(input: object) {
++      Object.assign(this, input)
++    }
++  },
++  LanguageModel: { update: (model: object, patch: object) => ({ ...model, ...patch }) },
++  LLM: { request: (input: object) => input, stream: forbidden, generate: forbidden },
++  LLMRequest: { update: (input: object, patch: object) => (latestRequest = { ...input, ...patch }) },
++  Message: { make: (input: object) => input },
++  SystemPart: {},
++}))
++mock.module("@opencode/util/effect/app-node", () => ({ makeLocationNode: (input: object) => input }))
++local("../src/app.js", () => ({ App: { Metadata, useragent: () => "fixture" } }))
++local("../src/permission.js", () => ({ Permission: { DeclinedError: class extends Error {} } }))
++local("../src/tool/plugin/question.js", () => ({ QuestionTool: { CancelledError: class extends Error {} } }))
++local("../src/tool.js", () => ({ Tool: { Error: class extends Error {} } }))
++local("../src/session/model-transport.js", () => ({ SessionModelTransport: { Service: Transport, node: {} } }))
++local("../src/session/provider-context.js", () => ({ SessionProviderContext: { provenance: () => undefined } }))
++local("../src/session/runner/model.js", () => ({ SessionRunnerModel: {} }))
++local("../src/session/schema.js", () => ({ SessionSchema: {} }))
++local("../src/session/system-prompt.js", () => ({ SessionSystemPrompt: { make: () => [] } }))
++local("../src/session/runner/to-llm-message.js", () => ({ toLLMMessages: () => [] }))
++const { PluginHooks } = await import("../src/plugin/hooks.js")
++const { SessionModelRequest } = await import("../src/session/model-request.js")
++const { ModelPhaseAuthority, makeModelPhaseChannel } = await import("../src/session/model-phase-channel.js")
++
++const owner = {},
++  foreign = {}
++const challenge = (nonce = "a".repeat(64)) => ({
++  nonce,
++  session_ref: "b".repeat(64),
++  proof_ref: "c".repeat(64),
++  issuer_origin: "https://guard.example.test",
++})
++function input() {
++  return {
++    session: { id: "ses_fixture", projectID: "project" },
++    agent: "research",
++    model: {
++      ref: { providerID: "openai", id: "model" },
++      model: {
++        capabilities: { input: {} },
++        route: { provider: "openai", endpoint: { baseURL: "https://provider.invalid" }, with: forbidden },
++      },
++    },
++    tools: {
++      definitions: [
++        { name: "tessera_status", description: "fixture", inputSchema: { type: "object", properties: {} } },
++      ],
++      execute: forbidden,
++    },
++    system: [],
++    messages: [],
++  }
++}
++const run = (body: () => Effect.Effect<any, any, any>) => {
++  const dependencies = Layer.mergeAll(
++    PluginHooks.layer,
++    Layer.succeed(Metadata, {}),
++    Layer.succeed(Transport, { bind: forbidden }),
++  )
++  const services = Layer.provideMerge(SessionModelRequest.layer, dependencies)
++  return Effect.runPromise(
++    Effect.scoped(
++      Effect.gen(function* () {
++        // Fixture-only upstream plugin enforcement, not real guard/OAuth admission.
++        const hooks = yield* PluginHooks.Service
++        yield* hooks.setRequiredPluginCheck(Effect.void)
++        return yield* Effect.suspend(body)
++      }),
++    ).pipe(Effect.provide(services)),
++  )
++}
++const authority = (principal = owner) => ({
++  authorizeSession: (id: string) =>
++    Effect.sync(() => {
++      if (id !== "ses_fixture") throw new Error("unauthorized session")
++      return { principal, session_ref: "b".repeat(64) }
++    }),
++})
++
++test("actual preparation service publishes read/consume SDK channel without provider dispatch", async () => {
++  await run(() =>
++    Effect.gen(function* () {
++      const channel = makeModelPhaseChannel()
++      const prepared = yield* channel.prepare("ses_fixture", challenge(), input() as any)
++      expect(prepared.phase).toBe("post-model-request-hooks")
++      expect("request" in prepared).toBe(false)
++      const read = yield* channel.read("ses_fixture", challenge().nonce)
++      expect(read.phase).toBe("post-model-request-hooks")
++      expect(read.complete).toBe(false)
++      let continued = false
++      expect(
++        yield* channel.consume("ses_fixture", challenge().nonce, (native) =>
++          Effect.sync(() => {
++            continued = true
++            expect(native.phaseEvidence!.receipt).toEqual(read)
++            expect(native.request.tools!.length).toBe(1)
++          }),
++        ),
++      ).toEqual(read)
++      expect(continued).toBe(true)
++      expect(dispatches).toBe(0)
++    }).pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++  )
++})
++
++test("actual preparation runs model request hooks before evidence", async () => {
++  await run(() =>
++    Effect.gen(function* () {
++      const hooks = yield* PluginHooks.Service
++      let called = 0
++      yield* hooks.register("session", "model.request", () =>
++        Effect.sync(() => {
++          called++
++        }),
++      )
++      const channel = makeModelPhaseChannel()
++      yield* channel.prepare("ses_fixture", challenge(), input() as any)
++      expect(called).toBe(1)
++      yield* channel.consume("ses_fixture", challenge().nonce)
++      expect(dispatches).toBe(0)
++    }).pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++  )
++})
++
++test("channel fails without current authenticated session authority", async () => {
++  await expect(run(() => makeModelPhaseChannel().prepare("ses_fixture", challenge(), input() as any))).rejects.toThrow()
++  expect(dispatches).toBe(0)
++})
++
++test("unauthorized session rejected before actual prepare", async () => {
++  await expect(
++    run(() =>
++      makeModelPhaseChannel()
++        .prepare("ses_foreign", challenge(), input() as any)
++        .pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++    ),
++  ).rejects.toThrow("unauthorized session")
++  expect(dispatches).toBe(0)
++})
++
++test("challenge replay fails and principal change cannot read pending receipt", async () => {
++  await run(() =>
++    Effect.gen(function* () {
++      const channel = makeModelPhaseChannel()
++      yield* channel
++        .prepare("ses_fixture", challenge(), input() as any)
++        .pipe(Effect.provideService(ModelPhaseAuthority, authority()))
++      const replay = yield* Effect.exit(
++        channel
++          .prepare("ses_fixture", challenge(), input() as any)
++          .pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++      )
++      expect(replay._tag).toBe("Failure")
++      const wrong = yield* Effect.exit(
++        channel
++          .read("ses_fixture", challenge().nonce)
++          .pipe(Effect.provideService(ModelPhaseAuthority, authority(foreign))),
++      )
++      expect(wrong._tag).toBe("Failure")
++      yield* channel
++        .consume("ses_fixture", challenge().nonce)
++        .pipe(Effect.provideService(ModelPhaseAuthority, authority()))
++      const replayConsume = yield* Effect.exit(
++        channel.consume("ses_fixture", challenge().nonce).pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++      )
++      expect(replayConsume._tag).toBe("Failure")
++    }),
++  )
++})
++
++test("revoked current authority prevents read/consume and privileged continuation", async () => {
++  let revoked = false
++  const current = {
++    authorizeSession: (sessionID: string) =>
++      Effect.sync(() => {
++        if (revoked || sessionID !== "ses_fixture") throw new Error("session authority revoked")
++        return { principal: owner, session_ref: "b".repeat(64) }
++      }),
++  }
++  await run(() =>
++    Effect.gen(function* () {
++      const channel = makeModelPhaseChannel()
++      yield* channel.prepare("ses_fixture", challenge(), input() as any)
++      revoked = true
++      expect((yield* Effect.exit(channel.read("ses_fixture", challenge().nonce)))._tag).toBe("Failure")
++      expect(
++        (yield* Effect.exit(channel.consume("ses_fixture", challenge().nonce, () => Effect.sync(forbidden))))._tag,
++      ).toBe("Failure")
++      expect(dispatches).toBe(0)
++    }).pipe(Effect.provideService(ModelPhaseAuthority, current)),
++  )
++})
++
++for (const drift of ["late-hook", "provider", "tool", "tool-schema", "stale", "future"])
++  test(`actual service channel consume rejects ${drift}`, async () => {
++    await run(() =>
++      Effect.gen(function* () {
++        const channel = makeModelPhaseChannel(),
++          fixture = input()
++        const prepared = yield* channel.prepare("ses_fixture", challenge(), fixture as any)
++        if (drift === "late-hook") {
++          const hooks = yield* PluginHooks.Service
++          yield* hooks.register("session", "model.request", () => Effect.void)
++        } else if (drift === "provider") fixture.model.ref.providerID = "other"
++        else if (drift === "tool") latestRequest.tools[0].name = "changed"
++        else if (drift === "tool-schema")
++          latestRequest.tools[0].inputSchema.properties = {
++            added: { type: "string" },
++          }
++        let result
++        if (drift === "stale" || drift === "future") {
++          const original = Date.now
++          const after = drift === "stale" ? Date.parse(prepared.valid_until) : Date.parse(prepared.observed_at) - 1
++          Date.now = () => after
++          try {
++            expect((yield* Effect.exit(channel.read("ses_fixture", challenge().nonce)))._tag).toBe("Failure")
++            result = yield* Effect.exit(channel.consume("ses_fixture", challenge().nonce, () => Effect.sync(forbidden)))
++          } finally {
++            Date.now = original
++          }
++        } else {
++          expect((yield* Effect.exit(channel.read("ses_fixture", challenge().nonce)))._tag).toBe("Failure")
++          result = yield* Effect.exit(channel.consume("ses_fixture", challenge().nonce, () => Effect.sync(forbidden)))
++        }
++        expect(result._tag).toBe("Failure")
++        expect(dispatches).toBe(0)
++      }).pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++    )
++  })
++
++test("supervised challenge must bind the current authorized session reference", async () => {
++  await expect(
++    run(() =>
++      makeModelPhaseChannel()
++        .prepare("ses_fixture", { ...challenge(), session_ref: "d".repeat(64) }, input() as any)
++        .pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++    ),
++  ).rejects.toThrow("session binding invalid")
++  expect(dispatches).toBe(0)
++})
++
++for (const invalid of ["extra", "getter"])
++  test(`SDK challenge rejects ${invalid} without private getter traversal`, async () => {
++    const value = challenge()
++    let touched = false
++    if (invalid === "extra") (value as any).authorized = true
++    else
++      Object.defineProperty(value, "nonce", {
++        get: () => {
++          touched = true
++          throw new Error("PRIVATE")
++        },
++      })
++    await expect(
++      run(() =>
++        makeModelPhaseChannel()
++          .prepare("ses_fixture", value, input() as any)
++          .pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++      ),
++    ).rejects.toThrow("closed fields required")
++    expect(touched).toBe(false)
++    expect(dispatches).toBe(0)
++  })
++
++test("actual ordered hook registration during prepare invalidates the service", async () => {
++  await expect(
++    run(() =>
++      Effect.gen(function* () {
++        const hooks = yield* PluginHooks.Service
++        yield* hooks.register("session", "model.request", () =>
++          hooks.register("session", "model.request", () => Effect.void).pipe(Effect.asVoid),
++        )
++        yield* makeModelPhaseChannel().prepare("ses_fixture", challenge(), input() as any)
++      }).pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++    ),
++  ).rejects.toThrow("order drift")
++  expect(dispatches).toBe(0)
++})
++
++test("public SDK channel reads only safe receipt, never private preparation payload", async () => {
++  const sdk = await import("@opencode/sdk/effect/model-phase")
++  expect(sdk.makeModelPhaseChannel).toBe(makeModelPhaseChannel)
++  await run(() =>
++    Effect.gen(function* () {
++      const fixture = input(),
++        channel = sdk.makeModelPhaseChannel()
++      fixture.messages = [{ role: "user", content: [{ type: "text", text: "PRIVATE-PROMPT-SENTINEL" }] }] as any
++      yield* channel.prepare("ses_fixture", challenge(), fixture as any)
++      const receipt = yield* channel.read("ses_fixture", challenge().nonce)
++      expect(JSON.stringify(receipt)).not.toContain("PRIVATE-PROMPT-SENTINEL")
++      expect(JSON.stringify(receipt)).not.toContain("headers")
++      expect(receipt.provider_facts.entitlement).toBe("unknown")
++      expect(dispatches).toBe(0)
++    }).pipe(Effect.provideService(ModelPhaseAuthority, authority())),
++  )
++})
++
++test("actual public guard runs in actual preparation service and publishes same live core phase", async () => {
++  const { createV2Guard } = await import("../../../harness/plugins/v2/subscription-guard.mjs")
++  const { createGuardCheckPublisher } = await import("../../../harness/plugins/v2/guard-check-publisher.mjs")
++  await run(() =>
++    Effect.gen(function* () {
++      const hooks = yield* PluginHooks.Service,
++        scope = yield* Scope.Scope
++      const sessionRef = createHash("sha256").update("ses_fixture").digest("hex")
++      const publisher = createGuardCheckPublisher({
++        publisher_ref: "d".repeat(64),
++        issuer_origin: challenge().issuer_origin,
++      })
++      const native = createV2Guard({
++        env: {},
++        onChecks: publisher.onChecks,
++        readJSON: (file: string) =>
++          file.endsWith("auth.json")
++            ? { auth_mode: "chatgpt", tokens: { account_id: "synthetic-only" } }
++            : {
++                auto_top_up_off: true,
++                automatic_reload_off: true,
++                purchased_credit_balance_ui: 0,
++                verified_at: "2026-10-01",
++              },
++        runQuota: async () => {
++          const stamp = Date.now()
++          return JSON.stringify({
++            evidence_class: "local_measured_enforcement",
++            outcome: "passed",
++            checked_at: new Date(stamp).toISOString(),
++            snapshot_checked_at: new Date(stamp).toISOString(),
++            valid_until: new Date(stamp + 30000).toISOString(),
++          })
++        },
++        append: () => {},
++        recordCompletion: forbidden,
++      })
++      const dispose = yield* Effect.promise(() =>
++        native.setup({
++          provider: {
++            transform: async () => {},
++            get: async () => ({ data: { package: "@opencode/ai/providers/openai", settings: {}, headers: {} } }),
++          },
++          model: { list: async () => ({ data: [{ providerID: "openai", settings: {}, headers: {} }] }) },
++          integration: {
++            connection: {
++              active: async () => ({ type: "credential", method: "oauth" }),
++              resolve: async () => ({
++                type: "oauth",
++                methodID: "chatgpt-browser",
++                metadata: { accountID: "synthetic-only" },
++              }),
++            },
++          },
++          tool: { transform: async () => {} },
++          event: { subscribe: async function* () {} },
++          session: {
++            hook: async (name: any, callback: any) =>
++              Effect.runPromise(
++                hooks
++                  .register("session", name, (event: any) => Effect.promise(() => callback(event)))
++                  .pipe(Effect.provideService(Scope.Scope, scope)),
++              ),
++          },
++        }),
++      )
++      try {
++        // Synthetic upstream route matches guard's actual allowed endpoint predicate.
++        const fixture = input()
++        fixture.model.model.route.endpoint.baseURL = "https://chatgpt.com/backend-api/codex"
++        const channel = makeModelPhaseChannel()
++        const current = { authorizeSession: () => Effect.succeed({ principal: owner, session_ref: sessionRef }) }
++        yield* channel
++          .prepare("ses_fixture", { ...challenge(), session_ref: sessionRef }, fixture as any)
++          .pipe(Effect.provideService(ModelPhaseAuthority, current))
++        const phase = yield* channel
++          .consume("ses_fixture", challenge().nonce)
++          .pipe(Effect.provideService(ModelPhaseAuthority, current))
++        const ownerChecks = JSON.parse(publisher.publishOwnerChecks(phase))
++        expect(ownerChecks.projection_fingerprint).toBe(phase.projection.fingerprint)
++        expect(ownerChecks.order_revision).toBe(phase.order_revision)
++        expect(ownerChecks.local_checks.account_match).toBe("passed")
++        expect(ownerChecks.provider_facts.entitlement).toBe("unknown")
++        expect(JSON.stringify(ownerChecks)).not.toContain("synthetic-only")
++        expect(dispatches).toBe(0)
++      } finally {
++        dispose()
++      }
++    }),
++  )
++})
+--- /dev/null
++++ b/packages/core/test/model-phase.test.ts
+@@ -0,0 +1,218 @@
++import { expect, test } from "bun:test"
++import { Context, Effect } from "effect"
++import { spawnSync } from "node:child_process"
++import { ModelPhaseOrder } from "../src/plugin/model-phase.js"
++
++const challenge = () => ({
++  nonce: "a".repeat(64),
++  session_ref: "b".repeat(64),
++  proof_ref: "c".repeat(64),
++  issuer_origin: "https://guard.example.test",
++})
++const safe = () => ({
++  provider: "openai",
++  model_id: "test-model",
++  tools: [
++    {
++      name: "tessera_status",
++      inputSchema: {
++        type: "object",
++        properties: {
++          project: { type: "string" },
++          count: { type: "integer" },
++        },
++      },
++    },
++  ],
++})
++const run = <T>(order: ModelPhaseOrder, event: T, hooks: ((event: T) => Effect.Effect<void>)[] = []) =>
++  Effect.runPromise(order.execute(event, hooks))
++
++test("actual core ordered executor runs all hooks before capturing partial phase", async () => {
++  const order = new ModelPhaseOrder(),
++    input = safe(),
++    seen: string[] = []
++  const { ticket } = await run(order, input, [
++    (event) =>
++      Effect.sync(() => {
++        event.model_id = "after-first"
++        seen.push("first")
++      }),
++    (event) =>
++      Effect.sync(() => {
++        expect(event.model_id).toBe("after-first")
++        event.model_id = "after-last"
++        seen.push("last")
++      }),
++  ])
++  const lease = order.capture(
++    ticket,
++    challenge(),
++    () => input,
++    () => 1700000000000,
++  )
++  expect(seen).toEqual(["first", "last"])
++  expect(lease.receipt.phase).toBe("post-model-request-hooks")
++  expect(lease.receipt.projection.model_id).toBe("after-last")
++  expect(lease.receipt.complete).toBe(false)
++  expect(lease.receipt.phase_finality).toBe("unproven")
++  expect(lease.receipt.ordering_enforced).toBe(false)
++  expect(lease.receipt.provider_facts.entitlement).toBe("unknown")
++  expect(lease.receipt.financial_settings.observation).toBe("not_supplied")
++  expect(Date.parse(lease.receipt.valid_until) - Date.parse(lease.receipt.observed_at)).toBe(30000)
++  expect(lease.consume()).toEqual(lease.receipt)
++  expect(() => lease.consume()).toThrow("invalidated")
++})
++
++test("late hook registration or disposal invalidates pending and captured order", async () => {
++  const order = new ModelPhaseOrder()
++  await expect(run(order, {}, [() => Effect.sync(() => order.changed())])).rejects.toThrow("order drift")
++  const { ticket } = await run(order, {})
++  const lease = order.capture(ticket, challenge(), safe)
++  order.changed()
++  expect(() => lease.consume()).toThrow("invalidated")
++})
++
++test("a subsequent execution invalidates earlier sequence", async () => {
++  const order = new ModelPhaseOrder()
++  const { ticket } = await run(order, {})
++  const lease = order.capture(ticket, challenge(), safe)
++  await run(order, {})
++  expect(() => lease.consume()).toThrow("invalidated")
++})
++
++for (const delta of [-1, 30000, 30001])
++  test(`freshness holds at clock delta ${delta}`, async () => {
++    const order = new ModelPhaseOrder(),
++      { ticket } = await run(order, {})
++    let time = 1700000000000
++    const lease = order.capture(ticket, challenge(), safe, () => time)
++    time += delta
++    expect(() => lease.consume()).toThrow("invalidated")
++  })
++
++for (const change of ["model", "provider", "schema", "name"])
++  test(`safe projection mutation holds: ${change}`, async () => {
++    const order = new ModelPhaseOrder(),
++      input = safe(),
++      { ticket } = await run(order, {})
++    const lease = order.capture(ticket, challenge(), () => input)
++    if (change === "model") input.model_id = "changed"
++    if (change === "provider") input.provider = "other"
++    if (change === "name") input.tools[0].name = "changed"
++    if (change === "schema") input.tools[0].inputSchema.properties.project.type = "boolean"
++    expect(() => lease.consume()).toThrow()
++  })
++
++test("nonce replay denied even before consume", async () => {
++  const order = new ModelPhaseOrder(),
++    { ticket } = await run(order, {})
++  order.capture(ticket, challenge(), safe)
++  expect(() => order.capture(ticket, challenge(), safe)).toThrow("nonce replay")
++})
++
++test("secret getters outside projection are never traversed or hashed", async () => {
++  const input = safe(),
++    tool = input.tools[0]
++  let touched = 0
++  const trap = () => {
++    touched++
++    throw new Error("PRIVATE-CONTENT")
++  }
++  for (const field of ["headers", "body", "options", "accountID", "messages", "prompt"])
++    Object.defineProperty(input, field, { enumerable: true, get: trap })
++  for (const field of ["description", "default", "examples", "enum"])
++    Object.defineProperty(tool.inputSchema, field, { enumerable: true, get: trap })
++  const order = new ModelPhaseOrder(),
++    { ticket } = await run(order, input)
++  const lease = order.capture(ticket, challenge(), () => input)
++  expect(lease.consume().projection.model_id).toBe("test-model")
++  expect(touched).toBe(0)
++  expect(JSON.stringify(lease.receipt)).not.toContain("PRIVATE-CONTENT")
++})
++
++test("required projection getter is rejected without invocation", async () => {
++  const input = safe()
++  let touched = false
++  Object.defineProperty(input, "model_id", {
++    get: () => {
++      touched = true
++      return "PRIVATE"
++    },
++  })
++  const order = new ModelPhaseOrder(),
++    { ticket } = await run(order, {})
++  expect(() => order.capture(ticket, challenge(), () => input)).toThrow("accessor denied")
++  expect(touched).toBe(false)
++})
++
++test("tool array getter is rejected without invocation", async () => {
++  const input = safe()
++  let touched = false
++  Object.defineProperty(input.tools, "0", {
++    get: () => {
++      touched = true
++      throw new Error("PRIVATE")
++    },
++  })
++  const order = new ModelPhaseOrder(),
++    { ticket } = await run(order, {})
++  expect(() => order.capture(ticket, challenge(), () => input)).toThrow("accessor denied")
++  expect(touched).toBe(false)
++})
++
++test("unsafe challenge origin and unbounded references fail", async () => {
++  const order = new ModelPhaseOrder(),
++    { ticket } = await run(order, {})
++  expect(() =>
++    order.capture(ticket, { ...challenge(), issuer_origin: "https://user:secret@guard.test" }, safe),
++  ).toThrow()
++  expect(() => order.capture(ticket, { ...challenge(), nonce: "raw-session" }, safe)).toThrow()
++})
++
++test("receipt and projection immutable; downstream HTTP remains outside scope", async () => {
++  const order = new ModelPhaseOrder(),
++    { ticket } = await run(order, {})
++  const lease = order.capture(ticket, challenge(), safe)
++  expect(Object.isFrozen(lease.receipt)).toBe(true)
++  expect(Object.isFrozen(lease.receipt.projection)).toBe(true)
++  expect(lease.receipt.local_enforcement.scope).toBe("model-request-hook-stage-only")
++})
++
++test("phase fingerprint matches Tessera sorted-key compact JSON contract", async () => {
++  const order = new ModelPhaseOrder(),
++    { ticket } = await run(order, {})
++  const receipt = order.capture(ticket, challenge(), safe).consume()
++  const { fingerprint, ...projection } = receipt.projection
++  const projected = {
++    phase: receipt.phase,
++    order_revision: receipt.order_revision,
++    sequence: receipt.sequence,
++    ...projection,
++  }
++  const native = spawnSync(
++    "python3",
++    [
++      "-c",
++      "import sys,json,hashlib;print(hashlib.sha256(json.dumps(json.loads(sys.argv[1]),sort_keys=True,separators=(',',':')).encode()).hexdigest())",
++      JSON.stringify(projected),
++    ],
++    { encoding: "utf8", env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: "1" } },
++  )
++  expect(native.status).toBe(0)
++  expect(native.stdout.trim()).toBe(fingerprint)
++})
++
++test("actual ordered executor preserves ambient Effect service context", async () => {
++  class Fixture extends Context.Service<Fixture, { marker: string }>()("Fixture") {}
++  const order = new ModelPhaseOrder()
++  const event = { observed: "" }
++  const execution = order.execute(event, [
++    (input) =>
++      Effect.gen(function* () {
++        input.observed = (yield* Fixture).marker
++      }),
++  ])
++  await Effect.runPromise(Effect.provideService(execution, Fixture, { marker: "preserved" }))
++  expect(event.observed).toBe("preserved")
++})
+--- a/packages/plugin/src/effect/session.ts
++++ b/packages/plugin/src/effect/session.ts
+@@ -61,6 +61,14 @@
+ export type SessionRequestKind = "primary" | "compaction" | "title" | "generate"
+ 
+ export interface SessionModelRequest {
++  /** Core-issued supervised execution identity, never authorization or transport finality. */
++  readonly phaseContext?: Readonly<{
++    nonce: string
++    session_ref: string
++    proof_ref: string
++    order_revision: number
++    sequence: number
++  }>
+   readonly sessionID: Session.ID
+   readonly agent: Agent.ID
+   readonly model: Model.Ref
+--- a/packages/plugin/src/promise/session.ts
++++ b/packages/plugin/src/promise/session.ts
+@@ -61,6 +61,14 @@
+ export type SessionRequestKind = "primary" | "compaction" | "title" | "generate"
+ 
+ export interface SessionModelRequest {
++  /** Core-issued supervised execution identity, never authorization or transport finality. */
++  readonly phaseContext?: Readonly<{
++    nonce: string
++    session_ref: string
++    proof_ref: string
++    order_revision: number
++    sequence: number
++  }>
+   readonly sessionID: Session.ID
+   readonly agent: Agent.ID
+   readonly model: Model.Ref
+--- a/packages/sdk/package.json
++++ b/packages/sdk/package.json
+@@ -18,6 +18,7 @@
+   "exports": {
+     ".": "./src/index.ts",
+     "./effect": "./src/effect/index.ts",
++    "./effect/model-phase": "./src/effect/model-phase.ts",
+     "./workerd": "./src/workerd.ts",
+     "./workerd/effect": "./src/effect/workerd.ts"
+   },
+--- /dev/null
++++ b/packages/sdk/src/effect/model-phase.ts
+@@ -0,0 +1,7 @@
++/** Narrow supervised in-process SDK surface; requires actual authenticated
++ * server/session ownership context. No HTTP listener or credential resolution.
++ * Read is informational; consume rechecks the live stage before transport use.
++ */
++export { makeModelPhaseChannel, ModelPhaseAuthority } from "@opencode/core/session/model-phase-channel"
++export type { ModelPhaseChannel } from "@opencode/core/session/model-phase-channel"
++export type { Challenge, Lease, SafeInput } from "@opencode/core/plugin/model-phase"

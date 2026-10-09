@@ -1,0 +1,10 @@
+{
+  "name": "tessera-opencode-observer-runtime-deps",
+  "version": "8.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [],
+  "dependencies": {
+    "effect": "4.0.0-rc.112"
+  }
+}
