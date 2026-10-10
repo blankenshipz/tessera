@@ -45,7 +45,8 @@ The pinned control-plane image uses Python 3.11 Trixie; its Linux amd64 base was
 probed with SQLite 3.46.1 and `trusted_schema=OFF`. The image pin is a multiarch
 index; other architectures are available upstream but have not been tested here.
 This is a capability requirement, not a claim about the first compatible SQLite
-release. Native tests additionally require an existing C compiler and `patch`;
+release. Native tests additionally require an existing C compiler, `patch`, and
+`/bin/ps` (provided by `procps` on Debian) for exact owned-process identity;
 the development-only Docker target supplies those tools and the locked setuptools
 build backend. Hardened lab/remote runtime targets do not include these test tools.
 
