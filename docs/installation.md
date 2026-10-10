@@ -123,9 +123,8 @@ The gateway must present a localhost-valid certificate and return unauthenticate
 for UID selection, state custody, TLS verification, supervision and safe cleanup.
 This is neither deployment/enrollment nor permanent external ingress. Unit checks,
 installed command help and actual intended-gateway acceptance remain distinct.
-The owned local bench has now passed actual installed default-selection
-authenticated connect/reconnect. Use [the actionable handoff](research-bench-handoff.md)
-for current command/reference layout; an expiring receipt is not permanent ingress.
+An owned local bench exercised installed authenticated connect/reconnect;
+temporary route observations are not permanent ingress or current readiness.
 
 ### Worker process
 

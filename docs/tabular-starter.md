@@ -169,35 +169,16 @@ not raw data/prompts. Existing output quarantine, manifest/artifact custody,
 notebook provenance, separately authenticated human review and reviewed export
 remain the normal workflow; this CLI neither promotes nor exports evidence.
 
-## Current verification boundary
+## Verification boundary
 
-Real local tests exercised four preregistered plans before approval, actual normal
-ASGI/auth/SQLite adoption/release/grant/lease inputs, the actual loaded OCI image
-for four sequential computations, actual quarantine/project placement/manifest,
-human disposition and custody release followed by byte-exact content export.
-Temporary test human/worker identities are synthetic; this is not production human
-identity or deployed production services.
-`IMAGE.lock.json` identifies the exact tested local OCI manifest (not published).
-A separate bounded local HTTPS/control/ordinary-worker run observed actual allowed
-and denied network probes, imported that exact OCI manifest into Docker Desktop's
-node containerd, and completed one native baseline Job with verified init inputs.
-The service committed a quarantined result; human review/export and admitted
-experiment artifact/measurement links were exercised against the same durable state.
-Four tasks were preregistered before approval as two paired experiment records (the
-normal experiment API supports two variants per record). No native four-trial sweep,
-physical UI, off-host reasoning or scientific validation is claimed. That earlier
-native starter run is indexed as local evidence ID
-`TABULAR-STARTER-NATIVE-BASELINE-INTENT8`; it predates the later candidate-bound
-restart/cancellation slice summarized in the
-[release evidence note](release-evidence-intent9.md). Never infer native execution
-from a dictionary manifest, CPU CLI or Docker mount.
+Local CPU and owned Docker Desktop Kubernetes runs exercised preregistered plans,
+verified input bytes, ordinary-worker output custody and separate human release/
+export. `IMAGE.lock.json` pins the local OCI manifest, not a published image.
+Synthetic data and temporary identities do not establish production identity,
+scientific validity, generated reasoning or independent-host execution. A native
+four-trial sweep and physical UI acceptance are not claimed.
 
-The earlier native starter run used an implementation preceding conservative
-uncertain-create hardening and does not verify that historical source revision.
-The later `0.1.0rc2` candidate-bound native slice is summarized separately in the
-[release evidence note](release-evidence-intent9.md); its temporary identities and
-synthetic dataset do not prove
-production human identity, scientific validity, generated reasoning or independent-
-host execution. The older run's initial harness failure and review-resume details
-remain under the same local evidence ID; the Job was not resubmitted just to repair
-the review harness.
+Historical runs bind only their original artifacts; changes need fresh affected
+checks. Never infer native execution from a dictionary manifest, CPU CLI or Docker
+mount, and never resubmit an uncertain Job merely to repair a review harness.
+See [capabilities](implemented-capabilities.md) and the [release checklist](release-checklist.md).

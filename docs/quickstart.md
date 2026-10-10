@@ -3,9 +3,8 @@
 This is one developer-alpha path: start a local control service, open the desktop,
 create a project and experiment design, then inspect results from a separately
 authorized baseline. The app does not itself issue execution grants or establish
-production readiness. The evidence below used the actual renderer and authenticated
-local backend in a test simulator with platform interactions explicitly simulated;
-that is distinct from the native macOS picker/save journey.
+production readiness. Renderer checks used a real authenticated backend but
+simulated platform interactions; native macOS picker/save acceptance is separate.
 
 ## Prerequisites and setup
 
@@ -90,32 +89,20 @@ For Python setup and development checks, see [CONTRIBUTING.md](../CONTRIBUTING.m
   intend to create a separate local service. Never rerun `init` over existing
   research state.
 - **Desktop install rejects Node:** the declared requirement is Node 22.12.0 or
-  newer. Check `node --version`; this checkout's earlier 22.2.0 host was below
-  that requirement and does not validate the newcomer install step.
+  newer. Check `node --version`; launching Electron on an older host does not
+  validate the npm installation prerequisite.
 - **Kubernetes namespace warning:** Kubernetes setup is optional for this local
   quickstart. The warning does not install or configure a control plane.
 - **Stale save or offline screen:** reconnect and review the selected project and
   current records before retrying a user action; do not assume a save or dispatch
   occurred from a quiet/stale screen.
 
-**What the bounded journey established:** the current renderer used the real local
-backend for project/design/study-ledger operations and, in a separate simulator
-session, displayed results from one successful, operator-authorized Docker Desktop
-Kubernetes CPU baseline. The 1,393-byte result measured test MSE 131.0623 and MAE
-9.8565 over 1,667 rows; it was marked late, quarantined and unclassified. The
-simulator read retention/custody records already written by an authorized operator
-through the API; it did not submit another retention review or
-custody release, perform a personal UI review, or change classification. It
-previewed and retrieved the exact released bytes through a simulated destination,
-created one reproduction-bundle record, then reconnected and restored the same
-records. The study-ledger export is a distinct 2,875-byte ledger,
-not the execution result. These measurements do not establish scientific validity.
+Local renderer checks exercised durable project/design/study records and inspected
+an operator-authorized CPU result. The screenshot journey read existing operator
+custody records, retrieved bytes to a simulated destination and reconnected; it
+did not establish personal UI approval, native dialogs or scientific validity.
+Execution, study-ledger JSON and reproduction-bundle records are distinct exports.
 
-These connected-flow checks used a test-only platform shim; the file-picker/save
-destination was simulated, not a native macOS chooser. The earlier real Electron
-capture showed the disconnected screen. This session did not verify a fresh native
-Connect/picker or OS save-dialog journey. Host Node 22.2.0 is below the declared
-22.12.0 minimum, so the newcomer npm install prerequisite remains unverified.
-Production-owner, genuine remote reasoning, independent-host/device and scientific
-acceptance remain separate; see the [release evidence](release-evidence-intent9.md)
-and [implementation journal](remote-agent-implementation-journal.md).
+Production identity, genuine agent reasoning, independent-host operation and
+scientific acceptance remain separate. See [capabilities and limits](implemented-capabilities.md)
+and [recovery](recovery.md) before operating valuable state.

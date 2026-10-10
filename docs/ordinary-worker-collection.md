@@ -126,7 +126,7 @@ public-CA references. It does not rely on the historical private route launcher
 or deploy a gateway. The installed command's default owned selection passed real
 authenticated connect/reconnect (receipt expiry 2026-10-04 09:54 UTC). This
 supersedes, without erasing, the historical private route's 07:23 UTC deadline;
-neither is permanent external ingress. See [the handoff](research-bench-handoff.md).
+neither is permanent external ingress. See [connection tunnel](connection-tunnel.md).
 The
 gateway's bounded thread-local TLS handshake repair passed concurrent reads and
 same-Pod reconnect; incomplete handshakes are not an unbounded accept-loop hold.

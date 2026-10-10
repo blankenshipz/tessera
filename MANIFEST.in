@@ -1,7 +1,9 @@
-include README.md CONTRIBUTING.md DESIGN.md CHANGELOG.md SECURITY.md LICENSE uv.lock
+include README.md CONTRIBUTING.md DESIGN.md CHANGELOG.md SECURITY.md AGENTS.md LICENSE uv.lock
 recursive-include docs *.md *.json *.yaml
+include docs/assets/alpha-design.png docs/assets/alpha-results.png docs/assets/alpha-review.png
 recursive-include deploy *.md *.yaml *.json
 recursive-include skills *.md
+include plugins/tessera-harness-observer/README.md
 recursive-include release/opencode-observer README.md LICENSE *.json *.patch
 include release/opencode-observer/baseline.tar.gz
 include release/opencode-observer/runtime-v8/baseline.json release/opencode-observer/runtime-v8/baseline.tar.gz release/opencode-observer/runtime-v8/observer.patch release/opencode-observer/runtime-v8/LICENSE

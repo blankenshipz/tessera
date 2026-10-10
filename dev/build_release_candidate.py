@@ -43,6 +43,9 @@ ROOT_FILES = {
     "compose.yaml",
     ".dockerignore",
     "desktop/EXECUTION.md",
+    "docs/assets/alpha-design.png",
+    "docs/assets/alpha-results.png",
+    "docs/assets/alpha-review.png",
 }
 TREES = {
     "src": {".py"},

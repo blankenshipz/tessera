@@ -1,4 +1,4 @@
-# Bounded launch-readiness contract
+# Local safeguards and production prerequisites
 
 Tessera remains a **source-only, single-owner developer alpha**, not a production
 service. This page distinguishes implemented safeguards from launch prerequisites.
@@ -14,7 +14,7 @@ It does not change identity authority, provider activation or recovery semantics
 | Workflow | Available boundary | Not established |
 |---|---|---|
 | Local research ledger | Authenticated API, immutable plans, human decisions, study/experiment exports and correction history; [quickstart](quickstart.md) | Scientific validity or execution from a human record |
-| Baseline/intervention integration | [Local API comparison](local-api-workflow.md) drives ordinary admission, worker dispatch and retained evidence with **fake external effects** | Real plan execution, target isolation, provider/model use or automated collection |
+| Baseline/intervention integration | [Local API comparison](local-api-workflow.md) drives admission/dispatch with **fake external effects**; [ordinary collection](ordinary-worker-collection.md) describes bounded owned-target collection | General target isolation, provider/model use or unattended production execution |
 | Local CPU development | Separate opt-in Docker/native-worker fixtures described in CONTRIBUTING.md | Pilot-grade persistent outputs or unattended production execution |
 | Remote lab packaging | Explicit host/origin configuration and single-active control-plane manifests; separate opt-in target fixtures | Production identity, supported remote deployment, HA or laptop-independent acceptance |
 | Provider/Astra seams | Deterministic provider-disabled paths, context/status contracts and fake receipts | Active model/provider, known billing, credential delivery or real provider termination |
@@ -103,11 +103,11 @@ and monitor private storage externally; this is an unresolved launch blocker.
 
 ## External and release-owner prerequisites
 
-The [release checklist](release-checklist.md) is intentionally unchecked. Before
+The [release checklist](release-checklist.md) requires candidate-bound proof. Before
 public/production release, provide dated evidence tied to one revision/profile for:
 
-1. Maintainer-selected license/release terms and a working private security-reporting
-   channel. Neither is configured by documentation.
+1. Preserve MIT release terms and third-party notices, and verify the enabled
+   GitHub private reporting channel remains available; see [SECURITY.md](../SECURITY.md).
 2. TLS certificates/termination, inaccessible direct backend, explicit ingress host
    policy, no trust of client-supplied forwarded identity, connection/header/rate and
    slow-client limits, secret-safe logs and private/no-store authenticated caching.
@@ -121,25 +121,9 @@ Local prerequisites reduce risk; they do not complete any of these external gate
 No service needs to remain running for this slice's tests. Live/provider fixtures
 remain opt-in outside default pytest/CI and require separately authorized effects.
 
-## Verification for this slice
+## Developer verification
 
-Targeted local checks on the existing dirty tree, 2026-09-21:
-
-```sh
-# 80 passed, 2 deprecation warnings (before the final two added regression tests).
-.venv/bin/pytest -q tests/test_launch_boundaries.py tests/test_kubernetes_lab_deployment.py tests/test_credentials.py tests/test_plans.py tests/test_execution.py tests/test_execution_api.py
-# 76 passed, 3 warnings; includes the final output-plan and spending regressions.
-.venv/bin/pytest -q tests/test_launch_boundaries.py tests/test_launch_spending.py tests/test_provider_activation.py tests/test_artifacts.py tests/test_artifact_upload_failures.py tests/test_control_event_streams.py tests/test_local_api_workflow.py
-# Both passed; formatting reports 6 files already formatted.
-.venv/bin/ruff check src/tessera_control/request_limits.py src/tessera_control/deployment.py src/tessera_control/models.py src/tessera_control/api.py tests/test_launch_boundaries.py tests/test_launch_spending.py
-.venv/bin/ruff format --check src/tessera_control/request_limits.py src/tessera_control/deployment.py src/tessera_control/models.py src/tessera_control/api.py tests/test_launch_boundaries.py tests/test_launch_spending.py
-git diff --check
-```
-
-The test batches overlap; their counts are not distinct-test totals. Warnings were
-Starlette/httpx and anyio deprecations, plus a Pydantic `project_id` alias warning
-in event-stream coverage. Existing and concurrent edits were preserved, including
-a separate recovery safety change in `deployment.backend_status`; this slice only
-changes host/origin validation there. Full integration, desktop, recovery and live
-fixtures were not run as acceptance gates. No install, credential provisioning,
-deployment or commit was performed.
+`tests/test_launch_boundaries.py` and `tests/test_launch_spending.py` exercise
+request/admission limits with isolated inputs. They are not live identity,
+provider or capacity acceptance. Follow [contributing](../CONTRIBUTING.md#verification-gates)
+for current checks; keep exact results outside shipped guidance.

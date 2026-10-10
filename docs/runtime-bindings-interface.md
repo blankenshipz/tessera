@@ -1,8 +1,8 @@
 # Runtime binding/control contract — version1
 
-Status: frozen DTOs with phase-two authenticated Store/API implementation for intent7.
+Status: closed DTOs with authenticated Store/API implementation.
 `src/tessera_control/runtime_binding_models.py` defines closed immutable wire models.
-Routes, Store methods and additive schema55 are implemented. **The actual installed
+Routes, Store methods and additive migrations are implemented. **The actual installed
 owner-private/native adapter remains an integration prerequisite, not a fake default.**
 Legacy defaults/opt-in admissionv2 remain unchanged.
 DTO validation and an authenticated response are not authorization or evidence that
@@ -176,17 +176,13 @@ is uncertain. Neither result automatically refunds or authorizes retries; new ro
 effects require current separate issuance/disposition review. Reconciliation with
 positive safe no-effect proof is a future explicitly human-scoped command, not in v1.
 
-## Expected schema and phase2 write ownership
+## Storage schema
 
-Schema54 was rechecked before the parent-authorized single-owner additive schema55.
-The descriptions below retain the original phase-one planned shape; immutable JSON
-records hold full scope/pins/bounds while dedicated columns enforce identity/uniqueness.
-New module `runtime_bindings.py` creates its tables and RuntimeBindingStore;
-`runtime_binding_api.py` router. Existing files discovered for future edits:
-`src/tessera_control/migrations.py`, `src/tessera_control/api.py`; reuse Store helpers
-without changing its globalauth behavior. Parent may authorize `store.py` only if
-concrete helper integration requires it. New tests `tests/test_runtime_bindings.py`,
-`tests/test_runtime_binding_api.py`. No files in this paragraph edited in phase1.
+Immutable JSON records hold full scope/pins/bounds while dedicated columns enforce
+identity/uniqueness. `runtime_bindings.py` owns tables and `RuntimeBindingStore`;
+`runtime_binding_api.py` owns the router. Migrations and tenant-scoped Store helpers
+remain authoritative. Coverage is in `tests/test_runtime_bindings.py` and
+`tests/test_runtime_binding_api.py`.
 
 Tables: runtime_policy_profiles(ref,org,project,humanissuer,immutablebody,digest);
 runtime_enrollments(ref,org,project,issuer,subjectcredential,publishercredential,

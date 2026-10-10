@@ -107,14 +107,11 @@ generated-public-output grants, immutable byte registrations and recipient
 disclosures. See [generated output contract](generated-public-output-interface.md).
 No generated output is assigned fabricated worker/Job/lease provenance.
 
-The current source schema is **55**, not the historical schema 53 described above.
-Schema 54 added the ordinary-Docker target/dispatch records; schema 55 adds ten
-empty runtime-binding tables with immutable-history triggers. Migration 54-to-55 is
-explicit; old readiness stays closed until migration. These are source contracts and
-local migration checks, not evidence that an installed database was upgraded. The
-latest recorded installed platform receipt is schema 52; see the
-[release checklist](release-checklist.md) before treating any later source as a
-release.
+Later migrations add ordinary-Docker target/dispatch and runtime-binding records
+with immutable-history triggers. Startup refuses older state until explicit
+migration. Source contracts and local tests do not establish that an installed
+database was upgraded; follow [compatibility](compatibility-matrix.md) and the
+[release checklist](release-checklist.md) for the intended artifact.
 
 Consumption rehydrates external-agent identity and validates enrollment,
 credential lifetime, tenant/project, destination/model, resource pins, execution

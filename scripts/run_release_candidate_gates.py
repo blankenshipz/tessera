@@ -65,7 +65,6 @@ ROOT_FILES = {
     "AGENTS.md",
     "LICENSE",
     "MANIFEST.in",
-    "IMPLEMENTATION_TASKS.md",
     "Dockerfile",
     "Dockerfile.guard",
     ".gitignore",

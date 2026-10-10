@@ -1,9 +1,9 @@
 # Local control-state backup and held recovery
 
-Schema 11 supports consistent local SQLite control-state backups. This recovery
+Tessera supports consistent local SQLite control-state backups. This recovery
 slice preserves history for inspection; it does not provide operational failover.
 
-Schema-v24 local filesystem project objects are outside SQLite. Current backups
+Local filesystem project objects are outside SQLite. Current backups
 use a versioned bundle when a committed local object exists: one SQLite snapshot,
 the exact referenced object bytes, and a declaration of their custody/retention
 metadata and SQLite-only legacy artifacts. Object namespaces and keys are verified
@@ -52,7 +52,7 @@ is not printed. Every restored principal and credential is revoked, including pr
 owner, human-session, control-agent, and worker credentials.
 
 Schema validation admits only the exact trusted bootstrap definitions, including
-v36's cancellation fence trigger for the Kubernetes dispatch ledger. An added,
+the cancellation fence trigger for the Kubernetes dispatch ledger. An added,
 removed, renamed, or altered trigger is rejected before restore authority fencing;
 recovery never permits arbitrary backup-supplied executable schema.
 
@@ -113,29 +113,22 @@ re-materialize credentials. Any future reconciliation uses the explicitly record
 target identity and fresh human authorization; it must not use an ambient context
 or automatically destroy resources.
 
-## Historical schema-50 post-migration verification gate (does not cover schema 55)
+## Post-migration verification
 
-This gate verifies a schema-50 migration/restore workflow only. The current source
-schema is 55, while the latest installed platform receipt is schema 52. Do not use
-this dated schema-50 manifest requirement as release verification for a newer
-artifact; an exact schema-55 migration/restore gate remains to be run against the
-frozen candidate.
+Run this drill with the intended installed release and its supported schema.
+A historical restore receipt does not verify a newer artifact or changed state.
 
 A pre-migration backup is rollback evidence, **not a backup of the migrated
 labbook**. Restore requires the running schema version; use the matching older
 release to restore an older backup, then explicitly migrate that held copy. Never
 edit a manifest's schema version or the database recovery state to bypass this.
 
-The v47-to-v48, v48-to-v49 and v49-to-v50 migrations clear the active state's
-previous backup-success time and ID (retaining any recorded failure).
-Backup freshness is unknown until a new
-backup succeeds. Held migration preserves its recovery/credential/health records;
-it does not grant authority. Repeating migration on current v50 state does not
-clear a new backup. **Already-migrated v50 installations must still perform this
-gate**: the migration is not rerun and a recent health timestamp alone is not
-proof that the backup includes the new records. `backups.freshness: fresh` means
-recent publication, not successful restore verification. No restore-verification
-receipt is currently persisted in operator health; keep the evidence externally.
+Migrations that invalidate active backup freshness retain recorded failures;
+take a new backup after upgrade regardless of the health timestamp. Held migration
+preserves recovery/credential/health records and does not grant authority. A
+repeat migration is not a replacement for this drill. `backups.freshness: fresh`
+means recent publication, not successful restore verification. No restore-verification
+receipt is persisted in operator health; keep the evidence externally.
 
 For an authorized lab upgrade, retain the pre-upgrade backup, explicitly migrate,
 then complete these steps before declaring recovery verification complete:
@@ -155,7 +148,8 @@ then complete these steps before declaring recovery verification complete:
    Record the last required event cursor. Check export completeness and pagination;
    do not treat a truncated projection as a complete baseline.
 3. Create a **new post-migration backup** with the command above. Retain its
-   manifest and require `schema_version: 50`, an `event_watermark` at least the
+   manifest and require `schema_version` to match the running release, an
+   `event_watermark` at least the
    last required cursor, and its backup ID, timestamp, size and SHA-256. A newer
    timestamp alone does not prove inclusion. The digest detects changed bytes,
    not malicious replacement of both manifest and snapshot; protect their custody.
@@ -198,4 +192,4 @@ copy again without writable promotion. It uses no network providers or PVCs:
 The full `tests/test_recovery_mixfm.py` additionally checks migration freshness,
 held migration, altered dataset bytes/schema/foreign keys, and incompatible
 schema/watermark manifests. All inputs and credentials are disposable synthetic
-fixtures; these checks do not attest to the contents of any live v48 smoke backup.
+fixtures; these checks do not attest to the contents of a live backup.

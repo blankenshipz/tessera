@@ -84,6 +84,25 @@ cap, and cannot change either state.
 NetworkPolicy enforcement and storage durability remain unproven by object
 presence. Resources are retained. There is no teardown.
 
+## Namespace lifecycle
+
+`tessera astra-namespace` is an operator-only boundary for an explicitly named
+namespace, not control-plane installation, target attachment, worker enrollment,
+credential delivery or dispatch. `inspect-existing` and `plan-use-existing` make
+only named `kubectl get namespace` calls; choosing an existing namespace writes
+nothing. Creating a dedicated namespace requires a fresh absent inspection,
+exact unexpired approved plan digest and explicit `create`. It submits one
+labelled Namespace and records UID/resourceVersion with status
+`namespace_created_control_plane_not_installed`. Retain the original receipt with
+`create --receipt-output /absolute/private/file` for later `status`/`reconcile`.
+
+Timeout, duplicate or malformed create responses require reconciliation, never
+automatic retry or same-name adoption. Read-only reconciliation fences the original
+UID/labels. Cleanup is not implemented; deletion needs a separate ownership/UID-
+fenced decision. Ambient contexts, insecure TLS, missing CA identity, Secret reads,
+response identity mismatches and oversized output are rejected. Default tests do
+not contact Kubernetes; explicit operator `create` is the mutation entrypoint.
+
 ## Explicit in-cluster conformance probes
 
 After setup, the separately opt-in `check_astra_kubernetes_conformance.py`
@@ -104,6 +123,11 @@ tessera.io/quota-enforcement: filesystem-quota-v1
 tessera.io/byte-quota-bytes: "1048576"
 tessera.io/inode-quota-files: "64"
 ```
+
+NetworkPolicy objects are declarations, not enforcement proof. Allowed and denied
+client probes must establish actual target-bound behavior; malformed output,
+unattributed Pod UIDs or a permissive denied path fail closed. This is not a
+general Docker Desktop/Kubernetes isolation guarantee.
 
 Those declarations are only an admission prerequisite, not proof. The fixture
 writes non-sparse bytes past the declared byte bound and creates files past the

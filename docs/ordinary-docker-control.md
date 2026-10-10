@@ -1,14 +1,12 @@
-# Ordinary Docker control-plane contract (historical source schema 54)
+# Ordinary Docker control-plane contract
 
 This is backend source acceptance, not Engine enforcement, live off-host execution,
 or laptop-off proof. Runtime preflight/witnesses remain required. Docker enrollment
 is a human declaration of bounded capability/placement, not a fabricated witness.
 Generated-public-output registration and schema-53 history are unchanged.
 
-This is a schema-54 source milestone, not the current schema. Source is now schema
-55; the latest installed journey receipt remains schema 52. Schema-55 migration adds
-runtime-binding records and does not establish Docker Engine enforcement or a new
-installed-worker acceptance. See the [runtime-binding contract](runtime-bindings-interface.md)
+Source implementation is not Docker Engine enforcement or installed-worker
+acceptance. See the [runtime-binding contract](runtime-bindings-interface.md)
 and [release checklist](release-checklist.md).
 
 ## Human enrollment and approved task
@@ -182,15 +180,10 @@ Any possible dispatch remains unresolved; no provider termination is inferred.
 
 ## Migration and remaining integration
 
-Source schema **54** explicitly adds empty `ordinary_docker_targets` and
+Migration adds empty `ordinary_docker_targets` and
 `ordinary_docker_dispatches`; `tessera migrate --state-dir STATE` is required before
 updated service readiness. Only active backup-success freshness resets;
-held-restore credentials/history/metadata and write fences remain intact. This
-worker did not migrate installed state or edit the generated registry.
-
-This schema-54 checkpoint's worker-CLI integration and target tests remain separate
-from later runtime-binding source work. Image/runtime witnesses, real output, running
-restart/cancellation, off-host and laptop-off remain separate acceptance. The test
-fixture migration was reconciled for schema 55 in the linked schema-55 owner handoff;
-this dated receipt is not rewritten. No peer/provenance/agent runtime source was
-edited in the original schema-54 slice.
+held-restore credentials/history/metadata and write fences remain intact.
+Image/runtime witnesses, real output, running restart/cancellation, off-host and
+laptop-off remain separate acceptance. Follow [recovery](recovery.md) for a new
+post-upgrade backup/held-restore drill.

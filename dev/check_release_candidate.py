@@ -100,8 +100,16 @@ def smoke(wheel: Path, dependencies: Path) -> dict:
         if not skill.read_text().startswith("---\nname: tessera-research-bench\n"):
             raise ValueError("Installed portable skill invalid.")
         for name in ("README.md", "DESIGN.md", "CONTRIBUTING.md", "SECURITY.md"):
-            if not (share / "docs" / name).is_file():
+            if not (share / name).is_file():
                 raise ValueError("Installed operator docs missing.")
+        for name in ("README.md", "quickstart.md", "implemented-capabilities.md", "recovery.md"):
+            if not (share / "docs" / name).is_file():
+                raise ValueError("Installed current guide missing.")
+        for name in ("alpha-design.png", "alpha-results.png", "alpha-review.png"):
+            if not (share / "docs/assets" / name).is_file():
+                raise ValueError("Installed guide screenshot missing.")
+        if not (share / "desktop/EXECUTION.md").is_file():
+            raise ValueError("Installed desktop execution contract missing.")
         if not (share / "release/opencode-observer/README.md").is_file():
             raise ValueError("Installed observer handoff missing.")
         catalog = json.loads(

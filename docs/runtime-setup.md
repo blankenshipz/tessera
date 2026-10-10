@@ -15,11 +15,9 @@ and an independently approved owner/observer; it represents local enforcement, n
 provider billing or entitlement.
 
 For control bootstrap and migration, see [runtime operator setup](runtime-operator-setup.md).
-Schema 55 was installed and checked in the historical `0.1.0rc2` candidate, but
-that candidate predates the current CLI/factory composition changes. The wiring and
-targeted source tests do not establish a fresh installed artifact or a production
-owner implementation. Re-run applicable installed checks against the next frozen
-candidate; do not infer support from source discovery alone.
+Source wiring and targeted tests do not establish installed-artifact support or
+a production owner implementation. Run applicable installed checks against the
+exact frozen candidate; do not infer support from source discovery alone.
 
 ## Prerequisites and owner contract
 

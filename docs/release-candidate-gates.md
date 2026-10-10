@@ -1,6 +1,6 @@
 # Exact-source candidate gate runner
 
-Intent revision 5. `scripts/run_release_candidate_gates.py` runs only the three
+`scripts/run_release_candidate_gates.py` runs only the three
 CONTRIBUTING standard local gates, with the current interpreter:
 
 | ID | Fixed command suffix | Proof |
@@ -19,8 +19,7 @@ that every writer stopped; exact source hashes and scope checks still apply.
 
 The actual packaging tools are `dev/build_release_candidate.py` and
 `dev/check_release_candidate.py`, documented in
-[release-candidate.md](release-candidate.md). They were inspected read-only and
-are exclusively owned by the packaging lane. Its owner should provide the reviewed
+[release-candidate.md](release-candidate.md). The release owner provides the reviewed
 tracked + intentional-new gate inventory and pinned artifact references using
 this closed JSON schema:
 
@@ -141,33 +140,5 @@ The matrix always retains `installed-mcp-entrypoint`, `installed-a2a-entrypoints
 Installed clean-package/secret-exclusion/observer compatibility checks remain the
 packaging/protocol owners' separately revision-bound receipts. Parent convergence
 joins those receipts and all real journey/admission/device/offhost evidence; this
-runner neither closes the root task nor transforms historical4268 evidence into
+runner neither closes product acceptance nor transforms historical evidence into
 current candidate acceptance.
-
-## Assigned source checkpoint
-
-The new runner, isolated tests and this runbook are this lane's only owned files.
-No full repository Ruff/pytest command or historical guardian rerun is performed
-while writers remain active. Parent should freeze packaging + protocol + remaining
-writers, provide the exact reviewed manifest/artifact references and rebind this
-same worker for the actual final local gate. No active service, provider, host,
-credential, private guard, bootstrap, migration, commit or delegate effects belong
-to this source-only checkpoint.
-
-Targeted checkpoint: **31 tests passed in 0.32s**, no warnings. Scoped Ruff lint
-and format passed for the runner/test; module help passed. Schema/status/hash-
-change/omitted-source/addition/secret-path/summary-redaction/standard-command tests
-use temporary fixtures and synthetic subprocess receipts. No standard full gate
-was executed. Historical guardian and4268 receipts were not rerun or relabelled.
-
-Observer-distribution alignment checkpoint: **39 tests passed in 0.26s**, no
-warnings; all original31 cases retained plus patch-drift, omitted-bundle and six
-unsafe-release-path negatives. Scoped Ruff lint/format and whitespace passed.
-Only this runbook, runner and tests changed; builder/checker and observer bundle
-were read-only. Full-source gates still await parent freeze.
-
-Fifth-file alignment checkpoint: **43 tests passed in 0.41s**, no warnings;
-prior39 preserved plus archive-drift, Git-ignored archive omission and two unsafe
-archive negatives. Scoped Ruff lint/format and whitespace passed. No archive
-extraction, bundle/packager edits or full-source execution occurred. Source writes
-stop here until parent final-freeze admission and same-worker gate continuation.

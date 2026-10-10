@@ -1,10 +1,9 @@
 # Source candidate packaging (not accepted release)
 
 The RC builder is offline, deterministic and allowlisted. It does not deploy,
-publish, commit, read active credentials or grant execution authority. Schema55
-source and the previously measured schema55 wheel are distinct revisions; see the
-[candidate evidence note](release-evidence-intent9.md). Subsequent edits require a
-new final freeze and candidate-bound checks.
+publish, commit, read active credentials or grant execution authority. Each
+candidate needs a frozen inventory and candidate-bound checks; earlier builds
+do not validate later source/documentation changes.
 
 Final source capture waits for all writers, the runtime owner's approved public
 observer bundle inputs and the parent's explicit freeze. Until then only labelled
@@ -72,26 +71,11 @@ independent dependency solve/offline installer bundle: record the exact local
 dependency versions separately and test clean installation with authorized locked
 dependency acquisition at the final packaging gate if required.
 
-## Candidate gate matrix
-
-| Proof | Required boundary | Status for initial builder slice |
-|---|---|---|
-| Input allowlist, exclusions, deterministic archives | Builder tests + exact manifest | Targeted local checks |
-| Pinned redistributable observer baseline/patch/license | Runtime owner final public bundle | Actual27->36 layout staged, copied-file provenance only |
-| Stable final source/wheel rebuild hashes | Parent freeze, same-child final build | Deferred, writers active |
-| Installed entrypoints/skill/docs/resources | Temporary wheel install | Initial development smoke only |
-| Full source Python gate | Exact final candidate inputs | Historical4268 not reused as current |
-| Real admission/planner/critic/MCP/A2A/notebook journey | Genuine installed supervised runtime | Outstanding, no admission lowering |
-| Independent-host execution/restart/cancel/laptop-off | Actual authorized host/device | Outstanding, no live proof |
-| Native desktop/device acceptance | Actual requested platform | Separate existing evidence |
+## Acceptance boundary
 
 Successful packaging produces a **source candidate**, never an accepted release.
-Parent keeps final gate matrix and remaining-items journal revision-bound, resumes
-the same packaging worker after freeze, and carries all live/installed prerequisites.
-
-The staged public bundle now contains the unchanged archive and patch plus the
-closed mapped baseline.json and actual OpenCode license. Both original licenses
-and all reproduction tests remain within the27original/36target pins. Shipped-file
-native patch reconstruction verifies target index6cb7fc98728449d640b9711389ef036de78735de74b0da8d60ccfe2d304c9e96.
-No final full source candidate capture/build occurred during this staging step;
-initial development wheel smoke is not acceptance of these newer source bytes.
+Verify input exclusions, bundle reconstruction/provenance, deterministic rebuild,
+installed entrypoints/docs/resources and applicable source/protocol gates against
+the final frozen inputs. Installed reasoning/admission, native dialogs and
+independent-host/laptop-off execution need separate real proof. Keep receipts
+revision-bound outside shipped artifacts; see the [release checklist](release-checklist.md).

@@ -18,5 +18,5 @@ as separate historical records. Do not infer execution, provider success, cost
 settlement, artifact acceptance, or scientific validity from the narrative.
 
 Use this as a terminology aid only. A real workflow needs the acceptance gates
-in [implementation progress](../../docs/implementation-progress.md), including
+in the [release checklist](../../docs/release-checklist.md), including
 reviewable evidence and explicit human decisions.

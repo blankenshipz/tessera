@@ -2,11 +2,10 @@
 
 This is a maintainer runbook for the optional isolated OpenCode observer/SDK source
 bundle. It does not authorize changing or restarting the active coding service,
-installing the bundle, invoking a provider, or declaring Tessera admission. Intent 8
-staged and package-integrated the runtime-v8 source closure as source inputs. A later
-`0.1.0rc2` candidate was built and measured for the bounded checks summarized below;
-that artifact predates subsequent CLI/factory and documentation edits. The current
-changed tree still needs a fresh freeze, candidate build and applicable gates.
+installing the bundle, invoking a provider, or declaring Tessera admission. The
+runtime-v8 source closure is integrated into package inputs. Changed inputs need
+a fresh freeze, candidate build and applicable checks; prior receipts cover only
+their original artifacts.
 
 ## Current boundary
 
@@ -55,20 +54,15 @@ changed tree still needs a fresh freeze, candidate build and applicable gates.
 
 The shipped runtime-v8 reconstruction/link/verification tools and public dependency
 lock operate on a fresh owned directory using only the 14 shipped files. Package
-integration validates the closed bundle and required inputs. The measured
-`0.1.0rc2` candidate passed its exact-candidate source, installed-wheel and protocol
-checks; the bounded native slice also ran against its installed wheel. See the
-[sanitized candidate evidence](release-evidence-intent9.md). Those gates apply only
-to that frozen artifact: later CLI/factory and documentation changes require a fresh
-inventory/build/install and applicable gates. Historic source-handoff and package
-checks are not substitutes for those later candidate gates.
+integration validates the closed bundle and required inputs. Each candidate needs
+its own frozen inventory/build/install and applicable gates; historical
+source-handoff and package checks do not cover later changes.
 
 ## Evidence boundary
 
-The exact candidate gate exercised SDK HTTP/WS and installed Python imports, with
-synthetic upstream identity, quota, private-owner resources and native primitives.
-It does not prove real account entitlement/billing, production credentials, active
-service compatibility, or live provider dispatch. Preserve earlier v5 and prior RC2
-receipts at their exact old revisions; they do not cover later source changes. See
+SDK HTTP/WS and installed Python checks using synthetic identity/quota/private-owner
+inputs do not prove real entitlement/billing, production credentials, active
+service compatibility or live provider dispatch. Preserve prior receipts at their
+original revisions; they do not cover later source changes. See
 the [release checklist](release-checklist.md) for the current freeze and remaining
 acceptance boundary.

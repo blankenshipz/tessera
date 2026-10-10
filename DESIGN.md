@@ -3,12 +3,11 @@
 Status: implementation contract and roadmap; the full pilot is not implemented.
 The control plane, bounded CPU execution components, desktop research records,
 and reasoned finding review are implemented in slices. See the
-[implementation status matrix](docs/implementation-progress.md#design-status-matrix)
+[implementation status matrix](docs/implemented-capabilities.md#design-status-matrix)
 for what is implemented, partial, blocked, or deferred, with remaining acceptance
-work. Component guarantees do not constitute pilot completion. The latest bounded
-installed-candidate and native-slice evidence, together with its synthetic inputs
-and unresolved acceptance, is summarized in the
-[release evidence note](docs/release-evidence-intent9.md). README.md describes the
+work. Component guarantees do not constitute pilot completion. Current limits
+and evidence boundaries are summarized in the
+[capability guide](docs/implemented-capabilities.md). README.md describes the
 runnable scope; the release checklist tracks the remaining release gates.
 This document defines the pilot, the contracts it must satisfy, and the order of
 implementation. “Required” describes intended behavior, not a verified guarantee.
@@ -702,7 +701,7 @@ unavailability blocks before create. Workload capabilities are never widened.
 This is the contract for remote research agents; it does not assert that the
 integrated runtime is complete. Current implementation status and the runnable
 operator boundary are tracked in the [remote-agent installation runbook](docs/remote-agent-platform-install.md)
-and [implementation journal](docs/remote-agent-implementation-journal.md).
+and [capability guide](docs/implemented-capabilities.md).
 
 An enrolled agent is a distinct authenticated principal, never a human session
 forwarded through a tool. A human with the required authority issues a bounded
@@ -1080,10 +1079,11 @@ or network calls, even when configuration is provided.
 ## 8. Implementation sequence and acceptance
 
 The table below is the target sequence, not a completion checklist. Current
-completion evidence and outstanding work live in the
-[status matrix](docs/implementation-progress.md#design-status-matrix).
+implementation boundaries and outstanding work live in the
+[status matrix](docs/implemented-capabilities.md#design-status-matrix).
 A component passing synthetic tests does not complete a workflow or the pilot.
-Update that tracker with every behavior-changing implementation checkpoint.
+Update current guidance when implemented behavior changes; retain exact check
+receipts separately from the user guide.
 
 Implement vertical slices through the modules, not complete horizontal platforms.
 These are the pilot's engineering tasks; each produces code, tests and a short

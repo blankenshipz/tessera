@@ -100,8 +100,8 @@ Connect to `http://127.0.0.1:8765` and select the private `.tessera/owner.header
 through the app's file picker; never paste its contents. Initialize only once;
 existing state needs the documented backup/migration procedure. Follow the
 [screen-by-screen quickstart](docs/quickstart.md) for review/export and troubleshooting.
-The newcomer npm installation and native picker/save sequence remain unverified
-on the prior Node 22.2.0 host; simulator evidence does not close those gates.
+Native installation and picker/save acceptance require their own checks;
+simulator evidence does not close those gates.
 
 ## Architecture
 
@@ -110,8 +110,9 @@ service owns revisions, authorization and durable records; workers perform
 explicitly admitted execution. Approvals, artifact custody, cost settlement and
 scientific acceptance are separate decisions. External trackers are not authority.
 
-See [DESIGN.md](DESIGN.md) for contracts, [the capability inventory](docs/implemented-capabilities.md)
-for implementation details, and [installation](docs/installation.md) for service operations.
+See the [documentation guide](docs/README.md) for user, operator and developer
+navigation, [capabilities and limits](docs/implemented-capabilities.md) for current
+status, and [DESIGN.md](DESIGN.md) for authoritative contracts.
 
 ## Limits and safety
 
@@ -121,8 +122,8 @@ for implementation details, and [installation](docs/installation.md) for service
   model reasoning, cost settlement and scientific validity need separate evidence.
 - Results can be late, quarantined or unclassified even after authorized retrieval.
   Successful execution is not a scientific finding or publication approval.
-- This source alpha is not a new signed binary release. See [launch readiness](docs/launch-readiness.md)
-  and [implementation progress](docs/implementation-progress.md) for remaining gates.
+- This source alpha is not a signed binary release. See the
+  [release checklist](docs/release-checklist.md) for remaining gates.
 
 ## Contributing and security
 
