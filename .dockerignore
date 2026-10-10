@@ -2,6 +2,7 @@
 !pyproject.toml
 !uv.lock
 !README.md
+!CHANGELOG.md
 !LICENSE
 !MANIFEST.in
 !src/
@@ -34,4 +35,9 @@
 !.dockerignore
 !compose.yaml
 !SECURITY.md
+!desktop/
+!desktop/EXECUTION.md
+!plugins/
+!plugins/tessera-harness-observer/
+!plugins/tessera-harness-observer/README.md
 **/__pycache__/

@@ -48,8 +48,21 @@ def test_docker_context_includes_public_test_inputs_without_runtime_state():
     for path in ("docs", "deploy", "examples", "release"):
         assert f"!{path}/" in patterns
         assert f"!{path}/**" in patterns
-    for path in ("Dockerfile", "Dockerfile.guard", "compose.yaml", "SECURITY.md"):
+    for path in (
+        "Dockerfile",
+        "Dockerfile.guard",
+        "compose.yaml",
+        "SECURITY.md",
+        "CHANGELOG.md",
+        "desktop/EXECUTION.md",
+        "plugins/tessera-harness-observer/README.md",
+    ):
         assert f"!{path}" in patterns
+    for path in ("desktop", "plugins", "plugins/tessera-harness-observer"):
+        assert f"!{path}/" in patterns
+    # Add only the public documentation closure, not dependency/runtime trees.
+    assert "!desktop/**" not in patterns
+    assert "!plugins/**" not in patterns
     for excluded in (".tessera", ".git", ".venv", "node_modules"):
         assert not any(
             pattern.startswith("!") and pattern[1:].split("/", 1)[0] == excluded
