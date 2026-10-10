@@ -125,6 +125,6 @@ for implementation details, and [installation](docs/installation.md) for service
 
 Use [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and bounded live fixtures.
 Read [SECURITY.md](SECURITY.md) before reporting vulnerabilities: do not post secrets,
-research data or exploit details publicly; private reporting availability remains
-an explicit publication gate. Tessera source is [MIT licensed](LICENSE); bundled
+research data or exploit details publicly; GitHub private vulnerability reporting
+is enabled through the repository's Security page. Tessera source is [MIT licensed](LICENSE); bundled
 third-party runtimes retain their own license notices.
