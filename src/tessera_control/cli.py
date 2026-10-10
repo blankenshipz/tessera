@@ -17,7 +17,7 @@ import uvicorn
 from .api import create_app
 from .deployment import serving_config
 from .recovery import backup_state, restore_state
-from .store import StoreError, initialize_state, migrate_state
+from .store import StoreError, initialize_state, migrate_state, require_sqlite_runtime
 from .workspace import WorkspaceError
 from .workspace_cli import add_workspace_commands, run_workspace
 
@@ -607,12 +607,20 @@ def main() -> int:
             print(str(error), file=sys.stderr)
             return 1
     if arguments.command == "init":
-        database_path, header_path = initialize_state(arguments.state_dir)
+        try:
+            database_path, header_path = initialize_state(arguments.state_dir)
+        except StoreError as error:
+            print(f"init failed: {error}", file=sys.stderr)
+            return 1
         print(database_path)
         print(header_path)
         return 0
     if arguments.command == "migrate":
-        print(migrate_state(arguments.state_dir))
+        try:
+            print(migrate_state(arguments.state_dir))
+        except StoreError as error:
+            print(f"migrate failed: {error}", file=sys.stderr)
+            return 1
         return 0
     if arguments.command == "backup":
         try:
@@ -631,6 +639,11 @@ def main() -> int:
         print(header_path)
         return 0
     if arguments.command == "serve":
+        try:
+            require_sqlite_runtime()
+        except StoreError as error:
+            print(f"serve failed: {error}", file=sys.stderr)
+            return 1
         owner = None
         try:
             deployment = serving_config(

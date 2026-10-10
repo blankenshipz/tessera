@@ -492,15 +492,20 @@ def test_claim_other_worker_and_invalid_typed_lease_never_launch(service_setup):
     assert s.transport.creates == s.transport.starts == 0
 
 
-def test_guard_image_source_is_minimal_and_uses_existing_pinned_base():
+def test_guard_image_source_is_minimal_and_keeps_separate_worker_pin():
     root = Path(__file__).resolve().parents[1]
     text = (root / "Dockerfile.guard").read_text()
-    old_base = next(
+    control_base = next(
         line.split()[1]
         for line in (root / "Dockerfile").read_text().splitlines()
         if line.startswith("FROM python:")
     )
-    assert "FROM " + old_base in text
+    worker_base = (
+        "python:3.11-slim-bookworm@sha256:"
+        "528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84"
+    )
+    assert "FROM " + worker_base in text
+    assert control_base != worker_base
     assert "USER 65532:65532" in text
     assert "ordinary_docker_guard.py" in text and "tessera_worker.ordinary_docker_guard" in text
     assert "pip install" not in text and "docker.sock" not in text and "VOLUME" not in text

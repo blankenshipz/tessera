@@ -12,6 +12,7 @@ import stat
 import uuid
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -72,11 +73,49 @@ def _database_path(state_dir: Path) -> Path:
 
 
 def _connect(database_path: Path) -> sqlite3.Connection:
+    require_sqlite_runtime()
     connection = sqlite3.connect(database_path, timeout=10, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 10000")
     return connection
+
+
+@lru_cache(maxsize=1)
+def _check_sqlite_runtime(connect) -> None:
+    """Cache only successful checks, bound to the active SQLite connection factory."""
+    message = (
+        "Unsupported SQLite runtime: built-in json_extract must be deterministic and "
+        "innocuous for trusted_schema=OFF recovery. Use the pinned Tessera control-plane "
+        "image or a Python build linked to compatible SQLite; Python version alone is insufficient."
+    )
+    connection = None
+    try:
+        connection = connect(":memory:")
+        rows = connection.execute(
+            "SELECT flags FROM pragma_function_list "
+            "WHERE name='json_extract' AND builtin=1 AND narg=-1"
+        ).fetchall()
+        required = 0x800 | 0x200000  # SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS
+        if not rows or not all((row[0] & required) == required for row in rows):
+            raise StoreError(message)
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("CREATE TABLE runtime_probe (metadata_json TEXT);")
+        connection.execute(
+            "CREATE UNIQUE INDEX runtime_probe_identity "
+            "ON runtime_probe(json_extract(metadata_json,'$.identity'))"
+        )
+        connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+    except sqlite3.Error as error:
+        raise StoreError(message) from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def require_sqlite_runtime() -> None:
+    """Reject incompatible SQLite before any control-state write, once per process."""
+    _check_sqlite_runtime(sqlite3.connect)
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:
@@ -343,6 +382,7 @@ def initialize_state(state_dir: Path) -> tuple[Path, Path]:
     parent = state_dir.parent
     if not parent.is_dir() or _lstat_is_symlink(parent):
         raise ValueError("State directory parent is not a safe directory.")
+    require_sqlite_runtime()
     try:
         state_dir.mkdir(mode=0o700)
         os.chmod(state_dir, 0o700)

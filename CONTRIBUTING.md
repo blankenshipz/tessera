@@ -37,6 +37,18 @@ This is a full-suite alternative, not permission to omit a failing shard.
 For native development, install [uv](https://docs.astral.sh/uv/getting-started/installation/)
 and Python 3.11 or newer:
 
+Control-plane SQLite must expose built-in `json_extract` with both
+`SQLITE_DETERMINISTIC` and `SQLITE_INNOCUOUS`. Python version alone does not establish
+this capability. Initialization, storage connections and standalone recovery fail
+closed before state writes on incompatible builds, with an actionable error.
+The pinned control-plane image uses Python 3.11 Trixie; its Linux amd64 base was
+probed with SQLite 3.46.1 and `trusted_schema=OFF`. The image pin is a multiarch
+index; other architectures are available upstream but have not been tested here.
+This is a capability requirement, not a claim about the first compatible SQLite
+release. Native tests additionally require an existing C compiler and `patch`;
+the development-only Docker target supplies those tools and the locked setuptools
+build backend. Hardened lab/remote runtime targets do not include these test tools.
+
 ```sh
 uv sync --locked --extra mcp
 .venv/bin/ruff check .
@@ -84,7 +96,11 @@ installs dependencies; unknown enforcement or cleanup blocks conformance. Read
 its runbook for the independent supervisor, recovery and current live blocker.
 
 For an opt-in live CPU isolation/cancellation fixture, first fetch the exact
-development Python image, then run the script against your local Docker daemon:
+worker fixture Python image, then run the script against your local Docker daemon.
+This Bookworm worker/stdlib-guard pin is deliberately unchanged: those images do
+not host control-plane SQLite recovery. Root lab/dev and remote control-plane
+images instead share the compatible Trixie pin; changing a control-plane base does
+not reapprove a worker artifact or imply a new live fixture run:
 
 ```sh
 docker pull python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84

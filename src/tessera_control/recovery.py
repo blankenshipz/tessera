@@ -17,7 +17,15 @@ from pathlib import Path
 from typing import Any
 
 from .migrations import LATEST_SCHEMA_VERSION
-from .store import DATABASE_NAME, OWNER_HEADER_NAME, StoreError, _connect, _token_hash, utc_now
+from .store import (
+    DATABASE_NAME,
+    OWNER_HEADER_NAME,
+    StoreError,
+    _connect,
+    _token_hash,
+    require_sqlite_runtime,
+    utc_now,
+)
 
 BACKUP_MANIFEST = "manifest.json"
 BACKUP_DATABASE = "snapshot.sqlite3"
@@ -254,6 +262,7 @@ def _expected_tables() -> tuple[
 
 
 def _defensive(connection: sqlite3.Connection, start: float) -> None:
+    require_sqlite_runtime()
     connection.execute("PRAGMA trusted_schema=OFF")
     if hasattr(connection, "enable_load_extension"):
         connection.enable_load_extension(False)
@@ -564,6 +573,7 @@ def _record_backup_health(
 
 def backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
     """Copy one SQLite-consistent snapshot and record best-effort backup health."""
+    require_sqlite_runtime()
     try:
         manifest = _backup_state(state_dir, output)
     except StoreError:
@@ -575,6 +585,7 @@ def backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
 
 def _backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
     """Copy one SQLite-consistent snapshot; source state remains active."""
+    require_sqlite_runtime()
     if state_dir.is_symlink() or not state_dir.is_dir():
         raise StoreError("Source state directory is unsafe.")
     with _open_regular(state_dir / DATABASE_NAME, MAX_BACKUP_BYTES):
@@ -764,6 +775,7 @@ def _read_manifest(backup: Path) -> dict[str, Any]:
 
 def restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
     """Create a new held restore with all prior authority revoked."""
+    require_sqlite_runtime()
     start = time.monotonic()
     manifest = _read_manifest(backup)
     _deadline(start)

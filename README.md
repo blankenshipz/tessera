@@ -78,7 +78,10 @@ are not available in this demonstrated journey.
 
 ## Quickstart
 
-Requires macOS, Python 3.11+, uv, Node **22.12.0+** and npm. In a fresh state directory:
+Requires macOS, Python 3.11+, uv, Node **22.12.0+** and npm. Python's SQLite must
+provide built-in deterministic, innocuous `json_extract` for defensive recovery;
+an incompatible build is rejected before control-state writes. See
+[runtime prerequisites](CONTRIBUTING.md#setup). In a fresh state directory:
 
 ```sh
 uv sync --locked --extra mcp
