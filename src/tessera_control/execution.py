@@ -683,7 +683,8 @@ class ExecutionStore(Store):
             except (TypeError, json.JSONDecodeError) as error:
                 raise Conflict("Task execution specification is invalid.") from error
             if (
-                spec.get("profile") not in {"local-cpu", "kubernetes-opencode", "ordinary-docker"}
+                spec.get("profile")
+                not in {"local-cpu", "kubernetes-opencode", "ordinary-docker", "agent-sandbox"}
                 or spec.get("network_enabled") is not False
             ):
                 raise Conflict(
@@ -696,6 +697,18 @@ class ExecutionStore(Store):
                 connection, actor["org_id"], payload["worker_principal_id"], project_id
             )
             docker_target_bounds = None
+            if spec["profile"] == "agent-sandbox":
+                from .agent_sandbox_models import SandboxPlan
+
+                try:
+                    sandbox_plan = SandboxPlan.model_validate(spec.get("sandbox"))
+                except ValueError as error:
+                    raise Conflict("Sandbox plan pins are invalid.") from error
+                if (
+                    sandbox_plan.target.org_id != actor["org_id"]
+                    or sandbox_plan.target.project_id != project_id
+                ):
+                    raise Conflict("Sandbox namespace target belongs to another tenant/project.")
             if spec["profile"] == "ordinary-docker":
                 from .ordinary_docker import OrdinaryDockerStore
 

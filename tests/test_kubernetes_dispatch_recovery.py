@@ -58,7 +58,7 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
 ) -> None:
     response, _worker, _package = _admitted_package(tmp_path, migrate_from_v35=migrated)
     state = tmp_path / "state"
-    assert LATEST_SCHEMA_VERSION == 55
+    assert LATEST_SCHEMA_VERSION == 56
     assert migrate_state(state) == LATEST_SCHEMA_VERSION
     assert migrate_state(state) == LATEST_SCHEMA_VERSION
 
@@ -94,7 +94,7 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
     restore_state(backup, restored)
     assert _ledger_rows(restored) == before
     with sqlite3.connect(restored / DATABASE_NAME) as connection:
-        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 56
         assert_empty_runtime_v55(connection)
 
     held = TestClient(create_app(restored))
@@ -133,7 +133,7 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
     restore_state(repeated_backup, repeatedly_restored)
     assert _ledger_rows(repeatedly_restored) == before
     with sqlite3.connect(repeatedly_restored / DATABASE_NAME) as connection:
-        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 56
         assert_empty_runtime_v55(connection)
 
 
@@ -176,8 +176,8 @@ def test_v35_fixture_failed_upgrade_rolls_back_schema_and_prior_authority(tmp_pa
             connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() == rows
             for table, rows in before.items()
         )
-    assert migrate_state(state) == 55
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / DATABASE_NAME) as connection:
         assert_empty_runtime_v55(connection)
         assert all(

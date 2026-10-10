@@ -389,7 +389,7 @@ def test_explicit53_to54_empty_enrollment(tmp_path, held):
             is None
         )
     assert TestClient(create_app(state)).get("/health/ready").status_code == 503
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert db.execute("SELECT count(*) FROM ordinary_docker_targets").fetchone()[0] == 0
         assert_empty_runtime_v55(db)

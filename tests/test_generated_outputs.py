@@ -236,7 +236,7 @@ def test_old52_requires_explicit53_migration(output_setup, held):
         before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
         health = db.execute("SELECT * FROM operator_backup_health").fetchall()
     assert TestClient(create_app(state)).get("/health/ready").status_code == 503
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
     if not held:
         assert TestClient(create_app(state)).get("/health/ready").status_code == 200
     with sqlite3.connect(state / "tessera.sqlite3") as db:

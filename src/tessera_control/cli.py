@@ -158,10 +158,12 @@ def _add_astra_namespace_command(subcommands: argparse._SubParsersAction) -> Non
 
 
 def parser() -> argparse.ArgumentParser:
+    from .agent_sandbox_cli import add_agent_sandbox_commands
     from .connection_tunnel import add_connection_tunnel_command
 
     command = argparse.ArgumentParser(prog="tessera")
     subcommands = command.add_subparsers(dest="command", required=True)
+    add_agent_sandbox_commands(subcommands)
     add_connection_tunnel_command(subcommands)
     add_workspace_commands(subcommands)
     _add_minikube_provisioning_command(subcommands)
@@ -186,6 +188,8 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--public-origin")
     serve.add_argument("--runtime-owner-config", type=Path)
     serve.add_argument("--runtime-owner-sha256")
+    serve.add_argument("--agent-sandbox-config", type=Path)
+    serve.add_argument("--agent-sandbox-sha256")
     return command
 
 
@@ -580,6 +584,10 @@ def _run_astra_namespace(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     arguments = parser().parse_args()
+    if arguments.command == "agent-sandbox":
+        from .agent_sandbox_cli import run_agent_sandbox
+
+        return run_agent_sandbox(arguments)
     if arguments.command == "connection-tunnel":
         from .connection_tunnel import run_connection_tunnel
 
@@ -628,6 +636,13 @@ def main() -> int:
             deployment = serving_config(
                 arguments.bind_host, arguments.trusted_host, arguments.public_origin
             )
+            sandbox_backend = None
+            if arguments.agent_sandbox_config is not None or arguments.agent_sandbox_sha256:
+                from .agent_sandbox_configuration import load_agent_sandbox_backend
+
+                sandbox_backend = load_agent_sandbox_backend(
+                    arguments.agent_sandbox_config, arguments.agent_sandbox_sha256
+                )
             if arguments.runtime_owner_config is not None or arguments.runtime_owner_sha256:
                 from .runtime_composition import load_runtime_owner
 
@@ -663,7 +678,12 @@ def main() -> int:
             return not cleanup_failed
 
         try:
-            app = create_app(arguments.state_dir, deployment, runtime_binding_adapter=adapter)
+            app = create_app(
+                arguments.state_dir,
+                deployment,
+                runtime_binding_adapter=adapter,
+                agent_sandbox_backend=sandbox_backend,
+            )
             if owner is not None:
                 previous_lifespan = app.router.lifespan_context
 

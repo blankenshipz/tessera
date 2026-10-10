@@ -124,7 +124,7 @@ def test_public_metadata_policy_pins_replay_and_bounded_capture(capture):
     assert row["harness_capture"]["unseen_sources_and_beyond_watermark"] == "unknown"
     assert row["model_attribution"] == "self_reported"
     with sqlite3.connect(capture[0] / "tessera.sqlite3") as conn:
-        assert conn.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert conn.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 56
         assert (
             conn.execute(
                 "SELECT count(*) FROM agent_provenance WHERE record_id='runtime_record_1'"
@@ -362,4 +362,4 @@ def test_generated_output_requires_registered_digest_and_matching_context(reques
             == 403
         )
     with _connect(output["state"] / "tessera.sqlite3") as conn:
-        assert conn.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert conn.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 56

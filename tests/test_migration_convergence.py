@@ -139,7 +139,7 @@ def test_runtime_fixture_cleanup_preserves_history_and_rolls_back(tmp_path):
         connection.execute("BEGIN")
         strip_empty_runtime_v55(connection)
         assert history_digest() == before
-        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 56
         connection.rollback()
         assert connection.execute("SELECT * FROM sqlite_schema ORDER BY name").fetchall() == schema
         assert_empty_runtime_v55(connection)
@@ -148,8 +148,8 @@ def test_runtime_fixture_cleanup_preserves_history_and_rolls_back(tmp_path):
         strip_empty_runtime_v55(connection)
         connection.execute("UPDATE schema_meta SET schema_version=54")
         connection.commit()
-    assert migrate_state(state) == 55
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert_empty_runtime_v55(connection)
         assert history_digest() == before

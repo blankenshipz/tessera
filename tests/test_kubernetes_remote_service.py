@@ -331,6 +331,9 @@ def test_kubernetes_transport_uses_scoped_token_and_bounded_request(tmp_path):
     requests = []
 
     class Response:
+        def __init__(self):
+            self.content = BytesIO(b'{"metadata":{"uid":"real-uid"}}')
+
         def __enter__(self):
             return self
 
@@ -338,8 +341,11 @@ def test_kubernetes_transport_uses_scoped_token_and_bounded_request(tmp_path):
             pass
 
         def read(self, limit):
-            assert limit == 2_000_001
-            return BytesIO(b'{"metadata":{"uid":"real-uid"}}').read()
+            return self.content.read(limit)
+
+        def read1(self, limit):
+            assert limit <= 65536
+            return self.content.read(limit)
 
     class Opener:
         def open(self, request, timeout):

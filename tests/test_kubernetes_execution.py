@@ -106,7 +106,7 @@ def _admitted_package(
     before = None
     if migrate_from_v35:
         before = _old_v35_state(state)
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert_empty_runtime_v55(connection)
         if before is not None:

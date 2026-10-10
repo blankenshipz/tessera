@@ -159,8 +159,8 @@ def test_schema54_to55_preserves_history_rollback_repeat_and_readiness(tmp_path)
         assert not c.execute(
             "SELECT 1 FROM sqlite_master WHERE name='runtime_native_claims'"
         ).fetchone()
-    assert migrate_state(state) == 55
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
+    assert migrate_state(state) == 56
     with sqlite3.connect(database) as c:
         assert all(
             c.execute(f"SELECT * FROM {t}").fetchall() == rows for t, rows in history.items()

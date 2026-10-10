@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import yaml
@@ -131,7 +132,13 @@ class NamespacedKubernetesClient:
         )
 
     def request(
-        self, method: str, path: str, body: dict | None = None, *, max_bytes: int = 2_000_000
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        max_bytes: int = 2_000_000,
+        timeout_seconds: float = 5.0,
     ) -> dict | None:
         if not path.startswith("/api/") and not path.startswith("/apis/"):
             raise RemoteTargetError("Kubernetes path outside fixed API")
@@ -151,18 +158,24 @@ class NamespacedKubernetesClient:
                 "Accept": "application/json",
             },
         )
+        deadline = time.monotonic() + min(5.0, timeout_seconds)
         try:
-            with self.opener.open(request, timeout=5) as response:
-                data = response.read(max_bytes + 1)
+            with self.opener.open(request, timeout=min(5.0, timeout_seconds)) as response:
+                data = self._read_response(response, max_bytes, deadline)
             if len(data) > max_bytes:
                 raise RemoteTargetError("Kubernetes response exceeds bound")
             return json.loads(data) if data else None
         except urllib.error.HTTPError as error:
             if method == "GET" and error.code == 404:
+                error.close()
                 return None
             code = "kubernetes_http_rejected"
             try:
-                status_body = error.read(8193)
+                # HTTPError wraps the HTTPResponse in fp. Read that response in
+                # single buffered chunks, resetting its socket to the remaining
+                # *original* budget, never a new diagnostics timeout.
+                response = error.fp
+                status_body = self._read_response(response, 8192, deadline, diagnostics=True)
                 status = json.loads(status_body) if len(status_body) <= 8192 else None
                 if (
                     isinstance(status, dict)
@@ -174,11 +187,14 @@ class NamespacedKubernetesClient:
                     code = "kubernetes_quota_exceeded"
             except (OSError, ValueError):
                 pass
+            finally:
+                error.close()
             raise RemoteTargetError(
                 f"Kubernetes {method} rejected (HTTP {error.code})",
                 diagnostic_code=code,
                 http_status=error.code,
             ) from None
+
         except ssl.SSLError:
             raise RemoteTargetError(
                 "Kubernetes TLS request unavailable", diagnostic_code="kubernetes_tls_error"
@@ -195,6 +211,37 @@ class NamespacedKubernetesClient:
             raise RemoteTargetError(
                 "Kubernetes request unavailable or malformed", diagnostic_code=code
             ) from None
+
+    @staticmethod
+    def _read_response(response, max_bytes, deadline, *, diagnostics=False):
+        socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+        if diagnostics and (
+            not callable(getattr(response, "read1", None))
+            or (socket is None and not isinstance(response, BytesIO))
+        ):
+            # Never attempt optional diagnostics on an unknown blocking stream.
+            # In-memory buffers require no I/O timeout; real HTTPResponses must
+            # expose the socket whose timeout we reduce on every buffered read.
+            raise ValueError("bounded HTTP diagnostics unavailable")
+        chunks, size = [], 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+            if socket is not None:
+                socket.settimeout(remaining)
+            reader = getattr(response, "read1", response.read)
+            chunk = reader(min(65536, max_bytes + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > max_bytes:
+                break
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        return b"".join(chunks)
 
     def path(self, kind: str, name: str | None = None) -> str:
         namespace = urllib.parse.quote(self.cluster.namespace, safe="")

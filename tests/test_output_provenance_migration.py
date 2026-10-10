@@ -34,7 +34,7 @@ def rows(state, tables):
 def test_explicit51_to52_preserves_forensics_and_only_invalidates_active_success(tmp_path, held):
     state = tmp_path / "source"
     initialize_state(state)
-    assert SCHEMA_VERSION == 55
+    assert SCHEMA_VERSION == 56
     assert TestClient(create_app(state)).get("/health/ready").status_code == 200
     assert rows(state, ["agent_output_provider_bindings"]) == {"agent_output_provider_bindings": []}
     if held:

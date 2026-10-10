@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 55
+LATEST_SCHEMA_VERSION = 56
 LOCAL_ORG_ID = "org_local"
 
 
@@ -942,6 +942,20 @@ def migrate_v54_to_v55(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version=55 WHERE singleton=1")
 
 
+def migrate_v55_to_v56(connection: sqlite3.Connection) -> None:
+    """Add empty Sandbox bindings; no inferred target, authority or provider effects."""
+    from .agent_sandbox import create_agent_sandbox_schema
+
+    create_agent_sandbox_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=56 WHERE singleton=1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -997,6 +1011,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     52: migrate_v52_to_v53,
     53: migrate_v53_to_v54,
     54: migrate_v54_to_v55,
+    55: migrate_v55_to_v56,
 }
 
 

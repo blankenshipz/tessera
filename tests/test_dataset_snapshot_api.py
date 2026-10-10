@@ -214,7 +214,7 @@ def test_normal_api_human_adopt_release_worker_lease_deliver_same_verified_bytes
                 "SELECT response_json FROM idempotency WHERE path=?", (path,)
             ).fetchone()[0]
         )
-        assert c.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 55
+        assert c.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 56
     finally:
         c.close()
 

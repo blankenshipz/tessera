@@ -86,7 +86,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 55);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 56);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -283,6 +283,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .runtime_bindings import create_runtime_binding_schema
 
     create_runtime_binding_schema(connection)
+    from .agent_sandbox import create_agent_sandbox_schema
+
+    create_agent_sandbox_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

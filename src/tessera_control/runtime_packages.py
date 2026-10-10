@@ -75,6 +75,17 @@ class RuntimePackageStore(ExecutionStore):
             adapter_version = "kubernetes-job-v1"
             profile_version = "development-minikube-opencode-v1"
             operation_seed = "tessera-kubernetes-v1"
+        elif spec["profile"] == "agent-sandbox":
+            if (
+                spec["sandbox"]["target"]["org_id"] != worker["org_id"]
+                or spec["sandbox"]["target"]["project_id"] != grant["project_id"]
+            ):
+                raise Conflict("Sandbox namespace target is not bound to this tenant/project.")
+            if len(spec["argv"]) > 32 or plan["max_duration_seconds"] > 3600:
+                raise Conflict("Sandbox workload exceeds the fixed profile bounds.")
+            adapter_version = "agent-sandbox-v1"
+            profile_version = "agent-sandbox-network-none-v1"
+            operation_seed = "tessera-agent-sandbox-v1"
         else:
             raise Conflict("Execution profile is not supported by the package contract.")
         package = {
@@ -119,6 +130,14 @@ class RuntimePackageStore(ExecutionStore):
                     "network_mode": "none",
                 },
                 output_paths=spec["output_paths"],
+            )
+        if spec["profile"] == "agent-sandbox":
+            package.update(
+                org_id=worker["org_id"],
+                sandbox=spec["sandbox"],
+                output_paths=spec["output_paths"],
+                # Initial lease window is immutable for this one-shot profile.
+                sandbox_expires_at=min(expiry, _parse_utc(lease["hard_expires_at"])).isoformat(),
             )
         package["docker_lookup_key"] = f"tessera-op-{package['operation_id']}"
         bound = connection.execute(
@@ -241,7 +260,7 @@ class RuntimePackageStore(ExecutionStore):
             or type(expected_epoch) is not int
             or not 1 <= expected_epoch <= 2**63 - 1
             or type(restart_intent) is not bool
-            or execution_adapter not in {None, "local-cpu", "kubernetes-job"}
+            or execution_adapter not in {None, "local-cpu", "kubernetes-job", "agent-sandbox"}
             or (
                 admitted_attempt_id is not None
                 and (
@@ -286,6 +305,7 @@ class RuntimePackageStore(ExecutionStore):
             requested_adapter = {
                 "local-cpu": "docker-local-cpu-v1",
                 "kubernetes-job": "kubernetes-job-v1",
+                "agent-sandbox": "agent-sandbox-v1",
             }.get(execution_adapter)
             if requested_adapter is not None and package["adapter_version"] != requested_adapter:
                 raise Conflict(
@@ -294,7 +314,7 @@ class RuntimePackageStore(ExecutionStore):
             operation, created = self._record_operation_intent(
                 connection, live, package, metadata["package_digest"], operation_request_digest
             )
-            if package["adapter_version"] == "kubernetes-job-v1":
+            if package["adapter_version"] in {"kubernetes-job-v1", "agent-sandbox-v1"}:
                 connection.execute(
                     """INSERT INTO execution_runtime_packages
                     (operation_id,package_digest,package_json,created_at) VALUES (?,?,?,?)
@@ -366,7 +386,7 @@ class RuntimePackageStore(ExecutionStore):
                 metadata["package_digest"],
                 operation_request_digest,
             )
-            if metadata["package"]["adapter_version"] == "kubernetes-job-v1":
+            if metadata["package"]["adapter_version"] in {"kubernetes-job-v1", "agent-sandbox-v1"}:
                 stored = connection.execute(
                     "SELECT package_digest,package_json FROM execution_runtime_packages "
                     "WHERE operation_id=?",

@@ -51,7 +51,7 @@ def test_v50_to_v51_invalidates_only_active_backup_freshness(
         )
         before_health = db.execute("SELECT * FROM operator_backup_health").fetchall()
         before_history = {t: db.execute(f"SELECT * FROM {t}").fetchall() for t in historical_tables}
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         db.row_factory = sqlite3.Row
         health = dict(db.execute("SELECT * FROM operator_backup_health").fetchone())
@@ -71,7 +71,7 @@ def test_v50_to_v51_invalidates_only_active_backup_freshness(
         assert db.execute("SELECT COUNT(*) FROM agent_authority_grants").fetchone()[0] == 0
         assert_empty_runtime_v55(db)
         after_health = db.execute("SELECT * FROM operator_backup_health").fetchall()
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert db.execute("SELECT * FROM operator_backup_health").fetchall() == after_health
     client = TestClient(create_app(state))
@@ -120,8 +120,8 @@ def test_v54_to_v55_preserves_history_empty_authority_and_held_readiness(tmp_pat
             db.execute("SELECT 1 FROM sqlite_master WHERE name='runtime_enrollments'").fetchone()
             is None
         )
-    assert migrate_state(state) == 55
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert_empty_runtime_v55(db)
         assert all(

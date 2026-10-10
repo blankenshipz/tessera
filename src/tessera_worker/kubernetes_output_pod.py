@@ -18,6 +18,24 @@ def run(mode: str, identity: dict, paths: list[str], root: Path = Path("/outputs
     operation = identity["operation"]
     if not re.fullmatch(r"[0-9a-f]{32}", operation):
         raise ValueError("Invalid output operation")
+    if mode == "sandbox-collect":
+        # Direct Sandbox owns a dedicated PVC, not the Job collector's prepared
+        # attempt directory/marker. The invoking adapter freshly verifies its
+        # stopped producer, exact PVC UID/spec and read-only mount before/after.
+        if identity.get("backend") != "agent-sandbox" or not identity.get("sandbox_uid"):
+            raise ValueError("Direct Sandbox collector identity required")
+        outputs = collect_outputs(root, paths, MAX_OUTPUT_BYTES)
+        return {
+            "identity": identity,
+            "outputs": [
+                {
+                    "path": item.relative_path,
+                    "content": base64.b64encode(item.content).decode(),
+                    "sha256": item.sha256,
+                }
+                for item in outputs
+            ],
+        }
     marker = root / (operation + ".provenance.json")
     directory = root / operation
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()

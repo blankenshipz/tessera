@@ -142,7 +142,7 @@ def test_collector_schema51_readiness_and_existing50_explicit_migration(tmp_path
         db.execute("UPDATE schema_meta SET schema_version=50")
     old = TestClient(create_app(state))
     assert old.get("/health/ready").status_code == 503
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert_empty_runtime_v55(db)
     assert TestClient(create_app(state)).get("/health/ready").status_code == 200

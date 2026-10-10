@@ -301,6 +301,15 @@ activate live Kubernetes enforcement or Salad effects. See
 
 #### Historical development execution-target direction
 
+The opt-in [direct Agent Sandbox adapter](docs/agent-sandbox.md) implements a
+one-shot `agent-sandbox` network-none plan using existing grants, leases,
+operation intents and artifact custody. It creates upstream suspended/gated
+Sandboxes, fences release to one Pod UID, retains PVCs on stop/uncertainty and
+separately gates cleanup on placed artifacts. Live isolation/admission witnesses
+and a verified operator target remain prerequisites, not available flags. This
+does not replace batch Jobs or enable a general networked agent session; see
+[decision 0030](docs/decisions/0030-direct-agent-sandbox.md).
+
 `local-cpu` remains an explicit development fixture target. Kubernetes preparation
 may proceed in parallel, but does not promote a cluster profile to supported or
 live execution. A future execution profile composes an `EnvironmentAdapter`

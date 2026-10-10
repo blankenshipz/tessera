@@ -12,9 +12,11 @@ from pydantic import (
     StringConstraints,
     ValidationInfo,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
+from .agent_sandbox_models import SandboxPlan
 from .request_limits import MAX_TOKEN_CHARS
 from .token_purpose import provider_key_shaped
 
@@ -64,17 +66,27 @@ class ExecutionSpec(StrictRequest):
     input_snapshot_digest: Sha256Digest
     pinned_skill_digests: Annotated[list[Sha256Digest], Field(max_length=128)]
     output_paths: Annotated[list[RawString4000], Field(max_length=128)]
-    profile: Literal["local-cpu", "kubernetes-opencode", "ordinary-docker"]
+    profile: Literal["local-cpu", "kubernetes-opencode", "ordinary-docker", "agent-sandbox"]
     docker: DockerPlan | None = None
+    sandbox: SandboxPlan | None = None
     network_enabled: Literal[False] = False
     # Both currently supported runtime packages and quarantine cap total output
     # at 16 MiB. Reject impossible new plans before approval/reservation.
     max_output_bytes: Annotated[int, Field(strict=True, ge=1, le=16 * 1024 * 1024)]
 
+    @model_serializer(mode="wrap")
+    def preserve_legacy_profile_shape(self, handler):
+        value = handler(self)
+        if self.sandbox is None:
+            value.pop("sandbox", None)
+        return value
+
     @model_validator(mode="after")
     def docker_is_explicit(self):
         if (self.profile == "ordinary-docker") != (self.docker is not None):
             raise ValueError("Docker profile requires its explicit approved target/resource pins")
+        if (self.profile == "agent-sandbox") != (self.sandbox is not None):
+            raise ValueError("Sandbox profile requires explicit approved target/resource pins")
         return self
 
     @field_validator("argv")

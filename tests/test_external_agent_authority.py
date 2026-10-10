@@ -466,8 +466,8 @@ def test_v49_migration_creates_empty_authority_without_inference(tmp_path):
         ):
             db.execute(f"DROP TABLE {table}")
         db.execute("UPDATE schema_meta SET schema_version=49")
-    assert migrate_state(state) == 55
-    assert migrate_state(state) == 55
+    assert migrate_state(state) == 56
+    assert migrate_state(state) == 56
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert_empty_runtime_v55(db)
         for table in (

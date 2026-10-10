@@ -73,6 +73,7 @@ def create_app(
     deployment: DeploymentConfig | None = None,
     *,
     runtime_binding_adapter: Any = None,
+    agent_sandbox_backend: Any = None,
 ) -> FastAPI:
     """Build a control API with an explicit serving profile around initialized state."""
 
@@ -173,6 +174,16 @@ def create_app(
 
     app.state.runtime_bindings = RuntimeBindingStore(state_dir, runtime_binding_adapter)
     app.include_router(runtime_binding_router)
+    from tessera_worker.agent_sandbox import SandboxUnsafe
+
+    from .agent_sandbox_api import router as agent_sandbox_router
+
+    app.state.agent_sandbox_backend = agent_sandbox_backend
+    app.include_router(agent_sandbox_router)
+
+    @app.exception_handler(SandboxUnsafe)
+    async def unresolved_sandbox(request: Request, error: SandboxUnsafe):
+        return JSONResponse(status_code=409, content={"detail": "sandbox_evidence_unresolved"})
 
     @app.exception_handler(NativeBridgeUnavailable)
     async def unavailable_runtime_bridge(request: Request, error: NativeBridgeUnavailable):
