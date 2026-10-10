@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import os
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -247,9 +248,13 @@ def actual_core(tmp_path_factory):
     core = Path(__file__).parents[1] / ".tessera/worktrees/opencode-observability-v4"
     source = core / "packages/core/src/plugin/model-phase.ts"
     effect = core / "packages/core/node_modules/effect/dist/index.js"
-    bun = Path(
-        "/Users/zach/Code/opencode-subscription/runtime/v2-core-stage/toolchain/package/bin/bun"
-    )
+    # Opt-in executable supplied by the operator; never assume a personal install.
+    bun_path = os.environ.get("TESSERA_TEST_BUN")
+    if not bun_path:
+        pytest.skip("Opt-in TESSERA_TEST_BUN executable not configured")
+    bun = Path(bun_path)
+    if not bun.is_absolute():
+        pytest.skip("Opt-in TESSERA_TEST_BUN must be an absolute executable path")
     if not all(path.is_file() for path in (source, effect, bun)):
         pytest.skip("Opt-in isolated core/Bun/Effect source prerequisites unavailable")
     root = tmp_path_factory.mktemp("core-phase-interop")

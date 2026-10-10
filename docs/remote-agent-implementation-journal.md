@@ -1429,11 +1429,11 @@ evidence that an end-to-end journey passed.
   journeys be evaluated. Preserve the stricter verifier and prior deployment refusal.
 - **Research-profile prerequisite still pending:** admit a dedicated included-OAuth
   reasoning profile only under the exact guardrails above. Intent revision 2 now
-  explicitly authorizes the garage-server Docker host `${GARAGE_USER}@${GARAGE_HOST}`
+  explicitly authorizes an operator-owned Docker host `${REMOTE_USER}@${REMOTE_HOST}`
   (`linux/amd64`) for independent-host testing; local Docker Desktop Kubernetes
   remains authorized for supporting checks. This changes target authorization,
   not evidence: no garage host inspection/deployment or laptop-off workflow is
-  recorded in this checkpoint. Before any scoped deployment, use the garage-server
+  recorded in this checkpoint. Before any scoped deployment, use the private host
   runbook and existing SSH/runtime references; inspect BatchMode SSH availability,
   explicit Docker context, host capacity, current workloads and ports. Preserve the
   LAN scanner on port 80, unrelated services/data and default Docker context.
@@ -1444,7 +1444,7 @@ evidence that an end-to-end journey passed.
 
 ### Intent revision 2 — authorized remote target, not yet exercised
 
-- User authorized `${GARAGE_USER}@${GARAGE_HOST}` as the garage-server Docker target
+- User authorized `${REMOTE_USER}@${REMOTE_HOST}` as the private off-host Docker target
   (`linux/amd64`, approximately 7 GiB) for independent-host testing, and reaffirmed
   local Docker Desktop Kubernetes for supporting checks. This supersedes the older
   “no named off-host target” assumption; it does **not** report a host connection,
@@ -1462,7 +1462,7 @@ evidence that an end-to-end journey passed.
   same-child admission is resolved, and do not use an alternate worker/model or
   bypass. Quota telemetry remains healthy (23% at 00:28/00:29 UTC; latest report
   22%), not exhausted. The gate status is neither a test failure nor a pass.
-- Next authorized host sequence belongs to the root/operator: use the garage-server
+- Next authorized host sequence belongs to the root/operator: use the private host
   skill and existing SSH/runtime references; first verify BatchMode access,
   explicit Docker context, capacity, workloads and port ownership. Then choose a
   narrowly scoped deployment while preserving scanner port 80, unrelated

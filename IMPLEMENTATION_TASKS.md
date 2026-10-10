@@ -1354,10 +1354,10 @@ claimed from the packaged hidden-window smoke.
   OAuth credentials or use paid fallback. Client disconnect does not prove physical
   laptop-off. Linux/systemd and native picker proof remain open.
 
-### Intent revision 2 — garage-server authorized target, acceptance not yet observed
+### Intent revision 2 — private off-host target authorized, acceptance not yet observed
 
 - Revision 2 supersedes the previous assumption that no off-host target was named.
-  The user authorized the garage-server Docker host `zach@192.168.68.74`
+  The user authorized an operator-owned off-host Docker target (identity private)
   (`linux/amd64`, approximately 7 GiB) and local Docker Desktop Kubernetes for
   supporting checks. This documentation update is not a host connection, workload
   inspection or deployment receipt; no remote effects are claimed.
@@ -1375,7 +1375,7 @@ claimed from the packaged hidden-window smoke.
   admission is resolved; no alternate worker/model or bypass. Reported coding quota
   was healthy at 23% at 00:28/00:29 UTC and at 22% at 00:46 UTC, not exhausted.
 - Before any bounded host deployment, the root/operator must follow the
-  garage-server skill, use existing SSH/runtime references, and inspect BatchMode
+  operator's private host runbook, use existing SSH/runtime references, and inspect BatchMode
   access, explicit Docker context, capacity, current workloads and port ownership.
   Preserve scanner port 80, unrelated services/data and the default Docker context.
   Do not install arbitrary Kubernetes, read/copy OAuth values or renew expired
@@ -1386,7 +1386,7 @@ claimed from the packaged hidden-window smoke.
 
 - The same deployment child `ses_ef8b39b5effeB4gZR6s7tenGiF` was rebound for
   read-only garage inventory, not denied-gate collection. After loading the
-  garage-server skill and preparing SSH BatchMode, explicit Docker context,
+  operator's private host runbook and preparing SSH BatchMode, explicit Docker context,
   services/capacity and scanner-port-80 preservation checks, coding-agent admission
   was denied with `misalignment_policy_violation` / `Potentially unintended
   activity` before any SSH or Docker inventory call. The child paused with no active

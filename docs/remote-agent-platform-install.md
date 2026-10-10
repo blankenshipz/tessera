@@ -449,7 +449,7 @@ is a separate opt-in fixture requiring a named remote Kubernetes namespace,
 pre-existing runner image/credential bridge, and explicit one-call provider
 authorization. It is not a prerequisite for installing the ordinary stdio MCP
 client, and this runbook does not invoke it. No such live credential or
-independent-host result is asserted here. The garage-server target is authorized
+independent-host result is asserted here. The private off-host target is authorized
 by the current intent, but its inventory/runtime authentication remain
 uninspected in this checkpoint.
 
