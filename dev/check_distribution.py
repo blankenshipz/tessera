@@ -119,6 +119,18 @@ def run(artifact: Path) -> dict:
             "tessera_list_proposals",
             "tessera_read_proposal",
             "tessera_propose_task_plan",
+            "tessera_register_generated_output",
+            "tessera_generated_output_metadata",
+            "tessera_read_generated_output",
+            "tessera_authority_status",
+            "tessera_consume_grant",
+            "tessera_export_notebook",
+            "tessera_list_authority_requests",
+            "tessera_notebook",
+            "tessera_propose_research",
+            "tessera_record_observation",
+            "tessera_request_authority",
+            "tessera_request_review",
         }
         if mcp_contract["sdk"] != "1.26.0" or set(mcp_contract["tools"]) != expected_tools:
             raise ValueError("installed MCP SDK/tool surface mismatches contract")

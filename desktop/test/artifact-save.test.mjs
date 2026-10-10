@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { linkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, readdir, stat, rm, writeFile, symlink, open, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { saveReleasedArtifact } from '../artifact-save.mjs';
@@ -10,7 +11,7 @@ import { ControlConnection } from '../connection.mjs';
 const content = Buffer.from('exact\0released\xffbytes');
 const sha256 = createHash('sha256').update(content).digest('hex');
 async function fixture(run) {
-  const root = await mkdtemp('/private/tmp/opencode/tessera-artifact-save-');
+  const root = await mkdtemp(join(tmpdir(), 'tessera-artifact-save-'));
   let live = true; let fetches = 0;
   const options = { manifestId: 'manifest_1', artifactId: 'artifact_1',
     dialog: { showSaveDialog: async () => ({ filePath: join(root, 'artifact.bin') }) },

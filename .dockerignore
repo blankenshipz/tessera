@@ -21,4 +21,16 @@
 !.agents/**
 !.github/
 !.github/**
+!docs/
+!docs/**
+!deploy/
+!deploy/**
+!examples/
+!examples/**
+!release/
+!release/**
+!Dockerfile
+!Dockerfile.guard
+!compose.yaml
+!SECURITY.md
 **/__pycache__/
