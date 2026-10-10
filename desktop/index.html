@@ -24,12 +24,13 @@
     <p class="aside-note">Your labbook persists when this window closes.</p>
   </aside>
   <main>
-    <header><div><p class="eyebrow">RESEARCH WORKSPACE</p><h1 id="project-title">Start with a question.</h1></div><button id="refresh" disabled>Refresh</button></header>
+    <header><div><p class="eyebrow" id="workspace-view-title">RESEARCH WORKSPACE</p><h1 id="project-title">Start with a question.</h1></div><button id="refresh" disabled>Refresh</button></header>
     <div id="notice" role="status" aria-live="polite"></div>
-    <section class="card" aria-labelledby="journey-heading">
-      <h2 id="journey-heading">Your research workflow</h2>
+    <p id="workspace-availability" class="muted" role="status">Not connected — connect before recording changes.</p>
+    <section class="next-step" aria-labelledby="journey-heading">
+      <h2 id="journey-heading">Next step</h2>
       <p id="journey-next" role="status">Next: Follow the init-once and serve commands below, then Connect with the endpoint and private owner.header file. For an existing service, use its operator-supplied endpoint and header. Kubernetes setup is optional.</p>
-      <details><summary>Follow the steps — no implicit authority</summary>
+      <details><summary>Research workflow &amp; authority boundaries</summary>
         <ol>
           <li><strong>Connect:</strong> select the private control credential header; confirm the displayed account and organization.</li>
           <li><strong>Create or bring existing work:</strong> select or create a project. Record imported observations in a study with imported provenance; file/project migration is not supported by this screen.</li>
@@ -42,6 +43,7 @@
       </details>
     </section>
     <section id="admin-workspace" hidden aria-labelledby="admin-heading">
+      <button id="admin-return" type="button">← Return to research</button>
       <div class="section-title"><h2 id="admin-heading">Project administration</h2><button id="admin-refresh" type="button">Refresh administrative state</button></div>
       <p id="admin-status" role="status">Select an authenticated project. Configuration is not readiness.</p>
       <nav aria-label="Administration"><button id="admin-setup" type="button">Setup</button><button id="admin-targets" type="button">Targets</button><button id="admin-secrets" type="button">Secrets</button><button id="admin-delegations" type="button">Delegations</button><button id="admin-readiness" type="button">Readiness</button><button id="admin-audit" type="button">Audit</button></nav>
@@ -94,10 +96,18 @@
       <section id="local-control-start" class="card" aria-labelledby="local-control-heading"><h3 id="local-control-heading">Start the local control service</h3><p>After installing Tessera, run initialization once in a new state directory:</p><pre>tessera init --state-dir "$HOME/.local/state/tessera-alpha"</pre><p>Then start the service in a terminal and leave it running:</p><pre>tessera serve --state-dir "$HOME/.local/state/tessera-alpha" --port 8765</pre><p>Click Connect, use <code>http://127.0.0.1:8765</code>, then select <code>$HOME/.local/state/tessera-alpha/owner.header</code> in the native file picker. Keep this file private; never paste its contents into chat. On later launches, run only serve. If port 8765 is occupied, choose a free port and use that same port in Connect.</p><p>Already have a service? Use its endpoint and private credential header instead. This app does not start a backend automatically or grant execution authority.</p></section>
       <details><summary>Optional advanced setup: Kubernetes namespace</summary><section class="card" aria-labelledby="namespace-setup-heading"><h3 id="namespace-setup-heading">Kubernetes namespace setup</h3><p class="muted">Choose one kubeconfig and explicit context to inspect or create exactly one namespace. Kubeconfig bytes and paths stay in the desktop main process. This never installs a control plane.</p><button id="namespace-setup" type="button">Set up Kubernetes namespace</button></section></details><p class="muted">Plans, execution admission, dispatch, operational observations, evidence, and conclusions remain separate records.</p></section>
     <section id="workspace" hidden>
+      <nav id="workspace-navigation" aria-label="Research workspace views">
+        <button id="view-experiments" type="button" aria-current="page">Experiments</button>
+        <button id="view-plans" type="button">Plans &amp; decisions</button>
+        <button id="view-ledger" type="button">Research ledger</button>
+        <button id="view-conversation" type="button">Conversation</button>
+        <button id="view-operations" type="button">Operations</button>
+      </nav>
+      <div data-workspace-view="conversation" hidden>
       <section class="workbench" aria-labelledby="workbench-heading">
         <div class="section-title"><div><h2 id="workbench-heading">Coordinator workbench</h2><p class="muted">Provider-disabled local coordination. Proposals require separate human review and do not approve, grant, dispatch, or execute.</p></div><div class="view-switch" role="group" aria-label="Workbench view"><button id="conversation-view" type="button" aria-pressed="true">Conversation</button><button id="labbook-view" type="button" aria-pressed="false">Labbook</button></div></div>
         <p id="coordinator-health" class="muted">Coordinator status: provider disabled. Displayed records refresh from the control plane.</p>
-        <form id="coordinator-form"><h3>Ask the local coordinator</h3><label>Mode<select name="mode"><option value="Discuss">Discuss</option><option value="Draft experiment">Draft experiment</option><option value="Explain status">Explain status</option><option value="Review results">Review results</option></select></label><div id="coordinator-context" class="context-chips"><span class="muted">No selected context. Select a plan or experiment below to include its current revision.</span></div><label>Message<textarea name="prompt" required maxlength="3900" rows="3"></textarea></label><button type="submit">Ask coordinator</button></form>
+        <form id="coordinator-form"><h3>Ask the local coordinator</h3><label>Mode<select name="mode"><option value="Discuss">Discuss</option><option value="Draft experiment">Draft experiment</option><option value="Explain status">Explain status</option><option value="Review results">Review results</option></select></label><div id="coordinator-context" class="context-chips"><span class="muted">No selected context. Open Experiments or Plans &amp; decisions, choose “Include experiment in coordinator context” or “Include plan in coordinator context”, then return to Conversation.</span></div><label>Message<textarea name="prompt" required maxlength="3900" rows="3"></textarea></label><button type="submit">Ask coordinator</button></form>
         <ol id="events" aria-live="polite"></ol><button id="events-more" hidden>Load more records</button>
       </section>
       <section class="interaction-grid">
@@ -112,14 +122,27 @@
           <section id="harness-context" hidden aria-live="polite"><h3>Send context to harness</h3><p class="muted">This queues context only. It does not request an answer, start execution, or accept a result.</p><form id="binding-form"><label>Server-derived harness binding ID<input name="harness_session_binding_id" required maxlength="200"></label><button id="binding-load" type="submit">Fetch binding</button></form><div id="binding-detail" class="muted">No server-derived harness binding loaded.</div><form id="context-form"><label>Context revision<input name="context_revision" type="number" min="1" step="1" required></label><label>Intent<select name="intent"><option value="question">Question</option><option value="direction">Direction</option><option value="status">Status</option><option value="evidence">Evidence</option></select></label><label>Context message<textarea name="body" required maxlength="8000" rows="3"></textarea></label><button type="submit">Queue context for harness</button></form></section>
         </div>
       </section>
+      </div>
+      <div data-workspace-view="operations" hidden>
       <section class="worker-discovery" aria-labelledby="worker-discovery-heading"><div class="section-title"><div><h2 id="worker-discovery-heading">Worker discovery</h2><p class="muted">Approved project metadata and observed freshness only. Registration never schedules or authorizes work.</p></div></div><div id="workers" class="cards" aria-live="polite"></div><button id="workers-more" hidden>More workers</button></section>
+      </div>
+      <div data-workspace-view="plans" hidden>
       <section class="inbox"><div class="section-title"><div><h2>Pending human decisions</h2><p class="muted">Approve or reject the displayed request revision. A recorded decision is intent only; it does not issue a grant or start execution.</p></div></div><div id="decisions" class="cards"></div><button id="decisions-more" hidden>More decisions</button></section>
+      </div>
+      <div data-workspace-view="experiments">
        <section class="experiments" aria-labelledby="experiments-heading"><div class="section-title"><div><h2 id="experiments-heading">Goal-to-decision experiments</h2><p class="muted">Revise a complete design, separately admit a matching approved grant, then inspect operational progress. None of those records establishes scientific success.</p></div><div class="study-actions"><button id="experiment-new">New experiment</button><button id="experiment-revise" disabled>Revise selected design</button><button id="conclusion-new" disabled>Author conclusion</button></div></div><div class="ledger-grid"><div><h3>Experiments</h3><div id="experiments" class="cards compact" aria-live="polite"></div><button id="experiments-more" hidden>More experiments</button></div><div><h3 id="experiment-title">Select an experiment</h3><div id="experiment-detail" class="ledger-detail" aria-live="polite" aria-busy="false"><p class="muted">Choose an experiment to inspect its complete goal-to-decision chain.</p></div></div></div></section>
          <section class="artifacts" aria-labelledby="artifacts-heading"><div class="section-title"><div><h2 id="artifacts-heading">Input and artifact review</h2><p class="muted">Plans show immutable input digests. Review quarantine retention explicitly, then separately release researcher retrieval. Previews and retrieval do not accept evidence or results.</p></div><div class="study-actions"><button id="artifact-disposition">Review quarantine retention</button><button id="artifact-custody">Record custody release</button><button id="artifact-review">Inspect released artifact</button></div></div><div id="artifacts" class="cards" aria-live="polite"></div><button id="artifacts-more" hidden>More artifacts</button></section>
+      </div>
+      <div data-workspace-view="operations" hidden>
        <section class="remote-workflows" aria-labelledby="remote-workflows-heading"><div class="section-title"><div><h2 id="remote-workflows-heading">Remote workflow bridge</h2><p class="muted">A reconciled operational projection of admitted remote operations. Refresh or reconnect reads the control-plane timeline; it never replays a run, dispatch, stop, evidence link, or conclusion.</p></div></div><div id="remote-workflows" class="cards" aria-live="polite"></div><button id="remote-workflows-more" hidden>More remote workflows</button></section>
+      </div>
+      <div data-workspace-view="ledger" hidden>
        <section class="ledger"><div class="section-title"><div><h2>Research ledger</h2><p class="muted">Browse complete in-scope study records. This view is read-only and does not accept findings or start work.</p></div><button id="study-new">New study</button></div><div class="ledger-grid"><div><h3>Studies</h3><div id="studies" class="cards compact"></div><button id="studies-more" hidden>More studies</button></div><div><h3 id="study-title">Select a study</h3><div class="study-actions"><button id="study-export" hidden>Save study ledger JSON</button><button id="program-review" hidden>Program review</button><button id="variant-new" hidden>Register variant</button><button id="study-close" hidden>Close study</button><button id="source-new" hidden>Record source</button><button id="finding-new" hidden>Propose finding</button></div><div id="study-detail" class="ledger-detail"><p class="muted">Choose a study to inspect its complete ledger.</p></div><section id="program-review-detail" class="ledger-detail" aria-live="polite"><p class="muted">Select a study to inspect its Outcome 0/1 program-review history.</p></section></div></div></section>
+      </div>
+      <div data-workspace-view="plans" hidden>
       <div class="section-title"><div><h2>Research plans</h2><p class="muted">Review purpose, limits, and the current plan before approving.</p></div><button id="task-new">New plan</button></div>
       <div id="tasks" class="cards"></div><button id="tasks-more" hidden>More plans</button>
+      </div>
     </section>
   </main>
     <dialog id="connection-dialog"><form id="connection-form"><h2>Connect to a control plane</h2><p>For a personal workspace, follow the local init-once and serve commands on the welcome screen, leave serve running, and use its loopback endpoint. For an existing service, enter the endpoint supplied by its operator. Kubernetes namespace setup is optional and does not start a backend.</p><p class="muted">This is a connection and inspection surface, not Kubernetes setup: it cannot apply Kubernetes resources or start or stop services.</p><p>Your credential stays in the desktop’s main process and is cleared when you disconnect.</p><label>Connection name<input name="name" value="Personal workspace" required maxlength="200"></label><label>Endpoint<input name="endpoint" value="http://127.0.0.1:8765" required></label><p class="muted">Next, select your private credential header file (<code>$HOME/.local/state/tessera-alpha/owner.header</code> for the welcome-screen commands). Never paste its contents. If connection fails, these values remain here so you can correct and retry.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Select credential</button></div></form></dialog>

@@ -7,13 +7,16 @@ import vm from 'node:vm';
 class Element {
   constructor(tagName = '') { this.tagName = tagName; this.children = []; this.listeners = {}; this.dataset = {}; this.fields = {}; this.hidden = false; this.disabled = false; this.textContent = ''; this.value = ''; this.isConnected = true; }
   append(...nodes) { this.children.push(...nodes); }
+  prepend(...nodes) { this.children.unshift(...nodes); }
+  contains(node) { return this === node || this.children.some(child => child.contains?.(node)); }
+  focus() { this.onFocus?.(); }
   replaceChildren(...nodes) { this.children = nodes; }
   addEventListener(name, handler) { this.listeners[name] = handler; }
-  setAttribute() {}
-  removeAttribute() {}
+  setAttribute(name, value) { (this.attributes ??= {})[name] = value; }
+  removeAttribute(name) { delete this.attributes?.[name]; }
   querySelector() { return this.submit ??= new Element(); }
   reset() { this.fields = {}; }
-  close() { this.open = false; }
+  close() { this.open = false; this.listeners.close?.(); }
   showModal() { this.open = true; }
 }
 function deferred() {
@@ -24,7 +27,10 @@ function deferred() {
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 function fixture(overrides = {}) {
   const nodes = new Map();
-  const get = id => { if (!nodes.has(id)) nodes.set(id, Object.assign(new Element(), { id })); return nodes.get(id); };
+  const dialogIds = [...readFileSync(new URL('../index.html', import.meta.url), 'utf8').matchAll(/<dialog id="([^"]+)"/g)].map(match => match[1]);
+  const dom = { activeElement: null };
+  const focusable = node => Object.assign(node, { onFocus: () => { dom.activeElement = node; } });
+  const get = id => { if (!nodes.has(id)) nodes.set(id, focusable(Object.assign(new Element(), { id }))); return nodes.get(id); };
   const api = { status: async () => ({ id: 'connection', name: 'Fixture', endpoint: 'http://127.0.0.1:8765', organizationId: 'org', health: 'online' }), commandId: async () => 'command',
     tasks: async () => ({ tasks: [] }), workers: async () => ({ workers: [] }), taskPlan: async () => null, labbook: async () => ({ events: [] }),
     threads: async () => ({ threads: [] }), messages: async () => ({ messages: [] }),
@@ -47,21 +53,108 @@ function fixture(overrides = {}) {
     registerVariant: async () => ({ id: 'v-created' }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
   const context = vm.createContext({ window: { tessera: api }, atob: globalThis.atob, TextDecoder, Uint8Array,
-    document: { getElementById: get, createElement: tag => new Element(tag), querySelectorAll: selector => {
+    document: Object.assign(dom, { getElementById: get, createElement: tag => focusable(new Element(tag)), querySelectorAll: selector => {
+      if (selector === 'dialog') return dialogIds.map(get);
+      if (selector === 'dialog[open]') return dialogIds.map(get).filter(dialog => dialog.open);
+      if (selector === '[data-workspace-view]') return ['experiments', 'plans', 'ledger', 'conversation', 'operations'].map(view => { const panel = get('panel-'+view); panel.dataset.workspaceView = view; return panel; });
       if (selector === '#conclusion-evidence input') return findAll(get('conclusion-evidence'), node => node.tagName === 'input');
       return selector.split(',').flatMap(part => {
         const match = /^#([a-z-]+) button$/.exec(part.trim());
         return match ? findAll(get(match[1]), node => node.tagName === 'button') : [];
       });
-    } },
+    } }),
     FormData: class { constructor(form) { this.fields = { ...form.fields }; } get(name) { return this.fields[name]; } },
   });
   const source = readFileSync(new URL('../renderer.mjs', import.meta.url), 'utf8');
   vm.runInContext(source + '\napplyRecoveryStatus({state: \'active\', recovery_hold: false}); globalThis.hooks = { applyRecoveryStatus, applyConnectionHealth, guarded, command, selectProject, selectThread, loadThreads, loadMessages, loadDecisions, loadExperiments, selectExperiment, loadRemoteWorkflows, loadStudies, selectStudy, loadEvents, loadWorkbench, renderWorkbenchEntries, clearContext, clearNamespaceSetup, namespaceWork, selectNamespaceKubeconfig, inspectNamespace, planNamespace, confirmNamespace, reconcileNamespace, state: () => ({ activeProject, activeThread, activeExperiment, activeStudy, activeHarnessBinding, namespaceContext, coordinatorConversationRevision, selectedCoordinatorContext: [...selectedCoordinatorContext] }) };', context);
-  return { ...context.hooks, get, api, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
+  return { ...context.hooks, get, api, activeElement: () => dom.activeElement, submit: id => { const target = get(id); target.listeners.submit({ target, preventDefault() {} }); } };
 }
 const thread = id => ({ id, title: id });
 const project = id => ({ id, name: id });
+
+test('403 feedback stays visible inside the open artifact dialog while authorization is cleared', async () => {
+  const ui = fixture({ status: async () => null }); await flush();
+  const dialog = ui.get('artifact-dialog'); const input = ui.get('artifact-id-input'); dialog.append(input); input.focus(); dialog.showModal();
+  await ui.guarded(async () => { throw new Error('Control request failed (403). Reconnect with an authorized identity.'); });
+  const region = find(dialog, node => node.className === 'dialog-notice');
+  assert.equal(dialog.open, true);
+  assert.equal(region.hidden, false);
+  assert.equal(region.attributes.role, 'alert');
+  assert.equal(region.attributes['aria-live'], 'assertive');
+  assert.match(region.textContent, /\(403\)/);
+  assert.equal(ui.get('notice').textContent, region.textContent);
+  assert.equal(ui.activeElement(), region);
+  assert.equal(ui.get('project-new').disabled, true);
+  assert.equal(ui.state().activeProject, null);
+});
+
+test('dialog load clears stale errors and restores focus; close clears scoped feedback', async () => {
+  const ui = fixture(); await flush();
+  const dialog = ui.get('artifact-dialog'); const input = ui.get('artifact-id-input'); dialog.append(input); dialog.showModal(); input.focus();
+  await ui.guarded(async () => { throw new Error('Control request failed (404).'); });
+  const region = find(dialog, node => node.className === 'dialog-notice');
+  assert.equal(ui.activeElement(), region);
+  await ui.guarded(async () => {});
+  assert.equal(region.hidden, true); assert.equal(region.textContent, ''); assert.equal(ui.activeElement(), input);
+  await ui.guarded(async () => { throw new Error('Control request failed (404).'); });
+  dialog.close();
+  assert.equal(region.hidden, true); assert.equal(region.textContent, '');
+  assert.match(ui.get('notice').textContent, /404/, 'global feedback remains outside the closed dialog');
+});
+
+test('late background errors do not attach to a dialog opened by unrelated work', async () => {
+  const ui = fixture(); await flush(); const pending = deferred();
+  const result = ui.guarded(() => pending.promise);
+  const dialog = ui.get('artifact-dialog'); dialog.showModal();
+  pending.reject(new Error('Control request failed (404).')); await result;
+  assert.equal(find(dialog, node => node.className === 'dialog-notice'), null);
+  assert.match(ui.get('notice').textContent, /404/);
+});
+
+test('Conversation context guidance names the separate views and return path', async () => {
+  const ui = fixture(); await ui.selectProject(project('p1'));
+  const text = JSON.stringify(ui.get('coordinator-context'));
+  assert.match(text, /Experiments or Plans & decisions/);
+  assert.match(text, /Include experiment in coordinator context/);
+  assert.match(text, /then return to Conversation/);
+  assert.doesNotMatch(text, /experiment below/);
+});
+
+test('workspace defaults to Experiments, switches panels without commands, and preserves view on refresh', async () => {
+  const ui = fixture();
+  await ui.selectProject(project('p1'));
+  assert.equal(ui.get('view-experiments').attributes['aria-current'], 'page');
+  for (const view of ['plans', 'ledger', 'conversation', 'operations', 'experiments']) {
+    ui.get('view-'+view).listeners.click();
+    assert.equal(ui.get('workspace-view-title').textContent, {plans:'Plans & decisions', ledger:'Research ledger', conversation:'Conversation', operations:'Operations', experiments:'Experiments'}[view]);
+    for (const other of ['plans', 'ledger', 'conversation', 'operations', 'experiments']) assert.equal(ui.get('panel-'+other).hidden, other !== view);
+  }
+  ui.get('view-ledger').listeners.click();
+  await ui.selectProject(project('p1'));
+  assert.equal(ui.get('view-ledger').attributes['aria-current'], 'page');
+  await ui.selectProject(project('p2'));
+  assert.equal(ui.get('view-experiments').attributes['aria-current'], 'page');
+});
+
+test('refresh restores selected experiment through a fresh read, without repeating the current design in history', async () => {
+  const data = experimentLedger(); let reads = 0;
+  const ui = fixture({ experiment: async () => { reads++; return data; } });
+  await ui.selectProject(project('p1'));
+  await ui.selectExperiment({ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 });
+  await ui.selectProject(project('p1'));
+  assert.equal(reads, 2);
+  assert.equal(ui.state().activeExperiment.id, 'e1');
+  assert.equal(ui.get('experiment-title').textContent, data.experiment.goal);
+  const detail = ui.get('experiment-detail');
+  assert.equal(findAll(detail, node => node.textContent === 'Current design revision 2').length, 1);
+  assert.equal(findAll(detail, node => node.textContent === 'Design revision 2').length, 0);
+  assert.ok(find(detail, node => node.textContent === 'Historical design revisions (1)'));
+  const provenance = find(detail, node => node.tagName === 'details' && node.children[0]?.textContent === 'Identifiers & provenance');
+  assert.ok(provenance);
+  assert.equal(provenance.open, undefined);
+  const history = find(detail, node => node.tagName === 'details' && /^Semantic state history/.test(node.children[0]?.textContent));
+  assert.equal(history.open, true, 'unknown history stays expanded');
+});
 
 test('pending Connect ignores duplicate submissions without invalidating the first result', async () => {
   const pending = deferred(); const calls = []; const recoveries = [];
@@ -976,7 +1069,7 @@ test('human disposition reviews exact metadata before retention and never implic
   ui.applyConnectionHealth(await ui.api.status()); assert.equal(form.querySelector('button[type="submit"]').disabled, true);
   form.fields = { manifest_id: manifest.id };
   ui.get('artifact-disposition-load').listeners.click(); await flush();
-  assert.match(ui.get('artifact-disposition-detail').textContent, /36 bytes.*sha256/);
+  assert.match(JSON.stringify(ui.get('artifact-disposition-detail')), /36 bytes.*sha256/);
   assert.equal(form.querySelector('button[type="submit"]').disabled, false);
   form.fields.rationale = 'Human review of operational toy output, not scientific acceptance.';
   ui.submit('artifact-disposition-form'); await flush();
@@ -1172,8 +1265,8 @@ test('released artifact previews require the exact current manifest and render u
   ui.get('artifact-form').fields = { manifest_id: 'manifest_1', artifact_id: 'artifact_1' };
   ui.submit('artifact-form'); await flush();
   assert.deepEqual(calls, [{ manifestId: 'manifest_1', artifactId: 'artifact_1', maxBytes: 4096 }]);
-  assert.match(ui.get('artifact-review-detail').textContent, /<img src=x onerror=alert\(1\)>\.txt/);
-  assert.match(ui.get('artifact-review-detail').textContent, /<script>inert<\/script>/);
+  assert.match(JSON.stringify(ui.get('artifact-review-detail')), /<img src=x onerror=alert\(1\)>\.txt/);
+  assert.match(JSON.stringify(ui.get('artifact-review-detail')), /<script>inert<\/script>/);
   assert.equal(findAll(ui.get('artifact-review-detail'), node => ['img', 'script'].includes(node.tagName)).length, 0);
   assert.equal(ui.get('artifact-download').disabled, false);
   await ui.selectProject(project('p2'));
@@ -1457,7 +1550,7 @@ test('experiment projection renders migrated unknown context, attempt history, l
   const detail = ui.get('experiment-detail');
   for (const outcome of ['failed', 'inconclusive']) assert.ok(find(detail, node => node.textContent === `Attempt-recorded outcome: ${outcome}`));
   assert.ok(find(detail, node => node.textContent === 'Design revision 1'));
-  assert.ok(find(detail, node => node.textContent === 'Design revision 2'));
+  assert.ok(find(detail, node => node.textContent === 'Current design revision 2'));
   assert.ok(find(detail, node => /Current unattempted intervention/.test(node.textContent)));
   assert.ok(find(detail, node => node.textContent === 'No attempts recorded for this registered variant.'));
   assert.ok(find(detail, node => /Registered execution reference: task task_1/.test(node.textContent)));

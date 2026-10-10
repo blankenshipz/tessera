@@ -78,7 +78,45 @@ const pendingDecisionResolutions = new Map();
 const loading = new Set();
 const readVersion = { workers: 0, artifacts: 0, threads: 0, messages: 0, binding: 0, decisions: 0, experiments: 0, experiment: 0, remoteWorkflows: 0, studies: 0, study: 0, program: 0, workbench: 0 };
 
-function notice(message = '') { $('notice').textContent = message; }
+const dialogNotices = new WeakMap();
+function activeDialog() { return [...document.querySelectorAll('dialog[open]')].at(-1) ?? null; }
+function clearDialogNotice(dialog) {
+  const state = dialog && dialogNotices.get(dialog);
+  if (!state) return;
+  if (dialog.open && document.activeElement === state.region && state.previousFocus?.isConnected && dialog.contains(state.previousFocus) && !state.previousFocus.disabled) state.previousFocus.focus();
+  state.region.textContent = ''; state.region.hidden = true; state.previousFocus = null;
+}
+function notice(message = '', { dialog = activeDialog(), error = false } = {}) {
+  // Messages have already been mapped by the typed client/renderer. Never render
+  // response bodies or HTML. Keep feedback accessible above an inert backdrop.
+  $('notice').textContent = message;
+  if (!dialog?.open) return;
+  if (!message) { clearDialogNotice(dialog); return; }
+  let state = dialogNotices.get(dialog);
+  if (!state) {
+    const region = element('p', undefined, 'dialog-notice'); region.tabIndex = -1;
+    dialog.prepend(region); state = { region, previousFocus: null }; dialogNotices.set(dialog, state);
+  }
+  state.region.setAttribute('role', error ? 'alert' : 'status');
+  state.region.setAttribute('aria-live', error ? 'assertive' : 'polite');
+  state.region.textContent = message; state.region.hidden = false;
+  if (error) {
+    if (document.activeElement !== state.region) state.previousFocus = document.activeElement;
+    state.region.focus();
+  }
+}
+const workspaceViews = { experiments: 'Experiments', plans: 'Plans & decisions', ledger: 'Research ledger', conversation: 'Conversation', operations: 'Operations' };
+let workspaceView = 'experiments';
+function selectWorkspaceView(view) {
+  if (!Object.hasOwn(workspaceViews, view)) return;
+  workspaceView = view;
+  for (const panel of document.querySelectorAll('[data-workspace-view]')) panel.hidden = panel.dataset.workspaceView !== view;
+  for (const name of Object.keys(workspaceViews)) {
+    if (name === view) $(`view-${name}`).setAttribute('aria-current', 'page');
+    else $(`view-${name}`).removeAttribute('aria-current');
+  }
+  $('workspace-view-title').textContent = workspaceViews[view];
+}
 function canMutate() { return !recoveryHeld && connectionOnline; }
 const unavailableControls = new WeakMap();
 function availabilityBasis() {
@@ -278,12 +316,13 @@ function renderOnboarding() {
   $('welcome-project-new').hidden = !connectedWithoutProject;
   $('welcome-project-new').disabled = !canMutate();
   $('namespace-setup').disabled = !api?.namespaceSelectKubeconfig;
+  $('workspace-availability').textContent = !connectionOnline ? 'Not connected — connect before recording changes.' : recoveryHeld ? 'Recovery hold — inspect history; changes remain disabled.' : 'Connected · records only. Approval, execution and scientific review remain separate.';
   $('journey-next').textContent = !connectionId ?
     'Next: Follow the init-once and serve commands below, then Connect with the endpoint and private owner.header file. For an existing service, use its operator-supplied endpoint and header. Kubernetes setup is optional.' :
     !connectionOnline ? 'Next: Reconnect with a current credential, then refresh history. Do not replay uncertain commands.' :
     recoveryHeld ? 'Next: Inspect recovered history. Mutations stay disabled until an operator resolves the recovery hold.' :
     !activeProject ? 'Next: Select an existing project or create one. Connection switching is not project import or migration.' :
-    'Next: Draft a plan, then revise it to declare an execution specification. Review the exact digest before approval; admission and dispatch are separate actions.';
+    'Next: Record an experiment design, or review plans and human decisions; admission and dispatch are separate. No implicit execution.';
 }
 function namespaceIsCurrent(context) { return context === namespaceContext && context?.epoch === epoch; }
 function renderNamespaceInspection(inspection) {
@@ -559,13 +598,14 @@ function clearContext({ preserveConnectionForm = false } = {}) {
   loading.clear();
 }
 async function guarded(work, { preserveConnectionForm = false } = {}) {
-  notice();
+  const dialog = activeDialog();
+  notice('', { dialog });
   try {
     await work();
     const state = api && await api.status();
     if (state) applyConnectionHealth(state);
+    clearDialogNotice(dialog);
   } catch (error) {
-    notice(error.message || 'The request could not be completed.');
     const state = api && await api.status();
     if (!state) {
       clearContext({ preserveConnectionForm });
@@ -573,6 +613,7 @@ async function guarded(work, { preserveConnectionForm = false } = {}) {
     } else {
       applyConnectionHealth(state);
     }
+    notice(error.message || 'The request could not be completed.', { dialog, error: true });
   }
 }
 async function keyFor(scope, body) {
@@ -611,6 +652,8 @@ async function loadProjects(reset = false) {
   $('projects-more').hidden = response.projects.length < 100;
 }
 async function selectProject(project) {
+  const sameProject = activeProject?.id === project.id;
+  const restoreSelection = sameProject ? { experiment: activeExperiment, study: activeStudy, thread: activeThread } : {};
   const secretSelectionUpdate = connectionId && api.secretContext ? api.secretContext(connectionId, project.id) : Promise.resolve();
   clearAdmin();
   clearNamespaceSetup();
@@ -639,11 +682,19 @@ async function selectProject(project) {
   $('coordinator-form').reset(); renderCoordinatorContext();
   $('project-title').textContent = project.name;
   $('welcome').hidden = true; $('workspace').hidden = false;
+  selectWorkspaceView(sameProject ? workspaceView : 'experiments');
   for (const button of $('projects').children) {
     if (button.dataset.projectId === project.id) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   }
   await Promise.all([secretSelectionUpdate, selectionUpdate, loadTasks(), loadWorkers(true), loadArtifacts(true), loadWorkbench(true), loadThreads(true), loadDecisions(true), loadExperiments(true), loadRemoteWorkflows(true), loadStudies(true)]);
+  if (activeProject !== project) return;
+  // Refresh is a read: restore selections from fresh ledgers, never replay commands.
+  await Promise.all([
+    restoreSelection.experiment ? selectExperiment(restoreSelection.experiment) : Promise.resolve(),
+    restoreSelection.study ? selectStudy(restoreSelection.study) : Promise.resolve(),
+    restoreSelection.thread ? selectThread(restoreSelection.thread) : Promise.resolve(),
+  ]);
 }
 async function loadTasks() {
   const version = epoch;
@@ -1034,7 +1085,8 @@ async function loadDecisions(reset = false) {
     for (const decision of response.decisions) {
       const card = element('article', undefined, 'card');
       card.append(element('span', `${decision.kind} · pending`, 'tag'));
-      card.append(element('h3', `Decision ${decision.id}`));
+      card.append(element('h3', `${decision.kind} review`));
+      card.append(element('p', `Decision ${decision.id}`, 'muted identifiers'));
       const researchReview = decision.scope?.type === 'research_program';
       if (researchReview) {
         const scope = decision.scope;
@@ -1152,6 +1204,14 @@ function ledgerCard(title, id, value) {
   return card;
 }
 function ledgerText(value) { return JSON.stringify(value); }
+function recordFields(fields) {
+  const list = element('dl', undefined, 'record-fields');
+  for (const [label, value] of fields) list.append(element('dt', label), element('dd', String(value)));
+  return list;
+}
+function disclosure(label, ...content) {
+  const details = element('details'); details.append(element('summary', label), ...content); return details;
+}
 function isDigest(value) { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value); }
 function isIdentifier(value) { return typeof value === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(value); }
 function isOperationId(value) { return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value); }
@@ -1459,9 +1519,8 @@ function renderExperimentLedger(ledger) {
   const context = experimentContext(ledger);
   const summary = element('article', undefined, 'card');
   summary.append(element('span', `Current design revision ${experiment.current_design_revision}`, 'tag'));
-  summary.append(element('p', `Current goal: ${experiment.goal}`));
   summary.append(element('p', `Current success criterion: ${experiment.success_criterion}`));
-  summary.append(element('p', 'Completeness: complete in-scope goal-to-decision chain. This projection cannot approve, dispatch, or edit conclusions.', 'muted'));
+  summary.append(element('p', 'Design recorded, not execution authority. Scientific validity: not assessed.', 'muted'));
   detail.append(summary);
   const section = (title, records, render) => {
     detail.append(element('h4', `${title} (${records.length})`));
@@ -1470,18 +1529,22 @@ function renderExperimentLedger(ledger) {
   };
   const attemptsByVariant = new Map(ledger.variants.map(variant => [variant.id, []]));
   for (const attempt of [...ledger.attempts, ...ledger.admitted_attempts]) attemptsByVariant.get(attempt.variant_id).push(attempt);
-  section('Historical design revisions', ledger.designs, design => {
+  const renderDesign = design => {
     const card = element('article', undefined, 'card');
-    card.append(element('h5', `Design revision ${design.revision}`));
-    card.append(element('p', `Goal: ${recordedOrUnknown(design.goal)}`));
-    card.append(element('p', `Success criterion: ${recordedOrUnknown(design.success_criterion)}`));
+    if (design.revision !== experiment.current_design_revision) {
+      card.append(element('h5', `Design revision ${design.revision}`));
+      card.append(element('p', `Goal: ${recordedOrUnknown(design.goal)}`));
+      card.append(element('p', `Success criterion: ${recordedOrUnknown(design.success_criterion)}`));
+    }
     card.append(element('p', `Protocol: ${design.protocol}`));
     for (const variant of design.variants) {
-      card.append(element('p', `${variant.kind}: ${variant.name} · method ${variant.method_digest} · inputs ${variant.input_digest}`));
+      card.append(element('h5', `${variant.kind}: ${variant.name}`));
+      card.append(disclosure('Identifiers & provenance', recordFields([
+        ['Variant ID', variant.id], ['Method digest', variant.method_digest], ['Input digest', variant.input_digest],
+      ]), element('pre', JSON.stringify(variant.metadata, null, 2))));
       card.append(element('p', variant.execution_task_id === null ?
         'Registered execution reference: none recorded.' :
         `Registered execution reference: task ${variant.execution_task_id} · plan digest ${variant.execution_plan_digest}`, 'muted'));
-      card.append(element('p', `Registered metadata: ${ledgerText(variant.metadata)}`, 'muted'));
       if (!attemptsByVariant.get(variant.id).length) card.append(element('p', 'No attempts recorded for this registered variant.', 'muted'));
       if (design.revision === experiment.current_design_revision && variant.execution_task_id !== null) {
         const admit = element('button', 'Review separate execution admission'); admit.type = 'button'; admit.disabled = !canMutate();
@@ -1496,7 +1559,8 @@ function renderExperimentLedger(ledger) {
       }
     }
     return card;
-  });
+  };
+  summary.append(...renderDesign(ledger.designs.find(design => design.revision === experiment.current_design_revision)).children);
   section('External operations', ledger.operations, operation => {
     const card = ledgerCard(`Operation ${operation.operation_id}`, 'experimentOperationId', { id: operation.operation_id });
     const admitted = ledger.admitted_attempts.find(attempt => attempt.operation_id === operation.operation_id);
@@ -1600,10 +1664,12 @@ function renderExperimentLedger(ledger) {
       $('attempt-artifacts-dialog').showModal();
     }));
     card.append(linkArtifacts);
-    card.append(element('p', `Semantic state history (${attempt.state_history.length})`, 'muted'));
+    const history = disclosure(`Semantic state history (${attempt.state_history.length})`);
+    history.open = attempt.state_history.some(entry => ['unknown', 'interrupted', 'restart_pending'].includes(entry.state) || entry.observed_state === 'unknown');
     for (const entry of attempt.state_history) {
-      card.append(element('p', `#${entry.sequence}: ${entry.state} · observed ${entry.observed_state ?? 'not recorded'} · actor ${entry.actor_principal_id}${entry.reason ? ` · reason: ${entry.reason}` : ''}`, 'muted'));
+      history.append(element('p', `#${entry.sequence}: ${entry.state} · observed ${entry.observed_state ?? 'not recorded'} · actor ${entry.actor_principal_id}${entry.reason ? ` · reason: ${entry.reason}` : ''}`, 'muted'));
     }
+    card.append(history);
     const links = ledger.artifact_links.filter(link => link.attempt_id === attempt.id);
     const measurements = ledger.measurements.filter(measurement => measurement.attempt_id === attempt.id);
     card.append(element('p', `Linked artifacts: ${links.map(link => link.artifact_id).join(', ') || 'none'}`));
@@ -1624,7 +1690,7 @@ function renderExperimentLedger(ledger) {
   section('Measurements', ledger.measurements, measurement => {
     const card = ledgerCard(`Measurement ${measurement.id}: ${measurement.name}`, 'experimentMeasurementId', measurement);
     card.append(element('p', `Attempt: ${measurement.attempt_id}`));
-    card.append(element('p', `Recorded value: ${ledgerText(measurement.value)}`));
+    card.append(disclosure('Recorded value — full measurement JSON', element('pre', JSON.stringify(measurement.value, null, 2))));
     card.append(element('p', `Artifact reference: ${measurement.artifact_id ?? 'none recorded'}`, 'muted'));
     return card;
   });
@@ -1661,6 +1727,14 @@ function renderExperimentLedger(ledger) {
     }
     return card;
   });
+  const historicalDesigns = ledger.designs.filter(design => design.revision !== experiment.current_design_revision);
+  const designHistory = disclosure(`Historical design revisions (${historicalDesigns.length})`, ...historicalDesigns.map(renderDesign));
+  designHistory.open = historicalDesigns.some(design => design.goal === null || design.success_criterion === null);
+  detail.append(designHistory);
+  detail.append(disclosure('Experiment identifiers & provenance', recordFields([
+    ['Experiment ID', experiment.id], ['Project ID', experiment.project_id], ['Current revision', experiment.current_design_revision],
+    ['Completeness', ledger.completeness],
+  ])));
 }
 function validRemoteWorkflow(workflow, project) {
   const reconciliation = workflow?.reconciliation;
@@ -1850,7 +1924,7 @@ async function selectExperiment(experiment) {
   $('experiment-revise').disabled = $('conclusion-new').disabled = true;
   workbenchEntries = workbenchEntries.filter(item => item.source !== 'projection');
   renderWorkbenchEntries();
-  $('experiment-title').textContent = `Experiment ${experiment.id}`;
+   $('experiment-title').textContent = experiment.goal;
   $('experiment-detail').setAttribute('aria-busy', 'true');
   $('experiment-detail').replaceChildren(element('p', 'Loading complete goal-to-decision chain…', 'muted'));
   for (const button of $('experiments').children) {
@@ -2416,7 +2490,7 @@ function cancellationEventLabel(event) {
 function renderCoordinatorContext() {
   const container = $('coordinator-context'); container.replaceChildren();
   if (!selectedCoordinatorContext.length) {
-    container.append(element('span', 'No selected context. Select a plan or experiment below to include its current revision.', 'muted'));
+    container.append(element('span', 'No selected context. Open Experiments or Plans & decisions, choose “Include experiment in coordinator context” or “Include plan in coordinator context”, then return to Conversation.', 'muted'));
     return;
   }
   for (const reference of selectedCoordinatorContext) {
@@ -2663,8 +2737,28 @@ for (const button of document.querySelectorAll('[data-close]')) {
   button.addEventListener('click', () => button.closest('dialog').close());
 }
 $('admin-open').addEventListener('click', () => guarded(async () => {
-  $('admin-workspace').hidden = false; renderAdmin(); await loadAdmin();
+  $('admin-workspace').hidden = false; $('workspace').hidden = true; $('welcome').hidden = true;
+  $('workspace-view-title').textContent = 'Administration'; renderAdmin(); await loadAdmin();
 }));
+$('admin-return').addEventListener('click', () => {
+  clearAdmin(); $('workspace').hidden = !activeProject; $('welcome').hidden = Boolean(activeProject); selectWorkspaceView(workspaceView);
+});
+for (const view of Object.keys(workspaceViews)) $(`view-${view}`).addEventListener('click', () => selectWorkspaceView(view));
+// Native dialog Escape/cancel behavior and focus restoration are retained. Give
+// every modal a programmatic name, including dynamically titled review dialogs.
+for (const dialog of document.querySelectorAll('dialog')) {
+  dialog.addEventListener('close', () => clearDialogNotice(dialog));
+  const heading = dialog.querySelector('h2');
+  if (heading) { if (!heading.id) heading.id = `${dialog.id}-heading`; dialog.setAttribute('aria-labelledby', heading.id); }
+}
+for (const group of document.querySelectorAll('#experiment-form fieldset')) {
+  const reference = group.querySelector('input[name$="_task_id"]');
+  const digest = group.querySelector('input[name$="_plan_digest"]');
+  if (reference && digest) {
+    const details = disclosure('Optional execution reference — no execution authority');
+    details.append(reference.closest('label'), digest.closest('label')); group.append(details);
+  }
+}
 $('admin-refresh').addEventListener('click', () => guarded(() => loadAdmin()));
 $('admin-more').addEventListener('click', () => guarded(() => loadAdmin(true)));
 for (const view of ['setup', 'targets', 'secrets', 'delegations', 'readiness', 'audit']) {
@@ -2729,6 +2823,7 @@ $('connection-form').addEventListener('submit', event => {
     try {
       const fields = new FormData(event.target);
       const settings = { name: fields.get('name'), endpoint: fields.get('endpoint') };
+      for (const dialog of document.querySelectorAll('dialog')) clearDialogNotice(dialog);
       // Failed enrollment must discard the previous connection context, but the
       // operator's endpoint and name are safe retry inputs and should remain.
       clearContext({ preserveConnectionForm: true });
@@ -3031,7 +3126,12 @@ $('conclusion-amendment-form').addEventListener('submit', event => {
     artifactDispositionContext = { project, version, manifest, revision };
     const set = (name, value) => { if (form.elements?.[name]) form.elements[name].value = value; else { form.fields ??= {}; form.fields[name] = value; } };
     set('expected_manifest_digest', manifest.manifest_digest); set('expected_revision', revision);
-    $('artifact-disposition-detail').textContent = `Manifest ${manifest.id} · digest ${manifest.manifest_digest} · quarantine ${manifest.status} · classification ${manifest.classification} · late ${manifest.late}. Outputs: ${manifest.artifacts.map(a => `${a.relative_path} · ${a.id} · ${a.size} bytes · sha256 ${a.sha256}`).join('; ')}. Scientific validity: not assessed.`;
+    const review = $('artifact-disposition-detail');
+    review.replaceChildren(element('p', `Quarantine ${manifest.status} · classification ${manifest.classification} · late ${manifest.late}`, 'tag'),
+      element('p', 'Scientific validity: not assessed. Retention review does not release custody.', 'muted'));
+    for (const artifact of manifest.artifacts) review.append(recordFields([
+      ['Output', artifact.relative_path], ['Artifact ID', artifact.id], ['Size', `${artifact.size} bytes`], ['sha256', artifact.sha256],
+    ]));
     form.querySelector('button[type="submit"]').disabled = !canMutate() || connectionState?.role !== 'human';
   }));
   $('artifact-disposition-form').addEventListener('submit', event => {
@@ -3078,7 +3178,13 @@ $('artifact-form').addEventListener('submit', event => {
     }
     let text = '(binary preview omitted)';
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(preview.preview_base64), char => char.charCodeAt(0))); } catch {}
-    $('artifact-review-detail').textContent = `Released manifest ${released.manifest.id ?? manifestId} · artifact ${preview.relative_path} · ${preview.preview_bytes}/${preview.size} bytes${preview.truncated ? ' (truncated)' : ''} · digest ${preview.sha256}\n${text}`;
+    let formatted = text;
+    if (!preview.truncated) { try { formatted = JSON.stringify(JSON.parse(text), null, 2); } catch {} }
+    $('artifact-review-detail').replaceChildren(
+      element('p', `Quarantine ${preview.status} · classification ${preview.classification} · late ${recordedOrUnknown(released.manifest.late ?? null)}`, 'tag'),
+      element('p', 'Custody: released for private researcher retrieval. Scientific validity: not assessed.', 'muted'),
+      recordFields([['Artifact', preview.relative_path], ['Preview', `${preview.preview_bytes}/${preview.size} bytes${preview.truncated ? ' (truncated)' : ''}`], ['sha256', preview.sha256]]),
+      element('pre', formatted));
     artifactReviewContext = { ...previewContext, manifestId, artifactId, sha256: preview.sha256 }; $('artifact-download').disabled = !connectionOnline; $('artifact-bundle').disabled = !canMutate();
     } finally {
       if (artifactReviewContext === previewContext && context.project === activeProject && context.version === epoch) submit.disabled = !connectionOnline;

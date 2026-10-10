@@ -41,11 +41,25 @@ and private credential file supplied by its operator.
 
 ## Follow the supported screen flow
 
+The project opens in **Experiments**. Use **Plans & decisions** for proposals and
+human review, **Research ledger** for studies and findings, **Conversation** for
+coordinator/thread records, and **Operations** for workers and remote recovery.
+**Administration** is a separate destination; **Return to research** restores the
+research view. Connection/recovery warnings remain outside these views. Switching
+views does not change authority or run work. Expand **Identifiers & provenance**
+for full design IDs/digests and **Historical design revisions** for prior designs;
+unresolved states and custody warnings remain visible.
+
+To include coordinator context, open **Experiments** or **Plans & decisions**,
+choose **Include experiment in coordinator context** or **Include plan in
+coordinator context**, then return to **Conversation**. Recording context does
+not grant authority or request execution.
+
 1. **Connect** to the running local service; the disconnected guide remains visible
    if it is unavailable.
 2. Choose **New project** (or **Create your first project**), enter a project name,
    and choose **Create project**; otherwise select an existing project. Then in
-   **Goal-to-decision experiments**, choose **New experiment**, enter its goal,
+    **Experiments** → **Goal-to-decision experiments**, choose **New experiment**, enter its goal,
    success criterion, protocol and baseline/intervention details with real
    method/input digests, then choose **Record design**. This records a design
    only—not approval, a grant, a dispatch, or a result.
@@ -55,14 +69,14 @@ and private credential file supplied by its operator.
    The desktop controls do not create those authorities or start a job. Follow the
    bounded [desktop execution procedure](../desktop/EXECUTION.md); do not dispatch
    without its prerequisites and an operator-issued grant.
-4. Once a run exists, select the experiment to inspect its measurements, attempts
+4. In **Experiments**, once a run exists, select the experiment to inspect its measurements, attempts
    and artifact inventory. For quarantined output, choose **Review quarantine
    retention** → **Load exact output metadata**, inspect it, then submit the human
     decision with **Record human retain-quarantined review**. Retrieval separately
     requires **Record custody release** → select **Release researcher retrieval**
     → **Record custody action**. Neither decision classifies data or accepts
     scientific results.
-5. For an already released output, choose **Input and artifact review** → **Inspect
+5. For an already released output, in **Experiments** choose **Input and artifact review** → **Inspect
    released artifact**, enter its released manifest and artifact IDs from the
    selected experiment's inventory, then **Load released preview**. **Save exact
    released bytes** opens the artifact-save path.
@@ -97,10 +111,10 @@ For Python setup and development checks, see [CONTRIBUTING.md](../CONTRIBUTING.m
   current records before retrying a user action; do not assume a save or dispatch
   occurred from a quiet/stale screen.
 
-Local renderer checks exercised durable project/design/study records and inspected
-an operator-authorized CPU result. The screenshot journey read existing operator
-custody records, retrieved bytes to a simulated destination and reconnected; it
-did not establish personal UI approval, native dialogs or scientific validity.
+Earlier evaluation inspected an operator-authorized CPU result. The current UI
+gallery instead uses controlled test records with a real isolated local backend:
+no experiment execution or model calls. Selectors/save destinations are simulated;
+the captures do not establish native dialogs or scientific validity.
 Execution, study-ledger JSON and reproduction-bundle records are distinct exports.
 
 Production identity, genuine agent reasoning, independent-host operation and

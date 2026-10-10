@@ -11,35 +11,32 @@ integrated agent reasoning and scientific acceptance are not demonstrated.
 
 ## A look inside
 
-These are cropped, sanitized captures of the actual renderer connected to a real
-local backend, **with platform selection/save interactions simulated**. Private
-record identifiers are masked; no UI or results were fabricated. These are not
-native macOS picker/save proof or screenshots of an autonomous agent conversation.
+Actual Electron renderer and real isolated local backend with controlled UI test
+records. Platform selectors/save destinations are simulated; **no experiment
+execution or model calls**. Scientific validity is not assessed. Captures are
+cropped or masked for privacy, with visible test labels retained—not native OS proof.
 
 ### Record the experiment design
 
-![Experiment design with its goal, success criterion and retained design history](docs/assets/alpha-design.png)
+![Experiments workspace with a controlled test design, goal and success criterion](docs/assets/alpha-design.png)
 
-An immutable design revision records intent, not execution authority. This earlier
-revision explicitly says execution is not yet authorized; the later baseline used
-a separately bound and approved revision.
+An immutable design records intent, not execution authority. Provenance and prior
+designs remain available without crowding the current research question.
 
-### Inspect real baseline results
+### Inspect released test output
 
-![Real baseline test metrics and quarantined, unclassified artifact inventory](docs/assets/alpha-results.png)
+![Controlled test JSON preview with manifest input and late, quarantined, unclassified status](docs/assets/alpha-results.png)
 
-One operator-authorized CPU baseline on synthetic data produced test MSE 131.0623
-and MAE 9.8565 over 1,667 rows. Scientific validity is not established; there are
-no human conclusions. The output remains quarantined and unclassified.
+Private retrieval does not classify data or accept scientific results. The fixture
+JSON explicitly identifies itself as UI test data with no execution performed.
 
 ### Review before retrieval and export
 
 ![Quarantine-retention review showing late output and scientific validity not assessed](docs/assets/alpha-review.png)
 
-The renderer read an existing operator-recorded review; this capture is not a new
-personal UI approval. Late status remains true. Separate custody release enabled
-exact-byte retrieval and a reproduction-bundle **record** export in the simulator;
-it did not classify data, accept science or save a filesystem bundle.
+Retention review and custody release are separate actions. Late status remains
+visible; neither action establishes scientific validity. The test journey verified
+saved bytes against the backend digest using a simulated save destination.
 
 ## Supported workflow
 
