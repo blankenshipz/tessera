@@ -2,7 +2,14 @@
 
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from .capability_models import Digest, Identifier, Positive, Strict
 
@@ -51,6 +58,7 @@ class SaladExecution(Frozen):
         list[Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,64}$")]],
         Field(max_length=16),
     ]
+    argv_binding: Literal["exact", "smoke_operation_v1"] = "exact"
     env: dict[str, str]
     max_output_bytes: int = Field(ge=1, le=16 * 1024 * 1024)
     max_output_files: int = Field(ge=1, le=128)
@@ -71,6 +79,16 @@ class SaladExecution(Frozen):
     ssh: Literal[False] = False
     exec: Literal[False] = False
 
+    @model_serializer(mode="wrap")
+    def legacy_exact_shape(self, handler):
+        data = handler(self)
+        # Exact is the pre-existing contract, not new authority. Keep historical
+        # proposal/package bytes and digests stable without migrating any ledger.
+        # The new smoke binding must remain explicit in every serialized review.
+        if self.argv_binding == "exact":
+            data.pop("argv_binding", None)
+        return data
+
     @field_validator("env")
     @classmethod
     def closed_environment(cls, value):
@@ -78,6 +96,57 @@ class SaladExecution(Frozen):
         if any(k not in allowed or v not in allowed[k] for k, v in value.items()):
             raise ValueError("only explicit non-secret execution environment is supported")
         return value
+
+
+def derived_salad_argv(execution, approved_argv, operation_id, epoch, max_seconds):
+    """Resolve only the two reviewed smoke operation slots; never a template engine.
+
+    The retained approved spec/package bytes are unchanged. Human route review
+    still covers the concrete resolved selection, and every use re-derives it.
+    """
+    profile = SaladExecution.model_validate(execution)
+    if profile.argv_binding == "exact":
+        if approved_argv != [profile.command, *profile.argv]:
+            raise ValueError("Salad argv differs from approved execution spec")
+        return list(profile.argv)
+    if (
+        type(approved_argv) is not list
+        or len(approved_argv) != 11
+        or approved_argv[:3] != ["/tessera/bin/run", "v1", "public-integers-v1"]
+        or approved_argv[3:5] != ["operation-id", "operation-epoch"]
+        or type(operation_id) is not str
+        or len(operation_id) != 32
+        or any(c not in "0123456789abcdef" for c in operation_id)
+        or type(epoch) is not int
+        or epoch < 1
+    ):
+        raise ValueError("unsupported Salad smoke binding")
+    argv = list(approved_argv[1:])
+    argv[2:4] = [operation_id, str(epoch)]
+    if (
+        not argv[4]
+        or len(argv[4]) > 64
+        or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for c in argv[4])
+        or argv[4].startswith((".", "-"))
+        or argv[4].endswith((".", "-"))
+        or argv[5] != profile.watchdog_profile
+    ):
+        raise ValueError("unsupported Salad smoke binding")
+    try:
+        seconds, byte_cap, file_cap, dimension = map(int, argv[6:])
+    except (TypeError, ValueError):
+        raise ValueError("unsupported Salad smoke binding") from None
+    if (
+        argv[6:] != list(map(str, (seconds, byte_cap, file_cap, dimension)))
+        or not 1 <= seconds <= min(300, max_seconds)
+        or not 256 <= byte_cap <= min(65536, profile.max_output_bytes)
+        or file_cap != 1
+        or file_cap > profile.max_output_files
+        or not 2 <= dimension <= 32
+        or profile.argv != argv
+    ):
+        raise ValueError("Salad smoke runtime binding differs from approved spec")
+    return argv
 
 
 class SaladProfile(Frozen):

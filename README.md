@@ -118,6 +118,21 @@ are not available in this demonstrated journey.
 
 ## Quickstart
 
+### Opt-in Salad GPU execution milestone
+
+The separate trusted-server single-container GPU transport, guardian/custody and
+secure-file live-check composition have local implementations, not deployed/live
+GPU acceptance. Default/fake APIs stay disabled. Run
+`.venv/bin/python -m tessera_control.salad_live_check` for a zero-read/network/effect
+readiness report. Actual execution uses explicit `--run --server-config PATH
+--receipt-directory PATH` on the trusted Linux server, with existing exact human
+authority and approved financial scope; unknown rate or unresolved exposure blocks
+new work. Published-rate estimates are not actual billed-cost proof or hard caps.
+See the [Salad runbook](docs/salad-proxy.md#first-gpu-journey-setup-versus-normal-operation)
+for one-time setup, normal execution, confirmed stop and same-record reconnect.
+
+### Local desktop/control setup
+
 Requires macOS, Python 3.11+, uv, Node **22.12.0+** and npm. Python's SQLite must
 provide built-in deterministic, innocuous `json_extract` for defensive recovery;
 an incompatible build is rejected before control-state writes. See

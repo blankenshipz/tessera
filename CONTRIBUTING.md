@@ -97,6 +97,7 @@ change a shared context. All cleanup must stay within exact owned identities.
 
 | Fixture | Guide / invocation | Evidence boundary |
 |---|---|---|
+| Salad single-container GPU | [Runbook](docs/salad-proxy.md); `.venv/bin/python -m tessera_control.salad_live_check` | Zero reads/network/effects by default; explicit `--run --server-config ABSOLUTE_PATH --receipt-directory ABSOLUTE_PATH` needs existing exact human authority, independent service and approved financial scope; unknown rate/unresolved exposure blocks new work; estimates are not bills/hard caps and local tests are not GPU/live proof |
 | Execution monitor | [Monitor](docs/execution-monitor.md); `scripts/check_execution_monitor.py` | Zero effects by default; Docker case needs native host observation and already-local pinned image |
 | Closed networkless Docker | [Runbook](docs/local-networkless-docker-fixture.md); `scripts/check_local_docker_fixture.py` | Separate explicit `--run`; no image pull/build/install; unknown enforcement/cleanup fails closed |
 | Development CPU/control/worker | `scripts/check_cpu_runtime.py`, `scripts/check_control_runtime.py`, `scripts/check_development_e2e.py` | Networkless non-root containers, temporary state/fake provider, quarantine-only synthetic output; not scientific acceptance |

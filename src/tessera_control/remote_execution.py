@@ -1,4 +1,4 @@
-"""Transactional remote-route overlay on admitted operations; offline activation only.
+"""Transactional remote-route overlay; default store admits synthetic evidence only.
 
 Events retain proposals, one-shot effect intents and receipts in the existing
 control backup/held-recovery boundary. No provider client or credential lives here.
@@ -18,6 +18,7 @@ from .remote_execution_models import (
     RemoteExecutionPackage,
     RemoteProposal,
     TargetPolicy,
+    derived_salad_argv,
 )
 from .store import Conflict, Forbidden, NotFound, _connect, _parse_utc, canonical_digest, utc_now
 
@@ -480,7 +481,9 @@ class RemoteExecutionStore(CapabilityStore):
             if state["effects"][-1]["id"] != effect_id:
                 raise Conflict("Late/out-of-order receipt cannot overwrite current evidence.")
             effect = state["effects"][-1]
-            if body["provenance"] != "synthetic":
+            if body["provenance"] != "synthetic" and not self._provider_receipt_allowed(
+                db, live, state, effect_id
+            ):
                 raise Forbidden("Live provider evidence intake is not activated.")
             observed = _parse_utc(body["observed_at"])
             if not _parse_utc(effect["requested_at"]) <= observed <= datetime.now(UTC):
@@ -542,6 +545,11 @@ class RemoteExecutionStore(CapabilityStore):
             command,
             audience="worker",
         )[1]
+
+    def _provider_receipt_allowed(self, db, worker, state, effect_id):
+        # Only a separately server-composed store can accept provider evidence.
+        # Neither a public payload nor adapter injection activates this boundary.
+        return False
 
     def get(self, actor, ident):
         with _connect(self.database_path) as db:
@@ -605,10 +613,19 @@ class RemoteExecutionStore(CapabilityStore):
             if (
                 execution is None
                 or execution["max_output_bytes"] > spec["max_output_bytes"]
-                or [execution["command"], *execution["argv"]] != spec["argv"]
                 or execution["max_cost_cents"] > package["plan"]["budget_cents"]
             ):
                 raise Conflict("Salad output limits exceed admitted package.")
+            try:
+                derived_salad_argv(
+                    execution,
+                    spec["argv"],
+                    proposal["operation_id"],
+                    proposal["epoch"],
+                    proposal["selection"]["resources"]["max_seconds"],
+                )
+            except ValueError:
+                raise Conflict("Salad argv differs from admitted package.") from None
             if action in {"create", "start"}:
                 capability = db.execute(
                     "SELECT * FROM capability_policies WHERE org_id=? AND project_id=? "

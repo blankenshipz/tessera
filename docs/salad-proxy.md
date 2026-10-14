@@ -1,9 +1,12 @@
-# Salad server proxy — offline boundary and activation runbook
+# Salad server proxy — GPU milestone and activation runbook
 
-**Live transport stays disabled. No provider request, real credential resolution,
-project creation, resource, paid effect or dependency installation is part of this
-implementation or its validation.** This is not a provider isolation witness and
-does not make Salad a trusted autonomous sandbox. See [decision 0024](decisions/0024-salad-server-proxy-boundary.md).
+**Default and fake entry points remain provider-disabled.** A separate trusted-server
+composition implements real Salad HTTP calls; implementation is not deployment or
+live acceptance. No real provider call, GPU run, deployment, build/pull, credential
+discovery or paid effect was authorized for this milestone's local validation.
+See [decision 0031](decisions/0031-salad-single-container-gpu.md) and the preserved
+[original boundary](decisions/0024-salad-server-proxy-boundary.md). Salad is not a
+provider-isolation witness or trusted autonomous sandbox.
 
 ## Deployment topology and trust
 
@@ -12,17 +15,18 @@ desktop / agent -- authenticated control requests --> control API + authority DB
                                                         |
                                              enrolled remote dispatcher
                                                         |
-                                          trusted server proxy (disabled)
+                                           trusted server proxy (explicit composition)
                                               |                 |
                                   secret resolver boundary   fixed Salad API
-                                  (fake implementation)     (NO transport)
+                                   (private server backend)  (bounded HTTPS transport)
 
 workload -- bounded output/checkpoints --> external quarantine custody
 independent target monitor -- authenticated evidence --> control receiver
 ```
 
-The last two lines describe required deployment boundaries, not conformance achieved
-here. The proxy must not share a process, filesystem, credentials or administrative
+The last two lines have local implementations but still require independent deployed
+services and live conformance. The proxy must not share a process, filesystem,
+credentials or administrative
 channel with desktop renderer, agent harness or provider workload. The control API
 accepts proposals/reviews/cancellation; it does not expose the proxy or its config.
 The server composition authenticates a worker through existing audience/tenant/project
@@ -34,7 +38,9 @@ exact `FakeSaladProxy`, `FakeSaladTransport` and `FakeSecretResolver`; these exe
 no processes and call no provider. Passing an arbitrary injected transport cannot
 enable the fake path. The deployable `SaladProxy.request` is always blocked,
 including when dependencies have been injected. There is deliberately no enable
-flag, live CLI or network client hidden behind a test flag.
+flag or network client hidden behind a test flag. `TrustedSaladServer` and
+`SaladTrustedAdapter` are a separate administrator-owned composition, never a
+client-request switch or substitution in the fake adapter.
 
 ## Secret custody
 
@@ -47,7 +53,9 @@ enrollment is not completion of the activation checklist.
 * `ProxyPolicy.management` is server-only reference/version/purpose metadata and
   is excluded from policy serialization. Do not put it into route packages, plans,
   prompts, client settings, receipts or artifact manifests. Actual key values have
-  no config/request/env field and no environment or file discovery path.
+  no config/request/env field and no ambient discovery path. The explicit isolated
+  server backend uses owner-only files in an administrator-selected private directory;
+  file values never belong in CLI/configuration, workload or receipts.
 * Only `credential-ref:<opaque-name>` is accepted. Env/prompt/request locators,
   raw values and account-key overrides are invalid. The management purpose is
   `salad_management`; AI Gateway keys must never use this resolver or be substituted
@@ -56,8 +64,10 @@ enrollment is not completion of the activation checklist.
   purpose and expiry. Resolution must **atomically** recheck those conditions and
   return an exclusively owned mutable buffer. Current fake checks allow five-second
   metadata age and require expiry beyond the two-second request budget. Neither
-  metadata nor value resolution occurs before admitted one-use intent, and neither
-  occurs at all on the live-disabled entry point.
+  metadata nor value resolution occurs at all on the live-disabled entry point.
+  The trusted composition resolves for authorized read-only preflight and rechecks
+  current authority after resolution; mutations additionally require a durable
+  one-use claim and fresh use-time authority before sending.
 * `SecretBuffer` has redacted repr, denies pickling and wipes its owned bytearray on
   exit, including response errors and exceptions. **This is not guaranteed Python
   process-memory erasure:** immutable copies, backend caches, stack traces, native
@@ -78,8 +88,9 @@ enrollment is not completion of the activation checklist.
 `ProxyRequest` contains only `route_id`, committed `effect_id` (nonce), and one of:
 `read_project`, `read_quota`, `read_availability`, `create_stopped`, `read_group`,
 `read_instance`, `read_events`, `read_logs`, `start`, `stop`, `delete`.
-These are normalized **offline** operations, not a claimed validated Salad HTTP
-wire implementation. Read operations reconcile an admitted group; fake preflight
+These are closed normalized operations. `salad_http.py` implements their current
+fixed wire mapping with isolated contract tests, not live API conformance. Read
+operations reconcile an admitted group; fake preflight
 supplies project/quota/availability/absence before create without network or secrets.
 No project-creation endpoint is implemented. The fixed prospective management
 origin is `https://api.salad.com/api/public`; the legacy rejecting config also
@@ -102,6 +113,14 @@ Before create/start, the server rechecks:
    trust acknowledgement. Only `PYTHONUNBUFFERED=1` and `OMP_NUM_THREADS=1|2|4` are
    supported environment settings. Runtime install/download, queues, autoscaling,
    gateway, SSH, exec and interactive shell are forbidden.
+   The optional `argv_binding="smoke_operation_v1"` resolves only the reviewed
+   smoke slots: retained plan `execution_spec.argv` is
+   `[/tessera/bin/run, v1, public-integers-v1, operation-id, operation-epoch,
+   CUSTODY_DNS, WATCHDOG_SHA256, MAX_SECONDS, MAX_OUTPUT_BYTES, 1, DIMENSION]`.
+   Only those two literal placeholders are replaced with the current admitted
+   operation/epoch; every other token stays pinned. The approved retained package
+   is never rewritten, no deterministic nonce is invented, and human concrete-route
+   review still applies. Default `argv_binding="exact"` preserves legacy equality.
 4. Current approved capability declaration for the same tenant/project/task/image;
    actions, credential refs and runtime network capabilities must be empty in this
    supported slice. No capability expansion, downloads, installs or broker activation
@@ -111,21 +130,26 @@ Before create/start, the server rechecks:
    credit is not a hard cap, fresh exact five-second target preflight and exact
    stopped-group identity before start. Monitor/profile/destination hashes are
    reviewed requirements, **not evidence those systems exist or enforce limits**.
+   The independent service uses official positive published GPU rate observations
+   and a conservative durable exposure ledger to fence stale/unknown/rising rate,
+   unclosed orphan exposure and estimate-over-cap. Estimates never establish actual
+   billed cost, a credit balance or a hard financial cutoff.
 6. Retained package, operation, attempt, lease, epoch, manifests, route digest and
    one-use effect nonce. A `salad_proxy.claim` event commits before fake resolution/
    effect. Claims survive process death and restart; a later read may reconcile but
    never authorize another create/start. A new target cannot reuse an operation.
 
 Legacy routes without the executable profile remain readable and usable by the
-older offline adapter, but cannot pass the new proxy admission. Live dispatch is
-blocked regardless of whether any of the above offline checks pass.
+older offline adapter, but cannot pass the new proxy admission. Default/fake dispatch
+remains disabled; trusted-server dispatch separately requires current authority,
+private credential custody and fresh independent safety-service readiness.
 
 ## Responses, evidence, cancellation and custody
 
-One bounded fake call, zero retries. Unknown create reconciles the same reserved
+One bounded call, zero retries per effect. Unknown create reconciles the same reserved
 name/identity; never creates a duplicate. The simulator uses the operation ID as
-its provider ID; a live implementation must persist actual provider-assigned ID
-discovery and prove lost-create reconciliation before activation.
+its provider ID; the trusted transport discovers the actual provider-assigned ID.
+Lost-create reconciliation still needs live conformance before acceptance.
 
 Stop/delete 202 is `pending`, never confirmed termination. Outage, timeout,
 redirect, identity mismatch, malformed/oversized response or echoed marker returns
@@ -141,7 +165,9 @@ raw untrusted text is not placed in API projections. These hashes alone do not
 retain bytes or prove custody. Artifact/checkpoint links must match retained
 same-project/operation/epoch/plan manifests. Byte upload, quarantine retention,
 custody release and scientific acceptance use existing APIs, not provider claims.
-No automatic live collector or external destination transport is implemented.
+The GPU recipe uploads bounded canonical bytes to authenticated external quarantine
+custody; independent deployment, actual byte retention and stop conformance are
+still prerequisites, not facts established by a signed receipt or local tests.
 
 ## Local validation (no network, opt-in file read)
 
@@ -161,7 +187,9 @@ The example contains only invented identities, hashes and an opaque reference,
 reports transport disabled, effects 0 and the safety prerequisites. Do not use
 configuration validation to discover credentials or test an account.
 
-## Live enablement checklist — all currently unresolved
+<a id="live-enablement-checklist--all-currently-unresolved"></a>
+
+## Live enablement checklist — local implementation is not deployed proof
 
 - [ ] Reviewed native Salad package and provider API/version/serialization contract,
       exact stopped creation, immutable identity, no redirects/retries/proxy inheritance.
@@ -180,8 +208,181 @@ configuration validation to discover credentials or test an account.
 - [ ] Separately authorized bounded live acceptance with provider prerequisites and
       spending limits, outside default pytest/CI. Fake/monitor signatures are not passes.
 
-This checklist is documentation, not a set of booleans that enables transport. A
-reviewed implementation change is required even after evidence exists.
+This checklist is documentation, not a set of booleans that enables transport.
+The separate server implementation removes code gaps; deployment and explicitly
+bounded live evidence still must satisfy every requirement.
+
+## First GPU journey: setup versus normal operation
+
+### One-time setup (not authorized by this runbook)
+
+1. Choose an existing Salad organization/project and reviewed GPU resource/country
+   mapping. Do not create projects, purchase credits or infer spending approval.
+2. Build/publish the [GPU smoke recipe](../workloads/salad_gpu_smoke/README.md) under
+   separate authorization; retain the resulting immutable linux/amd64 image digest.
+   The recipe is currently unbuilt; installed torch or a Dockerfile is not GPU proof.
+3. Provision the trusted Linux server identity and private version-pinned management
+   credential backend. Enroll through the administrator-only backend, not argv,
+   environment, a client request, config values or a desktop Keychain search.
+4. Independently supervise the guardian/custody service, its durable private database,
+   exact peer identity and HTTPS workload destination. Review the native Salad IMDS
+   JWT verification and exact operation/group/machine/image bindings. Guardian must
+   survive control/proxy disconnect/death; sharing a thread is not independence.
+5. Approve the exact public-data task, package, route, account/project/image/GPU,
+   capability declaration and exposure ceiling through existing human authority.
+   Review startup/runtime/output limits and orphan/unknown usage policy. Account
+   credit is not a hard cap; unknown usage must block new work, not exact stop.
+
+### Everyday operation and return
+
+1. Enter through the existing authenticated control workflow and select the approved
+   route. Obtain current grant/reviews/lease/epoch; command-line `--run` grants none.
+2. Dispatch create-stopped and start only through `RemoteDispatcher` and the concrete
+   trusted adapter. Each is one-shot and consumes durable intent before provider
+   effect. A lost response means reconcile the original group, not relaunch.
+3. Observe the CUDA smoke and its bounded quarantined canonical output. Re-read the
+   retained bytes and verify SHA-256; workload-reported CUDA is not GPU attestation
+   or scientific acceptance. Provider log hashes are not retained artifact bytes.
+4. Cancel the exact route, revoke writers and issue narrowly scoped exact-group stop.
+   Require observed stopped identity plus independent writer quiescence. HTTP 202,
+   outage, missing group, allocation change or an acknowledgment is not a stop pass.
+5. Exit the client without shutting down guardian/custody or deleting its database.
+   Reconnect/restart reads the same route, effect history and retained bytes without
+   create/start. Setup credential/JWT expiry must not erase custody or consumed
+   claims. Management credential expiry may require independently authorized
+   stop-only recovery; it is not termination proof.
+
+The workload's operation-wide begin-once claim survives startup failure/reallocation;
+there is no automatic GPU retry, new epoch reset, resumption or replacement group.
+Guardian must stop uncertain allocations and retain unresolved resource/cost exposure.
+After normal confirmed stop, keep quarantine and audit records according to approved
+retention; deletion of the stopped group is separately scoped cleanup, not this
+milestone's automatic fallback. Never tear down the independent service merely
+because the live-check process exits.
+
+### Opt-in live check and current service prerequisites
+
+```sh
+.venv/bin/python -m tessera_control.salad_live_check
+```
+
+The default reads **no config, secrets, environment or provider state**, performs
+zero network calls/effects, and prints static missing prerequisites. Supplying
+`--server-config` or `--receipt-directory` without `--run` also remains static:
+these paths are not probed. This is not an account probe. Only an explicitly
+authorized operator run reads a server config:
+
+```sh
+.venv/bin/python -m tessera_control.salad_live_check --run \
+  --server-config /absolute/private/live-config.json \
+  --receipt-directory /absolute/private/new-receipt-directory
+```
+
+Neither this example nor `--run` supplies missing execution/spending authorization.
+Run only on the enrolled trusted Linux server with the exact preexisting human-
+approved route, not from the desktop, agent, workload or a generic developer shell.
+Exit 0 with `--run` means the bounded driver passed its provider/custody journey;
+without `--run`, exit 0 means only that static readiness printed. Neither exit
+proves actual billed cost, node-local writer death, or scientific acceptance.
+Exit 2 with `--run` means setup/acceptance is unresolved.
+Errors are closed codes, never raw exception text or config/credential values.
+
+The callable `salad_live_check.SaladLiveSession(config_path)` loads the concrete
+server composition in that same module. `salad_live_check.run(session, ...)` uses exact
+`TrustedSaladServer`/`RemoteDispatcher`,
+authenticated external `evidence`, `retained_bytes` and `reopen`, exact `state`
+and `cancel`. Runtime use-time admission remains authoritative. The external
+evidence must independently establish output retention/digest/byte cap, provider
+identity, stop and writer quiescence; user-supplied booleans cannot supply it.
+HTTPS admin status/import uses `SafetyHTTPSClient`, CA hostname validation and an
+exact certificate SHA-256 pin; provider mutation remains behind the one-shot
+dispatcher and independent Linux peer-authenticated guardian socket. Reopen
+reloads/re-authenticates the same config and durable database; no launcher or claim
+is reset. Default/fake APIs are not changed by this CLI.
+
+#### Private config contract
+
+Config is a closed JSON object, <=64 KiB, mode 0600, owned by the server uid,
+single-linked, with no symlink path components. Referenced state/credential
+directories must already exist (0700); referenced files must be 0600/owner-only,
+single-linked and non-symlinked. Paths are absolute; no env interpolation, relative
+paths, raw token/key fields, arbitrary provider endpoints or extra fields exist.
+TLS CA is a referenced reviewed file, not embedded configuration bytes.
+
+| Field | Required binding |
+|---|---|
+| `schema` | `tessera.salad.live-config.v1` |
+| `state_dir` | Existing private authority database directory, never initialized by this harness |
+| `route_id`, `task_id`, `org_id`, `project_id`, `proposal_digest` | Exact existing approved route and raw 64-hex retained routing-package digest |
+| `policy` | Exact server `ProxyPolicy`, including management **reference/version/purpose only**, immutable image/account/project/GPU and executable profile |
+| `worker_credential_file` | Explicit private file containing an already-enrolled worker-audience token |
+| `cancel_credential_file` | Explicit private file containing existing human control authority for exact cancellation; never a newly issued approval |
+| `credential_directory` | Existing `PrivateFileSecretResolver` directory, separately enrolled by administrator |
+| `guardian_socket`, `guardian_uid` | Independent Linux service's exact Unix socket and uid; peer pid must differ |
+| `custody` | Closed object: `host`, `port` (443), `token_file`, `ca_file`, `certificate_sha256` (64 hex) |
+| `approved_max_cost_cents` | Existing explicitly approved exposure ceiling, 1–10000; admitted plan/profile cap must fit and independent conservative ledger must remain within the profile cap |
+| `max_seconds`, `max_polls` | 1–300 seconds, 1–30 polls; profile runtime must fit |
+| `source_revision` | Git source reference plus observed installed package inventory: `40hex+sha256:64hex` |
+
+After package writers are paused, obtain the inventory digest locally without
+network/credentials using
+`.venv/bin/python -c 'from tessera_control.salad_live_check import source_digest; print(source_digest())'`.
+The digest covers sorted names and content hashes of installed `tessera_control`
+and `tessera_worker` Python inputs. The driver rechecks it before effects; changing
+inputs invalidates the candidate. The git reference is supplied provenance; the
+inventory digest is observed. Keep transient receipts outside those package inputs.
+
+#### Independent service observations (not configuration switches)
+
+Actual billed cost remains unknown; there is no assumed billing endpoint. Admission
+requires fresh official GPU compatibility and positive high-priority USD/hour rate
+plus the independent service's conservative exposure ledger within the reviewed
+amount. Published rate/exposure estimates are not invoices, account credit or a
+hard spending cap. Unknown rate, stale price, unresolved orphan exposure or unknown
+ledger state fence new work and trigger narrowly scoped stop/reconciliation.
+The harness consumes authenticated `published_hourly_rate_usd`,
+`estimated_exposure_cents`, `rate_unknown`, `budget_fenced` and
+`escalation_pending` status after fresh enforcing reservation. It independently
+checks accrued estimate plus remaining deadline at that rate against the reviewed
+profile cap. It does not require a nonexistent actual-billing endpoint or trust a
+config flag as current usage. Exact cancellation and stop remain available.
+
+`status.retained_output` is a read-only verified metadata projection: exact
+`binding` (tenant/project/operation/epoch/artifact/kind), `name="output.json"`,
+`retained`, `sha256`, `bytes` and `quarantine`. It neither seals/closes writers
+nor releases/returns output bytes. The harness validates the exact binding, one
+approved file, cap, size and digest shape, and pins the first retained identity.
+Retained quarantine metadata triggers cancellation while the group is running;
+it does **not** establish stop, writer quiescence or execution/scientific acceptance.
+
+`import` seals custody and closes writers. The harness never polls it before
+confirmed stopped status; afterward it verifies the sealed inventory, actual
+canonical bytes and unchanged metadata digest/size, then reopens the same durable
+route and custody without relaunch. Unknown/reallocated/unsealed state never
+passes. Isolated metadata/driver tests are local coverage, not deployed service
+or real GPU proof. Full integrated journey and live acceptance still need the
+coordinated runtime/service test and actual deployed prerequisites.
+
+Scheduling bounds are 300 seconds, 30 polls per observation phase, one create/start/stop
+attempt, no retries and no direct mutation bypass. On any issue the driver attempts
+exact cancel/stop/reconcile and retains sanitized inconclusive evidence; unresolved
+cleanup remains an exposure incident. Receipt directory must already be private
+(0700); exclusive 0600 receipts retain source revision, actual provider identity,
+verified output digest/size, stop and same-record reconnect. Raw credentials,
+responses, output bytes and exception text never belong in these receipts.
+Provider calls retain their two-second transport bounds; authenticated HTTPS
+admin exchanges have their service client's ten-second socket timeout. Cleanup
+may extend beyond the scheduling deadline for one exact stop/reconciliation;
+no timer grants authority or proves shutdown. Interrupted runs retain the durable
+started receipt and independent service recovery; they are not acceptance passes.
+The standalone main-thread driver additionally applies wall-clock bounds to IPC,
+HTTPS and each dispatcher operation; it refuses an existing active alarm rather
+than overwriting another component's timer.
+
+Current inspected references are offline examples, `compose.yaml` and
+`deploy/remote-agent-platform/docker/compose.yaml`, not verified Salad service
+deployments. No live account mapping, approved exposure limit, secure credential
+handoff, published GPU digest or independent running service was established.
 
 ## Rollback and incident response
 
@@ -201,7 +402,7 @@ reviewed implementation change is required even after evidence exists.
    after fresh human approvals, new valid authority, reviewed incident evidence and
    all live prerequisites. Existing claims remain consumed after credential rotation.
 
-No incident step here authorizes an actual Salad call during this offline task.
+No incident step here authorizes an actual Salad call during local implementation.
 
 ## Recorded offline task validation (2026-09-23)
 

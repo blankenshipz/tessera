@@ -606,10 +606,12 @@ meet the task's credential or network requirements.
 
 [Decision 0024](docs/decisions/0024-salad-server-proxy-boundary.md) places Salad
 management authority in a server-only proxy with versioned opaque references and
-closed operation admission. Its live entry point blocks before secret resolution
-or network; only synthetic transport/resolver conformance is implemented. The
-[runbook](docs/salad-proxy.md) requires independent monitor, termination, cost and
-external artifact custody conformance before any live activation implementation.
+closed operation admission. Default/fake entry points block before credential
+resolution or network. [Decision 0031](docs/decisions/0031-salad-single-container-gpu.md)
+adds separate administrator-composed trusted-server single-container GPU transport,
+guardian and custody implementations. The [runbook](docs/salad-proxy.md) still
+requires independently deployed monitor, termination, cost and external byte
+custody conformance; local code/tests are not live activation evidence.
 This boundary is not provider isolation or a trusted autonomous Salad sandbox.
 
 Local selection creates a classified source snapshot before external transfer.
@@ -1083,8 +1085,10 @@ just a human acknowledgment of a failed/incomplete record. Legacy prose-only pla
 remain unevaluated. These checks grant no execution authority or scientific truth.
 The [evaluation and Salad contract](docs/mixfm-evaluation-and-salad-contract.md)
 also defines opt-in target validation and neutral capability/health discovery;
-Salad live operations remain unsupported and fail closed without credential access
-or network calls, even when configuration is provided.
+default/fake Salad operations still fail closed without credential access or
+network calls, even when configuration is provided. Separate trusted-server
+composition must satisfy current execution authority and independent safety
+readiness; no client configuration flag activates it.
 
 ## 8. Implementation sequence and acceptance
 

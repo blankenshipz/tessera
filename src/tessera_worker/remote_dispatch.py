@@ -1,7 +1,8 @@
 """Trusted remote-plane dispatcher. No desktop process, shell or credential resolver.
 
 Construction is server-side dependency injection, not a workload/plugin API.
-All shipped adapters are offline. Live transports cannot be enabled by a request.
+Ordinary injected adapters remain offline. Provider mode requires the concrete
+administrator-owned Salad server composition; requests cannot activate it.
 """
 
 from dataclasses import dataclass
@@ -53,10 +54,15 @@ class RemoteDispatcher:
         adapter = self.adapters.get(proposal.selection.target_digest)
         if adapter is None:
             raise Conflict("Remote provider disabled or target adapter unavailable.")
-        preflight = adapter.preflight(proposal)
+        from .salad_remote import SaladTrustedAdapter
+
+        trusted = type(adapter) is SaladTrustedAdapter and adapter._server.store is self.store
+        preflight = (
+            adapter.preflight_for(action, proposal) if trusted else adapter.preflight(proposal)
+        )
         if (
             not preflight.admissible
-            or preflight.mode != "offline"
+            or preflight.mode != ("trusted_server" if trusted else "offline")
             or preflight.selection_digest
             != canonical_digest(proposal.selection.model_dump(mode="json"))
         ):
@@ -72,7 +78,9 @@ class RemoteDispatcher:
             if fresh["effects"][-1]["id"] != effect_id or (
                 action in {"create", "start"}
                 and (
-                    fresh["authority_status"] != "current_offline_only" or fresh["desired"] != "run"
+                    fresh["authority_status"]
+                    != ("current_trusted_server_only" if trusted else "current_offline_only")
+                    or fresh["desired"] != "run"
                 )
             ):
                 raise Conflict("Remote effect fenced after intent; reconcile only.")
@@ -80,7 +88,11 @@ class RemoteDispatcher:
             readback = ProviderReadback.model_validate_json(readback.model_dump_json())
         except Exception:
             # Provider exceptions may contain keys/URLs/headers; never retain their text.
-            readback = ProviderReadback(state="unknown", observed_at=utc_now())
+            readback = ProviderReadback(
+                state="unknown",
+                observed_at=utc_now(),
+                provenance="provider" if trusted else "synthetic",
+            )
         return self.store.record(self.worker, route_id, effect_id, readback.model_dump(mode="json"))
 
 

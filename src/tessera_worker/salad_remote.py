@@ -1,4 +1,4 @@
-"""Narrow Salad fake adapter and trusted proxy seam; zero live transport implementation."""
+"""Disabled/fake Salad adapters and a concrete trusted-server-only adapter."""
 
 from datetime import UTC, datetime
 from typing import Annotated, Literal, Protocol
@@ -147,3 +147,44 @@ class SaladProxyFakeAdapter:
                 state="unknown", observed_at=utc_now(), proxy_reason=result.reason
             )
         return ProviderReadback.model_validate(result.observation | {"proxy_reason": result.reason})
+
+
+class SaladTrustedAdapter:
+    """Only the concrete administrator-composed server can mint provider evidence."""
+
+    def __init__(self, server, route_id):
+        from tessera_control.salad_server import TrustedSaladServer
+
+        if type(server) is not TrustedSaladServer:
+            raise ValueError("concrete trusted Salad server required")
+        self._server, self._route_id, self._preflight = server, route_id, None
+
+    def preflight_for(self, action, proposal):
+        from tessera_control.store import canonical_digest
+
+        self._preflight = self._server.preflight(proposal, self._route_id, action)
+        return RoutePreflight(
+            True,
+            canonical_digest(proposal.selection.model_dump(mode="json")),
+            mode="trusted_server",
+            reason="independent_readiness_required",
+        )
+
+    def perform(self, action, proposal, state):
+        from tessera_control.salad_proxy_contract import ProxyRequest
+
+        if state["id"] != self._route_id:
+            raise Conflict("Salad route mismatch.")
+        operation = {
+            "create": "create_stopped",
+            "observe": "read_instance" if state["provider_id"] else "read_group",
+        }.get(action, action)
+        result = self._server.request(
+            ProxyRequest(
+                route_id=self._route_id,
+                effect_id=state["effects"][-1]["id"],
+                operation=operation,
+            ),
+            preflight=self._preflight,
+        )
+        return self._server.readback(result, state)

@@ -29,6 +29,7 @@ Repository = "https://github.com/blankenshipz/tessera"
 Issues = "https://github.com/blankenshipz/tessera/issues"
 
 [project.optional-dependencies]
+salad = ["cryptography>=48.0.1,<49"]
 a2a = ["a2a-sdk[http-server]==1.2.1"]
 mcp = [
   "mcp==1.26.0",
@@ -61,6 +62,7 @@ tessera-a2a-peer = "tessera_control.a2a_peer:main"
 "share/tessera/examples/local-ledger" = ["examples/local-ledger/*.md"]
 "share/tessera/examples/kubernetes-hello" = ["examples/kubernetes-hello/*.go", "examples/kubernetes-hello/Dockerfile"]
 "share/tessera/examples/tabular-starter" = ["examples/tabular-starter/Dockerfile", "examples/tabular-starter/Dockerfile.dockerignore", "examples/tabular-starter/IMAGE.lock.json", "examples/tabular-starter/portable_verifier.py", "examples/tabular-starter/requirements.lock", "examples/tabular-starter/workflow.py"]
+"share/tessera/workloads/salad_gpu_smoke" = ["workloads/salad_gpu_smoke/README.md", "workloads/salad_gpu_smoke/Dockerfile", "workloads/salad_gpu_smoke/run", "workloads/salad_gpu_smoke/smoke.py"]
 "share/tessera/release/opencode-observer" = ["release/opencode-observer/README.md", "release/opencode-observer/*.json", "release/opencode-observer/*.patch", "release/opencode-observer/LICENSE*", "release/opencode-observer/baseline.tar.g[z]"]
 "share/tessera/release/opencode-observer/runtime-v8" = ["release/opencode-observer/runtime-v8/baseline.json", "release/opencode-observer/runtime-v8/baseline.tar.gz", "release/opencode-observer/runtime-v8/observer.patch", "release/opencode-observer/runtime-v8/LICENSE", "release/opencode-observer/runtime-v8/BASELINE.sha256", "release/opencode-observer/runtime-v8/TARGET.sha256", "release/opencode-observer/runtime-v8/origins.json", "release/opencode-observer/runtime-v8/README.md", "release/opencode-observer/runtime-v8/reconstruct.py", "release/opencode-observer/runtime-v8/link_runtime.py", "release/opencode-observer/runtime-v8/verify_runtime.mjs", "release/opencode-observer/runtime-v8/verify_python.py"]
 "share/tessera/release/opencode-observer/runtime-v8/runtime-deps" = ["release/opencode-observer/runtime-v8/runtime-deps/package.json", "release/opencode-observer/runtime-v8/runtime-deps/bun.lock"]
