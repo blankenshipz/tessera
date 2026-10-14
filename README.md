@@ -1,13 +1,57 @@
 # Tessera
 
-**A research workspace for turning goals into bounded experiments, linked evidence,
-and human decisions.** Tessera keeps the design, approvals, attempts, results and
-research ledger together—without treating an agent's proposal as permission to run.
+**Run agent-assisted experiments. Keep a scientist’s record.** Tessera is being
+built for computational researchers and research engineers who already have
+scripts or notebooks, data, and access to compute—and want to delegate experimental
+work without losing control of the method, access, cost, or conclusions.
+
+An agent can suggest a change or produce an output; the harder research questions
+are what was actually run, how it differed from the baseline, what the evidence
+supports, and why you chose the next step. Tessera connects plans, permissions,
+execution attempts, evidence and human decisions in a durable research ledger.
+The investigation—not a chat session—is the unit you should be able to return to.
 
 **Developer alpha · local evaluation, not a production platform.** The supported
 starting point is a local control service and macOS desktop. A bounded CPU baseline
 has run on an owned Docker Desktop Kubernetes bench; general remote execution,
 integrated agent reasoning and scientific acceptance are not demonstrated.
+
+## From a research question to a defensible next step
+
+Consider a tabular prediction experiment: does a proposed feature transformation
+improve on the existing baseline, using the same data split and evaluation method?
+The **intended agent-assisted workflow** is:
+
+1. **Establish the question and baseline.** Identify the script, input snapshot,
+   environment, metric and success criterion before changing the experiment.
+2. **Review one bounded intervention.** Let an agent propose the change and checks;
+   you review the exact plan, approved compute target, data access, cost/exposure
+   limits, deadline and stop rules. A proposal is not permission to run.
+3. **Follow the attempt.** Inspect progress, outputs and failures rather than
+   relying on a reassuring summary. Keep a failed run distinct from a valid
+   negative or inconclusive result; record changes of plan rather than silently
+   replacing the original method.
+4. **Stop and return.** Request a stop when needed and distinguish the request from
+   confirmed termination. Revisit the same investigation to inspect what happened
+   and what remains unresolved; returning to its history should not rerun work.
+5. **Review the evidence and decide.** Compare baseline and intervention, check the
+   method and uncertainty, and record whether to continue, revise or reject the
+   idea—with links to the supporting and opposing evidence.
+
+The aim is less reconstruction across chats, scripts and result folders, and a
+clearer account of what you knew when you made a decision. **Traceability is not
+scientific validity:** a complete record, successful process or agent critique
+does not establish that the method is sound or the conclusion is justified.
+
+This end-to-end agent workflow is a design target, **not today's integrated alpha**.
+Today you can use the local desktop/control service for versioned designs, studies,
+linked measurements, human conclusions/corrections and exports. Bounded CPU execution
+uses a separate API/operator handoff; integrated planning, execution and agent
+critique remain unverified. See [capabilities and limits](docs/implemented-capabilities.md)
+for the implemented boundaries and the [tabular starter](docs/tabular-starter.md)
+for the bounded baseline/intervention path. The intended compute target can be
+outside the laptop, but demonstrated laptop-local execution does not prove
+independent-host or laptop-off operation.
 
 ## A look inside
 
@@ -37,7 +81,7 @@ observations. No operation or scientific success is inferred from these records.
 The test draft survives reload and reconnect without replay. Drafting and human
 approval remain distinct from execution admission, dispatch and scientific review.
 
-## Supported workflow
+## What you can evaluate today
 
 The [quickstart](docs/quickstart.md) follows this bounded local journey. Execution
 is a separate API/operator handoff, not a one-click desktop operation.

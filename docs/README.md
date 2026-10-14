@@ -1,20 +1,31 @@
 # Tessera documentation
 
-Tessera is a developer alpha for local evaluation. Start with the current guides
-below; protocol specifications and opt-in fixture runbooks are references, not
-claims of a supported production deployment.
+Tessera helps computational researchers keep a durable account of a question,
+bounded experiment, evidence and human decision. It is a developer alpha for local
+evaluation, not yet an integrated agent-assisted research workflow. Start with the
+reader paths below; protocol specifications and opt-in fixture runbooks are
+references, not claims of a supported production deployment.
 
-## Use Tessera
+## Plan, run, monitor, review and revisit research
 
-- [Quickstart](quickstart.md): install, connect, record a design, review and export.
-- [Capabilities and limits](implemented-capabilities.md): what exists and what
-  remains unverified.
-- [Local API workflow](local-api-workflow.md): separate approval, admission,
-  execution, custody release and scientific review.
-- [Tabular starter](tabular-starter.md): bounded public-data baseline/intervention.
-- [Research records](research-human-records.md), [dataset snapshots](dataset-snapshots.md)
-  and [workspace adoption](workspace-adoption.md): record provenance without
+- **Start and plan:** [Quickstart](quickstart.md) for local setup and versioned
+  designs; [tabular starter](tabular-starter.md) for a concrete synthetic-data
+  question, baseline, intervention and comparison criteria.
+- **Run a bounded attempt:** [Local API workflow](local-api-workflow.md) for the
+  separate operator handoff, approval, grant, admission and execution. Recording
+  a plan in the desktop does not start a job.
+- **Monitor and stop:** [Execution monitor](execution-monitor.md) and
+  [desktop execution procedure](../desktop/EXECUTION.md) for attempt/output
+  inspection and stop boundaries; requested cancellation is not confirmed termination.
+- **Review and decide:** [Research records](research-human-records.md) for linked
+  measurements, conclusions and corrections; the quickstart separates quarantine
+  retention, retrieval release and export from scientific acceptance.
+- **Revisit the investigation:** reconnect to durable records without replaying
+  commands; use [dataset snapshots](dataset-snapshots.md) and
+  [workspace adoption](workspace-adoption.md) to retain provenance without
   mistaking metadata for transferred or validated data.
+- **Check the boundary:** [Capabilities and limits](implemented-capabilities.md)
+  separates implemented components, demonstrated journeys and planned capabilities.
 
 ## Operate a service
 

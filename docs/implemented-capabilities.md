@@ -5,7 +5,11 @@ The [quickstart](quickstart.md) is the supported starting point for local evalua
 The [design](../DESIGN.md) describes the wider target; it is not an inventory of
 completed features.
 
-## Current workflow
+## Implemented components, grouped by researcher need
+
+“Implemented” below means a component exists; it does not mean the full intended
+agent-assisted journey has been demonstrated. Plan/run/monitor/review/revisit is
+the organizing workflow, not a promise of one-click execution.
 
 | Boundary | Implemented | Important limit |
 |---|---|---|
@@ -17,6 +21,23 @@ completed features.
 | Recovery | Consistent SQLite/object backups and verified restore to permanently held history | Restore does not fence the original writer/jobs and cannot promote a copy to active failover |
 | Agents | Scoped identities, authority requests/grants, MCP stdio, A2A reference exchange, provenance and runtime binding checks | A catalog entry, peer response or signed binding is not proof of integrated planner/critic reasoning |
 | Agent Sandbox | Opt-in direct adapter targeting upstream v1.0.6 one-shot network-none Sandboxes | Component-tested; live controller/CRD/isolation acceptance, warm pools and reasoning/input credential delivery are not established |
+
+Read these components by the work you need to do:
+
+- **Plan:** research-ledger designs, baselines, variants and criteria keep the
+  method explicit before a run; local control owns revision and authority checks.
+- **Run and monitor:** execution grants, admission, worker dispatch and journals
+  govern bounded attempts; the desktop inspects results but needs the separate
+  API/operator handoff to execute.
+- **Review and decide:** artifact custody enables exact-byte inspection; linked
+  measurements, human conclusions and corrections preserve the decision without
+  treating retrieval release as scientific acceptance.
+- **Revisit:** durable project records and exports let you return without command
+  replay; held backup/restore is recovery evidence, not active failover.
+- **Delegate:** agent identities and the Sandbox adapter are supporting components,
+  not a demonstrated integrated planner/critic loop.
+
+## Demonstrated journeys and evidence limits
 
 The [tabular starter](tabular-starter.md) offers a bounded baseline/intervention
 workflow. Local CPU and Kubernetes observations used synthetic data/identities;
@@ -34,6 +55,16 @@ selection/save interactions. Native OS dialogs remain a separate acceptance gate
 | Identity and transport | Local owner/scoped agents, stdio MCP and reference-only A2A | Production owner/private-resource integration, organization sessions/revocation and supported remote deployment |
 | Review and recover | Human review, correction lineage, export and held restore | Supported recovery objectives, retention operations and target-specific incident drills |
 | Release and operations | Source packaging and reproducible-check tooling | Signed artifact/update verification, independent security review and production service commitments |
+
+These remaining items are **planned or unverified**, not features established by
+the local demonstrations. The intended loop includes an agent proposing a bounded
+intervention, supervised execution, independent critique and a human decision;
+today's records, adapters and tests do not demonstrate that integrated loop.
+
+“Remote” in architecture can mean outside Electron on the same laptop. An
+independent-host target is a different machine; laptop-off acceptance additionally
+needs observed continuity while the laptop is off/disconnected. Neither a remote
+API shape nor Docker Desktop Kubernetes establishes those outcomes.
 
 ## Safety boundaries
 

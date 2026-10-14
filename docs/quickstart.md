@@ -1,10 +1,19 @@
 # Tessera local macOS alpha quickstart
 
-This is one developer-alpha path: start a local control service, open the desktop,
+Use this path to preserve the question, method and evidence behind your next research
+decision, rather than reconstructing them from chat and result folders. This is
+one developer-alpha path: start a local control service, open the desktop,
 create a project and experiment design, then inspect results from a separately
 authorized baseline. The app does not itself issue execution grants or establish
 production readiness. Renderer checks used a real authenticated backend but
 simulated platform interactions; native macOS picker/save acceptance is separate.
+
+For example, ask whether one preregistered coefficient change improves a tabular
+predictor against its baseline on unchanged data splits. The
+[tabular starter](tabular-starter.md) specifies that bounded engineering example.
+The expected result here is a durable design and, after the separate authorized
+execution handoff, inspectable measurements and output records—not an autonomous
+agent run or a scientifically validated conclusion.
 
 ## Prerequisites and setup
 
@@ -39,7 +48,7 @@ picker. Confirm the displayed account/organization. The app does not start or
 initialize the service for you. For an existing service, use only the endpoint
 and private credential file supplied by its operator.
 
-## Follow the supported screen flow
+## Everyday use: plan, monitor, review and revisit
 
 The project opens in **Experiments**. The sidebar groups projects and research
 destinations. Use **Plans & decisions** for proposals and
@@ -96,6 +105,20 @@ not grant authority or request execution.
    the ledger, not the experiment design or execution-result artifact. Reconnect
    and reselect the project/experiment to refresh durable records; reconnect does
    not replay commands.
+
+Use the design's question and criterion when reviewing the measurements: record
+whether to continue, revise or reject the intervention, and link the evidence in
+the research ledger. A failed process is not a negative scientific finding; missing
+or incomparable measurements leave the comparison inconclusive. Human conclusions
+and corrections are records, not automatic validation by an agent.
+
+To leave, close the desktop. For this local setup, stop your own `tessera serve`
+process when finished and restart it with the same state directory on return; do
+not initialize again. Closing the app or stopping the control service is **not**
+an execution-stop procedure. If an attempt is active, use the separate operator
+workflow and retain confirmed termination/reconciliation evidence before treating
+it as stopped. Reconnect and reselect the investigation to inspect its history
+without rerunning it.
 
 For Python setup and development checks, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 

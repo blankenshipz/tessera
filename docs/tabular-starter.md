@@ -5,6 +5,32 @@ dataframe framework, model provider, download or automatic approval is needed.
 Actual numeric analysis uses the standard library; immutable snapshot verification
 reuses Tessera's existing typed verifier dependencies.
 
+## Research question and decision
+
+**Question:** on one fixed synthetic dataset, does shrinking the fitted linear
+coefficient improve prediction compared with the unchanged linear baseline?
+This is a small, inspectable instance of the README's baseline/intervention journey,
+not a claim about real-world data or a demonstrated agent reasoning loop.
+
+- **Baseline:** fit `linear` on the training split only. The `constant` training
+  mean is a reference check, not a replacement selected after seeing results.
+- **Intervention:** `half-slope` changes only the fitted coefficient; `zero-slope`
+  is the preregistered control. Keep input bytes, splits and evaluation unchanged.
+- **Criteria:** before approval, record which split/metric governs the comparison
+  (for example validation MSE), what improvement would justify another experiment,
+  and how test MSE/MAE will be reported. This guide supplies no universal scientific
+  threshold and permits no adaptive search over the held-out results.
+- **Execution:** preregister all four variants, obtain separate human authority,
+  and use the bounded operator/worker path below. Monitor actual attempt state;
+  a stop request needs termination and exposure reconciliation evidence.
+- **Evidence:** retain exact snapshot, method/image identities, split counts,
+  metrics, output custody and terminal outcome. Missing metrics or a failed attempt
+  cannot be recast as evidence that the intervention did not help.
+- **Decision and return:** compare the preregistered variants against the recorded
+  criterion, then record a human continue/revise/reject or inconclusive decision
+  linked to the measurements. Revisit those same records without dispatching again;
+  a new method or trial requires a new reviewed plan, not a rewritten history.
+
 ## Preregister and approve before running
 
 Generate `tessera_starter.synthetic.example()` once: seed1729,120 immutable IDs,

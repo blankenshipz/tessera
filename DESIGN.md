@@ -12,6 +12,12 @@ runnable scope; the release checklist tracks the remaining release gates.
 This document defines the pilot, the contracts it must satisfy, and the order of
 implementation. “Required” describes intended behavior, not a verified guarantee.
 
+Researchers should start with the [README](README.md) for the question-to-decision
+journey and the [documentation guide](docs/README.md) for plan/run/monitor/review/
+revisit paths. This document is for researchers checking the intended boundaries
+and developers/operators implementing them; it preserves the authority, evidence
+and safety contracts behind that experience.
+
 ## 1. Product and scope
 
 Tessera's differentiator is a durable path from a research goal through bounded
@@ -24,6 +30,10 @@ control of direction, access, cost, methodology, and publication.
 Desktop, control plane, and execution plane are independently deployable.
 “Remote” means outside Electron, not necessarily on another machine. Network
 placement does not change authorization requirements.
+In this architectural usage, a service or worker on the same laptop can be remote
+from the renderer. **Independent-host** means another machine; **laptop-off**
+operation additionally requires evidence that work continues while the laptop is
+off or disconnected. Laptop-local Docker/Kubernetes evidence proves neither.
 
 The first user is a hands-on researcher or research engineer with an existing
 script/notebook investigation and an available execution host, local or elsewhere.
