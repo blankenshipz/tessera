@@ -15,6 +15,10 @@ let adminRead = 0;
 let adminBusy = false;
 let adminEditing = null;
 const $ = id => document.getElementById(id);
+// Keep the trusted application URL exact; skip navigation moves focus only.
+document.querySelector('.skip-link').addEventListener('click', event => {
+  event.preventDefault(); $('main-content').focus();
+});
 let epoch = 0;
 let connectionId = null;
 let recoveryHeld = true;
@@ -110,6 +114,9 @@ let workspaceView = 'experiments';
 function selectWorkspaceView(view) {
   if (!Object.hasOwn(workspaceViews, view)) return;
   workspaceView = view;
+  if (!$('admin-workspace').hidden && activeProject) clearAdmin();
+  $('workspace').hidden = !activeProject;
+  $('workspace-navigation').hidden = !activeProject;
   for (const panel of document.querySelectorAll('[data-workspace-view]')) panel.hidden = panel.dataset.workspaceView !== view;
   for (const name of Object.keys(workspaceViews)) {
     if (name === view) $(`view-${name}`).setAttribute('aria-current', 'page');
@@ -582,6 +589,7 @@ function clearContext({ preserveConnectionForm = false } = {}) {
   $('project-title').textContent = 'Start with a question.';
   $('welcome').hidden = false;
   $('workspace').hidden = true;
+  $('workspace-navigation').hidden = true;
   renderOnboarding();
   $('project-new').disabled = $('refresh').disabled = true;
   $('disconnect').hidden = true;

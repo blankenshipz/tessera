@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
   <title>Tessera</title>
+  <script src="appearance.js"></script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <aside>
+  <a class="skip-link" href="#main-content">Skip to workspace</a>
+  <aside aria-label="Workspace sidebar">
     <div class="brand"><span class="mosaic" aria-hidden="true">▦</span> Tessera</div>
     <p class="caption">A workspace for inquiry</p>
     <section class="connection">
@@ -20,10 +22,18 @@
     <div class="section-title"><h2>Projects</h2><button id="project-new" aria-label="New project" disabled>+</button></div>
     <nav id="projects" aria-label="Projects"></nav>
     <button id="projects-more" hidden>More projects</button>
-    <button id="admin-open" type="button">Administration</button>
+    <nav id="workspace-navigation" aria-label="Research workspace views" hidden>
+      <p class="sidebar-label">Workspace</p>
+      <button id="view-experiments" type="button" aria-current="page">Experiments</button>
+      <button id="view-plans" type="button">Plans &amp; decisions</button>
+      <button id="view-ledger" type="button">Research ledger</button>
+      <button id="view-conversation" type="button">Conversation</button>
+      <button id="view-operations" type="button">Operations</button>
+    </nav>
+    <div class="sidebar-tools"><button id="admin-open" type="button">Administration</button><button id="appearance-open" type="button">Appearance</button></div>
     <p class="aside-note">Your labbook persists when this window closes.</p>
   </aside>
-  <main>
+  <main id="main-content" tabindex="-1">
     <header><div><p class="eyebrow" id="workspace-view-title">RESEARCH WORKSPACE</p><h1 id="project-title">Start with a question.</h1></div><button id="refresh" disabled>Refresh</button></header>
     <div id="notice" role="status" aria-live="polite"></div>
     <p id="workspace-availability" class="muted" role="status">Not connected — connect before recording changes.</p>
@@ -96,13 +106,6 @@
       <section id="local-control-start" class="card" aria-labelledby="local-control-heading"><h3 id="local-control-heading">Start the local control service</h3><p>After installing Tessera, run initialization once in a new state directory:</p><pre>tessera init --state-dir "$HOME/.local/state/tessera-alpha"</pre><p>Then start the service in a terminal and leave it running:</p><pre>tessera serve --state-dir "$HOME/.local/state/tessera-alpha" --port 8765</pre><p>Click Connect, use <code>http://127.0.0.1:8765</code>, then select <code>$HOME/.local/state/tessera-alpha/owner.header</code> in the native file picker. Keep this file private; never paste its contents into chat. On later launches, run only serve. If port 8765 is occupied, choose a free port and use that same port in Connect.</p><p>Already have a service? Use its endpoint and private credential header instead. This app does not start a backend automatically or grant execution authority.</p></section>
       <details><summary>Optional advanced setup: Kubernetes namespace</summary><section class="card" aria-labelledby="namespace-setup-heading"><h3 id="namespace-setup-heading">Kubernetes namespace setup</h3><p class="muted">Choose one kubeconfig and explicit context to inspect or create exactly one namespace. Kubeconfig bytes and paths stay in the desktop main process. This never installs a control plane.</p><button id="namespace-setup" type="button">Set up Kubernetes namespace</button></section></details><p class="muted">Plans, execution admission, dispatch, operational observations, evidence, and conclusions remain separate records.</p></section>
     <section id="workspace" hidden>
-      <nav id="workspace-navigation" aria-label="Research workspace views">
-        <button id="view-experiments" type="button" aria-current="page">Experiments</button>
-        <button id="view-plans" type="button">Plans &amp; decisions</button>
-        <button id="view-ledger" type="button">Research ledger</button>
-        <button id="view-conversation" type="button">Conversation</button>
-        <button id="view-operations" type="button">Operations</button>
-      </nav>
       <div data-workspace-view="conversation" hidden>
       <section class="workbench" aria-labelledby="workbench-heading">
         <div class="section-title"><div><h2 id="workbench-heading">Coordinator workbench</h2><p class="muted">Provider-disabled local coordination. Proposals require separate human review and do not approve, grant, dispatch, or execute.</p></div><div class="view-switch" role="group" aria-label="Workbench view"><button id="conversation-view" type="button" aria-pressed="true">Conversation</button><button id="labbook-view" type="button" aria-pressed="false">Labbook</button></div></div>
@@ -145,6 +148,7 @@
       </div>
     </section>
   </main>
+  <dialog id="appearance-dialog" aria-labelledby="appearance-heading"><form method="dialog"><h2 id="appearance-heading">Make this workspace yours</h2><p class="muted">Appearance stays on this desktop. It does not change your connection or research records.</p><label>Appearance<select id="appearance-mode"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><label>Workspace palette<select id="appearance-palette"><option value="plum">Plum</option><option value="lagoon">Lagoon</option><option value="graphite">Graphite</option></select></label><p id="appearance-status" class="muted" role="status"></p><div class="actions"><button type="submit">Done</button></div></form></dialog>
     <dialog id="connection-dialog"><form id="connection-form"><h2>Connect to a control plane</h2><p>For a personal workspace, follow the local init-once and serve commands on the welcome screen, leave serve running, and use its loopback endpoint. For an existing service, enter the endpoint supplied by its operator. Kubernetes namespace setup is optional and does not start a backend.</p><p class="muted">This is a connection and inspection surface, not Kubernetes setup: it cannot apply Kubernetes resources or start or stop services.</p><p>Your credential stays in the desktop’s main process and is cleared when you disconnect.</p><label>Connection name<input name="name" value="Personal workspace" required maxlength="200"></label><label>Endpoint<input name="endpoint" value="http://127.0.0.1:8765" required></label><p class="muted">Next, select your private credential header file (<code>$HOME/.local/state/tessera-alpha/owner.header</code> for the welcome-screen commands). Never paste its contents. If connection fails, these values remain here so you can correct and retry.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Select credential</button></div></form></dialog>
    <dialog id="namespace-dialog"><form id="namespace-form"><h2>Kubernetes namespace only</h2><p id="namespace-selection" class="muted">Select a kubeconfig through the native file picker. Its path and contents are not shown here.</p><button id="namespace-kubeconfig-select" type="button">Select kubeconfig</button><label>Explicit context<input name="context" required maxlength="253" autocomplete="off"></label><label>Namespace<input name="namespace" required maxlength="63" pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?" autocomplete="off"></label><p class="muted">Inspection sends named read-only namespace requests. It does not use the current context, read Secrets, install a control plane, apply, patch, delete, or run arbitrary commands.</p><div class="actions"><button type="button" data-close>Cancel</button><button type="submit">Inspect namespace (zero writes)</button></div></form><section id="namespace-detail" class="ledger-detail" aria-live="polite"><p class="muted">No namespace selected.</p></section><div class="actions"><button id="namespace-use-existing" type="button" disabled>Use existing namespace</button><button id="namespace-create-plan" type="button" disabled>Create dedicated namespace plan</button><button id="namespace-reconcile" type="button" disabled>Reconcile status (read-only)</button></div></dialog>
    <dialog id="namespace-confirm-dialog"><form id="namespace-confirm-form"><h2 id="namespace-confirm-heading">Confirm namespace action</h2><div id="namespace-confirm-detail"></div><label><input name="confirmed" type="checkbox" required> I confirm this exact namespace plan and understand that no control plane will be installed.</label><p class="muted">A create command is submitted once only. Timeout, duplicate, conflict, or unknown results require read-only reconciliation; this desktop will not replay create.</p><div class="actions"><button type="button" data-close>Cancel</button><button id="namespace-confirm-submit" type="submit">Confirm</button></div></form></dialog>

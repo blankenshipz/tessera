@@ -33,7 +33,7 @@ npm ci --prefix desktop
 npm start --prefix desktop
 ```
 
-In **Your research workflow**, choose **Connect**, use the endpoint
+In the sidebar's **Control plane** panel, choose **Connect**, use the endpoint
 `http://127.0.0.1:8765`, and select `.tessera/owner.header` with the native file
 picker. Confirm the displayed account/organization. The app does not start or
 initialize the service for you. For an existing service, use only the endpoint
@@ -41,7 +41,8 @@ and private credential file supplied by its operator.
 
 ## Follow the supported screen flow
 
-The project opens in **Experiments**. Use **Plans & decisions** for proposals and
+The project opens in **Experiments**. The sidebar groups projects and research
+destinations. Use **Plans & decisions** for proposals and
 human review, **Research ledger** for studies and findings, **Conversation** for
 coordinator/thread records, and **Operations** for workers and remote recovery.
 **Administration** is a separate destination; **Return to research** restores the
@@ -49,6 +50,13 @@ research view. Connection/recovery warnings remain outside these views. Switchin
 views does not change authority or run work. Expand **Identifiers & provenance**
 for full design IDs/digests and **Historical design revisions** for prior designs;
 unresolved states and custody warnings remain visible.
+
+Choose **Appearance** at the bottom of the sidebar to select **System**, **Light**
+or **Dark**, and a **Plum**, **Lagoon** or **Graphite** palette. Preferences apply
+immediately and stay on this desktop across reload and reconnect; System follows
+the OS. Escape closes the dialog and restores focus. Appearance never changes a
+connection, research record or execution permission. At the 900px minimum width,
+detail panes stack and actions wrap; long sidebar content and dialogs can scroll.
 
 To include coordinator context, open **Experiments** or **Plans & decisions**,
 choose **Include experiment in coordinator context** or **Include plan in

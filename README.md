@@ -11,10 +11,10 @@ integrated agent reasoning and scientific acceptance are not demonstrated.
 
 ## A look inside
 
-Actual Electron renderer and real isolated local backend with controlled UI test
-records. Platform selectors/save destinations are simulated; **no experiment
-execution or model calls**. Scientific validity is not assessed. Captures are
-cropped or masked for privacy, with visible test labels retained—not native OS proof.
+Actual Electron renderer and real isolated local backend with explicitly synthetic
+UI test records. The credential picker is substituted; **no experiment execution
+or model calls**. Scientific validity is not assessed. These renderer captures
+are not native OS-picker proof.
 
 ### Record the experiment design
 
@@ -23,20 +23,19 @@ cropped or masked for privacy, with visible test labels retained—not native OS
 An immutable design records intent, not execution authority. Provenance and prior
 designs remain available without crowding the current research question.
 
-### Inspect released test output
+### Keep uncertain observations visible
 
-![Controlled test JSON preview with manifest input and late, quarantined, unclassified status](docs/assets/alpha-results.png)
+![Synthetic human-reported failed and inconclusive observations, with no execution observed](docs/assets/alpha-results.png)
 
-Private retrieval does not classify data or accept scientific results. The fixture
-JSON explicitly identifies itself as UI test data with no execution performed.
+Historical failure and current uncertainty remain attributed to human-reported
+observations. No operation or scientific success is inferred from these records.
 
-### Review before retrieval and export
+### Separate proposals from authority
 
-![Quarantine-retention review showing late output and scientific validity not assessed](docs/assets/alpha-review.png)
+![Plans and decisions workspace with a durable zero-budget record-only test draft](docs/assets/alpha-review.png)
 
-Retention review and custody release are separate actions. Late status remains
-visible; neither action establishes scientific validity. The test journey verified
-saved bytes against the backend digest using a simulated save destination.
+The test draft survives reload and reconnect without replay. Drafting and human
+approval remain distinct from execution admission, dispatch and scientific review.
 
 ## Supported workflow
 

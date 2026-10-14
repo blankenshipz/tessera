@@ -6,6 +6,7 @@
   "main": "main.mjs",
   "files": [
     "*.mjs",
+    "*.js",
     "*.cjs",
     "*.html",
     "*.css"
@@ -13,7 +14,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check main.mjs && node --check renderer.mjs && node --check connection.mjs && node --check control-credential.mjs",
+    "check": "node --check main.mjs && node --check renderer.mjs && node --check connection.mjs && node --check control-credential.mjs && node --check appearance.js",
     "test:native-screen": "electron test/electron-screen-smoke.cjs"
   },
   "devDependencies": {

@@ -53,7 +53,7 @@ function fixture(overrides = {}) {
     registerVariant: async () => ({ id: 'v-created' }),
     study: async () => ({ completeness: 'complete_in_scope_study_ledger', study: {}, variants: [], sources: [], findings: [], corrections: [], events: [] }), ...overrides };
   const context = vm.createContext({ window: { tessera: api }, atob: globalThis.atob, TextDecoder, Uint8Array,
-    document: Object.assign(dom, { getElementById: get, createElement: tag => focusable(new Element(tag)), querySelectorAll: selector => {
+    document: Object.assign(dom, { getElementById: get, createElement: tag => focusable(new Element(tag)), querySelector: selector => selector === '.skip-link' ? get('skip-link') : null, querySelectorAll: selector => {
       if (selector === 'dialog') return dialogIds.map(get);
       if (selector === 'dialog[open]') return dialogIds.map(get).filter(dialog => dialog.open);
       if (selector === '[data-workspace-view]') return ['experiments', 'plans', 'ledger', 'conversation', 'operations'].map(view => { const panel = get('panel-'+view); panel.dataset.workspaceView = view; return panel; });
@@ -71,6 +71,13 @@ function fixture(overrides = {}) {
 }
 const thread = id => ({ id, title: id });
 const project = id => ({ id, name: id });
+
+test('keyboard skip link prevents URL navigation and moves workspace focus', () => {
+  const ui = fixture(); let prevented = false;
+  ui.get('skip-link').listeners.click({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(ui.activeElement().id, 'main-content');
+});
 
 test('403 feedback stays visible inside the open artifact dialog while authorization is cleared', async () => {
   const ui = fixture({ status: async () => null }); await flush();

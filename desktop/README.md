@@ -7,7 +7,7 @@ For the normal native **new plan → new execution** path and its explicit human
 operator/worker API boundaries, see [EXECUTION.md](EXECUTION.md). Reviewing old
 attempts or a proposal-only draft is not acceptance of that path.
 
-The **Your research workflow** guide stays visible across connection states and
+The **Next step** guide stays visible across connection states and
 spells out connect → create/import observations → propose → approve → separately
 grant/admit/dispatch → review/export → reconnect. Execution grants are
 currently API-first; admission and dispatch have separate experiment controls.
@@ -15,6 +15,30 @@ Importing a study observation is not project migration. Null-spec record-only
 drafts remain visible and editable; no command or input digest is invented.
 Approved cards display both task and immutable plan revisions because recording
 approval advances only the task revision.
+
+## Navigation and appearance
+
+The workspace sidebar keeps projects and five research destinations together:
+**Experiments**, **Plans & decisions**, **Research ledger**, **Conversation** and
+**Operations**. Select a connected project to reveal these destinations.
+**Administration** and **Return to research** keep configuration separate from
+research work. The keyboard skip link moves focus to the main workspace.
+
+Choose **Appearance** at the bottom of the sidebar for **System**, **Light** or
+**Dark**, with **Plum**, **Lagoon** or **Graphite** workspace palettes. Changes
+apply immediately and persist locally across reload and disconnect. System follows
+OS appearance changes. Escape closes the dialog and returns focus to Appearance.
+Only validated appearance enums are stored in renderer-local storage; credentials
+and research records are not. If storage is unavailable, preferences last until
+reload and the dialog says so. At the 900px minimum width, detail panes stack and
+actions wrap; the sidebar and long dialogs can scroll.
+
+The opt-in `.venv/bin/python scripts/check_desktop_workspace.py PRIVATE_OUTPUT_DIR`
+from the repository root exercises the production Electron client against a
+temporary authenticated local service, captures the three README images and checks
+draft/reconnect, appearance, focus and narrow-width geometry. Only the credential
+picker is substituted. Synthetic human-observation records are not execution
+evidence; this check makes no provider or model calls.
 
 Connect accepts private owner-controlled header files containing
 `Authorization: Bearer <control-token>` (43–4096 URL-safe token characters), with

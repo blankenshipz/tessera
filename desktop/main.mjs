@@ -15,6 +15,7 @@ import { runProtectedHelper, validateProtectedRequest } from './protected-secret
 const root = dirname(fileURLToPath(import.meta.url));
 const assets = new Map([
   ['/index.html', 'index.html'], ['/style.css', 'style.css'], ['/renderer.mjs', 'renderer.mjs'],
+  ['/appearance.js', 'appearance.js'],
 ]);
 const connection = new ControlConnection();
 const namespaceLifecycle = new NamespaceLifecycle({ picker: (parent, options) => dialog.showOpenDialog(parent, options) });
