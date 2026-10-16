@@ -7,12 +7,15 @@ import http.client
 import json
 import logging
 import os
+import socket
+import ssl
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
+import certifi
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
@@ -122,7 +125,12 @@ def _provider_get(path, secret):
     try:
         if not all(33 <= byte <= 126 for byte in secret._buffer):
             return "credential_unavailable", None
-        connection = http.client.HTTPSConnection("api.salad.com", port=443, timeout=3)
+        # The existing httpx dependency supplies certifi. Explicit Mozilla roots
+        # avoid Python installs with no default CA paths; TLS/hostname checks stay on.
+        context = ssl.create_default_context(cafile=certifi.where())
+        connection = http.client.HTTPSConnection(
+            "api.salad.com", port=443, timeout=3, context=context
+        )
         deadline = time.monotonic() + 3
         connection.request(
             "GET",
@@ -133,12 +141,18 @@ def _provider_get(path, secret):
         if 300 <= response.status < 400:
             return "redirect_denied", None
         if response.status != 200:
-            return "provider_read_failed", None
+            return {
+                401: "credential_rejected",
+                403: "provider_access_denied",
+                404: "scope_not_found",
+                408: "provider_timeout",
+                429: "provider_rate_limited",
+            }.get(response.status, "provider_http_error"), None
         raw = bytearray()
         while len(raw) <= 65536:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return "provider_read_failed", None
+                return "provider_timeout", None
             if connection.sock is not None:
                 connection.sock.settimeout(remaining)
             chunk = response.read1(min(4096, 65537 - len(raw)))
@@ -151,6 +165,12 @@ def _provider_get(path, secret):
         if not isinstance(data, dict):
             return "malformed_response", None
         return "readable", data
+    except ssl.SSLError:
+        return "provider_tls_failed", None
+    except socket.gaierror:
+        return "provider_dns_failed", None
+    except TimeoutError:
+        return "provider_timeout", None
     except Exception:
         return "provider_read_failed", None
     finally:

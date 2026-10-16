@@ -175,7 +175,10 @@ def test_explicit_readiness_version_expiry_and_redaction(directories, monkeypatc
     [
         (200, b'{"items":[]}', "project_readable"),
         (302, b"", "redirect_denied"),
-        (403, b"private error", "provider_read_failed"),
+        (401, b"private error", "credential_rejected"),
+        (403, b"private error", "provider_access_denied"),
+        (404, b"private error", "scope_not_found"),
+        (429, b"private error", "provider_rate_limited"),
         (200, b'{"items":[{"project_name":"other"}]}', "project_identity_mismatch"),
         (200, b"synthetic-only-marker", "malformed_response"),
         (200, b"x" * 65537, "malformed_response"),
@@ -188,6 +191,8 @@ def test_fixed_https_get_bounded_response(monkeypatch, status, body, expected):
         sock = None
 
         def __init__(self, host, **kwargs):
+            context = kwargs.pop("context")
+            assert context.check_hostname and context.verify_mode == salad.ssl.CERT_REQUIRED
             assert host == "api.salad.com" and kwargs == {"port": 443, "timeout": 3}
 
         def request(self, method, path, *, headers):
@@ -212,6 +217,25 @@ def test_fixed_https_get_bounded_response(monkeypatch, status, body, expected):
     assert calls == [
         ("GET", "/api/public/organizations/existing-org/projects/existing-project/containers")
     ]
+
+
+@pytest.mark.parametrize(
+    "error,reason",
+    [
+        (salad.ssl.SSLError("sensitive exception details"), "provider_tls_failed"),
+        (salad.socket.gaierror("sensitive exception details"), "provider_dns_failed"),
+        (TimeoutError("sensitive exception details"), "provider_timeout"),
+    ],
+)
+def test_transport_diagnostics_redacted(monkeypatch, error, reason):
+    def unavailable(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(salad.http.client, "HTTPSConnection", unavailable)
+    with SecretBuffer(bytearray(b"synthetic-only-marker")) as secret:
+        result = salad._provider_get("/api/public/organizations/luxai/quotas", secret)
+    assert result == (reason, None)
+    assert "sensitive" not in json.dumps(result)
 
 
 def test_real_stdio_handshake_configure_reconnect(directories):

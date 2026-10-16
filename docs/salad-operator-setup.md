@@ -64,6 +64,13 @@ Obtain the existing project name from trusted configuration or the luxai Portal;
 then pass `candidate_project` to the same tool. It makes one documented container
 collection GET for that exact candidate and returns only read-access status,
 never quota/container bodies. It does not save configuration or select a host.
+Failures return closed categories only: credential rejection, access denial,
+scope-not-found, rate limit, TLS/DNS/timeout or generic provider failure. No raw
+error bodies, headers or exception messages are exposed. An access denial is not
+permission to try another identity or guess alternate organization/project names.
+TLS uses the installed `certifi` Mozilla CA bundle (already required by `httpx`)
+with certificate and hostname verification enabled, including Python installations
+whose default system CA paths are absent. No caller-supplied CA or TLS bypass exists.
 See [official scope guidance](https://docs.salad.com/agents/container-engine/discover-scope-and-preflight).
 
 Start the human operator server using explicit **paths only**:
