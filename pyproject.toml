@@ -43,6 +43,7 @@ dev = ["httpx>=0.27,<1", "pytest>=8,<10", "ruff>=0.9,<1", "setuptools>=77,<82"]
 tessera = "tessera_control.cli:main"
 tessera-worker = "tessera_worker.cli:main"
 tessera-mcp = "tessera_mcp.server:main"
+tessera-salad-operator = "tessera_operator.salad:main"
 tessera-reasoning = "tessera_agent.remote_reasoning_runtime:main"
 tessera-a2a-peer = "tessera_control.a2a_peer:main"
 
