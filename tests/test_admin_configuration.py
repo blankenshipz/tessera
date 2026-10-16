@@ -433,6 +433,14 @@ def test_http_cross_tenant_owner_cannot_read_or_review(f):
     response = f["client"].get(f"/admin/projects/{f['project']}/records", headers=f["other"])
     assert response.status_code == 404
     command(f, target, "approve", "other", status=404)
+    assert (
+        f["client"]
+        .get(
+            f"/admin/projects/{f['project']}/records/{target['id']}/salad-setup", headers=f["other"]
+        )
+        .status_code
+        == 404
+    )
     create(f, grant(f, target, subject_id="other_owner", subject_role="human"), status=403)
 
 

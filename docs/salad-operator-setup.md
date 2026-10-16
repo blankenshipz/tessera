@@ -115,6 +115,63 @@ network listener and no additional human-approval mechanism invented here.
 
 ## Normal use, exit and return
 
+### Authoritative control metadata mode
+
+The separate control-backed mode uses an existing Salad configuration record in
+the active control database, not the private JSON file as authority:
+
+```sh
+.venv/bin/python -m tessera_operator.salad \
+  --control-url http://127.0.0.1:18765 \
+  --control-project-id TESSERA_PROJECT_ID --control-record-id ADMIN_RECORD_ID \
+  --control-token-file /PRIVATE/delegated-operator-token
+```
+
+Do not combine these options with `--state-directory`/`--credential-directory`.
+This mode exposes only inspect/configure/readiness metadata tools; it cannot read
+Salad credentials or call the provider. It never falls back to local JSON, owner
+authority, the research MCP credential, or an HTTP redirect. Non-loopback origins
+require verified HTTPS. Token files are explicit private regular files; token
+replacement is reopened for each independent operation. Configure pins that one
+verified delegated credential across inspect, POST and readback, so mid-operation
+file replacement cannot widen the write to owner authority. Server-side expiry,
+revocation and delegation checks still run on every request; there is no global
+credential cache. The client refuses a root-authority
+projection: use a separate delegated operator credential, not an owner token.
+
+One-time authority bootstrap is separate from normal use: an eligible human uses
+existing current-control authority to issue a separate project-scoped control
+credential (not an external-research credential); the operator requests its own
+exact-record delegation for `configuration.read`, `configuration.propose` and
+`readiness.read`; a different eligible root reviewer approves under existing rules.
+Never create another identity to bypass self-approval. No bootstrap/approval is
+performed by this MCP. Existing credential/delegation expiry is at most 24 hours;
+expiry/revocation denies access but does not erase the record. A fresh authorized
+credential/delegation handoff is necessary after expiry, not re-enrollment of the
+Salad key. Existing agent credentials are not globally setup-only tokens; the admin
+delegation restricts this record's administration surface.
+
+`salad_inspect()` reads `GET /admin/projects/PROJECT/records/RECORD/salad-setup`.
+`salad_configure(organization="luxai", expected_revision=REV,
+idempotency_key=KEY, proposed_project="tessera-research", project=null)` uses the
+existing revision-checked admin `revise` command. Persist the non-secret key and
+exact arguments before calling; reuse them on retry, never silently allocate a new
+key or revision. The response is a fresh authoritative HTTP readback; no cached
+success is returned when control is unavailable. Exit/reconnect rereads the same
+record. Only organization/proposed/selected project metadata changes; existing
+other configuration fields are preserved. No provider key or `credential-ref:` is
+sent to control, and no fake admin secret binding substitutes for private custody.
+
+The control projection requires both read scopes and is explicitly metadata-only:
+Portal-required or selected-unverified project, provider validation not performed
+by control, deployment/custody/billing unverified, execution disabled. A selected
+project name is not a creation or provider-health receipt. This mode connects setup
+metadata only; it does not inject runtime target policies or implement the trusted
+execution/guardian bridge. The running Kubernetes image must contain these routes
+before live use; local isolated HTTP tests are not live cluster activation proof.
+
+### Private JSON mode
+
 1. Call `salad_inspect`: returns current non-secret operator metadata and revision.
 2. Call `salad_configure(organization, project, management_host,
    credential_reference, credential_version, expected_revision)` using only the

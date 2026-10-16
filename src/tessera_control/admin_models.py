@@ -31,6 +31,9 @@ class Configuration(Closed):
     salad_project: (
         Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")] | None
     ) = None
+    salad_proposed_project: (
+        Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")] | None
+    ) = None
     country: Annotated[str, StringConstraints(pattern=r"^[A-Z]{2}$")] | None = None
     cluster_identity: Digest | None = None
     ca_digest: Digest | None = None
@@ -64,7 +67,10 @@ class Configuration(Closed):
         if self.provider not in providers[self.component]:
             raise ValueError("component/provider mismatch")
         if (
-            self.salad_organization or self.salad_project or self.country
+            self.salad_organization
+            or self.salad_project
+            or self.salad_proposed_project
+            or self.country
         ) and self.provider != "salad":
             raise ValueError("Salad account metadata requires Salad")
         if self.endpoint is not None:
@@ -195,6 +201,21 @@ class AdminRecord(Closed):
     verified_secret_versions: dict[str, int] = Field(default_factory=dict)
     enabled: Literal[False] = False
     effective: bool = False
+
+
+class SaladSetupView(Closed):
+    record: AdminRecord
+    authority: Literal["root", "delegated"]
+    state: Literal["project_creation_requires_portal", "project_selected_unverified"]
+    proposed_project: str
+    project_created: bool | None
+    portal_url: Literal["https://docs.salad.com/general/tutorials/account-setup"]
+    provider_validation: Literal["not_performed_by_control"] = "not_performed_by_control"
+    deployment: Literal["unverified"] = "unverified"
+    guardian_custody: Literal["unverified"] = "unverified"
+    billing: Literal["no_cash_hard_cap_unverified"] = "no_cash_hard_cap_unverified"
+    control_integration: Literal["metadata_only_connected"] = "metadata_only_connected"
+    execution_enabled: Literal[False] = False
 
 
 class AdminWorkspace(Closed):

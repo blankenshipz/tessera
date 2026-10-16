@@ -5,7 +5,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request
 
 from .admin import AdminStore
-from .admin_models import AdminCommand, AdminCreate, AdminRecord, AdminWorkspace, Identifier
+from .admin_models import (
+    AdminCommand,
+    AdminCreate,
+    AdminRecord,
+    AdminWorkspace,
+    Identifier,
+    SaladSetupView,
+)
 from .execution_api import Actor, Key, result
 from .protected_secrets import ProtectedSecretStore
 from .store import Forbidden
@@ -34,6 +41,11 @@ def enrollment(
             "Remote enrollment requires a server-side broker; desktop custody is unavailable."
         )
     return ProtectedSecretStore(store.database_path.parent).inspect(actor, project_id, ident)
+
+
+@router.get("/records/{ident}/salad-setup", response_model=SaladSetupView)
+def salad_setup(project_id: Identifier, ident: Identifier, actor: Actor, store: Administration):
+    return store.salad_setup(actor, project_id, ident)
 
 
 @router.get("/records", response_model=AdminWorkspace)

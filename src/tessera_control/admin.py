@@ -214,6 +214,31 @@ class AdminStore(Store):
         finally:
             db.close()
 
+    def salad_setup(self, actor, project_id, ident):
+        """Exact-record metadata projection; no provider read, approval or secret access."""
+        with _connect(self.database_path) as db:
+            db.execute("BEGIN")
+            live = self._live_principal(db, actor)
+            state = self._load(db, live, project_id, ident)
+            if state["spec"]["kind"] != "configuration" or state["spec"]["provider"] != "salad":
+                raise NotFound("Salad configuration not found.")
+            self._allow(db, live, project_id, "configuration.read", state)
+            self._allow(db, live, project_id, "readiness.read", state)
+            if state["state"] in {"revoked", "expired", "deleted", "rejected"}:
+                raise Forbidden("Salad setup record is no longer current.")
+            selected = state["spec"].get("salad_project")
+            return {
+                "record": self._projected(db, live, state),
+                "authority": "root" if self._is_root_owner(live) else "delegated",
+                "state": "project_selected_unverified"
+                if selected
+                else "project_creation_requires_portal",
+                "proposed_project": state["spec"].get("salad_proposed_project")
+                or "tessera-research",
+                "project_created": None if selected else False,
+                "portal_url": "https://docs.salad.com/general/tutorials/account-setup",
+            }
+
     def create(self, actor, project_id, key, payload):
         body = self._body(AdminCreate, payload)
         spec = body["spec"]

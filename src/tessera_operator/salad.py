@@ -413,12 +413,38 @@ def create_server(store, credential_directory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Separate human-only Salad operator stdio MCP")
-    parser.add_argument("--state-directory", required=True)
-    parser.add_argument("--credential-directory", required=True)
+    parser.add_argument("--state-directory")
+    parser.add_argument("--credential-directory")
+    parser.add_argument("--control-url")
+    parser.add_argument("--control-project-id")
+    parser.add_argument("--control-record-id")
+    parser.add_argument("--control-token-file")
     args = parser.parse_args(argv)
     logging.disable(logging.CRITICAL)
     store = None
     try:
+        control_options = (
+            args.control_url,
+            args.control_project_id,
+            args.control_record_id,
+            args.control_token_file,
+        )
+        if any(control_options):
+            if not all(control_options) or args.state_directory or args.credential_directory:
+                return 2  # No ambiguous backend selection or local authority fallback.
+            from .salad_control import SaladControl
+            from .salad_control import create_server as control_server
+
+            control = SaladControl(
+                args.control_url,
+                args.control_token_file,
+                args.control_project_id,
+                args.control_record_id,
+            )
+            control_server(control).run(transport="stdio")
+            return 0
+        if not args.state_directory or not args.credential_directory:
+            return 2
         store = ConfigurationStore(args.state_directory)
         create_server(store, args.credential_directory).run(transport="stdio")
     except Exception:
