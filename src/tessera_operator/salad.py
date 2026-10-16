@@ -31,14 +31,41 @@ class SaladConfiguration(BaseModel):
     schema_version: Literal[1] = 1
     integration: Literal["salad"] = "salad"
     organization: Name
-    project: Name
-    management_host: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$")]
+    project: Name | None = None
+    proposed_project: Name = "tessera-research"
+    management_host: (
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$")] | None
+    ) = None
     credential_reference: Annotated[str, Field(pattern=r"^credential-ref:[a-z0-9-]{1,63}$")]
     credential_version: Annotated[int, Field(ge=1, le=2**31 - 1)]
 
 
 def _digest(config):
     return hashlib.sha256(config.model_dump_json().encode()).hexdigest()
+
+
+def _setup_state(config):
+    if config is None:
+        return "unconfigured"
+    return "project_creation_requires_portal" if config.project is None else "configured"
+
+
+def _portal_action(config):
+    if config is None or config.project is not None:
+        return None
+    return {
+        "url": "https://docs.salad.com/general/tutorials/account-setup",
+        "proposed_project": config.proposed_project,
+        "project_created": False,
+        "steps": [
+            f"Open the Salad Portal and select organization {config.organization}.",
+            f"Create a project using proposed name {config.proposed_project}; "
+            "do not deploy workloads.",
+            "Return the actual project name to salad_discover_projects(candidate_project=...).",
+            "After a successful project read, save that name with salad_configure "
+            "and the inspected revision.",
+        ],
+    }
 
 
 def _directory(path):
@@ -116,7 +143,12 @@ class ConfigurationStore:
                     os.unlink(temporary, dir_fd=self.fd)
                 except FileNotFoundError:
                     pass
-            return {"state": "configured", "revision": _digest(config), "enabled": False}
+            return {
+                "state": _setup_state(config),
+                "revision": _digest(config),
+                "enabled": False,
+                "next_action": _portal_action(config),
+            }
 
 
 def _provider_get(path, secret):
@@ -226,11 +258,12 @@ def create_server(store, credential_directory):
         def inspect():
             config = store.read()
             return {
-                "state": "unconfigured" if config is None else "configured",
+                "state": _setup_state(config),
                 "revision": None if config is None else _digest(config),
                 "configuration": None if config is None else config.model_dump(),
                 "enabled": False,
                 "workload_operations": [],
+                "next_action": _portal_action(config),
             }
 
         return guarded(inspect)
@@ -240,10 +273,11 @@ def create_server(store, credential_directory):
     )
     def salad_configure(
         organization: str,
-        project: str,
-        management_host: str,
         credential_reference: str,
         credential_version: int,
+        project: str | None = None,
+        management_host: str | None = None,
+        proposed_project: str = "tessera-research",
         expected_revision: str | None = None,
     ) -> dict:
         """Persist operator metadata with compare-and-swap; no enrollment/deploy/provider effects.
@@ -256,6 +290,7 @@ def create_server(store, credential_directory):
                 SaladConfiguration(
                     organization=organization,
                     project=project,
+                    proposed_project=proposed_project,
                     management_host=management_host,
                     credential_reference=credential_reference,
                     credential_version=credential_version,
@@ -276,12 +311,17 @@ def create_server(store, credential_directory):
         def readiness():
             config = store.read()
             result = {
-                "state": "unconfigured" if config is None else "configured",
+                "state": _setup_state(config),
                 "revision": None if config is None else _digest(config),
                 "provider": "unrun",
                 "deployment": "unverified",
                 "guardian_custody": "unverified",
                 "execution_enabled": False,
+                "account": "unrun",
+                "project": "requires_portal" if config and config.project is None else "unverified",
+                "billing": "no_cash_hard_cap_unverified",
+                "control_integration": "not_connected",
+                "next_action": _portal_action(config),
             }
             if config is None or not validate_provider:
                 return result
@@ -298,7 +338,17 @@ def create_server(store, credential_directory):
                 with resolver.resolve(
                     config.credential_reference, config.credential_version
                 ) as secret:
-                    result["provider"] = provider_project(config, secret)
+                    if config.project is None:
+                        reason, _ = _provider_get(
+                            f"/api/public/organizations/{config.organization}/quotas", secret
+                        )
+                        result["provider"] = (
+                            "organization_readable" if reason == "readable" else reason
+                        )
+                        result["account"] = result["provider"]
+                    else:
+                        result["provider"] = provider_project(config, secret)
+                        result["project"] = result["provider"]
             finally:
                 resolver.close()
             return result

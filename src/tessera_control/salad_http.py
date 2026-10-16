@@ -178,11 +178,22 @@ class SaladHTTPTransport:
         if connection.sock is not None:
             connection.sock.settimeout(remaining)
 
-    def _group_observation(self, data, provider_id):
+    def _group_identity(self, data, provider_id):
         p = self._selection.salad
         actual = _uuid(data["id"])
         if provider_id is not None and actual != provider_id:
             raise _Failure("identity_mismatch")
+        if (
+            data["name"] != p.group
+            or data["organization_name"] != p.organization
+            or data["project_name"] != p.project
+        ):
+            raise _Failure("identity_mismatch")
+        return actual
+
+    def _group_observation(self, data, provider_id):
+        p = self._selection.salad
+        actual = self._group_identity(data, provider_id)
         expected = self._spec
         for key in (
             "name",
@@ -375,6 +386,25 @@ class SaladHTTPTransport:
         except Exception:
             return self._failed(_Failure("malformed_response"))
 
+    def inspect_stop(self, selection, provider_id, secret):
+        """Server-only stop preflight: exact scope/name/bound UUID, no drift gate.
+
+        This is an identity observation, NOT stopped-state or execution readiness.
+        It is deliberately not a public proxy operation or a relaxed read_group.
+        """
+        try:
+            self._check(selection, secret)
+            if not isinstance(provider_id, str) or not re.fullmatch(r"[a-f0-9]{32}", provider_id):
+                raise _Failure("identity_mismatch")
+            _, data = self._request("GET", self._group, secret)
+            return self._result(
+                dict(provider_id=self._group_identity(data, provider_id), state="unknown")
+            )
+        except _Failure as error:
+            return self._failed(error)
+        except Exception:
+            return self._failed(_Failure("malformed_response"))
+
     def send(self, operation, selection, provider_id, secret):
         try:
             self._check(selection, secret)
@@ -396,7 +426,14 @@ class SaladHTTPTransport:
             if operation != "read_group" and provider_id is None:
                 raise _Failure("identity_mismatch")
             _, data = self._request("GET", self._group, secret)
-            group = self._group_observation(data, provider_id)
+            # Stop only the bound tenant/project/name/UUID even if mutable
+            # workload configuration drifted. Such drift still fences every
+            # execution/read/delete path; a stop acknowledgement stays pending.
+            group = (
+                {"provider_id": self._group_identity(data, provider_id)}
+                if operation == "stop"
+                else self._group_observation(data, provider_id)
+            )
             if operation == "read_group":
                 return self._result(group)
             if operation == "read_instance":

@@ -305,6 +305,129 @@ def test_real_wire_composition_one_shot_pending_stop_and_reconnect(tmp_path, mon
         restarted.dispatcher(h.route["id"]).dispatch(h.route["id"], "create")
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("replicas", 2),
+        ("restart_policy", "always"),
+        ("country_codes", ["ca"]),
+        ("priority", "low"),
+    ],
+)
+def test_rev001_dispatcher_stop_after_same_uuid_mutable_drift(tmp_path, monkeypatch, field, value):
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    dispatch(h, "create")
+    command(h, "cancel")
+    drifted = copy.deepcopy(h.provider_group)
+    drifted[field] = value
+    factory = wire(h, (200, drifted), (200, drifted), (202, b""))
+    # Actual public dispatcher journey, not a direct transport/guardian call.
+    state = h.dispatcher.dispatch(h.route["id"], "stop")
+    persisted = h.store.get(h.worker, h.route["id"])
+    effect = persisted["effects"][-1]
+    assert effect["action"] == "stop"
+    assert state["receipts"][-1]["effect_id"] == effect["id"]
+    assert state["receipts"][-1]["response_status"] == 202
+    assert state["cancellation"] == "pending" and not state["termination_confirmed"]
+    assert [call[0] for call in factory.calls] == ["GET", "GET", "POST"]
+    assert factory.calls[-1][1].endswith("/" + h.body["selection"]["salad"]["group"] + "/stop")
+    with sqlite3.connect(h.store.database_path) as db:
+        claims = db.execute(
+            "SELECT payload_json FROM events WHERE event_type='salad_proxy.claim' "
+            "AND json_extract(payload_json,'$.action')='stop'"
+        ).fetchall()
+    assert len(claims) == 1
+    assert json.loads(claims[0][0])["nonce"] == effect["id"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("id", GPU),
+        ("name", "foreign-group"),
+        ("organization_name", "foreign-org"),
+        ("project_name", "foreign-project"),
+    ],
+)
+def test_rev001_dispatcher_stop_rejects_foreign_identity_before_effect(
+    tmp_path, monkeypatch, field, value
+):
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    dispatch(h, "create")
+    command(h, "cancel")
+    foreign = copy.deepcopy(h.provider_group)
+    foreign[field] = value
+    factory = wire(h, (200, foreign))
+    with pytest.raises(Conflict, match="Fresh provider preflight unavailable"):
+        h.dispatcher.dispatch(h.route["id"], "stop")
+    state = h.store.get(h.worker, h.route["id"])
+    assert not any(effect["action"] == "stop" for effect in state["effects"])
+    assert [call[0] for call in factory.calls] == ["GET"]
+
+
+@pytest.mark.parametrize("action", ["start", "observe"])
+def test_rev001_dispatcher_execution_reads_stay_strict_under_drift(tmp_path, monkeypatch, action):
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    dispatch(h, "create")
+    h.provider_group["replicas"] = 2
+    factory = wire(
+        h, *(preflight(h, absent=False) if action == "start" else [(200, h.provider_group)])
+    )
+    with pytest.raises(Conflict, match="Fresh provider preflight unavailable"):
+        h.dispatcher.dispatch(h.route["id"], action)
+    assert [call[0] for call in factory.calls] == ["GET"]
+    assert [effect["action"] for effect in h.store.get(h.worker, h.route["id"])["effects"]] == [
+        "create"
+    ]
+
+
+def test_rev001_dispatcher_rechecks_uuid_before_stop_send(tmp_path, monkeypatch):
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    dispatch(h, "create")
+    command(h, "cancel")
+    foreign = copy.deepcopy(h.provider_group)
+    foreign["id"] = GPU
+    factory = wire(h, (200, h.provider_group), (200, foreign))
+    state = h.dispatcher.dispatch(h.route["id"], "stop")
+    assert state["effects"][-1]["action"] == "stop"
+    assert state["receipts"][-1]["proxy_reason"] == "identity_mismatch"
+    assert state["cancellation"] != "confirmed"
+    assert [call[0] for call in factory.calls] == ["GET", "GET"]
+
+
+@pytest.mark.parametrize("fence", ["revoked", "version", "expired"])
+def test_rev001_dispatcher_stop_keeps_credential_fences(tmp_path, monkeypatch, fence):
+    import tessera_control.salad_server as module
+
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    dispatch(h, "create")
+    command(h, "cancel")
+    if fence == "revoked":
+        h.server.resolver.revoke("credential-ref:fixture")
+    elif fence == "version":
+        h.server.resolver.enroll(
+            "credential-ref:fixture",
+            2,
+            SecretBuffer(bytearray(b"isolated-replacement")),
+            expires_at=time.time() + 300,
+        )
+    else:
+        future = time.time() + 400
+        monkeypatch.setattr(module.time, "time", lambda: future)
+    factory = wire(h)
+    with pytest.raises(ValueError, match="credential unavailable"):
+        h.dispatcher.dispatch(h.route["id"], "stop")
+    assert not factory.calls
+    assert not any(
+        effect["action"] == "stop" for effect in h.store.get(h.worker, h.route["id"])["effects"]
+    )
+
+
 def test_lost_create_reconciles_reserved_name_never_relaunches(tmp_path, monkeypatch):
     h = fixture(tmp_path, monkeypatch)
     wire(h, *preflight(h, absent=True), TimeoutError("not-retained"))

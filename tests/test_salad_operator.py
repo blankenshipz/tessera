@@ -97,6 +97,83 @@ async def call(server, name, arguments=None):
     return json.loads(result[0].text)
 
 
+def test_account_only_setup_real_stdio_reconnect(directories):
+    state, credentials = directories
+
+    async def roundtrip(create):
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-B",
+                "-m",
+                "tessera_operator.salad",
+                "--state-directory",
+                str(state),
+                "--credential-directory",
+                str(credentials),
+            ],
+        )
+        async with stdio_client(params) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+                if create:
+                    result = await session.call_tool(
+                        "salad_configure",
+                        {
+                            "organization": "luxai",
+                            "credential_reference": "credential-ref:salad-test",
+                            "credential_version": 1,
+                        },
+                    )
+                    assert (
+                        json.loads(result.content[0].text)["state"]
+                        == "project_creation_requires_portal"
+                    )
+                result = await session.call_tool("salad_inspect", {})
+                data = json.loads(result.content[0].text)
+                assert data["state"] == "project_creation_requires_portal"
+                assert data["configuration"]["project"] is None
+                assert data["configuration"]["management_host"] is None
+                assert data["next_action"]["project_created"] is False
+                assert data["next_action"]["proposed_project"] == "tessera-research"
+                result = await session.call_tool("salad_readiness", {})
+                ready = json.loads(result.content[0].text)
+                assert ready["provider"] == "unrun"
+                assert ready["project"] == "requires_portal"
+                assert ready["billing"] == "no_cash_hard_cap_unverified"
+                assert ready["execution_enabled"] is False
+                return data["revision"]
+
+    assert asyncio.run(roundtrip(True)) == asyncio.run(roundtrip(False))
+
+
+def test_account_setup_survives_credential_expiry(directories, monkeypatch):
+    state, credentials = directories
+    store = salad.ConfigurationStore(state)
+    config = salad.SaladConfiguration(
+        organization="luxai", credential_reference="credential-ref:salad-test", credential_version=1
+    )
+    result = store.configure(config, None)
+    resolver = PrivateFileSecretResolver(credentials)
+    resolver.enroll(
+        "credential-ref:salad-test",
+        1,
+        SecretBuffer(bytearray(b"synthetic-only-marker")),
+        expires_at=time.time() + 60,
+    )
+    resolver.close()
+    server = salad.create_server(store, credentials)
+    now = time.time()
+    monkeypatch.setattr(salad.time, "time", lambda: now + 120)
+    ready = asyncio.run(call(server, "salad_readiness", {"validate_provider": True}))
+    assert ready["provider"] == "credential_unavailable"
+    inspected = asyncio.run(call(server, "salad_inspect"))
+    assert inspected["revision"] == result["revision"]
+    assert inspected["state"] == "project_creation_requires_portal"
+    assert store.configure(config, None)["reason"] == "stale_revision"
+    store.close()
+
+
 def test_metadata_default_no_credentials_no_network(directories, monkeypatch):
     state, credentials = directories
     store = salad.ConfigurationStore(state)

@@ -59,6 +59,16 @@ all databases. HTTPS has no stale-socket prerequisite.
 
 ## Normal operation and interfaces
 
+Reservation admission and every bind/ready/heartbeat recheck require the pinned
+stop credential to remain valid **strictly beyond the execution deadline plus a
+60-second recovery margin**. Insufficient coverage fails before provider reads or
+provisioning. This does not renew credentials or prevent later revocation/outages;
+those remain unresolved stop/exposure liabilities. Still-valid stop-only use does
+not require the full admission margin. Stop verifies the exact organization,
+project, reserved group name and bound UUID, but does not let mutable workload
+configuration drift block shutdown; create/start remain strictly fenced. A stop
+acknowledgement remains pending, never physical termination/no-writers proof.
+
 `SafetyHTTPSClient(host, port, token_file=..., ca_file=...,
 certificate_sha256=...).exchange(envelope)` posts to `/v1/admin`.
 

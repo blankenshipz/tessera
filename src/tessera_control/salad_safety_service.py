@@ -172,8 +172,11 @@ class SaladSafetyService:
         with alarm_budget(6):
             return self._bounded_send(row, action, provider_id)
 
-    def _bounded_send(self, row, action, provider_id):
-        proposal = RemoteProposal.model_validate_json(row["proposal"])
+    # Explicit admission reserve for stop/reconciliation after the run deadline.
+    # This is not automatic renewal or proof the provider can always terminate.
+    STOP_RECOVERY_MARGIN_SECONDS = 60
+
+    def _credential(self):
         metadata = self.resolver.metadata(self.reference)
         now = self.clock()
         if (
@@ -184,6 +187,16 @@ class SaladSafetyService:
             or metadata.expires_at <= now + 2
         ):
             raise ValueError("credential_unavailable")
+        return metadata
+
+    def _require_stop_coverage(self, deadline):
+        metadata = self._credential()
+        if metadata.expires_at <= deadline + self.STOP_RECOVERY_MARGIN_SECONDS:
+            raise ValueError("stop_credential_window_insufficient")
+
+    def _bounded_send(self, row, action, provider_id):
+        proposal = RemoteProposal.model_validate_json(row["proposal"])
+        self._credential()
         with self.resolver.resolve(self.reference, self.version) as secret:
             transport = self.transport_factory(proposal.selection)
             if action == "gpu_class":
@@ -548,6 +561,7 @@ class SaladSafetyService:
                 profile.execution.artifact_destination,
             )
             serialized = p.model_dump_json()
+            self._require_stop_coverage(body["deadline"])
             rate, rate_at = self._rate({"proposal": serialized})
             if (
                 rate * Decimal(str(body["deadline"] - now)) * 100 / 3600
@@ -610,6 +624,8 @@ class SaladSafetyService:
                 expected_files=1,
             )
         row = self._row(reservation)
+        if action in {"bind", "ready", "heartbeat"}:
+            self._require_stop_coverage(row["deadline"])
         if action == "bind":
             self._budget(row, refresh=True)
             # Caller-supplied allocation/group is not evidence. Independently

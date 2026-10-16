@@ -378,8 +378,15 @@ class TrustedSaladServer:
                 state = self.store.preflight_authority(self.worker, route_id, proposal, action)
                 self._credential()
                 result = self.transport.preflight(proposal.selection, secret)
+            elif action == "stop":
+                # A narrowly bound stop must survive mutable configuration drift.
+                # Keep credential/authority checks and fresh scope/name/UUID proof;
+                # this observation says nothing about execution or termination.
+                result = self.transport.inspect_stop(
+                    proposal.selection, state["provider_id"], secret
+                )
             else:
-                # Stop/reconcile do not depend on quota/GPU availability/grant expiry.
+                # Observe/delete keep full reviewed-profile validation.
                 result = self.transport.send(
                     "read_group", proposal.selection, state["provider_id"], secret
                 )

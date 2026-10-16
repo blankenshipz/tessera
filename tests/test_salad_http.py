@@ -240,6 +240,9 @@ def test_no_redirect_retry_raw_output_or_missing_group_termination(status, data,
     "field,value",
     [
         ("id", GPU),
+        ("organization_name", "foreign"),
+        ("project_name", "foreign"),
+        ("name", "foreign"),
         ("replicas", 2),
         ("country_codes", ["ca"]),
         ("autostart_policy", True),
@@ -250,12 +253,17 @@ def test_no_redirect_retry_raw_output_or_missing_group_termination(status, data,
         ("scheduled-scaling-enabled", True),
     ],
 )
-def test_stop_refuses_group_identity_or_selection_drift(field, value):
+def test_rev001_stop_survives_mutable_drift_but_start_stays_fenced(field, value):
     data = group()
     data[field] = value
     f = Factory((200, data))
-    assert run(f, "stop").reason == "identity_mismatch"
-    assert len(f.calls) == 1
+    assert run(f, "start").reason == "identity_mismatch"
+    f = Factory((200, data), (202, b""))
+    result = run(f, "stop")
+    if field in {"id", "organization_name", "project_name", "name"}:
+        assert result.reason == "identity_mismatch" and len(f.calls) == 1
+    else:
+        assert result.status == "pending" and len(f.calls) == 2
 
 
 def test_pin_rejects_client_selection_override_before_network():

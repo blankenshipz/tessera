@@ -8,6 +8,34 @@ The existing Kubernetes control and research MCP are unchanged.
 
 ## One-time setup
 
+### Zero-project account setup
+
+For an organization with no project, call `salad_configure(organization="luxai",
+credential_reference="credential-ref:salad-management", credential_version=1)`.
+Project and management host are optional at this stage. The CAS-protected private
+record survives reconnect and credential expiry. It reports
+`project_creation_requires_portal`, proposed slug `tessera-research`, and
+`project_created:false`; **a proposed name is not an existing project**.
+
+Follow the returned [official account setup instructions](https://docs.salad.com/general/tutorials/account-setup):
+open the Salad Portal, select `luxai`, create the project (proposed name
+`tessera-research`), and do not create/deploy any workload or change billing.
+The documented public API/SDK has no project-create/list operation; Tessera cannot
+truthfully automate this Portal step through an invented endpoint. Resume with
+the actual name via `salad_discover_projects(candidate_project=..., ...)`, then
+save it with `salad_configure(..., project=..., expected_revision=...)` after a
+successful documented container-collection read. No project is asserted created
+by merely recording its name.
+
+`salad_readiness()` separates account/project, deployment/custody, billing and
+control integration; it is offline unless explicitly asked to validate provider
+access. Zero-cash enforcement is unverified, so execution stays disabled even if
+account/project reads pass. The local operator record is **not consumed by the
+running Kubernetes control**. Its default target policies remain empty; an
+authenticated integration bridge is separate work. Never duplicate authority
+SQLite state or restart the fenced source as a shortcut. Guardian deployment and
+management-host selection are not prerequisites to this nonbillable account setup.
+
 Install the existing `mcp` optional dependency. Select the existing Salad
 organization/project and the trusted Linux management host; the host is recorded
 metadata, not an SSH destination or proof of a deployment. No target is inferred.

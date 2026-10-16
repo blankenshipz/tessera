@@ -193,10 +193,12 @@ def make_service(root, clock, key, provider):
     provider.clock = clock
     jwt = SaladWorkloadJWT(clock=clock)
     jwt.load(key_document(key), observed_at=clock())
+    resolver = FakeSecretResolver("credential-ref:guardian", now=clock)
+    resolver.expires_at = clock() + 3600
     return SaladSafetyService(
         root,
         organization_ids={"acme": ORG},
-        resolver=FakeSecretResolver("credential-ref:guardian", now=clock),
+        resolver=resolver,
         reference="credential-ref:guardian",
         version=1,
         destination="localhost",
@@ -229,6 +231,82 @@ def service_case(tmp_path):
     token = signed(key, payload)
     yield service, body, request, token, clock, provider, key, tmp_path
     service.close()
+
+
+def test_rev002_reservation_requires_stop_credential_recovery_window(tmp_path):
+    tmp_path.chmod(0o700)
+    now = 100.0
+    key = ec.generate_private_key(ec.SECP256R1())
+    provider = Provider()
+    service = make_service(tmp_path, lambda: now, key, provider)
+    body = reservation()
+    service.resolver.expires_at = body["deadline"] + 60 - 1
+    service.loop()
+    try:
+        with pytest.raises(ValueError, match="stop_credential_window_insufficient"):
+            service.admin(body)
+        assert not provider.calls
+        assert service.db.execute("SELECT count(*) FROM reservations").fetchone()[0] == 0
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 0.001])
+def test_rev002_exact_deadline_margin_boundary(tmp_path, delta):
+    tmp_path.chmod(0o700)
+    provider = Provider()
+    service = make_service(tmp_path, lambda: 100, ec.generate_private_key(ec.SECP256R1()), provider)
+    body = reservation()
+    service.resolver.expires_at = body["deadline"] + service.STOP_RECOVERY_MARGIN_SECONDS + delta
+    service.loop()
+    try:
+        if delta <= 0:
+            with pytest.raises(ValueError, match="stop_credential_window_insufficient"):
+                service.admin(body)
+            assert not provider.calls
+        else:
+            assert service.admin(body)["state"] == "ready"
+    finally:
+        service.close()
+
+
+def test_rev002_ready_rechecks_coverage_but_stop_preserves_remaining_authority(service_case):
+    service, body, _, _, clock, provider, _, _ = service_case
+    service.resolver.expires_at = body["deadline"] + 1
+    provider.calls.clear()
+    with pytest.raises(ValueError, match="stop_credential_window_insufficient"):
+        service.admin({"operation": "ready", "reservation": body["reservation"]})
+    assert not provider.calls
+    # Shortening coverage blocks new work but must not block still-valid stop-only use.
+    assignment = service._assignment(service._row(body["reservation"]))
+    assert service._stop(assignment) == "pending"
+    service.resolver.revoked = True
+    with pytest.raises(ValueError, match="credential_unavailable"):
+        service._stop(assignment)
+
+
+def test_rev001_guardian_stop_uses_same_uuid_despite_replica_drift(service_case):
+    from uuid import UUID
+
+    from test_salad_http import Factory, group
+
+    from tessera_control.salad_http import SaladHTTPTransport
+
+    service, body, _, _, _, _, _, _ = service_case
+    data = group()
+    data.update(id=str(UUID(GROUP)), replicas=2, restart_policy="always", priority="low")
+    factory = Factory((200, data), (202, b""))
+    service.transport_factory = lambda selection: SaladHTTPTransport(
+        selection, connection_factory=factory
+    )
+    assignment = service._assignment(service._row(body["reservation"]))
+    assert service._stop(assignment) == "pending"
+    assert [call[0] for call in factory.calls] == ["GET", "POST"]
+    data["id"] = str(UUID("d" * 32))
+    factory.responses = [(200, data)]
+    with pytest.raises(ValueError, match="provider_unknown"):
+        service._stop(assignment)
+    assert [call[0] for call in factory.calls] == ["GET", "POST", "GET"]
 
 
 def test_real_signature_begin_output_stop_and_reconnect(service_case):
