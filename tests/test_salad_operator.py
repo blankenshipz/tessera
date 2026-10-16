@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 
@@ -12,7 +13,7 @@ from pydantic import ValidationError
 
 from tessera_control.salad_secret_files import PrivateFileSecretResolver
 from tessera_control.salad_secrets import SecretBuffer
-from tessera_operator import salad
+from tessera_operator import salad, salad_enroll
 
 
 @pytest.fixture
@@ -172,10 +173,10 @@ def test_explicit_readiness_version_expiry_and_redaction(directories, monkeypatc
 @pytest.mark.parametrize(
     "status,body,expected",
     [
-        (200, b'{"name":"existing-project"}', "project_readable"),
+        (200, b'{"items":[]}', "project_readable"),
         (302, b"", "redirect_denied"),
         (403, b"private error", "provider_read_failed"),
-        (200, b'{"name":"other"}', "project_identity_mismatch"),
+        (200, b'{"items":[{"project_name":"other"}]}', "project_identity_mismatch"),
         (200, b"synthetic-only-marker", "malformed_response"),
         (200, b"x" * 65537, "malformed_response"),
     ],
@@ -208,7 +209,9 @@ def test_fixed_https_get_bounded_response(monkeypatch, status, body, expected):
     monkeypatch.setattr(salad.http.client, "HTTPSConnection", Connection)
     with SecretBuffer(bytearray(b"synthetic-only-marker")) as secret:
         assert salad.provider_project(configuration(), secret) == expected
-    assert calls == [("GET", "/api/public/organizations/existing-org/projects/existing-project")]
+    assert calls == [
+        ("GET", "/api/public/organizations/existing-org/projects/existing-project/containers")
+    ]
 
 
 def test_real_stdio_handshake_configure_reconnect(directories):
@@ -235,6 +238,7 @@ def test_real_stdio_handshake_configure_reconnect(directories):
                     "salad_inspect",
                     "salad_configure",
                     "salad_readiness",
+                    "salad_discover_projects",
                 }
                 if configure:
                     result = await session.call_tool(
@@ -249,3 +253,158 @@ def test_real_stdio_handshake_configure_reconnect(directories):
 
     asyncio.run(session_round(True))
     asyncio.run(session_round(False))
+
+
+def test_discovery_fixed_luxai_no_invented_project_listing(directories, monkeypatch):
+    state, credentials = directories
+    resolver = PrivateFileSecretResolver(credentials)
+    resolver.enroll(
+        "credential-ref:salad-test",
+        1,
+        SecretBuffer(bytearray(b"synthetic-only-marker")),
+        expires_at=time.time() + 60,
+    )
+    resolver.close()
+    requests = []
+
+    def get(path, secret):
+        requests.append(path)
+        return "readable", {"items": []}
+
+    monkeypatch.setattr(salad, "_provider_get", get)
+    store = salad.ConfigurationStore(state)
+    server = salad.create_server(store, credentials)
+    args = {"credential_reference": "credential-ref:salad-test", "credential_version": 1}
+    result = asyncio.run(call(server, "salad_discover_projects", args))
+    assert result["project_discovery"] == "unsupported_by_public_api"
+    assert result["provider"] == "organization_readable"
+    result = asyncio.run(
+        call(server, "salad_discover_projects", args | {"candidate_project": "existing-project"})
+    )
+    assert result["provider"] == "project_readable"
+    assert requests == [
+        "/api/public/organizations/luxai/quotas",
+        "/api/public/organizations/luxai/projects/existing-project/containers",
+    ]
+    assert store.read() is None
+    assert "synthetic-only-marker" not in json.dumps(result)
+    requests.clear()
+    invalid = asyncio.run(
+        call(server, "salad_discover_projects", args | {"candidate_project": "../escape"})
+    )
+    assert invalid["state"] == "blocked"
+    assert requests == []
+    store.close()
+
+
+def test_enrollment_refuses_non_tty_and_secret_arguments(directories):
+    _, credentials = directories
+    cmd = [
+        sys.executable,
+        "-m",
+        "tessera_operator.salad_enroll",
+        "--credential-directory",
+        str(credentials),
+        "--reference",
+        "credential-ref:salad-test",
+    ]
+    result = subprocess.run(cmd, input="synthetic-only-marker\n", capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "synthetic-only-marker" not in result.stdout + result.stderr
+    assert not (credentials / "salad-test.credential").exists()
+    result = subprocess.run(
+        cmd + ["--key", "synthetic-only-marker"], capture_output=True, text=True
+    )
+    assert result.returncode == 2
+    assert "synthetic-only-marker" not in result.stdout + result.stderr
+
+
+def test_enrollment_no_overwrite_or_echo_fallback(directories, monkeypatch, capsys):
+    _, credentials = directories
+    resolver = PrivateFileSecretResolver(credentials)
+    resolver.enroll(
+        "credential-ref:salad-test",
+        1,
+        SecretBuffer(bytearray(b"synthetic-only-marker")),
+        expires_at=time.time() + 60,
+    )
+    resolver.close()
+    before = (credentials / "salad-test.credential").read_bytes()
+    monkeypatch.setattr(salad_enroll, "hidden_secret", lambda: pytest.fail("must not prompt"))
+    assert (
+        salad_enroll.main(
+            ["--credential-directory", str(credentials), "--reference", "credential-ref:salad-test"]
+        )
+        == 2
+    )
+    assert (credentials / "salad-test.credential").read_bytes() == before
+    assert "synthetic-only-marker" not in capsys.readouterr().err
+
+
+def test_hidden_input_rejects_echo_warning(monkeypatch):
+    import warnings
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    def unsupported(prompt):
+        warnings.warn("echo unavailable", salad_enroll.getpass.GetPassWarning, stacklevel=1)
+        pytest.fail("must stop before fallback")
+
+    monkeypatch.setattr(salad_enroll.getpass, "getpass", unsupported)
+    with pytest.raises(salad_enroll.getpass.GetPassWarning):
+        salad_enroll.hidden_secret()
+
+
+def test_real_hidden_terminal_enrollment_no_echo(directories):
+    import pty
+    import select
+
+    _, credentials = directories
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "tessera_operator.salad_enroll",
+            "--credential-directory",
+            str(credentials),
+            "--reference",
+            "credential-ref:salad-test",
+            "--expires-in-hours",
+            "24",
+        ],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        deadline = time.monotonic() + 10
+        while b"local entry only): " not in output:
+            assert time.monotonic() < deadline
+            if select.select([master], [], [], 0.2)[0]:
+                output.extend(os.read(master, 4096))
+        # The prompt is emitted after getpass has disabled terminal echo.
+        os.write(master, b"synthetic-only-marker\n")
+        while process.poll() is None:
+            assert time.monotonic() < deadline
+            if select.select([master], [], [], 0.2)[0]:
+                try:
+                    output.extend(os.read(master, 4096))
+                except OSError:
+                    break
+        assert process.wait(timeout=5) == 0
+        assert b"synthetic-only-marker" not in output
+        assert b'"reference": "credential-ref:salad-test"' in output
+        resolver = PrivateFileSecretResolver(credentials)
+        with resolver.resolve("credential-ref:salad-test", 1) as secret:
+            assert secret._buffer == bytearray(b"synthetic-only-marker")
+        resolver.close()
+        assert stat.S_IMODE((credentials / "salad-test.credential").stat().st_mode) == 0o600
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)

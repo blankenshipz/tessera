@@ -116,29 +116,29 @@ class ConfigurationStore:
             return {"state": "configured", "revision": _digest(config), "enabled": False}
 
 
-def provider_project(config, secret):
+def _provider_get(path, secret):
     """Exactly one GET to a fixed origin/path; no redirects, retries or proxy env."""
     connection = None
     try:
         if not all(33 <= byte <= 126 for byte in secret._buffer):
-            return "credential_unavailable"
+            return "credential_unavailable", None
         connection = http.client.HTTPSConnection("api.salad.com", port=443, timeout=3)
         deadline = time.monotonic() + 3
         connection.request(
             "GET",
-            f"/api/public/organizations/{config.organization}/projects/{config.project}",
+            path,
             headers={"Salad-Api-Key": secret._buffer.decode("ascii"), "Accept": "application/json"},
         )
         response = connection.getresponse()
         if 300 <= response.status < 400:
-            return "redirect_denied"
+            return "redirect_denied", None
         if response.status != 200:
-            return "provider_read_failed"
+            return "provider_read_failed", None
         raw = bytearray()
         while len(raw) <= 65536:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return "provider_read_failed"
+                return "provider_read_failed", None
             if connection.sock is not None:
                 connection.sock.settimeout(remaining)
             chunk = response.read1(min(4096, 65537 - len(raw)))
@@ -146,16 +146,46 @@ def provider_project(config, secret):
                 break
             raw.extend(chunk)
         if len(raw) > 65536 or secret.contains_in(raw):
-            return "malformed_response"
+            return "malformed_response", None
         data = json.loads(raw)
-        if not isinstance(data, dict) or data.get("name") != config.project:
-            return "project_identity_mismatch"
-        return "project_readable"
+        if not isinstance(data, dict):
+            return "malformed_response", None
+        return "readable", data
     except Exception:
-        return "provider_read_failed"
+        return "provider_read_failed", None
     finally:
         if connection is not None:
             connection.close()
+
+
+def provider_project(config, secret):
+    reason, data = _provider_get(
+        f"/api/public/organizations/{config.organization}/projects/{config.project}/containers",
+        secret,
+    )
+    if reason != "readable":
+        return reason
+    if not isinstance(data.get("items"), list):
+        return "malformed_response"
+    for item in data["items"]:
+        if not isinstance(item, dict) or (
+            item.get("organization_name", config.organization) != config.organization
+            or item.get("project_name", config.project) != config.project
+        ):
+            return "project_identity_mismatch"
+    return "project_readable"
+
+
+class ProjectRead(BaseModel):
+    organization: Name
+    project: Name
+
+
+class ScopeReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    credential_reference: Annotated[str, Field(pattern=r"^credential-ref:[a-z0-9-]{1,63}$")]
+    credential_version: Annotated[int, Field(ge=1, le=2**31 - 1)]
+    candidate_project: Name | None = None
 
 
 def create_server(store, credential_directory):
@@ -254,6 +284,59 @@ def create_server(store, credential_directory):
             return result
 
         return guarded(readiness)
+
+    @server.tool(
+        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
+    )
+    def salad_discover_projects(
+        credential_reference: str, credential_version: int, candidate_project: str | None = None
+    ) -> dict:
+        """Validate luxai scope; the public API CANNOT enumerate projects.
+
+        No candidate: one GET of luxai quotas. Candidate: one GET of its container
+        collection. No raw quota/container data is returned. No key values accepted.
+        """
+
+        def discover():
+            reference = ScopeReference(
+                credential_reference=credential_reference,
+                credential_version=credential_version,
+                candidate_project=candidate_project,
+            )
+            result = {
+                "organization": "luxai",
+                "project_discovery": "unsupported_by_public_api",
+                "candidate_project": reference.candidate_project,
+                "provider": "credential_unavailable",
+                "execution_enabled": False,
+            }
+            resolver = PrivateFileSecretResolver(credential_directory)
+            try:
+                metadata = resolver.metadata(reference.credential_reference)
+                if (
+                    metadata.version != reference.credential_version
+                    or metadata.revoked
+                    or metadata.expires_at <= time.time() + 3
+                ):
+                    return result
+                with resolver.resolve(
+                    reference.credential_reference, reference.credential_version
+                ) as secret:
+                    if reference.candidate_project is None:
+                        reason, _ = _provider_get("/api/public/organizations/luxai/quotas", secret)
+                        result["provider"] = (
+                            "organization_readable" if reason == "readable" else reason
+                        )
+                    else:
+                        config = ProjectRead(
+                            organization="luxai", project=reference.candidate_project
+                        )
+                        result["provider"] = provider_project(config, secret)
+            finally:
+                resolver.close()
+            return result
+
+        return guarded(discover)
 
     return server
 

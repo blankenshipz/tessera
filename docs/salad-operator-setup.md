@@ -2,7 +2,7 @@
 
 This separate **human/operator-only** stdio MCP records Salad setup and optionally
 checks read-only account/project access. Never add it to the research-agent MCP
-configuration. It does not deploy services, enroll credentials, approve research,
+configuration. The MCP does not deploy services, enroll credentials, approve research,
 enable dispatch, create/start workloads, provision GPUs, or purchase credits.
 The existing Kubernetes control and research MCP are unchanged.
 
@@ -24,6 +24,47 @@ arguments, environment, configuration, MCP arguments, logs or Git. A reference i
 not inherited by a child process unless the actual private backend is available.
 The secret remains in the trusted operator process during explicit validation;
 this is not a workload credential or remote deployment custody mechanism.
+
+### Private local enrollment (human terminal only)
+
+The separate command below accepts the existing management key through a hidden
+terminal prompt, **not chat**. No key may be supplied as an argument, environment
+variable, stdin pipe or MCP request. It refuses non-terminals and echo fallback,
+validates private paths, and creates version 1 only. Existing references are never
+overwritten, even by concurrent entry. It prints only reference/version/expiry.
+Directory preparation is separate; local setup already prepared these mode-0700
+directories. From this checkout run this exact command in a local terminal:
+
+```sh
+/Users/zach/Code/tessera/.venv/bin/python -m tessera_operator.salad_enroll \
+  --credential-directory /Users/zach/Code/tessera/.tessera/private/salad-operator/credentials \
+  --reference credential-ref:salad-management --expires-in-hours 24
+```
+
+This is one-time private entry of the already-authorized key, not a request to
+paste it into chat again. There is no chat-to-runtime secret handoff. The process
+must run with the checkout installed (the local `.venv` is editable); elsewhere
+install the package first. The command has no network effects and does not validate
+the key. After 24 hours metadata inspection still works, but provider validation
+requires a fresh private reference. Expiry is not provider key revocation. Existing
+runtime workload/safety credentials are unchanged. Rotation of existing backend
+entries remains a separately administered resolver operation. Python/getpass creates
+immutable string copies; hidden entry and buffer wiping do not guarantee process
+memory erasure. Keep terminal/session recording, tracing and dumps disabled.
+
+### luxai scope and project selection
+
+`salad_discover_projects(credential_reference="credential-ref:salad-management",
+credential_version=1)` makes exactly one `GET /organizations/luxai/quotas` to
+validate organization read access. Despite the tool's discoverability name,
+`project_discovery` truthfully reports `unsupported_by_public_api`: the official
+Salad public OpenAPI has **no organization/project enumeration or project-get
+operation**. Do not guess names or call undocumented `/projects` endpoints.
+Obtain the existing project name from trusted configuration or the luxai Portal;
+then pass `candidate_project` to the same tool. It makes one documented container
+collection GET for that exact candidate and returns only read-access status,
+never quota/container bodies. It does not save configuration or select a host.
+See [official scope guidance](https://docs.salad.com/agents/container-engine/discover-scope-and-preflight).
 
 Start the human operator server using explicit **paths only**:
 
@@ -50,7 +91,7 @@ network listener and no additional human-approval mechanism invented here.
 4. Only when provider validation is authorized, call
    `salad_readiness(validate_provider=true)`. It resolves the pinned private key
    and makes exactly one bounded GET of the selected project at
-   `https://api.salad.com/api/public/organizations/ORG/projects/PROJECT`.
+   `https://api.salad.com/api/public/organizations/ORG/projects/PROJECT/containers`.
    No endpoint overrides, redirects, retries or environment proxies are supported.
    Provider errors/bodies/headers and credentials are never returned. A successful
    `project_readable` means read access only—not independent deployment, quota,
@@ -66,6 +107,8 @@ approval or provider enablement switch. Existing
 [Salad proxy admission](salad-proxy.md) and
 [independent safety/custody](salad-safety-service.md) requirements still apply.
 Deployment and genuinely independent service readiness remain separate prerequisites.
+The cash ceiling remains zero: Salad documents overrun invoices even with manual
+recharge. Existing credits are not a verified financial hard cap; execution stays disabled.
 
 Other integrations can reuse the explicit startup paths, strict versioned typed
 configuration, private fixed filenames, atomic compare-and-swap persistence and
