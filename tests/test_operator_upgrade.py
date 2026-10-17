@@ -1,20 +1,29 @@
 """Synthetic-only upgrade admission. No real Docker/Kubernetes/backup actions."""
 
 import asyncio
+import contextlib
 import copy
+import io
 import json
 import sqlite3
 import sys
+import time
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from tessera_control.recovery import backup_state
+from tessera_control.store import initialize_state
 from tessera_operator import build_receipt, upgrade
 from tessera_operator import upgrade_support as activation
 from tessera_operator import upgrade_support as private_import
 from tessera_operator import upgrade_support as target
+
+_REAL_SNAPSHOT_HEAD = upgrade._snapshot_head
+_REAL_VALIDATE_BACKUP = target.validate_backup
 
 OLD = "docker.io/library/tessera-local-persistent@sha256:" + "a" * 64
 NEW = "docker.io/library/tessera-local-persistent@sha256:" + "b" * 64
@@ -135,6 +144,20 @@ def case(tmp_path, monkeypatch):
     monkeypatch.setattr(upgrade, "_now", lambda: state["clock"], raising=False)
     monkeypatch.setattr(upgrade, "_control_head", lambda pod: state["head"], raising=False)
     monkeypatch.setattr(upgrade, "_snapshot_head", lambda path: "1" * 64, raising=False)
+    monkeypatch.setattr(
+        upgrade,
+        "_control_backup_health",
+        lambda pod: (
+            state.get("health_override")
+            or {
+                "singleton": 1,
+                "last_backup_id": "backup-1",
+                "last_success_at": datetime.fromtimestamp(state["clock"], UTC).isoformat(),
+                "last_failure_at": None,
+                "last_failure_code": None,
+            }
+        ),
+    )
     return SimpleNamespace(
         deployment=deployment, backend=backend, inventory=inventory, state=state, base=base
     )
@@ -380,6 +403,10 @@ def test_rev005_actual_sqlite_head_covers_non_event_authority_write(tmp_path):
             "CREATE TABLE delegation(revision INTEGER, enabled INTEGER);"
             "INSERT INTO delegation VALUES(1,1);"
         )
+        db.executescript(
+            upgrade._HEALTH_SQL
+            + "; INSERT INTO operator_backup_health VALUES(1,NULL,NULL,NULL,NULL);"
+        )
         with sqlite3.connect(snapshot) as out:
             db.backup(out)
     first = upgrade._snapshot_head(database)
@@ -400,3 +427,158 @@ def test_rev004_published_proof_remains_valid_after_subsequent_pod_recreation(ca
     assert (upgrade.ROOT / "current.json").read_bytes() == pointer
     assert activation.ready_pod()["pod_uid"] == "later-pod"
     assert len(case.state["patches"]) == 1
+
+
+def test_real_normal_backup_health_write_preserves_authority_head(tmp_path):
+    source = tmp_path / "state"
+    initialize_state(source)
+    before = upgrade._snapshot_head(source / "tessera.sqlite3")
+    target_backup = tmp_path / "backup"
+    manifest = backup_state(source, target_backup)
+    with sqlite3.connect(source / "tessera.sqlite3") as db:
+        assert (
+            db.execute("SELECT last_backup_id FROM operator_backup_health").fetchone()[0]
+            == manifest["backup_id"]
+        )
+    assert upgrade._snapshot_head(target_backup / "snapshot.sqlite3") == before
+    assert upgrade._snapshot_head(source / "tessera.sqlite3") == before
+
+
+@pytest.fixture
+def real_sqlite_case(case, tmp_path, monkeypatch):
+    source = tmp_path / "real-state"
+    initialize_state(source)
+    database = source / "tessera.sqlite3"
+    with sqlite3.connect(database) as db:
+        case.backend["incarnation"] = db.execute(
+            "SELECT incarnation FROM control_recovery"
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO projects (id,org_id,name,created_at) "
+            "SELECT 'fixture-project',id,'fixture','fixture' FROM organizations LIMIT 1"
+        )
+        db.execute("""INSERT INTO events
+            (org_id,project_id,event_type,resource_revision,actor_principal_id,created_at,payload_json)
+            SELECT org_id,'fixture-project','fixture',1,id,'fixture','{}'
+            FROM principals LIMIT 1""")
+        db.execute("""INSERT INTO operator_audit_events
+            (org_id,event_type,decision,created_at,payload_json)
+            SELECT id,'admin.state','allowed','fixture',
+            '{"id":"fixture","spec":{"kind":"delegation"},"state":"approved"}'
+            FROM organizations LIMIT 1""")
+    case.state["clock"] = time.time()
+
+    def health(pod):
+        with sqlite3.connect(database) as db:
+            db.execute("BEGIN")
+            return upgrade._health_state(db)
+
+    def backup(pod, stage, output):
+        manifest = backup_state(source, output)
+        return {
+            "pod_uid": pod["pod_uid"],
+            "pv_uid": "pv",
+            "backup_id": manifest["backup_id"],
+            "snapshot_sha256": manifest["sha256"],
+            "incarnation": case.backend["incarnation"],
+            "recovery_state": "active",
+        }
+
+    monkeypatch.setattr(upgrade, "_snapshot_head", _REAL_SNAPSHOT_HEAD)
+    monkeypatch.setattr(upgrade, "_control_head", lambda pod: _REAL_SNAPSHOT_HEAD(database))
+    monkeypatch.setattr(upgrade, "_control_backup_health", health)
+    monkeypatch.setattr(upgrade.recovery, "_pod_backup", backup)
+    monkeypatch.setattr(target, "validate_backup", _REAL_VALIDATE_BACKUP)
+    return database, case
+
+
+def test_real_backup_health_bookkeeping_allows_bound_admission(real_sqlite_case):
+    database, case = real_sqlite_case
+    saved = prepared()
+    freshness = private_import._receipt(upgrade.ROOT / OP / "backup-freshness.json")
+    assert freshness["fingerprint_version"] == upgrade.HEAD_VERSION
+    assert freshness["backup_health"]["last_backup_id"]
+    assert (
+        upgrade.apply(OP, saved["plan_sha256"])["state"]
+        == "image_patch_submitted_readiness_unproven"
+    )
+    assert len(case.state["patches"]) == 1  # Synthetic K8s; real SQLite backup/health/admission.
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE credentials SET revoked_at='fixture-revoked'",
+        "UPDATE credentials SET expires_at='fixture-expiry'",
+        "DELETE FROM credentials",
+        "UPDATE operator_audit_events SET payload_json='{}' WHERE event_type='admin.state'",
+        "DELETE FROM operator_audit_events WHERE event_type='admin.state'",
+        "INSERT INTO operator_audit_events (org_id,event_type,decision,created_at,payload_json) "
+        "SELECT id,'admin.state','allowed','fixture','{}' FROM organizations LIMIT 1",
+        "UPDATE events SET payload_json='\"changed-event\"'",
+        "UPDATE control_recovery SET state='held_restore'",
+        "UPDATE control_recovery SET incarnation='different-fence'",
+        "UPDATE control_recovery SET source_backup_digest='different-source-fence'",
+    ],
+)
+def test_real_substantive_insert_update_delete_revocation_fence_rejected(
+    real_sqlite_case, mutation
+):
+    database, case = real_sqlite_case
+    saved = prepared()
+    with sqlite3.connect(database) as db:
+        assert db.execute(mutation).rowcount > 0
+    with pytest.raises(target.AdmissionError, match="backup control state changed"):
+        upgrade.apply(OP, saved["plan_sha256"])
+    assert not (upgrade.ROOT / "apply-claim.json").exists() and not case.state["patches"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE operator_backup_health SET last_backup_id='wrong-backup'",
+        "UPDATE operator_backup_health SET last_failure_code='failed',last_failure_at='fixture'",
+        "UPDATE operator_backup_health SET last_success_at='1970-01-01T00:00:00+00:00'",
+        "ALTER TABLE operator_backup_health ADD COLUMN authority_flag INTEGER",
+        "DELETE FROM operator_backup_health",
+    ],
+)
+def test_health_row_mismatch_or_unknown_schema_never_admits(real_sqlite_case, mutation):
+    database, case = real_sqlite_case
+    saved = prepared()
+    with sqlite3.connect(database) as db:
+        assert db.execute(mutation).rowcount != 0
+    with pytest.raises(target.AdmissionError):
+        upgrade.apply(OP, saved["plan_sha256"])
+    assert not (upgrade.ROOT / "apply-claim.json").exists() and not case.state["patches"]
+
+
+def test_old_fingerprint_receipt_cannot_be_reused(case):
+    saved = prepared()
+    path = upgrade.ROOT / OP / "backup-freshness.json"
+    value = json.loads(path.read_text())
+    value.pop("fingerprint_version")
+    path.write_text(json.dumps(value))
+    with pytest.raises(target.AdmissionError, match="fingerprint contract changed"):
+        upgrade.apply(OP, saved["plan_sha256"])
+    assert not (upgrade.ROOT / "apply-claim.json").exists() and not case.state["patches"]
+
+
+def test_generated_pod_observation_code_is_self_contained(tmp_path, monkeypatch):
+    source = tmp_path / "observation-state"
+    initialize_state(source)
+    database = source / "tessera.sqlite3"
+
+    def local_pod_simulation(argv, **kwargs):
+        assert argv[-3:-1] == ["python", "-c"]
+        code = argv[-1].replace(
+            "file:/state/control/tessera.sqlite3?mode=ro", database.as_uri() + "?mode=ro"
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exec(code, {})
+        return SimpleNamespace(returncode=0, stdout=output.getvalue().encode())
+
+    monkeypatch.setattr(upgrade.subprocess, "run", local_pod_simulation)
+    assert upgrade._control_head({"pod_name": "synthetic-pod"}) == _REAL_SNAPSHOT_HEAD(database)
+    assert upgrade._control_backup_health({"pod_name": "synthetic-pod"})["singleton"] == 1

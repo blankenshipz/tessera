@@ -92,9 +92,23 @@ ID. Disconnect does not delete receipts, restore authority or replay mutations.
    the owned Pod, retained independently on the Mac. Its generated backup path is
    unique to this operation; old before/after backups are never overwritten. A
    partial preparation is retained and cannot silently retry under the same ID.
-   Preparation binds the backup's complete logical SQL-state digest (not merely
+   Preparation binds a versioned authority/data SQL-state digest (not merely
    events/schema/incarnation) to matching live read transactions before and after
-   the backup. It retains a separate immutable freshness receipt, timestamped at
+   the backup. `authority-sql-v2-backup-health-row` normalizes only four values in
+   the exact `operator_backup_health` singleton: success time/backup ID and failure
+   time/code. The normal backup records this operational status after copying its
+   snapshot. Keeping that row in the authority digest self-invalidates every
+   successful backup. The row grants no recovery/credential/policy authority;
+   administrative/delegation records in `operator_audit_events` are **not** excluded.
+   Exact health-table DDL/columns/singleton are required; its schema and every
+   other SQL statement remain hashed. Unknown shape refuses admission.
+
+   Operational status is independently bound: the live successful health record
+   must name this exact backup, have no failure, and have an aware success time in
+   the observed backup interval (five seconds allowed for same-host clock skew).
+   Apply requires that record unchanged. Backup health reporting is not disabled.
+   The plan/freshness receipt declare the fingerprint version; old full-dump
+   receipts cannot be relabeled/reused. The immutable freshness receipt starts at
    backup start. Raw SQL/private values never leave these hashing routines.
 3. `local_control_upgrade_apply(operation,expected_plan_sha256)` rechecks the
    plan/capacity/backup and commits a global one-use apply claim **before** a JSON
@@ -102,8 +116,9 @@ ID. Disconnect does not delete receipts, restore authority or replay mutations.
    Only the container image is replaced. PVC/other spec fields are never edited.
    The normal Kubernetes Recreate controller owns old/new writer sequencing.
    Immediately before the claim, apply requires backup age in `[0,300]` seconds
-   and a matching fresh full SQL-state observation. Age expiry, changed authority
-   state, or unavailable observation rejects **before** claiming or patching.
+    and a matching versioned authority/data observation plus the independently
+    bound backup-health record. Age expiry, changed substantive state, mismatched
+    bookkeeping, or unavailable observation rejects **before** claiming or patching.
    Refresh uses a new operation ID, plan and create-only backup; retained evidence
    is never overwritten. This is a state-at-observation binding, **not** an atomic
    writer fence: a write may commit after that observation and before Recreate

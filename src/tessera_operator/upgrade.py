@@ -16,6 +16,7 @@ import stat
 import subprocess
 import time
 from contextlib import contextmanager
+from datetime import datetime
 
 from mcp.types import ToolAnnotations
 
@@ -29,35 +30,90 @@ IMAGE = r"docker\.io/library/tessera-local-persistent@sha256:[a-f0-9]{64}"
 IDENTITY = ("namespace_uid", "deployment_uid", "pvc_uid", "pv_uid")
 MIN_NODE_FREE = 5 * 1024**3
 MAX_BACKUP_AGE_SECONDS = 300
+HEAD_VERSION = "authority-sql-v2-backup-health-row"
+_HEALTH_COLUMNS = (
+    "singleton",
+    "last_success_at",
+    "last_backup_id",
+    "last_failure_at",
+    "last_failure_code",
+)
+_HEALTH_SQL = """CREATE TABLE operator_backup_health (
+singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+last_success_at TEXT,
+last_backup_id TEXT,
+last_failure_at TEXT,
+last_failure_code TEXT
+)"""
 
 
 def _now():
     return time.time()
 
 
+def _health_state(db):
+    schema = db.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='operator_backup_health'"
+    ).fetchone()
+    if schema is None or " ".join(schema[0].split()) != " ".join(_HEALTH_SQL.split()):
+        raise ValueError("unsupported backup health schema")
+    columns = db.execute("PRAGMA table_info(operator_backup_health)").fetchall()
+    expected = [
+        (name, "INTEGER" if name == "singleton" else "TEXT", 0, None, int(name == "singleton"))
+        for name in _HEALTH_COLUMNS
+    ]
+    if [tuple(row[1:]) for row in columns] != expected:
+        raise ValueError("unsupported backup health columns")
+    rows = db.execute(
+        "SELECT singleton,last_success_at,last_backup_id,last_failure_at,last_failure_code "
+        "FROM operator_backup_health"
+    ).fetchall()
+    if len(rows) != 1 or rows[0][0] != 1:
+        raise ValueError("backup health singleton unavailable")
+    return dict(zip(_HEALTH_COLUMNS, rows[0], strict=True))
+
+
 def _logical_head(db):
-    # All SQL state, not just event cursor: includes credentials, delegations and
-    # idempotency. Only a digest leaves this function; SQL values are never logged.
+    # Every schema/data statement remains hashed except four values in the exact
+    # validated non-authorizing backup-health singleton. Its schema/key remain.
+    # Admin/delegation state lives in operator_audit_events, never excluded here.
     db.execute("BEGIN")
+    _health_state(db)
     digest = hashlib.sha256()
+    digest.update(HEAD_VERSION.encode() + b"\0")
+    normalized = 0
     for statement in db.iterdump():
+        if statement.startswith('INSERT INTO "operator_backup_health" VALUES('):
+            statement = 'INSERT INTO "operator_backup_health" VALUES(1,NULL,NULL,NULL,NULL);'
+            normalized += 1
         encoded = statement.encode()
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
+    if normalized != 1:
+        raise ValueError("backup health dump shape unsupported")
     return digest.hexdigest()
 
 
 def _snapshot_head(path):
-    with sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True) as db:
-        return _logical_head(db)
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True) as db:
+            return _logical_head(db)
+    except (sqlite3.Error, ValueError):
+        raise target.AdmissionError("backup state schema unverifiable") from None
 
 
-def _control_head(pod):
-    code = "import hashlib,sqlite3\n" + inspect.getsource(_logical_head)
+def _control_observation(pod, health=False):
+    code = "import hashlib,sqlite3,json\n"
+    for name in ("HEAD_VERSION", "_HEALTH_COLUMNS", "_HEALTH_SQL"):
+        code += name + "=" + repr(globals()[name]) + "\n"
+    code += inspect.getsource(_health_state) + "\n" + inspect.getsource(_logical_head)
     code += (
         "\nwith sqlite3.connect('file:/state/control/tessera.sqlite3?mode=ro',uri=True) as db:\n"
     )
-    code += " print(_logical_head(db))\n"
+    if health:
+        code += " db.execute('BEGIN')\n print(json.dumps(_health_state(db)))\n"
+    else:
+        code += " print(json.dumps(_logical_head(db)))\n"
     try:
         result = subprocess.run(
             [
@@ -76,16 +132,52 @@ def _control_head(pod):
             capture_output=True,
             timeout=15,
         )
-        head = result.stdout.decode().strip()
-        if result.returncode or not re.fullmatch(r"[a-f0-9]{64}", head):
+        if result.returncode or len(result.stdout) > 8192:
             raise ValueError()
-        return head
+        return json.loads(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         raise target.AdmissionError("backup control state unverifiable") from None
 
 
+def _control_head(pod):
+    head = _control_observation(pod)
+    if not isinstance(head, str) or not re.fullmatch(r"[a-f0-9]{64}", head):
+        raise target.AdmissionError("backup control state unverifiable")
+    return head
+
+
+def _control_backup_health(pod):
+    return _control_observation(pod, health=True)
+
+
+def _bound_backup_health(pod, backup, started):
+    state = _control_backup_health(pod)
+    try:
+        if set(state) != set(_HEALTH_COLUMNS) or state["singleton"] != 1:
+            raise ValueError()
+        if (
+            state["last_backup_id"] != backup["backup_id"]
+            or state["last_failure_at"] is not None
+            or state["last_failure_code"] is not None
+        ):
+            raise ValueError()
+        if not isinstance(state["last_success_at"], str):
+            raise ValueError()
+        success = datetime.fromisoformat(state["last_success_at"].replace("Z", "+00:00"))
+        if success.tzinfo is None or not started - 5 <= success.timestamp() <= _now() + 5:
+            raise ValueError()
+        return {
+            "last_backup_id": state["last_backup_id"],
+            "last_success_at": state["last_success_at"],
+        }
+    except (TypeError, KeyError, ValueError, OverflowError):
+        raise target.AdmissionError("backup health bookkeeping unverifiable or changed") from None
+
+
 def _backup_admission(directory, saved, backup):
     freshness = admission._receipt(directory / "backup-freshness.json")
+    if freshness.get("fingerprint_version") != HEAD_VERSION:
+        raise target.AdmissionError("backup fingerprint contract changed; fresh operation required")
     age = _now() - freshness["started_at"]
     if not 0 <= age <= MAX_BACKUP_AGE_SECONDS:
         raise target.AdmissionError(
@@ -101,6 +193,10 @@ def _backup_admission(directory, saved, backup):
         raise target.AdmissionError("backup control state unverifiable")
     if observed != freshness.get("control_head"):
         raise target.AdmissionError("backup control state changed; prepare a new operation")
+    if _bound_backup_health(saved["pod"], backup, freshness["started_at"]) != freshness.get(
+        "backup_health"
+    ):
+        raise target.AdmissionError("backup health bookkeeping changed; fresh operation required")
     # Also reject if the bounded observation itself consumed the remaining window.
     if not 0 <= _now() - freshness["started_at"] <= MAX_BACKUP_AGE_SECONDS:
         raise target.AdmissionError("backup stale after control observation")
@@ -319,6 +415,7 @@ def plan(operation: str, image: str) -> dict:
         raise target.AdmissionError("new and retained rollback image references required")
     value = {
         "operation": operation,
+        "fingerprint_version": HEAD_VERSION,
         **{k: base[k] for k in IDENTITY},
         "old_image": base["image"],
         "new_image": image,
@@ -366,12 +463,15 @@ def prepare(operation: str, image: str, expected_plan_sha256: str) -> dict:
             or head != _control_head(current["pod"])
         ):
             raise target.AdmissionError("backup control state changed during preparation")
+        health = _bound_backup_health(current["pod"], backup, started)
         if not 0 <= _now() - started <= MAX_BACKUP_AGE_SECONDS:
             raise target.AdmissionError("backup stale during preparation; retained")
         activation._write_once(
             directory / "backup-freshness.json",
             {
                 "started_at": started,
+                "fingerprint_version": HEAD_VERSION,
+                "backup_health": health,
                 "control_head": head,
                 "snapshot_sha256": backup["snapshot_sha256"],
                 "plan_sha256": current["plan_sha256"],
