@@ -3,11 +3,14 @@
 No live image builds/imports/containers/namespace changes.
 """
 
+import gzip
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
 from types import SimpleNamespace
 
 import pytest
@@ -63,6 +66,93 @@ GC Policy rule#3:
 """
 
 
+def _identity_fixture(shape="descriptor", nested=False):
+    """Sanitized real export shape; all blob contents/digests are synthetic."""
+    files = {}
+
+    def blob(data, media):
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        files["blobs/sha256/" + digest[7:]] = data
+        return {"digest": digest, "size": len(data), "mediaType": media}
+
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    raw = b"synthetic uncompressed layer"
+    diff = "sha256:" + hashlib.sha256(raw).hexdigest()
+    layer = blob(gzip.compress(raw, mtime=0), "application/vnd.oci.image.layer.v1.tar+gzip")
+    config = blob(
+        encoded(
+            {
+                "os": "linux",
+                "architecture": "amd64",
+                "rootfs": {"type": "layers", "diff_ids": [diff]},
+            }
+        ),
+        "application/vnd.oci.image.config.v1+json",
+    )
+    manifest = blob(
+        encoded(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": config,
+                "layers": [layer],
+            }
+        ),
+        "application/vnd.oci.image.manifest.v1+json",
+    )
+    root = manifest
+    if nested:
+        root = blob(
+            encoded(
+                {
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "manifests": [
+                        manifest | {"platform": {"os": "linux", "architecture": "amd64"}}
+                    ],
+                }
+            ),
+            "application/vnd.oci.image.index.v1+json",
+        )
+    files["oci-layout"] = encoded({"imageLayoutVersion": "1.0.0"})
+    files["index.json"] = encoded(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [root],
+        }
+    )
+    files["manifest.json"] = encoded(
+        [
+            {
+                "Config": "blobs/sha256/" + config["digest"][7:],
+                "Layers": ["blobs/sha256/" + layer["digest"][7:]],
+            }
+        ]
+    )
+    image = {
+        "Id": config["digest"] if shape == "classic" else root["digest"],
+        "Os": "linux",
+        "Architecture": "amd64",
+        "RootFS": {"Layers": [diff]},
+    }
+    if shape != "classic":
+        image["Descriptor"] = root | {"annotations": {"config.digest": config["digest"]}}
+    return SimpleNamespace(
+        files=files, image=image, root=root, config=config, manifest=manifest, layer=layer
+    )
+
+
+def _write_identity_archive(path, fixture):
+    with tarfile.open(path, "w") as archive:
+        for name, data in fixture.files.items():
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            archive.addfile(entry, io.BytesIO(data))
+
+
 @pytest.fixture
 def candidate(tmp_path, monkeypatch):
     tmp_path.chmod(0o700)
@@ -116,9 +206,8 @@ def candidate(tmp_path, monkeypatch):
     state = {"commands": [], "fail": None, "crash": None, "drift": None}
     monkeypatch.setattr(producer, "_runtime", lambda: dict(runtime))
     monkeypatch.setattr(producer, "_capacity", lambda: None)
-    config = "sha256:" + "c" * 64
-    manifest = json.dumps({"config": {"digest": config}}, separators=(",", ":")).encode()
-    digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+    identity_fixture = _identity_fixture("classic")
+    digest = identity_fixture.root["digest"]
     pinned = "docker.io/library/tessera-local-persistent@" + digest
 
     def docker(directory, label, *args, **kwargs):
@@ -136,7 +225,7 @@ def candidate(tmp_path, monkeypatch):
         out = directory / (label + ".stdout")
         data = b""
         if label == "inspect":
-            data = json.dumps([{"Id": config, "Os": "linux", "Architecture": "amd64"}]).encode()
+            data = json.dumps([identity_fixture.image]).encode()
         if label == "contents":
             files = producer._file_inventory(directory / "context")
             packaged = {
@@ -156,13 +245,13 @@ def candidate(tmp_path, monkeypatch):
             data = (
                 "docker.io/library/tessera-local-persistent:upgrade-" + OP + " type " + digest
             ).encode()
-        if label in {"manifest", "pinned-manifest"}:
-            data = manifest
+        if label.startswith(("manifest", "pinned-manifest")):
+            data = identity_fixture.files["blobs/sha256/" + args[-1][7:]]
         if label == "pins":
             data = (pinned + " type " + digest).encode()
         out.write_bytes(data)
         if label == "export-tagged":
-            (directory / "tagged.tar").write_bytes(b"synthetic-image")
+            _write_identity_archive(directory / "tagged.tar", identity_fixture)
         return out
 
     def import_image(directory, archive):
@@ -206,9 +295,11 @@ def test_freeze_build_inspect_import_then_publish(candidate):
         "import",
         "node-list",
         "manifest",
+        "manifest-child-1",
         "pin",
         "pins",
         "pinned-manifest",
+        "pinned-manifest-child-1",
     ]
     receipt = private_import._receipt(
         upgrade.ROOT / "candidates" / (candidate.digest[7:] + ".json")
@@ -464,3 +555,106 @@ def test_rev007_pin_name_with_replaced_descriptor_fails_closed(candidate, monkey
         run_build()
     assert not (upgrade.ROOT / "candidates").exists()
     assert producer.status(OP)["state"] == "failed_or_uncertain_no_replay"
+
+
+@pytest.mark.parametrize("shape", ["classic", "descriptor"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_typed_archive_chain_config_or_manifest_id(tmp_path, shape, nested):
+    fixture = _identity_fixture(shape, nested)
+    path = tmp_path / "image.tar"
+    _write_identity_archive(path, fixture)
+    identity = producer._archive_identity(path, fixture.image)
+    assert identity["root_digest"] == fixture.root["digest"]
+    assert identity["config_digest"] == fixture.config["digest"]
+    assert identity["manifest_digest"] == fixture.manifest["digest"]
+    assert identity["identity_kind"] == (
+        "classic-config-id" if shape == "classic" else "descriptor-id"
+    )
+    assert len(identity["chain"]) == (3 if nested else 2)
+
+
+@pytest.mark.parametrize(
+    "substitution",
+    ["config", "manifest", "index", "layer", "hint", "id", "ambiguous-index", "diff-id"],
+)
+def test_typed_archive_substitutions_fail_closed(tmp_path, substitution):
+    fixture = _identity_fixture("descriptor", nested=True)
+    if substitution in {"config", "manifest", "index", "layer"}:
+        desc = {
+            "config": fixture.config,
+            "manifest": fixture.manifest,
+            "index": fixture.root,
+            "layer": fixture.layer,
+        }[substitution]
+        key = "blobs/sha256/" + desc["digest"][7:]
+        data = fixture.files[key]
+        fixture.files[key] = data[:-1] + bytes([data[-1] ^ 1])
+    if substitution == "hint":
+        fixture.image["Descriptor"]["annotations"]["config.digest"] = "sha256:" + "f" * 64
+    if substitution == "id":
+        fixture.image["Id"] = fixture.config["digest"]
+    if substitution == "ambiguous-index":
+        index = json.loads(fixture.files["index.json"])
+        index["manifests"] *= 2
+        fixture.files["index.json"] = json.dumps(index).encode()
+    if substitution == "diff-id":
+        fixture.image["RootFS"]["Layers"] = ["sha256:" + "0" * 64]
+    path = tmp_path / "image.tar"
+    _write_identity_archive(path, fixture)
+    with pytest.raises(target.AdmissionError, match="descriptor/config/layer"):
+        producer._archive_identity(path, fixture.image)
+
+
+@pytest.mark.parametrize("label", ["manifest", "pinned-manifest"])
+@pytest.mark.parametrize("substitution", ["root", "config"])
+def test_import_and_final_node_chain_cannot_substitute(tmp_path, monkeypatch, label, substitution):
+    fixture = _identity_fixture()
+    path = tmp_path / "image.tar"
+    _write_identity_archive(path, fixture)
+    identity = producer._archive_identity(path, fixture.image)
+    changed = fixture.root if substitution == "root" else fixture.config
+
+    def query(directory, stage, *args):
+        data = fixture.files["blobs/sha256/" + args[-1][7:]]
+        if args[-1] == changed["digest"]:
+            data = data[:-1] + bytes([data[-1] ^ 1])
+        result = directory / (stage + ".stdout")
+        result.write_bytes(data)
+        return result
+
+    monkeypatch.setattr(producer, "_docker", query)
+    with pytest.raises(target.AdmissionError, match="node descriptor/config"):
+        producer._verify_node_identity(tmp_path, label, identity["root_digest"], identity)
+
+
+def test_classic_config_anchor_requires_uncompressed_layer_digest(tmp_path):
+    fixture = _identity_fixture("classic")
+    # Rehash a substituted layer and all manifest/export parents coherently,
+    # keeping the inspected config ID/diff IDs unchanged. Parent-only checks
+    # would pass, but actual uncompressed layer content must still fail.
+    data = gzip.compress(b"different uncompressed layer", mtime=0)
+    changed = {
+        "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "mediaType": fixture.layer["mediaType"],
+    }
+    fixture.files["blobs/sha256/" + changed["digest"][7:]] = data
+    manifest = json.loads(fixture.files["blobs/sha256/" + fixture.root["digest"][7:]])
+    manifest["layers"] = [changed]
+    data = json.dumps(manifest).encode()
+    parent = {
+        "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "mediaType": fixture.root["mediaType"],
+    }
+    fixture.files["blobs/sha256/" + parent["digest"][7:]] = data
+    index = json.loads(fixture.files["index.json"])
+    index["manifests"] = [parent]
+    fixture.files["index.json"] = json.dumps(index).encode()
+    legacy = json.loads(fixture.files["manifest.json"])
+    legacy[0]["Layers"] = ["blobs/sha256/" + changed["digest"][7:]]
+    fixture.files["manifest.json"] = json.dumps(legacy).encode()
+    path = tmp_path / "substituted.tar"
+    _write_identity_archive(path, fixture)
+    with pytest.raises(target.AdmissionError, match="descriptor/config/layer"):
+        producer._archive_identity(path, fixture.image)

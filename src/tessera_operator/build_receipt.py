@@ -3,6 +3,7 @@
 No authority/data mounts, namespace writes, bootstrap, rollout or automatic replay.
 """
 
+import gzip
 import hashlib
 import json
 import re
@@ -269,6 +270,195 @@ def _file_inventory(root):
     return entries
 
 
+MANIFEST_TYPES = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+INDEX_TYPES = {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}
+CONFIG_TYPES = {
+    "application/vnd.oci.image.config.v1+json",
+    "application/vnd.docker.container.image.v1+json",
+}
+LAYER_TYPES = {
+    "application/vnd.oci.image.layer.v1.tar",
+    "application/vnd.oci.image.layer.v1.tar+gzip",
+    "application/vnd.docker.image.rootfs.diff.tar.gzip",
+}
+
+
+def _archive_identity(path, image):
+    """Verify OCI export chain, config and layer diff IDs before any import.
+
+    A modern manifest/index ID anchors its descriptor; an explicitly descriptor-
+    absent classic ID anchors config bytes. Neither shape accepts the other ID.
+    Only a single linux/amd64 image is supported; multi-platform/ambiguous exports
+    and old non-OCI save formats fail closed rather than guessing a manifest.
+    """
+    try:
+        with tarfile.open(path) as archive:
+            members = archive.getmembers()
+            names = [m.name for m in members]
+            if len(names) > 10000 or len(set(names)) != len(names):
+                raise ValueError()
+
+            def read_json(name):
+                member = archive.getmember(name)
+                if not member.isfile() or not 0 < member.size <= 16 * 1024**2:
+                    raise ValueError()
+                return json.load(archive.extractfile(member))
+
+            def member_for(desc):
+                if not re.fullmatch(r"sha256:[a-f0-9]{64}", desc["digest"]):
+                    raise ValueError()
+                member = archive.getmember("blobs/sha256/" + desc["digest"][7:])
+                if not member.isfile() or member.size != desc["size"] or member.size <= 0:
+                    raise ValueError()
+                if (
+                    "sha256:"
+                    + hashlib.file_digest(archive.extractfile(member), "sha256").hexdigest()
+                    != desc["digest"]
+                ):
+                    raise ValueError()
+                return member
+
+            def descriptor_json(desc):
+                member_for(desc)
+                return read_json("blobs/sha256/" + desc["digest"][7:])
+
+            if read_json("oci-layout") != {"imageLayoutVersion": "1.0.0"}:
+                raise ValueError()
+            index = read_json("index.json")
+            if (
+                index.get("schemaVersion") != 2
+                or index.get("mediaType") not in INDEX_TYPES
+                or len(index["manifests"]) != 1
+            ):
+                raise ValueError()
+            root = index["manifests"][0]
+            chain = [root]
+            manifest = descriptor_json(root)
+            leaf = root
+            if root["mediaType"] in INDEX_TYPES:
+                if (
+                    manifest.get("schemaVersion") != 2
+                    or manifest.get("mediaType") != root["mediaType"]
+                    or len(manifest["manifests"]) != 1
+                ):
+                    raise ValueError()
+                leaf = manifest["manifests"][0]
+                if leaf.get("platform") != {"os": "linux", "architecture": "amd64"}:
+                    raise ValueError()
+                chain.append(leaf)
+                manifest = descriptor_json(leaf)
+            if (
+                leaf["mediaType"] not in MANIFEST_TYPES
+                or manifest.get("mediaType") != leaf["mediaType"]
+                or manifest.get("schemaVersion") != 2
+            ):
+                raise ValueError()
+            config_desc = manifest["config"]
+            if config_desc["mediaType"] not in CONFIG_TYPES:
+                raise ValueError()
+            config = descriptor_json(config_desc)
+            chain.append(config_desc)
+            if (image["Os"], image["Architecture"], config["os"], config["architecture"]) != (
+                "linux",
+                "amd64",
+                "linux",
+                "amd64",
+            ):
+                raise ValueError()
+            diffs = config["rootfs"]["diff_ids"]
+            layers = manifest["layers"]
+            if (
+                config["rootfs"]["type"] != "layers"
+                or diffs != image["RootFS"]["Layers"]
+                or len(layers) != len(diffs)
+                or not 0 < len(layers) <= 128
+            ):
+                raise ValueError()
+            legacy = read_json("manifest.json")
+            if (
+                len(legacy) != 1
+                or legacy[0]["Config"] != "blobs/sha256/" + config_desc["digest"][7:]
+                or legacy[0]["Layers"] != ["blobs/sha256/" + d["digest"][7:] for d in layers]
+            ):
+                raise ValueError()
+            # Classic config-ID anchoring also needs actual uncompressed layers,
+            # not merely an untrusted manifest claiming those config diff IDs.
+            expanded = 0
+            for desc, diff in zip(layers, diffs, strict=True):
+                if desc["mediaType"] not in LAYER_TYPES:
+                    raise ValueError()
+                stream = archive.extractfile(member_for(desc))
+                if desc["mediaType"].endswith("gzip"):
+                    stream = gzip.GzipFile(fileobj=stream)
+                digest = hashlib.sha256()
+                with stream:
+                    while chunk := stream.read(65536):
+                        expanded += len(chunk)
+                        if expanded > 5 * 1024**3:
+                            raise ValueError()
+                        digest.update(chunk)
+                if "sha256:" + digest.hexdigest() != diff:
+                    raise ValueError()
+            inspected = image.get("Descriptor")
+            if inspected is None:
+                if image["Id"] != config_desc["digest"]:
+                    raise ValueError()
+                kind = "classic-config-id"
+            else:
+                if image["Id"] != root["digest"] or any(
+                    inspected[k] != root[k] for k in ("digest", "size", "mediaType")
+                ):
+                    raise ValueError()
+                hint = inspected.get("annotations", {}).get("config.digest")
+                if hint is not None and hint != config_desc["digest"]:
+                    raise ValueError()
+                kind = "descriptor-id"
+            return {
+                "identity_kind": kind,
+                "root_digest": root["digest"],
+                "manifest_digest": leaf["digest"],
+                "config_digest": config_desc["digest"],
+                "chain": [{k: d[k] for k in ("digest", "size", "mediaType")} for d in chain],
+                "layer_count": len(layers),
+            }
+    except (KeyError, TypeError, ValueError, OSError, EOFError, tarfile.TarError):
+        raise target.AdmissionError(
+            "exported image descriptor/config/layer identity invalid"
+        ) from None
+
+
+def _verify_node_identity(directory, label, root_digest, identity):
+    if root_digest != identity["root_digest"]:
+        raise target.AdmissionError("node root descriptor differs from inspected image")
+    for number, desc in enumerate(identity["chain"]):
+        stage = label if number == 0 else label + "-child-" + str(number)
+        data = _docker(
+            directory,
+            stage,
+            "exec",
+            "desktop-control-plane",
+            "ctr",
+            "--namespace",
+            "k8s.io",
+            "content",
+            "get",
+            desc["digest"],
+        ).read_bytes()
+        if (
+            len(data) != desc["size"]
+            or "sha256:" + hashlib.sha256(data).hexdigest() != desc["digest"]
+        ):
+            raise target.AdmissionError(
+                "node descriptor/config content differs from inspected image"
+            )
+
+
 def _freeze(directory, inventory):
     context = directory / "context"
     context.mkdir(mode=0o700)
@@ -444,6 +634,7 @@ print(json.dumps({'store_sha256':hashlib.sha256(pathlib.Path(s.__file__).read_by
                 tag,
             )
             # Import via stdin without a shared node filesystem or shell pipeline.
+            identity = _archive_identity(directory / "tagged.tar", image)
             _import(directory, directory / "tagged.tar")
             listing = _docker(
                 directory,
@@ -468,22 +659,7 @@ print(json.dumps({'store_sha256':hashlib.sha256(pathlib.Path(s.__file__).read_by
             )
             if len(digests) != 1:
                 raise target.AdmissionError("imported image manifest unavailable")
-            manifest = _docker(
-                directory,
-                "manifest",
-                "exec",
-                "desktop-control-plane",
-                "ctr",
-                "--namespace",
-                "k8s.io",
-                "content",
-                "get",
-                digests[0],
-            ).read_bytes()
-            if "sha256:" + hashlib.sha256(manifest).hexdigest() != digests[0]:
-                raise target.AdmissionError("node manifest digest mismatch")
-            if json.loads(manifest)["config"]["digest"] != image["Id"]:
-                raise target.AdmissionError("imported node image differs from inspected build")
+            _verify_node_identity(directory, "manifest", digests[0], identity)
             pinned = "docker.io/library/tessera-local-persistent@" + digests[0]
             _docker(
                 directory,
@@ -525,23 +701,7 @@ print(json.dumps({'store_sha256':hashlib.sha256(pathlib.Path(s.__file__).read_by
                 raise target.AdmissionError(
                     "final pin descriptor digest differs from inspected image"
                 )
-            final_manifest = _docker(
-                directory,
-                "pinned-manifest",
-                "exec",
-                "desktop-control-plane",
-                "ctr",
-                "--namespace",
-                "k8s.io",
-                "content",
-                "get",
-                final_digests[0],
-            ).read_bytes()
-            if (
-                "sha256:" + hashlib.sha256(final_manifest).hexdigest() != digests[0]
-                or json.loads(final_manifest).get("config", {}).get("digest") != image["Id"]
-            ):
-                raise target.AdmissionError("final pin identity differs from inspected build")
+            _verify_node_identity(directory, "pinned-manifest", final_digests[0], identity)
             _unchanged(directory, context, context_digest, current)
             receipt = {
                 "image": pinned,
@@ -552,7 +712,8 @@ print(json.dumps({'store_sha256':hashlib.sha256(pathlib.Path(s.__file__).read_by
                 "context_sha256": context_digest,
                 "runtime": current["runtime"],
                 "package_sha256": observed["package_sha256"],
-                "image_config": image["Id"],
+                "image_config": identity["config_digest"],
+                "image_identity": identity,
                 "producer": "frozen-build-v1",
             }
             activation._write_once(directory / "verified.json", receipt)

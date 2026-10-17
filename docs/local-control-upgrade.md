@@ -51,6 +51,15 @@ identity (Kubernetes configuration, Docker endpoint/node ID, owned namespace/
 Deployment/PVC/PV, old image and backend incarnation/schema/fence).
 Final pin verification reads its full descriptor, requires the exact previously
 verified manifest digest, then verifies that content digest and config ID again.
+Docker inspection IDs are explicitly typed: config-ID runtimes anchor config
+bytes, while descriptor-ID runtimes anchor the exported manifest/index descriptor.
+The producer verifies the OCI export's descriptor sizes/hashes, config platform,
+inspected rootfs diff IDs and every layer's compressed and uncompressed digest.
+Both OCI and Docker save metadata must agree. A single-platform index with exactly
+one linux/amd64 member is supported; ambiguous/multi-platform or non-OCI exports
+are rejected, not guessed. Imported and final pinned root/config chains must match
+the verified archive; a config digest is never compared interchangeably with a
+manifest digest. Failed attempts are never retroactively marked successful.
 A final name pointing at different content fails closed, even if the imported
 mutable source tag was valid earlier. This is verified provenance at observation,
 not protection against an administrator mutating containerd after verification.
