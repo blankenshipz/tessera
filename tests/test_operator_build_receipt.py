@@ -20,6 +20,48 @@ from tessera_operator import upgrade_support as target
 
 OP = "a" * 32
 
+# Captured successful native v0.36.1-desktop.1 inspect output. Only runtime UUID,
+# host-gateway address and activity timestamp are sanitized; grammar is retained.
+INSTALLED_BUILDER_INSPECT = """Name:          desktop-linux
+Driver:        docker
+Last Activity: 2026-10-15 00:00:00 +0000 UTC
+
+Nodes:
+Name:             desktop-linux
+Endpoint:         desktop-linux
+Status:           running
+BuildKit version: v0.32.2
+Platforms:        linux/amd64, linux/amd64/v2, linux/amd64/v3, linux/arm64, \
+linux/riscv64, linux/ppc64le, linux/s390x, linux/arm/v7, linux/arm/v6
+Labels:
+ org.mobyproject.buildkit.worker.containerd.namespace: moby
+ org.mobyproject.buildkit.worker.containerd.uuid:      fixture-uuid
+ org.mobyproject.buildkit.worker.executor:             containerd
+ org.mobyproject.buildkit.worker.hostname:             docker-desktop
+ org.mobyproject.buildkit.worker.moby.host-gateway-ip: 192.0.2.1
+ org.mobyproject.buildkit.worker.network:              host
+ org.mobyproject.buildkit.worker.selinux.enabled:      false
+ org.mobyproject.buildkit.worker.snapshotter:          overlayfs
+Devices:
+ Name:                  docker.com/gpu=webgpu
+ Automatically allowed: false
+GC Policy rule#0:
+ All:            false
+ Filters:        type==source.local type==exec.cachemount type==source.git.checkout
+ Keep Duration:  48h0m0s
+ Max Used Space: 2.764GiB
+GC Policy rule#1:
+ All:            false
+ Keep Duration:  1440h0m0s
+ Reserved Space: 20GiB
+GC Policy rule#2:
+ All:            false
+ Reserved Space: 20GiB
+GC Policy rule#3:
+ All:            true
+ Reserved Space: 20GiB
+"""
+
 
 @pytest.fixture
 def candidate(tmp_path, monkeypatch):
@@ -319,46 +361,23 @@ def test_rev006_build_explicitly_selects_local_builder(candidate):
 
 @pytest.mark.parametrize("drift", ["driver", "endpoint", "multiple", "flags"])
 def test_rev006_remote_or_custom_builder_rejected(monkeypatch, drift):
-    value = {
-        "Name": "desktop-linux",
-        "Driver": "docker",
-        "Nodes": [
-            {
-                "Name": "desktop-linux",
-                "Endpoint": "desktop-linux",
-                "Status": "running",
-                "Buildkit": "v0.25.1",
-                "DriverOpts": None,
-                "BuildkitdFlags": None,
-            }
-        ],
-    }
+    value = INSTALLED_BUILDER_INSPECT
     if drift == "driver":
-        value["Driver"] = "remote"
+        value = value.replace("Driver:        docker", "Driver:        remote")
     if drift == "endpoint":
-        value["Nodes"][0]["Endpoint"] = "tcp://synthetic-remote:1234"
+        value = value.replace(
+            "Endpoint:         desktop-linux", "Endpoint:         tcp://synthetic-remote:1234"
+        )
     if drift == "multiple":
-        value["Nodes"] *= 2
+        value += "\nName: second-node\nEndpoint: other\n"
     if drift == "flags":
-        value["Nodes"][0]["BuildkitdFlags"] = ["synthetic-custom-policy"]
-    monkeypatch.setattr(producer, "_query", lambda *args: json.dumps(value))
+        value = value.replace("Labels:", "BuildkitdFlags: synthetic-custom-policy\nLabels:")
+    monkeypatch.setattr(producer, "_query", lambda *args: value)
     with pytest.raises(target.AdmissionError, match="local embedded"):
         producer._builder_identity()
 
 
 def test_rev006_local_builder_identity_and_queries_use_sanitized_env(monkeypatch):
-    value = {
-        "Name": "desktop-linux",
-        "Driver": "docker",
-        "Nodes": [
-            {
-                "Name": "desktop-linux",
-                "Endpoint": "desktop-linux",
-                "Status": "running",
-                "Buildkit": "v0.25.1",
-            }
-        ],
-    }
     monkeypatch.setenv("DOCKER_CONFIG", "/synthetic/unreviewed-config")
     monkeypatch.setenv("BUILDX_CONFIG", "/synthetic/unreviewed-builder-config")
     monkeypatch.setenv("BUILDX_BUILDER", "synthetic-remote")
@@ -371,14 +390,14 @@ def test_rev006_local_builder_identity_and_queries_use_sanitized_env(monkeypatch
             "buildx",
             "inspect",
             "desktop-linux",
-            "--format",
-            "{{json .}}",
         ]
         env = kwargs["env"]
         assert env["DOCKER_CONFIG"] == "/Users/zach/.docker"
         assert env["BUILDX_CONFIG"] == "/Users/zach/.docker/buildx"
         assert "BUILDX_BUILDER" not in env
-        return SimpleNamespace(returncode=0, stdout=json.dumps(value).encode())
+        # Exact command assertion ensures the previously unsupported --format
+        # path is never retried, even though a synthetic runner could accept it.
+        return SimpleNamespace(returncode=0, stdout=INSTALLED_BUILDER_INSPECT.encode())
 
     monkeypatch.setattr(producer.subprocess, "run", command)
     assert producer._builder_identity() == {
@@ -386,8 +405,44 @@ def test_rev006_local_builder_identity_and_queries_use_sanitized_env(monkeypatch
         "driver": "docker",
         "endpoint": "desktop-linux",
         "node": "desktop-linux",
-        "buildkit": "v0.25.1",
+        "buildkit": "v0.32.2",
     }
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "truncated",
+        "metadata-truncated",
+        "duplicate",
+        "unknown",
+        "stopped",
+        "version",
+        "wrong-name",
+        "oversized",
+    ],
+)
+def test_native_builder_output_rejects_ambiguous_or_unrecognized(monkeypatch, drift):
+    value = INSTALLED_BUILDER_INSPECT
+    if drift == "truncated":
+        value = value.split("BuildKit version:")[0]
+    if drift == "metadata-truncated":
+        value = value.split("Labels:")[0] + "Labels:"
+    if drift == "duplicate":
+        value = value.replace("Endpoint:", "Status: running\nEndpoint:")
+    if drift == "unknown":
+        value = value.replace("Labels:", "Source policy: unreviewed\nLabels:")
+    if drift == "stopped":
+        value = value.replace("Status:           running", "Status:           stopped")
+    if drift == "version":
+        value = value.replace("v0.32.2", "unknown-version")
+    if drift == "wrong-name":
+        value = value.replace("Name:          desktop-linux", "Name:          other")
+    if drift == "oversized":
+        value += " " * 65536
+    monkeypatch.setattr(producer, "_query", lambda *args: value)
+    with pytest.raises(target.AdmissionError, match="local embedded"):
+        producer._builder_identity()
 
 
 def test_rev007_pin_name_with_replaced_descriptor_fails_closed(candidate, monkeypatch):

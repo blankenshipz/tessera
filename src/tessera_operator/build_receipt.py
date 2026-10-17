@@ -51,9 +51,99 @@ def _query(*args):
         raise target.AdmissionError("local Docker/builder identity unavailable") from None
 
 
+def _native_builder_inspect():
+    """Decode the supported inspect text, never guess/fall back to a builder.
+
+    Buildx v0.36.1-desktop.1 has no inspect --format flag. Require the observed
+    header/core grammar and bounded known metadata sections; an indented device
+    Name is not another node. Unknown/duplicate/missing fields fail closed.
+    """
+    text = _query("buildx", "inspect", LOCAL_BUILDER)
+    if len(text.encode()) > 65536 or len(text.splitlines()) > 1024:
+        raise ValueError()
+    header, node = {}, {}
+    in_nodes = False
+    metadata = None
+    metadata_rows = 0
+    rules = set()
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line == "Nodes:":
+            if in_nodes or set(header) != {"Name", "Driver", "Last Activity"}:
+                raise ValueError()
+            in_nodes = True
+            continue
+        if in_nodes and (
+            line in {"Labels:", "Devices:"} or re.fullmatch(r"GC Policy rule#[0-9]+:", line)
+        ):
+            if (
+                set(node) != {"Name", "Endpoint", "Status", "BuildKit version", "Platforms"}
+                or line in rules
+            ):
+                raise ValueError()
+            if metadata is not None and metadata_rows == 0:
+                raise ValueError()
+            rules.add(line)
+            metadata = line
+            metadata_rows = 0
+            continue
+        if line.startswith(" "):
+            if metadata is None or ":" not in line:
+                raise ValueError()
+            key, value = line.strip().split(":", 1)
+            if not key or not value.strip():
+                raise ValueError()
+            if metadata == "Labels:":
+                if not re.fullmatch(r"org\.mobyproject\.buildkit\.worker\.[a-zA-Z0-9_.-]+", key):
+                    raise ValueError()
+            elif metadata == "Devices:":
+                if key not in {"Name", "Automatically allowed"}:
+                    raise ValueError()
+            elif key not in {
+                "All",
+                "Filters",
+                "Keep Duration",
+                "Max Used Space",
+                "Reserved Space",
+                "Min Free Space",
+            }:
+                raise ValueError()
+            metadata_rows += 1
+            continue
+        if metadata is not None or ":" not in line:
+            raise ValueError()
+        key, value = line.split(":", 1)
+        fields = node if in_nodes else header
+        allowed = (
+            {"Name", "Endpoint", "Status", "BuildKit version", "Platforms"}
+            if in_nodes
+            else {"Name", "Driver", "Last Activity"}
+        )
+        if key not in allowed or key in fields or not value.strip():
+            raise ValueError()
+        fields[key] = value.strip()
+    if not in_nodes or set(node) != {"Name", "Endpoint", "Status", "BuildKit version", "Platforms"}:
+        raise ValueError()
+    if metadata is not None and metadata_rows == 0:
+        raise ValueError()
+    return {
+        "Name": header["Name"],
+        "Driver": header["Driver"],
+        "Nodes": [
+            {
+                "Name": node["Name"],
+                "Endpoint": node["Endpoint"],
+                "Status": node["Status"],
+                "Buildkit": node["BuildKit version"],
+            }
+        ],
+    }
+
+
 def _builder_identity():
     try:
-        observed = json.loads(_query("buildx", "inspect", LOCAL_BUILDER, "--format", "{{json .}}"))
+        observed = _native_builder_inspect()
         nodes = observed["Nodes"]
         if (
             observed["Name"] != LOCAL_BUILDER
@@ -76,7 +166,7 @@ def _builder_identity():
             "buildkit": node["Buildkit"],
         }
         if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,128}", identity["node"]) or not re.fullmatch(
-            r"[a-zA-Z0-9_.+-]{1,128}", identity["buildkit"]
+            r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9_.-]+)?", identity["buildkit"]
         ):
             raise ValueError()
         return identity
