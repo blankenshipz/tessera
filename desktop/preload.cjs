@@ -7,6 +7,7 @@ const methods = Object.freeze([
   'artifactDispositions', 'recordArtifactDisposition',
   'remoteExecutions', 'remoteExecution', 'remoteExecutionCommand',
   'adminWorkspace', 'adminCreate', 'adminCommand', 'adminAudit',
+  'issueOperatorControlCredential',
   'secretContext', 'protectedSecret',
   'status', 'connect', 'disconnect', 'recovery', 'projects', 'tasks', 'workers', 'revisions', 'taskPlan', 'reviseTaskPlan',
   'threads', 'messages', 'decisions', 'programContext', 'experiments', 'experiment', 'createExperiment', 'reviseExperiment', 'admitExperimentAttempt', 'dispatchAdmittedAttempt', 'resolveAdmittedAttempt', 'linkAttemptArtifacts', 'recordMeasurement', 'createConclusion', 'updateConclusion', 'reviewConclusion', 'amendConclusion', 'remoteWorkflows', 'remoteWorkflow', 'executionGrant', 'revokeExecutionGrant', 'recoveryReconciliations', 'reconcileLostWorkerOperation', 'studies', 'study', 'artifacts', 'artifactManifests', 'recordArtifactCustodyRelease', 'releasedArtifactManifest', 'artifactPreview', 'saveReleasedArtifact', 'exportReproductionBundle', 'reproductionBundle', 'studySelection', 'saveStudyExport', 'createStudy', 'registerVariant', 'recordVariant', 'closeStudy', 'createSource', 'assessSource', 'correctSource', 'createFinding', 'acceptFinding', 'reaffirmFinding', 'retractFinding', 'reviseFinding', 'labbook', 'createProject', 'createTask',

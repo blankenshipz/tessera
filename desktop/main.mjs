@@ -4,7 +4,8 @@ import { open } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ControlConnection } from './connection.mjs';
-import { MAX_CREDENTIAL_HEADER_BYTES, parseCredentialHeader } from './control-credential.mjs';
+import { MAX_CREDENTIAL_HEADER_BYTES, parseCredentialHeader, parseControlTokenFile } from './control-credential.mjs';
+import { runControlIssuance, nativeIssuanceDialogs } from './control-issuance.mjs';
 import { NamespaceLifecycle } from './astra-namespace.mjs';
 import { validateSender } from './ipc-policy.mjs';
 import { saveStudyExport } from './study-export.mjs';
@@ -85,8 +86,8 @@ async function connect(settings) {
   connection.disconnect();
   try {
     const selection = await dialog.showOpenDialog(window, {
-      title: 'Select the private control-plane credential header',
-      properties: ['openFile'], filters: [{ name: 'Credential header', extensions: ['header'] }],
+      title: 'Select a private control-plane credential file',
+      properties: ['openFile'], filters: [{ name: 'Control credential', extensions: ['header', 'control-token'] }],
     });
     if (selection.canceled || selection.filePaths.length !== 1) return null;
     if (!constants.O_NOFOLLOW || !constants.O_NONBLOCK) {
@@ -102,7 +103,7 @@ async function connect(settings) {
       if (bytesRead > MAX_CREDENTIAL_HEADER_BYTES) throw new Error('Credential header is too large.');
       header = buffer.subarray(0, bytesRead).toString('utf8');
     } finally { buffer.fill(0); await file.close(); }
-    const token = parseCredentialHeader(header);
+    const token = selection.filePaths[0].endsWith('.control-token') ? parseControlTokenFile(header) : parseCredentialHeader(header);
     // Session-only custody initially. No plaintext persistent credential fallback.
     return await connection.connect({ id: connection.commandId(), name: settings.name,
       endpoint: settings.endpoint, token });
@@ -121,7 +122,22 @@ protocol.handle('tessera', request => {
 session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
 session.defaultSession.setPermissionCheckHandler(() => false);
 
+let issuanceBusy = false;
 const handlers = {
+  issueOperatorControlCredential: async (projectId, mode, minutes) => {
+    if (issuanceBusy) throw new Error('Credential issuance is already in progress.');
+    if (!['new', 'resume'].includes(mode) || !Number.isInteger(minutes) || minutes < 1 || minutes > 1440) throw new Error('Invalid credential issuance selection.');
+    issuanceBusy = true;
+    try {
+      const context = secretContext;
+      const current = () => {
+        if (!context || secretContext !== context || context.connectionId !== connection.status()?.id || context.projectId !== projectId) throw new Error('Selected project changed.');
+      };
+      current();
+      const issuer = await connection.prepareControlIssuance(projectId, current);
+      return await runControlIssuance({ issuer, mode, minutes, ...nativeIssuanceDialogs(dialog, window) });
+    } finally { issuanceBusy = false; }
+  },
   status: () => connection.status(), connect: async settings => { selectedStudy = null; await namespaceLifecycle.clear(); return connect(settings); },
   disconnect: async () => { selectedStudy = null; await namespaceLifecycle.clear(); return connection.disconnect(); },
   autonomySessions: taskId => connection.autonomySessions(taskId),

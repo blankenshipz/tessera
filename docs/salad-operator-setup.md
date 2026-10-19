@@ -151,6 +151,42 @@ credential/delegation handoff is necessary after expiry, not re-enrollment of th
 Salad key. Existing agent credentials are not globally setup-only tokens; the admin
 delegation restricts this record's administration surface.
 
+### Desktop human-only issuance
+
+Connect using your privately held **current root local-owner** credential; a
+`human_session` cannot issue credentials under the current contract. Select the
+Tessera project, open Administration, and choose **Issue and save private
+credential…**. Choose 1–1440 minutes and a new bundle directory outside the
+repository. The native confirmation names the endpoint, root, project and expiry.
+Cancel sends no credential request. Tokens never appear in renderer forms or logs.
+
+The bundle contains private `operator.control-token` and `intent.json` files.
+Keep both: if the request outcome is unknown, reconnect with the same root identity
+and select **Resume exact private bundle…**. It reuses the same token, command key
+and expiry; never create a replacement blindly. An expired request requires human
+inspection/revocation, not silent token regeneration. Do not commit or share the bundle.
+
+Disconnect the root and Connect by explicitly choosing `operator.control-token`
+(legacy `.header` files remain supported). As this operator, propose a Salad
+configuration for `luxai` and its own delegation for the exact configuration record:
+choose subject role **Operator / agent (control agent credential)**, all three
+actions `configuration.read`, `configuration.propose`, `readiness.read`, and an
+expiry no later than the child credential. The server enforces subject lifetime.
+Record the returned principal ID and exact admin record ID; no proposal is automatic.
+
+A human reviewer separately reconnects with a current root credential, inspects
+the exact request and explicitly approves. The reviewer must differ from proposer
+and subject. This principal-level check is not proof of independent real-world
+human identity. Do not create another root or reuse a research credential to pass it.
+Then use the separate operator MCP command above with the private token-file path
+and exact Tessera project/record IDs; inspect, configure, read back, exit and reconnect.
+The Salad provider key stays enrolled privately and is not entered again.
+
+**Scope warning:** the issued credential is an ordinary project-scoped CONTROL
+AGENT credential, with existing broader control-agent routes. Exact-record
+delegation restricts administration only; it is not a universal action sandbox.
+Issuance neither approves research nor enables provider execution or spending.
+
 `salad_inspect()` reads `GET /admin/projects/PROJECT/records/RECORD/salad-setup`.
 `salad_configure(organization="luxai", expected_revision=REV,
 idempotency_key=KEY, proposed_project="tessera-research", project=null)` uses the

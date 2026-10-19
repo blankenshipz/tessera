@@ -6,6 +6,7 @@ const rendererMethods = Object.freeze([
   'autonomySessions',
   'artifactDispositions', 'recordArtifactDisposition',
   'adminWorkspace', 'adminCreate', 'adminCommand', 'adminAudit',
+  'issueOperatorControlCredential',
   'secretContext', 'protectedSecret',
   'remoteExecutions', 'remoteExecution', 'remoteExecutionCommand',
   'status', 'connect', 'disconnect', 'recovery', 'projects', 'tasks', 'workers', 'revisions', 'taskPlan', 'reviseTaskPlan',

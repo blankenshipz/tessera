@@ -148,6 +148,8 @@ function clearAdmin() {
   $('admin-workspace').hidden = true; $('admin-preview').hidden = true;
   $('admin-preview-body').textContent = ''; $('admin-records').replaceChildren();
   $('admin-status').textContent = 'Select an authenticated project. Configuration is not readiness.';
+  $('admin-issuance').hidden = true;
+  $('admin-issuance-status').textContent = 'Select an authenticated root connection and project.';
   for (const id of ['admin-configuration-form', 'admin-secret-form', 'admin-delegation-form']) $(id).reset();
 }
 function adminCurrent(context) {
@@ -162,6 +164,7 @@ function adminPreview(body, record = null) {
 }
 function renderAdmin() {
   const state = adminState;
+  $('admin-issuance').hidden = !state?.root_admin || state.held || !activeProject || !canMutate();
   $('admin-configuration-editor').hidden = !['setup', 'targets'].includes(adminView);
   $('admin-secret-editor').hidden = adminView !== 'secrets' || connectionState?.role !== 'human';
   $('admin-delegation-editor').hidden = adminView !== 'delegations';
@@ -2801,9 +2804,29 @@ $('admin-secret-form').addEventListener('submit', event => {
 $('admin-delegation-form').addEventListener('submit', event => {
   event.preventDefault(); guarded(async () => {
     const fields = new FormData(event.target);
-    adminPreview({ expected_revision: 0, spec: { kind: 'delegation', subject_id: fields.get('subject_id'), subject_role: fields.get('subject_role'), target_id: fields.get('target_id'), provider: fields.get('provider'), resource: 'configuration', actions: [fields.get('action')], expires_at: new Date(Date.now() + Number(fields.get('minutes')) * 60000).toISOString() } });
+    const actions = fields.getAll('action');
+    if (!actions.length || actions.some(action => !['configuration.read', 'configuration.propose', 'readiness.read'].includes(action))) throw new Error('Select at least one exact administration action.');
+    const expires = Date.now() + Number(fields.get('minutes')) * 60000;
+    if (fields.get('subject_id') === connectionState?.principalId && connectionState?.expiresAt && expires > Date.parse(connectionState.expiresAt)) throw new Error('Delegation cannot outlive your credential. Shorten its lifetime.');
+    adminPreview({ expected_revision: 0, spec: { kind: 'delegation', subject_id: fields.get('subject_id'), subject_role: fields.get('subject_role'), target_id: fields.get('target_id'), provider: fields.get('provider'), resource: 'configuration', actions, expires_at: new Date(expires).toISOString() } });
   });
 });
+for (const [id, mode] of [['admin-issue', 'new'], ['admin-issue-resume', 'resume']]) {
+  $(id).addEventListener('click', () => guarded(async () => {
+    if (!canMutate() || !adminState?.root_admin || adminState.held || adminBusy) throw new Error('Current root administration is required.');
+    const context = adminContext();
+    const minutes = Number($('admin-issuance-minutes').value);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) throw new Error('Choose 1–1440 minutes.');
+    adminBusy = true; $('admin-issue').disabled = true; $('admin-issue-resume').disabled = true;
+    try {
+      const result = await api.issueOperatorControlCredential(context.connectionId, context.projectId, mode, minutes);
+      if (!adminCurrent(context)) return;
+      $('admin-issuance-status').textContent = result.canceled ? 'Canceled; no credential request sent.' : `Issued principal ${result.principal_id}; expires ${result.expires_at}. Private token file: ${result.token_file}. Disconnect, then Connect with that file to propose your own exact-record delegation. Root reviews separately.`;
+    } finally {
+      if (adminCurrent(context)) { adminBusy = false; $('admin-issue').disabled = false; $('admin-issue-resume').disabled = false; }
+    }
+  }));
+}
 $('connection-open').addEventListener('click', () => $('connection-dialog').showModal());
 function openCreationDialog(kind) {
   const dialog = $(`${kind}-dialog`);

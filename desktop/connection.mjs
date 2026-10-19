@@ -267,6 +267,54 @@ export class ControlConnection {
   }
 
   projects(page) { return this.#request(`/projects?${pageQuery(page)}`); }
+  // Main-process capability only. Never expose this object or its issue method via IPC.
+  async prepareControlIssuance(projectId, contextCurrent = () => {}) {
+    resourceId(projectId);
+    const connection = this.#active;
+    if (!connection) throw new ConnectionError('Select an authenticated root connection first.');
+    const current = () => {
+      if (this.#active !== connection || connection.generation !== this.#generation) throw new ConnectionError('Connection changed.');
+      contextCurrent();
+    };
+    const refresh = async () => {
+      current();
+      const identity = await this.#send(connection, '/me');
+      current();
+      if (identity.role !== 'human' || identity.kind !== 'local_owner' || identity.parent_id !== null ||
+          identity.audience !== 'control' || identity.revoked_at !== null ||
+          identity.principal_id !== connection.identity.principal_id ||
+          identity.credential_id !== connection.identity.credential_id ||
+          identity.org_id !== connection.identity.org_id ||
+          typeof identity.credential_id !== 'string' || typeof identity.org_id !== 'string') {
+        throw new ConnectionError('Credential issuance requires the current root local-owner identity.');
+      }
+      return identity;
+    };
+    const identity = await refresh();
+    return Object.freeze({
+      binding: Object.freeze({ origin: connection.origin, principal_id: identity.principal_id,
+        credential_id: identity.credential_id, org_id: identity.org_id, project_id: projectId }),
+      current,
+      issue: async ({ token, expires_at, key }) => {
+        await refresh();
+        const expiry = Date.parse(expires_at);
+        if (!validControlToken(token) || !Number.isFinite(expiry) || expiry <= Date.now() ||
+            expiry > Date.now() + 24 * 60 * 60 * 1000 || typeof key !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(key)) {
+          throw new ConnectionError('Invalid bounded credential issuance request.');
+        }
+        current();
+        const response = await this.#send(connection, '/credentials',
+          { token, kind: 'agent', audience: 'control', project_id: projectId, expires_at }, key);
+        current();
+        if (response.kind !== 'agent' || response.role !== 'agent' || response.audience !== 'control' || response.project_id !== projectId ||
+            response.org_id !== identity.org_id || response.revoked_at !== null || Date.parse(response.expires_at) !== expiry ||
+            response.parent_id !== identity.credential_id || typeof response.credential_id !== 'string' ||
+            typeof response.principal_id !== 'string') throw new ConnectionError('Issued credential metadata mismatch; retain the private intent.');
+        return { credential_id: response.credential_id, principal_id: response.principal_id,
+          project_id: projectId, expires_at: response.expires_at, kind: 'agent', audience: 'control' };
+      },
+    });
+  }
   recovery() { return this.#request('/recovery'); }
   adminWorkspace(projectId, page) { return this.#request(`/admin/projects/${resourceId(projectId)}/records?${interactionPageQuery(page)}`); }
   cancelProtectedSecrets() { this.#secretController?.abort(); }

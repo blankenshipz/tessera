@@ -252,3 +252,12 @@ before the passing run. No Python/Node functional test failures occurred in the
 recorded runs. Full-repository integration and native graphical acceptance were
 not run. No live Salad, paid provider, cloud deployment, dependency install, commit
 or push occurred.
+# Human-only control credential entry
+
+The desktop Administration workspace adds root-only **Issue and save private
+credential…** and **Resume exact private bundle…** actions for the selected project.
+They use the currently connected root local-owner identity, native confirmation,
+and private create-only token/intent files; no token enters renderer IPC. A human
+session is not a root issuer. Keep the bundle outside the repository and preserve
+it after uncertain outcomes. See the exact [Salad bootstrap sequence](salad-operator-setup.md#desktop-human-only-issuance),
+including separate operator proposal/root review, expiry and reconnect behavior.

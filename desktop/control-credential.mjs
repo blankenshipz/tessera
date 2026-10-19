@@ -11,3 +11,13 @@ export function parseCredentialHeader(header) {
   }
   return match[1];
 }
+
+// Explicit token-only file mode; never guess a file's format or accept provider keys.
+export function parseControlTokenFile(contents) {
+  if (typeof contents !== 'string' || !/^[A-Za-z0-9_-]{43,4096}\n?$/.test(contents)) {
+    throw new Error('Select a private control-token file, not a provider key or header.');
+  }
+  const token = contents.endsWith('\n') ? contents.slice(0, -1) : contents;
+  if (!validControlToken(token)) throw new Error('Select a control-plane token, not a provider key.');
+  return token;
+}

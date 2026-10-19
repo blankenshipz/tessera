@@ -57,6 +57,13 @@
       <div class="section-title"><h2 id="admin-heading">Project administration</h2><button id="admin-refresh" type="button">Refresh administrative state</button></div>
       <p id="admin-status" role="status">Select an authenticated project. Configuration is not readiness.</p>
       <nav aria-label="Administration"><button id="admin-setup" type="button">Setup</button><button id="admin-targets" type="button">Targets</button><button id="admin-secrets" type="button">Secrets</button><button id="admin-delegations" type="button">Delegations</button><button id="admin-readiness" type="button">Readiness</button><button id="admin-audit" type="button">Audit</button></nav>
+      <fieldset id="admin-issuance" hidden><legend>Human-only operator credential</legend>
+        <p>A separate project-scoped CONTROL AGENT credential retains existing control-agent permissions. Delegation limits administration only. No proposal or approval is automatic.</p>
+        <label>Credential lifetime in minutes (maximum 24 hours)<input id="admin-issuance-minutes" type="number" min="1" max="1440" value="60"></label>
+        <button id="admin-issue" type="button">Issue and save private credential…</button>
+        <button id="admin-issue-resume" type="button">Resume exact private bundle…</button>
+        <p id="admin-issuance-status" role="status">Selected project and root identity will be confirmed natively. Save outside the repository.</p>
+      </fieldset>
       <p id="admin-explanation" class="muted"></p>
       <div id="admin-records" class="cards"></div><button id="admin-more" type="button" hidden>More administrative records</button>
       <details id="admin-configuration-editor"><summary>Propose component configuration (metadata only)</summary>
@@ -96,7 +103,19 @@
       </details>
       <details id="admin-delegation-editor" hidden><summary>Request bounded administration access</summary>
         <p>Existing principal only. Invitation delivery and organization membership enrollment are unavailable. This does not issue a login or a workload capability.</p>
-        <form id="admin-delegation-form"><label>Existing subject principal ID<input name="subject_id" pattern="[a-zA-Z0-9_-]{1,128}" required autocomplete="off"></label><label>Subject role<select name="subject_role"><option value="human">Human</option><option value="operator">Operator (administration only)</option><option value="agent">Agent</option><option disabled>Worker / proxy / monitor — unavailable</option></select></label><label>Exact configuration target ID<input name="target_id" pattern="admin_[a-f0-9]{32}" required autocomplete="off"></label><label>Provider<select name="provider"><option value="none">None</option><option value="kubernetes">Kubernetes</option><option value="local_fixture">Local fixture</option><option value="salad">Salad</option><option value="ai_gateway">AI Gateway</option><option value="artifact_store">Artifact store</option></select></label><label>Action<select name="action"><option value="configuration.read">Read configuration</option><option value="configuration.propose">Propose configuration revision</option><option value="readiness.read">Record blocked local verification</option></select></label><label>Expires in minutes (must fit credential lifetime)<input name="minutes" type="number" min="1" max="1440" value="15" required></label><button type="submit">Preview access request</button></form>
+        <form id="admin-delegation-form">
+          <label>Existing subject principal ID<input name="subject_id" pattern="[a-zA-Z0-9_-]{1,128}" required autocomplete="off"></label>
+          <label>Subject role<select name="subject_role"><option value="human">Human</option><option value="operator">Human operator</option><option value="agent">Operator / agent (control agent credential)</option><option disabled>Worker / proxy / monitor — unavailable</option></select></label>
+          <label>Exact configuration target ID<input name="target_id" pattern="admin_[a-f0-9]{32}" required autocomplete="off"></label>
+          <label>Provider<select name="provider"><option value="none">None</option><option value="kubernetes">Kubernetes</option><option value="local_fixture">Local fixture</option><option value="salad">Salad</option><option value="ai_gateway">AI Gateway</option><option value="artifact_store">Artifact store</option></select></label>
+          <fieldset><legend>Exact administration actions (select at least one)</legend>
+            <label><input type="checkbox" name="action" value="configuration.read" checked>Read configuration</label>
+            <label><input type="checkbox" name="action" value="configuration.propose">Propose configuration revision</label>
+            <label><input type="checkbox" name="action" value="readiness.read">Read readiness</label>
+          </fieldset>
+          <label>Expires in minutes (must fit subject credential lifetime)<input name="minutes" type="number" min="1" max="1440" value="15" required></label>
+          <button type="submit">Preview access request</button>
+        </form>
         <button type="button" disabled>Invite organization member — identity enrollment unavailable</button>
       </details>
       <section id="admin-preview" hidden><h3>Review exact metadata command</h3><pre id="admin-preview-body"></pre><p>No secret values or backend locators. Submission records metadata only; no provider effects. A proposal needs another authorized human principal's review.</p><button id="admin-confirm" type="button">Confirm metadata command</button><button id="admin-cancel" type="button">Discard preview</button></section>
