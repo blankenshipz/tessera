@@ -167,6 +167,36 @@ class PrivateFileSecretResolver:
                     secret,
                 )
 
+    def renew(self, reference, *, expected_version, expires_at):
+        """Explicit trusted-admin same-key renewal, not an access-lease refresh.
+
+        Current human authority must be established by the calling administrator.
+        No API/MCP route exposes this method. Expired references may be renewed;
+        revoked references may not. CAS prevents concurrent or duplicate renewal.
+        """
+        now = self._now()
+        if (
+            type(expected_version) is not int
+            or not 1 <= expected_version < 2**31 - 1
+            or type(expires_at) not in {int, float}
+            or not math.isfinite(expires_at)
+            or not now < expires_at <= now + 24 * 60 * 60
+        ):
+            raise ValueError("credential renewal rejected")
+        with self._locked() as directory:
+            name = self._name(reference)
+            metadata, secret = self._read(directory, name)
+            with secret:
+                if (
+                    metadata["version"] != expected_version
+                    or metadata["revoked"]
+                    or expires_at <= metadata["expires_at"]
+                ):
+                    raise ValueError("credential renewal rejected")
+                renewed = metadata | {"version": expected_version + 1, "expires_at": expires_at}
+                self._write(directory, name, renewed, secret)
+                return SecretMetadata(checked_at=now, **renewed)
+
     def revoke(self, reference):
         with self._locked() as directory:
             name = self._name(reference)

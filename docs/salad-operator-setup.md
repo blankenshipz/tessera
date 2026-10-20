@@ -113,6 +113,19 @@ The packaged entrypoint is `tessera-salad-operator`. Keep this process separate
 from the research MCP. Stdio process access is operator authority; there is no
 network listener and no additional human-approval mechanism invented here.
 
+### Explicit same-key private-reference renewal
+
+The trusted backend administrator may call `PrivateFileSecretResolver.renew`
+under current explicit human authorization, with `expected_version` and an
+absolute expiry no more than 24 hours ahead. This is a server-only administrative
+method, not an MCP tool, renderer action, access-lease refresh or provider key
+rotation. It preserves the private key and `salad_management` purpose atomically,
+increments the version, rejects stale versions and revoked records, and returns
+metadata only. Ordinary `resolve` still rejects expired references. Persist the
+non-secret before/after version and authorization receipt, then CAS-update the
+operator configuration's version pin; inspect metadata before retrying an uncertain
+renewal. Renewal grants no control credential, delegation approval or spending.
+
 ## Normal use, exit and return
 
 ### Authoritative control metadata mode
