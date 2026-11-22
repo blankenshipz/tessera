@@ -86,8 +86,9 @@ def check_summary_totals(summary: dict[str, Any]) -> None:
         ),
         "bytes_up": sum(d["bytes_up"] for d in summary["destinations"]),
         "bytes_down": sum(d["bytes_down"] for d in summary["destinations"]),
+        "connections_unclosed": sum(d.get("unclosed", 0) for d in summary["destinations"]),
     }
-    if any(summary[name] != value for name, value in totals.items()):
+    if any(summary.get(name, 0) != value for name, value in totals.items()):
         raise StoreError("Egress journal totals must equal the sums over its destinations.")
 
 

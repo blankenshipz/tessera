@@ -74,8 +74,10 @@ artifacts, results, or scientific success.
 If a receipt report, heartbeat, or renewal cannot be confirmed, the
 development worker keeps its durable intent and output reservation unresolved
 and attempts cancellation without waiting for that control-plane report.
-An observation report that cannot be delivered stays in the worker's durable outbox:
-the run ends as `report_pending` with no recorded result, and the poller redelivers the
+An observation report that cannot be delivered stays in the worker's durable outbox. While
+the container is observed running, a timeout, connection error or 5xx does not cancel it: the run
+goes on and retries within the lease (lost renewals or a confirmed refusal still cancel). After the
+run has ended the run ends as `report_pending` with no recorded result, and the poller redelivers the
 same observation (same idempotency key) after an exponential backoff of 2 s to 300 s that
 survives a restart, until control accepts it, permanently refuses it, or it is 24 hours old
 ([ADR 0054](decisions/0054-durable-observation-delivery.md)). Local

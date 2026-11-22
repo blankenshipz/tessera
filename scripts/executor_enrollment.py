@@ -68,12 +68,22 @@ def _repeated_enrollment(args) -> ee.Executor | None:
     """The record of an identical earlier ``--existing-project`` enrollment, else ``None``.
 
     Re-running the command in the same directory changes nothing and prints the same
-    record; a directory that holds anything else is refused, never overwritten."""
+    record; a directory that holds anything else (another provider, project, region or
+    number of days, or no record at all) is refused, never overwritten."""
     if not args.existing_project or not args.executor_dir.exists():
         return None
     executor = ee.read(args.executor_dir)
-    if not ee.same_enrollment(executor, provider=args.provider, project_id=args.existing_project):
-        raise ee.ExecutorError("executor directory already holds a different enrollment")
+    if not ee.same_enrollment(
+        executor,
+        provider=args.provider,
+        project_id=args.existing_project,
+        region=args.region,
+        lifetime=timedelta(days=args.days),
+    ):
+        raise ee.ExecutorError(
+            "executor directory already holds a different enrollment "
+            "(provider, project, region or days differ, or it is revoked)"
+        )
     return executor
 
 

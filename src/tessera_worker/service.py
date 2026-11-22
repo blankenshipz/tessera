@@ -20,7 +20,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .control_channel import ControlChannelError, HttpControlChannel, classify_control_failure
+from .control_channel import (
+    DEFAULT_TIMEOUT_SECONDS,
+    ControlChannelError,
+    HttpControlChannel,
+    classify_control_failure,
+    validate_operator_timeout,
+)
 from .cpu import (
     DEVELOPMENT_OUTPUT_PROFILE,
     DockerCpuAdapter,
@@ -120,6 +126,9 @@ class DevelopmentWorkerConfig:
     max_scratch_bytes: int | None = None
     container_user: str | None = None
     allow_root_container_user: bool = False
+    # HTTP timeout for every control request (seconds, 1 to 120; default 15). A slow answer is a
+    # transient failure that is retried, never a reason to stop a healthy run (ADR 0054).
+    control_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     # Operator-owned IPv4 block (and per-network prefix length) for the Docker networks
     # Tessera creates; None keeps Docker's default address pools.
     docker_network_pool: str | None = None
@@ -159,6 +168,10 @@ class DevelopmentWorkerConfig:
         ):
             raise DevelopmentWorkerError("Development worker configuration is invalid.")
         _check_container_user(self.container_user, self.allow_root_container_user)
+        try:
+            validate_operator_timeout(self.control_timeout_seconds, self.renew_after_seconds)
+        except ValueError as error:
+            raise DevelopmentWorkerError("Control timeout configuration is invalid.") from error
         network_pool_from_config(self.docker_network_pool, self.docker_network_prefix_length)
 
 
@@ -383,7 +396,9 @@ class DevelopmentWorkerService:
         self.root = _private_directory(config.workspace_root)
         self.output_root = _private_directory(config.development_output_root)
         self.token = read_private_credential(config.credential_file)
-        self.channel = channel or HttpControlChannel(config.control_url, self.token)
+        self.channel = channel or HttpControlChannel(
+            config.control_url, self.token, timeout_seconds=config.control_timeout_seconds
+        )
         self._watch = _CredentialWatch(self.channel)
         self.adapter = adapter
         self.provider = provider
@@ -548,7 +563,11 @@ class DevelopmentWorkerService:
             try:
                 self._report(runtime, result)
             except Exception as error:
-                return self._report_failed(runtime, error)
+                stopped = self._report_failed(runtime, error, running=True)
+                if stopped is not None:
+                    return stopped
+                # The observation is queued in the durable outbox and the healthy container
+                # keeps running; the next ticks retry it after its backoff (ADR 0054).
             if tick == self.config.max_ticks:
                 # Do not abandon Docker merely because this foreground loop has
                 # exhausted its own budget. Request cancellation and retain the
@@ -701,16 +720,24 @@ class DevelopmentWorkerService:
             runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
         return {"state": "unknown", "quarantined": False, "reason": reason}
 
-    def _report_failed(self, runtime: DevelopmentCpuRuntime, error: Exception) -> dict[str, Any]:
+    def _report_failed(
+        self, runtime: DevelopmentCpuRuntime, error: Exception, *, running: bool = False
+    ) -> dict[str, Any] | None:
         """An observation was not delivered (ADR 0054).
 
-        The container is cancelled either way (a run that cannot be observed must not go on),
-        but the observation stays in the durable outbox. A retryable failure ends this run
+        While the container is observed ``running``, a transient failure (a timeout, a
+        connection error, a 5xx) does NOT stop it: the observation stays in the durable outbox,
+        this returns ``None`` and the run goes on, retrying after the backoff. Authority is
+        proven by the lease renewals, which still cancel on loss. A rejected credential, a
+        permanent refusal, or any failure after the run has ended cancels the container as
+        before; the observation stays in the outbox, and a retryable failure then ends this run
         as ``report_pending`` WITHOUT a recorded result, so the poller recovers the grant after
         the backoff and delivers the same observation, whatever state the container reached
         meanwhile. Only a permanent refusal, or a report that aged out undelivered, is a
         recorded unknown outcome.
         """
+        if running and isinstance(error, ObservationDeliveryPending) and not error.auth:
+            return None
         outcome = self._cancel_unresolved(
             runtime,
             "observation_refused"

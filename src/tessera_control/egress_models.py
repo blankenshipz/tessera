@@ -87,6 +87,9 @@ class EgressDestinationSummary(_Strict):
     connections: Count
     bytes_up: Count
     bytes_down: Count
+    # Allowed tunnels admitted but never closed in the journal (interrupted): recorded,
+    # with bytes unknown (counted as zero here).
+    unclosed: Count = 0
 
 
 class EgressJournalSummary(_Strict):
@@ -94,6 +97,7 @@ class EgressJournalSummary(_Strict):
     connections_denied: Count
     bytes_up: Count
     bytes_down: Count
+    connections_unclosed: Count = 0
     destinations: Annotated[list[EgressDestinationSummary], Field(max_length=256)]
 
 

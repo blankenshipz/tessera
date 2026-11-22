@@ -402,3 +402,70 @@ def test_staging_does_not_widen_who_may_compose_chunk_stored_sources(tmp_path, m
     with pytest.raises(Forbidden):
         store.compose(forged, project_id, "c3", digest, again)
     assert uploads() == before
+
+
+def test_another_campaigns_delegation_cannot_stage_this_campaigns_chunk_source(
+    tmp_path, monkeypatch
+):
+    """A real, active delegation of campaign B is refused for a chunk-stored source that only
+    campaign A owns, before anything is copied."""
+    env = Env(tmp_path)
+    files = {"one.txt": b"1" * 10, "two.txt": b"2" * 20}
+    base = _adopt(env.state, env.owner, env.project["id"], files, "base")
+    monkeypatch.setattr(composition, "MAX_SNAPSHOT_FILES", 1)
+    store = SnapshotCompositionStore(env.state)
+    first = {
+        "sources": [
+            {
+                "name": "base",
+                "kind": "snapshot",
+                "snapshot_id": base["id"],
+                "expected_digest": base["digest"],
+            }
+        ],
+        "expected_snapshot_digest": _expected([("base", files)]),
+    }
+    status, chunked = store.compose(
+        env.owner, env.project["id"], "c1", canonical_digest(first), first
+    )
+    assert status == 201
+    campaign_a, approval_a = env.approved()
+    campaign_b, approval_b = env.approved()
+    assert campaign_a["id"] != campaign_b["id"]
+    # Only campaign A owns the chunk-stored snapshot (recorded as its stage input).
+    env.execute(
+        "UPDATE campaign_stages SET input_snapshot_id=? WHERE campaign_id=?",
+        chunked["id"],
+        campaign_a["id"],
+    )
+    body = {
+        "sources": [
+            {
+                "name": "again",
+                "kind": "snapshot",
+                "snapshot_id": chunked["id"],
+                "expected_digest": chunked["digest"],
+            }
+        ],
+        "expected_snapshot_digest": _expected(
+            [("again", {"base/one.txt": files["one.txt"], "base/two.txt": files["two.txt"]})]
+        ),
+    }
+
+    def uploads() -> int:
+        return env.query("SELECT count(*) AS n FROM snapshot_chunk_uploads")[0]["n"]
+
+    resources = {"project_id": env.project["id"]}
+    before = uploads()
+    principal, _, key, digest = env.intent(
+        campaign_b, approval_b, "compose_snapshot", resources, body, stage_key="s2"
+    )
+    with pytest.raises(Forbidden):
+        store.compose(principal, env.project["id"], key, digest, body)
+    assert uploads() == before
+    # Positive control: campaign A's own delegation stages and composes the same source.
+    principal, _, key, digest = env.intent(
+        campaign_a, approval_a, "compose_snapshot", resources, body, stage_key="s2"
+    )
+    status, composed = store.compose(principal, env.project["id"], key, digest, body)
+    assert status == 201 and uploads() == before + 1

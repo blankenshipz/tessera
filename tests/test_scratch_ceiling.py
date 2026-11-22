@@ -353,3 +353,142 @@ def test_a_stage_that_asks_for_nothing_records_the_default_it_ran_with(tmp_path,
     (entry,) = [a for stage in receipt["stages"] for a in stage["attempts"]]
     assert entry["scratch"]["requested_bytes"] is None
     assert entry["scratch"]["granted_bytes"] == 16 * MIB  # the CpuOperation default
+
+
+# -- review follow-ups -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("scratch", "memory", "fits"),
+    [
+        (16 * MIB, None, True),
+        (64 * MIB, 64 * MIB, True),  # up to the historical ceiling always fits, as before
+        (128 * MIB, None, True),  # 128 + 64 <= the 256 MiB default
+        (512 * MIB, None, False),
+        (512 * MIB, GIB, True),
+        (GIB, GIB, False),
+        (GIB - 64 * MIB, GIB, True),
+    ],
+)
+def test_one_rule_decides_whether_scratch_fits_memory(scratch, memory, fits, monkeypatch):
+    _host(monkeypatch, 64 * GIB)
+    assert limits.scratch_fits_memory(scratch, memory) is fits
+    # The adapter's request check and the operation's check agree with it, default included.
+    adapter = _adapter(memory_bytes=memory, max_scratch_bytes=max(scratch, 64 * MIB))
+    try:
+        adapter.scratch_for(scratch)
+        granted = True
+    except ValueError:
+        granted = False
+    assert granted is fits
+    effective = memory if memory is not None else limits.DEFAULT_MEMORY_BYTES
+    try:
+        CpuOperation(
+            "a" * 32, IMAGE, ("x",), "b" * 64, 10, memory_bytes=effective, scratch_bytes=scratch
+        )
+        built = True
+    except ValueError:
+        built = False
+    assert built is fits
+
+
+def test_an_operator_default_scratch_the_memory_cannot_hold_is_refused_at_config(
+    tmp_path, monkeypatch
+):
+    _host(monkeypatch, 64 * GIB)
+    with pytest.raises(DevelopmentWorkerError, match="scratch_bytes needs more memory"):
+        _config(tmp_path, scratch_bytes=512 * MIB, max_scratch_bytes=GIB)  # memory unset: 256 MiB
+    with pytest.raises(DevelopmentWorkerError, match="scratch_bytes needs more memory"):
+        _config(tmp_path, memory_bytes=GIB, scratch_bytes=GIB, max_scratch_bytes=GIB)
+    _config(tmp_path, memory_bytes=2 * GIB, scratch_bytes=GIB, max_scratch_bytes=GIB)
+    with pytest.raises(ValueError, match="needs more memory"):
+        _adapter(scratch_bytes=512 * MIB)  # the adapter refuses it too, before any grant
+    # The same through the config file.
+    credential = tmp_path / "file-credential"
+    credential.write_text("x")
+    credential.chmod(0o600)
+    path = tmp_path / "poll.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "tessera.worker.development-poll.v1",
+                "control_url": "http://127.0.0.1:8765",
+                "credential_file": str(credential),
+                "workspace_root": str(tmp_path / "w"),
+                "development_output_root": str(tmp_path / "o"),
+                "allowed_images": [IMAGE],
+                "scratch_bytes": 512 * MIB,
+                "max_scratch_bytes": GIB,
+            }
+        )
+    )
+    path.chmod(0o600)
+    with pytest.raises(DevelopmentWorkerError):
+        load_poller_config(path)
+
+
+def test_a_control_ceiling_above_the_workers_is_refused_by_the_worker_with_its_reason(
+    tmp_path, monkeypatch
+):
+    """The provider file and the poller config are declared separately and can drift. Control
+    admits against its declaration; the worker's own ceiling is authoritative."""
+    _host(monkeypatch, 64 * GIB)
+    world = World(tmp_path)
+    register_from_config(
+        {
+            "local_docker": {
+                "worker_principal_id": world.env.worker["id"],
+                "max_scratch_bytes": 2 * GIB,
+            }
+        }
+    )
+    try:
+        assert world.env.submit(spec=spec_with(world, GIB))["id"]  # control admits 1 GiB
+    finally:
+        register_from_config(None)
+    runtime = CpuRuntime.__new__(CpuRuntime)
+    runtime.adapter = _adapter(memory_bytes=4 * GIB)  # the worker's ceiling is still 64 MiB
+    with pytest.raises(SupervisorError) as refused:
+        runtime._operation_limits(GIB)
+    assert "exceeds the operator ceiling of 67108864" in str(refused.value)
+
+
+def test_the_fence_pins_the_operations_scratch_to_the_ceiling_not_to_the_default(monkeypatch):
+    """A plan may ask for less or more than the operator default, within the ceiling; the
+    adapter refuses only an operation above the ceiling."""
+    _host(monkeypatch, 64 * GIB)
+    adapter = _adapter(memory_bytes=4 * GIB, scratch_bytes=64 * MIB, max_scratch_bytes=2 * GIB)
+
+    def operation(scratch):
+        return CpuOperation(
+            "a" * 32, IMAGE, ("x",), "b" * 64, 10, memory_bytes=4 * GIB, scratch_bytes=scratch
+        )
+
+    for scratch in (4 * MIB, 64 * MIB, GIB, 2 * GIB):
+        adapter.create_arguments(operation(scratch))
+    with pytest.raises(CpuError):
+        adapter.create_arguments(operation(2 * GIB + MIB))
+
+
+def test_a_ceiling_the_memory_cannot_back_is_warned_about_at_startup(monkeypatch, caplog):
+    """Control admits against the ceiling it is told; a worker whose memory backs less
+    refuses a larger request at run, so the operator is told at startup."""
+    _host(monkeypatch, 64 * GIB)
+    with caplog.at_level("WARNING", logger="tessera.worker.cpu"):
+        adapter = _adapter(max_scratch_bytes=2 * GIB)  # memory unset: 256 MiB backs 192 MiB
+    assert "can back" in caplog.text and str(2 * GIB) in caplog.text
+    assert limits.scratch_backed_by(None) == 192 * MIB
+    with pytest.raises(ValueError, match="needs more memory"):
+        adapter.scratch_for(512 * MIB)  # passes control's check, refused here, clearly
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="tessera.worker.cpu"):
+        _adapter(memory_bytes=4 * GIB, max_scratch_bytes=2 * GIB)
+        _adapter()  # the defaults never warn
+    assert caplog.text == ""
+
+
+def test_the_container_defaults_come_from_one_place():
+    operation = CpuOperation("a" * 32, IMAGE, ("x",), "b" * 64, 10)
+    assert operation.scratch_bytes == limits.DEFAULT_SCRATCH_BYTES == 16 * MIB
+    assert operation.memory_bytes == limits.DEFAULT_MEMORY_BYTES == 256 * MIB
+    assert _adapter().operation_limits() == {}

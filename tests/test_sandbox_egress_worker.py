@@ -15,6 +15,7 @@ from tessera_worker.egress_proxy import (
     is_public_address,
     journal_sha256,
     summarize_journal,
+    summarize_journal_bytes,
 )
 from tessera_worker.runtime import CpuRuntime, ObservationDeliveryPending
 from tessera_worker.supervisor import DriverResult, Lease, SupervisorError
@@ -340,9 +341,12 @@ def test_allowed_connect_tunnels_bytes_and_journals(tmp_path):
 
     eport = _run(scenario())
     entries = [json.loads(x) for x in (tmp_path / "journal.jsonl").read_text().splitlines()]
-    assert entries[0]["decision"] == "allow" and entries[0]["port"] == eport
-    assert entries[0]["bytes_up"] == 5 and entries[0]["bytes_down"] == 5
-    assert set(entries[0]) == {
+    assert [e["reason"] for e in entries] == ["opened", "closed"]
+    assert entries[0]["tunnel"] == entries[1]["tunnel"]
+    assert entries[0]["bytes_up"] == 0 and entries[0]["bytes_down"] == 0
+    assert entries[1]["decision"] == "allow" and entries[1]["port"] == eport
+    assert entries[1]["bytes_up"] == 5 and entries[1]["bytes_down"] == 5
+    assert set(entries[1]) == {
         "ts",
         "host",
         "port",
@@ -351,9 +355,11 @@ def test_allowed_connect_tunnels_bytes_and_journals(tmp_path):
         "bytes_up",
         "bytes_down",
         "duration_ms",
+        "tunnel",
     }
     summary = summarize_journal(tmp_path / "journal.jsonl")
     assert summary["connections_allowed"] == 1 and summary["bytes_up"] == 5
+    assert summary["connections_unclosed"] == 0
     assert len(journal_sha256(tmp_path / "journal.jsonl")) == 64
 
 
@@ -455,8 +461,9 @@ def test_cap_exceeded_closes_tunnel(tmp_path):
 
     assert _run(scenario()).startswith(b"HTTP/1.1 403")
     entries = _entries(tmp_path)
-    assert entries[0]["reason"] == "cap" and entries[0]["bytes_up"] <= 10
-    assert entries[1]["reason"] == "cap" and entries[1]["decision"] == "deny"
+    assert entries[0]["reason"] == "opened"
+    assert entries[1]["reason"] == "cap" and entries[1]["bytes_up"] <= 10
+    assert entries[2]["reason"] == "cap" and entries[2]["decision"] == "deny"
 
 
 def test_oversized_header_rejected(tmp_path):
@@ -572,8 +579,9 @@ def test_raw_http10_connect_allowed_tunnels_and_journals(tmp_path):
 
     eport = _run(scenario())
     entries = _entries(tmp_path)
-    assert [(e["host"], e["port"], e["decision"]) for e in entries] == [
-        ("api.example.org", eport, "allow")
+    assert [(e["host"], e["port"], e["decision"], e["reason"]) for e in entries] == [
+        ("api.example.org", eport, "allow", "opened"),
+        ("api.example.org", eport, "allow", "closed"),
     ]
 
 
@@ -591,6 +599,132 @@ def test_raw_http10_connect_to_a_non_public_address_is_403(tmp_path):
     assert [(e["decision"], e["reason"]) for e in _entries(tmp_path)] == [
         ("deny", "non_public_address")
     ]
+
+
+def test_a_resumed_run_does_not_report_a_second_confirmed_exit_after_a_journal_failure(tmp_path):
+    """The exit control accepted is not sent again when only its egress journal was retried."""
+    journal = tmp_path / "j.jsonl"
+    EgressJournal(journal).close()
+    channel = Channel()
+    channel.fail_journal = 1
+    runtime = CpuRuntime(
+        tmp_path / "rt", _private(tmp_path / "in"), channel, EgressAdapter(journal), worker_id="w"
+    )
+    runtime.operation = egress_op()
+    runtime.lease = Lease("lease-1", OP, "c" * 64, 3, _future(), 1, "p")
+    result = DriverResult("terminal", CpuObservation("exited", "cid", 0, True), "observed_exited")
+
+    def exits():
+        return [p for p in channel.posts if p[0] == "/worker/observations"]
+
+    with pytest.raises(ObservationDeliveryPending):
+        runtime.report(result)  # the exit was accepted, then its egress journal failed
+    assert len(exits()) == 1
+    first = exits()[0]
+    with runtime._observation_connection() as connection:
+        connection.execute("UPDATE reports SET next_attempt_at='2000-01-01T00:00:00+00:00'")
+    runtime.report(result)  # the resumed run: no new exit observation, only the journal
+    assert exits() == [first]  # still one exit, same body and key
+    assert [p[0] for p in channel.posts].count(f"/worker/operations/{OP}/egress-journal") == 1
+    # The accepted exit is also reused by a third report (for example after a failed collect).
+    runtime.report(result)
+    assert exits() == [first]
+
+
+def test_tunnel_is_journaled_as_opened_before_bytes_flow_and_survives_interruption(tmp_path):
+    """An admitted tunnel is on record while open; a tunnel that never closes stays recorded."""
+
+    async def scenario():
+        echo = await _echo_server()
+        eport = echo.sockets[0].getsockname()[1]
+
+        async def resolver(h, p):
+            return ["127.0.0.1"]
+
+        journal = EgressJournal(tmp_path / "journal.jsonl")
+        proxy = EgressProxy(
+            [("api.example.org", eport)],
+            1000,
+            journal,
+            resolver=resolver,
+            is_public=lambda a: True,
+            idle_timeout=30,
+        )
+        server = await proxy.start("127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        head, reader, writer = await _connect(
+            port, f"CONNECT api.example.org:{eport} HTTP/1.1\r\n\r\n".encode()
+        )
+        assert head.startswith(b"HTTP/1.1 200")
+        writer.write(b"abc")
+        await writer.drain()
+        assert await reader.readexactly(3) == b"abc"
+        # Snapshot of the journal as a killed process would leave it: tunnel still open.
+        snapshot = (tmp_path / "journal.jsonl").read_bytes()
+        writer.close()
+        await asyncio.sleep(0.2)
+        server.close()
+        echo.close()
+        journal.close()
+        return eport, snapshot
+
+    eport, snapshot = _run(scenario())
+    interrupted = [json.loads(line) for line in snapshot.decode().splitlines()]
+    assert [(e["decision"], e["reason"], e["port"]) for e in interrupted] == [
+        ("allow", "opened", eport)
+    ]
+    summary = summarize_journal_bytes(snapshot)
+    assert summary["connections_allowed"] == 1 and summary["connections_denied"] == 0
+    assert summary["connections_unclosed"] == 1
+    assert summary["bytes_up"] == 0 and summary["bytes_down"] == 0
+    assert summary["destinations"] == [
+        {
+            "host": "api.example.org",
+            "port": eport,
+            "decision": "allow",
+            "connections": 1,
+            "bytes_up": 0,
+            "bytes_down": 0,
+            "unclosed": 1,
+        }
+    ]
+    complete = summarize_journal(tmp_path / "journal.jsonl")
+    assert complete["connections_allowed"] == 1 and complete["connections_unclosed"] == 0
+    assert complete["bytes_up"] == 3 and complete["bytes_down"] == 3
+
+
+def test_summary_counts_each_tunnel_once_and_keeps_legacy_records():
+    def line(reason, tunnel=None, decision="allow", up=0, down=0, host="a.example"):
+        entry = {
+            "host": host,
+            "port": 443,
+            "decision": decision,
+            "reason": reason,
+            "bytes_up": up,
+            "bytes_down": down,
+        }
+        if tunnel:
+            entry["tunnel"] = tunnel
+        return json.dumps(entry)
+
+    data = "\n".join(
+        [
+            line("opened", "t1"),
+            line("closed", "t1", up=4, down=6),
+            line("opened", "t2"),  # interrupted
+            line("closed", up=1, down=2),  # legacy single record
+            line("closed", "t3", up=2, down=2),  # opened record lost: still counted once
+            line("not_allowlisted", decision="deny", host="evil.example"),
+        ]
+    ).encode()
+    summary = summarize_journal_bytes(data)
+    assert summary["connections_allowed"] == 4 and summary["connections_denied"] == 1
+    assert summary["connections_unclosed"] == 1
+    assert summary["bytes_up"] == 7 and summary["bytes_down"] == 10
+    by_host = {(d["host"], d["decision"]): d for d in summary["destinations"]}
+    assert by_host[("a.example", "allow")]["connections"] == 4
+    assert by_host[("a.example", "allow")]["unclosed"] == 1
+    assert by_host[("evil.example", "deny")]["unclosed"] == 0
 
 
 async def _drip_server(chunks: int, every: float):
@@ -644,7 +778,7 @@ def _idle_scenario(tmp_path, chunks: int):
 
     received = _run(scenario())
     entries = [json.loads(x) for x in (tmp_path / "journal.jsonl").read_text().splitlines()]
-    return received, entries[0]
+    return received, entries[-1]  # the close entry (an "opened" entry is written at admission)
 
 
 def test_quiet_request_side_does_not_cut_a_flowing_download(tmp_path):
@@ -689,5 +823,5 @@ def test_tunnel_with_no_traffic_either_way_still_closes_idle(tmp_path):
         journal.close()
 
     _run(scenario())
-    entry = json.loads((tmp_path / "journal.jsonl").read_text().splitlines()[0])
+    entry = json.loads((tmp_path / "journal.jsonl").read_text().splitlines()[-1])
     assert entry["reason"] == "idle"

@@ -280,11 +280,11 @@ def test_disconnect_while_reporting_attempts_cancellation_and_retains_the_report
     )
 
     result = service.run()
-    # Not a verdict: the observation stays in the durable outbox for the poller to redeliver.
-    assert (result["state"], result["reason"]) == (
-        "report_pending",
-        "observation_delivery_pending",
-    )
+    # A running observation that could not be delivered no longer stops the container (ADR
+    # 0054): the run went on, and it was the renewal that then failed over the same lost
+    # connection (authority is proven by renewals), which cancels. The observation stays in
+    # the durable outbox for the poller to redeliver.
+    assert result["reason"] == "heartbeat_or_renewal_failure"
     assert adapter.calls.count("cancel") == 1
     with _connect(tmp_path / "worker" / "runtime" / "runtime-observations.sqlite3") as connection:
         assert tuple(

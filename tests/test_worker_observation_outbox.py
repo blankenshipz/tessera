@@ -160,11 +160,9 @@ def test_an_undelivered_running_observation_is_never_sent_after_the_exit(tmp_pat
     state, _, _, _, grant = _unleased_delivery(tmp_path)
     adapter = FakeAdapter()
     channel = FlakyObservations(state, fail_at={1})  # the first (running) report fails
+    # The healthy container keeps running; its exit supersedes the queued running report.
     first = _run_to_pending(tmp_path, state, grant, channel, adapter)
-    assert first["state"] == "report_pending"
-    assert _control_observations(state) == []
-    _make_due(tmp_path)
-    _resume(tmp_path, state, grant, adapter)
+    assert first.get("state") != "report_pending"
     states = [s for s, _ in _control_observations(state)]
     assert "exited" in states and "running" not in states  # the stale running is superseded
     rows = {r["observed_state"]: r for r in _outbox(tmp_path)}
@@ -365,3 +363,540 @@ def test_the_single_run_cli_exits_with_a_retryable_code_while_an_observation_wai
     assert cli.main() == EXIT_REPORT_PENDING == 4
     assert "outbox" in capsys.readouterr().err
     assert classify_exit(EXIT_REPORT_PENDING) == "failure"  # a daemon retries it with backoff
+
+
+def test_an_age_limit_runs_from_the_first_undelivered_report_of_the_operation(tmp_path):
+    """A superseding exit does not restart the 24 hours of the report it replaced."""
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    # The running report fails (queued; the container keeps running), then the exit fails too.
+    first = _run_to_pending(
+        tmp_path, state, grant, FlakyObservations(state, fail_at={1, 2}), adapter
+    )
+    assert first["state"] == "report_pending"
+    with _connect(tmp_path / "worker" / "runtime" / "runtime-observations.sqlite3") as connection:
+        connection.execute(
+            "UPDATE reports SET first_failed_at='2000-01-01T00:00:00+00:00', "
+            "next_attempt_at='2000-01-01T00:00:00+00:00'"
+        )
+    # The exit supersedes the stale running report and its own first failure is brand new, but
+    # the operation has been undeliverable for far more than a day: it is abandoned, not retried.
+    outcome = _resume(tmp_path, state, grant, adapter, FlakyObservations(state, fail_at={1}))
+    assert outcome["state"] == "unknown" and outcome["reason"] == "observation_refused"
+    rows = {row["observed_state"]: row for row in _outbox(tmp_path)}
+    assert rows["exited"]["abandoned"] == 1 and "aged out" in rows["exited"]["last_error"]
+
+
+def test_a_redelivered_exit_reaches_collection_the_receipt_and_a_succeeded_campaign(
+    tmp_path, monkeypatch
+):
+    """The live failure end to end: the exit report fails once; the next cycle finishes the run."""
+    from campaign_runner_harness import ScriptedAdapter, World, dump, stage_spec
+    from test_campaign_runner import METRIC, _spec
+
+    from tessera_worker import runtime as worker_runtime
+    from tessera_worker.service import DevelopmentWorkerService
+
+    monkeypatch.setattr(worker_runtime, "DELIVERY_BACKOFF_BASE_SECONDS", 0.0)  # due at once
+    world = World(tmp_path)
+    failed = []
+    real_post = world.channel.post
+
+    def post(path, body, key):
+        if (
+            path == OBSERVATIONS
+            and body.get("observed_state") == "exited"
+            and body.get("termination_confirmed")
+            and not failed
+        ):
+            failed.append(key)
+            raise ConnectionError("synthetic: the exit report is lost once")
+        return real_post(path, body, key)
+
+    monkeypatch.setattr(world.channel, "post", post)
+    # One adapter per grant, as with a real Docker daemon: the container the first run left
+    # behind is still there when the poller recovers the grant.
+    adapters = {}
+
+    def service(config):
+        adapter = adapters.get(config.grant_id)
+        if adapter is None:
+            exit_code, outputs = (
+                world.scenarios.pop(0) if world.scenarios else world.default_scenario
+            )
+            adapter = adapters[config.grant_id] = ScriptedAdapter(exit_code, outputs)
+            adapter.development_output_root = (
+                config.development_output_root / "development-only-cpu-outputs" / "workspaces"
+            )
+        return DevelopmentWorkerService(
+            config,
+            channel=world.channel,
+            adapter=adapter,
+            sleep=lambda _: setattr(adapter, "state", "exited"),
+        )
+
+    world.poller.service_factory = service
+    campaign = world.campaign(_spec(world, [stage_spec(world.env, "s1", metrics=METRIC)]))
+    world.tick_all(campaign["id"])
+    assert failed, "the failure was injected"
+    assert world.status(campaign["id"]) == "succeeded", dump(world, campaign["id"])
+    (attempt,) = world.attempts(campaign["id"])
+    assert attempt["status"] == "succeeded" and attempt["run_receipt_digest"]  # a receipt
+    assert attempt["manifest_id"]  # the redelivered exit led on to collection and a manifest
+    exits = [
+        row
+        for row in world.env.query(
+            "SELECT observed_state, termination_confirmed FROM execution_observations"
+        )
+        if row["observed_state"] == "exited" and row["termination_confirmed"]
+    ]
+    assert len(exits) == 1  # recorded once, though sent twice under the same key
+    assert world.env.query("SELECT count(*) AS n FROM campaign_receipts")[0]["n"] == 1
+
+
+def test_a_rejected_credential_keeps_the_poller_retrying_at_the_backoff_cap(tmp_path):
+    from tessera_worker.runtime import DELIVERY_BACKOFF_CAP_SECONDS
+
+    now = [0.0]
+    rejected = {
+        "state": "report_pending",
+        "delivery_pending": True,
+        "credential_rejected": True,
+        "control_status": 401,
+        "retry_after_seconds": DELIVERY_BACKOFF_CAP_SECONDS,
+    }
+    poller, calls = _poller(tmp_path, [dict(rejected) for _ in range(3)], lambda: now[0])
+    result = poller.run(max_cycles=1)
+    assert result["errors"] == 0 and result["grants"] == []
+    for at, expected_calls in ((100.0, 1), (299.0, 1), (300.0, 2), (599.0, 2), (600.0, 3)):
+        now[0] = at
+        poller.run(max_cycles=1)
+        assert len(calls) == expected_calls, at  # never sooner than the cap, then again at it
+    grant = tmp_path / "ws" / "grants" / "grant_1"
+    assert not (grant / "result.json").exists()  # a rejected credential is never a verdict
+    # After the operator renews the credential the same grant delivers and is then recorded.
+    poller_outcomes = [{"state": "exited", "quarantined": True}]
+    (tmp_path / "again").mkdir()
+    poller2, calls2 = _poller(tmp_path / "again", poller_outcomes, lambda: now[0])
+    assert [i["outcome"]["state"] for i in poller2.run(max_cycles=1)["grants"]] == ["exited"]
+    assert calls2 == ["grant_1"]
+
+
+class SlowObservations(ApiChannel):
+    """Fails the Nth observation post with a chosen transient error, before control sees it."""
+
+    def __init__(self, state, error, fail_at=(1,)):
+        super().__init__(state)
+        self.error, self.fail_at, self.posts_seen = error, set(fail_at), 0
+
+    def post(self, path, body, key):
+        if path == OBSERVATIONS:
+            self.posts_seen += 1
+            if self.posts_seen in self.fail_at:
+                raise self.error
+        return super().post(path, body, key)
+
+
+def _exits_on_nth_sleep(adapter, n):
+    count = [0]
+
+    def sleep(_):
+        count[0] += 1
+        if count[0] >= n:
+            adapter.state = "exited"
+
+    return sleep
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("timed out"),
+        ControlChannelError("control request timed out"),
+        ControlChannelError("control unavailable", 503),
+        ConnectionResetError("reset"),
+    ],
+    ids=["socket-timeout", "channel-timeout", "http-503", "connection-reset"],
+)
+def test_a_slow_or_failed_running_observation_does_not_stop_a_healthy_container(
+    tmp_path, monkeypatch, error
+):
+    """The live failure: a routine running report timed out and the worker killed the container."""
+    from tessera_worker import runtime as worker_runtime
+
+    monkeypatch.setattr(worker_runtime, "DELIVERY_BACKOFF_BASE_SECONDS", 0.0)  # due at once
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    channel = SlowObservations(state, error)  # the first running report is lost
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=6,
+        sleep=_exits_on_nth_sleep(adapter, 3),  # still running for two more ticks
+    )
+    outcome = service.run()
+    assert "cancel" not in adapter.calls  # the healthy container was never cancelled
+    assert outcome.get("state") != "report_pending"
+    assert outcome.get("reason") != "observation_report_failure"
+    observed = _control_observations(state)
+    assert observed[0] == ("running", 0)  # the lost running report was redelivered
+    assert ("exited", 1) in observed
+    assert channel.posts_seen >= 3
+    running = [r for r in _outbox(tmp_path) if r["observed_state"] == "running"]
+    assert running and all(r["completed"] == 1 for r in running)  # delivered, none left queued
+    assert running[0]["attempts"] == 1  # one transient failure, then the retry succeeded
+
+
+def test_the_run_keeps_going_while_the_running_report_waits_out_its_backoff(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    channel = SlowObservations(state, TimeoutError("timed out"))
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=4,
+        sleep=_exits_on_nth_sleep(adapter, 3),
+    )
+    outcome = service.run()  # the 2 s backoff has not elapsed, so no early resend
+    assert "cancel" not in adapter.calls
+    assert channel.posts_seen == 2  # the failed running report, then the exit (no spam between)
+    assert ("exited", 1) in _control_observations(state)
+    assert outcome.get("state") != "report_pending"
+
+
+@pytest.mark.parametrize("status", [400, 409, 422])
+def test_a_confirmed_refusal_of_a_running_observation_still_cancels(tmp_path, status):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    channel = SlowObservations(state, ControlChannelError("refused", status))
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=6,
+        sleep=_exits_on_nth_sleep(adapter, 3),
+    )
+    outcome = service.run()
+    assert (outcome["state"], outcome["reason"]) == ("unknown", "observation_refused")
+    assert adapter.calls.count("cancel") == 1  # control refused it: stop the run
+    assert adapter.state == "exited"
+    assert any(r["abandoned"] for r in _outbox(tmp_path))
+
+
+def test_a_lost_lease_while_an_observation_waits_still_cancels(tmp_path):
+    """Authority loss, not a slow report, is what stops a run: renewal fails and cancels."""
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+
+    class Outage(SlowObservations):
+        def post(self, path, body, key):
+            if path == OBSERVATIONS and self.posts_seen >= 1:
+                raise ConnectionError("control unreachable")  # everything fails after the first
+            if path == OBSERVATIONS:
+                self.posts_seen += 1
+                raise self.error
+            if self.posts_seen >= 1:
+                raise ConnectionError("control unreachable")
+            return ApiChannel.post(self, path, body, key)
+
+    outcome = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=Outage(state, TimeoutError("timed out")),
+        adapter=adapter,
+        max_ticks=6,
+        sleep=_exits_on_nth_sleep(adapter, 4),
+    ).run()
+    assert outcome["reason"] == "heartbeat_or_renewal_failure"
+    assert adapter.calls.count("cancel") == 1
+
+
+# -- the operator's control timeout --------------------------------------------------------
+
+
+def test_the_control_timeout_defaults_to_15_seconds_and_fits_the_lease():
+    from tessera_worker.control_channel import (
+        DEFAULT_TIMEOUT_SECONDS,
+        HttpControlChannel,
+        validate_operator_timeout,
+    )
+
+    assert DEFAULT_TIMEOUT_SECONDS == 15.0
+    assert HttpControlChannel("http://127.0.0.1:1", "token").timeout_seconds == 15.0
+    assert validate_operator_timeout(1) == 1.0 and validate_operator_timeout(20) == 20.0
+    for bad in (0, 0.5, 21, 120, -3, True, "15", None, float("nan")):
+        with pytest.raises(ValueError):
+            validate_operator_timeout(bad)
+
+
+def test_the_timeout_is_an_operator_setting_of_the_worker_and_the_poller(tmp_path, monkeypatch):
+    import json
+    import os
+
+    from tessera_worker import grant_poller
+    from tessera_worker import service as worker_service
+    from tessera_worker.grant_poller import load_poller_config
+    from tessera_worker.service import DevelopmentWorkerConfig, DevelopmentWorkerError
+
+    created = []
+
+    class Channel:
+        def __init__(self, url, token, *, timeout_seconds):
+            created.append(timeout_seconds)
+
+        def get(self, path):  # pragma: no cover - unused
+            return {}
+
+    monkeypatch.setattr(worker_service, "HttpControlChannel", Channel)
+    monkeypatch.setattr(grant_poller, "HttpControlChannel", Channel)
+    credential = tmp_path / "cred"
+    credential.write_text("token")
+    credential.chmod(0o600)
+    base = {
+        "control_url": "http://127.0.0.1:1",
+        "credential_file": credential,
+        "workspace_root": tmp_path / "ws",
+        "development_output_root": tmp_path / "out",
+    }
+    image = "python@sha256:" + "a" * 64
+
+    def worker(**kw):
+        return DevelopmentWorkerConfig(grant_id="g", allowed_image=image, **base, **kw)
+
+    def poller_config(**kw):
+        return grant_poller.GrantPollerConfig(**base, allowed_images=(image,), **kw)
+
+    # The poller's own channel and the one a per-grant service builds both honour the setting.
+    assert worker().control_timeout_seconds == 15.0
+    poller = grant_poller.DevelopmentGrantPoller(poller_config(control_timeout_seconds=18))
+    worker_service.DevelopmentWorkerService(worker(control_timeout_seconds=18))
+    assert created == [18, 18] and poller.config.control_timeout_seconds == 18
+    for bad in (0, 0.2, 21, 500, True):
+        with pytest.raises(DevelopmentWorkerError):
+            worker(control_timeout_seconds=bad)
+        with pytest.raises(DevelopmentWorkerError):
+            poller_config(control_timeout_seconds=bad)
+    # The config file key and the CLI flags.
+    path = tmp_path / "poll.json"
+    document = {
+        "schema": "tessera.worker.development-poll.v1",
+        "control_url": "http://127.0.0.1:1",
+        "credential_file": str(credential),
+        "workspace_root": str(tmp_path / "ws"),
+        "development_output_root": str(tmp_path / "out"),
+        "allowed_images": [image],
+        "control_timeout_seconds": 20,
+    }
+    path.write_text(json.dumps(document))
+    os.chmod(path, 0o600)
+    assert load_poller_config(path).control_timeout_seconds == 20
+    from tessera_worker.cli import parser
+
+    flags = [
+        "--control-url", "http://127.0.0.1:1", "--credential-file", str(credential),
+        "--workspace-root", str(tmp_path), "--development-output-root", str(tmp_path),
+        "--allowed-image", image, "--control-timeout-seconds", "30",
+    ]  # fmt: skip
+    assert parser().parse_args(["development-poll", *flags]).control_timeout_seconds == 30.0
+    assert parser().parse_args(["development-poll", *flags[:-2]]).control_timeout_seconds == 15.0
+    assert (
+        parser().parse_args(["development-run", "--grant-id", "g", *flags]).control_timeout_seconds
+        == 30.0
+    )
+
+
+# -- a timed-out request must not block the next call (real channel, real local server) ------
+
+
+class _SlowServer:
+    """A loopback control stand-in: dribbles a body, answers late, or answers at once."""
+
+    def __init__(self, dribble_seconds=0.15, late_seconds=1.0):
+        import http.server
+        import threading
+        import time
+
+        body = b'{"ok":1}'
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _reply_headers(self, length):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(length))
+                self.end_headers()
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                outer.paths.append(self.path)
+                try:
+                    if self.path.endswith("/dribble"):
+                        # Headers at once, then the body a byte at a time: every read succeeds
+                        # within the socket timeout, so the request thread outlives the caller.
+                        self._reply_headers(len(body))
+                        self.wfile.flush()
+                        for byte in body:
+                            time.sleep(dribble_seconds)
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                    elif self.path.endswith("/late"):
+                        time.sleep(late_seconds)
+                        self._reply_headers(len(body))
+                        self.wfile.write(body)
+                    elif self.path.endswith("/hang"):
+                        time.sleep(30)
+                    else:
+                        self._reply_headers(len(body))
+                        self.wfile.write(body)
+                except OSError:
+                    pass  # the client gave up
+
+        self.paths = []
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def slow_server():
+    server = _SlowServer()
+    yield server
+    server.close()
+
+
+@pytest.mark.parametrize("slow", ["dribble", "late"])
+def test_a_timed_out_request_does_not_make_the_next_call_fail(slow_server, slow):
+    from tessera_worker.control_channel import HttpControlChannel
+
+    # The report gets a short per-call deadline; the next call (the heartbeat) has the channel's
+    # 2 s, so it may wait up to half of that for the straggler to finish.
+    channel = HttpControlChannel(slow_server.url, "token", timeout_seconds=2.0)
+    with pytest.raises(ControlChannelError, match="deadline"):
+        channel.post(f"/worker/test/{slow}", {}, "k1", timeout_seconds=0.4)  # the report times out
+    # The very next call goes through instead of being refused with "still in progress", which
+    # would have cancelled the healthy run as a failed heartbeat.
+    assert channel.post("/worker/test/fast", {}, "k2") == {"ok": 1}
+    assert slow_server.paths == [f"/worker/test/{slow}", "/worker/test/fast"]
+
+
+def test_a_call_with_a_short_deadline_is_never_held_for_a_straggler(slow_server):
+    import time
+
+    from tessera_worker.control_channel import HttpControlChannel
+
+    channel = HttpControlChannel(slow_server.url, "token", timeout_seconds=2.0)
+    with pytest.raises(ControlChannelError, match="deadline"):
+        channel.post("/worker/test/dribble", {}, "k1", timeout_seconds=0.4)
+    started = time.monotonic()
+    with pytest.raises(ControlChannelError):  # a cancellation-path call with a 0.2 s deadline
+        channel.post("/worker/test/fast", {}, "k2", timeout_seconds=0.2)
+    assert time.monotonic() - started < 0.5  # it waited at most half its own 0.2 s
+
+
+def test_the_wait_for_a_straggler_is_bounded_and_never_adds_threads(monkeypatch):
+    import threading
+    import time
+
+    from tessera_worker import control_channel
+    from tessera_worker.control_channel import HttpControlChannel
+
+    server = _SlowServer(dribble_seconds=0.3)  # a 2.4 s body, each read within the 0.4 s timeout
+    try:
+        monkeypatch.setattr(control_channel, "STRAGGLER_WAIT_SECONDS", 0.2)
+        channel = HttpControlChannel(server.url, "token", timeout_seconds=2.0)
+        with pytest.raises(ControlChannelError, match="deadline"):
+            channel.post("/worker/test/dribble", {}, "k1", timeout_seconds=0.4)
+        before = threading.active_count()
+        started = time.monotonic()
+        with pytest.raises(ControlChannelError, match="still in progress"):
+            channel.post("/worker/test/fast", {}, "k2")
+        assert time.monotonic() - started < 1.5  # it waited ~0.2 s, not for the whole body
+        assert threading.active_count() <= before  # no second request thread was started
+    finally:
+        server.close()
+
+
+# -- one report may not outlast the lease --------------------------------------------------
+
+
+class _RecordingChannel:
+    timeout_seconds = 15.0
+
+    def __init__(self):
+        self.timeouts = []
+
+    def post(self, path, body, key, *, timeout_seconds=None):
+        self.timeouts.append(timeout_seconds)
+        return {}
+
+
+@pytest.mark.parametrize(
+    "seconds_left,expected",
+    [(120.0, 15.0), (30.0, 15.0), (22.0, 12.0), (12.0, 2.0), (3.0, 1.0), (-5.0, 1.0)],
+)
+def test_a_report_never_outlasts_the_lease_it_runs_under(tmp_path, seconds_left, expected):
+    from datetime import UTC, datetime, timedelta
+
+    from test_sandbox_egress_worker import OP, _private, egress_op
+
+    from tessera_worker.cpu import CpuObservation
+    from tessera_worker.runtime import CpuRuntime
+    from tessera_worker.supervisor import DriverResult, Lease
+
+    channel = _RecordingChannel()
+    runtime = CpuRuntime(
+        tmp_path / "rt", _private(tmp_path / "in"), channel, FakeAdapter(), worker_id="w"
+    )
+    runtime.operation = egress_op()
+    now = datetime.now(UTC)
+    runtime._clock = lambda: now
+    runtime.lease = Lease("lease-1", OP, "c" * 64, 3, now + timedelta(seconds=seconds_left), 1, "p")
+    runtime.report(DriverResult("running", CpuObservation("running", "cid")))
+    assert channel.timeouts == [expected]
+
+
+def test_the_timeout_setting_must_fit_the_lease_and_the_renewal_interval():
+    from tessera_control.execution import LEASE_SECONDS
+    from tessera_worker.control_channel import (
+        MAX_OPERATOR_TIMEOUT_SECONDS,
+        RENEWAL_INTERVAL_SECONDS,
+        WORKER_LEASE_SECONDS,
+        validate_operator_timeout,
+    )
+    from tessera_worker.service import DevelopmentWorkerConfig, DevelopmentWorkerError
+
+    assert WORKER_LEASE_SECONDS == LEASE_SECONDS  # the worker's copy tracks control's lease
+    assert DevelopmentWorkerConfig.renew_after_seconds == RENEWAL_INTERVAL_SECONDS
+    assert MAX_OPERATOR_TIMEOUT_SECONDS == LEASE_SECONDS - RENEWAL_INTERVAL_SECONDS == 20.0
+    # A slower renewal cadence leaves less room: with renewal every 15 s the ceiling is 15 s.
+    assert validate_operator_timeout(15, 15.0) == 15.0
+    with pytest.raises(ValueError):
+        validate_operator_timeout(16, 15.0)
+    base = {
+        "control_url": "http://127.0.0.1:1",
+        "grant_id": "g",
+        "credential_file": Path("/nonexistent/credential"),
+        "workspace_root": Path("/nonexistent/workspace"),
+        "development_output_root": Path("/nonexistent/outputs"),
+        "allowed_image": "python@sha256:" + "a" * 64,
+    }
+    DevelopmentWorkerConfig(**base, renew_after_seconds=15.0, control_timeout_seconds=15.0)
+    with pytest.raises(DevelopmentWorkerError):
+        DevelopmentWorkerConfig(**base, renew_after_seconds=15.0, control_timeout_seconds=16.0)

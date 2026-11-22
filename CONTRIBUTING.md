@@ -58,6 +58,9 @@ credentials and `.venv/` must stay out of Git and image contexts.
    logical tested commits on `main`, staging only intended paths. Push requires
    separate permission; authorization for one does not authorize the other.
    PRs remain paused unless requested; merge/deploy requires separate instruction.
+   Commit messages are public and permanent: no links to private tool or agent
+   sessions. Install `dev/hooks/commit-msg` (`ln -s ../../dev/hooks/commit-msg
+   .git/hooks/commit-msg`), which rejects them.
 6. For an authorized push/PR inspect CI and repair in-scope failures; report
    unrelated failures without bypassing required gates. If a PR is requested,
    use a feature branch and the repository template. Hosting protections are not

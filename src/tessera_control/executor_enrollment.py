@@ -356,13 +356,30 @@ def _existing_project(http: Http, project_id: str) -> str:
     return project_id
 
 
-def same_enrollment(executor: Executor, *, provider: str, project_id: str) -> bool:
-    """Whether a live record already enrolls ``provider`` into ``project_id`` (idempotency)."""
+def same_enrollment(
+    executor: Executor,
+    *,
+    provider: str,
+    project_id: str,
+    region: str | None = None,
+    lifetime: timedelta | None = None,
+) -> bool:
+    """Whether a live record already enrolls ``provider`` into ``project_id`` (idempotency).
+
+    ``region`` and ``lifetime`` (``not_after`` minus ``enrolled_at``, exactly the lifetime the
+    enrollment was made with) are compared when given, so a rerun that asks for a different
+    region or number of days is refused instead of silently returning the old record.
+    """
     return (
         executor.revoked_at is None
         and executor.provider == provider
         and executor.project_id == project_id
         and executor.project_existing
+        and (region is None or executor.region == region)
+        and (
+            lifetime is None
+            or _parse(executor.not_after) - _parse(executor.enrolled_at) == lifetime
+        )
     )
 
 

@@ -19,6 +19,7 @@ DEFAULT_SCRATCH_BYTES = 16 * MIB
 # The ceiling when the operator sets none: the historical maximum.
 LEGACY_SCRATCH_CEILING = 64 * MIB
 MIN_MEMORY_BYTES = 32 * MIB
+DEFAULT_MEMORY_BYTES = 256 * MIB
 LEGACY_MEMORY_CEILING = GIB
 # The most an operator may configure for either; the host check bounds it further.
 MAX_BYTES = 64 * GIB
@@ -64,6 +65,24 @@ def check_host_capacity(
             f"max_scratch_bytes {max_scratch_bytes} exceeds "
             f"{int(MAX_SCRATCH_SHARE * 100)}% of host memory"
         )
+
+
+def scratch_fits_memory(scratch_bytes: int, memory_bytes: int | None = None) -> bool:
+    """Whether a memory-backed scratch can live inside the container's memory limit.
+
+    The one rule every check uses (the operator's config, the adapter, a plan's request and
+    the operation): up to the historical 64 MiB always fits, as before; above it the scratch
+    plus ``MEMORY_HEADROOM_BYTES`` must fit the limit. ``None`` means the 256 MiB default."""
+    memory = DEFAULT_MEMORY_BYTES if memory_bytes is None else memory_bytes
+    return (
+        scratch_bytes <= LEGACY_SCRATCH_CEILING or scratch_bytes + MEMORY_HEADROOM_BYTES <= memory
+    )
+
+
+def scratch_backed_by(memory_bytes: int | None = None) -> int:
+    """The largest scratch a memory limit can back (the 256 MiB default when unset)."""
+    memory = DEFAULT_MEMORY_BYTES if memory_bytes is None else memory_bytes
+    return max(memory - MEMORY_HEADROOM_BYTES, 0)
 
 
 def valid_bytes(value: object, low: int, high: int) -> bool:

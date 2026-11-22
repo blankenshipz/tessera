@@ -2,9 +2,11 @@
 
 ## Status
 
-Implemented. No schema change. Amends the operator container limits of
+Implemented. No schema change. Extends the operator container limits of
 [ADR 0038](0038-campaign-specs-and-platform-campaign-runner.md) and the provider file of
-[ADR 0040](0040-multi-stage-multi-vendor-campaigns.md).
+[ADR 0040](0040-multi-stage-multi-vendor-campaigns.md). Neither ADR (nor DESIGN.md or
+CONTRIBUTING.md) states the numeric container limits, so none of their text changes; the
+limits are documented in `docs/campaign-providers.md` and here.
 
 ## Context
 
@@ -36,6 +38,11 @@ memory and the ceiling at most 50%, read from `/proc/meminfo`. Where host memory
 read the check is skipped, and default settings are never checked. A default scratch above
 the historical ceiling raises the ceiling to cover it.
 
+One rule, `scratch_limits.scratch_fits_memory`, decides whether a scratch fits its memory
+limit (the 256 MiB default when none is set) and is used everywhere: the poller config and
+the adapter refuse an operator default scratch that its memory cannot hold at load, before
+any grant, a plan's request is checked against it, and so is the operation built from it.
+
 ### 2. A stage may request more, within the ceiling
 
 A stage spec (v1 and v2) takes an optional `scratch_bytes` (1 MiB to 64 GiB) for
@@ -48,6 +55,13 @@ limit cannot back is refused when the operation is built, before any container e
 the memory limit with 64 MiB to spare, in the operator's setting and in the container's
 operation.
 
+**The supervisor fence no longer pins scratch to the operator default.** The operation's
+scratch is part of its durable fence, as before, but it is now whatever was granted: the
+operator default, or a plan's request, smaller or larger, within the ceiling. The adapter
+refuses an operation only when its scratch is above the ceiling (or its memory does not
+match the operator's), so the fence records and recovery re-checks the scratch the
+container actually ran with rather than equality with the default.
+
 ### 3. Admission fails clearly
 
 Control cannot read a worker's config, so the operator also declares the ceiling in the
@@ -56,8 +70,17 @@ provider file: `max_scratch_bytes` on `local_docker` and each `self_hosted` entr
 its provider's declared ceiling with 409 and `scratch_exceeds_operator_ceiling`, naming the
 request, the ceiling and the settings to change, and refuse a request to a provider that
 does not grant scratch (Salad and plugins do not). The declaration is the operator's to keep
-equal to the poller's; if they disagree the worker's own check still refuses the run at
-admission with its reason.
+equal to the poller's. If control's is higher than the worker's, control admits the stage and
+the worker's own ceiling is authoritative: it refuses the run when the operation is built,
+before any container exists, naming the request and its ceiling (covered by a test). If
+control's is lower, control refuses what the worker would have granted.
+
+Control admits against the declared ceiling only, so a request the declaration allows can
+still be refused at run when the worker's memory cannot back it: with `memory_bytes` unset
+the worker has 256 MiB and backs at most 192 MiB of scratch whatever its ceiling. The
+refusal is the same clear one, before any container exists; the poller logs a warning at
+startup when its ceiling is above what its memory can back, so the operator hears of it
+before a stage does.
 
 ### 4. The receipt
 

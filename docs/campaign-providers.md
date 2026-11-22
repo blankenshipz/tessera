@@ -102,6 +102,15 @@ settings, never a secret:
 }
 ```
 
+`control_timeout_seconds` (optional, 1 to 20, default 15; also `--control-timeout-seconds` on
+`development-poll` and `development-run`) is how long one HTTP request to control may take. A
+slower answer is a transient failure that is retried (a running container is not stopped for it,
+see [ADR 0054](decisions/0054-durable-observation-delivery.md)); raise it for a control plane that
+answers slowly under load. The ceiling is the 30 s worker lease minus the 10 s renewal interval, so
+one unanswered request cannot lapse the lease (the worker refuses a larger value, and a slower
+`renew_after_seconds` lowers the ceiling accordingly). Each observation report is also capped by
+the lease time left minus one renewal interval, never below 1 s.
+
 `memory_bytes` and `scratch_bytes` are optional, operator-owned limits applied to every
 container this poller runs (memory, with swap equal to it, and the `/work` tmpfs). A plan
 cannot raise them. Unset keeps the defaults of 256 MiB and 16 MiB; accepted ranges are
@@ -114,7 +123,12 @@ a memory above 1 GiB or a ceiling above 64 MiB is checked against the host's mem
 admission, never mid-run. Declare the same ceiling to control as `max_scratch_bytes` on the
 provider's entry in the provider file (`local_docker`, or a `self_hosted` instance), so
 submit and approval refuse an over-large request with `scratch_exceeds_operator_ceiling`
-([ADR 0059](decisions/0059-operator-scratch-ceiling.md)). Size them to the host: one poller
+([ADR 0059](decisions/0059-operator-scratch-ceiling.md)); keep the two equal: if control's
+is higher the worker still refuses the run with its own ceiling, and if lower control refuses
+what the worker would grant. A ceiling above what `memory_bytes` can back (the 256 MiB
+default backs 192 MiB) is logged as a warning at startup, and a request over that is refused at
+run. A default `scratch_bytes` above 64 MiB must fit `memory_bytes`
+(256 MiB when unset) or the poller config is refused at load. Size them to the host: one poller
 runs one container at a time.
 
 `docker_network_pool` (optional, with `docker_network_prefix_length`, default 24; also

@@ -130,3 +130,41 @@ def test_egress_sources_are_optional_and_validated():
     ):
         with pytest.raises(ValueError):
             EgressPolicy.model_validate({**base, "sources": sources})
+
+
+def test_receipt_records_an_unclosed_tunnel_with_unknown_bytes(tmp_path, monkeypatch):
+    def interrupted(self, operation):
+        destination = operation.egress["destinations"][0]
+        return "e" * 64, {
+            "connections_allowed": 1,
+            "connections_denied": 0,
+            "bytes_up": 0,
+            "bytes_down": 0,
+            "connections_unclosed": 1,
+            "destinations": [
+                {
+                    **destination,
+                    "decision": "allow",
+                    "connections": 1,
+                    "bytes_up": 0,
+                    "bytes_down": 0,
+                    "unclosed": 1,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(EgressAdapter, "egress_summary", interrupted)
+    world = EgressWorld(tmp_path)
+    world.adapters = []
+    world.default_scenario = (0, {"data.json": PAYLOAD})
+    spec = world.env.spec()
+    spec["stages"] = [stage_spec(world.env, "fetch", egress=EGRESS)]
+    campaign = world.campaign(spec)
+    world.tick_all(campaign["id"])
+    assert world.status(campaign["id"]) == "succeeded", dump(world, campaign["id"])
+    row = world.row("SELECT * FROM campaign_receipts WHERE campaign_id=?", campaign["id"])
+    receipt = json.loads(row["receipt_json"])
+    (attempt,) = receipt["stages"][0]["attempts"]
+    summary = attempt["egress"]["journal"]["summary"]
+    assert summary["connections_allowed"] == 1 and summary["connections_unclosed"] == 1
+    assert summary["destinations"][0]["unclosed"] == 1

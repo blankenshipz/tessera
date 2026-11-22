@@ -80,7 +80,7 @@ def test_post_pins_url_authentication_key_and_json_body() -> None:
     }
     request, timeout = opener.requests[0]
     assert request.full_url == "https://control.example/worker/leases/lease-1/package"
-    assert timeout == 5.0
+    assert timeout == 15.0  # the default (it was a fixed 5 s; see ADR 0054)
     assert request.get_method() == "POST"
     assert request.get_header("Authorization") == "Bearer worker-token"
     assert request.get_header("Idempotency-key") == "package"
@@ -209,7 +209,12 @@ def test_bounded_inputs_and_timeout_reject_before_network() -> None:
     assert opener.requests == []
 
 
-def test_total_deadline_fences_a_blocked_request_without_spawning_more_threads() -> None:
+def test_total_deadline_fences_a_blocked_request_without_spawning_more_threads(
+    monkeypatch,
+) -> None:
+    # The next call waits a bounded time for the straggler (see STRAGGLER_WAIT_SECONDS); keep
+    # that wait short so the refusal this test pins is immediate.
+    monkeypatch.setattr("tessera_worker.control_channel.STRAGGLER_WAIT_SECONDS", 0.05)
     response = BlockingResponse()
     opener = FakeOpener(response)
     channel = HttpControlChannel(

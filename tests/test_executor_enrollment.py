@@ -631,6 +631,63 @@ def test_a_directory_holding_another_enrollment_is_refused_not_overwritten(input
     assert (directory / ee.RECORD_NAME).read_text() == before
 
 
+@pytest.mark.parametrize(
+    "change", [{"region": "salad-eu"}, {"days": 3}, {"region": "salad-eu", "days": 2}]
+)
+def test_a_rerun_with_another_region_or_days_is_refused_not_silently_ignored(
+    inputs, capsys, change
+):
+    _, cpu, _ = _enroll(inputs, capsys, provider="local-docker", region="local", name="cpu")
+    code, directory, _ = _enroll_into(
+        inputs, capsys, cpu["project_id"], name="salad", provider="salad", region="salad-us"
+    )
+    assert code == 0
+    before = (directory / ee.RECORD_NAME).read_text()
+    credentials = _count(inputs, "credentials")
+    options = {"region": "salad-us", "days": 7} | change
+    code, _, out = _enroll_into(
+        inputs, capsys, cpu["project_id"], name="salad", provider="salad", **options
+    )
+    assert code == 1 and "different enrollment" in out.err and "region or days" in out.err
+    assert (directory / ee.RECORD_NAME).read_text() == before  # the old record is untouched
+    assert _count(inputs, "credentials") == credentials  # and nothing new was issued
+    # The identical request still repeats cleanly.
+    code, _, same = _enroll_into(
+        inputs, capsys, cpu["project_id"], name="salad", provider="salad", region="salad-us"
+    )
+    assert code == 0 and json.loads(same.out)["region"] == "salad-us"
+
+
+def test_an_interrupted_first_run_is_refused_and_never_mints_a_second_credential(inputs, capsys):
+    """Idempotency covers a completed enrollment only (ADR 0056 section 3)."""
+    _, cpu, _ = _enroll(inputs, capsys, provider="local-docker", region="local", name="cpu")
+    code, directory, _ = _enroll_into(
+        inputs, capsys, cpu["project_id"], name="salad", provider="salad", region="salad-us"
+    )
+    assert code == 0
+    # The first run issued its credential, then died before executor.json was written.
+    (directory / ee.RECORD_NAME).unlink()
+    token = (directory / ee.TOKEN_NAME).read_text()
+    credentials, principals = _count(inputs, "credentials"), _count(inputs, "principals")
+    code, _, out = _enroll_into(
+        inputs, capsys, cpu["project_id"], name="salad", provider="salad", region="salad-us"
+    )
+    assert code == 1 and "executor.json is missing" in out.err
+    assert (_count(inputs, "credentials"), _count(inputs, "principals")) == (
+        credentials,
+        principals,
+    )  # no second credential or principal
+    assert not (directory / ee.RECORD_NAME).exists()
+    assert (directory / ee.TOKEN_NAME).read_text() == token  # nothing was rewritten
+    # Recovery is a fresh directory.
+    code, fresh, out = _enroll_into(
+        inputs, capsys, cpu["project_id"], name="salad-again", provider="salad", region="salad-us"
+    )
+    assert code == 0, out.err
+    assert json.loads(out.out)["project_id"] == cpu["project_id"]
+    assert (fresh / ee.RECORD_NAME).is_file()
+
+
 @pytest.mark.parametrize("project", ["project_" + "0" * 32, "not-a-project", "project_x"])
 def test_an_unknown_or_malformed_project_is_refused_before_anything_is_issued(
     inputs, capsys, project

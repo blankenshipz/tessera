@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -37,6 +38,9 @@ MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_INPUT_FILES = 1000
 MAX_INPUT_MANIFEST_BYTES = 1024 * 1024
 _DIGEST = re.compile(r"[a-f0-9]{64}\Z")
+
+
+log = logging.getLogger("tessera.worker.cpu")
 
 
 class CpuError(Exception):
@@ -155,8 +159,8 @@ class CpuOperation:
     argv: tuple[str, ...]
     plan_digest: str
     max_duration_seconds: int
-    memory_bytes: int = 256 * 1024 * 1024
-    scratch_bytes: int = 16 * 1024 * 1024
+    memory_bytes: int = limits.DEFAULT_MEMORY_BYTES
+    scratch_bytes: int = limits.DEFAULT_SCRATCH_BYTES
     # Operator-owned (never from a plan or spec); recorded in the durable fence.
     container_user: str = LEGACY_CONTAINER_USER
     input_directory: str | None = None
@@ -207,10 +211,7 @@ class CpuOperation:
             raise ValueError("Invalid memory bound.")
         if not limits.MIN_SCRATCH_BYTES <= self.scratch_bytes <= limits.MAX_BYTES:
             raise ValueError("Invalid scratch bound.")
-        if (
-            self.scratch_bytes > limits.LEGACY_SCRATCH_CEILING
-            and self.scratch_bytes + limits.MEMORY_HEADROOM_BYTES > self.memory_bytes
-        ):
+        if not limits.scratch_fits_memory(self.scratch_bytes, self.memory_bytes):
             # tmpfs is charged to the container's memory, so a scratch that cannot fit in
             # it would end as an out-of-memory kill, not as a full scratch.
             raise ValueError("Scratch needs more memory than the container's memory limit.")
@@ -332,7 +333,23 @@ class DockerCpuAdapter:
             scratch_bytes is not None and scratch_bytes > ceiling
         ):
             raise ValueError("Invalid scratch ceiling.")
+        if scratch_bytes is not None and not limits.scratch_fits_memory(
+            scratch_bytes, memory_bytes
+        ):
+            # The default scratch every container gets must itself fit the memory limit, or
+            # every grant would fail when its operation is built.
+            raise ValueError("Scratch needs more memory than the container's memory limit.")
         limits.check_host_capacity(memory_bytes, ceiling)
+        backed = limits.scratch_backed_by(memory_bytes)
+        if ceiling > max(backed, limits.LEGACY_SCRATCH_CEILING):
+            # A request between what the memory can back and the ceiling passes control's
+            # admission (which knows only the ceiling) and is refused here, at run.
+            log.warning(
+                "max_scratch_bytes %d is above the %d bytes memory_bytes can back; larger "
+                "requests are refused when their operation is built",
+                ceiling,
+                backed,
+            )
         self.memory_bytes = memory_bytes
         self.scratch_bytes = scratch_bytes
         self.max_scratch_bytes = ceiling
@@ -641,11 +658,8 @@ class DockerCpuAdapter:
                 f"The requested scratch of {requested} bytes exceeds the operator ceiling of "
                 f"{self.max_scratch_bytes} bytes."
             )
-        memory = self.memory_bytes if self.memory_bytes is not None else 256 * limits.MIB
-        if (
-            requested > limits.LEGACY_SCRATCH_CEILING
-            and requested + limits.MEMORY_HEADROOM_BYTES > memory
-        ):
+        if not limits.scratch_fits_memory(requested, self.memory_bytes):
+            memory = self.memory_bytes or limits.DEFAULT_MEMORY_BYTES
             raise ValueError(
                 f"The requested scratch of {requested} bytes needs more memory than the "
                 f"operator's limit of {memory} bytes (scratch is memory-backed)."
@@ -654,12 +668,12 @@ class DockerCpuAdapter:
 
     def operation_limits(self) -> dict[str, int]:
         """The operator limits to set on every CpuOperation this adapter will run."""
-        limits = {
+        values = {
             "memory_bytes": self.memory_bytes,
             "scratch_bytes": self.scratch_bytes,
             "container_user": self.container_user,
         }
-        return {name: value for name, value in limits.items() if value is not None}
+        return {name: value for name, value in values.items() if value is not None}
 
     def create_arguments(self, operation: CpuOperation) -> list[str]:
         # The operation carries the limits (built from this adapter's operator limits by the

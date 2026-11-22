@@ -204,6 +204,7 @@ def _journal(destinations=None, **overrides):
         ),
         "bytes_up": sum(d["bytes_up"] for d in destinations),
         "bytes_down": sum(d["bytes_down"] for d in destinations),
+        "connections_unclosed": sum(d.get("unclosed", 0) for d in destinations),
         "destinations": destinations,
     }
     return {"journal_sha256": "c" * 64, "summary": summary} | overrides
@@ -353,3 +354,20 @@ def test_cap_exceeded_is_recorded_not_rejected(egress: Harness) -> None:
     recorded = egress.events()
     assert recorded["cap_exceeded"] is True
     assert json.dumps(recorded["summary"])
+
+
+def test_unclosed_tunnel_is_recorded_not_missing(egress: Harness) -> None:
+    body = _journal()
+    destinations = body["summary"]["destinations"]
+    destinations[0] = destinations[0] | {"connections": 2, "unclosed": 1}
+    body["summary"]["connections_unclosed"] = 1
+    assert egress.post(body).status_code == 201
+    recorded = egress.events()
+    assert recorded["summary"]["connections_unclosed"] == 1
+    assert recorded["summary"]["connections_allowed"] == 2
+
+
+def test_unclosed_total_must_match_destinations(egress: Harness) -> None:
+    body = _journal()
+    body["summary"]["connections_unclosed"] = 1
+    assert egress.post(body).status_code == 400

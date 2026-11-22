@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from .control_channel import DEFAULT_TIMEOUT_SECONDS
 from .docker_network_pool import DEFAULT_PREFIX_LENGTH
 from .grant_poller import DevelopmentGrantPoller, GrantPollerConfig, load_poller_config
 from .service import (
@@ -56,6 +57,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--allow-root-container-user", action="store_true")
     run.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
     run.add_argument("--docker-network-prefix-length", type=int, default=DEFAULT_PREFIX_LENGTH)
+    run.add_argument("--control-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     run.add_argument("--poll-seconds", type=float, default=1.0)
     run.add_argument("--max-ticks", type=int, default=90_000)
     poll = commands.add_parser("development-poll")
@@ -81,6 +83,7 @@ def parser() -> argparse.ArgumentParser:
     poll.add_argument("--allow-root-container-user", action="store_true")
     poll.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
     poll.add_argument("--docker-network-prefix-length", type=int, default=DEFAULT_PREFIX_LENGTH)
+    poll.add_argument("--control-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     poll.add_argument("--poll-seconds", type=float, default=2.0)
     poll.add_argument("--max-grants", type=int, default=None)
     poll.add_argument("--max-cycles", type=int, default=None)
@@ -107,6 +110,7 @@ def _poll_config(arguments: argparse.Namespace) -> GrantPollerConfig:
         allow_root_container_user=arguments.allow_root_container_user,
         docker_network_pool=arguments.docker_network_pool,
         docker_network_prefix_length=arguments.docker_network_prefix_length,
+        control_timeout_seconds=arguments.control_timeout_seconds,
         poll_seconds=arguments.poll_seconds,
         max_grants=arguments.max_grants,
     )
@@ -171,6 +175,7 @@ def main() -> int:
             allow_root_container_user=arguments.allow_root_container_user,
             docker_network_pool=arguments.docker_network_pool,
             docker_network_prefix_length=arguments.docker_network_prefix_length,
+            control_timeout_seconds=arguments.control_timeout_seconds,
             poll_seconds=arguments.poll_seconds,
             max_ticks=arguments.max_ticks,
         )

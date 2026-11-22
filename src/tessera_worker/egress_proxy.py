@@ -6,7 +6,9 @@ into the proxy container and run as ``python egress_proxy.py ...``.
 Only ``CONNECT host:port`` to an exact allowlisted destination is tunnelled. The
 proxy resolves the name itself, refuses it if ANY resolved address is not
 globally routable, and connects to the address it checked. TLS is not
-intercepted. Every decision is appended to a JSONL journal.
+intercepted. Every decision is appended to a JSONL journal; an admitted tunnel is
+journaled as "opened" before bytes flow and again at close with byte counts, so an
+interrupted tunnel is still on record.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import secrets
 import signal
 import socket
 import sys
@@ -31,6 +34,7 @@ IDLE_TIMEOUT_SECONDS = 60.0
 CONNECT_TIMEOUT_SECONDS = 10.0
 CHUNK = 16 * 1024
 MAX_SUMMARY_DESTINATIONS = 256
+OPENED = "opened"
 
 Resolver = Callable[[str, int], Awaitable[list[str]]]
 PublicPredicate = Callable[[str], bool]
@@ -85,8 +89,9 @@ class EgressJournal:
         bytes_up: int = 0,
         bytes_down: int = 0,
         duration_ms: int = 0,
+        tunnel: str | None = None,
     ) -> None:
-        entry = {
+        entry: dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "host": host[:255],
             "port": port,
@@ -96,6 +101,8 @@ class EgressJournal:
             "bytes_down": bytes_down,
             "duration_ms": duration_ms,
         }
+        if tunnel is not None:
+            entry["tunnel"] = tunnel
         self._file.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
         self._file.flush()
 
@@ -216,6 +223,10 @@ class EgressProxy:
                 self.journal.record(host, port, "deny", "connect_failed")
                 await self._reply(writer, "502 Bad Gateway")
                 return
+            # Journal the admission before any byte flows, so a tunnel interrupted by a kill or
+            # crash is still on record (bytes unknown) rather than missing.
+            tunnel_id = secrets.token_hex(8)
+            self.journal.record(host, port, "allow", OPENED, tunnel=tunnel_id)
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
             counts = {"up": 0, "down": 0}
@@ -228,6 +239,7 @@ class EgressProxy:
                 counts["up"],
                 counts["down"],
                 int((time.monotonic() - started) * 1000),
+                tunnel=tunnel_id,
             )
         except (ConnectionError, OSError):
             pass
@@ -337,6 +349,24 @@ def summarize_journal_bytes(data: bytes) -> dict[str, Any]:
     """Aggregate JSONL journal bytes (file or pod log); malformed lines are skipped."""
     allowed = denied = up = down = 0
     groups: dict[tuple[str, int, str], list[int]] = {}
+    # tunnel id -> destination of an admitted tunnel with no closing record (yet).
+    opened: dict[str, tuple[str, int]] = {}
+    unclosed = 0
+
+    def count(host: str, port: int, decision: str, sent: int, received: int, open_: int) -> None:
+        nonlocal allowed, denied, up, down
+        if decision == "allow":
+            allowed += 1
+        else:
+            denied += 1
+        up += sent
+        down += received
+        group = groups.setdefault((host, port, decision), [0, 0, 0, 0])
+        group[0] += 1
+        group[1] += sent
+        group[2] += received
+        group[3] += open_
+
     for line in data.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -345,26 +375,34 @@ def summarize_journal_bytes(data: bytes) -> dict[str, Any]:
             entry = json.loads(line)
             host, port, decision = entry["host"], entry["port"], entry["decision"]
             sent, received = int(entry["bytes_up"]), int(entry["bytes_down"])
-        except (KeyError, TypeError, ValueError):
+            tunnel = entry.get("tunnel")
+            if tunnel is not None and not isinstance(tunnel, str):
+                continue
+        except (KeyError, TypeError, ValueError, AttributeError):
             continue
         if decision not in {"allow", "deny"}:
             continue
-        if decision == "allow":
-            allowed += 1
-        else:
-            denied += 1
-        up += sent
-        down += received
-        group = groups.setdefault((host, port, decision), [0, 0, 0])
-        group[0] += 1
-        group[1] += sent
-        group[2] += received
+        if decision == "allow" and entry.get("reason") == OPENED:
+            if tunnel is None:
+                unclosed += 1
+                count(host, port, decision, 0, 0, 1)
+            else:
+                opened[tunnel] = (host, port)
+            continue
+        if decision == "allow" and tunnel is not None:
+            opened.pop(tunnel, None)
+        count(host, port, decision, sent, received, 0)
+    # Admitted but never closed: recorded, with bytes unknown (reported as zero and flagged).
+    for host, port in opened.values():
+        count(host, port, "allow", 0, 0, 1)
+    unclosed += len(opened)
     ordered = sorted(groups.items(), key=lambda item: (-item[1][0], item[0]))
     return {
         "connections_allowed": allowed,
         "connections_denied": denied,
         "bytes_up": up,
         "bytes_down": down,
+        "connections_unclosed": unclosed,
         "destinations": [
             {
                 "host": host,
@@ -373,6 +411,7 @@ def summarize_journal_bytes(data: bytes) -> dict[str, Any]:
                 "connections": values[0],
                 "bytes_up": values[1],
                 "bytes_down": values[2],
+                "unclosed": values[3],
             }
             for (host, port, decision), values in ordered[:MAX_SUMMARY_DESTINATIONS]
         ],

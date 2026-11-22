@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from . import scratch_limits as limits
-from .control_channel import HttpControlChannel, classify_control_failure
+from .control_channel import (
+    DEFAULT_TIMEOUT_SECONDS,
+    HttpControlChannel,
+    classify_control_failure,
+    validate_operator_timeout,
+)
 from .cpu import CpuError, _docker
 from .docker_network_pool import DEFAULT_PREFIX_LENGTH, DockerNetworkPool
 from .service import (
@@ -65,6 +70,9 @@ class GrantPollerConfig:
     # Operator ceiling on the scratch a plan may request (ADR 0059); None keeps the 64 MiB
     # default ceiling. Checked against the host's memory when above the historical bounds.
     max_scratch_bytes: int | None = None
+    # HTTP timeout for every control request, seconds (1 to 120, default 15). A slow answer is a
+    # transient failure that is retried; it never stops a healthy run (ADR 0054).
+    control_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         if (
@@ -104,6 +112,13 @@ class GrantPollerConfig:
         ):
             raise DevelopmentWorkerError("Grant poller configuration is invalid.")
         _check_container_user(self.container_user, self.allow_root_container_user)
+        if self.scratch_bytes is not None and not limits.scratch_fits_memory(
+            self.scratch_bytes, self.memory_bytes
+        ):
+            raise DevelopmentWorkerError(
+                "Grant poller configuration is invalid: scratch_bytes needs more memory than "
+                "memory_bytes (scratch is memory-backed)."
+            )
         try:
             limits.check_host_capacity(self.memory_bytes, self.max_scratch_bytes)
         except ValueError as error:
@@ -111,6 +126,10 @@ class GrantPollerConfig:
                 f"Grant poller configuration is invalid: {error}"
             ) from None
         network_pool_from_config(self.docker_network_pool, self.docker_network_prefix_length)
+        try:
+            validate_operator_timeout(self.control_timeout_seconds)
+        except ValueError as error:
+            raise DevelopmentWorkerError("Grant poller configuration is invalid.") from error
 
 
 ServiceFactory = Callable[[DevelopmentWorkerConfig], Any]
@@ -133,6 +152,7 @@ _CONFIG_KEYS = {
     "allow_root_container_user",
     "docker_network_pool",
     "docker_network_prefix_length",
+    "control_timeout_seconds",
     "max_output_bytes",
     "max_scratch_bytes",
 }
@@ -189,6 +209,9 @@ def load_poller_config(path: Path) -> GrantPollerConfig:
             docker_network_prefix_length=document.get(
                 "docker_network_prefix_length", DEFAULT_PREFIX_LENGTH
             ),
+            control_timeout_seconds=document.get(
+                "control_timeout_seconds", DEFAULT_TIMEOUT_SECONDS
+            ),
             max_output_bytes=document.get("max_output_bytes"),
             max_scratch_bytes=document.get("max_scratch_bytes"),
         )
@@ -224,7 +247,9 @@ class DevelopmentGrantPoller:
         self.root = _private_dir(Path(config.workspace_root))
         self.output_root = _private_dir(Path(config.development_output_root))
         self.channel = channel or HttpControlChannel(
-            config.control_url, read_private_credential(config.credential_file)
+            config.control_url,
+            read_private_credential(config.credential_file),
+            timeout_seconds=config.control_timeout_seconds,
         )
         self.service_factory = service_factory or self._default_service
         self.sleep = sleep
@@ -271,6 +296,7 @@ class DevelopmentGrantPoller:
                 allow_root_container_user=self.config.allow_root_container_user,
                 docker_network_pool=self.config.docker_network_pool,
                 docker_network_prefix_length=self.config.docker_network_prefix_length,
+                control_timeout_seconds=self.config.control_timeout_seconds,
                 max_output_bytes=self.config.max_output_bytes,
                 max_scratch_bytes=self.config.max_scratch_bytes,
                 poll_seconds=self.config.poll_seconds,

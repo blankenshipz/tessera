@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from collections.abc import Callable
-from concurrent.futures import Future, TimeoutError
+from concurrent.futures import Future, TimeoutError, wait
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -14,7 +15,39 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+# A routine observation can take longer than a few seconds on a busy control plane (a live run saw
+# 7 s), so the default leaves room; an operator can raise it to the bound or lower it to 1 s.
+DEFAULT_TIMEOUT_SECONDS = 15.0
+MIN_OPERATOR_TIMEOUT_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 30.0
+# A worker lease lasts 30 s (tessera_control.execution.LEASE_SECONDS, asserted by a test) and is
+# renewed every 10 s by a single-threaded loop, so one request may take at most the lease minus a
+# renewal interval; anything longer lets one unanswered call lapse the lease.
+WORKER_LEASE_SECONDS = 30.0
+RENEWAL_INTERVAL_SECONDS = 10.0
+MAX_OPERATOR_TIMEOUT_SECONDS = WORKER_LEASE_SECONDS - RENEWAL_INTERVAL_SECONDS
+# After a request times out its thread may still be finishing (the socket timeout restarts on each
+# read). The next call waits up to this long for it before refusing, instead of failing at once.
+STRAGGLER_WAIT_SECONDS = 5.0
+
+
+def validate_operator_timeout(
+    value: object, renewal_interval_seconds: float = RENEWAL_INTERVAL_SECONDS
+) -> float:
+    """An operator-set control HTTP timeout in seconds, or ``ValueError``.
+
+    It must fit the renewal timing: at most the worker lease minus the renewal interval, so a
+    single unanswered request cannot outlast the lease (20 s with the default interval).
+    """
+    ceiling = min(MAX_OPERATOR_TIMEOUT_SECONDS, WORKER_LEASE_SECONDS - renewal_interval_seconds)
+    if type(value) not in {int, float} or not MIN_OPERATOR_TIMEOUT_SECONDS <= value <= ceiling:
+        raise ValueError(
+            f"Control timeout must be between 1 and {ceiling:g} seconds "
+            "(the lease minus the renewal interval)."
+        )
+    return float(value)
+
+
 _MAX_BASE_URL_BYTES = 2048
 _MAX_HEADER_VALUE_BYTES = 4096
 _MAX_PATH_BYTES = 4096
@@ -158,7 +191,7 @@ class HttpControlChannel:
         base_url: str,
         bearer_token: str,
         *,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         opener: OpenRequest | None = None,
     ):
         self.origin = self._origin(base_url)
@@ -285,6 +318,28 @@ class HttpControlChannel:
             future.set_exception(error)
 
     def _submit(self, request: Request, timeout_seconds: float) -> Future[dict[str, Any]]:
+        """Start the request thread and return its future (see ``_submit_within``)."""
+        return self._submit_within(request, timeout_seconds)[0]
+
+    def _submit_within(
+        self, request: Request, timeout_seconds: float
+    ) -> tuple[Future[dict[str, Any]], float]:
+        """Start the request thread; return its future and the time left to wait for it.
+
+        A request that timed out may still be winding down; wait briefly for it so the next call
+        (a heartbeat, say) is not refused and a healthy run is not cancelled for it. The wait is
+        bounded (``STRAGGLER_WAIT_SECONDS`` and half of this call's own timeout, so a call with
+        a short deadline, such as a cancellation path, is never held), it comes out of this
+        call's own deadline, and there is still never more than one request thread.
+        """
+        with self._inflight_lock:
+            straggler = self._inflight if self._inflight and not self._inflight.done() else None
+        waited = 0.0
+        if straggler is not None:
+            started = time.monotonic()
+            wait([straggler], timeout=min(STRAGGLER_WAIT_SECONDS, timeout_seconds / 2))
+            waited = time.monotonic() - started
+            timeout_seconds = max(0.001, timeout_seconds - waited)
         with self._inflight_lock:
             if self._inflight is not None and not self._inflight.done():
                 raise ControlChannelError("control request is still in progress")
@@ -300,7 +355,7 @@ class HttpControlChannel:
             except RuntimeError:
                 self._inflight = None
                 raise ControlChannelError("control transport unavailable") from None
-            return future
+            return future, timeout_seconds
 
     def get(self, path: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         """GET one bounded JSON document without redirects, cookies, or retries."""
@@ -321,7 +376,7 @@ class HttpControlChannel:
             },
             method="GET",
         )
-        future = self._submit(request, request_timeout)
+        future, request_timeout = self._submit_within(request, request_timeout)
         try:
             return future.result(timeout=request_timeout)
         except TimeoutError:
@@ -360,7 +415,7 @@ class HttpControlChannel:
             },
             method="POST",
         )
-        future = self._submit(request, request_timeout)
+        future, request_timeout = self._submit_within(request, request_timeout)
         try:
             return future.result(timeout=request_timeout)
         except TimeoutError:

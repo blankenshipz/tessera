@@ -198,7 +198,9 @@ provider's worker may receive (public only by default). With the owner-set mode
 `all_registered_providers` (ADR 0047), agents and specs route any data class among the
 configured, registered providers without a per-run approval; data never goes to the public
 internet or an unregistered destination in any mode, because non-public inputs cannot use
-egress or workload fetch hosts and every transfer is recorded on the receipt. A stage input is a snapshot, the
+egress or workload fetch hosts and every transfer is recorded on the receipt (the egress
+proxy journals a tunnel when it is admitted and again at close, so an interrupted tunnel is
+recorded with unknown bytes rather than missing, [ADR 0057](docs/decisions/0057-egress-tunnel-opened-record.md)). A stage input is a snapshot, the
 declared output of an earlier stage (any provider), or an `artifact` pinned by campaign,
 stage, output and sha256 from an earlier campaign; every input and output is indexed in
 `campaign_stage_io`. Each attempt is settled once through a single settlement path with a
@@ -266,12 +268,11 @@ new work. Published-rate estimates are not actual billed-cost proof or hard caps
 See the [Salad runbook](docs/salad-proxy.md#first-gpu-journey-setup-versus-normal-operation)
 for one-time setup, normal execution, confirmed stop and same-record reconnect. Routes
 that carry owner-approved private code reuse one owner-enrolled executor enrollment
-(`scripts/executor_enrollment.py`; `--existing-project` enrolls an executor of any provider
-into a project that already exists, so one campaign can mix CPU and Salad stages with their
-data and receipts together, [ADR 0056](docs/decisions/0056-executor-enrollment-into-an-existing-project.md))
-whose worker principal is listed in the
+(`scripts/executor_enrollment.py`) whose worker principal is listed in the
 [provider trust](docs/provider-trust.md#stable-executor-route-setups-that-mint-principals)
-file. Control issues worker credentials for at most 24 hours, renews them only up to
+file. `--existing-project` enrolls an executor of any provider into a project that already
+exists, so one campaign can mix CPU and Salad stages with their data and receipts together
+([ADR 0056](docs/decisions/0056-executor-enrollment-into-an-existing-project.md)). Control issues worker credentials for at most 24 hours, renews them only up to
 seven days after issue, refuses them at use time past that point and never revives an
 expired one, so the enrollment needs a renewal
 at least daily and a rotation within the week; it is revocable at any time.

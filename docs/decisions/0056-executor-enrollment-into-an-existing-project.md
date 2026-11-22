@@ -45,9 +45,20 @@ names, so mixed-provider stages need nothing more once both principals are in th
 ### 3. Idempotency and the journal
 
 Re-running the same `--existing-project` command in the same executor directory (same
-provider, same project, live record) changes nothing and prints the same record. A
-directory that holds any other enrollment is refused and never overwritten. Every control
-request of a first enrollment is journaled before it is sent, as before.
+provider, project, region and number of days, live record) changes nothing and prints the
+same record. A directory that holds any other enrollment is refused and never overwritten:
+another provider or project, a different `--region` or `--days` (the recorded lifetime is
+compared exactly, so a changed value is a refusal, not a silently ignored option) or a revoked
+record. Every control request of a first enrollment is journaled before it is sent, as before.
+
+The idempotency covers a **completed** enrollment only. It is a check of the record in
+`executor.json`, not a reconciliation with control. If a first run stops after the credential
+was issued but before `executor.json` was written (a crash, a full disk), the directory then
+holds a token and a journal but no record; a rerun there is refused ("executor executor.json is
+missing") and issues nothing more, rather than minting a second credential. Recover by
+revoking the orphaned credential if the journal shows one was issued (it expires on its own
+within 24 hours) and enrolling into a **new** directory. This is the same limit as an
+enrollment into a new project.
 
 ### 4. Trust is unchanged
 
@@ -75,7 +86,8 @@ module so these checks apply.
 ## Tests
 
 `tests/test_executor_enrollment.py`: a CPU worker and a Salad executor in one project,
-journal and privacy, idempotent repeat, a directory with another enrollment refused,
+journal and privacy, idempotent repeat, a directory with another enrollment (including another
+region or number of days) refused, an interrupted first run refused without issuing anything more,
 unknown and malformed projects refused before anything is issued, `--project-name`
 conflict, a worker credential refused, renew and revoke in an existing project, and a
 record written before the field still validating.

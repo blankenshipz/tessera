@@ -8,6 +8,7 @@ artifact/cost acceptance are integrated. Closing a desktop has no role here.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import sqlite3
@@ -37,6 +38,11 @@ EGRESS_REPORT_STATE = "egress_journal"
 DELIVERY_BACKOFF_BASE_SECONDS = 2.0
 DELIVERY_BACKOFF_CAP_SECONDS = 300.0
 DELIVERY_MAX_AGE = timedelta(hours=24)
+# One report may use at most the lease time left, less this reserve (one renewal interval), so a
+# report that hangs cannot by itself lapse the 30 s lease (the loop is single-threaded and the
+# renewal follows). It is never shorter than the minimum request time.
+REPORT_LEASE_RESERVE_SECONDS = 10.0
+MIN_REPORT_REQUEST_SECONDS = 1.0
 
 
 class ObservationDeliveryPending(SupervisorError):
@@ -548,16 +554,24 @@ class CpuRuntime:
             provider_id = self.provider_dispatch.provider_id(self.operation)
         launch_error = result.launch_error if state == "unknown" and provider_id is None else None
         confirmed_exit = state == "exited" and observation.termination_confirmed
-        payload, key, intent_id = self._observation_intent(
-            state, provider_id, confirmed_exit, launch_error
-        )
-        self._begin_delivery(intent_id, confirmed_exit)
-        try:
-            response = self.channel.post("/worker/observations", payload, key)
-        except Exception as error:
-            self._delivery_failed(intent_id, error)
-        with self._observation_connection() as connection:
-            connection.execute("UPDATE reports SET completed=1 WHERE id=?", (intent_id,))
+        # A confirmed exit control already accepted is never sent again: a resumed run (for
+        # example after its egress journal could not be delivered) reuses the stored answer, so
+        # control records one exit per operation, not one per attempt.
+        response = self._delivered_exit() if confirmed_exit else None
+        if response is None:
+            payload, key, intent_id = self._observation_intent(
+                state, provider_id, confirmed_exit, launch_error
+            )
+            self._begin_delivery(intent_id, confirmed_exit)
+            try:
+                response = self._post_report("/worker/observations", payload, key)
+            except Exception as error:
+                self._delivery_failed(intent_id, error)
+            with self._observation_connection() as connection:
+                connection.execute(
+                    "UPDATE reports SET completed=1, response_json=? WHERE id=?",
+                    (json.dumps(response, sort_keys=True, separators=(",", ":")), intent_id),
+                )
         if (
             state == "exited"
             and observation.termination_confirmed
@@ -566,6 +580,46 @@ class CpuRuntime:
         ):
             self._report_egress_journal()
         return response
+
+    def _report_request_seconds(self) -> float | None:
+        """The request time one report may use: the channel's timeout, capped by the lease.
+
+        ``None`` when the channel has no timeout of its own (a test double): it is called
+        without one.
+        """
+        channel_timeout = getattr(self.channel, "timeout_seconds", None)
+        if type(channel_timeout) not in {int, float}:
+            return None
+        budget = float(channel_timeout)
+        if self.lease is not None:
+            left = (self.lease.expires_at - self._clock()).total_seconds()
+            budget = min(budget, left - REPORT_LEASE_RESERVE_SECONDS)
+        return max(MIN_REPORT_REQUEST_SECONDS, min(float(channel_timeout), budget))
+
+    def _post_report(self, path: str, payload: dict[str, Any], key: str) -> dict[str, Any]:
+        """Post a report, with a per-call time cap when the channel supports one."""
+        seconds = self._report_request_seconds()
+        try:
+            accepts = "timeout_seconds" in inspect.signature(self.channel.post).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        if seconds is None or not accepts:
+            return self.channel.post(path, payload, key)
+        return self.channel.post(path, payload, key, timeout_seconds=seconds)
+
+    def _delivered_exit(self) -> dict[str, Any] | None:
+        """Control's stored answer to this operation's accepted confirmed exit, if any."""
+        if self.operation is None:
+            return None
+        with self._observation_connection() as connection:
+            row = connection.execute(
+                """SELECT response_json FROM reports
+                WHERE operation_id=? AND observed_state='exited'
+                AND termination_confirmed=1 AND completed=1 AND abandoned=0
+                AND response_json IS NOT NULL ORDER BY id LIMIT 1""",
+                (self.operation.operation_id,),
+            ).fetchone()
+        return None if row is None else json.loads(row[0])
 
     def _begin_delivery(self, intent_id: int, confirmed_exit: bool) -> None:
         """Supersede stale intents, and honour the persisted backoff after a restart.
@@ -605,10 +659,24 @@ class CpuRuntime:
         now = self._clock()
         with self._observation_connection() as connection:
             row = connection.execute(
-                "SELECT attempts, first_failed_at FROM reports WHERE id=?", (intent_id,)
+                "SELECT attempts, first_failed_at, operation_id FROM reports WHERE id=?",
+                (intent_id,),
             ).fetchone()
             attempts = (row[0] if row else 0) + 1
-            first = datetime.fromisoformat(row[1]) if row and row[1] else now
+            # The age bound is per operation: the earliest undelivered failure of any of its
+            # reports counts, so a newer (for example superseding exit) row does not restart
+            # the 24 hours.
+            started = [
+                datetime.fromisoformat(value[0])
+                for value in connection.execute(
+                    """SELECT first_failed_at FROM reports WHERE operation_id=?
+                    AND completed=0 AND first_failed_at IS NOT NULL""",
+                    (row[2],),
+                )
+            ]
+            if row and row[1]:
+                started.append(datetime.fromisoformat(row[1]))
+            first = min(started, default=now)
             detail = f"{kind}: {type(error).__name__}"[:120]
             reason = None
             if kind == "permanent":
@@ -695,7 +763,7 @@ class CpuRuntime:
                 intent_id = cursor.lastrowid
         self._begin_delivery(intent_id, False)
         try:
-            self.channel.post(
+            self._post_report(
                 f"/worker/operations/{operation.operation_id}/egress-journal", payload, key
             )
         except Exception as error:
@@ -723,6 +791,7 @@ class CpuRuntime:
                 ("next_attempt_at", "TEXT"),
                 ("last_error", "TEXT"),
                 ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
+                ("response_json", "TEXT"),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE reports ADD COLUMN {name} {definition}")
