@@ -49,6 +49,56 @@ delegated steps) and refuses a malformed one. Optional runner hooks (`sweep`, `o
 A settlement whose provider is no longer registered fails closed and is recorded rather than
 skipping that provider's bookkeeping.
 
+### Adapting a local-docker CPU stage to Salad
+
+Contract: [ADR 0076](decisions/0076-salad-cpu-stage-adapter-and-cpu-runtime.md). A v2 stage on
+`local-docker` (`docker-cpu-v1`) lists a Salad CPU profile as an alternate with no Salad-form copy:
+
+```json
+"alternate_providers": [{"provider": "salad", "runtime": "salad-workload-v1",
+                         "provider_config": {"adapt": {"profile": "cpu-2c-4g"}}}]
+```
+
+Submit (and `tessera_validate_campaign_spec`, which returns the result as `expanded_spec`) replaces
+the request with the explicit `salad` block, so the approver sees and approves the exact workload
+by digest and a later profile edit cannot change it. The block holds the profile and its worker, a
+`gpu_runtime_v1` contract whose manifest is the stage's own argv as one image entry (no fetch or
+redirect host, no env), one output per stage output, one `input` for the stage's snapshot, the
+profile's program template, and a cost estimate of the full duration at the profile's CPU rate. The
+ordinary submit, approval and placement checks then apply to it.
+
+The operator opens a CPU profile to this by adding a `stage_adapter` section to it (its presence
+is the opt-in; [ADR 0077](decisions/0077-campaign-prep-from-the-spec.md)). Every field is optional:
+`program` (absent: a generic program template naming only the stage), `max_input_bytes` (absent: the
+profile's `disk_mb` bounds the input) and `grant_ttl_seconds` (default 21600). The profile's
+`allowed_image_digests` must hold the stage's image digest, so the same image has to run on both
+providers: build it from the CPU runtime variant (`workloads/gpu_runtime_v1/README.md`, section "CPU runtime variant and baked wheels"; a source-tree file, not installed with the docs)
+(it carries the runtime; the local worker overrides the entrypoint), with the dependencies baked in.
+Tessera builds no image: it is operator-built and pinned by digest.
+
+**Inputs.** A stage may read several pinned `snapshot` inputs and pinned `artifact` inputs. The runner
+composes them into one snapshot before staging, and that snapshot's digest is a pure function of the
+files' digests, so submit computes it from the platform's recorded inputs (read only) and writes it,
+with the exact total size as `input.max_bytes`, into the contract. The runner still composes under the
+approved campaign's existing delegation and fails closed if its digest differs. A `stage` input (another
+stage's output in the same campaign) has no digest at submit and is refused; an `artifact` input must
+already exist when the spec is submitted.
+
+On Salad the argv runs with its working directory at the run's work directory; arguments at
+`/inputs` and `/outputs` (whole, or after `--name=`) are mapped to the staged input and the output
+directory. Refused with a message that names the limit or the fix: a profile that is not a CPU profile
+with a `stage_adapter`; an image outside the allowlist (the message gives the exact
+`"sha256:..."` entry and profile to add to `allowed_image_digests`); a duration above 3600 s (or under
+60); `env`, `egress`, `scratch_bytes` or `retry.transient_exit_codes`; a `stage` input; inputs larger
+than the profile's `disk_mb` or `max_input_bytes`; an output path that is not a flat Salad output
+name; outputs above 16 MiB or 16 files; an argv too large for the workload argv (about 4 KiB); and a
+stage `max_exposure_cents` below the estimate. When provider trust does not admit the Salad worker
+for the stage's data, the 409 says what to merge into the provider trust file (see
+[provider trust](provider-trust.md)); the policy itself stays the operator's.
+Check the argv before opting in: glued short flags (`-o/outputs/x`) and paths inside config files are
+not rewritten, and a hard-coded `/work/...` differs from the Salad work directory. It is verified with
+fakes only: no adapted stage has run on Salad.
+
 ### Placement across candidates
 
 Contract: [ADR 0060](decisions/0060-capacity-aware-stage-placement.md). A v2 stage may list
@@ -279,7 +329,8 @@ part of default pytest or CI: it is a dry run unless you pass `--run` and an exa
 scripts/salad_cpu_live_check.py check --profiles FILE --profile NAME --contract FILE \
     --image IMAGE@sha256:DIGEST [--max-cents N]                     # plan only, no network
 scripts/salad_cpu_live_check.py check ... --run --confirm spend-up-to-Nc \
-    --credential-file FILE --receipt-directory DIR                  # spends, up to the ceiling
+    (--credential-file FILE | --credential-dir DIR --credential-version N) \
+    --receipt-directory DIR                                         # spends, up to the ceiling
 scripts/salad_cpu_live_check.py billing --receipt FILE --portal-cents X
 ```
 
@@ -297,13 +348,25 @@ scripts/salad_cpu_live_check.py billing --receipt FILE --portal-cents X
   An unexpected error does not lose the receipt: it is recorded as `aborted` (its type only, never
   its message) beside the group name and the cleanup outcome.
 - **What a run does.** It makes only the vetted Salad transport's calls: read the quota, create
-  one stopped group (free), read it back and compare its shape (**no GPU class**, the shape check),
-  start it, poll until it ends or the bound, stop, delete. Salad publishes no CPU availability read,
+  one stopped group (free), read it until it settles (stopped, no change in flight, no instance:
+  at most 60 s, unbilled, [ADR 0071](decisions/0071-salad-start-settles-the-group.md)) and compare
+  its shape (**no GPU class**, the shape check), start it, poll until it ends or the bound, stop,
+  delete. A group that never settles is not started, and the receipt records the observed state,
+  the change flag and the instance-count keys (no secret). Salad publishes no CPU availability read,
   so the check cannot show capacity.
 - **Inputs.** The profile must be a CPU profile; the image must be allowlisted by it; the contract
   is your reviewed `tessera.salad.workload.v1` JSON for a short CPU job (a stub that exits in
-  seconds is enough). The credential is an owner-only (0600) absolute file holding the Salad
-  management token; it is held in a wiped buffer and never printed or stored.
+  seconds is enough). The credential is either an owner-only (0600) absolute file holding only the
+  Salad management token, or the operator's credential directory read by reference
+  (`--credential-dir`, `--credential-version`, `--credential-ref`, default
+  `credential-ref:salad-management`), like the rest of the Salad stack; it is held in a wiped
+  buffer and never printed or stored.
+- **Run it once before relying on Salad CPU.** The offline tests use a fake group, so what Salad
+  reports for a real CPU group's instance counts is unconfirmed: a group that omits them is
+  started but never reported as a confirmed stop ([ADR 0071](decisions/0071-salad-start-settles-the-group.md)).
+  One bounded `--run` shows the real shape in the receipt's `settle` block and the `start` step's
+  `instance_counts_complete`. The credential is wiped on every path, including a failure before
+  the journey starts.
 - **Billing is a manual comparison.** The receipt records the running seconds and the estimate at
   your rates (`estimated_cents`). Copy the figure Salad's own usage page shows for that group and
   run `billing --receipt FILE --portal-cents X`: it agrees if the two are within the larger of one

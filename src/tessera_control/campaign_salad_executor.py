@@ -69,7 +69,6 @@ class ExecutorConfig(_Closed):
     profiles_file: _Path
     profile: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
     worker_credential_file: _Path
-    cancel_credential_file: _Path
     credential_directory: _Path
     guardian_socket: _Path
     guardian_uid: Annotated[int, Field(ge=0, le=2**31 - 1)]
@@ -100,7 +99,6 @@ def load_config(path: Path | str) -> ExecutorConfig:
             os.close(_private_path(directory, directory=True))
         for file in (
             config.worker_credential_file,
-            config.cancel_credential_file,
             config.custody.token_file,
             config.custody.ca_file,
             config.profiles_file,
@@ -379,7 +377,6 @@ class SaladCampaignExecutor:
             proposal_digest=state["proposal_digest"],
             policy=policy_json,
             worker_credential_file=self.config.worker_credential_file,
-            cancel_credential_file=self.config.cancel_credential_file,
             credential_directory=self.config.credential_directory,
             guardian_socket=self.config.guardian_socket,
             guardian_uid=self.config.guardian_uid,

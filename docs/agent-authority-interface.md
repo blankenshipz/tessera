@@ -139,7 +139,10 @@ decision; `human_session` is the only class that does. Remote route state record
 same provenance under `approval_provenance` / `start_provenance` / `stop_provenance`,
 and autonomy sessions under `approval_provenance` / `resume_provenance` /
 `stop_provenance`; the state events carry them. `scripts/salad_live_setup.py` sends
-`X-Tessera-Automation: salad-live-setup` on every owner-made request.
+`X-Tessera-Automation: salad-live-setup` on every owner-made request. A route stopped by
+the executor's worker credential records `credential_kind: worker`, `decision_class:
+other_credential` and `cancel_authority: executor_worker` in `stop_provenance`
+([ADR 0075](decisions/0075-executor-worker-credential-cancels-own-route.md)).
 
 Next: desktop `human_session` login. The desktop app should obtain and use a
 `human_session` credential instead of the labelled owner token, so its decisions

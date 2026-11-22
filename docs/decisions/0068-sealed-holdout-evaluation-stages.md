@@ -43,12 +43,17 @@ providers and records stage metrics on the receipt. What was missing was a durab
    An attempt of a holdout stage is never followed by another once the claim is open: a failed
    attempt, including one reconciled as not started (ADR 0046), fails the stage
    (`holdout_spent:<class>`) instead of being requeued, so the partition is released at most once.
-5. **Sealed inputs.** A stage that is not the holdout stage may not read a partition with any
-   recorded claim, and an `artifact` input may not come from another campaign's holdout stage
-   (its outputs, per-example predictions for example, must not feed back into selection). Both
-   are refused at submit and approval and checked again by the runner just before each input
-   release, so a campaign approved before the claim existed fails with `sealed_partition` and
-   nothing is released.
+5. **Sealed inputs.** A partition is sealed from the first human approval of a spec that names
+   it as a holdout (no separate registration step: the approved declaration is the
+   registration), and stays sealed once claimed. A submitted but unapproved spec seals nothing,
+   so an agent cannot block other campaigns' data. A stage that is not a holdout stage naming it
+   as its holdout input may not read a sealed partition, and an `artifact` input may not come
+   from another campaign's holdout stage (its outputs, per-example predictions for example, must
+   not feed back into selection). Both are refused at submit and approval and checked again by
+   the runner just before each input release, so a campaign approved before the partition was
+   sealed fails with `sealed_partition` and nothing is released. A holdout stage's outputs also
+   cannot be staged as an input snapshot (`snapshot.staged_from_artifacts` refuses its
+   manifests), which closes the human staging path back into selection.
 6. **Closing.** When the stage succeeds the claim becomes `scored` with the succeeded attempt's
    metric values (same transaction as the stage). A campaign that finishes with the claim still
    open marks it `spent` with the stage's status as the reason. Either way the partition stays
@@ -70,13 +75,32 @@ partition digest and the claim scope. No per-scoring "go" is needed.
 - A claim opened for a run that then failed (including a grant that expired before any worker
   leased it, or a launch the worker reported as refused) is spent. One-time is the stricter
   reading: control does not try to prove the labels were never read.
-- Claims are project-scoped. The same bytes staged in another project, or a different claim
-  scope, are a new claim; choosing the scope is part of the approved spec.
+**Known limits / future decision.** The next three bullets and the seal-permanence and
+seal-start notes below are documented limits, not defects; changing any of them needs its own
+decision.
+
+- Claims and seals are project-scoped, because the project is the tenant boundary every
+  other campaign check uses: control does not compare a digest across projects. The same bytes
+  staged in another project, or a different claim scope, are a new claim, so an actor with
+  several projects can score the same labels once per project. Choosing the scope and project
+  is part of the approved spec; a deployment that needs one claim across projects keeps the
+  labels in one project.
 - The claim key is the pinned digest of the input's kind (a snapshot's digest or an artifact's
   sha256), so the same labels pinned once as a snapshot and once as an artifact are two
   partitions to the platform; like a new scope, that needs a newly approved spec.
-- The platform learns that a partition is sealed when a claim exists. A stage that read it
-  before the first claim was opened is not undone; from then on every release is refused.
+- A stage that read a partition before any holdout spec naming it was approved is not undone;
+  from that approval on every release to a non-holdout stage is refused. An approved holdout
+  spec that never runs (cancelled, for example) still seals its partition, and there is no
+  release path for that seal yet (an operator escape hatch would be its own decision).
+- **Upgrade note.** After upgrading, a campaign approved earlier that reads a digest which an
+  approved holdout spec now declares fails that stage with `sealed_partition` at its next input
+  release, even though it was approved first. Before upgrading, let such campaigns finish, or
+  expect those stages to fail and resubmit them without the sealed input.
+- Each approved spec's declared holdouts are parsed once and cached per campaign (keyed by the
+  stored spec text), so the seal check before each release does not re-parse every approved
+  holdout spec in the project.
+- Bytes a person downloads from custody and re-stages by hand outside these paths are outside
+  what control can see; the staging refusal covers the platform's own path.
 - The scorer stays in the experiment's own repository and reaches Tessera only as a pinned
   image.
 

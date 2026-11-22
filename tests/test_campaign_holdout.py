@@ -303,7 +303,7 @@ def test_a_repeat_claim_is_refused_at_submit_but_another_scope_is_a_new_claim(tm
     peek["stages"] = [
         _stage("peek", [peek["stages"][1]["inputs"][1]], "x"),
     ]
-    with pytest.raises(Conflict, match="claimed sealed partition"):
+    with pytest.raises(Conflict, match="is a sealed partition"):
         _submit(env, peek, "peek")
 
 
@@ -367,6 +367,9 @@ def test_a_failed_scorer_spends_the_claim_and_the_partition_stays_sealed(tmp_pat
     assert receipt["holdout_claims"][0]["status"] == "spent"
     with pytest.raises(Conflict, match="already claimed"):
         _submit(env, _spec(env, labels, name="retry"), "retry")
+    # The identical spec under a new idempotency key is refused the same way.
+    with pytest.raises(Conflict, match="already claimed"):
+        _submit(env, _spec(env, labels), "same-spec-new-key")
 
 
 def test_a_failed_dependency_never_opens_the_claim(tmp_path):
@@ -501,11 +504,11 @@ def test_a_campaign_approved_before_the_claim_is_refused_at_release(tmp_path):
     world = _world(tmp_path)
     env = world.env
     labels = _labels(world)
-    holder = world.campaign(_spec(env, labels, name="holder"))
     peek = _spec(env, labels, name="peek")
     peek["stages"] = [_stage("train", [peek["stages"][1]["inputs"][1]], "x")]
-    reader = world.campaign(peek)  # approved while the partition has no claim yet
+    reader = world.campaign(peek)  # approved while nothing seals the partition yet
     _pause(world, reader["id"], 1)
+    holder = world.campaign(_spec(env, labels, name="holder"))
     world.tick_all(holder["id"])
     assert world.status(holder["id"]) == "succeeded", dump(world, holder["id"])
     _pause(world, reader["id"], 0)
@@ -515,7 +518,7 @@ def test_a_campaign_approved_before_the_claim_is_refused_at_release(tmp_path):
     (attempt,) = world.attempts(reader["id"])
     assert attempt["failure_class"] == "sealed_partition"
     assert attempt["release_id"] is None and attempt["grant_id"] is None
-    assert "claimed sealed partition" in attempt["failure_detail"]
+    assert "is a sealed partition" in attempt["failure_detail"]
 
 
 def test_a_holdout_stage_output_cannot_be_another_campaign_artifact_input(tmp_path):
@@ -618,3 +621,307 @@ def test_a_holdout_stage_with_alternate_providers_claims_once(tmp_path):
 
         for provider_id in made:
             unregister_provider(provider_id)
+
+
+# -- second review (shs2) ----------------------------------------------------------------
+
+
+def test_an_approved_holdout_declaration_seals_the_partition_before_any_claim(tmp_path):
+    """Findings 2/3: sealing starts at the first human approval of a holdout spec."""
+    world = _world(tmp_path)
+    env = world.env
+    labels = _labels(world)
+    peek = _spec(env, labels, name="peek")
+    peek["stages"] = [_stage("train", [peek["stages"][1]["inputs"][1]], "x")]
+    # A submitted but unapproved holdout spec seals nothing (an agent cannot block data).
+    submitted = env.submit(spec=_spec(env, labels, name="pending"))
+    status, _ = _submit(env, peek, "peek-before")
+    assert status == 201
+    env.approve(submitted)  # never run: no claim exists
+    assert _claims(world) == []
+    with pytest.raises(Conflict, match="is a sealed partition"):
+        _submit(env, peek, "peek-after")
+    # Another holdout stage may still name it as its own holdout input, under a new scope.
+    status, _ = _submit(env, _spec(env, labels, scope="study-a/other", name="b"), "other")
+    assert status == 201
+
+
+def test_holdout_stage_outputs_cannot_be_staged_as_an_input_snapshot(tmp_path):
+    """Finding 1: the snapshot-staging path is closed for holdout-stage outputs."""
+    from tessera_control.dataset_staging import DatasetStagingStore
+
+    world = _world(tmp_path)
+    env = world.env
+    campaign = world.campaign(_spec(env, _labels(world)))
+    world.tick_all(campaign["id"])
+    assert world.status(campaign["id"]) == "succeeded", dump(world, campaign["id"])
+    staging = DatasetStagingStore(env.state)
+
+    def stage(stage_key: str):
+        attempt = world.row(
+            "SELECT manifest_id, manifest_digest FROM campaign_stage_attempts "
+            "WHERE campaign_id=? AND stage_key=?",
+            campaign["id"],
+            stage_key,
+        )
+        payload = {
+            "manifest_id": attempt["manifest_id"],
+            "expected_manifest_digest": attempt["manifest_digest"],
+            "expected_snapshot_digest": "0" * 64,
+        }
+        return staging.stage(env.human(), env.project["id"], f"stage-{stage_key}", payload)
+
+    with pytest.raises(Conflict, match="holdout stage final"):
+        stage("final")
+    # The selection stage's outputs reach the ordinary checks (here: a wrong digest).
+    with pytest.raises(Conflict) as error:
+        stage("select")
+    assert "holdout" not in str(error.value)
+    assert env.query("SELECT 1 FROM events WHERE event_type='snapshot.staged_from_artifacts'") == []
+
+
+def test_a_lost_race_at_the_insert_is_a_clean_refusal(tmp_path, monkeypatch):
+    """Finding 4: open_claim returns the refusal even if the unique key decides the race."""
+    from tessera_control import campaign_holdout
+    from tessera_control.campaign_models import normalize, parse_spec_json
+    from tessera_control.store import _connect
+
+    world = _world(tmp_path)
+    env = world.env
+    labels = _labels(world)
+    first = world.campaign(_spec(env, labels, name="first"))
+    other_id, other_digest = _labels(world, b"print('other code')\n")
+    code = {
+        "kind": "snapshot",
+        "name": "code",
+        "snapshot_id": other_id,
+        "digest": other_digest,
+        "data_class": "private_derived",
+    }
+    second = world.campaign(_spec(env, labels, name="second", code=code))
+    world.tick_all(first["id"])
+    assert world.status(first["id"]) == "succeeded", dump(world, first["id"])
+
+    real = campaign_holdout.existing_claim
+    calls = []
+
+    def stale(*args):  # the lookup misses the winner once, as an interleaved writer would
+        calls.append(args)
+        return None if len(calls) == 1 else real(*args)
+
+    monkeypatch.setattr(campaign_holdout, "existing_claim", stale)
+    env.execute(
+        "UPDATE campaign_stages SET status='succeeded' WHERE campaign_id=? AND stage_key='select'",
+        second["id"],
+    )
+    connection = _connect(env.state / "tessera.sqlite3")
+    try:
+        row = connection.execute("SELECT * FROM campaigns WHERE id=?", (second["id"],)).fetchone()
+        stage = normalize(parse_spec_json(row["spec_json"])).stage("final")
+        held, claim = campaign_holdout.open_claim(
+            connection, row, second["approval"], stage, "2026-01-01T00:00:00Z"
+        )
+    finally:
+        connection.close()
+    assert held is False and claim["campaign_id"] == first["id"]
+    assert len(calls) == 2
+    (only,) = _claims(world)
+    assert only["campaign_id"] == first["id"]
+
+
+def _other_org(env) -> dict:
+    now = "2026-01-01T00:00:00Z"
+    env.execute("INSERT INTO organizations VALUES ('org_two','Two',?)", now)
+    env.execute(
+        "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+        "VALUES ('p_two','org_two','human',?,NULL,?)",
+        "f" * 64,
+        now,
+    )
+    env.execute(
+        "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+        "expires_at, revoked_at, created_at, created_by_principal_id) "
+        "VALUES ('c_two','p_two','local_owner','control',NULL,NULL,NULL,NULL,?,'p_two')",
+        now,
+    )
+    return {"id": "p_two", "org_id": "org_two", "kind": "local_owner", "automation_label": "t"}
+
+
+def test_holdout_reads_are_tenant_scoped_and_capped(tmp_path):
+    """Findings 5 and 6: another org sees nothing; the per-campaign read reports truncation."""
+    from tessera_control.store import NotFound
+
+    world = _world(tmp_path)
+    env = world.env
+    labels = _labels(world)
+    campaign = world.campaign(_spec(env, labels))
+    world.tick_all(campaign["id"])
+    reads = AgentCampaignReads(env.state)
+    stranger = _other_org(env)
+    with pytest.raises(NotFound):
+        reads.campaign_holdout(stranger, campaign["id"])
+    with pytest.raises(NotFound):
+        reads.holdout_claims(stranger, env.project["id"])
+    with pytest.raises(NotFound):
+        reads.holdout_claims(stranger, env.project["id"], labels[1])
+    view = reads.campaign_holdout(env.owner, campaign["id"])
+    assert view["truncated"] is False and len(view["evaluation_stages"]) == 1
+
+
+def test_migration_71_to_72_adds_the_claim_table_and_its_triggers(tmp_path):
+    """Finding 5: a populated v71 database gains the table and the triggers it would have
+    fresh, and the triggers hold after migration."""
+    from campaign_fixture import Env
+
+    from tessera_control.migrations import migrate_database
+    from tessera_control.store import _connect, validate_database
+
+    env = Env(tmp_path)
+    env.submit()  # populated: a campaign row exists
+    path = env.state / "tessera.sqlite3"
+    query = "SELECT name, sql FROM sqlite_schema WHERE tbl_name='campaign_holdout_claims'"
+    fresh = dict(sqlite3.connect(path).execute(query).fetchall())
+    assert len(fresh) >= 4  # table, its unique indexes and three triggers
+    with sqlite3.connect(path) as db:
+        for name in fresh:
+            if name.startswith("campaign_holdout_claims_") and "autoindex" not in name:
+                db.execute(f"DROP TRIGGER {name}")
+        db.execute("DROP TABLE campaign_holdout_claims")
+        db.execute("UPDATE schema_meta SET schema_version=71")
+    assert migrate_database(path, _connect) == 72
+    assert migrate_database(path, _connect) == 72  # a second run is a no-op
+    validate_database(path)
+    assert dict(sqlite3.connect(path).execute(query).fetchall()) == fresh
+    campaign = env.query("SELECT * FROM campaigns")[0]
+    approval_id = "approval_x"
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute(
+            """INSERT INTO campaign_holdout_claims (id, org_id, project_id, partition_digest,
+            claim_scope, campaign_id, stage_key, input_name, approval_id, spec_digest, status,
+            opened_at, closed_at) VALUES ('h1',?,?,?,?,?,'final','labels',?,?,'scored',?,?)""",
+            (
+                campaign["org_id"],
+                campaign["project_id"],
+                "a" * 64,
+                SCOPE,
+                campaign["id"],
+                approval_id,
+                campaign["spec_digest"],
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:01Z",
+            ),
+        )
+    with sqlite3.connect(path) as db:
+        with pytest.raises(sqlite3.IntegrityError, match="permanent"):
+            db.execute("DELETE FROM campaign_holdout_claims")
+        with pytest.raises(sqlite3.IntegrityError, match="cannot change"):
+            db.execute("UPDATE campaign_holdout_claims SET metrics_json='{}'")
+
+
+# -- third review follow-ups -------------------------------------------------------------------
+
+
+def test_sealed_digests_read_only_approved_specs_and_skip_unparseable_ones(tmp_path):
+    from tessera_control import campaign_holdout
+    from tessera_control.store import _connect
+
+    world = _world(tmp_path)
+    env = world.env
+    labels = _labels(world)
+    project = env.project["id"]
+
+    def sealed() -> set:
+        connection = _connect(env.state / "tessera.sqlite3")
+        try:
+            return campaign_holdout.sealed_digests(connection, project)
+        finally:
+            connection.close()
+
+    submitted = env.submit(spec=_spec(env, labels, name="pending"))
+    assert labels[1] not in sealed()  # submitted, never approved: seals nothing
+    env.approve(submitted)
+    assert labels[1] in sealed()
+    assert labels[1] in sealed()  # served from the per-campaign cache, same answer
+    # A stored spec that now declares another digest replaces its cache entry.
+    other = _labels(world, b"id,label\n22,1\n")
+    env.execute(
+        "UPDATE campaigns SET spec_json=? WHERE id=?",
+        json.dumps(_spec(env, other, name="pending")),
+        submitted["id"],
+    )
+    assert other[1] in sealed() and labels[1] not in sealed()
+    # A stored spec that no longer parses is skipped, not fatal, and its cached digests are
+    # not reused for the changed text.
+    env.execute(
+        "UPDATE campaigns SET spec_json=? WHERE id=?",
+        '{"version": 2, "stages": [{"evaluation": {"holdout": "broken"}}]}',
+        submitted["id"],
+    )
+    assert labels[1] not in sealed()
+
+
+def test_the_insert_race_returns_the_stages_own_claim(tmp_path, monkeypatch):
+    """open_claim's IntegrityError path when the row that won is this stage's own claim."""
+    from tessera_control import campaign_holdout
+    from tessera_control.campaign_models import normalize, parse_spec_json
+    from tessera_control.store import _connect
+
+    world = _world(tmp_path)
+    env = world.env
+    campaign = world.campaign(_spec(env, _labels(world)))
+    world.tick_all(campaign["id"])
+    assert world.status(campaign["id"]) == "succeeded", dump(world, campaign["id"])
+    (own,) = _claims(world)
+
+    class _Interleaved:
+        """The first own-claim lookup misses, as if the claim were written just after it."""
+
+        def __init__(self, connection):
+            self.connection, self.missed = connection, False
+
+        def execute(self, sql, params=()):
+            if not self.missed and "FROM campaign_holdout_claims WHERE campaign_id=?" in sql:
+                self.missed = True
+                return self.connection.execute("SELECT 1 WHERE 0")
+            return self.connection.execute(sql, params)
+
+    monkeypatch.setattr(campaign_holdout, "existing_claim", lambda *args: None)
+    connection = _connect(env.state / "tessera.sqlite3")
+    try:
+        row = connection.execute("SELECT * FROM campaigns WHERE id=?", (campaign["id"],)).fetchone()
+        stage = normalize(parse_spec_json(row["spec_json"])).stage("final")
+        proxy = _Interleaved(connection)
+        held, claim = campaign_holdout.open_claim(
+            proxy, row, campaign["approval"], stage, "2026-01-01T00:00:00Z"
+        )
+    finally:
+        connection.close()
+    assert proxy.missed
+    assert held is True and claim["claim_id"] == own["id"]
+    assert len(_claims(world)) == 1
+
+
+def test_the_campaign_holdout_read_reports_truncation_at_the_cap(tmp_path, monkeypatch):
+    from tessera_control import agent_campaign_reads
+
+    world = _world(tmp_path)
+    env = world.env
+    campaign = world.campaign(_spec(env, _labels(world)))
+    world.tick_all(campaign["id"])
+    monkeypatch.setattr(agent_campaign_reads, "_ROW_CAP", 1)
+    view = AgentCampaignReads(env.state).campaign_holdout(env.owner, campaign["id"])
+    assert view["truncated"] is True and len(view["evaluation_stages"]) == 1
+
+
+def test_declared_holdout_cache_is_bounded_and_thread_safe(monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tessera_control import campaign_holdout as module
+
+    monkeypatch.setattr(module, "_DECLARED", {})
+    monkeypatch.setattr(module, "_DECLARED_LIMIT", 8)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda i: module._declared_holdouts(f"c{i}", "not json"), range(200)))
+    assert len(module._DECLARED) <= 8
+    assert module._declared_holdouts("c199", "not json") == frozenset()

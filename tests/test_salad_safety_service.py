@@ -201,6 +201,7 @@ class Provider:
         self.group_without_instances = False  # read_group omits the instances list
         self.pending_change = False
         self.counts = None  # override instance_status_counts
+        self.counts_complete = None  # False: Salad omitted counts and the transport zero-filled
         # read_absence reply: "not_found", "present", "unknown" (timeout/5xx), "raise"
         self.absence = "not_found"
         # list read after a definite 404: absent, absent_partial, present, unavailable
@@ -286,6 +287,11 @@ class Provider:
                     },
                     pending_change=owner.pending_change,
                     instances=instances,
+                    **(
+                        {}
+                        if owner.counts_complete is None
+                        else {"instance_counts_complete": owner.counts_complete}
+                    ),
                 )
                 if owner.group_without_instances and action == "read_group":
                     observation.pop("instances")
@@ -1681,7 +1687,8 @@ def test_custody_failure_never_leaves_a_reconciled_operation_with_writers_open(
 
 
 @pytest.mark.parametrize(
-    "variant", ["pending_change", "stopping_count", "creating_count", "group_running"]
+    "variant",
+    ["pending_change", "stopping_count", "creating_count", "group_running", "counts_omitted"],
 )
 def test_non_exact_stopped_read_never_closes_uncertain_orphan(tmp_path, variant):
     tmp_path.chmod(0o700)
@@ -1712,6 +1719,9 @@ def test_non_exact_stopped_read_never_closes_uncertain_orphan(tmp_path, variant)
         )
         if variant == "pending_change":
             provider.pending_change = True
+        elif variant == "counts_omitted":
+            # Stopped, no change, all zeros, but Salad never sent the counts: not a proven stop.
+            provider.counts_complete = False
         elif variant == "group_running":
             provider.group_state = "running"
         else:

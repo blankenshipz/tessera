@@ -22,6 +22,7 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_campaign_outputs` | `GET /campaigns/{id}/outputs` | `artifact:read` |
 | `tessera_campaign_logs` | `GET /campaigns/{id}/logs` | `campaign:logs` |
 | `tessera_campaign_budget` | `GET /campaigns/{id}/budget` | `budget:read` |
+| `tessera_project_spend` | `GET /projects/{id}/agent-spend` | `budget:read` |
 | `tessera_campaign_retries` | `GET /campaigns/{id}/retries` | `campaign:read` |
 | `tessera_campaign_standing_status` | `GET /projects/{p}/agent-standing-status` | `campaign:read` |
 | `tessera_campaign_gate_decisions` | `GET /campaigns/{id}/gate-decisions` | `campaign:read` |
@@ -36,6 +37,7 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_limit_campaign_concurrency` | `POST /campaigns/{id}/concurrency-limit` | `campaign:cancel` |
 | `tessera_cancel_campaign_stage` | `POST /campaigns/{id}/stages/{stage}/cancel` | `campaign:cancel` |
 | `tessera_approve_campaign` (only with `--approval-tool`) | `GET /campaigns/{id}`, `POST /campaigns/{id}/approve` | a person's session credential; no enrollable scope grants it |
+| `tessera_rerun_campaign` | `POST /campaigns/{id}/rerun` | `campaign:submit` + `campaign:read` + `artifact:read` (all three needed to register it) |
 | `tessera_prepare_stage_retry` | `GET /campaigns/{id}` and `/outputs` (offline build) | `campaign:read` + `artifact:read` (both needed to register it) |
 
 The grants, budget-reduction, release-revocation, pause, resume, concurrency and stage-cancel tools, and the retry tool, are the steering tools of [ADR 0055](decisions/0055-mcp-steering-tools.md) and [ADR 0061](decisions/0061-campaign-pause-concurrency-stage-cancel.md) (pause and resume, a lower-only concurrency limit, single-stage cancel); the audit is in
@@ -50,7 +52,7 @@ guess. It omits the template spec and every principal id; standing approvals are
 created, shown in full and revoked only by a human. Unlock evaluations are in the receipt. `tessera_campaign_gate_decisions` returns each decision and its note but not who decided or the credential, matching the standing-status view.
 
 `budget:read` alone (a results-only credential) never turns the campaign tools on; it
-enables `tessera_campaign_budget` only beside another campaign scope. Experiment and
+enables `tessera_campaign_budget` and `tessera_project_spend` only beside another campaign scope. Experiment and
 program budget roll-ups remain in `tessera_experiment_results` / `tessera_program_results`.
 
 Every route requires the real agent bearer and `X-Agent-Destination` matching the
@@ -61,7 +63,9 @@ column allowlists.
 
 `tessera_submit_campaign` accepts v1 and v2 specs. v2 adds providers, runtimes, typed
 outputs, up to 64 stages, stage chaining and `kind: artifact` inputs pinning another
-campaign's output. The tool validates with the control plane's own parser, so an invalid
+campaign's output. `receipt_output` inputs resolve at submit from a succeeded campaign's receipt;
+pass `predecessors` (name to campaign id) to `tessera_submit_campaign` to name them
+([ADR 0080](decisions/0080-campaign-inputs-from-a-predecessor-receipt.md)). The tool validates with the control plane's own parser, so an invalid
 spec never leaves the adapter; provider-registry checks still run at submit and approve.
 Find snapshot ids and digests with `tessera_list_snapshots` and a source campaign's output
 sha256 with `tessera_campaign_outputs`.

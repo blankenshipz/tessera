@@ -23,7 +23,7 @@ from . import campaign_placement, program_budget, provider_trust
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
 from .campaign_holdout import campaign_claims, check_unclaimed
-from .campaign_io import resolve_artifact
+from .campaign_io import refuse_submitted_lineage, resolve_artifact, resolve_receipt_refs
 from .campaign_models import (
     GRANT_SETTLE_MARGIN_SECONDS,
     TERMINAL_CAMPAIGN,
@@ -31,6 +31,7 @@ from .campaign_models import (
     CancelCampaign,
     SubmitCampaign,
     normalize,
+    parse_spec,
     parse_spec_json,
     placement_candidates,
     spec_digest,
@@ -39,6 +40,18 @@ from .campaign_models import (
     stage_provider,
     topological_order,
 )
+from .campaign_rerun import (
+    RERUN_EVENT,
+    RerunCampaign,
+    RerunRefused,
+    lineage_of,
+    lineage_remaining,
+    load_source,
+    plan_rerun,
+    rerun_tree,
+    reruns_of,
+)
+from .campaign_salad_adapter import expand_with_registered
 from .campaign_salad_commands import (  # noqa: F401
     SALAD_ACTIVE_PHASES,
     SaladWorkerCommands,
@@ -59,6 +72,7 @@ from .store import (
     _connect,
     _parse_utc,
     _utc_string,
+    canonical_digest,
     utc_now,
 )
 
@@ -154,6 +168,31 @@ class CampaignStore(
     # -- spec reference checks (submit and approve) ---------------------------------
 
     @staticmethod
+    def adapter_entries(connection: sqlite3.Connection, live: dict[str, Any], project_id: str):
+        """The stage adapter's view of a pinned input: (path, sha256, size) of each file it holds.
+
+        Reads only: a snapshot's recorded manifest (same project) or a pinned artifact resolved as
+        an ``artifact`` input is at submit. Anything else is a 409 naming the input."""
+        project = {"org_id": live["org_id"], "project_id": project_id}
+
+        def entries(source: Any) -> list[tuple[str, str, int]]:
+            if source.kind == "artifact":
+                found = resolve_artifact(connection, project, source)
+                return [(found.path, found.sha256, found.size_bytes)]
+            row = connection.execute(
+                "SELECT manifest_json FROM source_snapshots WHERE id=? AND project_id=?",
+                (source.snapshot_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise Conflict(f"Input {source.name!r}: the pinned snapshot was not found.")
+            return [
+                (e["relative_path"], e["sha256"], int(e["size"]))
+                for e in json.loads(row["manifest_json"])["entries"]
+            ]
+
+        return entries
+
+    @staticmethod
     def recorded_snapshot_class(connection: sqlite3.Connection, snapshot_id: str) -> str:
         """The ADR 0039 recorded class of a snapshot (the one source of truth).
 
@@ -205,6 +244,19 @@ class CampaignStore(
             raise Conflict(f"Stage {stage.key!r}: {error.detail}") from None
 
     @staticmethod
+    def trust_hint(provider_id: str, worker: str | None, cls: str = "private_derived") -> str:
+        """What the operator adds to the provider trust file to admit ``cls``.
+
+        Provider trust stays explicit operator policy: this only names the entry."""
+        who = worker or "<worker principal id>"
+        return (
+            f'To admit it, make the provider trust file\'s "providers" entry for '
+            f'"{provider_id}" list "{cls}" under data_classes and "{who}" under '
+            "worker_principal_ids (merge into the existing entry; do not replace it, or other "
+            "listed workers lose access), then restart serve."
+        )
+
+    @staticmethod
     def check_stage_inputs(
         connection: sqlite3.Connection,
         stage: Any,
@@ -233,8 +285,13 @@ class CampaignStore(
                         approval_digest,
                     )
                 except DataClassRefused as error:
+                    hint = ""
+                    if error.admit_class is not None:
+                        hint = " " + CampaignStore.trust_hint(
+                            stage.provider, worker, error.admit_class
+                        )
                     raise Conflict(
-                        f"Stage {stage.key!r} input {source.name!r}: {error} ({who})."
+                        f"Stage {stage.key!r} input {source.name!r}: {error} ({who}).{hint}"
                     ) from None
             elif not provider_trust.provider_admits_class(
                 stage.provider,
@@ -246,7 +303,8 @@ class CampaignStore(
             ):
                 raise Conflict(
                     f"Stage {stage.key!r} input {source.name!r} is derived data and {who} is "
-                    "not trusted to receive private_derived (provider trust setting)."
+                    "not trusted to receive private_derived (provider trust setting). "
+                    + CampaignStore.trust_hint(stage.provider, worker)
                 )
 
     @staticmethod
@@ -391,22 +449,67 @@ class CampaignStore(
 
     # -- commands -------------------------------------------------------------------
 
-    def submit_campaign(self, principal, project_id, key, digest, payload) -> tuple[int, dict]:
+    @staticmethod
+    def _resolve_receipt_refs(connection, live, project_id, spec, predecessors, raw=None):
+        if raw is not None:
+            refuse_submitted_lineage(raw)
+        value = spec.model_dump(mode="json")
+        resolved = resolve_receipt_refs(
+            connection, {"org_id": live["org_id"], "project_id": project_id}, value, predecessors
+        )
+        if resolved == value:
+            if predecessors:
+                raise Conflict("predecessors were given but no input references one.")
+            return spec
+        try:
+            return parse_spec(resolved)
+        except ValidationError as error:
+            raise _invalid(error) from None
+
+    def submit_campaign(
+        self, principal, project_id, key, digest, payload, *, lineage=None
+    ) -> tuple[int, dict]:
         try:
             body = SubmitCampaign.model_validate(payload)
         except ValidationError as error:
             raise _invalid(error) from None
-        spec = body.spec
-        normal_spec = normalize(spec)
-        encoded_spec = json.dumps(spec.model_dump(mode="json"), sort_keys=True)
-        spec_hash = spec_digest(spec)
+        raw_spec = payload.get("spec") if isinstance(payload, dict) else None
 
         def command(connection, live):
             self._project(connection, live, project_id)
             self._require_action(connection, live, "campaign:submit")
             if live["role"] not in {"human", "agent"}:
                 raise Forbidden("This credential cannot submit campaigns.")
+            # ADR 0076/0077: a Salad adapter request becomes the explicit candidate before the spec
+            # is digested; the identity for a spec without one.
+            spec = expand_with_registered(
+                body.spec,
+                self.adapter_entries(connection, live, project_id),
+                (live["org_id"], project_id),
+            )
+            # ADR 0080: receipt_output references become pinned artifact inputs before the
+            # spec is digested, so approval binds the exact bytes and lineage.
+            spec = self._resolve_receipt_refs(
+                connection, live, project_id, spec, body.predecessors, raw_spec
+            )
+            normal_spec = normalize(spec)
+            encoded_spec = json.dumps(spec.model_dump(mode="json"), sort_keys=True)
+            spec_hash = spec_digest(spec)
             self._check_references(connection, live, project_id, spec)
+            if lineage is not None:
+                # The tree's budget is re-read here, under the write lock, so two re-runs planned
+                # against the same state cannot both fit (ADR 0074): the plan's check gives the
+                # good message, this one is the bound.
+                parent = connection.execute(
+                    "SELECT * FROM campaigns WHERE id=?", (lineage["rerun_of"],)
+                ).fetchone()
+                left = 0 if parent is None else lineage_remaining(connection, parent)
+                if spec.budget_cap_cents > left:
+                    raise Conflict(
+                        f"The tree's remaining budget ({max(left, 0)} cents) no longer covers this "
+                        f"re-run's cap of {spec.budget_cap_cents} cents: another re-run was "
+                        "submitted since it was planned."
+                    )
             now, ident = utc_now(), "campaign_" + uuid.uuid4().hex
             campaign = {
                 "id": ident,
@@ -459,14 +562,92 @@ class CampaignStore(
                     "stage_keys": [stage.key for stage in spec.stages],
                 },
             )
+            if lineage is not None:
+                # The link to the campaign this one re-runs, in the same transaction (ADR 0069).
+                self._event(
+                    connection,
+                    live,
+                    project_id,
+                    None,
+                    RERUN_EVENT,
+                    1,
+                    {"campaign_id": ident, **lineage},
+                )
             return 201, {
                 **_summary(campaign),
                 "spec": spec.model_dump(mode="json"),
                 "infra_retry_policy": infra_retry_policy(spec),
+                **({} if lineage is None else {"rerun": lineage}),
             }
 
         return self._mutate(
             principal, key, "POST", f"/projects/{project_id}/campaigns", digest, command
+        )
+
+    def rerun_campaign(self, principal, campaign_id, key, digest, payload) -> tuple[int, dict]:
+        """Submit a new campaign that re-runs a finished one's failed stages (or its identical
+        spec) and reuses its succeeded outputs (ADR 0069). It is an ordinary submission: it
+        grants nothing and a person approves the new digest."""
+        try:
+            request = RerunCampaign.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+        connection = _connect(self.database_path)
+        try:
+            actor = self._read_actor(connection, principal)
+            self._require_action(connection, actor, "campaign:submit")
+            if request.mode == "failed_stages":
+                # Reusing outputs hands the caller their digests (in the pins and the receipt):
+                # the same scope the offline retry tool needs to read them.
+                self._require_action(connection, actor, "artifact:read")
+            old = self._campaign(connection, actor, campaign_id)
+            project_id = old["project_id"]
+            request_digest = canonical_digest(payload)
+            stored = connection.execute(
+                """SELECT request_digest, response_json FROM idempotency WHERE principal_id=?
+                AND org_id=? AND idempotency_key=? AND method='POST' AND path=?""",
+                (actor["id"], actor["org_id"], key, f"/projects/{project_id}/campaigns"),
+            ).fetchone()
+            source = None if stored is not None else load_source(connection, old)
+        finally:
+            connection.close()
+        if stored is not None:
+            earlier = json.loads(stored["response_json"]).get("rerun") or {}
+            if (
+                earlier.get("rerun_of") == campaign_id
+                and earlier.get("request_digest") == request_digest
+            ):
+                # The same request again: answer from the record without planning, so a custody
+                # or output change since then cannot turn a replay into a refusal.
+                def refuse(connection, live):
+                    raise Conflict("The recorded re-run could not be replayed.")
+
+                return self._mutate(
+                    principal,
+                    key,
+                    "POST",
+                    f"/projects/{project_id}/campaigns",
+                    stored["request_digest"],
+                    refuse,
+                )
+            source = None
+            connection = _connect(self.database_path)
+            try:
+                source = load_source(connection, self._campaign(connection, actor, campaign_id))
+            finally:
+                connection.close()
+        try:
+            plan = plan_rerun(source, request)
+        except RerunRefused as error:
+            raise Conflict(str(error)) from None
+        plan["lineage"]["request_digest"] = request_digest
+        try:
+            body = SubmitCampaign.model_validate({"spec": plan["spec"]}).model_dump(mode="json")
+        except ValidationError as error:
+            raise Conflict("The re-run spec is not valid: " + str(_invalid(error))) from None
+        # Digested as the submit route digests its body, so a replay and a plain submit agree.
+        return self.submit_campaign(
+            principal, project_id, key, canonical_digest(body), body, lineage=plan["lineage"]
         )
 
     def approve_campaign(self, principal, campaign_id, key, digest, payload) -> tuple[int, dict]:
@@ -848,8 +1029,15 @@ class CampaignStore(
                     (campaign_id, MAX_LISTED_INTENTS),
                 )
             ]
+            rerun_of = lineage_of(connection, campaign_id, campaign["project_id"])
+            reruns = reruns_of(connection, campaign_id, campaign["project_id"])
+            tree = rerun_tree(connection, campaign) if (rerun_of or reruns) else None
             return {
                 **_summary(campaign),
+                **({} if rerun_of is None else {"rerun": rerun_of}),
+                **({} if not reruns else {"reruns": reruns}),
+                # ADR 0074: the re-run tree's first cap, what it has committed, what is left.
+                **({} if tree is None else {"rerun_tree": tree}),
                 "spec": json.loads(campaign["spec_json"]),
                 "infra_retry_policy": infra_retry_policy(parse_spec_json(campaign["spec_json"])),
                 "approval": next((a for a in approvals if a["status"] == "active"), None),

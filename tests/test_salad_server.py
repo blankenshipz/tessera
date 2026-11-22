@@ -356,14 +356,35 @@ def test_created_group_still_pending_binds_identity_then_requires_stopped_read(
     assert dispatch(h, "start")["receipts"][-1]["response_status"] == 202
 
 
+def test_a_stopped_group_that_omits_its_counts_is_never_a_confirmed_stop(tmp_path, monkeypatch):
+    """Stopped, no change in flight, no instance listed, but Salad sent no counts: the transport
+    zero-fills them for start admission, and the server must not read that as a proven stop."""
+    h = fixture(tmp_path, monkeypatch)
+    pending = copy.deepcopy(h.provider_group)
+    pending["current_state"]["status"] = "pending"
+    pending["pending_change"] = True
+    wire(h, *preflight(h, absent=True), (201, pending))
+    assert dispatch(h, "create")["provider_id"] == ID
+    omitted = copy.deepcopy(h.provider_group)
+    omitted["current_state"].pop("instance_status_counts")
+    wire(h, (200, omitted), (200, omitted), (200, {"instances": []}))
+    observed = dispatch(h, "observe")
+    assert observed["provider_status"] == "stopped"
+    assert not observed["termination_confirmed"]  # no counts sent: not a confirmed stop
+    wire(h, (200, h.provider_group), (200, h.provider_group), (200, {"instances": []}))
+    assert dispatch(h, "observe")["termination_confirmed"]  # complete zeros: confirmed
+
+
 @pytest.mark.parametrize(
-    "field,value",
+    "field,value,reason",
     [
-        ("pending_change", False),
-        ("status", "running"),
+        # Pending with nothing running is a transitional read even with no change flagged: the
+        # caller settles it by reading, and start is admitted only on a settled read (ADR 0071).
+        ("pending_change", False, "accepted_pending"),
+        ("status", "running", "admission_denied"),
     ],
 )
-def test_created_group_unsettled_otherwise_is_still_denied(tmp_path, monkeypatch, field, value):
+def test_created_group_unsettled_otherwise(tmp_path, monkeypatch, field, value, reason):
     h = fixture(tmp_path, monkeypatch)
     pending = copy.deepcopy(h.provider_group)
     pending["current_state"]["status"] = "pending"
@@ -373,7 +394,7 @@ def test_created_group_unsettled_otherwise_is_still_denied(tmp_path, monkeypatch
     else:
         pending[field] = value
     wire(h, *preflight(h, absent=True), (201, pending))
-    assert dispatch(h, "create")["receipts"][-1]["proxy_reason"] == "admission_denied"
+    assert dispatch(h, "create")["receipts"][-1]["proxy_reason"] == reason
 
 
 @pytest.mark.parametrize(

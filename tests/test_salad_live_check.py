@@ -324,7 +324,6 @@ def concrete_session(tmp_path, monkeypatch):
     files = {}
     for name, data in (
         ("worker", b"worker-token"),
-        ("cancel", h.journey.owner.removeprefix("Bearer ").encode()),
         ("admin", b"synthetic-admin-token"),
         ("ca", b"synthetic-ca-not-a-real-certificate"),
     ):
@@ -344,7 +343,6 @@ def concrete_session(tmp_path, monkeypatch):
         proposal_digest=h.route["proposal_digest"],
         policy=policy,
         worker_credential_file=files["worker"],
-        cancel_credential_file=files["cancel"],
         credential_directory=str(tmp_path / "private-credentials"),
         guardian_socket=str(tmp_path / "guardian.sock"),
         guardian_uid=__import__("os").geteuid(),
@@ -395,15 +393,72 @@ def test_concrete_unknown_exposure_blocks_actual_dispatch(tmp_path, monkeypatch)
     h.server.resolver.close()
 
 
-def test_concrete_cancel_preserves_human_authority_and_is_repeatable(tmp_path, monkeypatch):
+def test_concrete_cancel_uses_worker_credential_and_is_repeatable(tmp_path, monkeypatch):
     session, h, _ = concrete_session(tmp_path, monkeypatch)
+    assert not hasattr(session, "cancel_actor")
     session.cancel(h.route["id"])
     state = session.state(h.route["id"])
     assert state["desired"] == "stop"
+    provenance = state["stop_provenance"]
+    assert provenance["credential_kind"] == "worker"
+    assert provenance["cancel_authority"] == "executor_worker"
+    assert provenance["decision_class"] == "other_credential"
     session.cancel(h.route["id"])
     assert session.state(h.route["id"])["revision"] == state["revision"]
     session.close()
     h.server.resolver.close()
+
+
+def test_worker_cancel_is_scoped_to_the_routes_own_worker(tmp_path, monkeypatch):
+    from tessera_control.store import Forbidden
+
+    session, h, _ = concrete_session(tmp_path, monkeypatch)
+    route = session.state(h.route["id"])
+    store = session.server.store
+    kwargs = dict(expected_revision=route["revision"], proposal_digest=route["proposal_digest"])
+    # A human/owner credential is not a worker credential: refused on the worker path.
+    with pytest.raises(Forbidden):
+        store.worker_cancel(
+            store.authenticate(h.journey.owner.removeprefix("Bearer ")),
+            h.route["id"],
+            "k1",
+            **kwargs,
+        )
+    # A different worker principal of the same org cannot cancel this route.
+    # (a second, real, authenticating worker of the same org and project)
+    from test_execution import _worker
+
+    owner_actor = store.authenticate(h.journey.owner.removeprefix("Bearer "))
+    other = _worker(h.journey.state, owner_actor, h.route["project_id"], "other-worker-token")
+    other = store.authenticate_worker("other-worker-token")
+    assert other["id"] != session.server.worker["id"]
+    with pytest.raises(Forbidden, match="own dispatcher worker"):
+        store.worker_cancel(other, h.route["id"], "k2", **kwargs)
+    assert session.state(h.route["id"])["desired"] != "stop"
+    # A stale revision or digest is a conflict, never a blind stop.
+    from tessera_control.store import Conflict
+
+    with pytest.raises(Conflict):
+        store.worker_cancel(
+            session.server.worker, h.route["id"], "k3", **dict(kwargs, expected_revision=999)
+        )
+    with pytest.raises(Conflict):
+        store.worker_cancel(
+            session.server.worker, h.route["id"], "k4", **dict(kwargs, proposal_digest="0" * 64)
+        )
+    session.close()
+    h.server.resolver.close()
+
+
+def test_live_config_refuses_a_cancel_credential_file(tmp_path, monkeypatch):
+    session, h, path = concrete_session(tmp_path, monkeypatch)
+    session.close()
+    h.server.resolver.close()
+    document = json.loads(path.read_text())
+    document["cancel_credential_file"] = str(path)
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="closed server config"):
+        _config(path)
 
 
 def test_concrete_reopen_rejects_changed_config(tmp_path, monkeypatch):
@@ -1257,3 +1312,57 @@ def test_a_receipt_cannot_mix_a_status_0_rejection_with_another_reason():
     with pytest.raises(ValidationError):
         ProviderReadback(proxy_reason="request_not_sent",
                          provider_rejection=dict(zero, status=400), **base)  # fmt: skip
+
+
+def test_receipt_records_cancel_authority_and_outcome():
+    session = LocalSession()
+    receipt = drive(session)
+    assert receipt["cancel_authority"] == "executor_worker"
+    assert receipt["cancel_recorded"] is True
+
+
+def test_receipt_records_a_failed_cancel():
+    class Refusing(LocalSession):
+        def cancel(self, route):
+            raise ValueError("refused")
+
+    receipt = drive(Refusing())
+    assert receipt["cancel_authority"] == "executor_worker"
+    assert receipt["cancel_recorded"] is False
+
+
+# --- the group must read settled, not only stopped, before start (ADR 0071) ----------------
+
+
+class UnsettledSession(LocalSession):
+    """Reads stopped but not terminal (a change in flight) for the first observations."""
+
+    def __init__(self, unsettled: int):
+        super().__init__()
+        self.unsettled = unsettled
+        self.now = 0.0
+
+    def dispatch(self, route, action):
+        state = super().dispatch(route, action)
+        if action == "observe":
+            state["termination_confirmed"] = self.unsettled <= 0
+            self.unsettled -= 1
+        return state
+
+
+def test_start_waits_until_the_group_reads_settled_not_just_stopped():
+    session = UnsettledSession(unsettled=3)
+    receipt = drive(session, max_polls=8)
+    first = session.actions.index("start")
+    assert session.actions[:first].count("observe") == 4  # three unsettled reads, one settled
+    assert receipt["prestart_settle"] == {"polls": 4, "provider_status": "stopped", "settled": True}
+    assert receipt["status"] == "passed"
+
+
+def test_a_group_that_stays_stopped_but_unsettled_is_handed_to_start_after_the_bound():
+    session = UnsettledSession(unsettled=10_000)
+    receipt = drive_clocked(session, max_polls=40, max_seconds=400)
+    assert "start" in session.actions  # the transport's own exact read decides
+    assert receipt["prestart_settle"]["settled"] is False
+    assert receipt["prestart_settle"]["provider_status"] == "stopped"
+    assert session.now >= 45  # it waited the bounded settle window first

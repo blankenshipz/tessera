@@ -417,6 +417,7 @@ class _Flight:
         self.finished: float | None = None
 
 
+_ABANDONED = "\x00abandoned"  # a flight's answer when its upload went away before it ran
 _FLIGHTS: dict[tuple[str, str, str], _Flight] = {}
 _FLIGHTS_LOCK = threading.Lock()
 
@@ -428,6 +429,13 @@ def _forget(key: tuple[str, str, str], flight: _Flight) -> None:
             _FLIGHTS.pop(key, None)
 
 
+def _forget_answer(key: tuple[str, str, str]) -> None:
+    with _FLIGHTS_LOCK:
+        flight = _FLIGHTS.get(key)
+        if flight is not None and flight.finished is not None:
+            _FLIGHTS.pop(key, None)
+
+
 def _sweep_flights(now: float) -> None:
     """Forget finished answers older than ``FLIGHT_KEEP_SECONDS`` (called under the lock)."""
     for key in [
@@ -436,6 +444,35 @@ def _sweep_flights(now: float) -> None:
         if flight.finished is not None and now - flight.finished > FLIGHT_KEEP_SECONDS
     ]:
         _FLIGHTS.pop(key, None)
+
+
+def _sweep_now() -> None:
+    with _FLIGHTS_LOCK:
+        _sweep_flights(time.monotonic())
+
+
+# One sweeper thread for the whole process, started with the first verification; it wakes at a
+# fraction of the keep time (at most a minute), or when a verification finishes, and costs nothing
+# while no answer is kept. The flight table is per process: several control processes would each
+# hash once (duplicate work, never a wrong result), as ADR 0050 notes.
+_sweeper: threading.Thread | None = None
+_SWEEP_WAKE = threading.Event()
+
+
+def _sweep_loop() -> None:
+    while True:
+        # Re-read the keep time on every pass; a finished verification wakes it at once.
+        _SWEEP_WAKE.wait(timeout=max(0.05, min(60.0, FLIGHT_KEEP_SECONDS / 4)))
+        _SWEEP_WAKE.clear()
+        _sweep_now()
+
+
+def _ensure_sweeper() -> None:
+    global _sweeper
+    with _FLIGHTS_LOCK:
+        if _sweeper is None or not _sweeper.is_alive():
+            _sweeper = threading.Thread(target=_sweep_loop, name="flight-sweeper", daemon=True)
+            _sweeper.start()
 
 
 class _VerificationPending(Exception):  # noqa: N818 - a control-flow signal, not an error
@@ -919,6 +956,8 @@ class LargeArtifactStore(ArtifactStore):
                 "id": upload_id,
                 "status": "verifying",
                 "retry_after_seconds": VERIFY_RETRY_AFTER_SECONDS,
+                # How long one ask may itself take, so a worker can budget the worst case.
+                "max_wait_seconds": VERIFY_WAIT_SECONDS,
             }
 
         def command(connection: sqlite3.Connection, actor: dict[str, Any]):
@@ -954,18 +993,27 @@ class LargeArtifactStore(ArtifactStore):
                 connection, actor, lease, grant, body, b"", size=manifest["size"]
             )
 
-        return self._mutate(
-            worker,
-            key,
-            "POST",
-            path,
-            digest,
-            command,
-            audience="worker",
-            replay_guard=lambda connection, actor, _: self._grant_for_upload(
-                connection, actor, lease_id
-            ),
-        )
+        try:
+            return self._mutate(
+                worker,
+                key,
+                "POST",
+                path,
+                digest,
+                command,
+                audience="worker",
+                replay_guard=lambda connection, actor, _: self._grant_for_upload(
+                    connection, actor, lease_id
+                ),
+            )
+        except (Conflict, Forbidden, NotFound):
+            # A refusal that makes the cached answer wrong (a re-fence, a changed chunk set): drop
+            # the answer this call verified, and only that one. A transient failure (a busy
+            # database) keeps a just-finished multi-gigabyte verification, and a flight for
+            # another chunk set of the same upload is left running.
+            if verified:
+                _forget_answer((str(self.database_path), upload_id, verified))
+            raise
 
     def _verify_stored(self, worker: dict[str, Any], lease_id: str, upload_id: str) -> str | None:
         """Hash the stored chunks on a read-only pass; ``None`` when the upload is not ready.
@@ -997,9 +1045,10 @@ class LargeArtifactStore(ArtifactStore):
                 flight = _FLIGHTS[key] = _Flight()
                 threading.Thread(
                     target=self._verification_job,
-                    args=(flight, upload_id, manifest, fingerprint),
+                    args=(flight, key, upload_id, manifest, fingerprint),
                     daemon=True,
                 ).start()
+        _ensure_sweeper()
         try:
             result = flight.future.result(timeout=VERIFY_WAIT_SECONDS)
         except FutureTimeout:
@@ -1007,35 +1056,75 @@ class LargeArtifactStore(ArtifactStore):
         except BaseException:
             _forget(key, flight)
             raise
+        if result == _ABANDONED:
+            _forget(key, flight)
+            raise Conflict(
+                "Artifact upload expired, completed or lost its lease epoch while its "
+                "verification waited; begin a new upload."
+            )
         if result is None:  # not ready or mismatched: a later call hashes afresh
             _forget(key, flight)
         return result
 
     def _verification_job(
-        self, flight: _Flight, upload_id: str, manifest: dict[str, Any], fingerprint: str
+        self,
+        flight: _Flight,
+        key: tuple[str, str, str],
+        upload_id: str,
+        manifest: dict[str, Any],
+        fingerprint: str,
     ) -> None:
         with _HASH_SLOTS:
             connection = _connect(self.database_path)
             try:
                 try:
-                    verify_artifact_bytes(
-                        connection,
-                        upload_id,
-                        manifest["relative_path"],
-                        manifest["size"],
-                        manifest["sha256"],
-                    )
+                    abandoned = not self._still_live(connection, upload_id, manifest)
+                    if abandoned:
+                        outcome: str | None = _ABANDONED  # abandoned while queued: nothing to hash
+                    else:
+                        verify_artifact_bytes(
+                            connection,
+                            upload_id,
+                            manifest["relative_path"],
+                            manifest["size"],
+                            manifest["sha256"],
+                        )
+                        outcome = fingerprint
                 except Conflict:
-                    outcome: str | None = None
-                else:
-                    outcome = fingerprint
+                    outcome = None
                 flight.finished = time.monotonic()
                 flight.future.set_result(outcome)
+                if abandoned:
+                    # Nobody is waiting on it: drop it at once. (A mismatch found by hashing is
+                    # kept until a caller consumes it, so its 409 is answered, not re-hashed.)
+                    _forget(key, flight)
             except BaseException as error:
                 flight.finished = time.monotonic()
                 flight.future.set_exception(error)
             finally:
                 connection.close()
+        # Finished answers are dropped on their own clock (the shared sweeper), not only when a
+        # later call arrives.
+        _sweep_now()
+        _SWEEP_WAKE.set()
+
+    @staticmethod
+    def _still_live(
+        connection: sqlite3.Connection, upload_id: str, manifest: dict[str, Any]
+    ) -> bool:
+        """False for an upload that expired, completed elsewhere or lost its lease epoch while
+        its verification waited for a slot (a worker that gave up, a re-fenced lease)."""
+        row = connection.execute(
+            "SELECT status, expires_at FROM snapshot_chunk_uploads WHERE id=?", (upload_id,)
+        ).fetchone()
+        if row is None or row["status"] != "uploading":
+            return False
+        if _parse_utc(row["expires_at"]) <= _parse_utc(utc_now()):
+            return False
+        lease = connection.execute(
+            "SELECT epoch FROM execution_leases WHERE id=?", (manifest["lease_id"],)
+        ).fetchone()
+        return lease is not None and lease["epoch"] == manifest["epoch"]
 
 
 __all__ = [

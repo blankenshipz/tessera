@@ -25,7 +25,7 @@ from test_large_artifacts import (  # noqa: F401
 from test_large_output_worker import EPOCH, LEASE, FakeControl, _collect, _workspace
 
 from tessera_control import large_artifacts
-from tessera_control.store import Conflict, canonical_digest
+from tessera_control.store import Conflict, _connect, canonical_digest
 from tessera_worker import artifacts
 from tessera_worker.artifacts import ArtifactTransferError, upload_large_artifact
 
@@ -116,13 +116,18 @@ class _Verifying(FakeControl):
 
     def __init__(self, polls: int, **kwargs):
         super().__init__(**kwargs)
-        self.polls, self.completes = polls, 0
+        self.polls, self.completes, self.advertised = polls, 0, 1
 
     def _large(self, route, body):
         if len(route) == 2 and route[1] == "complete":
             self.completes += 1
             if self.completes <= self.polls:
-                return {"id": route[0], "status": "verifying", "retry_after_seconds": 2}
+                return {
+                    "id": route[0],
+                    "status": "verifying",
+                    "retry_after_seconds": 2,
+                    "max_wait_seconds": self.advertised,
+                }
         return super()._large(route, body)
 
 
@@ -165,18 +170,24 @@ def test_the_worker_gives_up_when_verification_never_finishes(tmp_path, monkeypa
 # -- bound on the clock, the hold, cleanup, compatibility ------------------------------------
 
 
-def test_the_poll_bound_counts_the_time_each_ask_takes(tmp_path, monkeypatch):
-    """Each ask can itself wait on control for seconds; the bound is on elapsed time, not on the
-    sum of the sleeps (which understated it several times over)."""
+def test_the_poll_bound_counts_the_time_each_ask_takes_and_budgets_the_next_one(
+    tmp_path, monkeypatch
+):
+    """Each ask can itself wait on control for seconds. The bound is on elapsed time, and the next
+    ask is budgeted at the longest control holds it, so the last request never overshoots."""
     now = [0.0]
+    ends: list[float] = []
     monkeypatch.setattr(artifacts, "_monotonic", lambda: now[0])
     monkeypatch.setattr(artifacts, "_sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
     monkeypatch.setattr(artifacts, "COMPLETE_MAX_WAIT_SECONDS", 60.0)
 
     class Slow(_Verifying):
+        advertised = 8
+
         def _large(self, route, body):
             if len(route) == 2 and route[1] == "complete":
                 now[0] += 8.0  # control holds the request before answering 202
+                ends.append(now[0])
             return super()._large(route, body)
 
     control = Slow(polls=1000)
@@ -184,9 +195,10 @@ def test_the_poll_bound_counts_the_time_each_ask_takes(tmp_path, monkeypatch):
         upload_large_artifact(
             control, lease_id=LEASE, expected_epoch=EPOCH, output=_output(tmp_path)
         )
-    # 10 s per round (8 s on the call, 2 s asleep): six rounds fit 60 s and a seventh does not;
-    # counting only the sleeps would have allowed thirty asks.
-    assert control.completes == 7 and now[0] <= 60.0 + 8.0
+    # 10 s per round (8 on the call, 2 asleep). Counting only sleeps would allow thirty asks;
+    # budgeting only the sleep would let a seventh ask end at 68 s. Six fit, the worst case ends
+    # at 58 s, and no ask ever ended after the bound.
+    assert control.completes == 6 and max(ends) <= 60.0 and now[0] <= 60.0
 
 
 def test_the_poll_bound_is_below_the_hold_stall_window():
@@ -272,3 +284,177 @@ def test_a_lease_refenced_between_the_202_and_the_ask_finalizes_nothing(tmp_path
         _complete(store, worker, lease, upload)
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert db.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0  # nothing finalized
+
+
+def test_a_queued_flight_whose_upload_is_gone_is_skipped_not_hashed(
+    tmp_path, slow_hash, monkeypatch
+):
+    """A worker that gave up, or a re-fenced lease, must not cost a multi-gigabyte hash (and one
+    of the shared slots) when its turn comes."""
+    state, worker, lease, store, _, upload = start(tmp_path)
+    put_all(store, worker, lease["id"], upload["id"])
+    taken = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(large_artifacts, "_HASH_SLOTS", taken)
+    taken.acquire()  # every slot busy: the flight queues
+    assert _complete(store, worker, lease, upload)[0][0] == 202
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        db.execute("UPDATE execution_leases SET epoch = epoch + 1")  # the upload is stale now
+    taken.release()
+    deadline = time.monotonic() + 5
+    while large_artifacts._FLIGHTS and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert slow_hash == []  # never hashed
+    assert not large_artifacts._FLIGHTS  # and its empty answer was dropped
+
+
+def test_finished_answers_are_dropped_on_their_own_clock(tmp_path, slow_hash, monkeypatch):
+    monkeypatch.setattr(large_artifacts, "FLIGHT_KEEP_SECONDS", 0.2)
+    state, worker, lease, store, _, upload = start(tmp_path)
+    put_all(store, worker, lease["id"], upload["id"])
+    assert _complete(store, worker, lease, upload)[0][0] == 202
+    # No further call at all: the sweep runs without one.
+    deadline = time.monotonic() + HASH_SECONDS + 3
+    while time.monotonic() < deadline:
+        if slow_hash and not large_artifacts._FLIGHTS:
+            break
+        time.sleep(0.1)
+    assert slow_hash and not large_artifacts._FLIGHTS
+
+
+def test_a_refused_commit_drops_the_cached_success(tmp_path, slow_hash):
+    state, worker, lease, store, _, upload = start(tmp_path)
+    put_all(store, worker, lease["id"], upload["id"])
+    assert _complete(store, worker, lease, upload)[0][0] == 202
+    time.sleep(HASH_SECONDS + 0.2)
+    assert large_artifacts._FLIGHTS  # the verified answer is cached
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        db.execute("UPDATE execution_leases SET epoch = epoch + 1")
+    with pytest.raises(Conflict):
+        _complete(store, worker, lease, upload)
+    assert not large_artifacts._FLIGHTS  # nothing left to lean on for the next ask
+
+
+# -- lca3 follow-ups ----------------------------------------------------------------------
+
+
+def test_a_transient_failure_keeps_the_verified_answer_and_a_refusal_drops_only_its_own(
+    tmp_path, slow_hash, monkeypatch
+):
+    state, worker, lease, store, _, upload = start(tmp_path)
+    put_all(store, worker, lease["id"], upload["id"])
+    assert _complete(store, worker, lease, upload)[0][0] == 202
+    time.sleep(HASH_SECONDS + 0.2)
+    (key,) = large_artifacts._FLIGHTS
+    other = (key[0], key[1], "f" * 64)  # a flight for another chunk set of the same upload
+    large_artifacts._FLIGHTS[other] = large_artifacts._Flight()
+    real = store._mutate
+
+    def busy(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_mutate", busy)
+    with pytest.raises(sqlite3.OperationalError):
+        _complete(store, worker, lease, upload)
+    assert key in large_artifacts._FLIGHTS  # the finished multi-gigabyte answer is not thrown away
+    monkeypatch.setattr(store, "_mutate", real)
+    (status, _), took = _complete(store, worker, lease, upload)
+    assert status == 201 and len(slow_hash) == 1  # the retry used it: one hash in all
+    # A refusal that makes the answer wrong drops that answer only, never another chunk set's.
+    large_artifacts._FLIGHTS.pop(key, None)
+    assert other in large_artifacts._FLIGHTS
+    large_artifacts._forget_answer(other)  # an unfinished flight is never dropped this way
+    assert other in large_artifacts._FLIGHTS
+
+
+def test_one_shared_sweeper_serves_every_verification_and_no_timer_is_started(
+    tmp_path, slow_hash, monkeypatch
+):
+    monkeypatch.setattr(large_artifacts, "FLIGHT_KEEP_SECONDS", 0.2)
+    timers = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+    for index in range(3):
+        home = tmp_path / f"u{index}"
+        home.mkdir(mode=0o700)
+        state, worker, lease, store, _, upload = start(home)
+        put_all(store, worker, lease["id"], upload["id"])
+        assert _complete(store, worker, lease, upload)[0][0] == 202
+    deadline = time.monotonic() + 3 * HASH_SECONDS + 4
+    while time.monotonic() < deadline and (len(slow_hash) < 3 or large_artifacts._FLIGHTS):
+        time.sleep(0.1)
+    assert len(slow_hash) == 3 and not large_artifacts._FLIGHTS
+    sweepers = [t for t in threading.enumerate() if t.name == "flight-sweeper"]
+    assert len(sweepers) == 1
+    assert [t for t in threading.enumerate() if isinstance(t, threading.Timer)] == timers
+
+
+def test_an_abandoned_verification_is_a_distinct_refusal(tmp_path, slow_hash, monkeypatch):
+    state, worker, lease, store, _, upload = start(tmp_path)
+    put_all(store, worker, lease["id"], upload["id"])
+    taken = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(large_artifacts, "_HASH_SLOTS", taken)
+    taken.acquire()
+    assert _complete(store, worker, lease, upload)[0][0] == 202
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        db.execute("UPDATE execution_leases SET epoch = epoch + 1")
+    taken.release()
+    time.sleep(0.5)
+    # The abandoned flight is dropped on its own, so a later ask starts a fresh one (and is then
+    # refused by the lease check); a caller joined to it gets the specific message.
+    flight = large_artifacts._Flight()
+    flight.future.set_result(large_artifacts._ABANDONED)
+    flight.finished = time.monotonic()
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        db.execute("UPDATE execution_leases SET epoch = epoch - 1")
+    connection = _connect(state / "tessera.sqlite3")
+    try:
+        fingerprint = large_artifacts.chunk_fingerprint(connection, upload["id"])
+    finally:
+        connection.close()
+    key = (str(store.database_path), upload["id"], fingerprint)
+    large_artifacts._FLIGHTS[key] = flight
+    with pytest.raises(Conflict, match="expired, completed or lost its lease epoch"):
+        _complete(store, worker, lease, upload)
+    assert key not in large_artifacts._FLIGHTS
+
+
+def test_the_poll_clock_starts_at_the_last_accepted_chunk_so_a_slow_final_check_counts(
+    tmp_path, monkeypatch
+):
+    """ADR 0064's stall window runs from the last change in held bytes. A slow final check (a
+    multi-gigabyte file re-read) must come out of the poll budget, not add to it."""
+    from tessera_control.campaign_exited_resolve import UPLOAD_STALL_SECONDS
+    from tessera_worker.outputs import LargeOutputHandle
+
+    now = [0.0]
+    monkeypatch.setattr(artifacts, "_monotonic", lambda: now[0])
+    monkeypatch.setattr(artifacts, "_sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    real = LargeOutputHandle.assert_unchanged
+
+    def slow_check(self):
+        now[0] += 300.0  # re-reading the file takes five minutes
+        return real(self)
+
+    monkeypatch.setattr(LargeOutputHandle, "assert_unchanged", slow_check)
+
+    class Chunky(_Verifying):
+        def _large(self, route, body):
+            if len(route) == 3 and route[1] == "chunks":
+                now[0] += 1.0  # each chunk takes a second to send
+                self.last_chunk = now[0]
+            if len(route) == 2 and route[1] == "complete":
+                now[0] += 8.0
+                self.ends.append(now[0])
+            return super()._large(route, body)
+
+    control = Chunky(polls=10_000)
+    control.advertised, control.ends, control.last_chunk = 8, [], 0.0
+    with pytest.raises(ArtifactTransferError, match="still verifying"):
+        upload_large_artifact(
+            control, lease_id=LEASE, expected_epoch=EPOCH, output=_output(tmp_path)
+        )
+    # Every ask ended inside the stall window measured from the last chunk, the 300 s check
+    # included: the worker never polls for a verification the hold has stopped waiting for.
+    assert (
+        control.ends
+        and max(control.ends) - control.last_chunk <= artifacts.COMPLETE_MAX_WAIT_SECONDS
+    )
+    assert max(control.ends) - control.last_chunk < UPLOAD_STALL_SECONDS

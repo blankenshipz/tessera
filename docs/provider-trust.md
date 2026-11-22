@@ -37,6 +37,15 @@ narrow it, never widen it. There is no write API; host file permissions are the 
 - **Audit.** Each new digest is stored immutably and records
   `provider_trust.policy_changed` with the per-provider difference and the actor.
 
+## Refusals name the entry
+
+When a campaign stage is refused because a provider's worker is not trusted for the stage's data,
+the 409 says what to merge into that provider's entry under `"providers"`: the class to add to
+`data_classes` and the worker principal to add to `worker_principal_ids`. Merge it into the existing
+entry; replacing the entry would drop the other workers listed there. Nothing lists a worker
+automatically: the file stays the operator's policy, and a refusal is the only thing the platform
+adds.
+
 ## Upgrade impact
 
 On upgrade without a file, local CPU grants on `private_derived` releases (including
@@ -193,14 +202,15 @@ as usual ([ADR 0056](decisions/0056-executor-enrollment-into-an-existing-project
   the old one while routes still run), reload, then `revoke` the old directory (revokes
   the credential at control and marks the record) and remove the old principal from the
   trust file with another reload. Rotate before `not_after`, and whenever the shared
-  project reaches its cap below.
-- **Shared project authority.** Each route still mints its own short-lived cancel
-  credential (a human session) in the project it runs in. With a shared executor
-  project that session's authority covers the whole project, not just its route: while
-  live, its holder could act on other routes' records or approve a new snapshot release
-  to the trusted executor principal. On the single trusted host this is no wider than the
-  owner header that already sits beside it under the same user, but do not hand a route's
-  `cancel-token` to anyone you would not give the owner header.
+  project reaches its cap below. Revoke the old directory only after its routes have
+  ended: once its worker credential is revoked, those routes can be cancelled only by a
+  human, because the executor's worker credential is their only non-human cancel authority
+  ([ADR 0075](decisions/0075-executor-worker-credential-cancels-own-route.md)).
+- **No cancel credential.** A route no longer mints a cancel credential (the former
+  human session, which reached the whole shared project). The live check cancels its own
+  route with the executor's worker credential, which can stop only routes it dispatches and
+  is renewed by `executor_enrollment renew`
+  ([ADR 0075](decisions/0075-executor-worker-credential-cancels-own-route.md)).
 - **Shared-project bounds.** Live routes still end with their execution grant
   `cancel_requested` (nothing reconciles them until ADR 0041 settlement), so each keeps
   holding its cap. Each route raises the project limit by exactly its own cap over the

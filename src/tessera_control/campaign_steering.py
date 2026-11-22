@@ -28,6 +28,7 @@ from .campaign_models import (
     stage_output_class,
     topological_order,
 )
+from .campaign_salad_adapter import expand_with_registered
 from .store import Conflict, Forbidden, NotFound, StoreError, _connect, utc_now
 
 Reason = Annotated[str, StringConstraints(min_length=1, max_length=1000)]
@@ -101,8 +102,7 @@ class CampaignSteeringCommands:
             body = SubmitCampaign.model_validate(payload)
         except ValidationError as error:
             raise _invalid(error) from None
-        spec = body.spec
-        normal = normalize(spec)
+        raw_spec = payload.get("spec") if isinstance(payload, dict) else None
         connection = _connect(self.database_path)
         try:
             live = self._actor(connection, principal)
@@ -110,6 +110,17 @@ class CampaignSteeringCommands:
             self._require_action(connection, live, "campaign:submit")
             if live["role"] not in {"human", "agent"}:
                 raise Forbidden("This credential cannot submit campaigns.")
+            # ADR 0076/0077: the same expansion submit performs; the identity without an adapter.
+            spec = expand_with_registered(
+                body.spec,
+                self.adapter_entries(connection, live, project_id),
+                (live["org_id"], project_id),
+            )
+            # ADR 0080: resolve receipt_output references read-only, exactly as submit does.
+            spec = self._resolve_receipt_refs(
+                connection, live, project_id, spec, body.predecessors, raw_spec
+            )
+            normal = normalize(spec)
             self._check_references(connection, live, project_id, spec)
             order = topological_order(spec)
             return {
@@ -129,6 +140,9 @@ class CampaignSteeringCommands:
                     }
                     for key in order
                 ],
+                **(
+                    {"expanded_spec": spec.model_dump(mode="json")} if spec is not body.spec else {}
+                ),
                 "boundary": (
                     "Validation only: nothing was stored or submitted, and a human must still "
                     "approve the digest of the spec that is submitted."

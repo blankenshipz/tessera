@@ -53,7 +53,15 @@ _NOT_A_LICENSE = frozenset({"NOASSERTION", "NONE", "UNKNOWN", "UNLICENSED", "PRO
 
 
 class DataClassRefused(ValueError):
-    """The recorded data class does not permit this use."""
+    """The recorded data class does not permit this use.
+
+    ``admit_class`` is the provider-trust class whose admission would lift this refusal
+    (None when no trust setting could: a mismatched code approval, an unreadable manifest,
+    public data without evidence)."""
+
+    def __init__(self, message: str, admit_class: str | None = None) -> None:
+        super().__init__(message)
+        self.admit_class = admit_class
 
 
 class DataClassDeclaration(BaseModel):

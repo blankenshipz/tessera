@@ -11,6 +11,7 @@ from .campaign_holdout import receipt_section as holdout_receipt_section
 from .campaign_io import stage_io
 from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
 from .campaign_placement import placements as recorded_placements
+from .campaign_rerun import lineage_of
 from .code_approval import input_classes
 from .store import canonical_digest
 
@@ -332,6 +333,7 @@ def build_receipt(
     from .campaign_preapproval import preapproval_summary
 
     delegated = preapproval_summary(connection, campaign_id)
+    rerun = lineage_of(connection, campaign_id, current["project_id"])
     return _finish(
         {
             "version": RECEIPT_VERSION,
@@ -358,6 +360,9 @@ def build_receipt(
             },
             "stages": stage_rows,
             "lineage": _lineage(connection, campaign_id),
+            # ADR 0080: inputs submit resolved from an earlier campaign's receipt; absent
+            # when none, so existing receipts keep their shape.
+            **_chained_inputs(current["spec_json"]),
             **({"unlock": unlock} if unlock["requirements"] else {}),
             **steering_receipt_section(connection, campaign_id),
             # ADR 0068: the one-time holdout claims and their scored values; absent otherwise.
@@ -367,8 +372,33 @@ def build_receipt(
             # Reviews resolved by delegation, citing the approval (ADR 0044); absent when
             # none was recorded, so existing receipts keep their shape.
             **({"preapprovals": delegated} if delegated else {}),
+            # The campaign this one re-runs, the stages it re-runs and the outputs it reuses by
+            # digest (ADR 0069); absent for a campaign that is not a re-run.
+            **({"rerun": rerun} if rerun else {}),
         }
     )
+
+
+def _chained_inputs(spec_json: str) -> dict[str, Any]:
+    """Receipt section for ``artifact`` inputs that carry ``resolved_from`` (ADR 0080)."""
+    items = []
+    for stage in json.loads(spec_json).get("stages", []):
+        for source in stage.get("inputs", []):
+            lineage = source.get("resolved_from")
+            if source.get("kind") == "artifact" and lineage:
+                items.append(
+                    {
+                        "stage_key": stage["key"],
+                        "input": source["name"],
+                        "campaign_id": source["campaign_id"],
+                        "stage": source["stage"],
+                        "output": source["output"],
+                        "sha256": source["sha256"],
+                        "predecessor": lineage.get("predecessor"),
+                        "source_receipt_sha256": lineage["source_receipt_sha256"],
+                    }
+                )
+    return {"chained_inputs": items} if items else {}
 
 
 def _finish(receipt: dict[str, Any]) -> tuple[dict[str, Any], str]:

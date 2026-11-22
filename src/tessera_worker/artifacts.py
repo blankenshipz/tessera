@@ -311,6 +311,10 @@ def _stream_large(
     status = channel.post(base + "/status", {}, "artifact-status-" + uuid.uuid4().hex)
     seq = progress(status)
     held = _held_parts(status, chunk_count, chunk_bytes, size)
+    # When control's held bytes last changed (this call's start if it sends no chunk): ADR 0064's
+    # stall window runs from there, so the completion poll is bounded from here, not from the
+    # moment the poll starts.
+    last_change = _monotonic()
     while seq < chunk_count:
         chunk = handle.read_chunk(seq * chunk_bytes, chunk_bytes)
         chunk_digest = hashlib.sha256(chunk).hexdigest()
@@ -364,16 +368,20 @@ def _stream_large(
         ):
             raise ArtifactTransferError("Artifact chunk receipt has an unexpected sequence.")
         seq += 1
+        last_change = _monotonic()
     handle.assert_unchanged()
-    started = _monotonic()
+    started = last_change
     receipt = channel.post(base + "/complete", {}, _key(base + "/complete", {}))
     while receipt.get("status") == "verifying":
         # Control is hashing the whole file, which can outlast one request: ask again with the
         # same key (it joins the verification that is running) instead of starting over.
         delay = receipt.get("retry_after_seconds")
         delay = float(min(max(delay, 1), 30)) if type(delay) is int else 5.0
-        # Measured on the clock, so the time each ask itself takes counts toward the bound.
-        if _monotonic() - started + delay > COMPLETE_MAX_WAIT_SECONDS:
+        # Measured on the clock, and the next ask is budgeted at the longest control may hold it
+        # (it advertises that), so the bound is never overshot by the last request.
+        ask = receipt.get("max_wait_seconds")
+        ask = float(min(max(ask, 0), 60)) if type(ask) in {int, float} else 10.0
+        if _monotonic() - started + delay + ask > COMPLETE_MAX_WAIT_SECONDS:
             raise ArtifactTransferError("Control is still verifying the artifact; try again later.")
         _sleep(delay)
         receipt = channel.post(base + "/complete", {}, _key(base + "/complete", {}))

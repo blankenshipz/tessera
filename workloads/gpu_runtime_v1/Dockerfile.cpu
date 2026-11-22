@@ -1,0 +1,38 @@
+# Recipe only (ADR 0076): the gpu_runtime_v1 runtime on a CPU-only base, for a Salad CPU profile.
+# The base is an owner-supplied, digest-pinned image that already ships python3 (3.10 or newer)
+# and pip, for example a Python image on Debian or Ubuntu. There is no default. Nothing is added
+# from a package manager. Optional dependencies are the wheels in requirements.lock, every one
+# pinned by sha256 (pip --require-hashes, binary wheels only, no resolution), fetched at BUILD
+# time from the index the operator chooses. The image then needs no network at run time.
+#
+# Build (linux/amd64; keep the context to this directory plus your requirements.lock):
+#   docker build -f Dockerfile.cpu --build-arg CPU_RUNTIME_BASE=<name@sha256:...> \
+#     --build-arg WHEELS_LOCK=requirements.lock -t <name> .
+# Put the pushed image digest in the Salad profile's allowed_image_digests. That digest is what
+# pins the wheels; record it with the base digest, the lock file's sha256 and this recipe's commit.
+ARG CPU_RUNTIME_BASE
+FROM --platform=linux/amd64 ${CPU_RUNTIME_BASE}
+ARG CPU_RUNTIME_BASE
+ARG WHEELS_LOCK=
+USER root
+RUN printf '%s' "$CPU_RUNTIME_BASE" | grep -Eq '^[a-z0-9][a-z0-9./_-]*@sha256:[a-f0-9]{64}$' \
+ && test "$(uname -m)" = x86_64 \
+ && python3 -c 'import sys; assert sys.version_info >= (3, 10)' \
+ && python3 -m pip --version >/dev/null \
+ && mkdir -p /tessera/bin /tessera/lib/entries /tessera/work \
+ && chown 65532:65532 /tessera/work
+COPY run /tessera/bin/run
+COPY runtime.py /tessera/lib/runtime.py
+COPY stage_argv.py /tessera/lib/entries/stage_argv.py
+# An empty WHEELS_LOCK installs nothing; a path must name a hash-pinned lock in the build context.
+COPY ${WHEELS_LOCK:-run} /tmp/wheels.lock
+RUN if [ -n "$WHEELS_LOCK" ]; then \
+      grep -Eq -- '--hash=sha256:[a-f0-9]{64}' /tmp/wheels.lock \
+      && python3 -m pip install --no-cache-dir --disable-pip-version-check \
+           --require-hashes --only-binary=:all: --no-deps -r /tmp/wheels.lock; \
+    fi \
+ && rm -rf /tmp/wheels.lock /root/.cache \
+ && chmod 0555 /tessera/bin/run /tessera/lib/runtime.py /tessera/lib/entries/stage_argv.py
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+USER 65532:65532
+ENTRYPOINT ["/tessera/bin/run"]

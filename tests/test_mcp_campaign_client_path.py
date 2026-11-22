@@ -179,3 +179,70 @@ def test_mutating_annotations_and_catalog_isolation(tmp_path):
     # budget:read alone (a results-only credential) never switches campaign tools on.
     assert "budget:read" not in CAMPAIGN_ACTIONS
     assert "tessera_get_campaign_receipt" in tools["tessera_get_campaign"].description
+
+
+def _chained(**ref):
+    stage = {
+        **V2["stages"][0],
+        "inputs": [
+            {"kind": "receipt_output", "name": "prev", "stage": "a", "output": "result", **ref}
+        ],
+    }
+    return {**V2, "stages": [stage]}
+
+
+def test_submit_receipt_output_with_predecessors(tmp_path):
+    seen: list = []
+    _call(
+        _server(tmp_path, seen),
+        "tessera_submit_campaign",
+        {
+            "spec": _chained(predecessor="first"),
+            "idempotency_key": "k",
+            "predecessors": {"first": "campaign_1"},
+        },
+    )
+    body = json.loads(seen[0][3])
+    assert body["predecessors"] == {"first": "campaign_1"}
+    assert body["spec"]["stages"][0]["inputs"][0]["kind"] == "receipt_output"
+    assert body["spec"]["stages"][0]["inputs"][0]["predecessor"] == "first"
+
+
+def test_submit_omits_empty_predecessors(tmp_path):
+    seen: list = []
+    server = _server(tmp_path, seen)
+    _call(server, "tessera_submit_campaign", {"spec": V2, "idempotency_key": "k"})
+    _call(
+        server,
+        "tessera_submit_campaign",
+        {"spec": V2, "idempotency_key": "k", "predecessors": {}},
+    )
+    assert all("predecessors" not in json.loads(item[3]) for item in seen)
+
+
+def test_receipt_output_by_campaign_id_and_docs(tmp_path):
+    seen: list = []
+    server = _server(tmp_path, seen)
+    _call(
+        server,
+        "tessera_submit_campaign",
+        {"spec": _chained(campaign_id="campaign_1"), "idempotency_key": "k"},
+    )
+    assert json.loads(seen[0][3])["spec"]["stages"][0]["inputs"][0]["campaign_id"] == "campaign_1"
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+    assert "receipt_output" in tools["tessera_submit_campaign"].description
+    assert "predecessors" in tools["tessera_submit_campaign"].inputSchema["properties"]
+    _call(server, "tessera_validate_campaign_spec", {"spec": _chained(predecessor="first")})
+    assert seen[-1][1].endswith("/campaign-specs/validate")
+
+
+def test_receipt_output_needs_exactly_one_reference(tmp_path):
+    seen: list = []
+    for ref in ({}, {"campaign_id": "campaign_1", "predecessor": "first"}):
+        with pytest.raises(Exception):  # noqa: B017
+            _call(
+                _server(tmp_path, seen),
+                "tessera_submit_campaign",
+                {"spec": _chained(**ref), "idempotency_key": "k"},
+            )
+    assert seen == []

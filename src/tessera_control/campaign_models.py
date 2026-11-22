@@ -216,13 +216,35 @@ class SaladStageSpec(_Strict):
     # ``false`` declares a CPU-only stage that may run only on an operator CPU profile (and a GPU
     # stage never on one). Absent when True, so existing spec digests are unchanged.
     gpu: bool = True
+    # ADR 0076: the workload carries a local-docker stage's own argv (an image entry in its
+    # manifest) instead of equalling it. Set only by the stage adapter's expansion; absent when
+    # False, so every existing spec digest is unchanged.
+    adapted: bool = False
 
     @model_serializer(mode="wrap")
     def _omit_default_gpu(self, handler):
         value = handler(self)
         if self.gpu:
             value.pop("gpu", None)
+        if not self.adapted:
+            value.pop("adapted", None)
         return value
+
+
+class SaladAdapterBody(_Strict):
+    profile: Key
+
+
+class SaladAdapterRequest(_Strict):
+    """``provider_config`` of a Salad candidate that asks for the stage adapter (ADR 0076).
+
+    Expanded to a full ``SaladStageSpec`` at submit; never stored, never run."""
+
+    adapt: SaladAdapterBody
+
+
+def is_adapter_request(config: Any) -> bool:
+    return isinstance(config, dict) and "adapt" in config
 
 
 class StageSpec(_Strict):
@@ -358,6 +380,24 @@ class StageOutputSource(_Strict):
     outputs: Annotated[list[Key], Field(min_length=1, max_length=128)]
 
 
+class ReceiptLineage(_Strict):
+    """Where a pinned artifact input came from (ADR 0080), recorded by submit.
+
+    ``predecessor`` is the chain name the author used (absent when the source campaign was
+    named by id); ``source_receipt_sha256`` is the digest of the predecessor's terminal
+    receipt as read at submit. It is part of the spec the approver reviews."""
+
+    predecessor: Key | None = None
+    source_receipt_sha256: Sha256Digest
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_predecessor(self, handler):
+        value = handler(self)
+        if self.predecessor is None:
+            value.pop("predecessor", None)
+        return value
+
+
 class ArtifactSource(_Strict):
     kind: Literal["artifact"]
     name: Key
@@ -365,10 +405,44 @@ class ArtifactSource(_Strict):
     stage: Key
     output: Key
     sha256: Sha256Digest
+    # Present only when submit resolved a ``receipt_output`` reference; absent keeps every
+    # existing spec digest unchanged.
+    resolved_from: ReceiptLineage | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_lineage(self, handler):
+        value = handler(self)
+        if self.resolved_from is None:
+            value.pop("resolved_from", None)
+        return value
+
+
+class ReceiptOutputSource(_Strict):
+    """A reference to an output a finished campaign's receipt lists (ADR 0080).
+
+    Accepted only in a submit request: submit resolves it to a pinned ``artifact`` input
+    (campaign id and sha256 read from the predecessor's succeeded receipt) before the spec
+    is digested, stored or approved, so approval binds the exact bytes. Name the source
+    campaign by ``campaign_id`` or, within a submit that carries ``predecessors``, by the
+    ``predecessor`` name."""
+
+    kind: Literal["receipt_output"]
+    name: Key
+    campaign_id: Identifier | None = None
+    predecessor: Key | None = None
+    stage: Key
+    output: Key
+
+    @model_validator(mode="after")
+    def _one_source(self) -> ReceiptOutputSource:
+        if (self.campaign_id is None) == (self.predecessor is None):
+            raise ValueError("name exactly one of campaign_id and predecessor")
+        return self
 
 
 StageInputV2 = Annotated[
-    SnapshotSource | StageOutputSource | ArtifactSource, Field(discriminator="kind")
+    SnapshotSource | StageOutputSource | ArtifactSource | ReceiptOutputSource,
+    Field(discriminator="kind"),
 ]
 
 
@@ -537,9 +611,14 @@ def parse_spec_json(text: str, *, providers: bool = False) -> CampaignSpec | Cam
     """Parse a stored spec. Structural only unless ``providers`` (submit and approve)."""
     token = _PROVIDER_CHECKS.set(providers)
     try:
-        return _SPEC_ADAPTER.validate_json(text)
+        spec = _SPEC_ADAPTER.validate_json(text)
     finally:
         _PROVIDER_CHECKS.reset(token)
+    if isinstance(spec, CampaignSpecV2) and any(
+        isinstance(item, ReceiptOutputSource) for stage in spec.stages for item in stage.inputs
+    ):
+        raise ValueError("A stored spec cannot hold an unresolved receipt_output input.")
+    return spec
 
 
 def _check_v1_shape(stage: StageSpec) -> None:
@@ -807,6 +886,20 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                         item.name,
                         stage=item.stage,
                         paths=tuple(upstream[name] for name in item.outputs),
+                    )
+                )
+            elif isinstance(item, ReceiptOutputSource):
+                # Structure checks of a submit request see the reference as an artifact
+                # input; submit replaces it before anything is stored (ADR 0080) and
+                # parse_spec_json refuses a stored spec that still holds one.
+                inputs.append(
+                    NormalInput(
+                        "artifact",
+                        item.name,
+                        campaign_id=item.campaign_id or "",
+                        stage=item.stage,
+                        output=item.output,
+                        sha256="0" * 64,
                     )
                 )
             else:
@@ -1150,6 +1243,16 @@ def _validate_provider(stage: NormalStage) -> None:
     label = f"Stage {stage.key}"
     if stage.runtime not in descriptor.runtimes:
         raise ValueError(f"{label}: provider {stage.provider} has no runtime {stage.runtime}")
+    if is_adapter_request(stage.provider_config):
+        # ADR 0076: a request, expanded by submit before anything is digested or stored. A
+        # request that is still here when a stage is run is refused by the full model.
+        try:
+            SaladAdapterRequest.model_validate(stage.provider_config)
+        except ValidationError:
+            raise ValueError(f"{label}: invalid salad adapter request") from None
+        if stage.provider != SALAD_PROVIDER or stage.runtime != SALAD_RUNTIME:
+            raise ValueError(f"{label}: only a salad candidate takes the stage adapter")
+        return
     model = provider.config_model
     if model is None:
         if stage.provider_config:
@@ -1190,6 +1293,16 @@ def spec_digest(spec: CampaignSpec | CampaignSpecV2) -> str:
 
 class SubmitCampaign(_Strict):
     spec: AnyCampaignSpec
+    # ADR 0080: chain names for ``receipt_output`` references (name -> earlier campaign id).
+    predecessors: dict[Key, Identifier] = Field(default_factory=dict, max_length=16)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_predecessors(self, handler):
+        # Absent when empty, so a request digest from before ADR 0080 is unchanged.
+        value = handler(self)
+        if not self.predecessors:
+            value.pop("predecessors", None)
+        return value
 
 
 class StagePreapproval(_Strict):

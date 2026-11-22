@@ -560,3 +560,262 @@ def tool_transport():
     from tessera_control.salad_http import SaladHTTPTransport
 
     return SaladHTTPTransport
+
+
+# -- a fresh group is read until it settles before it is started (ADR 0071) --
+
+
+class SettlingSalad(FakeSalad):
+    """A group that reads pending, with a change in flight, for its first reads after create."""
+
+    def __init__(self, clock, *, pending_reads, omit_counts=False, **kwargs):
+        super().__init__(clock, **kwargs)
+        self.pending_reads, self.omit_counts = pending_reads, omit_counts
+
+    def group(self):
+        data = super().group()
+        if self.status == "stopped" and self.pending_reads > 0 and self.started_at is None:
+            self.pending_reads -= 1
+            data["current_state"]["status"] = "pending"
+            data["pending_change"] = True
+        if self.omit_counts:
+            data["current_state"].pop("instance_status_counts", None)
+        return data
+
+
+def test_a_fresh_group_that_reads_pending_is_settled_before_start(files):
+    clock = Clock()
+    fake = SettlingSalad(clock, pending_reads=4, run_seconds=10)
+    receipt = run(files, fake, clock)
+    assert receipt["shape_ok"] is True and receipt["started"] is True and "aborted" not in receipt
+    assert receipt["settle"]["settled"] is True and receipt["settle"]["polls"] >= 4
+    assert receipt["settle"]["state"] == "stopped" and receipt["settle"]["pending_change"] is False
+    calls = fake.calls()
+    assert calls.index(("POST", "start")) > max(
+        i for i, call in enumerate(calls[: calls.index(("POST", "start"))]) if call[0] == "GET"
+    )  # every settle read comes before the one start
+    assert receipt["cleanup"] == dict(stopped=True, deleted=True)
+
+
+def test_a_group_that_never_settles_is_not_started_and_the_receipt_says_why(files):
+    clock = Clock()
+    fake = SettlingSalad(clock, pending_reads=10_000)
+    receipt = run(files, fake, clock)
+    assert receipt["started"] is False and "did not settle" in receipt["aborted"]
+    assert not any(call == ("POST", "start") for call in fake.calls())
+    assert receipt["settle"]["settled"] is False
+    assert receipt["settle"]["state"] == "pending" and receipt["settle"]["pending_change"] is True
+    assert receipt["settle"]["instance_count_keys"] == [
+        "allocating_count",
+        "creating_count",
+        "running_count",
+        "stopping_count",
+    ]
+    assert receipt["cleanup"] == dict(stopped=True, deleted=True)  # still stopped and deleted
+    assert TOKEN.decode() not in json.dumps(receipt)
+
+
+def test_a_cpu_group_that_omits_its_instance_counts_is_still_started(files):
+    clock = Clock()
+    fake = SettlingSalad(clock, pending_reads=1, omit_counts=True, run_seconds=10)
+    receipt = run(files, fake, clock)
+    assert receipt["started"] is True and receipt["shape_ok"] is True
+    assert "instance_counts_complete" in receipt["settle"]
+    assert receipt["settle"]["instance_counts_complete"] is False
+
+
+# -- the credential by reference (ADR 0071) --
+
+
+def _credential_directory(tmp_path, token=TOKEN, version=3, **metadata):
+    from tessera_control.salad_secret_files import PrivateFileSecretResolver
+    from tessera_control.salad_secrets import SecretBuffer
+
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    resolver = PrivateFileSecretResolver(directory)
+    resolver.enroll(
+        tool.DEFAULT_CREDENTIAL_REFERENCE,
+        version,
+        SecretBuffer(bytearray(token)),
+        expires_at=metadata.get("expires_at", 4_102_444_800),
+    )
+    resolver.close()
+    return directory
+
+
+def test_the_credential_is_read_by_reference_from_the_operator_directory(files, tmp_path):
+    directory = _credential_directory(tmp_path)
+    secret = tool._read_reference(directory, tool.DEFAULT_CREDENTIAL_REFERENCE, 3)
+    clock = Clock()
+    receipt = tool.run_live(
+        plan_for(files), secret, factory=FakeSalad(clock, run_seconds=5), clock=clock,
+        sleep=clock.sleep,
+    )  # fmt: skip
+    assert receipt["shape_ok"] is True and TOKEN.decode() not in json.dumps(receipt)
+    assert not any(secret._buffer)  # wiped after the run, like the token-file path
+
+
+def test_a_wrong_version_or_a_missing_reference_is_refused_without_detail(files, tmp_path):
+    directory = _credential_directory(tmp_path)
+    with pytest.raises(tool.CheckRefused, match="unavailable at that version"):
+        tool._read_reference(directory, tool.DEFAULT_CREDENTIAL_REFERENCE, 99)
+    with pytest.raises(tool.CheckRefused, match="unavailable at that version"):
+        tool._read_reference(directory, "credential-ref:other", 3)
+    loose = tmp_path / "loose"
+    loose.mkdir(mode=0o755)
+    with pytest.raises(tool.CheckRefused, match="private"):
+        tool._read_reference(loose, tool.DEFAULT_CREDENTIAL_REFERENCE, 3)
+
+
+def test_main_takes_the_credential_directory_and_refuses_ambiguous_flags(
+    files, tmp_path, monkeypatch, capsys
+):
+    directory = _credential_directory(tmp_path)
+    clock = Clock()
+    fake = FakeSalad(clock, run_seconds=5)
+    real = tool.run_live
+    monkeypatch.setattr(
+        tool,
+        "run_live",
+        lambda plan, credential: real(
+            plan, credential, factory=fake, clock=clock, sleep=clock.sleep
+        ),
+    )
+    base = ["--run", "--confirm", "spend-up-to-5c", "--receipt-directory", str(files["receipts"])]
+    by_reference = ["--credential-dir", str(directory), "--credential-version", "3"]
+    assert tool.main(argv(files, *base, *by_reference)) == 0
+    both = ["--credential-file", str(files["credential"])]
+    assert tool.main(argv(files, *base, *by_reference, *both)) == 2  # exactly one source
+    assert tool.main(argv(files, *base, "--credential-dir", str(directory))) == 2  # no version
+    assert TOKEN.decode() not in capsys.readouterr().out
+
+
+class FlappingSalad(FakeSalad):
+    """Reads settled for the settle poll, then pending again when start re-reads the group."""
+
+    def __init__(self, clock, settled_reads, **kwargs):
+        super().__init__(clock, **kwargs)
+        self.reads, self.settled_reads = 0, settled_reads
+
+    def group(self):
+        data = super().group()
+        self.reads += 1
+        # Pending only while start re-reads (about a dozen reads), then settled again so the
+        # cleanup can observe the stop.
+        if self.settled_reads < self.reads <= self.settled_reads + 14 and self.started_at is None:
+            data["current_state"]["status"] = "pending"
+            data["pending_change"] = True
+        return data
+
+
+def test_a_refused_start_records_the_observed_state_and_the_counts_flag(files):
+    clock = Clock()
+    # create (read 1) and the settle read (read 2) are settled; start's own reads are pending.
+    fake = FlappingSalad(clock, settled_reads=2)
+    receipt = run(files, fake, clock)
+    assert receipt["started"] is False and "did not accept the start" in receipt["aborted"]
+    start = next(step for step in receipt["steps"] if step["step"] == "start")
+    assert start["status"] == "unknown" and start["reason"] == "admission_denied"
+    # One key name for the state, the same as the read steps; no body, no secret.
+    assert start["observation"]["state"] == "pending"
+    assert start["observation"]["pending_change"] is True
+    assert set(start["observation"]["instance_status_counts"]) == {
+        "allocating_count",
+        "creating_count",
+        "running_count",
+        "stopping_count",
+    }
+    assert start["instance_counts_complete"] is True
+    assert receipt["cleanup"] == dict(stopped=True, deleted=True)
+    assert TOKEN.decode() not in json.dumps(receipt)
+
+
+def test_the_start_step_flags_counts_salad_did_not_send(files):
+    clock = Clock()
+    fake = SettlingSalad(clock, pending_reads=1, omit_counts=True, run_seconds=5)
+    receipt = run(files, fake, clock)
+    start = next(step for step in receipt["steps"] if step["step"] == "start")
+    assert start["instance_counts_complete"] is False and receipt["started"] is True
+
+
+class LiveInstanceSalad(FakeSalad):
+    """Created clean, then reports a running instance on later reads (it must never start)."""
+
+    reads = 0
+
+    def group(self):
+        data = super().group()
+        self.reads += 1
+        if self.reads > 1 and self.started_at is None:
+            data["current_state"]["instance_status_counts"]["running_count"] = 1
+        return data
+
+
+def test_a_live_instance_ends_the_settle_wait_at_once_and_nothing_is_started(files):
+    clock = Clock()
+    fake = LiveInstanceSalad(clock)
+    receipt = run(files, fake, clock)
+    assert receipt["started"] is False and receipt["settle"]["polls"] == 1  # no waiting
+    assert not any(call == ("POST", "start") for call in fake.calls())
+    assert receipt["settle"]["instance_status_counts"]["running_count"] == 1
+    assert receipt["cleanup"] == dict(stopped=True, deleted=True)
+
+
+def test_a_credential_is_wiped_even_when_the_run_fails_before_it_starts(files, tmp_path):
+    from tessera_control.salad_secrets import SecretBuffer
+
+    class Broken:
+        selection = plan_for(files).selection
+        operation_id = "op"
+
+        def summary(self):
+            raise RuntimeError("fails while the receipt is being built")
+
+    token = bytearray(TOKEN)
+    with pytest.raises(RuntimeError):
+        tool.run_live(Broken(), token)
+    assert not any(token)
+    raw = bytearray(TOKEN)
+    with pytest.raises(RuntimeError):
+        tool.run_live(Broken(), SecretBuffer(raw))
+    assert not any(raw)  # a credential read by reference (a SecretBuffer) is wiped too
+
+
+def test_the_credential_source_flags_are_each_refused_alone(files, tmp_path, capsys):
+    """Exactly one source, and a version with the directory (both refused before any read)."""
+    directory = _credential_directory(tmp_path)
+    base = ["--run", "--confirm", "spend-up-to-5c", "--receipt-directory", str(files["receipts"])]
+    neither = tool.main(argv(files, *base))
+    both = tool.main(
+        argv(
+            files, *base, "--credential-file", str(files["credential"]),
+            "--credential-dir", str(directory), "--credential-version", "3",
+        )
+    )  # fmt: skip
+    no_version = tool.main(argv(files, *base, "--credential-dir", str(directory)))
+    assert (neither, both, no_version) == (2, 2, 2)
+    err = capsys.readouterr().err
+    assert "exactly one of --credential-file or --credential-dir" in err
+    assert "--credential-version is required" in err
+
+
+def test_main_wipes_a_credential_it_read_when_the_run_cannot_start(files, tmp_path, monkeypatch):
+    """A failure between reading the credential and the run still leaves nothing unwiped."""
+    directory = _credential_directory(tmp_path)
+    seen = []
+    real = tool._read_reference
+
+    def spy(*args):
+        secret = real(*args)
+        seen.append(secret)
+        return secret
+
+    monkeypatch.setattr(tool, "_read_reference", spy)
+    monkeypatch.setattr(tool, "run_live", lambda plan, credential: 1 / 0)
+    flags = ["--run", "--confirm", "spend-up-to-5c", "--receipt-directory", str(files["receipts"])]
+    flags += ["--credential-dir", str(directory), "--credential-version", "3"]
+    with pytest.raises(ZeroDivisionError):
+        tool.main(argv(files, *flags))
+    (secret,) = seen
+    assert not any(secret._buffer)  # wiped by main's own finally, not by run_live

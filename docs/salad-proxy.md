@@ -612,8 +612,7 @@ TLS CA is a referenced reviewed file, not embedded configuration bytes.
 | `state_dir` | Existing private authority database directory, never initialized by this harness |
 | `route_id`, `task_id`, `org_id`, `project_id`, `proposal_digest` | Exact existing approved route and raw 64-hex retained routing-package digest |
 | `policy` | Exact server `ProxyPolicy`, including management **reference/version/purpose only**, immutable image/account/project/GPU and executable profile |
-| `worker_credential_file` | Explicit private file containing an already-enrolled worker-audience token |
-| `cancel_credential_file` | Explicit private file containing existing human control authority for exact cancellation; never a newly issued approval |
+| `worker_credential_file` | Explicit private file containing an already-enrolled worker-audience token; it is also the only authority for the live check's reduce-only cancel of this route ([ADR 0075](decisions/0075-executor-worker-credential-cancels-own-route.md)). There is no human or cancel credential field |
 | `credential_directory` | Existing `PrivateFileSecretResolver` directory, separately enrolled by administrator |
 | `guardian_socket`, `guardian_uid` | Independent Linux service's exact Unix socket and uid; peer pid must differ |
 | `custody` | Closed object: `host`, `port` (443), `token_file`, `ca_file`, `certificate_sha256` (64 hex) |

@@ -54,7 +54,6 @@ def config_for(tmp_path):
             "profiles_file": "/x/profiles.json",
             "profile": "gpu-main",
             "worker_credential_file": "/x/w",
-            "cancel_credential_file": "/x/c",
             "credential_directory": "/x/cred",
             "guardian_socket": "/x/g.sock",
             "guardian_uid": 1000,
@@ -485,7 +484,7 @@ def test_config_is_closed_and_private(tmp_path):
     tmp_path.chmod(0o700)
     for name in ("state", "cred", "work"):
         (tmp_path / name).mkdir(mode=0o700)
-    for name in ("w", "c", "t", "ca", "profiles"):
+    for name in ("w", "t", "ca", "profiles"):
         (tmp_path / name).write_text("x")
         (tmp_path / name).chmod(0o600)
     document = {
@@ -494,7 +493,6 @@ def test_config_is_closed_and_private(tmp_path):
         "profiles_file": str(tmp_path / "profiles"),
         "profile": "gpu-main",
         "worker_credential_file": str(tmp_path / "w"),
-        "cancel_credential_file": str(tmp_path / "c"),
         "credential_directory": str(tmp_path / "cred"),
         "guardian_socket": "/run/guardian.sock",
         "guardian_uid": 1000,

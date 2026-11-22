@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from .api import idempotency_key
 from .campaign_gate_models import RecordGateDecision
 from .campaign_models import ApproveCampaign, CancelCampaign, SubmitCampaign, approve_payload
+from .campaign_rerun import RerunCampaign
 from .campaign_standing import CreateStandingApproval, RevokeStandingApproval
 from .campaign_steering import (
     CancelCampaignStage,
@@ -95,6 +96,16 @@ def validate_campaign_spec(
 ) -> dict[str, Any]:
     """Dry-run of submit (ADR 0055): the same checks, nothing stored, nothing granted."""
     return store.validate_campaign_spec(actor, project_id, body.model_dump(mode="json"))
+
+
+@router.post("/campaigns/{campaign_id}/rerun")
+def rerun_campaign(
+    campaign_id: str, body: RerunCampaign, actor: Actor, key: Key, store: Campaigns
+) -> JSONResponse:
+    """ADR 0069: submit a new campaign that re-runs a finished one's failed stages (or its
+    identical spec), reusing succeeded outputs by digest. It grants nothing; a person approves."""
+    payload = body.model_dump(mode="json", exclude_none=True)
+    return result(store.rerun_campaign(actor, campaign_id, key, canonical_digest(payload), payload))
 
 
 @router.post("/campaigns/{campaign_id}/budget-reduction")

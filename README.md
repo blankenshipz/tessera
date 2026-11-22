@@ -196,7 +196,8 @@ runner records a durable claim after every stage it depends on succeeded and bef
 are released to any worker, refuses every later claim (at submit, at approval and at the claim
 itself), and keeps the claim as `scored` with its metric values or `spent`. Claims cannot be
 deleted or reopened, a holdout stage is never requeued once its claim is open, and from then on
-no other stage receives the partition and no other campaign takes the holdout stage's outputs
+the partition is sealed from the first approval that declares it: no other stage receives it,
+and no other campaign takes the holdout stage's outputs, as an artifact or a staged snapshot
 (re-checked before every input release). The labels stay non-public, so they reach only registered, trusted
 providers and never the public internet (ADR 0047). `tessera_campaign_holdout` and
 `tessera_campaign_holdout_claims` read the claims; nothing reopens one
@@ -211,7 +212,16 @@ operator's ceiling, refused at admission when above it,
 uid:gid by default so the 0700 output workspace stays writable), `self-hosted` runs the same worker on a server you operate, and
 `salad` stages are refused unless the operator supplies Salad profiles (a billable,
 opt-in third-party path; a profile is a GPU class or a CPU-only container with operator rates, so a
-stage that needs no GPU does not take one, [ADR 0062](docs/decisions/0062-salad-cpu-only-profiles.md)). A vendor is a plugin: the operator's
+stage that needs no GPU does not take one, [ADR 0062](docs/decisions/0062-salad-cpu-only-profiles.md)).
+A local-docker CPU stage that reads pinned snapshot and pinned artifact inputs can list such a profile as an
+`alternate_providers` candidate with `{"adapt": {"profile": NAME}}`: submit expands it, from the
+stage and the operator's profile, into the explicit Salad workload a person approves by digest,
+and refuses a stage over a Salad limit or with a non-allowlisted image, naming the exact profile
+entry to add or the provider-trust entry to merge (provider trust stays the operator's explicit policy; images are
+still operator-built and pinned by digest, Tessera builds none;
+[ADR 0076](docs/decisions/0076-salad-cpu-stage-adapter-and-cpu-runtime.md),
+[ADR 0077](docs/decisions/0077-campaign-prep-from-the-spec.md); fakes only, no live
+Salad run of an adapted stage). A vendor is a plugin: the operator's
 `--campaign-providers` file names it (entry point group `tessera.campaign_providers` or a
 dotted module) and gives it a config section, so adding one never edits the runner.
 Descriptors are validated at registration. `--provider-trust` sets which data classes each
@@ -223,7 +233,7 @@ egress or workload fetch hosts and every transfer is recorded on the receipt (th
 proxy journals a tunnel when it is admitted and again at close, so an interrupted tunnel is
 recorded with unknown bytes rather than missing, [ADR 0057](docs/decisions/0057-egress-tunnel-opened-record.md)). A stage input is a snapshot, the
 declared output of an earlier stage (any provider), or an `artifact` pinned by campaign,
-stage, output and sha256 from an earlier campaign; every input and output is indexed in
+stage, output and sha256 from an earlier campaign (or a `receipt_output` reference to a value on a succeeded campaign's receipt, resolved and pinned at submit, [ADR 0080](docs/decisions/0080-campaign-inputs-from-a-predecessor-receipt.md)); every input and output is indexed in
 `campaign_stage_io`. A stage may also list ordered `alternate_providers`; the runner then places
 each attempt on the first candidate that is registered, enrolled for the project, trusted for the
 stage's inputs, within the per-run cap and the remaining campaign and program budget, and has a free
@@ -244,10 +254,14 @@ Example systemd units for the poller, Salad executor and guardian are in
 Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes v1 and v2
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
 `tessera_get_campaign_receipt`, `tessera_list_snapshots`, `tessera_campaign_outputs`,
-`tessera_campaign_logs` and `tessera_campaign_budget` read recorded state under separate
+`tessera_campaign_logs`, `tessera_campaign_budget` and `tessera_project_spend` (the operator's
+project limits and campaign totals) read recorded state under separate
 scopes. Steering tools ([ADR 0055](docs/decisions/0055-mcp-steering-tools.md)) dry-run a spec
 (`tessera_validate_campaign_spec`), build a retry spec for the stages that did not succeed
-(`tessera_prepare_stage_retry`), show held grants and releases (`tessera_campaign_grants`) and
+(`tessera_prepare_stage_retry`), re-run a failed campaign as a new submission that reuses its
+succeeded outputs by digest and is linked on the receipt
+(`tessera_rerun_campaign`, [ADR 0069](docs/decisions/0069-rerun-a-finished-campaign.md)),
+show held grants and releases (`tessera_campaign_grants`) and
 only reduce authority (`tessera_reduce_campaign_budget`, `tessera_revoke_campaign_release`).
 Pause and resume (new reservations only; running attempts finish), a lower-only per-campaign
 concurrency limit and cancelling a single stage
@@ -316,7 +330,7 @@ exists, so one campaign can mix CPU and Salad stages with their data and receipt
 ([ADR 0056](docs/decisions/0056-executor-enrollment-into-an-existing-project.md)). Control issues worker credentials for at most 24 hours, renews them only up to
 seven days after issue, refuses them at use time past that point and never revives an
 expired one, so the enrollment needs a renewal
-at least daily and a rotation within the week; it is revocable at any time.
+at least daily and a rotation within the week; it is revocable at any time. The same worker credential is the only authority the Salad executor uses to cancel its own routes (reduce-only, own routes, recorded as `cancel_authority: executor_worker`); no human session credential is issued or configured for it ([ADR 0075](docs/decisions/0075-executor-worker-credential-cancels-own-route.md)).
 
 Since schema 57 (the current schema number is `LATEST_SCHEMA_VERSION` in
 `src/tessera_control/migrations.py`) the source also implements an experiment-parent admission ledger (up to

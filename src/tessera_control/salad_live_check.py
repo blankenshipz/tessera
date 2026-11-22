@@ -22,6 +22,9 @@ from pathlib import Path
 # GPU node allocation plus a multi-GB CUDA image pull exceeds 5 minutes. Polls stay
 # <=10s apart for guardian heartbeats, so the poll cap scales with the window.
 # 45 min unbilled provisioning + up to 60 min billed workload + upload grace.
+# How long a group that reads stopped may take to read settled (no change in flight, no instance)
+# before start is attempted anyway and the transport's own exact read decides.
+PRESTART_SETTLE_SECONDS = 45
 MAX_ROUTE_SECONDS = 7200
 MAX_POLLS = 720
 
@@ -104,7 +107,6 @@ def _config(path):
         "proposal_digest",
         "policy",
         "worker_credential_file",
-        "cancel_credential_file",
         "credential_directory",
         "guardian_socket",
         "guardian_uid",
@@ -159,7 +161,6 @@ def _config(path):
         os.close(_private_path(value[key], directory=True))
     for path_value in (
         value["worker_credential_file"],
-        value["cancel_credential_file"],
         custody["token_file"],
         custody["ca_file"],
         str(Path(value["state_dir"]) / "tessera.sqlite3"),
@@ -191,11 +192,6 @@ class SaladLiveSession:
             worker = auth.authenticate_worker(
                 _private_bytes(self.config["worker_credential_file"], 4096).decode("ascii").strip()
             )
-            self.cancel_actor = auth.authenticate(
-                _private_bytes(self.config["cancel_credential_file"], 4096).decode("ascii").strip()
-            )
-            if self.cancel_actor["role"] != "human":
-                raise ValueError("existing human cancellation credential required")
             self.resolver = PrivateFileSecretResolver(self.config["credential_directory"])
         except Exception:
             raise ValueError("private authenticated config unavailable") from None
@@ -412,15 +408,14 @@ class SaladLiveSession:
     def cancel(self, route):
         state = self.state(route)
         if state["desired"] != "stop":
-            self.server.store.command(
-                self.cancel_actor,
+            # The executor's own worker credential (reduce-only, own route): no human
+            # session credential exists for this path.
+            self.server.store.worker_cancel(
+                self.server.worker,
                 route,
                 "salad-live-cancel-" + route,
-                dict(
-                    command="cancel",
-                    expected_revision=state["revision"],
-                    proposal_digest=state["proposal_digest"],
-                ),
+                expected_revision=state["revision"],
+                proposal_digest=state["proposal_digest"],
             )
         with _wall_bound(15):
             self.server.safety.cancel(self.state(route))
@@ -860,6 +855,10 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
         "input_expected": None,
         "input_delivered": False,
         "input_revoked": None,
+        # The reduce-only cancel is sent with the executor's own worker credential
+        # (ADR 0075); True once the route state recorded it, False if it was refused.
+        "cancel_authority": "executor_worker",
+        "cancel_recorded": None,
         # ADR 0039: the delivered input's recorded class (None when nothing is
         # delivered or the session cannot read it); outputs are always private_derived.
         "input_data_class": None,
@@ -981,14 +980,36 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
                 # guardian releases the reservation only on its own absence reads.
                 receipt["create_rejection"] = created.get("provider_rejection")
                 raise ValueError("create rejected")
-            # A new group settles from pending to stopped after create (observed
-            # live); poll the exact group within the same bounds before start.
+            # A new group settles from pending to stopped after create (observed live), and
+            # can read stopped while a change is still in flight; poll the exact group within
+            # the same bounds until it reads stopped AND settled (no change in flight, no
+            # instance: the guardian's terminal reading) before start. A group that reads
+            # stopped but never reports a settled shape is handed to start after a bounded
+            # wait, where the transport's own exact read decides.
+            polls = 0
+            stopped_since = None
             for _ in range(max_polls):
                 heartbeat()
                 state = observe() or state
-                if state["provider_status"] == "stopped" or clock() >= deadline:
+                polls += 1
+                if state["provider_status"] == "stopped":
+                    stopped_since = clock() if stopped_since is None else stopped_since
+                    # The guardian's state always carries termination_confirmed (true only for
+                    # a stopped group with no change in flight and no instance); a session
+                    # that does not report it gives no settle signal to wait for.
+                    if (
+                        state.get("termination_confirmed", True) is True
+                        or clock() - stopped_since >= PRESTART_SETTLE_SECONDS
+                    ):
+                        break
+                if clock() >= deadline:
                     break
                 sleep(min(interval, max(0, deadline - clock())))
+            receipt["prestart_settle"] = {
+                "polls": polls,
+                "provider_status": state["provider_status"],
+                "settled": state.get("termination_confirmed", True) is True,
+            }
             if state["provider_status"] != "stopped":
                 raise ValueError("create unresolved")
             if receipt["input_expected"]:
@@ -1045,8 +1066,9 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
         # exact stop attempt. Never delete, choose a new target, or retry stop.
         try:
             session.cancel(route_id)
+            receipt["cancel_recorded"] = True
         except Exception:
-            pass
+            receipt["cancel_recorded"] = False
         # Completion, failure and cancel alike: drop the guardian's ticket and revoke it at
         # control. Best effort; the ticket's own expiry (at most an hour) bounds a failure.
         try:

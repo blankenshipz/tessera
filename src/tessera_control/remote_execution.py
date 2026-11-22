@@ -385,6 +385,70 @@ class RemoteExecutionStore(CapabilityStore):
             replay_guard=lambda db, live, r: self._load(db, live, r["id"]),
         )
 
+    def _request_stop(self, db, live, state, **provenance):
+        """Reduce-only stop: desired stop, pending cancellation, active grant cancelling."""
+        state.update(desired="stop", cancellation="pending", state="stop_requested")
+        state["stop_provenance"] = {**decision_provenance(live), **provenance}
+        # Pause means stop/hold, never process suspension or automatic resume.
+        op, _ = self._operation(db, live, state["proposal"])
+        grant = self._grant(db, live, op["grant_id"])
+        if grant["status"] == "active":
+            updated, operation_ids = self._request_grant_cancellation(db, grant, grant["revision"])
+            self._event(
+                db,
+                live,
+                grant["project_id"],
+                grant["task_id"],
+                "execution.grant_cancel_requested",
+                updated["revision"],
+                {
+                    "grant_id": grant["id"],
+                    "epoch": updated["epoch"],
+                    "operation_ids": operation_ids,
+                    "cancellation": self._cancellation_payload(db, updated),
+                    "operational_only": True,
+                },
+            )
+
+    def worker_cancel(self, worker, ident, key, *, expected_revision, proposal_digest):
+        """Reduce-only cancel of the worker's own route, authorized by its worker credential.
+
+        No human credential is involved: the dispatcher worker of the admitted operation
+        (the executor enrollment's worker principal) may only stop a route it dispatches,
+        never pause, approve, start or touch another worker's route. The route state
+        records the credential kind and ``cancel_authority``.
+        """
+
+        def command(db, live):
+            state = self._load(db, live, ident)
+            op, _ = self._operation(db, live, state["proposal"])
+            if live.get("kind") != "worker" or live["id"] != op["worker_principal_id"]:
+                raise Forbidden("Only the route's own dispatcher worker may cancel here.")
+            if (
+                state["revision"] != expected_revision
+                or state["proposal_digest"] != proposal_digest
+            ):
+                raise Conflict("Review the current exact remote proposal.")
+            self._request_stop(
+                db,
+                live,
+                state,
+                cancel_authority="executor_worker",
+                worker_principal_id=live["id"],
+            )
+            return 200, self._save(db, live, state)
+
+        return self._mutate(
+            worker,
+            key,
+            "POST",
+            f"/internal/remote/{ident}/cancel",
+            canonical_digest(["cancel", expected_revision, proposal_digest]),
+            command,
+            audience="worker",
+            replay_guard=lambda db, live, r: self._load(db, live, ident),
+        )[1]
+
     def command(self, actor, ident, key, payload):
         body = self._body(RemoteCommand, payload)
 
@@ -400,30 +464,7 @@ class RemoteExecutionStore(CapabilityStore):
                 raise Conflict("Review the current exact remote proposal.")
             choice = body["command"]
             if choice in {"pause", "cancel"}:
-                state.update(desired="stop", cancellation="pending", state="stop_requested")
-                state["stop_provenance"] = decision_provenance(live)
-                # Pause means stop/hold, never process suspension or automatic resume.
-                op, _ = self._operation(db, live, state["proposal"])
-                grant = self._grant(db, live, op["grant_id"])
-                if grant["status"] == "active":
-                    updated, operation_ids = self._request_grant_cancellation(
-                        db, grant, grant["revision"]
-                    )
-                    self._event(
-                        db,
-                        live,
-                        grant["project_id"],
-                        grant["task_id"],
-                        "execution.grant_cancel_requested",
-                        updated["revision"],
-                        {
-                            "grant_id": grant["id"],
-                            "epoch": updated["epoch"],
-                            "operation_ids": operation_ids,
-                            "cancellation": self._cancellation_payload(db, updated),
-                            "operational_only": True,
-                        },
-                    )
+                self._request_stop(db, live, state)
             else:
                 op = self._current(db, live, state)
                 if choice == "approve" and state["state"] == "proposed":

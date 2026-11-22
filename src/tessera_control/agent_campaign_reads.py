@@ -17,7 +17,8 @@ from typing import Any
 
 from .campaign_holdout import campaign_claims, project_claims
 from .campaign_infra_retry import infra_attempts
-from .campaign_models import normalize, parse_spec_json
+from .campaign_models import TERMINAL_CAMPAIGN, normalize, parse_spec_json
+from .campaign_rerun import custody_released
 from .campaign_store import CampaignStore
 from .data_class import snapshot_data_class
 from .store import StoreError, _connect
@@ -68,29 +69,7 @@ class AgentCampaignReads(CampaignStore):
     @staticmethod
     def _custody_released(connection, manifest_id) -> bool:
         """The condition a later campaign's artifact pin needs (campaign_io.resolve_artifact)."""
-        if manifest_id is None:
-            return False
-        manifest = connection.execute(
-            "SELECT manifest_digest FROM artifact_manifests WHERE id=?", (manifest_id,)
-        ).fetchone()
-        disposition = connection.execute(
-            "SELECT disposition FROM artifact_dispositions WHERE manifest_id=? "
-            "ORDER BY revision DESC LIMIT 1",
-            (manifest_id,),
-        ).fetchone()
-        release = connection.execute(
-            "SELECT state, manifest_digest FROM artifact_custody_releases WHERE manifest_id=? "
-            "ORDER BY revision DESC LIMIT 1",
-            (manifest_id,),
-        ).fetchone()
-        return bool(
-            manifest is not None
-            and disposition is not None
-            and disposition["disposition"] == "retain_quarantined"
-            and release is not None
-            and release["state"] == "released"
-            and release["manifest_digest"] == manifest["manifest_digest"]
-        )
+        return custody_released(connection, manifest_id)
 
     def campaign_outputs(self, principal, campaign_id) -> dict[str, Any]:
         connection = _connect(self.database_path)
@@ -297,7 +276,8 @@ class AgentCampaignReads(CampaignStore):
         try:
             actor = self._reader(connection, principal, "campaign:read")
             campaign = self._campaign(connection, actor, campaign_id)
-            claims = {c["stage_key"]: c for c in campaign_claims(connection, campaign_id)}
+            listed = campaign_claims(connection, campaign_id, _ROW_CAP)
+            claims = {c["stage_key"]: c for c in listed}
             stages = []
             for stage in normalize(parse_spec_json(campaign["spec_json"])).stages:
                 if stage.evaluation is None:
@@ -315,7 +295,8 @@ class AgentCampaignReads(CampaignStore):
             return {
                 "campaign_id": campaign_id,
                 "status": campaign["status"],
-                "evaluation_stages": stages,
+                "evaluation_stages": stages[:_ROW_CAP],
+                "truncated": len(listed) == _ROW_CAP or len(stages) > _ROW_CAP,
                 "boundary": BOUNDARY
                 + " A scored claim records measured numbers, not a scientific verdict.",
             }
@@ -344,6 +325,52 @@ class AgentCampaignReads(CampaignStore):
                 "truncated": len(claims) == _ROW_CAP,
                 "boundary": BOUNDARY,
             }
+        finally:
+            connection.close()
+
+    def project_spend(self, principal, project_id) -> dict[str, Any]:
+        """The operator's project limits and what campaigns hold and have settled (budget:read).
+
+        Shows the ceiling a campaign budget or concurrency reduction works within; it changes
+        nothing, and raising a limit stays with the operator. Aggregates only: no spec or
+        provider detail.
+        """
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, BUDGET_SCOPE)
+            self._project(connection, actor, project_id)
+            limits = connection.execute(
+                """SELECT currency, monetary_limit_cents, max_concurrency, held_cents,
+                settled_cents FROM execution_project_limits WHERE project_id=?""",
+                (project_id,),
+            ).fetchone()
+            rows = connection.execute(
+                """SELECT status, COUNT(*) AS campaigns, SUM(budget_cap_cents) AS cap_cents,
+                SUM(held_cents) AS held_cents, SUM(settled_cents) AS settled_cents
+                FROM campaigns WHERE project_id=? AND org_id=? GROUP BY status ORDER BY status""",
+                (project_id, actor["org_id"]),
+            ).fetchall()
+            by_status = [dict(row) for row in rows]
+            unfinished = [row for row in by_status if row["status"] not in TERMINAL_CAMPAIGN]
+            result: dict[str, Any] = {
+                "project_id": project_id,
+                "limits": None,
+                "campaigns_by_status": by_status,
+                "unfinished": {
+                    key: sum(row[key] for row in unfinished)
+                    for key in ("campaigns", "cap_cents", "held_cents", "settled_cents")
+                },
+                "boundary": BOUNDARY
+                + " Limits are the operator's; no tool raises them. Ledger records are not "
+                "provider billing.",
+            }
+            if limits is not None:
+                limit = dict(limits)
+                limit["remaining_cents"] = (
+                    limit["monetary_limit_cents"] - limit["held_cents"] - limit["settled_cents"]
+                )
+                result["limits"] = limit
+            return result
         finally:
             connection.close()
 

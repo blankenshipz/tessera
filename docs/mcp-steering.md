@@ -4,8 +4,12 @@ This is the operator runbook for letting an agent drive a multi-stage campaign t
 `tessera_mcp` alone, and the list of places where a person or the operator CLI is still needed.
 The tool-by-tool audit is in [mcp-steering-gaps.md](mcp-steering-gaps.md); the contract is
 [ADR 0055](decisions/0055-mcp-steering-tools.md). The end-to-end proof is
-`tests/test_mcp_steering_e2e.py` (real control app and runner in process, fake worker, no
-network, no Docker).
+`tests/test_mcp_steering_e2e.py` and `tests/test_mcp_steering_e2e_rerun.py` (real control app
+and runner in process, fake worker, no network, no Docker). The second drives one local-docker
+campaign through submit, inspect, approve, adjust, stop, re-run of the failed stages under the
+re-run tree's spend bound (ADR 0074) and outcome and receipt retrieval, with every step a tool
+call; approval is `tessera_approve_campaign` on an approve-only server holding a person's own
+credential, and an agent credential is refused there.
 
 ## Runbook
 
@@ -59,13 +63,16 @@ are not planned to change; the rest are gaps.
 | 5 | Raise a cap, raise concurrency, extend a deadline | new approval / operator limits | by design |
 | 6 | Pause and resume, cancel one stage, a lower-only per-campaign concurrency limit | `tessera_pause_campaign`, `tessera_resume_campaign`, `tessera_cancel_campaign_stage`, `tessera_limit_campaign_concurrency` (ADR 0061). Still human: lifting a pause a person set, raising a limit, extending a deadline | closed |
 | 7 | Reconcile a grant that is not a confirmed exit; restore a revoked release | a person with evidence | by design |
-| 8 | Infrastructure faults other than a worker-reported exit code (lost worker lease, hung container) | the test injects an exit code 137 through the fake worker only; recovery of a lost attempt is the platform's auto-reconcile (ADR 0053), not exercised here | gap, not proven |
+| 8 | Infrastructure faults other than a worker-reported exit code | exit code 137 and two lost-worker faults are injected in `tests/test_mcp_steering_e2e_rerun.py`. A container that started with every report lost leaves the attempt `unknown`, the campaign `blocked` and the grant active; the agent sees all three, and its `tessera_cancel_campaign` is recorded (a `campaign.cancel_requested` event) while the campaign stays `blocked` as long as the grant is unresolved; the test does not reconcile the grant, so it does not show what happens after a person does. A launch the worker reports as refused is reconciled by the platform itself (ADR 0046) and the campaign finishes. That auto-reconcile was exercised with a v1 spec. Observation, pinned by `test_a_refused_launch_on_a_v2_stage_stays_blocked_for_a_person`: the same fault on a v2 `local-docker` stage is not auto-reconciled (attempt `unknown`, campaign `blocked`, grant unresolved, no `campaign.attempt_not_started` event). The cause read from `campaign_autoreconcile.assess`: it only applies to an attempt with a zero hold and a zero-exposure grant, and a v2 stage holds its `max_exposure_cents`, so the guard fails before the launch error is read. A v2 stage whose launch is refused therefore still needs a person; this is how the code behaves today, not a stated design rule | partly proven; see the v2 difference |
 | 9 | Enrollment, token renewal and the runner/worker processes | operator CLI | by design |
 | 10 | A gate between stages of one campaign | does not exist: a gate is an unlock between campaigns (stages 1-2 are one campaign, stage 3 the next). The retry of a gated campaign is a plain submission and a person approves its digest; the unlock is not re-applied | design note |
 | 11 | Gate on a measurement without a go | a measurement only narrows a go or a bound outcome (ADR 0051), so some human or opted-in script act always precedes a gated start | by design |
+| 12 | Learn why a call was refused (for example how many cents a re-run may still ask for) | the tool returns only "HTTP 409": `tessera_mcp` deliberately never relays a denial body, which could hold protected content. The reason is in the control API's own response (the end-to-end test reads it at the store). The remaining re-run amount is readable from `rerun_tree` in `tessera_get_campaign`. Passing a reason through would be a decision on that rule, not made here | gap, by the adapter's design |
+| 13 | A cap reduction does not change a re-run tree's first cap | the tree is bounded by the first spec's cap less what the tree committed (ADR 0074); a reduced cap lowers only what that campaign may spend, and a finished campaign commits what it settled | design note |
+| 14 | Approve over MCP | needs a separate approve-only server with a person's credential (`--approval-tool`); covered by the second end-to-end test | by design |
 
 No steering tool approves a spec, records a go, raises a cap, reconciles a grant or releases data (the
 operator-enabled approval tool of ADR 0065 runs only on a separate server holding a person's own
-credential, and the test does not register it); the
+credential; the first test does not register it, the second does); the
 end-to-end test marks each human act `HUMAN` and asserts the approval count does not change
 while the runner advances the stages.

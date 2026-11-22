@@ -11,15 +11,25 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-from campaign_runner_harness import ScriptedAdapter, World, dump, stage_spec
+from campaign_runner_harness import (  # noqa: F401
+    POOLS,
+    ScriptedAdapter,
+    World,
+    dump,
+    stage_spec,
+)
+from campaign_runner_harness import admit as _admit  # noqa: F401
+from campaign_runner_harness import cut_reports as _cut_reports  # noqa: F401
+from campaign_runner_harness import lapse as _lapse  # noqa: F401
+from campaign_runner_harness import latest as _latest  # noqa: F401
+from campaign_runner_harness import refuse_launches as _refuse_launches  # noqa: F401
+from campaign_runner_harness import started_but_unreported as _started_but_unreported  # noqa: F401
 
 from tessera_control.campaign_autoreconcile import MAX_AUTO_REQUEUES
 from tessera_control.execution_models import ReportExecutionObservation
-from tessera_worker.cpu import CpuLaunchError
 
 METRIC = [{"name": "score", "path": "data.json", "json_pointer": "/score"}]
 PAST = "2000-01-01T00:00:00Z"
-POOLS = "network_address_pool_exhausted"
 
 
 def _world(tmp_path, **stage_extra) -> tuple[World, dict]:
@@ -27,38 +37,6 @@ def _world(tmp_path, **stage_extra) -> tuple[World, dict]:
     spec = world.env.spec()
     spec["stages"] = [stage_spec(world.env, "s1", metrics=METRIC, **stage_extra)]
     return world, world.campaign(spec)
-
-
-def _latest(world, cid):
-    return world.attempts(cid)[-1]
-
-
-def _admit(world, cid):
-    world.tick_until(
-        lambda: any(a["status"] == "admitted" for a in world.attempts(cid)), worker=False
-    )
-
-
-def _cut_reports(world):
-    original = world.channel.post
-
-    def cut(path, body, key):
-        if "/worker/observations" in path or "receipt" in path or "manifest" in path:
-            raise ConnectionError("synthetic report loss")
-        return original(path, body, key)
-
-    world.channel.post = cut
-    return original
-
-
-def _lapse(world, grant_id):
-    world.env.execute("UPDATE execution_grants SET expires_at=? WHERE id=?", PAST, grant_id)
-    world.env.execute(
-        "UPDATE execution_leases SET expires_at=?, hard_expires_at=? WHERE grant_id=?",
-        PAST,
-        PAST,
-        grant_id,
-    )
 
 
 def _report_launch_error(world, error=POOLS):
@@ -80,13 +58,6 @@ def _report_launch_error(world, error=POOLS):
     )
 
 
-def _refuse_launches(monkeypatch):
-    def refuse(self, operation):
-        raise CpuLaunchError("refused", POOLS)
-
-    monkeypatch.setattr(ScriptedAdapter, "prepare", refuse)
-
-
 def _refused_launch(world, cid, *, report=True) -> dict:
     """The worker leases the grant, Docker refuses the launch, the grant then lapses. With
     ``report=False`` the worker's report is lost (it can be sent later)."""
@@ -100,27 +71,6 @@ def _refused_launch(world, cid, *, report=True) -> dict:
         "SELECT provider_id FROM external_operations WHERE grant_id=?", attempt["grant_id"]
     )
     assert operation["provider_id"] is None
-    _lapse(world, attempt["grant_id"])
-    return attempt
-
-
-def _started_but_unreported(world, cid, starts) -> dict:
-    """The adapter really creates and starts the container (it runs and writes outputs) but
-    every report is lost: control sees a lease and an operation and nothing else."""
-    _admit(world, cid)
-    original = ScriptedAdapter.start
-
-    def counted(self, operation):
-        starts.append(operation.operation_id)
-        return original(self, operation)
-
-    ScriptedAdapter.start = counted
-    try:
-        _cut_reports(world)
-        world.poller.run(max_cycles=1)
-    finally:
-        ScriptedAdapter.start = original
-    attempt = _latest(world, cid)
     _lapse(world, attempt["grant_id"])
     return attempt
 

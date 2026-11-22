@@ -934,6 +934,9 @@ class SaladSafetyService:
             and all(type(v) is int and v == 0 for v in counts.values())
             and observation.get("pending_change") is False
             and not observation.get("instances")
+            # Counts Salad did not send (the transport zero-fills a CPU group's omissions) are
+            # never evidence that no instance runs (ADR 0071).
+            and observation.get("instance_counts_complete", True) is True
         ):
             raise ValueError("reconcile_requires_exact_stopped_group")
         # Freeze the estimate through now; reconciled operations stop accruing.
@@ -1306,6 +1309,7 @@ class SaladSafetyService:
             and all(type(v) is int and v == 0 for v in counts.values())
             and observation.get("pending_change") is False
             and not observation.get("instances")
+            and observation.get("instance_counts_complete", True) is True
         )
         status = self.guardian.status(assignment.binding.operation)
         stopping = status["reason"] != "armed" or row["recovery"]

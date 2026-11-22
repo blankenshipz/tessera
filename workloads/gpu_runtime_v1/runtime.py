@@ -69,6 +69,14 @@ KINDS = ("wheel", "file", "entry")
 INPUT_SOURCE = "input"
 INPUT_ITEM_KEYS = {"kind", "source", "path"}
 INPUT_ITEM_KINDS = ("entry", "file")
+# An entry shipped in this image (ADR 0076): ``{"kind":"entry","source":"image","path":NAME,
+# "argv":[...]}``. NAME must be one of IMAGE_ENTRIES; the file lives under IMAGE_ENTRY_DIR.
+IMAGE_SOURCE = "image"
+IMAGE_ENTRIES = ("stage_argv.py",)
+IMAGE_ENTRY_DIR = "/tessera/lib/entries"
+IMAGE_ITEM_KEYS = {"kind", "source", "path", "argv"}
+MAX_IMAGE_ARGV = 128
+MAX_IMAGE_ARGV_TOKEN = 4000
 _KIND_DIR = {"wheel": "wheels", "file": "files", "entry": "entry"}
 _DEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){0,7}")
 _CHUNK = 1 << 16
@@ -300,13 +308,41 @@ def load_input_manifest(request, input_root):
     return manifest
 
 
+def is_image_item(item):
+    """Resolved inside this image (``source`` is ``image``), not fetched."""
+    return isinstance(item, dict) and item.get("source") == IMAGE_SOURCE
+
+
 def is_input_item(item):
     """Served from the verified input snapshot (has ``source``), not fetched."""
-    return isinstance(item, dict) and "source" in item
+    return isinstance(item, dict) and "source" in item and not is_image_item(item)
 
 
 def url_items(manifest):
-    return [item for item in manifest["fetches"] if not is_input_item(item)]
+    return [
+        item for item in manifest["fetches"] if not is_input_item(item) and not is_image_item(item)
+    ]
+
+
+def image_items(manifest):
+    return [item for item in manifest["fetches"] if is_image_item(item)]
+
+
+def _validate_image_item(item):
+    """Exactly ``{kind: entry, source: image, path, argv}`` with a shipped path."""
+    argv = item.get("argv")
+    if (
+        set(item) != IMAGE_ITEM_KEYS
+        or item["kind"] != "entry"
+        or item["path"] not in IMAGE_ENTRIES
+        or not isinstance(argv, list)
+        or not 1 <= len(argv) <= MAX_IMAGE_ARGV
+        or not all(
+            isinstance(t, str) and 1 <= len(t) <= MAX_IMAGE_ARGV_TOKEN and "\x00" not in t
+            for t in argv
+        )
+    ):
+        raise Failure("manifest")
 
 
 def input_items(manifest):
@@ -349,6 +385,13 @@ def validate_manifest(manifest):
             raise Failure("manifest")
     seen, entries, total = set(), 0, 0
     for item in manifest["fetches"]:
+        if is_image_item(item):
+            # Only item of the manifest: the launcher runs the argv and nothing else is staged.
+            _validate_image_item(item)
+            entries += 1
+            if len(manifest["fetches"]) != 1:
+                raise Failure("manifest")
+            continue
         if is_input_item(item):
             try:
                 kind, path = _validate_input_item(item)
@@ -1162,15 +1205,17 @@ class HTTPSCustody:
 # ---------------------------------------------------------------- entry run
 
 
-def run_entry(entry, work, site, out_dir, deadline, runner=subprocess.Popen):
-    """Run the verified entry: ``python entry WORK_DIR OUT_DIR`` with a hard wall clock."""
+def run_entry(entry, work, site, out_dir, deadline, runner=subprocess.Popen, args=None):
+    """Run the verified entry: ``python entry WORK_DIR OUT_DIR`` with a hard wall clock.
+
+    An image entry (ADR 0076) also gets ``-- ARGV...``, the manifest's reviewed argv."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise Failure("deadline")
     env = _entry_env(work, site)
     try:
         proc = runner(
-            [sys.executable, "-B", entry, work, out_dir],
+            [sys.executable, "-B", entry, work, out_dir, *(["--", *args] if args else [])],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1374,8 +1419,13 @@ def execute(
             manifest = load_input_manifest(request, input_root)
             paths, fetched = fetch_all(manifest, work, deadline, opener)
             site = installer(paths["wheel"], work, deadline)
-    entry = resolve_input_items(manifest, input_root) or paths["entry"][0]
-    entry_runner(entry, work, site, out_dir, deadline)
+    image = image_items(manifest)
+    if image:
+        entry = os.path.join(IMAGE_ENTRY_DIR, image[0]["path"])
+        entry_runner(entry, work, site, out_dir, deadline, args=list(image[0]["argv"]))
+    else:
+        entry = resolve_input_items(manifest, input_root) or paths["entry"][0]
+        entry_runner(entry, work, site, out_dir, deadline)
     staged = stage_outputs(out_dir, os.path.join(work, "staged"), plan, fetched)
     return upload_outputs(custody, staged)
 

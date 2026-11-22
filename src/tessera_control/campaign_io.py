@@ -195,6 +195,14 @@ def resolve_artifact(
     ).fetchone()
     if row is None:
         raise _refuse(source, "no such output in this project")
+    lineage = getattr(source, "resolved_from", None)
+    if lineage is not None:
+        recorded = connection.execute(
+            "SELECT receipt_digest FROM campaign_receipts WHERE campaign_id=?",
+            (source.campaign_id,),
+        ).fetchone()
+        if recorded is None or recorded["receipt_digest"] != lineage.source_receipt_sha256:
+            raise _refuse(source, "resolved_from does not match the source campaign receipt")
     if row["attempt_status"] != "succeeded":
         raise _refuse(source, "the producing attempt did not succeed")
     receipt_row = connection.execute(
@@ -261,3 +269,122 @@ def resolve_artifact(
         source_attempt_id=row["attempt_id"],
         lineage_node_id=row["lineage_node_id"],
     )
+
+
+def _receipt_ref_refusal(stage_key: str, ref: Mapping[str, Any], why: str) -> Conflict:
+    return Conflict(f"Stage {stage_key!r} receipt_output input {ref['name']!r}: {why}.")
+
+
+def _source_receipt_output(
+    receipt: Mapping[str, Any], stage: str, output: str
+) -> tuple[str, int] | None:
+    """The sha256 and attempt of the last succeeded attempt's named output, or None."""
+    found: tuple[str, int] | None = None
+    for item in receipt.get("stages", []):
+        if item.get("stage_key") != stage:
+            continue
+        for attempt in item.get("attempts", []):
+            if attempt.get("status") != "succeeded":
+                continue
+            for io in attempt.get("io", []):
+                if io.get("direction") == "output" and io.get("name") == output:
+                    found = (io["sha256"], attempt["attempt"])
+    return found
+
+
+def refuse_submitted_lineage(spec_value: Any) -> None:
+    """Refuse any submitted ``resolved_from`` (ADR 0080): only submit's resolver sets it.
+
+    Call this on the raw request spec, before ``resolve_receipt_refs`` adds the lineage.
+    """
+    stages = spec_value.get("stages", []) if isinstance(spec_value, Mapping) else []
+    for stage in stages if isinstance(stages, list) else []:
+        inputs = stage.get("inputs", []) if isinstance(stage, Mapping) else []
+        for item in inputs if isinstance(inputs, list) else []:
+            if isinstance(item, Mapping) and "resolved_from" in item:
+                raise Conflict(
+                    f"Stage {stage.get('key', '?')!r} input {item.get('name', '?')!r}: "
+                    "resolved_from is set by submit only; remove it or use a receipt_output "
+                    "reference."
+                )
+
+
+def resolve_receipt_refs(
+    connection: sqlite3.Connection,
+    project: Mapping[str, Any],
+    spec_value: Mapping[str, Any],
+    predecessors: Mapping[str, str],
+) -> dict[str, Any]:
+    """Replace every ``receipt_output`` input of a spec (as a JSON mapping) by a pinned one.
+
+    The source campaign must be in this org and project, ``succeeded``, with a terminal
+    receipt that lists a succeeded attempt output of that name; the resulting ``artifact``
+    input (campaign id, sha256, ``resolved_from`` lineage with the receipt digest) is then
+    verified by ``resolve_artifact`` exactly like a hand-written one. Anything else is a
+    Conflict that names the stage, the input and the reason. Specs without references are
+    returned unchanged.
+    """
+    stages = spec_value.get("stages", [])
+    if not any(
+        isinstance(i, dict) and i.get("kind") == "receipt_output"
+        for stage in stages
+        for i in stage.get("inputs", [])
+    ):
+        return dict(spec_value)
+    resolved = json.loads(json.dumps(spec_value))
+    for stage in resolved["stages"]:
+        inputs = []
+        for item in stage.get("inputs", []):
+            if item.get("kind") != "receipt_output":
+                inputs.append(item)
+                continue
+            key = stage.get("key", "?")
+            campaign_id = item.get("campaign_id")
+            if campaign_id is None:
+                campaign_id = predecessors.get(item.get("predecessor"))
+                if campaign_id is None:
+                    raise _receipt_ref_refusal(
+                        key, item, f"predecessor {item.get('predecessor')!r} is not in the submit"
+                    )
+            row = connection.execute(
+                "SELECT status FROM campaigns WHERE id=? AND org_id=? AND project_id=?",
+                (campaign_id, project["org_id"], project["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise _receipt_ref_refusal(key, item, "no such campaign in this project")
+            if row["status"] != "succeeded":
+                raise _receipt_ref_refusal(
+                    key, item, f"campaign {campaign_id} is {row['status']}, not succeeded"
+                )
+            receipt_row = connection.execute(
+                "SELECT receipt_json, receipt_digest FROM campaign_receipts WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchone()
+            if receipt_row is None:
+                raise _receipt_ref_refusal(key, item, "the source campaign has no terminal receipt")
+            found = _source_receipt_output(
+                json.loads(receipt_row["receipt_json"]), item["stage"], item["output"]
+            )
+            if found is None:
+                raise _receipt_ref_refusal(
+                    key,
+                    item,
+                    f"the receipt of {campaign_id} lists no succeeded output "
+                    f"{item['output']!r} of stage {item['stage']!r}",
+                )
+            lineage: dict[str, Any] = {"source_receipt_sha256": receipt_row["receipt_digest"]}
+            if item.get("predecessor") is not None:
+                lineage["predecessor"] = item["predecessor"]
+            inputs.append(
+                {
+                    "kind": "artifact",
+                    "name": item["name"],
+                    "campaign_id": campaign_id,
+                    "stage": item["stage"],
+                    "output": item["output"],
+                    "sha256": found[0],
+                    "resolved_from": lineage,
+                }
+            )
+        stage["inputs"] = inputs
+    return resolved

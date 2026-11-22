@@ -588,7 +588,8 @@ def provider_admits(
             raise DataClassRefused(
                 f"the snapshot carries approved private code, which {who} is not "
                 "trusted to receive (private_code_approved); without a provider trust "
-                "setting only data recorded public is admitted"
+                "setting only data recorded public is admitted",
+                admit_class=PRIVATE_CODE_APPROVED,
             )
         approved = frozenset(f["relative_path"] for f in approval["files"])
     has_data = approval is None or any(e["relative_path"] not in approved for e in entries)
@@ -596,7 +597,8 @@ def provider_admits(
         raise DataClassRefused(
             f"the snapshot data is recorded {recorded}, which {who} is not trusted to receive "
             "(without a provider trust setting only data recorded public with license and "
-            "source evidence is admitted)"
+            "source evidence is admitted)",
+            admit_class=recorded if recorded == "private_derived" else None,
         )
     return AdmittedInput(
         code_paths=approved,

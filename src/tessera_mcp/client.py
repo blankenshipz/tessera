@@ -124,11 +124,14 @@ class ControlClient:
             key=idempotency_key,
         )
 
-    async def submit_campaign(self, spec, idempotency_key):
+    async def submit_campaign(self, spec, idempotency_key, predecessors=None):
+        body = {"spec": spec}
+        if predecessors:
+            body["predecessors"] = dict(predecessors)
         return await self._request(
             "POST",
             f"/projects/{segment(self.config.project_id)}/campaigns",
-            body={"spec": spec},
+            body=body,
             key=idempotency_key,
         )
 
@@ -171,6 +174,10 @@ class ControlClient:
         project = segment(self.config.project_id)
         return await self._request("GET", f"/projects/{project}/agent-standing-status")
 
+    async def project_spend(self):
+        project = segment(self.config.project_id)
+        return await self._request("GET", f"/projects/{project}/agent-spend")
+
     async def gate_decisions(self, campaign_id):
         return await self._request("GET", f"/campaigns/{segment(campaign_id)}/gate-decisions")
 
@@ -182,12 +189,15 @@ class ControlClient:
             key=idempotency_key,
         )
 
-    async def validate_campaign_spec(self, spec):
+    async def validate_campaign_spec(self, spec, predecessors=None):
         """Dry-run of submit on the control plane: same checks, nothing stored."""
+        body = {"spec": spec}
+        if predecessors:
+            body["predecessors"] = dict(predecessors)
         return await self._request(
             "POST",
             f"/projects/{segment(self.config.project_id)}/campaign-specs/validate",
-            body={"spec": spec},
+            body=body,
         )
 
     async def reduce_campaign_budget(
@@ -202,6 +212,18 @@ class ControlClient:
                 "reason": reason,
             },
             key=idempotency_key,
+        )
+
+    async def rerun_campaign(
+        self, campaign_id, idempotency_key, mode="failed_stages", stage_keys=None, cap=None
+    ):
+        body: dict = {"mode": mode}
+        if stage_keys is not None:
+            body["stage_keys"] = list(stage_keys)
+        if cap is not None:
+            body["budget_cap_cents"] = cap
+        return await self._request(
+            "POST", f"/campaigns/{segment(campaign_id)}/rerun", body=body, key=idempotency_key
         )
 
     async def _steer(self, campaign_id, action, body, key):

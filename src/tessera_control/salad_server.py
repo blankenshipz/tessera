@@ -962,6 +962,9 @@ class TrustedSaladServer:
             and not instances
             and observation.get("pending_change") is False
             and observation.get("response_status") != 202
+            # Counts Salad did not send (a CPU-only group may omit them) are read as no live
+            # instance for start admission, but never as evidence that a stop took effect.
+            and observation.get("instance_counts_complete", True) is True
         )
         rejection = (
             observation.get("provider_rejection")

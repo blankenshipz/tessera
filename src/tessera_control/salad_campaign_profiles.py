@@ -19,6 +19,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from .campaign_models import SaladProgramTemplate
 from .remote_execution_models import CpuRate, ExecutionSelection, TargetPolicy, route_window_limit
 from .salad_proxy_contract import ManagementCredential, ProxyPolicy
 from .salad_workload_contract import WorkloadContractV1
@@ -47,6 +48,21 @@ _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 class _Closed(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class StageAdapterConfig(_Closed):
+    """Operator opt-in for the stage adapter (ADR 0076): what the adapter cannot take from a stage.
+
+    Every field is optional (ADR 0077): the section's presence is the opt-in. ``program`` is the
+    operator-authored program template of an adapted stage (absent: the generic default of
+    ``campaign_salad_adapter``); ``max_input_bytes`` is a ceiling on the stage's input (absent:
+    only the profile's disk bounds it; the reviewed cap is the pinned input's exact size)."""
+
+    program: SaladProgramTemplate | None = None
+    max_input_bytes: int | None = Field(default=None, ge=1, le=1 << 40)
+    grant_ttl_seconds: int = Field(default=21600, ge=3600, le=43200)
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class SaladCampaignProfile(_Closed):
@@ -89,6 +105,8 @@ class SaladCampaignProfile(_Closed):
     # Narrowing only (ADR 0044): False ignores any approve-body review pre-approval for
     # stages of this profile. True never pre-approves anything by itself.
     preapprove_reviews: bool = True
+    # Present only on a CPU profile the operator opened to adapted local-docker stages (ADR 0076).
+    stage_adapter: StageAdapterConfig | None = None
 
     @model_validator(mode="after")
     def consistent(self):
@@ -101,6 +119,8 @@ class SaladCampaignProfile(_Closed):
             raise ValueError("max_task_cents must be at least max_run_cents")
         if (self.gpu_class is None) == (self.cpu_rate is None):
             raise ValueError("a profile names a gpu_class (GPU) or cpu_rate (CPU-only), not both")
+        if self.stage_adapter is not None and self.gpu:
+            raise ValueError("stage_adapter applies to a CPU-only profile")
         return self
 
     @property

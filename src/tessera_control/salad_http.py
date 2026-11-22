@@ -176,8 +176,10 @@ REQUEST_TIMEOUT_SECONDS = READ_DEADLINE_SECONDS
 
 
 class _Failure(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, observation=None):
         self.reason = reason
+        # Non-secret diagnostics (state, pending change, instance-count keys), never a body.
+        self.observation = observation
 
 
 class _Rejected(_Failure):
@@ -219,6 +221,66 @@ def _integer(value, *, maximum=2**31 - 1):
     return value
 
 
+# A group that is about to start must read as stopped, with no change in flight and no live
+# instance. Salad answers a fresh group as pending for a moment, so ``start`` reads it again a few
+# times (reads only; the single start POST is unchanged) before it refuses. The wait is short on
+# purpose: the executor's own heartbeat and the guardian's silence bound run through this call.
+START_SETTLE_SECONDS = 10.0
+START_SETTLE_POLL_SECONDS = 1.0
+_COUNT_KEYS = ("allocating_count", "creating_count", "running_count", "stopping_count")
+
+
+def _instance_counts(raw):
+    """Normalize a group's instance counts, tolerating shapes a CPU-only group may report.
+
+    Returns ``(counts, complete, keys)``: the four known counts (a missing one is zero), whether
+    all four were reported, and the key names Salad sent. An absent, null or empty object means
+    no instance was reported; a known key that is not a non-negative integer is malformed (fail
+    closed), and an unknown ``*_count`` key with a positive integer counts as a live instance.
+    """
+    if raw is None:
+        raw = {}
+    if type(raw) is not dict:
+        raise _Failure("malformed_response")
+    counts = {key: 0 for key in _COUNT_KEYS}
+    for key in _COUNT_KEYS:
+        if key in raw:
+            counts[key] = _integer(raw[key])
+    for key, value in raw.items():
+        if key not in _COUNT_KEYS and type(key) is str and key.endswith("_count"):
+            if _integer(value) > 0:
+                counts[key] = value  # a count we do not know by name still means instances
+    # The key names go into receipts: keep only count-shaped names, bounded in number and length.
+    keys = sorted(
+        k for k in raw if type(k) is str and len(k) <= 40 and re.fullmatch(r"[a-z_]+_count", k)
+    )[:16]
+    return counts, all(key in raw for key in _COUNT_KEYS), keys
+
+
+def group_settled(group):
+    """True for a group that reads stopped, has no change in flight and no live instance."""
+    return (
+        group.get("state") == "stopped"
+        and group.get("pending_change") is False
+        and not any(group.get("instance_status_counts", {}).values())
+    )
+
+
+def _refusal_diagnostics(group):
+    """What a start refusal records so the cause is visible (no secret, no body).
+
+    Nested under ``refusal`` so nothing downstream can mistake a refusal for a group readback."""
+    return dict(
+        refusal=dict(
+            state=group.get("state"),
+            pending_change=group.get("pending_change"),
+            instance_status_counts=dict(group.get("instance_status_counts", {})),
+            instance_count_keys=list(group.get("instance_count_keys", [])),
+            instance_counts_complete=group.get("instance_counts_complete"),
+        )
+    )
+
+
 def _object(pairs):
     result = {}
     for key, value in pairs:
@@ -237,7 +299,15 @@ class SaladHTTPTransport:
     read_instance reads the exact group's instance collection, not arbitrary IDs.
     """
 
-    def __init__(self, selection, *, connection_factory=BoundedHTTPSConnection):
+    def __init__(
+        self,
+        selection,
+        *,
+        connection_factory=BoundedHTTPSConnection,
+        sleep=time.sleep,
+        clock=time.monotonic,
+    ):
+        self._sleep, self._clock = sleep, clock
         self._selection = ExecutionSelection.model_validate_json(selection.model_dump_json())
         s = self._selection
         p, r = s.salad, s.resources
@@ -487,15 +557,18 @@ class SaladHTTPTransport:
         state = data["current_state"]["status"]
         if state not in {"pending", "running", "stopped", "succeeded", "failed", "deploying"}:
             raise _Failure("malformed_response")
-        counts = data["current_state"]["instance_status_counts"]
-        counts = {
-            k: _integer(counts[k])
-            for k in ("allocating_count", "creating_count", "running_count", "stopping_count")
-        }
+        counts, complete, keys = _instance_counts(
+            data["current_state"].get("instance_status_counts")
+        )
         return dict(
             provider_id=actual,
             state=state,
             instance_status_counts=counts,
+            # False when the group did not report all four counts (a CPU-only group may omit
+            # them): admission still reads it as no live instance, but a stop is never
+            # *confirmed* from counts Salad did not send.
+            instance_counts_complete=complete,
+            instance_count_keys=keys,
             pending_change=data["pending_change"],
             version=_integer(data["version"]),
         )
@@ -522,17 +595,39 @@ class SaladHTTPTransport:
                     observed_at=utc_now(),
                 ),
             )
-        return ProxyResult(status="unknown", reason=error.reason)
+        return ProxyResult(
+            status="unknown",
+            reason=error.reason,
+            observation=None
+            if error.observation is None
+            else dict(error.observation, selection_digest=self._digest, observed_at=utc_now()),
+        )
 
     @staticmethod
     def _require_stopped(group):
         # This is provider-side admission, not independent no-writers evidence.
-        if (
-            group["state"] != "stopped"
-            or group["pending_change"] is not False
-            or any(group["instance_status_counts"].values())
+        if not group_settled(group):
+            raise _Failure("admission_denied", _refusal_diagnostics(group))
+
+    def _settle(self, group, secret, provider_id):
+        """Re-read a not-yet-settled group a few times; return the last observation.
+
+        Stops at the first settled read, at a live (allocating, creating or running) instance,
+        or after ``START_SETTLE_SECONDS``; the caller then refuses with what was observed.
+        """
+        deadline = self._clock() + START_SETTLE_SECONDS
+        counts = group["instance_status_counts"]
+        while (
+            not group_settled(group)
+            and group["state"] in {"pending", "stopped"}
+            and not any(v for k, v in counts.items() if k != "stopping_count")
+            and self._clock() < deadline
         ):
-            raise _Failure("admission_denied")
+            self._sleep(START_SETTLE_POLL_SECONDS)
+            _, data = self._request("GET", self._group, secret)
+            group = self._group_observation(data, provider_id)
+            counts = group["instance_status_counts"]
+        return group
 
     def _cpu_rate(self):
         """The reviewed operator CPU rate for this selection; no provider read exists for it."""
@@ -769,14 +864,14 @@ class SaladHTTPTransport:
                     raise _Failure("malformed_response")
                 group = self._group_observation(data, None)
                 if (
-                    group["state"] == "pending"
-                    and group["pending_change"] is True
+                    group["state"] in {"pending", "stopped"}
+                    and not group_settled(group)
                     and not any(group["instance_status_counts"].values())
                 ):
-                    # A new autostart=false group answers
-                    # 201 as pending with a change in flight before settling stopped.
-                    # Keep its verified identity but report unknown/pending; a later
-                    # exact read must observe stopped before start is admitted.
+                    # A new autostart=false group answers 201 as pending, or as stopped with a
+                    # change still in flight, before it settles. Keep its verified identity but
+                    # report unknown/pending; the caller settles it with exact reads (a bounded
+                    # poll) and start is admitted only after one reads settled.
                     return self._result(
                         dict(group, state="unknown", response_status=201), pending=True
                     )
@@ -823,8 +918,12 @@ class SaladHTTPTransport:
                     )
                 return self._result(dict(group, instances=normalized))
             if operation == "start":
-                # Recheck the immediately preceding exact GET, not stale preflight.
-                # Caller has consumed its claim; failure never resets or retries it.
+                # Recheck the immediately preceding exact GET, not stale preflight, after a
+                # short bounded settle: a freshly created group can still read pending for a
+                # moment. Reads only; the one start POST below is never repeated, and a group
+                # with a live instance is refused at once. Caller has consumed its claim;
+                # failure never resets or retries it.
+                group = self._settle(group, secret, provider_id)
                 self._require_stopped(group)
             path = self._group if operation == "delete" else f"{self._group}/{operation}"
             method = "DELETE" if operation == "delete" else "POST"

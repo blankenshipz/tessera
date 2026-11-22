@@ -1012,8 +1012,7 @@ def setup(args):
         _check_executor_at_control(args, executor, worker_token)
     else:
         worker_token = secrets.token_urlsafe(48)
-    cancel_token = secrets.token_urlsafe(48)
-    if len({worker_token, cancel_token, owner_token}) != 3:
+    if len({worker_token, owner_token}) != 2:
         raise SetupError("generated identities must be distinct")
 
     journal = Journal(args.output_dir)
@@ -1022,7 +1021,6 @@ def setup(args):
         # Tokens are persisted (0600, own file) BEFORE the issuing request is sent.
         if executor is None:
             journal.write("worker-token", worker_token.encode())
-        journal.write("cancel-token", cancel_token.encode())
         control = Control(args.state_dir, owner_token, journal)
         owner = control.owner
 
@@ -1036,21 +1034,6 @@ def setup(args):
                 control, args, worker_token, expires_at, inventory
             )
             worker_credential_file = out / "worker-token"
-        cancel_credential = control.http(
-            "cancel-credential",
-            "POST",
-            "/credentials",
-            dict(
-                token=cancel_token,
-                kind="human_session",
-                audience="control",
-                project_id=project_id,
-                expires_at=expires_at,
-            ),
-        )
-        if cancel_credential.get("role") != "human":
-            raise SetupError("cancel credential must be a human session")
-
         if args.input_digest is not None:
             # The reviewed staged input (the contract's declared input snapshot).
             snapshot_digest = args.input_digest
@@ -1491,7 +1474,6 @@ def setup(args):
             proposal_digest=route["proposal_digest"],
             policy=policy_json,
             worker_credential_file=str(worker_credential_file),
-            cancel_credential_file=str(out / "cancel-token"),
             credential_directory=str(args.credential_directory),
             guardian_socket=str(args.guardian_socket),
             guardian_uid=args.guardian_uid,
@@ -1515,14 +1497,12 @@ def setup(args):
             status="route_approved_not_dispatched",
             config_file=str(out / CONFIG_NAME),
             worker_credential_file=str(worker_credential_file),
-            cancel_credential_file=str(out / "cancel-token"),
             journal=str(out / "journal"),
             records=dict(
                 project_id=project_id,
                 worker_principal_id=worker_principal,
                 worker_registration_id=registration.get("id"),
                 executor=None if executor is None else executor.public(),
-                cancel_principal_id=cancel_credential.get("principal_id"),
                 snapshot_id=snapshot_id,
                 task_id=task_id,
                 grant_id=grant_id,

@@ -63,3 +63,8 @@ def budget(campaign_id: str, request: Request, actor: Actor):
 @router.get("/projects/{project_id}/agent-standing-status")
 def standing_status(project_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.standing_status(actor, project_id)
+
+
+@router.get("/projects/{project_id}/agent-spend")
+def project_spend(project_id: str, request: Request, actor: Actor):
+    return request.app.state.agent_campaign_reads.project_spend(actor, project_id)

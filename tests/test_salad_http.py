@@ -599,19 +599,28 @@ def test_start_never_posts_when_group_changes_after_stopped_preflight(
         ),
         (200, {"items": [gpu_class()]}),
         (200, {"available_gpu_high": 1}),
-        (200, changed),
+        *[(200, changed)] * 20,  # a changing group may be read again before start is refused
     )
     s = selection()
-    transport = SaladHTTPTransport(s, connection_factory=f)
+    ticks = iter(range(10_000))
+    transport = SaladHTTPTransport(
+        s, connection_factory=f, sleep=lambda _: None, clock=lambda: next(ticks)
+    )
     with SecretBuffer(bytearray(MARKER)) as secret:
         preflight = transport.preflight(s, secret)
         assert preflight.status == "observed" and preflight.observation["state"] == "stopped"
         result = transport.send("start", s, ID, secret)
     assert result.status == "unknown"
     assert result.reason == ("malformed_response" if state == "unknown" else "admission_denied")
-    assert len(f.calls) == 5
-    assert [call[0] for call in f.calls] == ["GET", "GET", "GET", "POST", "GET"]
+    assert [call[0] for call in f.calls][:5] == ["GET", "GET", "GET", "POST", "GET"]
+    assert {call[0] for call in f.calls[4:]} == {"GET"}  # only reads follow the preflight
     assert not any(call[1].endswith("/start") for call in f.calls)
+    if result.reason == "admission_denied":
+        # The refusal says why, with no body: the observed state, change in flight and counts.
+        refusal = result.observation["refusal"]
+        assert refusal["state"] == state and refusal["pending_change"] is pending_change
+        assert refusal["instance_status_counts"]["running_count"] == active_count
+        assert "instance_count_keys" in refusal
 
 
 @pytest.mark.parametrize(
@@ -633,8 +642,12 @@ def test_create_stopped_201_requires_stopped_no_pending_change_and_zero_instance
     data["current_state"]["instance_status_counts"]["allocating_count"] = active_count
     f = Factory((201, data))
     result = run(f, "create_stopped", None)
-    assert result.status == "unknown"
-    assert result.reason == ("malformed_response" if state == "unknown" else "admission_denied")
+    if (state, active_count) in {("pending", 0), ("stopped", 0)}:
+        # Not yet settled but nothing is running: accepted, the caller settles it by reading.
+        assert (result.status, result.reason) == ("pending", "accepted_pending")
+    else:
+        assert result.status == "unknown"
+        assert result.reason == ("malformed_response" if state == "unknown" else "admission_denied")
     assert len(f.calls) == 1  # Never retry creation after an uncertain acknowledgement.
 
 
@@ -1247,3 +1260,130 @@ def test_bounded_connection_bounds_dns_and_connect(monkeypatch):
     connection._deadline = time.monotonic() - 1
     with pytest.raises(TimeoutError):
         connection.connect()
+
+
+# -- start settles a fresh group before it is admitted (ADR 0071) -----------------------------
+
+
+def _read_start(reads, *, ticks=10_000):
+    """A start against a group whose successive reads are ``reads`` (each a group dict)."""
+    preflight = [
+        (200, {"items": [group()]}),
+        (
+            200,
+            {
+                "container_groups_quotas": {
+                    "container_replicas_quota": 1,
+                    "container_replicas_used": 1,
+                }
+            },
+        ),
+        (200, {"items": [gpu_class()]}),
+        (200, {"available_gpu_high": 1}),
+    ]
+    f = Factory(*preflight, *[(200, data) for data in reads], (202, b""))
+    s = selection()
+    clock = iter(range(ticks))
+    slept: list[float] = []
+    transport = SaladHTTPTransport(
+        s, connection_factory=f, sleep=slept.append, clock=lambda: next(clock)
+    )
+    with SecretBuffer(bytearray(MARKER)) as secret:
+        transport.preflight(s, secret)
+        result = transport.send("start", s, ID, secret)
+    return result, f, slept
+
+
+def _fresh(status="pending", pending=True, counts=None):
+    data = group()
+    data["current_state"]["status"] = status
+    data["pending_change"] = pending
+    if counts is not None:
+        data["current_state"]["instance_status_counts"] = counts
+    return data
+
+
+def test_start_waits_for_a_fresh_group_to_settle_then_posts_once():
+    reads = [_fresh(), _fresh("stopped", True), group()]  # pending, stopped-but-changing, settled
+    result, f, slept = _read_start(reads)
+    assert result.status == "pending" and result.reason == "accepted_pending"
+    assert [c[0] for c in f.calls[4:]] == ["GET", "GET", "GET", "POST"]  # three reads, one POST
+    assert f.calls[-1][1].endswith("/start")
+    assert slept and all(delay <= 1.0 for delay in slept)  # short, read-only waits
+    assert sum(1 for c in f.calls if c[1].endswith("/start")) == 1  # the POST is never repeated
+
+
+def test_start_that_never_settles_is_refused_with_what_was_observed():
+    result, f, slept = _read_start([_fresh()] * 30, ticks=10_000)
+    assert (result.status, result.reason) == ("unknown", "admission_denied")
+    refusal = result.observation["refusal"]
+    assert refusal["state"] == "pending" and refusal["pending_change"] is True
+    assert refusal["instance_status_counts"] == {
+        "allocating_count": 0,
+        "creating_count": 0,
+        "running_count": 0,
+        "stopping_count": 0,
+    }
+    assert refusal["instance_count_keys"] == [
+        "allocating_count",
+        "creating_count",
+        "running_count",
+        "stopping_count",
+    ]
+    assert not any(c[1].endswith("/start") for c in f.calls)  # never posted
+    assert MARKER.decode() not in result.model_dump_json()
+
+
+def test_a_live_instance_is_refused_at_once_without_waiting():
+    counts = {
+        "allocating_count": 0,
+        "creating_count": 0,
+        "running_count": 1,
+        "stopping_count": 0,
+    }
+    result, f, slept = _read_start([_fresh("stopped", False, counts)])
+    assert (result.status, result.reason) == ("unknown", "admission_denied")
+    refusal = result.observation["refusal"]
+    assert slept == [] and refusal["instance_status_counts"]["running_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [None, {}, {"running_count": 0}, {"allocating_count": 0, "running_count": 0}],
+)
+def test_a_group_that_omits_its_counts_reads_as_no_instance_but_is_not_a_stop_proof(counts):
+    data = _fresh("stopped", False)
+    data["current_state"].pop("instance_status_counts")
+    if counts is not None:
+        data["current_state"]["instance_status_counts"] = counts
+    read = run(Factory((200, data)))
+    assert read.status == "observed" and read.observation["state"] == "stopped"
+    assert read.observation["instance_status_counts"] == dict.fromkeys(
+        ("allocating_count", "creating_count", "running_count", "stopping_count"), 0
+    )
+    assert read.observation["instance_counts_complete"] is False
+    result, f, _ = _read_start([data])
+    assert result.status == "pending"  # start admitted: nothing reported as running
+
+
+def test_counts_that_are_garbage_or_name_live_instances_still_fail_closed():
+    bad = _fresh("stopped", False)
+    bad["current_state"]["instance_status_counts"] = {"running_count": "1"}
+    assert run(Factory((200, bad))).reason == "malformed_response"
+    bad["current_state"]["instance_status_counts"] = [1]
+    assert run(Factory((200, bad))).reason == "malformed_response"
+    named = _fresh("stopped", False, {"running_count": 0, "ready_count": 2})
+    result, f, slept = _read_start([named])
+    assert (result.reason, slept) == ("admission_denied", [])  # an unknown *_count with instances
+
+
+def test_the_count_key_names_that_reach_receipts_are_bounded_and_count_shaped():
+    counts = {
+        k: 0 for k in ("allocating_count", "creating_count", "running_count", "stopping_count")
+    }
+    counts.update({f"extra_{i}_count": 0 for i in range(40)})
+    counts.update({"Not A Key": 0, "x" * 80 + "_count": 0, "free text with spaces": 0})
+    read = run(Factory((200, _fresh("stopped", False, counts))))
+    keys = read.observation["instance_count_keys"]
+    assert len(keys) <= 16 and all(k.endswith("_count") and len(k) <= 40 for k in keys)
+    assert "Not A Key" not in keys and "free text with spaces" not in keys

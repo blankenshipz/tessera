@@ -24,6 +24,20 @@ another campaign's output (`kind: artifact`); that resolves through the source c
 v2 receipt and its stage I/O index, so a campaign that finished before schema v65 cannot be
 an artifact source.
 
+Instead of copying a campaign id and sha256 by hand, a v2 stage may take a value recorded on an
+earlier campaign's terminal receipt with `kind: receipt_output` (`name`, `stage`, `output`, and
+exactly one of `campaign_id` or `predecessor`). The submit body may add `predecessors:
+{name: campaign_id}` (at most 16). At submit, in the same transaction, the source must be in the
+same org and project, `succeeded`, with a terminal receipt listing a succeeded attempt output of
+that name (the last succeeded attempt wins). The reference becomes a pinned `artifact` input with
+`resolved_from {predecessor?, source_receipt_sha256}` before the spec is digested, so approval
+binds the exact bytes and lineage, and the usual artifact checks still run at submit and at stage
+start. Refusals are 409 and name the stage, input and reason. The consuming campaign's receipt
+gains `chained_inputs`. A predecessor must already have succeeded at submit. `resolved_from` is
+set by submit only; a submitted one is refused. Validate resolves references read-only; a standing
+approval refuses `receipt_output` (pin an `artifact` input). See
+[ADR 0080](decisions/0080-campaign-inputs-from-a-predecessor-receipt.md).
+
 A v2 stage may also declare `gate_evidence` (`{split_lock_id, seed, metrics: [{name, partition,
 unit}]}`, each name a stage metric). It is part of the digest; the runner binds that
 pre-registered split before dispatch and records each declared metric as a gate metric record
@@ -42,9 +56,11 @@ other stage of the spec may read that digest, and retries are off (`retry.max_at
 before the stage's input is released, after its dependencies succeeded; a later claim is refused
 at submit, approval or the claim itself (`holdout_already_claimed`). Once the claim is open a
 failed attempt (even one reconciled as not started) fails the stage instead of being requeued.
-A stage that is not the holdout stage cannot receive a partition that has a claim, and no
-`artifact` input may come from a holdout stage: both are refused at submit and approval and
-again before each input release (`sealed_partition`). The claim ends `scored` (with the metric
+A partition is sealed from the first approval of a spec naming it as a holdout (and once
+claimed): a stage that is not a holdout stage for it cannot receive it, and no `artifact` input
+may come from a holdout stage. Both are refused at submit and approval and again before each
+input release (`sealed_partition`). A holdout stage's outputs cannot be staged as an input
+snapshot either. The claim ends `scored` (with the metric
 values) or `spent` and is on the receipt (`holdout_claims`); read it with
 `tessera_campaign_holdout` or `tessera_campaign_holdout_claims`.
 
@@ -275,7 +291,8 @@ dispatched. Re-approval does not extend the campaign's total wall-clock bound.
 digest, exit code, manifest id and digest, holds and settlements), inputs with data
 class, measurements derived by the platform from retained bytes, stop-rule results,
 lineage node and edge ids, `verdict {operational, scientific_verdict}` and
-`receipt_digest`. `scientific_verdict` is `pending_human_approval` or `not_assessed`.
+`receipt_digest`, plus `chained_inputs` when an input was resolved from a predecessor's receipt
+(ADR 0080). `scientific_verdict` is `pending_human_approval` or `not_assessed`.
 Do not report a campaign as run without reading its receipt.
 
 ## Standing approvals and scheduled starts
@@ -368,6 +385,9 @@ receipt, cancel, the data-class refusal and a version-2 spec with a stop rule an
 `run.py` run skips it; `--include-opt-in` adds it. See [platform validation](platform-validation.md).
 
 ## Salad GPU stages
+
+(A local-docker CPU stage can also run on a Salad CPU profile without a Salad-form copy of the
+stage: see [Adapting a local-docker stage](campaign-providers.md#adapting-a-local-docker-cpu-stage-to-salad).)
 
 Contract: the Salad GPU stage driver amendment in ADR 0038. Every Salad GPU stage still
 needs people at a few fixed points; the runner pauses there and says why. Nothing below
@@ -499,7 +519,7 @@ trusted-server worker credential: the worker token of the Salad executor enrollm
 principal is listed under `salad` in the provider trust file (see
 [provider trust: stable executor](provider-trust.md#stable-executor-route-setups-that-mint-principals)). The closed, owner-only config
 (`tessera.salad.campaign-executor.v1`) names the state directory, the operator profile file
-and profile, the worker and cancel credential files, the credential directory, guardian socket
+and profile, the worker credential file (which also authorizes the executor's reduce-only cancel of its own routes, [ADR 0075](decisions/0075-executor-worker-credential-cancels-own-route.md); no human session credential is needed), the credential directory, guardian socket
 and uid, custody, a private work directory, the source revision and a 2 to 30 s poll.
 Per pass it leases and packages admitted Salad grants (refusing a plan budget above the
 profile's per-task ceiling), keeps leases alive (a renewal refusal is recorded and never

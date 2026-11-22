@@ -40,6 +40,11 @@ from .salad_campaign_profiles import (
     stage_has_nonpublic_input,
 )
 from .salad_workload_contract import COMMAND as SALAD_COMMAND
+from .salad_workload_contract import (
+    GPU_RUNTIME_V1,
+    check_gpu_runtime_inline_rules,
+    is_image_item,
+)
 from .store import Conflict, Store
 
 PROVIDER_ID = "salad"
@@ -117,7 +122,9 @@ class SaladRouteProvider:
             raise ValueError(f"{label}: Salad stages have no exit code to classify as transient")
         if stage.max_exposure_cents < 1:
             raise ValueError(f"{label}: a Salad stage needs max_exposure_cents >= 1")
-        if list(stage.argv) != [SALAD_COMMAND, *workload.argv_template]:
+        if config.adapted:
+            self._validate_adapted(label, stage, config)
+        elif list(stage.argv) != [SALAD_COMMAND, *workload.argv_template]:
             raise ValueError(f"{label}: argv must equal the workload contract's argv")
         if sorted(stage.output_paths) != sorted(o.name for o in workload.outputs):
             raise ValueError(f"{label}: output_paths must equal the contract's declared outputs")
@@ -131,13 +138,40 @@ class SaladRouteProvider:
             raise ValueError(f"{label}: declared outputs exceed the custody total")
         # The Kubernetes-job package refuses longer plans or argv; the lease also ends at
         # this duration, so it bounds the time humans have to resolve the attempt's reviews.
-        if stage.max_duration_seconds > 3600 or len(stage.argv) > 32:
+        if stage.max_duration_seconds > 3600 or (not config.adapted and len(stage.argv) > 32):
             raise ValueError(f"{label}: max_duration_seconds <= 3600 and at most 32 argv items")
         if stage_has_nonpublic_input(stage) and _hosts_declared(config):
             raise ValueError(
                 f"{label}: a stage with non-public input cannot declare workload fetch or "
                 "redirect hosts"
             )
+
+    @staticmethod
+    def _validate_adapted(label: str, stage: Any, config: SaladStageSpec) -> None:
+        """ADR 0076: the contract is the gpu_runtime_v1 launcher carrying this stage's argv.
+
+        The stage's argv is the local-docker form; what runs on Salad is the contract's argv, whose
+        manifest holds exactly the image entry with the stage's argv, so a person reviews one
+        and the other cannot differ."""
+        workload = config.workload
+        if config.gpu:
+            raise ValueError(f"{label}: an adapted stage is CPU-only")
+        try:
+            if workload.runtime != GPU_RUNTIME_V1:
+                raise ValueError("the workload must use the gpu_runtime_v1 layout")
+            manifest = check_gpu_runtime_inline_rules(workload)
+            items = None if manifest is None else manifest["fetches"]
+            if (
+                not items
+                or len(items) != 1
+                or not is_image_item(items[0])
+                or items[0]["argv"] != list(stage.argv)
+            ):
+                raise ValueError("the manifest must be the stage's argv as its one image entry")
+            if workload.egress.fetches or workload.egress.redirect_hosts or workload.env:
+                raise ValueError("an adapted workload declares no fetch, redirect host or env")
+        except ValueError as error:
+            raise ValueError(f"{label}: adapted stage: {error}") from None
 
     def check_stage(self, connection: sqlite3.Connection, project_id: str, stage: Any) -> None:
         """Operator profile ceilings for one Salad stage; every refusal is a 409.
@@ -180,7 +214,11 @@ class SaladRouteProvider:
                 "declare workload fetch or redirect hosts."
             )
         if not profile.image_allowed(stage.image):
-            raise Conflict("Salad stage image digest is not allowlisted by the operator profile.")
+            raise Conflict(
+                "Salad stage image digest is not allowlisted by the operator profile: add "
+                f'"sha256:{stage.image.split("@sha256:", 1)[-1]}" to allowed_image_digests of '
+                f"profile {profile.name!r}."
+            )
         if stage.max_exposure_cents > profile.max_run_cents:
             raise Conflict("Salad stage exposure exceeds the profile's per-run ceiling.")
         if not profile.gpu:
@@ -221,8 +259,14 @@ class SaladRouteProvider:
     def execution_spec(self, stage: Any, input_digest: str) -> dict[str, Any]:
         """The task plan's execution spec: the base plan contract only, because the
         workload contract declares Salad's provider-wide egress."""
+        config = _salad_config(stage)
+        argv = (
+            [SALAD_COMMAND, *config.workload.argv_template]
+            if config is not None and config.adapted
+            else list(stage.argv)
+        )
         return ExecutionSpec(
-            argv=list(stage.argv),
+            argv=argv,
             input_snapshot_digest=input_digest,
             pinned_skill_digests=[],
             output_paths=list(stage.output_paths),

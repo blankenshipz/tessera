@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from collections.abc import Mapping
 from typing import Any
@@ -104,26 +105,21 @@ def existing_claim(
 def sealed_input_refusal(connection: sqlite3.Connection, project_id: str, stage: Any) -> str | None:
     """Why this stage may not receive one of its inputs, or ``None`` (ADR 0068).
 
-    * A partition with a recorded claim (any scope) is read only by the holdout stage that
-      names it as its holdout input.
+    * A sealed partition (``sealed_digests``: claimed, or declared by an approved campaign) is
+      read only by a holdout stage that names it as its holdout input.
     * An ``artifact`` input may not come from another campaign's holdout stage: a scorer's
       outputs (per-example predictions, for example) must not feed back into selection.
 
     Used at submit and approval, and again by the runner before each input release, so a
-    campaign approved before a claim existed is still refused once it does."""
-    claimed = {
-        row["partition_digest"]
-        for row in connection.execute(
-            "SELECT DISTINCT partition_digest FROM campaign_holdout_claims WHERE project_id=?",
-            (project_id,),
-        )
-    }
+    campaign approved before the partition was sealed is still refused once it is."""
+    claimed = sealed_digests(connection, project_id)
     holdout = stage.holdout
     for item in stage.inputs:
         digest = item.digest if item.kind == "snapshot" else item.sha256
         if digest in claimed and (holdout is None or holdout.input != item.name):
             return (
-                f"Stage {stage.key}: input {item.name!r} is a claimed sealed partition; "
+                f"Stage {stage.key}: input {item.name!r} is a sealed partition (claimed, or "
+                "declared by an approved holdout stage); "
                 "only a final holdout evaluation stage may read it"
             )
         if item.kind == "artifact" and _holdout_stage(
@@ -135,6 +131,75 @@ def sealed_input_refusal(connection: sqlite3.Connection, project_id: str, stage:
                 "another campaign"
             )
     return None
+
+
+def sealed_digests(connection: sqlite3.Connection, project_id: str) -> set[str]:
+    """Partitions sealed in the project: every claimed digest, and every holdout digest an
+    approved campaign declares (ADR 0068). A partition is sealed from the first human approval
+    of a spec that names it as a holdout, before any claim exists, so a selection stage in
+    another campaign cannot read it in that window. Specs never approved seal nothing, so an
+    unapproved submission cannot block anyone's data."""
+    sealed = {
+        row["partition_digest"]
+        for row in connection.execute(
+            "SELECT DISTINCT partition_digest FROM campaign_holdout_claims WHERE project_id=?",
+            (project_id,),
+        )
+    }
+    for row in connection.execute(
+        """SELECT c.id, c.spec_json FROM campaigns c WHERE c.project_id=?
+        AND c.spec_json LIKE '%"holdout"%'
+        AND EXISTS (SELECT 1 FROM campaign_approvals a WHERE a.campaign_id=c.id)""",
+        (project_id,),
+    ):
+        sealed.update(_declared_holdouts(row["id"], row["spec_json"]))
+    return sealed
+
+
+# Declared holdout digests per campaign, so a release does not parse every approved holdout
+# spec in the project again. Keyed by campaign id and checked against the stored spec text, so
+# a changed spec is parsed afresh. Guarded by a lock because the runner and API may share a
+# process; bounded, evicting the oldest entry when full.
+_DECLARED_LOCK = threading.Lock()
+_DECLARED: dict[str, tuple[str, frozenset[str]]] = {}
+_DECLARED_LIMIT = 4096
+
+
+def _declared_holdouts(campaign_id: str, spec_json: str) -> frozenset[str]:
+    with _DECLARED_LOCK:
+        cached = _DECLARED.get(campaign_id)
+    if cached is not None and cached[0] == spec_json:
+        return cached[1]
+    from .campaign_models import parse_spec_json
+
+    try:
+        stages = normalize(parse_spec_json(spec_json)).stages
+    except ValueError:
+        declared: frozenset[str] = frozenset()  # an unparseable stored spec seals nothing
+    else:
+        declared = frozenset(s.holdout.partition_digest for s in stages if s.holdout is not None)
+    with _DECLARED_LOCK:
+        _DECLARED.pop(campaign_id, None)
+        while len(_DECLARED) >= _DECLARED_LIMIT:
+            del _DECLARED[next(iter(_DECLARED))]  # dicts keep insertion order: drop the oldest
+        _DECLARED[campaign_id] = (spec_json, declared)
+    return declared
+
+
+def holdout_output_source(
+    connection: sqlite3.Connection, project_id: str, manifest_id: str
+) -> tuple[str, str] | None:
+    """``(campaign_id, stage_key)`` when the manifest holds a holdout stage's outputs."""
+    row = connection.execute(
+        """SELECT campaign_id, stage_key FROM campaign_stage_attempts
+        WHERE manifest_id=? LIMIT 1""",
+        (manifest_id,),
+    ).fetchone()
+    if row is None or not _holdout_stage(
+        connection, project_id, row["campaign_id"], row["stage_key"]
+    ):
+        return None
+    return row["campaign_id"], row["stage_key"]
 
 
 def _holdout_stage(
@@ -212,6 +277,39 @@ def open_claim(
     if found is not None:
         return False, found
     claim_id = "holdout_claim_" + uuid.uuid4().hex
+    try:
+        _insert_claim(connection, claim_id, campaign, approval, stage, now)
+    except sqlite3.IntegrityError:
+        # The unique keys are the final arbiter: if another writer got there between the
+        # lookup and the insert (only possible if the caller's transaction were weakened), the
+        # statement is rolled back and the caller gets the same clean refusal as above.
+        own = connection.execute(
+            "SELECT * FROM campaign_holdout_claims WHERE campaign_id=? AND stage_key=?",
+            (campaign["id"], stage.key),
+        ).fetchone()
+        if own is not None:
+            return True, _claim(own)
+        found = existing_claim(
+            connection, campaign["project_id"], holdout.partition_digest, holdout.claim_scope
+        )
+        if found is None:
+            raise
+        return False, found
+    row = connection.execute(
+        "SELECT * FROM campaign_holdout_claims WHERE id=?", (claim_id,)
+    ).fetchone()
+    return True, _claim(row)
+
+
+def _insert_claim(
+    connection: sqlite3.Connection,
+    claim_id: str,
+    campaign: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    stage: Any,
+    now: str,
+) -> None:
+    holdout = stage.holdout
     connection.execute(
         """INSERT INTO campaign_holdout_claims (id, org_id, project_id, partition_digest,
         claim_scope, campaign_id, stage_key, input_name, approval_id, spec_digest, status,
@@ -230,10 +328,6 @@ def open_claim(
             now,
         ),
     )
-    row = connection.execute(
-        "SELECT * FROM campaign_holdout_claims WHERE id=?", (claim_id,)
-    ).fetchone()
-    return True, _claim(row)
 
 
 def score_claim(
@@ -279,12 +373,16 @@ def spend_open_claims(connection: sqlite3.Connection, campaign_id: str, now: str
         )
 
 
-def campaign_claims(connection: sqlite3.Connection, campaign_id: str) -> list[dict[str, Any]]:
+def campaign_claims(
+    connection: sqlite3.Connection, campaign_id: str, limit: int = -1
+) -> list[dict[str, Any]]:
+    """A campaign's claims, oldest first; ``limit`` caps the rows (-1: no cap)."""
     return [
         _claim(row)
         for row in connection.execute(
-            "SELECT * FROM campaign_holdout_claims WHERE campaign_id=? ORDER BY opened_at, id",
-            (campaign_id,),
+            """SELECT * FROM campaign_holdout_claims WHERE campaign_id=?
+            ORDER BY opened_at, id LIMIT ?""",
+            (campaign_id, limit),
         )
     ]
 

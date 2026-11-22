@@ -24,6 +24,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .artifact_custody import ArtifactCustodyStore
+from .campaign_holdout import holdout_output_source
 from .data_class import PRIVATE_DERIVED, record_snapshot_data_class
 from .snapshot_chunks import (
     collect_expired_uploads,
@@ -112,6 +113,14 @@ class DatasetStagingStore(SnapshotStore):
                 raise NotFound("Artifact manifest was not found.")
             if manifest["manifest_digest"] != body["expected_manifest_digest"]:
                 raise Conflict("Artifact manifest digest does not match.")
+            source = holdout_output_source(connection, project_id, manifest["id"])
+            if source is not None:
+                # ADR 0068: a held-out score (per-example predictions, for example) never
+                # becomes an input snapshot that could feed selection.
+                raise Conflict(
+                    f"Outputs of holdout stage {source[1]} of campaign {source[0]} cannot be "
+                    "staged as an input snapshot."
+                )
             release = custody._current_release(connection, manifest["id"])
             disposition = custody._latest_disposition(connection, manifest["id"])
             if (

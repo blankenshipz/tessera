@@ -13,10 +13,25 @@ from test_supervisor import FakeAdapter
 from tessera_control.api import create_app
 from tessera_control.campaign_runner import CampaignRunner
 from tessera_control.store import canonical_digest
+from tessera_worker.cpu import CpuLaunchError
 from tessera_worker.grant_poller import DevelopmentGrantPoller, GrantPollerConfig
 from tessera_worker.service import DevelopmentWorkerService
 
-__all__ = ["IMAGE", "World", "stage_spec"]
+__all__ = [
+    "IMAGE",
+    "POOLS",
+    "World",
+    "admit",
+    "cut_reports",
+    "lapse",
+    "latest",
+    "refuse_launches",
+    "stage_spec",
+    "started_but_unreported",
+]
+
+POOLS = "network_address_pool_exhausted"
+PAST = "2000-01-01T00:00:00Z"
 
 
 class ApiChannel:
@@ -254,3 +269,63 @@ def dump(world: World, campaign_id: str) -> str:
     row = world.row("SELECT stop_reason FROM campaigns WHERE id=?", campaign_id)
     lines.append(f"stop_reason={row['stop_reason']}")
     return "\n".join(lines)
+
+
+def latest(world, cid):
+    return world.attempts(cid)[-1]
+
+
+def admit(world, cid):
+    world.tick_until(
+        lambda: any(a["status"] == "admitted" for a in world.attempts(cid)), worker=False
+    )
+
+
+def cut_reports(world):
+    original = world.channel.post
+
+    def cut(path, body, key):
+        if "/worker/observations" in path or "receipt" in path or "manifest" in path:
+            raise ConnectionError("synthetic report loss")
+        return original(path, body, key)
+
+    world.channel.post = cut
+    return original
+
+
+def lapse(world, grant_id):
+    world.env.execute("UPDATE execution_grants SET expires_at=? WHERE id=?", PAST, grant_id)
+    world.env.execute(
+        "UPDATE execution_leases SET expires_at=?, hard_expires_at=? WHERE grant_id=?",
+        PAST,
+        PAST,
+        grant_id,
+    )
+
+
+def refuse_launches(monkeypatch):
+    def refuse(self, operation):
+        raise CpuLaunchError("refused", POOLS)
+
+    monkeypatch.setattr(ScriptedAdapter, "prepare", refuse)
+
+
+def started_but_unreported(world, cid, starts) -> dict:
+    """The adapter really creates and starts the container (it runs and writes outputs) but
+    every report is lost: control sees a lease and an operation and nothing else."""
+    admit(world, cid)
+    original = ScriptedAdapter.start
+
+    def counted(self, operation):
+        starts.append(operation.operation_id)
+        return original(self, operation)
+
+    ScriptedAdapter.start = counted
+    try:
+        cut_reports(world)
+        world.poller.run(max_cycles=1)
+    finally:
+        ScriptedAdapter.start = original
+    attempt = latest(world, cid)
+    lapse(world, attempt["grant_id"])
+    return attempt

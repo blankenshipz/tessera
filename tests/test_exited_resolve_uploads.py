@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from campaign_runner_harness import World  # noqa: F401 - imported for the fixtures below
@@ -313,3 +314,142 @@ def test_finished_uploads_are_forgotten_and_eviction_gives_a_fresh_window():
     )
     tracker.forget("a")
     assert "a" not in tracker._seen
+
+
+def test_the_hold_still_waits_while_a_verification_runs_inside_the_workers_poll_bound(
+    tmp_path, monkeypatch
+):
+    """All bytes are in, control is hashing the file (the complete call answers 202), and the
+    worker polls for at most ``COMPLETE_MAX_WAIT_SECONDS`` from the last chunk. Throughout that
+    time the exited attempt is still held; only after the stall window past the last chunk does
+    the hold end, and by then the worker has stopped polling."""
+    import threading
+
+    from tessera_control import large_artifacts
+    from tessera_worker import artifacts
+
+    release = threading.Event()
+    real = large_artifacts.verify_artifact_bytes
+
+    def blocked(*args, **kwargs):
+        release.wait(10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(large_artifacts, "verify_artifact_bytes", blocked)
+    monkeypatch.setattr(large_artifacts, "VERIFY_WAIT_SECONDS", 0.1)
+    large_artifacts._FLIGHTS.clear()
+    world, attempt, reach, lease, upload_id = _setup(tmp_path)
+    progress = cer.UploadProgress()
+    aid = attempt["id"]
+    for seq in range(len(DATA) // CHUNK):
+        _put(reach, lease, upload_id, seq)
+    t0 = datetime.now(UTC)
+    assert _assess(world, aid, progress, at=t0) is None  # first sight of the finished bytes
+    complete = reach(
+        f"/worker/leases/{lease['id']}/large-artifact-uploads/{upload_id}/complete", {}, "done"
+    )
+    assert complete["status"] == "verifying"  # the poll is in progress and nothing is final
+    budget = timedelta(seconds=artifacts.COMPLETE_MAX_WAIT_SECONDS)
+    # Every moment the worker may still be polling, the attempt is held for its outputs.
+    for offset in (1, 60, 300, budget.total_seconds()):
+        assert _assess(world, aid, progress, at=t0 + timedelta(seconds=offset)) is None
+    # Only past the stall window (which the poll bound stays inside) does the hold end.
+    assert artifacts.COMPLETE_MAX_WAIT_SECONDS < cer.UPLOAD_STALL_SECONDS
+    stalled = _assess(world, aid, progress, at=t0 + timedelta(seconds=cer.UPLOAD_STALL_SECONDS + 1))
+    assert stalled is not None and stalled.evidence["hold_ended_by"] == "stall"
+    release.set()
+    large_artifacts._FLIGHTS.clear()
+
+
+def test_the_real_poll_loop_runs_against_the_real_hold_and_ends_inside_it(tmp_path, monkeypatch):
+    """The worker's own completion loop (real code, real control routes, a fake clock) against
+    the exited attempt's hold: at every round of the poll the attempt is still held for its
+    outputs, the worker gives up inside the budget, and the hold ends only after the stall
+    window."""
+    import threading
+
+    from tessera_control import large_artifacts
+    from tessera_worker import artifacts
+    from tessera_worker.outputs import collect_output_set
+
+    release = threading.Event()
+    real = large_artifacts.verify_artifact_bytes
+    monkeypatch.setattr(
+        large_artifacts,
+        "verify_artifact_bytes",
+        lambda *a, **k: (release.wait(10), real(*a, **k))[1],
+    )
+    monkeypatch.setattr(large_artifacts, "VERIFY_WAIT_SECONDS", 0.05)
+    large_artifacts._FLIGHTS.clear()
+    world, attempt, reach, lease, upload_id = _setup(tmp_path)
+    operation = world.row(
+        "SELECT operation_id FROM external_operations WHERE grant_id=?", attempt["grant_id"]
+    )["operation_id"]
+    root = tmp_path / "worker-output"
+    root.mkdir()
+    (root / "data.json").write_bytes(DATA)
+    (output,) = collect_output_set(root, ["data.json"], 100_000, 1 << 20)
+    progress = cer.UploadProgress()
+    t0 = datetime.now(UTC)
+    clock = [0.0]
+    rounds: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+        rounds.append(clock[0])
+        # The runner's tick at this moment: the attempt must still be held for its outputs.
+        assert _assess(world, attempt["id"], progress, at=t0 + timedelta(seconds=clock[0])) is None
+
+    monkeypatch.setattr(artifacts, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(artifacts, "_sleep", sleep)
+    with pytest.raises(artifacts.ArtifactTransferError, match="still verifying"):
+        artifacts.upload_large_artifact(
+            SimpleNamespace(post=reach),  # the worker's own route, not the cut report channel
+            lease_id=lease["id"],
+            expected_epoch=lease["epoch"],
+            output=output,
+            operation_id=operation,
+        )
+    release.set()
+    assert len(rounds) > 10  # the loop really polled, round after round
+    assert clock[0] <= artifacts.COMPLETE_MAX_WAIT_SECONDS < cer.UPLOAD_STALL_SECONDS
+    # Only well after the worker stopped polling does the stall window end the hold.
+    stalled = _assess(
+        world, attempt["id"], progress, at=t0 + timedelta(seconds=cer.UPLOAD_STALL_SECONDS + 10)
+    )
+    assert stalled is not None and stalled.evidence["hold_ended_by"] == "stall"
+    large_artifacts._FLIGHTS.clear()
+
+
+def test_a_call_that_sends_no_chunk_measures_its_poll_from_its_own_start(tmp_path, monkeypatch):
+    """Every chunk is already held (an earlier poll gave up), so this call sends none: its bound
+    runs from its own start, the documented limit of what the call can know."""
+    from test_large_output_worker import EPOCH, LEASE, FakeControl, _collect, _workspace
+
+    from tessera_worker import artifacts
+
+    class AllHeld(FakeControl):
+        def _large(self, route, body):
+            if len(route) == 2 and route[1] == "complete":
+                return {"id": route[0], "status": "verifying", "retry_after_seconds": 5}
+            reply = super()._large(route, body)
+            if not route:  # begin: control already holds every chunk of this upload
+                upload = next(iter(self.uploads.values()))
+                for index in range(-(-upload["size"] // upload["chunk_bytes"])):
+                    upload["chunks"].setdefault(index, b"")
+                return self._large_view(upload)
+            return reply
+
+    now = [1000.0]
+    monkeypatch.setattr(artifacts, "_monotonic", lambda: now[0])
+    monkeypatch.setattr(artifacts, "_sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(artifacts, "COMPLETE_MAX_WAIT_SECONDS", 60.0)
+    root = _workspace(tmp_path, {"model.bin": bytes(range(256)) * 20 + b"tail-bytes"})
+    (output,) = _collect(root, ["model.bin"])
+    control = AllHeld()
+    with pytest.raises(artifacts.ArtifactTransferError, match="still verifying"):
+        artifacts.upload_large_artifact(
+            control, lease_id=LEASE, expected_epoch=EPOCH, output=output
+        )
+    assert not control.chunk_sizes  # no chunk was sent by this call
+    assert 1000.0 < now[0] <= 1000.0 + 60.0  # bounded from the call's own start, not from zero

@@ -40,6 +40,8 @@ CAMPAIGN_TOOL_SCOPES = {
     # ADR 0055: steering. Validation is a dry-run submit; the others only reduce authority.
     "tessera_validate_campaign_spec": "campaign:submit",
     "tessera_prepare_stage_retry": "campaign:read",
+    # ADR 0069: a server-side re-run is an ordinary submission (a person approves its digest).
+    "tessera_rerun_campaign": "campaign:submit",
     "tessera_campaign_grants": "campaign:logs",
     "tessera_reduce_campaign_budget": "campaign:cancel",
     "tessera_revoke_campaign_release": "campaign:cancel",
@@ -50,10 +52,15 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_cancel_campaign_stage": "campaign:cancel",
     # ADR 0060: filters a stage's approved provider candidates; never adds one.
     "tessera_steer_campaign_placement": "campaign:cancel",
+    # Project limits and spend: the ceiling a budget or concurrency reduction works within.
+    "tessera_project_spend": "budget:read",
 }
 # Further scopes a tool needs besides its own: it is registered only when all are enrolled, so a
 # tool never appears in the list only to fail at runtime.
-ALSO_REQUIRES = {"tessera_prepare_stage_retry": frozenset({"artifact:read"})}
+ALSO_REQUIRES = {
+    "tessera_prepare_stage_retry": frozenset({"artifact:read"}),
+    "tessera_rerun_campaign": frozenset({"campaign:read", "artifact:read"}),
+}
 
 
 def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
@@ -125,26 +132,38 @@ def register_campaign_tools(
     )
 
     async def tessera_submit_campaign(
-        spec: AnyCampaignSpec, idempotency_key: str
+        spec: AnyCampaignSpec,
+        idempotency_key: str,
+        predecessors: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Submit a v1 or v2 campaign spec for human approval. Submission grants nothing.
 
         v2 specs add providers, artifact inputs (kind=artifact) pinning another campaign's
         output, chaining and typed outputs; the control plane validates them with the same
-        parser. Find snapshot ids with tessera_list_snapshots. A human must separately
-        approve the exact spec digest before anything runs; the platform runner
+        parser. A v2 stage input may instead be kind=receipt_output (name, stage, output and
+        exactly one of campaign_id or predecessor): submit resolves it to a pinned artifact
+        input read from that campaign's receipt. Never send resolved_from: it is set by
+        submit only and a submitted one is refused. predecessor names a campaign given in
+        ``predecessors`` ({name: campaign_id}); the referenced campaign must already have
+        succeeded (read its receipt with tessera_get_campaign_receipt), otherwise submit is
+        refused with a conflict. Find snapshot ids with tessera_list_snapshots. A human must
+        separately approve the exact spec digest before anything runs; the platform runner
         then executes stages within the approved budget cap. Persist
         idempotency_key and reuse identical arguments on reconnect; a changed spec needs a
         new key. Never claim a campaign ran or succeeded without reading its receipt with
         tessera_get_campaign_receipt.
         """
-        return await client.submit_campaign(spec.model_dump(mode="json"), idempotency_key)
+        return await client.submit_campaign(
+            spec.model_dump(mode="json"), idempotency_key, predecessors
+        )
 
     async def tessera_get_campaign(campaign_id: str) -> dict[str, Any]:
         """Read any campaign in this project: status, stages, attempts, intents and placement.
 
         Reads are project-wide (campaign:read), not limited to your own submissions; only
-        cancel is submitter-only. The receipt is a separate record: use
+        cancel is submitter-only. A campaign in a re-run tree also shows rerun_tree: the first
+        cap, what the tree has committed (settled spend plus the caps of unfinished
+        campaigns) and what is left for another re-run. The receipt is a separate record: use
         tessera_get_campaign_receipt once the campaign is terminal. Status is recorded
         platform state, not evidence of a scientific result. ``placement`` lists, for each
         stage with alternate_providers, the candidate each attempt was placed on, why every
@@ -200,6 +219,13 @@ def register_campaign_tools(
         """Read a campaign's budget cap, holds and settled cents (budget:read)."""
         return await client.campaign_view(campaign_id, "budget")
 
+    async def tessera_project_spend() -> dict[str, Any]:
+        """Read the operator's project limits (money, concurrency) and what this project's
+        campaigns hold and have settled (budget:read, read-only). Use it before reducing a
+        campaign's budget or concurrency; no tool raises a limit.
+        """
+        return await client.project_spend()
+
     async def tessera_campaign_standing_status() -> dict[str, Any]:
         """Read why scheduled or follow-on campaigns did or did not start (campaign:read).
 
@@ -245,15 +271,42 @@ def register_campaign_tools(
         """
         return await client.cancel_campaign(campaign_id, expected_revision, reason, idempotency_key)
 
-    async def tessera_validate_campaign_spec(spec: AnyCampaignSpec) -> dict[str, Any]:
+    async def tessera_rerun_campaign(
+        campaign_id: str,
+        idempotency_key: str,
+        mode: str = "failed_stages",
+        stage_keys: list[str] | None = None,
+        budget_cap_cents: int | None = None,
+    ) -> dict[str, Any]:
+        """Re-run a failed, stopped or cancelled campaign as a NEW campaign (ADR 0069).
+
+        mode "failed_stages" (default) re-runs the stages that did not succeed, and anything that
+        consumed them, and reuses the succeeded stages' outputs by digest (custody-released
+        outputs only; a v2 spec); mode "identical" resubmits the same spec. It is an ordinary
+        submission: it grants nothing, may not ask for more than the original cap, and a person
+        approves the new digest before anything runs. The new campaign's receipt names the one
+        it re-runs and what it reused. Use a fresh idempotency_key for each campaign you re-run;
+        a key already used for a different request is refused (409).
+        """
+        return await client.rerun_campaign(
+            campaign_id, idempotency_key, mode, stage_keys, budget_cap_cents
+        )
+
+    async def tessera_validate_campaign_spec(
+        spec: AnyCampaignSpec, predecessors: dict[str, str] | None = None
+    ) -> dict[str, Any]:
         """Dry-run a spec against the control plane (campaign:submit): nothing is stored.
 
         Runs the same parse and reference checks as submit (provider registry, grant lifetime,
         trust narrowing, snapshot digests and data classes, pinned artifact inputs) and returns
         the spec digest, stage order, providers and data classes, or the refusal. A pass is not
-        approval: a human still approves the digest of what you submit.
+        approval: a human still approves the digest of what you submit. A kind=receipt_output
+        input is resolved read-only, as submit would (from a succeeded predecessor's receipt;
+        name chained campaigns in ``predecessors`` as for submit), and the returned digest is
+        the pinned spec's. An unresolvable reference is refused with its reason. A submitted
+        resolved_from is refused: only submit sets it.
         """
-        return await client.validate_campaign_spec(spec.model_dump(mode="json"))
+        return await client.validate_campaign_spec(spec.model_dump(mode="json"), predecessors)
 
     async def tessera_prepare_stage_retry(
         campaign_id: str,
@@ -397,6 +450,7 @@ def register_campaign_tools(
     )
     mutating = {
         "tessera_submit_campaign",
+        "tessera_rerun_campaign",
         "tessera_cancel_campaign",
         "tessera_reduce_campaign_budget",
         "tessera_pause_campaign",
@@ -422,6 +476,7 @@ def register_campaign_tools(
         tessera_cancel_campaign,
         tessera_validate_campaign_spec,
         tessera_prepare_stage_retry,
+        tessera_rerun_campaign,
         tessera_campaign_grants,
         tessera_reduce_campaign_budget,
         tessera_revoke_campaign_release,
@@ -430,6 +485,7 @@ def register_campaign_tools(
         tessera_limit_campaign_concurrency,
         tessera_cancel_campaign_stage,
         tessera_steer_campaign_placement,
+        tessera_project_spend,
     ):
         if wanted(function.__name__):
             if function.__name__ == "tessera_revoke_campaign_release":

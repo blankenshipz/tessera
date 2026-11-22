@@ -395,3 +395,28 @@ offline-tested against fake custody and the real guardian handler only.
 Reviewed redirects are offline-tested against a fake single-hop transport
 (`tests/test_gpu_runtime_redirects.py`) and need a rebuilt image.
 No live cold-start has been run.
+
+## CPU runtime variant and baked wheels
+
+`Dockerfile.cpu` (ADR 0076) builds this runtime on a non-CUDA base for a Salad CPU profile. The base
+is an owner-supplied `name@sha256:` image that already has python3 (3.10 or newer) and pip; there is
+no default, and no package manager is run. The runtime, `stage_argv.py` and the fixed entrypoint
+are the same as the GPU image's, and the local worker overrides the entrypoint, so one image runs
+on both.
+
+Dependencies for a stage with private inputs (which may not declare fetches) are baked in: pass
+`--build-arg WHEELS_LOCK=requirements.lock`, a complete lock (every transitive dependency, as
+`pip install --no-deps` is used) in which every requirement carries `--hash=sha256:...`; pip runs
+with `--require-hashes --only-binary=:all:`. Network access is at image build time only, to the
+index you choose. The pushed image's digest, listed in the profile's `allowed_image_digests`, is
+what pins the wheels, so record it with the base digest, the lock file's sha256 and this recipe's
+commit. Wheels supplied as hash-verified items of the input snapshot are not implemented.
+
+### Image entry
+
+A manifest may hold one item `{"kind":"entry","source":"image","path":"stage_argv.py","argv":[...]}`
+as its only item. It is resolved inside the image (`/tessera/lib/entries/`), is not a fetch, and
+needs no declared input. The runtime runs `python -B stage_argv.py WORK OUT -- ARGV...`; the launcher
+rewrites arguments at `/inputs` and `/outputs` to `WORK/input` and `OUT`, runs the argv in `WORK`
+with no stdin, and exits with its code. An image older than this change refuses the item (exact key
+set). The stage adapter builds such a manifest; a hand-written contract may too.

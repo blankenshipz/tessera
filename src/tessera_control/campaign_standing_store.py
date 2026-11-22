@@ -12,7 +12,9 @@ from pydantic import ValidationError
 
 from . import provider_trust
 from .approval_trust import decision_provenance, require_decision_actor
+from .campaign_io import refuse_submitted_lineage
 from .campaign_models import normalize, spec_digest
+from .campaign_salad_adapter import expand_with_registered
 from .campaign_standing import (
     MAX_WINDOW_DAYS,
     CreateStandingApproval,
@@ -75,12 +77,29 @@ class StandingApprovalCommands:
             body = CreateStandingApproval.model_validate(payload)
         except ValidationError as error:
             raise _invalid(error) from None
-        spec = body.spec
+        raw_spec = payload.get("spec") if isinstance(payload, dict) else None
 
         def command(connection, live):
             self._project(connection, live, project_id)
             self._require_human(connection, live)
             require_decision_actor(live, forbidden=Forbidden)
+            refuse_submitted_lineage(raw_spec)
+            # ADR 0077: the same expansion submit performs, so an adapter request is never
+            # checked raw; the expected digest is the digest of the expanded spec.
+            spec = expand_with_registered(
+                body.spec,
+                self.adapter_entries(connection, live, project_id),
+                (live["org_id"], project_id),
+            )
+            if any(
+                getattr(source, "kind", None) == "receipt_output"
+                for stage in spec.stages
+                for source in getattr(stage, "inputs", [])
+            ):
+                raise Conflict(
+                    "A standing approval cannot use receipt_output inputs: pin the value with "
+                    "an artifact input (campaign_id, stage, output, sha256) instead."
+                )
             if spec_digest(spec) != body.expected_spec_digest:
                 raise Conflict("Spec digest does not match expected_spec_digest.")
             self._check_references(connection, live, project_id, spec)

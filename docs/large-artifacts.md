@@ -85,8 +85,12 @@ future work.
    worker waits at most 9 minutes of elapsed time, counting the time each ask itself takes, and
    then gives up and retries later; that is below the 10-minute stall window of the exited-attempt
    hold (ADR 0064), so a worker never keeps waiting for a verification the hold has stopped
-   waiting for (a verification slower than that ends as an incomplete transfer, as before). At
-   most four whole-file hashes run at once on control, and a finished answer is kept for an hour.
+   waiting for (a verification slower than that ends as an incomplete transfer, as before). The
+   202 advertises the longest one ask may take (`max_wait_seconds`) and the worker budgets the
+   next ask at that, so the last request never overshoots the bound. At most four whole-file
+   hashes run at once on control; a queued verification whose upload has expired, completed or
+   lost its lease epoch is skipped instead of hashed, and a finished answer is kept for an hour,
+   dropped on its own timer, and dropped at once if the commit is refused.
    A worker that does not know "verifying" rejects the 202 body (it carries no lease or epoch),
    fails that attempt, and its next ask gets the 201 without another hash.
 3. **Quarantine.** The result is the ordinary quarantined, unclassified `artifacts` row

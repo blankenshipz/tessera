@@ -103,6 +103,8 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_resume_campaign",
         "tessera_limit_campaign_concurrency",
         "tessera_cancel_campaign_stage",
+        # ADR 0069: re-run a finished campaign as a new submission (a person approves it).
+        "tessera_rerun_campaign",
         # ADR 0060: filters a stage's approved provider candidates.
         "tessera_steer_campaign_placement",
     }

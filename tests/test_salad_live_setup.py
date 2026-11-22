@@ -101,14 +101,13 @@ def test_setup_creates_approved_route_and_private_config(inputs, capsys, monkeyp
     output = inputs["output"]
     assert stat.S_IMODE(output.stat().st_mode) == 0o700
     worker_token = (output / "worker-token").read_text()
-    cancel_token = (output / "cancel-token").read_text()
     owner = (inputs["state"] / "owner.header").read_text().strip().rsplit(" ", 1)[1]
-    assert len({worker_token, cancel_token, owner}) == 3
-    for secret in (worker_token, cancel_token, owner, "synthetic-admin-token"):
+    assert len({worker_token, owner}) == 2
+    for secret in (worker_token, owner, "synthetic-admin-token"):
         assert secret not in stdout
         for path in (output / "journal").iterdir():
             assert secret not in path.read_text()
-    for name in ("worker-token", "cancel-token", "salad-live-config.json", "setup-summary.json"):
+    for name in ("worker-token", "salad-live-config.json", "setup-summary.json"):
         assert stat.S_IMODE((output / name).stat().st_mode) == 0o600
     assert summary["status"] == "route_approved_not_dispatched"
     review = {item["field"] for item in summary["review_required"]}
@@ -145,7 +144,8 @@ def test_setup_creates_approved_route_and_private_config(inputs, capsys, monkeyp
 
     store = Store(inputs["state"])
     assert store.authenticate_worker(worker_token)["kind"] == "worker"
-    assert store.authenticate(cancel_token)["role"] == "human"
+    assert not (output / "cancel-token").exists()
+    assert "cancel_credential_file" not in config
     with _connect(inputs["state"] / "tessera.sqlite3") as db:
         budget = dict(
             db.execute(

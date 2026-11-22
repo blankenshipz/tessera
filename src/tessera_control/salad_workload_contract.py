@@ -299,6 +299,12 @@ def parse_gpu_runtime_manifest(raw, digest):
 # rules (check_gpu_runtime_manifest_rules) run where a NEW route is staged, proposed,
 # approved or admitted (setup, check_staged_input, check_workload_admission).
 INPUT_SOURCE = "input"
+# ADR 0076: an entry shipped in the (operator-pinned) image, not fetched and not in the input.
+IMAGE_SOURCE = "image"
+IMAGE_ENTRIES = ("stage_argv.py",)
+IMAGE_ITEM_KEYS = frozenset({"kind", "source", "path", "argv"})
+MAX_IMAGE_ARGV = 128
+MAX_IMAGE_ARGV_TOKEN = 4000
 INPUT_ITEM_KEYS = frozenset({"kind", "source", "path"})
 INPUT_ITEM_KINDS = ("entry", "file")
 URL_ITEM_KEYS = frozenset({"url", "sha256", "max_bytes", "kind", "dest"})
@@ -309,6 +315,32 @@ _INPUT_ITEM_PATH = re.compile(rf"^{_SEGMENT}(?:/{_SEGMENT}){{0,7}}$")
 def is_input_item(item):
     """A manifest item served from the staged input: ``source == "input"`` and no url."""
     return isinstance(item, dict) and item.get("source") == INPUT_SOURCE and "url" not in item
+
+
+def is_image_item(item):
+    """A manifest item resolved inside the image: ``source == "image"`` and no url (ADR 0076)."""
+    return isinstance(item, dict) and item.get("source") == IMAGE_SOURCE and "url" not in item
+
+
+def image_item_refusal(row):
+    """Reason an image item is malformed, else None: exactly {kind, source, path, argv}."""
+    argv = row.get("argv")
+    if (
+        set(row) != IMAGE_ITEM_KEYS
+        or row.get("kind") != "entry"
+        or row.get("path") not in IMAGE_ENTRIES
+        or not isinstance(argv, list)
+        or not 1 <= len(argv) <= MAX_IMAGE_ARGV
+        or not all(
+            isinstance(t, str) and 1 <= len(t) <= MAX_IMAGE_ARGV_TOKEN and "\x00" not in t
+            for t in argv
+        )
+    ):
+        return (
+            "gpu_runtime_v1 image item must be exactly {kind: entry, source: image, path, argv} "
+            f"with a shipped path ({', '.join(IMAGE_ENTRIES)}) and 1..{MAX_IMAGE_ARGV} argv strings"
+        )
+    return None
 
 
 def check_gpu_runtime_manifest_rules(manifest, input_declared, redirect_hosts=()):
@@ -332,6 +364,11 @@ def check_gpu_runtime_manifest_rules(manifest, input_declared, redirect_hosts=()
         )
     items = []
     for row in manifest["fetches"]:
+        if is_image_item(row):
+            reason = image_item_refusal(row)
+            if reason:
+                raise ValueError(reason)
+            continue
         if not is_input_item(row):
             if set(row) != URL_ITEM_KEYS or row["kind"] not in URL_ITEM_KINDS:
                 raise ValueError(
@@ -359,6 +396,8 @@ def check_gpu_runtime_manifest_rules(manifest, input_declared, redirect_hosts=()
         raise ValueError("gpu_runtime_v1 input item paths must be unique")
     if sum(1 for r in manifest["fetches"] if r.get("kind") == "entry") != 1:
         raise ValueError("gpu_runtime_v1 manifest needs exactly one entry")
+    if any(is_image_item(r) for r in manifest["fetches"]) and len(manifest["fetches"]) != 1:
+        raise ValueError("gpu_runtime_v1 image entry must be the manifest's only item")
     return items
 
 
@@ -378,7 +417,7 @@ def check_gpu_runtime_manifest(contract, raw, digest):
     # never a TypeError from comparing None with str inside the model validator.
     got = sorted(
         ((r.get("url"), r.get("sha256"), r.get("max_bytes"))
-         for r in manifest["fetches"] if not is_input_item(r)),
+         for r in manifest["fetches"] if not is_input_item(r) and not is_image_item(r)),
         key=repr,
     )  # fmt: skip
     want = sorted(((f.url, f.sha256, f.max_bytes) for f in contract.egress.fetches), key=repr)

@@ -80,11 +80,28 @@ until the receipt arrives, for at most 9 minutes of elapsed time (measured on th
 time each ask takes counts). That bound is deliberately below the 10-minute stall window of
 ADR 0064's exited-attempt hold, so the worker never polls for a verification the hold has
 stopped waiting for; a verification slower than that ends as an incomplete transfer, retried
-later, as before. Control runs at most four whole-file hashes at once, keeps a finished answer
-an hour (it is guarded by the chunk fingerprint, re-checked in the completing transaction) and
-drops one only if it is still the flight under its key. A worker that predates the 202 rejects
+later, as before. Control runs at most four whole-file hashes at once (a queued one whose upload has expired,
+completed or lost its lease epoch is skipped, not hashed), advertises in the 202 the longest
+one ask may take so the worker budgets its last request, keeps a finished answer an hour (it is
+guarded by the chunk fingerprint, which covers every chunk's size and its control-computed
+sha256, and re-checked in the completing transaction; swept on a timer, and dropped when the
+commit is refused) and drops one only if it is still the flight under its key. A worker that predates the 202 rejects
 its body and fails that attempt; its next ask gets the 201 with no second hash. The
 in-transaction check that the stored chunk set equals the verified one is unchanged.
+
+The worker's clock for that bound starts at the last accepted chunk of the call (the call's start
+when it sends none), so a slow final re-check of a multi-gigabyte file comes out of the budget and
+the poll ends inside ADR 0064's stall window, which runs from the last change in held bytes, as
+far as this call can know: the bound is measured from the last chunk this call sent. A call that
+sends none (every chunk was already held, for example after an earlier poll gave up) measures
+from its own start, while the real last change may be older; the hold's own stall clock starts at
+its first sighting of the bytes, which absorbs most of that, but it is not a proof. A refusal that makes a cached answer wrong (a lease re-fence, a changed chunk set) drops
+only that answer; a transient failure such as a busy database keeps a just-finished verification,
+so the retry does not hash again. One shared sweeper thread (not a timer per verification) drops
+finished answers; a verification abandoned while queued answers its joined callers with a
+distinct 409. **The flight table is per control process**: several control processes would each
+hash once per upload (duplicate work, never a wrong answer, since each commit re-checks the
+chunk fingerprint and lease epoch).
 
 ## Consequences
 

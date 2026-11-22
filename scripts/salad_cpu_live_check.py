@@ -9,7 +9,8 @@ operator's CPU rates (the billing). It is a dry run unless ``--run`` and an exac
     scripts/salad_cpu_live_check.py check  --profiles FILE --profile NAME --contract FILE \\
         --image IMAGE@sha256:DIGEST [--max-cents N]
     scripts/salad_cpu_live_check.py check  ... --run --confirm spend-up-to-Nc \\
-        --credential-file FILE --receipt-directory DIR
+        (--credential-file FILE | --credential-dir DIR --credential-version N \\
+         [--credential-ref credential-ref:salad-management]) --receipt-directory DIR
     scripts/salad_cpu_live_check.py billing --receipt FILE --portal-cents X
 
 Dry run (the default) reads only the operator's own files, derives the exact route, prints the
@@ -24,8 +25,10 @@ the group is always stopped and deleted, even on an error. Billing is **not** ve
 automatically: Salad exposes no billing read this tool relies on, so the receipt records the
 estimate and ``billing`` then compares a figure a person copies from Salad's own usage page.
 
-The management credential is read from an owner-only (0600) absolute file, held in a wiped
-buffer and never printed or written to the receipt. Nothing here is a paid default.
+The management credential is read either from an owner-only (0600) absolute file holding only the
+token, or by reference from the operator's credential directory like the rest of the Salad stack
+(``--credential-dir`` with the reference and exact version the campaign profile names). It is held
+in a wiped buffer and never printed or written to the receipt. Nothing here is a paid default.
 """
 
 from __future__ import annotations
@@ -56,6 +59,11 @@ SETTLE_WAIT_SECONDS = 90
 # is cut at what the ceiling buys minus this, and the estimate counts through the observed stop.
 SETTLE_RESERVE_SECONDS = 30
 POLL_SECONDS = 2.0
+# A fresh group can read pending or with a change in flight for a moment after create. It is read
+# until it reads stopped and settled before start; a stopped group is not billed, so this wait
+# costs nothing and is outside the spend ceiling and the settle reserve.
+SETTLE_BEFORE_START_SECONDS = 60
+DEFAULT_CREDENTIAL_REFERENCE = "credential-ref:salad-management"
 RECEIPT_SCHEMA = "tessera.salad.cpu-live-check.v1"
 # Salad's usage figures are coarse and our local clock brackets the run loosely; a portal figure
 # within the larger of this many cents or this fraction of the estimate agrees with it.
@@ -173,19 +181,76 @@ def _read_credential(path) -> bytearray:
     return bytearray(raw)
 
 
-def run_live(plan: Plan, credential: bytearray, *, factory=None, clock=time.monotonic, sleep=None):
+def _read_reference(directory, reference, version) -> object:
+    """The credential by reference from the operator's credential directory (a SecretBuffer).
+
+    The directory must be an owner-only (0700) directory of 0600 records, as the rest of the
+    Salad stack requires; a missing, revoked, expired or other-version record is refused with no
+    detail about which."""
+    from tessera_control.salad_secret_files import PrivateFileSecretResolver
+
+    try:
+        resolver = PrivateFileSecretResolver(directory)
+    except (OSError, ValueError):
+        raise CheckRefused("the credential directory is not a private (0700) directory") from None
+    try:
+        return resolver.resolve(reference, version)
+    except (OSError, ValueError):
+        raise CheckRefused("the credential reference is unavailable at that version") from None
+    finally:
+        resolver.close()
+
+
+def _diagnostics(observation) -> dict:
+    """The non-secret fields that say why a group is not ready: state, change in flight, counts."""
+    observation = observation or {}
+    observation = observation.get("refusal", observation)  # a refused start nests its reading
+    return {
+        key: observation[key]
+        for key in (
+            "state",
+            "pending_change",
+            "instance_status_counts",
+            "instance_count_keys",
+            "instance_counts_complete",
+        )
+        if key in observation
+    }
+
+
+def _wipe(credential) -> None:
+    """Zero a credential buffer (a bytearray or a SecretBuffer); safe to repeat."""
+    if isinstance(credential, bytearray):
+        for index in range(len(credential)):
+            credential[index] = 0
+    elif credential is not None and hasattr(credential, "zeroize"):
+        credential.zeroize()
+
+
+def run_live(plan: Plan, credential, *, factory=None, clock=time.monotonic, sleep=None):
     """Drive the bounded journey through the vetted transport; always stop and delete.
 
     ``factory`` is the transport's connection factory (a fake in tests); ``sleep`` defaults to
-    the real one. Returns the receipt (no secret in it).
+    the real one. Returns the receipt (no secret in it). The credential is wiped on every path,
+    including one that fails before the journey starts.
     """
-    from tessera_control.salad_http import SaladHTTPTransport
+    try:
+        return _run_live(plan, credential, factory=factory, clock=clock, sleep=sleep)
+    finally:
+        _wipe(credential)
+
+
+def _run_live(plan: Plan, credential, *, factory=None, clock=time.monotonic, sleep=None):
+    from tessera_control.salad_http import SaladHTTPTransport, group_settled
     from tessera_control.salad_secrets import SecretBuffer
 
     sleep = sleep or time.sleep
     selection = plan.selection
-    secret = SecretBuffer(credential)
-    options = {} if factory is None else {"connection_factory": factory}
+    secret = credential if isinstance(credential, SecretBuffer) else SecretBuffer(credential)
+    # The transport's own settle waits use the same clock and sleep as this run.
+    options = {"sleep": sleep, "clock": clock}
+    if factory is not None:
+        options["connection_factory"] = factory
     receipt = dict(
         schema=RECEIPT_SCHEMA,
         operation=plan.operation_id,
@@ -197,7 +262,10 @@ def run_live(plan: Plan, credential: bytearray, *, factory=None, clock=time.mono
     steps = receipt["steps"]
 
     def step(name, result):
-        steps.append(dict(step=name, status=result.status, reason=result.reason))
+        entry = dict(step=name, status=result.status, reason=result.reason)
+        if result.status != "observed" and result.observation:
+            entry["observation"] = _diagnostics(result.observation)  # why, without a body
+        steps.append(entry)
         return result
 
     provider_id = None
@@ -228,16 +296,40 @@ def run_live(plan: Plan, credential: bytearray, *, factory=None, clock=time.mono
                 )
             provider_id = created.observation.get("provider_id")
             # The shape check: Salad's own answer must still describe a group with no GPU class.
-            read = step("read_group", transport.send("read_group", selection, provider_id, secret))
+            # Read it until it settles (stopped, no change in flight, no instance): a fresh group
+            # answers pending for a moment, and start is admitted only on a settled read.
+            settle_until = clock() + SETTLE_BEFORE_START_SECONDS
+            polls = 0
+            while True:
+                read = transport.send("read_group", selection, provider_id, secret)
+                polls += 1
+                observed_group = read.observation or {}
+                counts = observed_group.get("instance_status_counts") or {}
+                if (
+                    read.status != "observed"
+                    or group_settled(observed_group)
+                    # A live instance will not settle by waiting: stop and let start refuse it.
+                    or any(v for k, v in counts.items() if k != "stopping_count")
+                    or clock() >= settle_until
+                ):
+                    break
+                sleep(POLL_SECONDS)
+            step("read_group", read)
             receipt["shape_ok"] = read.status == "observed"
+            receipt["settle"] = dict(
+                polls=polls, settled=group_settled(observed_group), **_diagnostics(observed_group)
+            )
             if not receipt["shape_ok"]:
                 raise CheckRefused(f"the created group does not match the CPU shape: {read.reason}")
-            if step(
-                "start", transport.send("start", selection, provider_id, secret)
-            ).status not in {
-                "observed",
-                "pending",
-            }:
+            if not receipt["settle"]["settled"]:
+                raise CheckRefused(
+                    "the created group did not settle (stopped, no change in flight, no "
+                    "instance) within the wait; nothing was started"
+                )
+            started_step = step("start", transport.send("start", selection, provider_id, secret))
+            # Whether the group reported all four instance counts (a CPU group may omit them).
+            steps[-1]["instance_counts_complete"] = observed_group.get("instance_counts_complete")
+            if started_step.status not in {"observed", "pending"}:
                 raise CheckRefused("Salad did not accept the start; nothing ran")
             begun = clock()
             started_at = begun
@@ -368,10 +460,25 @@ def _check(args) -> int:
         return 0
     if args.confirm != plan.confirm:
         raise CheckRefused(f"--confirm must be exactly {plan.confirm!r} to spend up to the ceiling")
-    if not args.credential_file or not args.receipt_directory:
-        raise CheckRefused("--credential-file and --receipt-directory are required with --run")
-    credential = _read_credential(args.credential_file)
-    receipt = run_live(plan, credential)
+    if bool(args.credential_file) == bool(args.credential_dir) or not args.receipt_directory:
+        raise CheckRefused(
+            "exactly one of --credential-file or --credential-dir, and --receipt-directory, "
+            "are required with --run"
+        )
+    if args.credential_dir and args.credential_version is None:
+        raise CheckRefused("--credential-version is required with --credential-dir")
+    credential = None
+    try:
+        # Anything added between reading the credential and the run is covered by the wipe.
+        if args.credential_dir:
+            credential = _read_reference(
+                args.credential_dir, args.credential_ref, args.credential_version
+            )
+        else:
+            credential = _read_credential(args.credential_file)
+        receipt = run_live(plan, credential)
+    finally:
+        _wipe(credential)
     path = _write_receipt(args.receipt_directory, receipt)
     print(json.dumps(receipt, indent=2, sort_keys=True))
     print(f"receipt: {path}", file=sys.stderr)
@@ -405,6 +512,14 @@ def main(argv=None) -> int:
     check.add_argument("--run", action="store_true", help="spend, up to the ceiling")
     check.add_argument("--confirm", default=None)
     check.add_argument("--credential-file", type=Path, default=None)
+    check.add_argument(
+        "--credential-dir",
+        type=Path,
+        default=None,
+        help="the operator's credential directory (read the credential by reference)",
+    )
+    check.add_argument("--credential-ref", default=DEFAULT_CREDENTIAL_REFERENCE)
+    check.add_argument("--credential-version", type=int, default=None)
     check.add_argument("--receipt-directory", type=Path, default=None)
     billing = actions.add_parser("billing", help="compare a Salad usage figure with a receipt")
     billing.add_argument("--receipt", type=Path, required=True)

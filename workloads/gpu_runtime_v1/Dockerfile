@@ -20,11 +20,12 @@ RUN printf '%s' "$GPU_RUNTIME_BASE" | grep -Eq '^[a-z0-9][a-z0-9./_-]*@sha256:[a
  && apt-get -o Acquire::Check-Valid-Until=false update \
  && apt-get install -y --no-install-recommends ca-certificates python3 python3-pip \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /root/.cache \
- && mkdir -p /tessera/bin /tessera/lib /tessera/work \
+ && mkdir -p /tessera/bin /tessera/lib/entries /tessera/work \
  && chown 65532:65532 /tessera/work
 COPY run /tessera/bin/run
 COPY runtime.py /tessera/lib/runtime.py
-RUN chmod 0555 /tessera/bin/run /tessera/lib/runtime.py
+COPY stage_argv.py /tessera/lib/entries/stage_argv.py
+RUN chmod 0555 /tessera/bin/run /tessera/lib/runtime.py /tessera/lib/entries/stage_argv.py
 ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 USER 65532:65532
 ENTRYPOINT ["/tessera/bin/run"]
