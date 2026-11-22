@@ -8,7 +8,8 @@ from typing import Any
 
 from .campaign_gates import unlock_receipt_section
 from .campaign_io import stage_io
-from .campaign_models import normalize, parse_spec_json, stage_provider
+from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
+from .campaign_placement import placements as recorded_placements
 from .code_approval import input_classes
 from .store import canonical_digest
 
@@ -120,6 +121,14 @@ def _scratch(connection: sqlite3.Connection, attempt: sqlite3.Row, spec_stage: A
     return {"requested_bytes": requested, "granted_bytes": granted}
 
 
+def _placed_runtime(spec_stage: Any, provider_id: str | None) -> str:
+    """The runtime of the candidate the stage was last placed on (ADR 0060)."""
+    try:
+        return stage_on_candidate(spec_stage, provider_id or spec_stage.provider).runtime
+    except KeyError:
+        return spec_stage.runtime
+
+
 def _attempt_entry(
     connection: sqlite3.Connection,
     attempt: sqlite3.Row,
@@ -128,9 +137,16 @@ def _attempt_entry(
     code: dict[str, Any],
     io_rows: list[dict[str, Any]],
     grants: dict[str, str],
+    placed: dict[tuple[str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     kind, digest = _evidence(attempt)
     provider_id = attempt["provider_id"] or stage["provider_id"] or spec_stage.provider
+    if spec_stage.alternates:
+        # ADR 0060: the attempt ran on one of the stage's approved candidates.
+        try:
+            spec_stage = stage_on_candidate(spec_stage, provider_id)
+        except KeyError:
+            pass
     entry = {
         "attempt": attempt["attempt"],
         "status": attempt["status"],
@@ -161,6 +177,22 @@ def _attempt_entry(
     egress = _egress_entry(connection, attempt, spec_stage)
     if egress is not None:
         entry["egress"] = egress
+    decision = (placed or {}).get((attempt["stage_key"], attempt["attempt"]))
+    if decision is not None:
+        # ADR 0060: the candidate chosen and why each other one was skipped.
+        entry["placement"] = {
+            key: decision.get(key)
+            for key in (
+                "candidates",
+                "provider_id",
+                "hold_cents",
+                "skipped",
+                "not_evaluated",
+                "steering",
+                "budget_refusal",
+                "recorded_at",
+            )
+        }
     try:
         extra = stage_provider(provider_id).receipt_fields(connection, dict(attempt))
     except KeyError:
@@ -168,6 +200,10 @@ def _attempt_entry(
     scratch = _scratch(connection, attempt, spec_stage)
     if scratch is not None:
         entry["scratch"] = scratch
+    if str(attempt["failure_class"] or "").startswith("infra_"):
+        # ADR 0058: the attempt ended for an infrastructure reason and was retried (or, when
+        # the bound was spent, the stage failed); the reason is the recorded detail.
+        entry["infrastructure_retry"] = {"reason": attempt["failure_detail"]}
     if attempt["failure_class"] == "not_started":
         # ADR 0046: recorded as no evidence; it is never a pass or a fail.
         entry["not_started"] = {"reason": attempt["failure_detail"], "is_evidence": False}
@@ -187,6 +223,29 @@ def _attempt_entry(
             "is_evidence": False,
         }
     return {**entry, **extra}
+
+
+def steering_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> dict[str, Any]:
+    """Pause, concurrency limit and stage cancels (ADR 0061); empty for an unsteered campaign,
+    so existing receipts keep their shape and digest."""
+    row = connection.execute(
+        "SELECT * FROM campaign_steering WHERE campaign_id=?", (campaign_id,)
+    ).fetchone()
+    cancels = connection.execute(
+        """SELECT stage_key, reason, requested_at, completed_at FROM campaign_stage_cancels
+        WHERE campaign_id=? ORDER BY requested_at, stage_key""",
+        (campaign_id,),
+    ).fetchall()
+    if row is None and not cancels:
+        return {}
+    return {
+        "steering": {
+            "paused_at_finish": bool(row and row["paused"]),
+            "pause_count": 0 if row is None else row["pause_count"],
+            "max_concurrent_stages": None if row is None else row["max_concurrent_stages"],
+            "stage_cancels": [dict(item) for item in cancels],
+        }
+    }
 
 
 def build_receipt(
@@ -210,6 +269,10 @@ def build_receipt(
     ).fetchall()
     normal = normalize(parse_spec_json(current["spec_json"]))
     io_rows = stage_io(connection, campaign_id)
+    placed = {
+        (item["stage_key"], item["attempt"]): item
+        for item in recorded_placements(connection, current)
+    }
     grants = {
         row["id"]: row["worker_principal_id"]
         for row in connection.execute(
@@ -235,7 +298,7 @@ def build_receipt(
             {
                 "stage_key": stage["stage_key"],
                 "provider_id": stage["provider_id"] or spec_stage.provider,
-                "runtime": spec_stage.runtime,
+                "runtime": _placed_runtime(spec_stage, stage["provider_id"]),
                 "status": stage["status"],
                 "task_id": stage["task_id"],
                 "experiment_id": stage["experiment_id"],
@@ -247,7 +310,9 @@ def build_receipt(
                 },
                 "output_data_class": stage["output_data_class"],
                 "attempts": [
-                    _attempt_entry(connection, attempt, stage, spec_stage, code, io_rows, grants)
+                    _attempt_entry(
+                        connection, attempt, stage, spec_stage, code, io_rows, grants, placed
+                    )
                     for attempt in attempts
                     if attempt["stage_key"] == stage["stage_key"]
                 ],
@@ -293,6 +358,7 @@ def build_receipt(
             "stages": stage_rows,
             "lineage": _lineage(connection, campaign_id),
             **({"unlock": unlock} if unlock["requirements"] else {}),
+            **steering_receipt_section(connection, campaign_id),
             "verdict": {"operational": operational, "scientific_verdict": scientific},
             "evidence_class": "operational",
             # Reviews resolved by delegation, citing the approval (ADR 0044); absent when

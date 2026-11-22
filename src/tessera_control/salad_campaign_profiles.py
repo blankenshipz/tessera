@@ -13,12 +13,13 @@ agent-chosen image on third-party compute.
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from .remote_execution_models import ExecutionSelection, TargetPolicy, route_window_limit
+from .remote_execution_models import CpuRate, ExecutionSelection, TargetPolicy, route_window_limit
 from .salad_proxy_contract import ManagementCredential, ProxyPolicy
 from .salad_workload_contract import WorkloadContractV1
 from .store import canonical_digest
@@ -56,7 +57,11 @@ class SaladCampaignProfile(_Closed):
     salad_organization: _SaladName
     salad_project: _SaladName
     country: Annotated[str, StringConstraints(pattern=r"^[A-Z]{2}$")]
-    gpu_class: Annotated[str, StringConstraints(pattern=_GPU_CLASS)]
+    # A GPU profile names its GPU class. A CPU-only profile omits it and instead carries the
+    # operator's CPU rates (``cpu_rate``): no GPU is requested, and cost is estimated from the
+    # rates, exactly one of the two (ADR 0062).
+    gpu_class: Annotated[str, StringConstraints(pattern=_GPU_CLASS)] | None = None
+    cpu_rate: CpuRate | None = None
     cpu_millicores: int = Field(ge=1000, le=64000)
     memory_mb: int = Field(ge=1024, le=262144)
     disk_mb: int = Field(ge=1024, le=1048576)
@@ -94,7 +99,25 @@ class SaladCampaignProfile(_Closed):
             raise ValueError("custody_host must be an exact *.ts.net hostname")
         if self.max_task_cents < self.max_run_cents:
             raise ValueError("max_task_cents must be at least max_run_cents")
+        if (self.gpu_class is None) == (self.cpu_rate is None):
+            raise ValueError("a profile names a gpu_class (GPU) or cpu_rate (CPU-only), not both")
         return self
+
+    @property
+    def gpu(self) -> bool:
+        """Whether this profile places a stage on a GPU (False: a CPU-only profile)."""
+        return self.gpu_class is not None
+
+    def estimated_cents(self, seconds: int) -> Decimal:
+        """Operator-rate cost estimate of running this CPU profile for ``seconds`` (cents).
+
+        Only a CPU profile has static rates; a GPU profile's rate is read from the provider
+        at admission, so this refuses rather than guess one.
+        """
+        if self.cpu_rate is None:
+            raise ValueError("only a CPU profile has a static rate")
+        hourly = self.cpu_rate.hourly_usd(self.cpu_millicores, self.memory_mb)
+        return hourly * Decimal(seconds) * 100 / 3600
 
     def image_allowed(self, image: str) -> bool:
         return _image_digest(image) in self.allowed_image_digests
@@ -197,6 +220,7 @@ def execution_profile(
         watchdog_profile=profile.watchdog_profile,
         max_cost_cents=max_cost_cents,
         credit_exposure="unknown_blocks_new_work_credit_not_hard_cap",
+        **({} if profile.gpu else {"cpu_rate": profile.cpu_rate.model_dump(mode="json")}),
     )
 
 
@@ -212,6 +236,9 @@ def derived_digests(
                 gpu_class=profile.gpu_class,
                 country=profile.country,
                 image=image,
+                # A CPU-only target is a different target from any GPU one; absent for GPU so
+                # every existing GPU target digest is unchanged.
+                **({} if profile.gpu else {"cpu_rate": profile.cpu_rate.model_dump(mode="json")}),
             )
         ),
         # The reviewed contract is the code identity of a generic workload route.
@@ -254,7 +281,7 @@ def derive_selection(
                 cpu_millicores=profile.cpu_millicores,
                 memory_mb=profile.memory_mb,
                 gpu_class=profile.gpu_class,
-                gpu_count=1,
+                gpu_count=1 if profile.gpu else 0,
                 disk_mb=profile.disk_mb,
                 max_seconds=min(
                     profile.route_max_seconds,

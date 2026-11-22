@@ -456,6 +456,8 @@ def report_observation(
     if payload.get("launch_error") is None:
         # Absent stays absent so an older client's replayed request keeps its digest.
         payload.pop("launch_error", None)
+    if payload.get("exit_code") is None:
+        payload.pop("exit_code", None)
     return result(
         store.report_execution_observation(
             worker, body.lease_id, key, canonical_digest(payload), payload

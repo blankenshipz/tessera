@@ -8,8 +8,6 @@ import json
 import httpx
 import pytest
 
-pytest.importorskip("mcp")
-
 from tessera_mcp.client import ControlClient  # noqa: E402
 from tessera_mcp.config import Config  # noqa: E402
 from tessera_mcp.server import CAMPAIGN_TOOL_SCOPES, create_server  # noqa: E402
@@ -22,6 +20,10 @@ STEERING = {
     "tessera_campaign_grants",
     "tessera_reduce_campaign_budget",
     "tessera_revoke_campaign_release",
+    "tessera_pause_campaign",
+    "tessera_resume_campaign",
+    "tessera_limit_campaign_concurrency",
+    "tessera_cancel_campaign_stage",
 }
 
 
@@ -206,6 +208,10 @@ def test_steering_tools_exist_only_with_their_scopes_and_no_approval_or_raise_to
         "tessera_validate_campaign_spec",
         "tessera_reduce_campaign_budget",
         "tessera_revoke_campaign_release",
+        "tessera_pause_campaign",
+        "tessera_resume_campaign",
+        "tessera_limit_campaign_concurrency",
+        "tessera_cancel_campaign_stage",
     }
     assert {CAMPAIGN_TOOL_SCOPES[n] for n in STEERING} <= {
         "campaign:submit",
@@ -292,3 +298,33 @@ def test_prepare_stage_retry_reads_only_and_returns_the_spec_without_submitting(
     with pytest.raises(Exception, match="nothing to retry"):
         campaign["stages"] = [{"stage_key": k, "status": "succeeded"} for k in "abc"]
         _call(server, "tessera_prepare_stage_retry", {"campaign_id": "campaign_1"})
+
+
+def test_pause_limit_and_stage_cancel_hit_the_expected_control_paths(tmp_path):
+    seen: list = []
+    server = _server(tmp_path, seen, {"ok": True})
+    base = {"campaign_id": "campaign_1", "expected_revision": 4, "reason": "r"}
+    _call(server, "tessera_pause_campaign", {**base, "idempotency_key": "k-p"})
+    _call(server, "tessera_resume_campaign", {**base, "idempotency_key": "k-r"})
+    _call(
+        server,
+        "tessera_limit_campaign_concurrency",
+        {**base, "max_concurrent_stages": 2, "idempotency_key": "k-l"},
+    )
+    _call(
+        server,
+        "tessera_cancel_campaign_stage",
+        {**base, "stage_key": "s2", "idempotency_key": "k-c"},
+    )
+    assert [(m, p, k) for m, p, k, _ in seen] == [
+        ("POST", "/campaigns/campaign_1/pause", "k-p"),
+        ("POST", "/campaigns/campaign_1/resume", "k-r"),
+        ("POST", "/campaigns/campaign_1/concurrency-limit", "k-l"),
+        ("POST", "/campaigns/campaign_1/stages/s2/cancel", "k-c"),
+    ]
+    assert json.loads(seen[2][3]) == {
+        "expected_revision": 4,
+        "max_concurrent_stages": 2,
+        "reason": "r",
+    }
+    assert json.loads(seen[3][3]) == {"expected_revision": 4, "reason": "r"}

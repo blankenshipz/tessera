@@ -161,6 +161,14 @@ class SaladRouteProvider:
             raise Conflict("Salad profile does not belong to this organization and project.")
         if config.worker_principal_id != profile.worker_principal_id:
             raise Conflict("Salad stage worker is not the profile's worker.")
+        # Placement (ADR 0062): a stage that declares no GPU runs only on a CPU-only profile,
+        # and a GPU stage never on one, so neither wastes a GPU nor fails at the provider.
+        if config.gpu != profile.gpu:
+            raise Conflict(
+                "Salad stage needs a GPU profile."
+                if config.gpu
+                else "Salad stage declares no GPU and needs a CPU-only profile."
+            )
         self._check_worker(connection, project["org_id"], project_id, config.worker_principal_id)
         if _hosts_declared(config) and any(
             provider_trust.admission_basis(connection, source.snapshot_id) != "public_only"
@@ -175,7 +183,20 @@ class SaladRouteProvider:
             raise Conflict("Salad stage image digest is not allowlisted by the operator profile.")
         if stage.max_exposure_cents > profile.max_run_cents:
             raise Conflict("Salad stage exposure exceeds the profile's per-run ceiling.")
-        if stage.max_exposure_cents * stage.retry.max_attempts > profile.max_task_cents:
+        if not profile.gpu:
+            # A CPU profile has static operator rates, so the worst-case cost of the stage's
+            # whole duration is known now; the per-run cap is enforced at admission, not only
+            # by the guardian while it runs.
+            worst = profile.estimated_cents(stage.max_duration_seconds)
+            if worst > stage.max_exposure_cents:
+                raise Conflict(
+                    "Salad stage's estimated CPU cost for its full duration exceeds its "
+                    "max_exposure_cents."
+                )
+        # Every attempt holds its own exposure, an enabled infrastructure retry (ADR 0058)
+        # included: the operator's billable per-task ceiling counts them all.
+        attempts = stage.retry.max_attempts + stage.retry.infra_retries
+        if stage.max_exposure_cents * attempts > profile.max_task_cents:
             raise Conflict("Salad stage worst-case hold exceeds the profile's per-task ceiling.")
 
     @staticmethod

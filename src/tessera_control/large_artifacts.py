@@ -113,7 +113,15 @@ def verify_artifact_bytes(
     verify_chunk_content(connection, artifact_id, [artifact_entry(relative_path, size, sha256)])
 
 
-def _public(upload: sqlite3.Row, received: int, next_seq: int) -> dict[str, Any]:
+MAX_PARTIAL_CHUNKS_LISTED = 64
+
+
+def _public(
+    upload: sqlite3.Row,
+    received: int,
+    next_seq: int,
+    partial: list[dict[str, int]] | None = None,
+) -> dict[str, Any]:
     manifest = json.loads(upload["manifest_json"])
     return {
         "id": upload["id"],
@@ -133,6 +141,9 @@ def _public(upload: sqlite3.Row, received: int, next_seq: int) -> dict[str, Any]
         "expires_at": upload["expires_at"],
         "received_chunks": received,
         "next_seq": next_seq,
+        # Chunks whose parts have not all arrived, with the bytes control holds from the start
+        # of each: a restarted worker continues there instead of resending confirmed parts.
+        "partial_chunks": partial or [],
     }
 
 
@@ -540,12 +551,34 @@ class LargeArtifactStore(ArtifactStore):
             next_seq += 1
         return len(seqs), next_seq
 
+    @staticmethod
+    def _partials(connection: sqlite3.Connection, upload_id: str) -> list[dict[str, int]]:
+        """Partially stored chunks (stored length below the planned length), lowest seq first."""
+        total = connection.execute(
+            "SELECT json_extract(manifest_json, '$.size') FROM snapshot_chunk_uploads WHERE id=?",
+            (upload_id,),
+        ).fetchone()
+        if total is None:
+            return []
+        found: list[dict[str, int]] = []
+        for row in connection.execute(
+            "SELECT seq, size FROM snapshot_chunks WHERE owner_id=? ORDER BY seq", (upload_id,)
+        ):
+            planned = min(chunks.CHUNK_BYTES, total[0] - row["seq"] * chunks.CHUNK_BYTES)
+            if row["size"] < planned:
+                found.append({"seq": row["seq"], "received_bytes": row["size"]})
+                if len(found) >= MAX_PARTIAL_CHUNKS_LISTED:
+                    break
+        return found
+
     def _status_body(
         self, connection: sqlite3.Connection, actor: dict[str, Any], lease_id: str, upload_id: str
     ) -> dict[str, Any]:
         self._grant_for_upload(connection, actor, lease_id)
         row = self._upload_row(connection, actor, lease_id, upload_id)
-        return _public(row, *self._progress(connection, upload_id))
+        return _public(
+            row, *self._progress(connection, upload_id), self._partials(connection, upload_id)
+        )
 
     # -- begin ----------------------------------------------------------------------
 
@@ -593,7 +626,11 @@ class LargeArtifactStore(ArtifactStore):
                     )
                 ):
                     raise Conflict("Artifact path is immutable.")
-                return 200, _public(existing, *self._progress(connection, upload_id))
+                return 200, _public(
+                    existing,
+                    *self._progress(connection, upload_id),
+                    self._partials(connection, upload_id),
+                )
             if (
                 connection.execute(
                     "SELECT 1 FROM artifacts WHERE lease_id=? AND relative_path=?",

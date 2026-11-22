@@ -129,6 +129,9 @@ class ReportExecutionObservation(ExecutionRequest):
     observed_at: datetime
     provider_id: Identifier | None = None
     termination_confirmed: bool = False
+    # The container's exit code, reported with a confirmed exit so a failed run that leaves no
+    # outputs (hence no run receipt) is still a final failure with its code (ADR 0063).
+    exit_code: Annotated[int, Field(strict=True, ge=-(2**31), le=2**31 - 1)] | None = None
     # The worker's own report that launching failed before any container existed
     # (ADR 0046). Only an unknown observation with no provider identity can carry it.
     launch_error: Literal[LAUNCH_ERROR_CLASSES] | None = None  # type: ignore[valid-type]
@@ -152,6 +155,15 @@ class ReportExecutionObservation(ExecutionRequest):
     def confirmation_requires_exit(cls, value: bool, info) -> bool:
         if value and info.data.get("observed_state") != "exited":
             raise ValueError("termination confirmation requires an exited observation")
+        return value
+
+    @field_validator("exit_code")
+    @classmethod
+    def exit_code_requires_a_confirmed_exit(cls, value: int | None, info) -> int | None:
+        if value is not None and not (
+            info.data.get("observed_state") == "exited" and info.data.get("termination_confirmed")
+        ):
+            raise ValueError("an exit code requires a confirmed exited observation")
         return value
 
     @field_validator("launch_error")

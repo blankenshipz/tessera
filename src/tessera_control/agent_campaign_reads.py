@@ -15,6 +15,8 @@ this is recorded status, exit code, failure class and bounded detail), ``budget:
 import json
 from typing import Any
 
+from .campaign_infra_retry import infra_attempts
+from .campaign_models import normalize, parse_spec_json
 from .campaign_store import CampaignStore
 from .data_class import snapshot_data_class
 from .store import StoreError, _connect
@@ -223,6 +225,65 @@ class AgentCampaignReads(CampaignStore):
                 "standing_approvals": items,
                 "truncated": len(approvals) == _ROW_CAP,
                 "boundary": BOUNDARY + " Agents cannot create, edit or revoke standing approvals.",
+            }
+        finally:
+            connection.close()
+
+    def campaign_retries(self, principal, campaign_id) -> dict[str, Any]:
+        """Infrastructure-retry state per stage (campaign:read, ADR 0058).
+
+        The policy the approved spec set, the attempts that ended for an infrastructure
+        reason, what remains, and where the next attempt would run. Stopping the retries is
+        stopping the campaign (``tessera_cancel_campaign``, campaign:cancel): nothing here
+        changes state."""
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, "campaign:read")
+            campaign = self._campaign(connection, actor, campaign_id)
+            spec = parse_spec_json(campaign["spec_json"])
+            normal = normalize(spec)
+            stages = []
+            for row in connection.execute(
+                """SELECT stage_key, status, attempts_used FROM campaign_stages
+                WHERE campaign_id = ? ORDER BY topo_index""",
+                (campaign_id,),
+            ):
+                policy = normal.stage(row["stage_key"])
+                attempts = [
+                    dict(a)
+                    for a in connection.execute(
+                        """SELECT attempt, status, failure_class, failure_detail, provider_id,
+                        exit_code, hold_cents, settled_cents FROM campaign_stage_attempts
+                        WHERE campaign_id = ? AND stage_key = ? ORDER BY attempt""",
+                        (campaign_id, row["stage_key"]),
+                    )
+                ]
+                used = infra_attempts(attempts)
+                limit = policy.retry.infra_retries
+                stages.append(
+                    {
+                        "stage_key": row["stage_key"],
+                        "stage_status": row["status"],
+                        "infra_retries_max": limit,
+                        "infra_retries_used": used,
+                        "infra_retries_remaining": max(limit - used, 0),
+                        "infra_exit_codes": list(policy.retry.infra_exit_codes),
+                        "reroute_providers": list(policy.retry.reroute_providers),
+                        "provider": policy.provider,
+                        "infra_failures": [
+                            a
+                            for a in attempts
+                            if str(a["failure_class"] or "").startswith("infra_")
+                        ],
+                        "attempts": len(attempts),
+                    }
+                )
+            return {
+                "campaign_id": campaign_id,
+                "status": campaign["status"],
+                "stages": stages,
+                "stop": "tessera_cancel_campaign stops the campaign and so every retry",
+                "boundary": BOUNDARY,
             }
         finally:
             connection.close()

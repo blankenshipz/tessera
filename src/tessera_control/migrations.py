@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 70
+LATEST_SCHEMA_VERSION = 71
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1381,3 +1381,27 @@ def migrate_evidence_rows_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(EVIDENCE_ROWS_SCHEMA_VERSION - 1, migrate_evidence_rows_schema)
+
+
+# Campaign pause, concurrency limit and single-stage cancel
+# (ADR 0061). Additive and idempotent; registered with setdefault. If another change owns this
+# version when branches merge, raise STEERING_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION).
+STEERING_SCHEMA_VERSION = 71
+
+
+def migrate_steering_schema(connection: sqlite3.Connection) -> None:
+    from .campaign_steering_schema import create_campaign_steering_schema
+
+    create_campaign_steering_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (STEERING_SCHEMA_VERSION,)
+    )
+
+
+MIGRATIONS.setdefault(STEERING_SCHEMA_VERSION - 1, migrate_steering_schema)

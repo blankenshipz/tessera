@@ -306,19 +306,33 @@ def _normal_spec(campaign: Mapping):
 def _stage_provider(
     connection: sqlite3.Connection, campaign: Mapping, stage_key: str | None
 ) -> str | None:
-    """The provider of a campaign stage (the recorded column, else the normalized spec)."""
+    """The provider of a campaign stage.
+
+    A stage with alternates: the placement recorded on the stage (ADR 0060). A stage with an
+    approved infrastructure reroute list and no alternates: the provider its latest attempt
+    runs on, which a reroute may have moved (ADR 0058). Otherwise the recorded column, else the
+    normalized spec's provider."""
     if stage_key is None:
         return None
+    try:
+        stage = _normal_spec(campaign).stage(stage_key)
+    except (StopIteration, ValueError):
+        stage = None
+    if stage is not None and not stage.alternates and stage.retry.reroute_providers:
+        latest = connection.execute(
+            """SELECT provider_id FROM campaign_stage_attempts WHERE campaign_id=?
+            AND stage_key=? ORDER BY attempt DESC LIMIT 1""",
+            (campaign["id"], stage_key),
+        ).fetchone()
+        if latest is not None and latest["provider_id"]:
+            return latest["provider_id"]
     row = connection.execute(
         "SELECT provider_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
         (campaign["id"], stage_key),
     ).fetchone()
     if row is not None and row["provider_id"]:
         return row["provider_id"]
-    try:
-        return _normal_spec(campaign).stage(stage_key).provider
-    except (StopIteration, ValueError):
-        return None
+    return None if stage is None else stage.provider
 
 
 def _snapshot_owned(connection: sqlite3.Connection, campaign: Mapping, snapshot_id: str) -> bool:
@@ -391,10 +405,24 @@ _SALAD_STAGE_COLUMNS = {
 
 def _spec_workers(campaign: Mapping) -> set[str]:
     """Workers the campaign may use: v1 stage workers and each stage provider's instance."""
-    from .campaign_models import stage_provider
+    import dataclasses
+
+    from .campaign_models import stage_candidates, stage_provider
 
     workers: set[str] = set()
-    for stage in _normal_spec(campaign).stages:
+    # ADR 0060: each approved provider candidate of a stage, and ADR 0058: each approved
+    # infrastructure reroute provider (as it would run the stage), never anything else.
+    for stage in (
+        c
+        for s in _normal_spec(campaign).stages
+        for c in (
+            *stage_candidates(s),
+            *(
+                dataclasses.replace(s, provider=pid, worker_principal_id=None, provider_config={})
+                for pid in s.retry.reroute_providers
+            ),
+        )
+    ):
         if stage.worker_principal_id:
             workers.add(stage.worker_principal_id)
         try:

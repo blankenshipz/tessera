@@ -36,6 +36,10 @@ uv run --locked tessera init --state-dir .tessera
 uv run --locked tessera serve --state-dir .tessera --port 8765
 ```
 
+The MCP tests need the `mcp` extra from the first line: without it they fail with the fix
+instead of skipping (a plain `pytest` would otherwise look green while covering none of
+them). A run that knowingly has no extra sets `TESSERA_ALLOW_MISSING_MCP=1` to skip them.
+
 Initialize once in an absent directory. Keep `owner.header` private and never
 give it to an agent. Local human authority is bearer possession, not verified
 human sessions or owner rotation. Desktop is installed separately; see the

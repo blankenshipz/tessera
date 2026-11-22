@@ -90,7 +90,7 @@ def test_v64_migrates_with_backfill_and_converges(tmp_path):
     fresh_shape = _shape(path)
     fresh_convergence = _convergence(path)
     _downgrade_to_v64(path)
-    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION == 70
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION == 71
     validate_database(path)
     connection = _connect(path)
     try:
@@ -117,7 +117,7 @@ def test_v64_migrates_with_backfill_and_converges(tmp_path):
                 connection.execute(sql)
     finally:
         connection.close()
-    assert migrate_database(path, _connect) == 70  # a second run is a no-op
+    assert migrate_database(path, _connect) == 71  # a second run is a no-op
     assert _shape(path).keys() == fresh_shape.keys()
     # The migrated database has the same columns and CHECK clauses as a fresh one.
     migrated = _convergence(path)

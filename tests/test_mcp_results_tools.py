@@ -4,10 +4,11 @@ import asyncio
 
 import httpx
 import pytest
+from mcp_required import require_mcp
 from test_agent_authority import prepared  # noqa: F401
 from test_agent_results_summary import world  # noqa: F401
 
-pytest.importorskip("mcp")
+require_mcp()
 
 from tessera_mcp.client import ControlClient, ControlError  # noqa: E402
 from tessera_mcp.config import Config  # noqa: E402

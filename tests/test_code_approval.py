@@ -715,7 +715,7 @@ def test_v62_migration_leaves_existing_snapshots_unapproved(tmp_path):
             f"SELECT {listed} FROM snapshot_data_classes ORDER BY snapshot_id"
         ).fetchall()
     assert len(snapshots) >= 2
-    assert migrate_state(state) == 70
+    assert migrate_state(state) == 71
     with closing(sqlite3.connect(db_path)) as db:
         assert db.execute("SELECT count(*) FROM snapshot_code_approvals").fetchone() == (0,)
         assert db.execute("SELECT id, digest FROM source_snapshots ORDER BY id").fetchall() == (
@@ -893,7 +893,7 @@ def test_v62_migration_adds_the_approval_record_and_converges(tmp_path):
             "UPDATE operator_backup_health SET last_success_at='synthetic',last_backup_id='old'"
         )
         db.commit()
-    assert migrate_state(migrated) == LATEST_SCHEMA_VERSION == 70
+    assert migrate_state(migrated) == LATEST_SCHEMA_VERSION == 71
     assert migrate_state(migrated) == LATEST_SCHEMA_VERSION
     names = (
         "snapshot_code_approvals",

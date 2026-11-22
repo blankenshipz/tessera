@@ -1730,7 +1730,8 @@ class ExecutionStore(Store):
                 )
             else:
                 semantic_transition = True
-            if semantic_transition or launch_error is not None:
+            exit_code = payload.get("exit_code")
+            if semantic_transition or launch_error is not None or exit_code is not None:
                 self._event(
                     connection,
                     worker,
@@ -1750,6 +1751,7 @@ class ExecutionStore(Store):
                         "observation_proof": "trusted_worker_assertion",
                         "operational_only": True,
                         **({"launch_error": launch_error} if launch_error is not None else {}),
+                        **({"exit_code": exit_code} if exit_code is not None else {}),
                     },
                 )
             return 201, {

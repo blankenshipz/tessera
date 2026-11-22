@@ -15,6 +15,7 @@ grants, observation, cancel, settlement, receipt fields) goes through the
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import sqlite3
@@ -28,6 +29,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import campaign_placement as placement
 from . import execution_frames as frames
 from . import provider_trust
 from .campaign_autoreconcile import (
@@ -41,6 +43,7 @@ from .campaign_autoreconcile import (
 from .campaign_delegation import approver_is_live
 from .campaign_exited_resolve import assess as assess_exited
 from .campaign_exited_resolve import release_grant
+from .campaign_infra_retry import INFRA_CONTAINER_KILLED, INFRA_PREFIX, infra_attempts
 from .campaign_io import (
     IoEntry,
     output_entries,
@@ -48,6 +51,7 @@ from .campaign_io import (
     write_io,
 )
 from .campaign_models import (
+    EXPERIMENT_CEILING_CENTS,
     FAILURE_CLASSES,
     GRANT_SETTLE_MARGIN_SECONDS,
     NormalSpec,
@@ -56,8 +60,8 @@ from .campaign_models import (
     normalize,
     parse_spec_json,
     spec_digest,
-    stage_execution_spec,
     stage_input_class,
+    stage_on_candidate,
     stage_provider,
 )
 from .campaign_providers import (
@@ -457,7 +461,7 @@ class CampaignRunner:
     ) -> StepResult:
         assert ctx.approval is not None
         self._renew_lease()
-        provider_id = None if stage_key is None else ctx.spec.stage(stage_key).provider
+        provider_id = None if stage_key is None else self._spec_stage(ctx, stage_key).provider
         result = self.steps.run(
             campaign=ctx.campaign,
             approval=ctx.approval,
@@ -516,15 +520,58 @@ class CampaignRunner:
             self._touch(connection, "campaign_stage_attempts", "id=?", (attempt_id,), **fields)
 
     def _spec_stage(self, ctx: _Ctx, key: str) -> NormalStage:
-        return ctx.spec.stage(key)
+        """The stage as it runs now (ADR 0058, ADR 0060).
+
+        A stage with alternates runs on the candidate it was last placed on; a stage without
+        them runs on the provider its latest attempt was given (an infrastructure retry may
+        have been rerouted along its approved ``reroute_providers``)."""
+        base = ctx.spec.stage(key)
+        if base.alternates:
+            row = self._one(
+                "SELECT provider_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+            )
+            return self._on_candidate(base, None if row is None else row["provider_id"])
+        latest = self._one(
+            """SELECT provider_id FROM campaign_stage_attempts WHERE campaign_id=?
+            AND stage_key=? ORDER BY attempt DESC LIMIT 1""",
+            (ctx.campaign["id"], key),
+        )
+        if latest is None or not latest["provider_id"]:
+            return base
+        return self._on_provider(base, latest["provider_id"])
+
+    @staticmethod
+    def _on_provider(stage: NormalStage, provider_id: str) -> NormalStage:
+        """The stage for another provider instance of the same runtime; the instance names
+        its own worker principal, never the original's."""
+        if provider_id == stage.provider:
+            return stage
+        return dataclasses.replace(
+            stage, provider=provider_id, worker_principal_id=None, provider_config={}
+        )
+
+    @staticmethod
+    def _on_candidate(base: NormalStage, provider_id: str | None) -> NormalStage:
+        if not provider_id:
+            return base
+        try:
+            return stage_on_candidate(base, provider_id)
+        except KeyError:  # never placed outside the approved list; keep the stage's own
+            return base
 
     @staticmethod
     def _provider(spec_stage: NormalStage) -> Any:
         return stage_provider(spec_stage.provider)
 
+    @staticmethod
+    def _candidate_ids(ctx: _Ctx) -> list[str]:
+        """Every provider any stage of the approved spec may run on (ADR 0060)."""
+        return sorted({pid for s in ctx.spec.stages for pid in s.candidate_ids})
+
     def _providers(self, ctx: _Ctx) -> list[Any]:
         found = []
-        for pid in sorted({s.provider for s in ctx.spec.stages}):
+        for pid in self._candidate_ids(ctx):
             try:
                 found.append(stage_provider(pid))
             except KeyError:  # dropped since approval: its stages fail in _advance_stage
@@ -538,7 +585,7 @@ class CampaignRunner:
 
         Such a provider cannot be asked about its exposure, so it is treated as open
         (fail closed) until the provider is registered again."""
-        for pid in sorted({s.provider for s in ctx.spec.stages}):
+        for pid in self._candidate_ids(ctx):
             try:
                 stage_provider(pid)
                 continue
@@ -606,7 +653,10 @@ class CampaignRunner:
         """The normalized spec stage an attempt row belongs to."""
         row = self._one("SELECT spec_json FROM campaigns WHERE id=?", (attempt["campaign_id"],))
         assert row is not None
-        return normalize(parse_spec_json(row["spec_json"])).stage(attempt["stage_key"])
+        stage = normalize(parse_spec_json(row["spec_json"])).stage(attempt["stage_key"])
+        if stage.alternates:
+            return self._on_candidate(stage, attempt["provider_id"])
+        return self._on_provider(stage, attempt["provider_id"] or stage.provider)
 
     def stage_failed(self, ctx: _Ctx, key: str, reason: str) -> bool:
         return self._stage_failed(ctx, key, reason)
@@ -641,17 +691,28 @@ class CampaignRunner:
 
     def emit_once(self, ctx: _Ctx, event_type: str, match: dict[str, Any], payload: dict) -> None:
         """One event per (type, match); the runner re-derives state every tick."""
-        clauses = " AND ".join(f"json_extract(payload_json, '$.{name}') IS ?" for name in match)
         with self.store.runner_connection() as connection:
-            seen = connection.execute(
-                f"""SELECT 1 FROM events WHERE project_id=? AND event_type=?
-                AND json_extract(payload_json, '$.campaign_id') = ? AND {clauses} LIMIT 1""",
-                (ctx.campaign["project_id"], event_type, ctx.campaign["id"], *match.values()),
-            ).fetchone()
-            if seen is None:
-                self.store.record_runner_event(
-                    connection, ctx.campaign, event_type, {**match, **payload}
-                )
+            self._emit_once_in(connection, ctx, event_type, match, payload)
+
+    def _emit_once_in(
+        self,
+        connection: sqlite3.Connection,
+        ctx: _Ctx,
+        event_type: str,
+        match: dict[str, Any],
+        payload: dict,
+    ) -> None:
+        """``emit_once`` inside a transaction the caller already holds."""
+        clauses = " AND ".join(f"json_extract(payload_json, '$.{name}') IS ?" for name in match)
+        seen = connection.execute(
+            f"""SELECT 1 FROM events WHERE project_id=? AND event_type=?
+            AND json_extract(payload_json, '$.campaign_id') = ? AND {clauses} LIMIT 1""",
+            (ctx.campaign["project_id"], event_type, ctx.campaign["id"], *match.values()),
+        ).fetchone()
+        if seen is None:
+            self.store.record_runner_event(
+                connection, ctx.campaign, event_type, {**match, **payload}
+            )
 
     def awaiting_human(
         self,
@@ -1104,12 +1165,54 @@ class CampaignRunner:
         for entry in order:
             if self._budget <= 0:
                 return
+            if self._drive_stage_cancel(ctx, entry["stage_key"]):
+                continue
             self._unwind_failed(ctx, entry["stage_key"])
             for _ in range(MAX_STAGE_LOOPS):
                 self._executed = False
                 if not self._advance_stage(ctx, entry["stage_key"]) or self._executed:
                     break
         self._maybe_complete(ctx)
+
+    def _drive_stage_cancel(self, ctx: _Ctx, key: str) -> bool:
+        """Unwind one stage a steering request cancelled; True while it owns the stage (ADR 0061).
+
+        The same grant revoke and reconcile path as a campaign cancel runs for this stage only;
+        stages that read its output are then skipped like any other dead dependency.
+        """
+        request = self._one(
+            "SELECT * FROM campaign_stage_cancels WHERE campaign_id=? AND stage_key=?",
+            (ctx.campaign["id"], key),
+        )
+        if request is None:
+            return False
+        stage = self._stage_row(ctx, key)
+        if stage["status"] in TERMINAL_STAGE:
+            self._finish_stage_cancel(ctx, key, request)
+            return True
+        if stage["status"] == "pending":
+            self._set_stage(ctx, key, status="cancelled")
+        elif self._cancel_stage_attempts(ctx, key):
+            return True
+        self._finish_stage_cancel(ctx, key, request)
+        return True
+
+    def _finish_stage_cancel(self, ctx: _Ctx, key: str, request: dict[str, Any]) -> None:
+        if request["completed_at"] is not None:
+            return
+        stage = self._stage_row(ctx, key)
+        with self.store.runner_connection() as connection:
+            connection.execute(
+                "UPDATE campaign_stage_cancels SET completed_at=? WHERE campaign_id=? "
+                "AND stage_key=? AND completed_at IS NULL",
+                (_iso(self.now()), ctx.campaign["id"], key),
+            )
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "campaign.stage_cancelled",
+                {"stage_key": key, "stage_status": stage["status"], "reason": request["reason"]},
+            )
 
     def _stopping(self, ctx: _Ctx) -> bool:
         return self._campaign(ctx.campaign["id"])["stop_reason"] is not None
@@ -1123,12 +1226,20 @@ class CampaignRunner:
         status = stage["status"]
         if status in TERMINAL_STAGE:
             return False
-        try:
-            self._provider(spec_stage)
-        except KeyError:
-            # The provider registry changed after approval: refuse the stage cleanly.
-            return self._stage_failed(ctx, key, "provider_unavailable")
         attempts = self._attempts(ctx, key)
+        latest = attempts[-1] if attempts else None
+        # ADR 0060: a stage with alternates is placed afresh whenever it needs a new attempt;
+        # placement itself skips an unregistered candidate. Otherwise the stage's (or the live
+        # attempt's) provider must still be registered.
+        placing = bool(spec_stage.alternates) and (
+            status == "pending" or latest is None or latest["status"] == "failed_transient"
+        )
+        if not placing:
+            try:
+                self._provider(spec_stage)
+            except KeyError:
+                # The provider registry changed after approval: refuse the stage cleanly.
+                return self._stage_failed(ctx, key, "provider_unavailable")
         stopping = self._stopping(ctx)
         if status == "pending":
             sources = [s.stage for s in spec_stage.inputs if s.kind == "stage"]
@@ -1138,18 +1249,17 @@ class CampaignRunner:
                 return True
             if any(state != "succeeded" for state in states):
                 return False
-            progress = self._provider(spec_stage).prepare(self, ctx, key)
-            if progress != "ready":
-                return progress == "progress"
-            return self._reserve(ctx, key)
-        latest = attempts[-1] if attempts else None
+            return self._place_and_reserve(ctx, key, prepare=True)
         if latest is None:
-            return self._reserve(ctx, key)
+            return self._place_and_reserve(ctx, key)
         attempt_status = latest["status"]
         if attempt_status == "succeeded":
             return self._stage_succeeded(ctx, key, latest)
         if attempt_status in {"failed_permanent"}:
-            return self._stage_failed(ctx, key, f"{latest['failure_class']}")
+            # A recorded exit code is part of the outcome the campaign reports (ADR 0063).
+            code = latest["exit_code"]
+            suffix = "" if code is None else f":exit_code={code}"
+            return self._stage_failed(ctx, key, f"{latest['failure_class']}{suffix}")
         if attempt_status == "refused_budget":
             return False
         if attempt_status == "cancelled":
@@ -1161,14 +1271,17 @@ class CampaignRunner:
             return self._stage_unknown(ctx, key)
         if attempt_status == "failed_transient":
             # An attempt that never started uses an attempt number, not a scientific retry.
-            scientific = stage["attempts_used"] - not_started_count(attempts)
+            # An infrastructure retry (ADR 0058) has its own bound, not a scientific one.
+            scientific = (
+                stage["attempts_used"] - not_started_count(attempts) - infra_attempts(attempts)
+            )
             if (
                 stopping
                 or scientific >= spec_stage.retry.max_attempts
                 or stage["attempts_used"] >= MAX_ATTEMPT_NUMBERS
             ):
                 return self._stage_failed(ctx, key, f"{latest['failure_class']}_exhausted")
-            return self._reserve(ctx, key)
+            return self._place_and_reserve(ctx, key)
         try:
             return self._advance_attempt(ctx, stage, spec_stage, latest)
         except StepFailed as error:
@@ -1177,10 +1290,237 @@ class CampaignRunner:
         except _Waiting:
             return False
 
+    # -- placement (ADR 0060) ---------------------------------------------------------
+
+    def _place_and_reserve(self, ctx: _Ctx, key: str, *, prepare: bool = False) -> bool:
+        """Place the stage's next attempt on an approved candidate, prepare it there and
+        reserve its hold. A stage with no alternates keeps the single-provider path."""
+        if self._reservation_held_back(ctx, key):
+            return False
+        base = ctx.spec.stage(key)
+        if not base.alternates:
+            if prepare:
+                progress = self._provider(base).prepare(self, ctx, key)
+                if progress != "ready":
+                    return progress == "progress"
+            return self._reserve(ctx, key)
+        stage_row = self._stage_row(ctx, key)
+        number = stage_row["attempts_used"] + 1
+        with self.store.runner_connection() as connection:
+            record = placement.recorded(connection, ctx.campaign, key, number)
+        if record is None:
+            decision = self._decide_placement(ctx, key, base, stage_row)
+            if decision.chosen is None:
+                return self._placement_refused(ctx, key, number, decision)
+            self._record_placement(ctx, key, number, decision)
+            chosen = decision.chosen
+        else:
+            chosen = record["provider_id"]  # binding for this attempt number once recorded
+        spec_stage = self._on_candidate(base, chosen)
+        try:
+            provider = self._provider(spec_stage)
+        except KeyError:
+            return self._stage_failed(ctx, key, "provider_unavailable")
+        # A provider's preparation (Salad scaffolding, for example) may take several ticks or
+        # wait for a person. An attempt is reserved on a provider only after its ``prepare``
+        # returned ``ready``, so a candidate that ran an earlier attempt of this stage is
+        # prepared; any other candidate is prepared again every tick until it is ready. The
+        # recorded placement says where, never whether that work finished.
+        prepared_on = {a["provider_id"] for a in self._attempts(ctx, key)}
+        if prepare or chosen not in prepared_on:
+            progress = provider.prepare(self, ctx, key)
+            if progress != "ready":
+                return progress == "progress"
+        return self._reserve(ctx, key)
+
+    def _decide_placement(
+        self, ctx: _Ctx, key: str, base: NormalStage, stage_row: Mapping[str, Any]
+    ) -> placement.Decision:
+        def exposure_open(connection: sqlite3.Connection) -> bool:
+            return any(
+                provider.exposure_open(connection, ctx.campaign["id"])
+                for provider in self._providers(ctx)
+            ) or self._dropped_provider_exposure(connection, ctx, ctx.campaign["id"])
+
+        # Once the stage's task plan binds an execution spec, a later attempt may move only to
+        # a candidate that runs the identical spec (same image, argv and limits).
+        mismatched: dict[str, placement.Skip] = {}
+        if stage_row["prep_phase"] not in (None, "none", "task_created", "input_ready"):
+            digest = stage_row["input_snapshot_digest"] or "0" * 64
+            try:
+                current = self._on_candidate(base, stage_row["provider_id"])
+                planned = self._provider(current).execution_spec(current, digest)
+            except KeyError:
+                planned = None
+            for pid in base.candidate_ids if planned is not None else ():
+                stage = self._on_candidate(base, pid)
+                try:
+                    same = self._provider(stage).execution_spec(stage, digest) == planned
+                except KeyError:
+                    continue  # unregistered: the decision records that reason itself
+                if not same:
+                    mismatched[pid] = placement.Skip(
+                        pid, "plan_mismatch", "differs from the stage's task plan"
+                    )
+        return placement.decide(self, ctx, base, exposure_open, extra_skip=mismatched)
+
+    def _record_placement(
+        self, ctx: _Ctx, key: str, number: int, decision: placement.Decision
+    ) -> None:
+        """The choice and every skip reason, with the stage's current provider, in one
+        transaction (the receipt and tessera_get_campaign read them back)."""
+        with self.store.runner_connection() as connection:
+            self._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+                provider_id=decision.chosen,
+            )
+            self.store.record_runner_event(
+                connection, ctx.campaign, placement.PLACED_EVENT, decision.payload(key, number)
+            )
+        self._actions.append(f"placed:{key}:{number}:{decision.chosen}")
+
+    def _placement_refused(
+        self, ctx: _Ctx, key: str, number: int, decision: placement.Decision
+    ) -> bool:
+        """No candidate may run now. Wait while a reason can clear on its own; otherwise end
+        the stage as a single-provider stage would, never on an unapproved destination."""
+        payload = decision.payload(key, number)
+        if decision.waiting:
+            signature = ",".join(f"{s.provider_id}:{s.reason}" for s in decision.skipped)
+            self.emit_once(
+                ctx,
+                placement.WAITING_EVENT,
+                {"stage_key": key, "attempt": number, "signature": signature},
+                {"skipped": payload["skipped"], "steering": payload["steering"]},
+            )
+            return False
+        budget = next((s for s in decision.skipped if s.reason == "over_campaign_budget"), None)
+        if budget is not None:
+            # A truthful budget refusal on the first candidate the cap refused: the recorded
+            # attempt and stop reason are the single-provider ones (ADR 0038).
+            self._record_placement(
+                ctx,
+                key,
+                number,
+                placement.Decision(
+                    decision.candidates,
+                    budget.provider_id,
+                    tuple(s for s in decision.skipped if s is not budget),
+                    decision.steering,
+                    self._on_candidate(ctx.spec.stage(key), budget.provider_id).max_exposure_cents,
+                    budget_refusal=True,
+                ),
+            )
+            return self._reserve(ctx, key)
+        self.emit_once(
+            ctx,
+            placement.WAITING_EVENT,
+            {"stage_key": key, "attempt": number, "signature": "refused"},
+            {"skipped": payload["skipped"], "steering": payload["steering"], "final": True},
+        )
+        return self._stage_failed(ctx, key, placement.failure_reason(decision))
+
     # -- reservation ----------------------------------------------------------------
 
+    def _reservation_held_back(self, ctx: _Ctx, key: str) -> bool:
+        """ADR 0061: an agent's or person's pause and per-campaign concurrency limit.
+
+        Both only delay NEW reservations of a stage; an attempt already running, its settlement,
+        cancellation and the deadline are unaffected. Each wait is recorded once.
+        """
+        steering = self._one(
+            "SELECT * FROM campaign_steering WHERE campaign_id=?", (ctx.campaign["id"],)
+        )
+        if steering is None:
+            return False
+        if steering["paused"]:
+            self.emit_once(
+                ctx,
+                "campaign.stage_waiting_paused",
+                {"stage_key": key, "pause_count": steering["pause_count"]},
+                {},
+            )
+            return True
+        limit = steering["max_concurrent_stages"]
+        if limit is not None:
+            marks = ",".join("?" for _ in ACTIVE_ATTEMPT)
+            busy = self._one(
+                f"""SELECT count(DISTINCT stage_key) AS n FROM campaign_stage_attempts
+                WHERE campaign_id=? AND stage_key<>? AND status IN ({marks})""",
+                (ctx.campaign["id"], key, *sorted(ACTIVE_ATTEMPT)),
+            )
+            if busy["n"] >= limit:
+                self.emit_once(
+                    ctx,
+                    "campaign.stage_waiting_concurrency",
+                    {"stage_key": key, "limit": limit},
+                    {"running_stages": busy["n"]},
+                )
+                return True
+        return False
+
+    def _retry_provider(self, ctx: _Ctx, key: str, attempts: list[dict[str, Any]]) -> str:
+        """The provider the next attempt runs on (ADR 0058).
+
+        A scientific retry stays where the last attempt ran. After an infrastructure failure
+        the next attempt moves, in the spec's order, to the first reroute provider not yet
+        tried that still passes every reroute check (registered, unbilled worker-grant provider
+        of the stage's runtime, the provider's own stage check, trust narrowing and input
+        admission, as at approval); with none left it returns to the stage's own provider.
+        Only providers the approved spec names are ever chosen."""
+        base = ctx.spec.stage(key)
+        if not attempts:
+            return base.provider
+        latest = attempts[-1]
+        current = latest["provider_id"] or base.provider
+        if not str(latest["failure_class"] or "").startswith(INFRA_PREFIX):
+            return current
+        tried = {
+            a["provider_id"] or base.provider
+            for a in attempts
+            if str(a["failure_class"] or "").startswith(INFRA_PREFIX)
+        }
+        for candidate in (base.provider, *base.retry.reroute_providers):
+            if candidate in tried:
+                continue
+            try:
+                stage_provider(candidate)
+                if candidate != base.provider:
+                    with self.store.runner_connection() as connection:
+                        CampaignStore.check_reroute(
+                            connection,
+                            ctx.campaign["project_id"],
+                            base,
+                            candidate,
+                            (ctx.approval or {}).get("trust_policy_digest"),
+                        )
+            except (KeyError, Conflict) as error:
+                log.warning(
+                    "campaign %s stage %s: reroute provider %s skipped: %s",
+                    ctx.campaign["id"],
+                    key,
+                    candidate,
+                    type(error).__name__,
+                )
+                continue
+            return candidate
+        return base.provider
+
     def _reserve(self, ctx: _Ctx, key: str) -> bool:
-        spec_stage = self._spec_stage(ctx, key)
+        if self._reservation_held_back(ctx, key):
+            return False
+        attempts = self._attempts(ctx, key)
+        if ctx.spec.stage(key).alternates:
+            # ADR 0060: placement already chose and recorded this attempt's provider; an
+            # infrastructure retry is placed like any retry, across the approved candidates.
+            spec_stage = self._spec_stage(ctx, key)
+            target = spec_stage.provider
+        else:
+            target = self._retry_provider(ctx, key, attempts)
+            spec_stage = self._on_provider(ctx.spec.stage(key), target)
         # ADR 0040 at reservation: nothing is held for a stage whose inputs the provider
         # instance is not trusted to receive (a 409-class refusal naming provider and worker).
         try:
@@ -1194,8 +1534,21 @@ class CampaignRunner:
         except Conflict:
             return self._stage_failed(ctx, key, "input_not_admitted")
         hold = spec_stage.max_exposure_cents
+        if attempts and str(attempts[-1]["failure_class"] or "").startswith(INFRA_PREFIX):
+            self.emit_once(
+                ctx,
+                "campaign.stage_infra_retry",
+                {"stage_key": key, "after_attempt": attempts[-1]["attempt"]},
+                {
+                    "reason": attempts[-1]["failure_class"],
+                    "infra_retries_used": infra_attempts(attempts),
+                    "infra_retries_max": spec_stage.retry.infra_retries,
+                    "provider": target,
+                    "rerouted": target != (attempts[-1]["provider_id"] or spec_stage.provider),
+                },
+            )
         try:
-            return self._reserve_hold(ctx, key, hold)
+            return self._reserve_hold(ctx, key, hold, target)
         except _ExposureBlocked:
             # An attempt with unresolved provider exposure blocks new positive holds.
             self.emit_once(
@@ -1206,7 +1559,8 @@ class CampaignRunner:
             )
             return False
 
-    def _reserve_hold(self, ctx: _Ctx, key: str, hold: int) -> bool:
+    def _reserve_hold(self, ctx: _Ctx, key: str, hold: int, provider_id: str | None = None) -> bool:
+        provider_id = provider_id or ctx.spec.stage(key).provider
         refused_event: dict[str, Any] | None = None
         with self.store.runner_connection() as connection:
             campaign = dict(
@@ -1257,7 +1611,7 @@ class CampaignRunner:
                     ("exposure_unknown" if unknown else "budget_refused") if refused else None,
                     now,
                     now,
-                    ctx.spec.stage(key).provider,
+                    provider_id,
                 ),
             )
             self._touch(
@@ -1488,7 +1842,13 @@ class CampaignRunner:
         phase = stage["prep_phase"]
         title = f"{ctx.spec.name}/{key}"[:200]
         purpose = f"Campaign {campaign['id']} stage {key} (ADR 0038)"
-        budget = hold * spec_stage.retry.max_attempts
+        # Every attempt, scientific or infrastructure (ADR 0058), holds its own exposure; the
+        # stage's own exposure is the per-run cap every candidate fits under (ADR 0060).
+        budget = min(
+            ctx.spec.stage(key).max_exposure_cents
+            * (spec_stage.retry.max_attempts + spec_stage.retry.infra_retries),
+            EXPERIMENT_CEILING_CENTS,
+        )
 
         if phase == "none":
             result = self._step(
@@ -1534,8 +1894,8 @@ class CampaignRunner:
                         "purpose": purpose,
                         "budget_cents": budget,
                         "max_duration_seconds": spec_stage.max_duration_seconds,
-                        "execution_spec": stage_execution_spec(
-                            ctx.spec, key, stage["input_snapshot_digest"]
+                        "execution_spec": self._provider(spec_stage).execution_spec(
+                            spec_stage, stage["input_snapshot_digest"]
                         ),
                     },
                 ),
@@ -2128,21 +2488,8 @@ class CampaignRunner:
         return True
 
     def _limits_allow(self, project_id: str, hold: int) -> bool:
-        limits = self._one(
-            "SELECT * FROM execution_project_limits WHERE project_id=?", (project_id,)
-        )
-        if limits is None:
-            return True  # the store refuses with a precise reason
-        unresolved = self._one(
-            """SELECT count(*) AS n FROM execution_grants WHERE project_id=?
-            AND status IN ('active','cancel_requested')""",
-            (project_id,),
-        )
-        return bool(
-            unresolved["n"] < limits["max_concurrency"]
-            and limits["held_cents"] + limits["settled_cents"] + hold
-            <= limits["monetary_limit_cents"]
-        )
+        with self.store.runner_connection() as connection:
+            return placement.project_limits_allow(connection, project_id, hold)
 
     def _note_waiting_limits(self, ctx: _Ctx, key: str, hold: int) -> None:
         """One event per stage when project limits keep it from getting a grant."""
@@ -2817,13 +3164,83 @@ class CampaignRunner:
         }.get(observed.outcome, "unknown")
         if status == "unknown":
             failure_class = "observed_unknown"
+        detail = observed.detail[:500] or None
+        infra = self._infra_failure(
+            ctx,
+            stage["stage_key"],
+            spec_stage,
+            attempt,
+            attempt["exit_code"],
+            status,
+            failure_class,
+        )
+        if infra is not None:
+            status, failure_class, detail = infra
         self._set_attempt(
-            attempt["id"],
-            status=status,
-            failure_class=failure_class,
-            failure_detail=observed.detail[:500] or None,
+            attempt["id"], status=status, failure_class=failure_class, failure_detail=detail
         )
         return True
+
+    def _infra_failure(
+        self,
+        ctx: _Ctx,
+        key: str,
+        spec_stage: NormalStage,
+        attempt: dict[str, Any],
+        exit_code: int | None,
+        status: str,
+        failure_class: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[str, str, str] | None:
+        """Reclassify a confirmed exit that the infrastructure caused (ADR 0058).
+
+        Only a recorded exit code the spec names as infrastructure (default 137: the engine
+        or the kernel's out-of-memory killer ended the container) on an attempt that would
+        otherwise be a permanent undeclared-exit failure qualifies, and only when the spec
+        enabled infrastructure retries. A declared transient code, a task failure, a refused
+        step and every budget or policy refusal keep their own class. Both the observation
+        path and the confirmed-exit path (ADR 0053) come here. ``connection`` is the caller's
+        open transaction, if any. Returns ``None`` when nothing changes; when the bound is
+        spent the failure stays permanent and says so, once, on the timeline."""
+        limit = spec_stage.retry.infra_retries
+        if (
+            limit < 1
+            or status != "failed_permanent"
+            or failure_class != "undeclared_exit_code"
+            or exit_code is None
+            or exit_code not in spec_stage.retry.infra_exit_codes
+        ):
+            return None
+        sql = (
+            "SELECT * FROM campaign_stage_attempts WHERE campaign_id=? AND stage_key=? "
+            "ORDER BY attempt"
+        )
+        params = (ctx.campaign["id"], key)
+        if connection is not None:
+            used = infra_attempts(connection.execute(sql, params).fetchall())
+        else:
+            used = infra_attempts(self._rows(sql, params))
+        if used >= limit:
+            exhausted = {"attempt": attempt["attempt"], "exit_code": exit_code}
+            exhausted["infra_retries_max"] = limit
+            if connection is not None:
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    "campaign.stage_infra_retries_exhausted",
+                    {"stage_key": key},
+                    exhausted,
+                )
+            else:
+                self.emit_once(
+                    ctx, "campaign.stage_infra_retries_exhausted", {"stage_key": key}, exhausted
+                )
+            return None
+        return (
+            "failed_transient",
+            INFRA_CONTAINER_KILLED,
+            f"exit_code:{exit_code}; infrastructure failure, retry {used + 1} of {limit}"[:500],
+        )
 
     # -- lineage --------------------------------------------------------------------
 
@@ -3262,11 +3679,34 @@ class CampaignRunner:
             if fresh is None:
                 return False
             verdict = assess_exited(
-                connection, fresh, now=self.now(), transient_codes=codes, free_worker_grant=free
+                connection,
+                fresh,
+                now=self.now(),
+                transient_codes=codes,
+                free_worker_grant=free,
+                infra_exit_codes=frozenset(stage.retry.infra_exit_codes),
+                infra_retries_enabled=stage.retry.infra_retries > 0,
             )
             if verdict is None:
                 return False
             self._hold_lease(connection)
+            infra = self._infra_failure(
+                ctx,
+                key,
+                stage,
+                fresh,
+                verdict.evidence["exit_code"],
+                verdict.status,
+                verdict.failure_class,
+                connection,
+            )
+            if infra is not None:
+                verdict = dataclasses.replace(
+                    verdict,
+                    status=infra[0],
+                    failure_class=infra[1],
+                    detail=f"{infra[2]}; resolved on the worker's confirmed exit"[:500],
+                )
             now = _iso(self.now())
             grant = connection.execute(
                 "SELECT * FROM execution_grants WHERE id=?", (fresh["grant_id"],)
@@ -3444,9 +3884,13 @@ class CampaignRunner:
             final = "stopped"
         elif all(stage["status"] == "succeeded" for stage in stages):
             final = "succeeded"
+        elif self._rows(
+            "SELECT 1 FROM campaign_stage_cancels WHERE campaign_id=?", (campaign["id"],)
+        ) and all(stage["status"] in {"succeeded", "cancelled", "skipped"} for stage in stages):
+            final, reason = "stopped", "stage_cancelled"
         else:
             final = "failed"
-        self._finish(campaign, final)
+        self._finish(campaign, final, reason=reason or None)
 
     def _finish(self, campaign: dict[str, Any], status: str, *, reason: str | None = None) -> None:
         """Terminal status, immutable receipt and completion event in one transaction."""

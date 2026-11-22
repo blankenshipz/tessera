@@ -33,6 +33,11 @@ def grants(campaign_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.campaign_grants(actor, campaign_id)
 
 
+@router.get("/campaigns/{campaign_id}/retries")
+def retries(campaign_id: str, request: Request, actor: Actor):
+    return request.app.state.agent_campaign_reads.campaign_retries(actor, campaign_id)
+
+
 @router.get("/campaigns/{campaign_id}/budget")
 def budget(campaign_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.campaign_budget(actor, campaign_id)

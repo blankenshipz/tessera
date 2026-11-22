@@ -218,6 +218,27 @@ def create_execution_recovery_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def confirmed_exit_code(connection: sqlite3.Connection, operation_id: str) -> int | None:
+    """The exit code the worker reported with its confirmed exit of this operation, if any.
+
+    Evidence only: callers still require ``current_operation_reconciliation`` to say the exit
+    is confirmed and uncontradicted. The worker reports the code before it collects outputs,
+    so a run that failed without leaving outputs (and so never posted a run receipt) still
+    has its code on record (ADR 0063). It is read from the observation event, so no schema
+    changes."""
+    row = connection.execute(
+        """SELECT json_extract(payload_json,'$.exit_code') AS exit_code FROM events
+        WHERE event_type='execution.observation_reported'
+        AND json_extract(payload_json,'$.operation_id')=?
+        AND json_extract(payload_json,'$.observed_state')='exited'
+        AND json_extract(payload_json,'$.termination_confirmed')=1
+        AND json_extract(payload_json,'$.exit_code') IS NOT NULL
+        ORDER BY cursor DESC LIMIT 1""",
+        (operation_id,),
+    ).fetchone()
+    return None if row is None else int(row["exit_code"])
+
+
 def current_operation_reconciliation(
     connection: sqlite3.Connection, operation_id: str
 ) -> dict[str, object] | None:

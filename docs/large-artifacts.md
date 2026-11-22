@@ -63,6 +63,12 @@ future work.
    (the smallest part is 64 KiB), or control refuses a part with HTTP 413, the worker fails the
    upload at once with an error naming the numbers and `TESSERA_MAX_REQUEST_BYTES`; it does not
    retry. A control from before this change advertises nothing and takes whole chunks only.
+   **Resuming after a restart.** `status` lists `partial_chunks`: each chunk whose parts have not
+   all arrived, with the bytes control holds from its start. A restarted worker continues each
+   such chunk at that byte, with whatever part size now fits, so a confirmed part is never sent
+   again and parts stay in order; a chunk control holds whole is not sent again either (a chunk
+   whose digest then fails is dropped by control, and the next attempt restarts it from byte 0).
+   Control answers a part it already holds with what it holds, and the worker accepts that.
    An upload lives 24 hours (`expires_at` is in every receipt). An expired upload no
    longer reserves lease or project budget, and a new `begin` reclaims it and starts again;
    so does a `begin` under a newer lease epoch, which discards bytes sent under the old one.

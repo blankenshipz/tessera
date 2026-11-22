@@ -13,7 +13,15 @@ from .api import idempotency_key
 from .campaign_gate_models import RecordGateDecision
 from .campaign_models import ApproveCampaign, CancelCampaign, SubmitCampaign, approve_payload
 from .campaign_standing import CreateStandingApproval, RevokeStandingApproval
-from .campaign_steering import ReduceCampaignBudget, RevokeCampaignRelease
+from .campaign_steering import (
+    CancelCampaignStage,
+    LimitCampaignConcurrency,
+    PauseCampaign,
+    ReduceCampaignBudget,
+    ResumeCampaign,
+    RevokeCampaignRelease,
+    SteerCampaignPlacement,
+)
 from .campaign_store import CampaignStore
 from .external_agent_api import Actor as external_actor_dep
 from .store import canonical_digest
@@ -97,6 +105,66 @@ def reduce_campaign_budget(
     payload = body.model_dump(mode="json")
     return result(
         store.reduce_campaign_budget(actor, campaign_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/campaigns/{campaign_id}/pause")
+def pause_campaign(
+    campaign_id: str, body: PauseCampaign, actor: Actor, key: Key, store: Campaigns
+) -> JSONResponse:
+    """ADR 0061: stops new stage reservations; running attempts are not touched."""
+    payload = body.model_dump(mode="json")
+    return result(store.pause_campaign(actor, campaign_id, key, canonical_digest(payload), payload))
+
+
+@router.post("/campaigns/{campaign_id}/resume")
+def resume_campaign(
+    campaign_id: str, body: ResumeCampaign, actor: Actor, key: Key, store: Campaigns
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.resume_campaign(actor, campaign_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/campaigns/{campaign_id}/concurrency-limit")
+def limit_campaign_concurrency(
+    campaign_id: str, body: LimitCampaignConcurrency, actor: Actor, key: Key, store: Campaigns
+) -> JSONResponse:
+    """ADR 0061: lower-only cap on stages with an unfinished attempt."""
+    payload = body.model_dump(mode="json")
+    return result(
+        store.limit_campaign_concurrency(
+            actor, campaign_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/campaigns/{campaign_id}/stages/{stage_key}/cancel")
+def cancel_campaign_stage(
+    campaign_id: str,
+    stage_key: str,
+    body: CancelCampaignStage,
+    actor: Actor,
+    key: Key,
+    store: Campaigns,
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return result(
+        store.cancel_campaign_stage(
+            actor, campaign_id, stage_key, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.post("/campaigns/{campaign_id}/placement-steering")
+def steer_campaign_placement(
+    campaign_id: str, body: SteerCampaignPlacement, actor: Actor, key: Key, store: Campaigns
+) -> JSONResponse:
+    """ADR 0060: pin or exclude a stage's approved provider candidates (latest call replaces)."""
+    payload = body.model_dump(mode="json")
+    return result(
+        store.steer_campaign_placement(actor, campaign_id, key, canonical_digest(payload), payload)
     )
 
 

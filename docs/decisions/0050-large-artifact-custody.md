@@ -49,6 +49,12 @@ Chunked input snapshots had a fixed 2 GiB / 8 GiB-per-project bound.
    chunk digest at the last part (a mismatch drops the stored parts, committed), and treats a
    repeated part as a no-op. A mismatch of limits fails fast: no part fits, or a 413, ends the upload
    with an error naming the numbers, never a retry loop. A control without parts is used as before.
+5b. **Resume after a restart.** A worker that restarted between parts used to resend the chunk from
+   byte 0, and control's honest receipt (what it held, more than the part just sent) made the worker
+   refuse the upload on every retry. `status` and an idempotent `begin` now list `partial_chunks`
+   (`seq`, `received_bytes`); the worker continues each partial chunk at that byte, accepts a receipt
+   that reports at least the bytes it sent, and never resends a confirmed part. Ordering and the
+   request-size guarantees of 5a are unchanged.
 6. **Reclamation.** Rejecting a manifest, and a sweep for artifacts no manifest lists, free
    chunk bytes in short batches and record `control.large_artifact_reclaimed` once per
    reclaim. An unmanifested artifact is reclaimed only after its lease is over and it is older

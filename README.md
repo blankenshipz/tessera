@@ -129,10 +129,13 @@ are not available in this demonstrated journey.
 ### Campaigns (ADR 0038)
 
 A session can submit a typed [campaign spec](docs/campaigns.md): a digest-pinned DAG of
-stages with a budget cap, retries for transient failures, data classes and stop rules. One
-human approval of the exact digest lets the in-process runner drive every step (including
-staging one stage's outputs into the next) through the existing checks. A terminal campaign
-has an operational receipt, not a scientific verdict.
+stages with a budget cap, retries for transient failures (including an opt-in, bounded automatic
+retry when the infrastructure killed the container, counted in the approved digest and
+worst-case exposure,
+[ADR 0058](docs/decisions/0058-infrastructure-retry-of-stages.md)), data classes and stop
+rules. One human approval of the exact digest lets the in-process runner drive every step
+(including staging one stage's outputs into the next) through the existing checks. A
+terminal campaign has an operational receipt, not a scientific verdict.
 
 **Standing approvals and scheduled starts.** A human can instead make one decision for a
 whole recurring or chained run: a [standing approval](docs/decisions/0042-standing-approvals-and-scheduled-campaign-starts.md)
@@ -189,8 +192,9 @@ poller config, never plan fields (a stage may request more scratch than the defa
 operator's ceiling, refused at admission when above it,
 [ADR 0059](docs/decisions/0059-operator-scratch-ceiling.md)); on native Linux the container runs as the poller's own
 uid:gid by default so the 0700 output workspace stays writable), `self-hosted` runs the same worker on a server you operate, and
-`salad` GPU stages are refused unless the operator supplies Salad profiles (a billable,
-opt-in third-party path). A vendor is a plugin: the operator's
+`salad` stages are refused unless the operator supplies Salad profiles (a billable,
+opt-in third-party path; a profile is a GPU class or a CPU-only container with operator rates, so a
+stage that needs no GPU does not take one, [ADR 0062](docs/decisions/0062-salad-cpu-only-profiles.md)). A vendor is a plugin: the operator's
 `--campaign-providers` file names it (entry point group `tessera.campaign_providers` or a
 dotted module) and gives it a config section, so adding one never edits the runner.
 Descriptors are validated at registration. `--provider-trust` sets which data classes each
@@ -203,7 +207,14 @@ proxy journals a tunnel when it is admitted and again at close, so an interrupte
 recorded with unknown bytes rather than missing, [ADR 0057](docs/decisions/0057-egress-tunnel-opened-record.md)). A stage input is a snapshot, the
 declared output of an earlier stage (any provider), or an `artifact` pinned by campaign,
 stage, output and sha256 from an earlier campaign; every input and output is indexed in
-`campaign_stage_io`. Each attempt is settled once through a single settlement path with a
+`campaign_stage_io`. A stage may also list ordered `alternate_providers`; the runner then
+places each attempt on the first candidate that is registered, enrolled for the project, trusted
+for the stage's inputs, within the per-run cap and the remaining campaign and program budget, and
+has a free slot, so independent stages run concurrently on different providers. Otherwise it waits
+or fails as a single-provider stage would; it never picks a provider the approved spec does not
+list. The choice and each skipped candidate's reason are on the receipt and in
+`tessera_get_campaign`, and `tessera_steer_campaign_placement` can pin or exclude candidates
+([ADR 0060](docs/decisions/0060-capacity-aware-stage-placement.md)). Each attempt is settled once through a single settlement path with a
 closed basis enum, and a finished or failed attempt releases its hold immediately.
 Outputs above 16 MiB, such as model weights, use chunked [large-artifact custody](docs/large-artifacts.md):
 one sha256 over the whole file, 4 MiB chunks, bounded memory, and an operator-configurable
@@ -218,8 +229,13 @@ specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
 scopes. Steering tools ([ADR 0055](docs/decisions/0055-mcp-steering-tools.md)) dry-run a spec
 (`tessera_validate_campaign_spec`), build a retry spec for the stages that did not succeed
 (`tessera_prepare_stage_retry`), show held grants and releases (`tessera_campaign_grants`) and
-only reduce authority (`tessera_reduce_campaign_budget`, `tessera_revoke_campaign_release`);
-approval, cap or concurrency increases and grant reconciliation stay human. A human still
+only reduce authority (`tessera_reduce_campaign_budget`, `tessera_revoke_campaign_release`).
+Pause and resume (new reservations only; running attempts finish), a lower-only per-campaign
+concurrency limit and cancelling a single stage
+([ADR 0061](docs/decisions/0061-campaign-pause-concurrency-stage-cancel.md):
+`tessera_pause_campaign`, `tessera_resume_campaign`, `tessera_limit_campaign_concurrency`,
+`tessera_cancel_campaign_stage`) are recorded as events and on the receipt; approval, cap or
+concurrency increases and grant reconciliation stay human. A human still
 approves the digest and stages snapshots. See
 [docs/mcp-campaign-client-path.md](docs/mcp-campaign-client-path.md).
 

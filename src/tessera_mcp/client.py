@@ -158,7 +158,7 @@ class ControlClient:
         )
 
     async def campaign_view(self, campaign_id, view):
-        if view not in {"outputs", "logs", "budget", "grants"}:
+        if view not in {"outputs", "logs", "budget", "grants", "retries"}:
             raise ControlError("Unknown campaign view")
         return await self._request("GET", f"/campaigns/{segment(campaign_id)}/{view}")
 
@@ -194,6 +194,53 @@ class ControlClient:
             body={
                 "expected_revision": expected_revision,
                 "budget_cap_cents": budget_cap_cents,
+                "reason": reason,
+            },
+            key=idempotency_key,
+        )
+
+    async def _steer(self, campaign_id, action, body, key):
+        return await self._request(
+            "POST", f"/campaigns/{segment(campaign_id)}/{action}", body=body, key=key
+        )
+
+    async def pause_campaign(self, campaign_id, expected_revision, reason, idempotency_key):
+        body = {"expected_revision": expected_revision, "reason": reason}
+        return await self._steer(campaign_id, "pause", body, idempotency_key)
+
+    async def resume_campaign(self, campaign_id, expected_revision, reason, idempotency_key):
+        body = {"expected_revision": expected_revision, "reason": reason}
+        return await self._steer(campaign_id, "resume", body, idempotency_key)
+
+    async def limit_campaign_concurrency(
+        self, campaign_id, expected_revision, max_concurrent_stages, reason, idempotency_key
+    ):
+        body = {
+            "expected_revision": expected_revision,
+            "max_concurrent_stages": max_concurrent_stages,
+            "reason": reason,
+        }
+        return await self._steer(campaign_id, "concurrency-limit", body, idempotency_key)
+
+    async def cancel_campaign_stage(
+        self, campaign_id, stage_key, expected_revision, reason, idempotency_key
+    ):
+        body = {"expected_revision": expected_revision, "reason": reason}
+        return await self._steer(
+            campaign_id, f"stages/{segment(stage_key)}/cancel", body, idempotency_key
+        )
+
+    async def steer_campaign_placement(
+        self, campaign_id, expected_revision, stage_key, pin, exclude, reason, idempotency_key
+    ):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/placement-steering",
+            body={
+                "expected_revision": expected_revision,
+                "stage_key": stage_key,
+                "pin": pin,
+                "exclude": list(exclude),
                 "reason": reason,
             },
             key=idempotency_key,

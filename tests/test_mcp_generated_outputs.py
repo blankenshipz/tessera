@@ -12,9 +12,10 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from mcp_required import require_mcp
 from test_generated_outputs import output_setup as output_setup
 
-pytest.importorskip("mcp")
+require_mcp()
 
 from mcp.shared.memory import create_connected_server_and_client_session  # noqa: E402
 

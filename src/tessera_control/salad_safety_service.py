@@ -649,13 +649,23 @@ class SaladSafetyService:
         result = self._send(row, "gpu_class")
         o = result.observation
         p = RemoteProposal.model_validate_json(row["proposal"])
+        cpu_only = p.selection.resources.gpu_count == 0
         if (
             result.status != "observed"
             or type(o) is not dict
             or o.get("selection_digest") != canonical_digest(p.selection.model_dump(mode="json"))
-            or normalized_uuid(o.get("gpu_class_id"))
-            != normalized_uuid(p.selection.resources.gpu_class)
-            or o.get("price_basis") != "published_gpu_hourly_rate_not_actual_cost"
+            or (
+                # A CPU-only route has no GPU class: its rate is the operator's reviewed CPU
+                # rate (ADR 0062), never a published GPU price.
+                o.get("gpu_class_id") is not None
+                or o.get("price_basis") != "operator_cpu_rate_not_actual_cost"
+                if cpu_only
+                else (
+                    normalized_uuid(o.get("gpu_class_id"))
+                    != normalized_uuid(p.selection.resources.gpu_class)
+                    or o.get("price_basis") != "published_gpu_hourly_rate_not_actual_cost"
+                )
+            )
             or type(o.get("hourly_price_usd")) is not str
         ):
             raise ValueError("rate_observation_invalid")

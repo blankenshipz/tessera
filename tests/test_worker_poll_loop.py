@@ -133,8 +133,7 @@ def test_config_file_loads_into_the_poller_config(tmp_path):
         {"unknown_key": 1},
         {"allowed_images": []},
         {"poll_seconds": 0},
-        # ADR 0059 raised the memory bound to 64 GiB, so refuse a value above it.
-        {"memory_bytes": 65 * 1024 * 1024 * 1024},
+        {"memory_bytes": 64 * 1024**3 + 1},  # above the ceiling ADR 0059 raised from 1 GiB
         {"memory_bytes": "1073741824"},
         {"memory_bytes": True},
         {"scratch_bytes": 0},

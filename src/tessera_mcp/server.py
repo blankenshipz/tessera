@@ -30,6 +30,7 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_outputs": "artifact:read",
     "tessera_campaign_logs": "campaign:logs",
     "tessera_campaign_budget": "budget:read",
+    "tessera_campaign_retries": "campaign:read",
     "tessera_campaign_standing_status": "campaign:read",
     "tessera_campaign_gate_decisions": "campaign:read",
     # ADR 0055: steering. Validation is a dry-run submit; the others only reduce authority.
@@ -38,6 +39,13 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_grants": "campaign:logs",
     "tessera_reduce_campaign_budget": "campaign:cancel",
     "tessera_revoke_campaign_release": "campaign:cancel",
+    # ADR 0061: pause/resume, a lower-only concurrency limit and single-stage cancel.
+    "tessera_pause_campaign": "campaign:cancel",
+    "tessera_resume_campaign": "campaign:cancel",
+    "tessera_limit_campaign_concurrency": "campaign:cancel",
+    "tessera_cancel_campaign_stage": "campaign:cancel",
+    # ADR 0060: filters a stage's approved provider candidates; never adds one.
+    "tessera_steer_campaign_placement": "campaign:cancel",
 }
 # Further scopes a tool needs besides its own: it is registered only when all are enrolled, so a
 # tool never appears in the list only to fail at runtime.
@@ -88,12 +96,14 @@ def register_campaign_tools(
         return await client.submit_campaign(spec.model_dump(mode="json"), idempotency_key)
 
     async def tessera_get_campaign(campaign_id: str) -> dict[str, Any]:
-        """Read any campaign in this project: status, stages, attempts and intents.
+        """Read any campaign in this project: status, stages, attempts, intents and placement.
 
         Reads are project-wide (campaign:read), not limited to your own submissions; only
         cancel is submitter-only. The receipt is a separate record: use
         tessera_get_campaign_receipt once the campaign is terminal. Status is recorded
-        platform state, not evidence of a scientific result.
+        platform state, not evidence of a scientific result. ``placement`` lists, for each
+        stage with alternate_providers, the candidate each attempt was placed on, why every
+        other candidate was skipped, any steering and, while it waits, the reasons.
         """
         return await client.campaign(campaign_id)
 
@@ -130,6 +140,16 @@ def register_campaign_tools(
         Tessera retains no raw stdout/stderr; these are the recorded, bounded diagnostics.
         """
         return await client.campaign_view(campaign_id, "logs")
+
+    async def tessera_campaign_retries(campaign_id: str) -> dict[str, Any]:
+        """Read a campaign's infrastructure-retry state (campaign:read).
+
+        Per stage: the retry bound the approved spec set, the attempts that ended for an
+        infrastructure reason (container killed), how many retries remain, and the providers
+        a retry may move to. Read-only; stop retrying by cancelling the campaign with
+        tessera_cancel_campaign.
+        """
+        return await client.campaign_view(campaign_id, "retries")
 
     async def tessera_campaign_budget(campaign_id: str) -> dict[str, Any]:
         """Read a campaign's budget cap, holds and settled cents (budget:read)."""
@@ -236,6 +256,77 @@ def register_campaign_tools(
             campaign_id, release_id, expected_revision, reason, idempotency_key
         )
 
+    async def tessera_pause_campaign(
+        campaign_id: str, expected_revision: int, reason: str, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Pause your running campaign: no NEW stage is started or prepared (campaign:cancel).
+
+        Attempts already running finish and settle as usual; cancel, the budget cap and the
+        deadline are unchanged (a long pause can run out the deadline). Read-back: the campaign's
+        events show campaign.paused and campaign.stage_waiting_paused.
+        """
+        return await client.pause_campaign(campaign_id, expected_revision, reason, idempotency_key)
+
+    async def tessera_resume_campaign(
+        campaign_id: str, expected_revision: int, reason: str, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Lift a pause you set. A pause a person set can be lifted only by a person."""
+        return await client.resume_campaign(campaign_id, expected_revision, reason, idempotency_key)
+
+    async def tessera_limit_campaign_concurrency(
+        campaign_id: str,
+        expected_revision: int,
+        max_concurrent_stages: int,
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Cap how many of your campaign's stages may run at once. Lower-only.
+
+        An existing limit can only be lowered; the project's own concurrency (the operator's
+        limit) still applies on top and cannot be raised by any tool.
+        """
+        return await client.limit_campaign_concurrency(
+            campaign_id, expected_revision, max_concurrent_stages, reason, idempotency_key
+        )
+
+    async def tessera_cancel_campaign_stage(
+        campaign_id: str,
+        stage_key: str,
+        expected_revision: int,
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Cancel one unfinished stage of your campaign; stages that read it are skipped.
+
+        A running attempt's grant is revoked and reconciled by the platform, not killed at once.
+        The campaign ends `stopped` (reason stage_cancelled) if nothing else failed. Reduce-only.
+        """
+        return await client.cancel_campaign_stage(
+            campaign_id, stage_key, expected_revision, reason, idempotency_key
+        )
+
+    async def tessera_steer_campaign_placement(
+        campaign_id: str,
+        expected_revision: int,
+        stage_key: str,
+        reason: str,
+        idempotency_key: str,
+        pin: str | None = None,
+        exclude: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Pin or exclude approved provider candidates of one stage of your campaign.
+
+        Only providers the approved spec lists for the stage (its provider and
+        alternate_providers) can be named, at least one must remain, and it applies to the
+        stage's next placement: an attempt already placed keeps its provider. Sending it again
+        replaces the previous pin/exclude (an empty exclude and no pin clears it). Read where
+        each stage was placed, and why other candidates were skipped, in the ``placement``
+        field of tessera_get_campaign.
+        """
+        return await client.steer_campaign_placement(
+            campaign_id, expected_revision, stage_key, pin, exclude or [], reason, idempotency_key
+        )
+
     # A revoked release cannot be restored by an agent: only a human issues a new one.
     destructive = ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
@@ -244,6 +335,11 @@ def register_campaign_tools(
         "tessera_submit_campaign",
         "tessera_cancel_campaign",
         "tessera_reduce_campaign_budget",
+        "tessera_pause_campaign",
+        "tessera_resume_campaign",
+        "tessera_limit_campaign_concurrency",
+        "tessera_cancel_campaign_stage",
+        "tessera_steer_campaign_placement",
     }
     for function in (
         tessera_submit_campaign,
@@ -254,6 +350,7 @@ def register_campaign_tools(
         tessera_campaign_outputs,
         tessera_campaign_logs,
         tessera_campaign_budget,
+        tessera_campaign_retries,
         tessera_campaign_standing_status,
         tessera_campaign_gate_decisions,
         tessera_cancel_campaign,
@@ -262,6 +359,11 @@ def register_campaign_tools(
         tessera_campaign_grants,
         tessera_reduce_campaign_budget,
         tessera_revoke_campaign_release,
+        tessera_pause_campaign,
+        tessera_resume_campaign,
+        tessera_limit_campaign_concurrency,
+        tessera_cancel_campaign_stage,
+        tessera_steer_campaign_placement,
     ):
         if wanted(function.__name__):
             if function.__name__ == "tessera_revoke_campaign_release":

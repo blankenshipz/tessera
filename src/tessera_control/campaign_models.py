@@ -6,6 +6,7 @@ registered compute provider of each stage and approval binds the spec as submitt
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -95,11 +96,45 @@ class StageSource(_Strict):
 StageInput = Annotated[SnapshotSource | StageSource, Field(discriminator="kind")]
 
 
+# Exit codes that mean the infrastructure killed the container (SIGKILL from the engine or
+# the kernel's out-of-memory killer, ADR 0058) rather than the task failing.
+DEFAULT_INFRA_EXIT_CODES = (137,)
+DEFAULT_INFRA_RETRIES = 0
+
+
 class RetryPolicy(_Strict):
     max_attempts: Annotated[int, Field(strict=True, ge=1, le=5)] = 1
     transient_exit_codes: Annotated[
         list[Annotated[int, Field(strict=True, ge=1, le=255)]], Field(max_length=16)
     ] = []
+    # ADR 0058: extra attempts, beyond max_attempts, that an infrastructure failure (the
+    # container killed, an infra exit code) may use. Off unless the spec says so, so an
+    # approval never covers spend its approver did not see: when enabled it is in the digest
+    # and counted in the stage's worst-case exposure. Never for a task failure, a policy
+    # refusal or a budget refusal. Each is a new attempt with its own hold and receipt.
+    infra_retries: Annotated[int, Field(strict=True, ge=0, le=3)] = DEFAULT_INFRA_RETRIES
+    infra_exit_codes: Annotated[
+        list[Annotated[int, Field(strict=True, ge=1, le=255)]], Field(min_length=1, max_length=8)
+    ] = list(DEFAULT_INFRA_EXIT_CODES)  # noqa: RUF012 - pydantic copies defaults
+    # Other registered providers an infrastructure retry may move to, in order. Each must
+    # already be registered, run the same runtime and admit the stage's inputs (checked at
+    # submit and approval); the campaign's own provider ban still applies.
+    reroute_providers: Annotated[
+        list[Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,63}$")]],
+        Field(max_length=4),
+    ] = []  # noqa: RUF012
+
+    @model_serializer(mode="wrap")
+    def _omit_defaults(self, handler):
+        """Absent stays absent: a spec written before ADR 0058 keeps its digest."""
+        value = handler(self)
+        if self.infra_retries == DEFAULT_INFRA_RETRIES:
+            value.pop("infra_retries", None)
+        if tuple(self.infra_exit_codes) == DEFAULT_INFRA_EXIT_CODES:
+            value.pop("infra_exit_codes", None)
+        if not self.reroute_providers:
+            value.pop("reroute_providers", None)
+        return value
 
 
 class MetricSpec(_Strict):
@@ -171,6 +206,17 @@ class SaladStageSpec(_Strict):
     workload: WorkloadContractV1
     program: SaladProgramTemplate
     grant_ttl_seconds: Annotated[int, Field(strict=True, ge=3600, le=43200)] = 21600
+    # Whether the stage needs a GPU. The default is True, which is every existing Salad stage;
+    # ``false`` declares a CPU-only stage that may run only on an operator CPU profile (and a GPU
+    # stage never on one). Absent when True, so existing spec digests are unchanged.
+    gpu: bool = True
+
+    @model_serializer(mode="wrap")
+    def _omit_default_gpu(self, handler):
+        value = handler(self)
+        if self.gpu:
+            value.pop("gpu", None)
+        return value
 
 
 class StageSpec(_Strict):
@@ -340,6 +386,30 @@ class GateEvidenceSpec(_Strict):
     metrics: Annotated[list[GateMetricDeclaration], Field(min_length=1, max_length=16)]
 
 
+# ADR 0060: a stage may name further provider candidates after its own, in order.
+MAX_ALTERNATE_PROVIDERS = 4
+
+
+class ProviderCandidate(_Strict):
+    """One more place a stage may run (ADR 0060). Approved with the spec digest.
+
+    ``max_exposure_cents`` is this candidate's cost estimate, held while it runs; absent, the
+    stage's own ``max_exposure_cents`` is used. It may never exceed the stage's value, which
+    stays the per-run cap a person approved."""
+
+    provider: ProviderId
+    runtime: ProviderId
+    provider_config: dict[str, Any] = {}  # noqa: RUF012 - pydantic copies defaults
+    max_exposure_cents: Cents | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler):
+        value = handler(self)
+        if self.max_exposure_cents is None:
+            value.pop("max_exposure_cents", None)
+        return value
+
+
 class StageV2(_Strict):
     key: Key
     provider: ProviderId
@@ -363,6 +433,11 @@ class StageV2(_Strict):
     send_classes: Annotated[list[TrustClass], Field(min_length=1, max_length=3)] | None = None
     # Absent keeps every existing spec digest unchanged.
     gate_evidence: GateEvidenceSpec | None = None
+    # ADR 0060: ordered further candidates after ``provider``; absent keeps the digest.
+    alternate_providers: (
+        Annotated[list[ProviderCandidate], Field(min_length=1, max_length=MAX_ALTERNATE_PROVIDERS)]
+        | None
+    ) = None
 
     @model_serializer(mode="wrap")
     def _omit_absent(self, handler):
@@ -373,6 +448,8 @@ class StageV2(_Strict):
             value.pop("gate_evidence", None)
         if self.scratch_bytes is None:
             value.pop("scratch_bytes", None)
+        if self.alternate_providers is None:
+            value.pop("alternate_providers", None)
         return value
 
 
@@ -466,6 +543,14 @@ class NormalOutput:
 
 
 @dataclass(frozen=True)
+class NormalCandidate:
+    provider: str
+    runtime: str
+    provider_config: dict[str, Any]
+    max_exposure_cents: int | None = None
+
+
+@dataclass(frozen=True)
 class NormalStage:
     key: str
     provider: str
@@ -489,10 +574,47 @@ class NormalStage:
     # v1 only: the spec-level (or Salad block) worker; v2 stages take the provider's.
     worker_principal_id: str | None = None
     scratch_bytes: int | None = None
+    # ADR 0060: further provider candidates, in order, after ``provider``.
+    alternates: tuple[NormalCandidate, ...] = ()
 
     @property
     def output_paths(self) -> list[str]:
         return [item.path for item in self.outputs]
+
+    @property
+    def candidate_ids(self) -> tuple[str, ...]:
+        """Every provider the approved spec lets this stage run on, in placement order."""
+        return (self.provider, *(item.provider for item in self.alternates))
+
+
+def stage_on_candidate(stage: NormalStage, provider_id: str) -> NormalStage:
+    """The stage as it runs on one of its approved candidates (ADR 0060).
+
+    The candidate's runtime, provider_config and cost estimate replace the stage's; the
+    candidate list is kept so the stage can be placed again. A provider id the stage does not
+    name is a programming error (KeyError): nothing outside the approved list is reachable."""
+    if provider_id == stage.provider:
+        return stage
+    for item in stage.alternates:
+        if item.provider == provider_id:
+            return dataclasses.replace(
+                stage,
+                provider=item.provider,
+                runtime=item.runtime,
+                provider_config=dict(item.provider_config),
+                max_exposure_cents=(
+                    stage.max_exposure_cents
+                    if item.max_exposure_cents is None
+                    else item.max_exposure_cents
+                ),
+                worker_principal_id=None,
+            )
+    raise KeyError(f"Stage {stage.key} has no candidate provider {provider_id!r}")
+
+
+def stage_candidates(stage: NormalStage) -> tuple[NormalStage, ...]:
+    """Each approved candidate of a stage, as the stage would run on it, in order."""
+    return tuple(stage_on_candidate(stage, pid) for pid in stage.candidate_ids)
 
 
 @dataclass(frozen=True)
@@ -645,6 +767,15 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                 send_classes=None if stage.send_classes is None else tuple(stage.send_classes),
                 gate_evidence=stage.gate_evidence,
                 scratch_bytes=stage.scratch_bytes,
+                alternates=tuple(
+                    NormalCandidate(
+                        item.provider,
+                        item.runtime,
+                        dict(item.provider_config),
+                        item.max_exposure_cents,
+                    )
+                    for item in stage.alternate_providers or ()
+                ),
             )
         )
     return NormalSpec(
@@ -805,16 +936,48 @@ def validate_structure(spec: NormalSpec) -> None:
         for rule in stage.stop_when:
             if rule.metric not in metric_names:
                 raise ValueError(f"Stage {stage.key} stop rule names unknown metric")
-        worst_hold = stage.max_exposure_cents * stage.retry.max_attempts
+        reroutes = stage.retry.reroute_providers
+        if len(set(reroutes)) != len(reroutes) or stage.provider in reroutes:
+            raise ValueError(f"Stage {stage.key}: reroute_providers must be distinct from it")
+        if reroutes and stage.alternates:
+            raise ValueError(
+                f"Stage {stage.key}: use alternate_providers (ADR 0060) or "
+                "retry.reroute_providers (ADR 0058) to move a stage between providers, not both"
+            )
+        banned = set(reroutes) & set(spec.forbid_providers)
+        if banned:
+            raise ValueError(
+                f"Stage {stage.key}: reroute provider {sorted(banned)[0]} is forbidden"
+            )
+        # An enabled infrastructure retry is another attempt with its own hold, so it counts
+        # (billable providers included); with it off this is the formula as it always was.
+        worst_hold = stage.max_exposure_cents * (
+            stage.retry.max_attempts + stage.retry.infra_retries
+        )
         if worst_hold > EXPERIMENT_CEILING_CENTS:
             raise ValueError(
-                f"Stage {stage.key} max_exposure_cents x retry.max_attempts = {worst_hold} "
+                f"Stage {stage.key} max_exposure_cents x (max_attempts + infra_retries) = "
+                f"{worst_hold} "
                 f"exceeds the experiment budget ceiling of {EXPERIMENT_CEILING_CENTS} cents"
             )
         if stage.max_exposure_cents > spec.budget_cap_cents:
             raise ValueError(f"Stage {stage.key} hold exceeds the campaign budget cap")
         if stage.provider in spec.forbid_providers:
             raise ValueError(f"Stage {stage.key}: provider {stage.provider} is forbidden")
+        if len(set(stage.candidate_ids)) != len(stage.candidate_ids):
+            raise ValueError(f"Stage {stage.key}: provider candidates must be distinct")
+        for item in stage.alternates:
+            if item.provider in spec.forbid_providers:
+                raise ValueError(f"Stage {stage.key}: provider {item.provider} is forbidden")
+            if (
+                item.max_exposure_cents is not None
+                and item.max_exposure_cents > stage.max_exposure_cents
+            ):
+                # The stage's own value is the per-run cap the approver saw (ADR 0060).
+                raise ValueError(
+                    f"Stage {stage.key}: candidate {item.provider} estimate exceeds the "
+                    "stage's max_exposure_cents"
+                )
     if sum(len(stage.inputs) for stage in spec.stages) > spec.max_edges:
         raise ValueError(f"Campaign declares more than {spec.max_edges} stage inputs in total")
     classes = stage_classes(spec)
@@ -832,7 +995,8 @@ def validate_structure(spec: NormalSpec) -> None:
                 "has non-public inputs"
             )
         if _PROVIDER_CHECKS.get():
-            _validate_provider(stage)
+            for candidate in stage_candidates(stage):
+                _validate_provider(candidate)
 
 
 def _validate_provider(stage: NormalStage) -> None:
@@ -973,6 +1137,7 @@ FAILURE_CLASSES = (
     "budget_refused",
     "exposure_unknown",
     "t1_salad_unclaimed",
+    "infra_container_killed",
     "not_started",
     "exit_confirmed_unresolved",
     "cancelled",

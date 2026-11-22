@@ -149,6 +149,20 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   `unknown`, which makes the stage
   `blocked_unknown` and the campaign `blocked` until a human reconciles it. A retry uses
   a fresh grant under the same approval. A scientific replicate is a separate stage.
+- **Infrastructure retries (ADR 0058).** A confirmed exit with a code the spec names as
+  infrastructure (`retry.infra_exit_codes`, default 137: the container was killed) is
+  retried by the runner itself, up to `retry.infra_retries` (off by default; 0 to 3) extra
+  attempts that use no scientific retry; enabling it puts it in the approved digest and in the
+  stage's worst-case exposure (and a Salad stage's per-task ceiling), the approval view
+  (`infra_retry_policy` on submit and every read) states it per stage, and it applies on the
+  confirmed-exit path (ADR 0053) too. Each is a new attempt with its own hold (against
+  the campaign cap and project limits), grant, receipt and recorded reason; a task failure,
+  a refused step, a policy or budget refusal and any unknown effect are never retried this
+  way. `retry.reroute_providers` may name other registered, unbilled worker-grant providers
+  of the same runtime for the retry to move to; they are part of the approved spec and
+  admitted like the stage's own provider at submit, approval and again at reservation (a
+  rerouted attempt drops the stage's `provider_config`). `tessera_campaign_retries` shows the state and
+  `tessera_cancel_campaign` stops it.
 - **Confirmed exits (ADR 0053).** An `admitted`, `running` or `unknown` attempt whose worker
   confirmed the exit, with no contradicting observation, is resolved by the runner on its next tick:
   the grant and its slot are released and the cost recorded (never above the hold), the attempt becomes
@@ -322,6 +336,22 @@ outputs must equal the contract, `max_duration_seconds` is at most 3600 (the Kub
 package limit), and every snapshot input must be recorded public unless the provider trust
 setting says otherwise. A stage with several inputs (snapshot, `stage` and `artifact`) is
 composed into one snapshot before staging, so the executor still receives one input.
+
+**CPU-only profiles ([ADR 0062](decisions/0062-salad-cpu-only-profiles.md)).** A profile with
+no `gpu_class` and a `cpu_rate` (`vcpu_hour_usd`, `memory_gb_hour_usd`: the operator's rates in
+USD per hour) places a stage on a Salad container with no GPU, for a simple baseline that does
+not need one. A stage declares `salad.gpu: false` to use one; the default (`true`) is a GPU
+stage, and a stage and profile of different kinds are refused with 409 at submit and approval,
+so a CPU stage never takes a GPU and a GPU stage never lands on a CPU container. The route
+renders no GPU field. Its cost is estimated from the two rates, which are part of the reviewed
+route (an estimate input, never invoice proof, labelled `operator_cpu_rate_not_actual_cost`).
+The operator's per-run cap is enforced at admission: the profile's `max_run_cents` bounds the
+stage's `max_exposure_cents`, and the worst case of the whole `max_duration_seconds` at the
+rates must fit that hold or the stage is refused (409); the guardian then enforces the same
+cap while the run is billed. Salad publishes no CPU availability read, so a CPU preflight
+reports `available: true` as a **constant**: it is not evidence that Salad has CPU capacity, and
+must not be read as one. The preflight checks the replica quota only; allocation is left to Salad
+(a stalled one ends at the route deadline). The provider's CPU-only group shape is untested live.
 
 **Data class.** By default a Salad stage may consume only snapshot sources the control
 plane records public (ADR 0039: a human declaration with license and source evidence at

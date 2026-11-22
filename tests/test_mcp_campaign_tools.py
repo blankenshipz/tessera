@@ -7,8 +7,9 @@ import json
 
 import httpx
 import pytest
+from mcp_required import require_mcp
 
-pytest.importorskip("mcp")
+require_mcp()
 
 from tessera_mcp.client import ControlClient  # noqa: E402
 from tessera_mcp.config import Config  # noqa: E402
@@ -86,6 +87,7 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_campaign_outputs",
         "tessera_campaign_logs",
         "tessera_campaign_budget",
+        "tessera_campaign_retries",
         "tessera_campaign_standing_status",
         "tessera_campaign_gate_decisions",
         # ADR 0055 steering: a dry-run, a grant read, and two reduce-only actions.
@@ -93,6 +95,13 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_campaign_grants",
         "tessera_reduce_campaign_budget",
         "tessera_revoke_campaign_release",
+        # ADR 0061: pause/resume, lower-only concurrency limit, single-stage cancel.
+        "tessera_pause_campaign",
+        "tessera_resume_campaign",
+        "tessera_limit_campaign_concurrency",
+        "tessera_cancel_campaign_stage",
+        # ADR 0060: filters a stage's approved provider candidates.
+        "tessera_steer_campaign_placement",
     }
     assert "tessera_list_snapshots" in tools
     assert tools["tessera_get_campaign"].annotations.readOnlyHint is True

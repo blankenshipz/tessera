@@ -64,6 +64,35 @@ def route_window_limit(target, plan_max_duration_seconds):
     return plan_max_duration_seconds
 
 
+_Rate = Annotated[str, StringConstraints(pattern=r"^(?:0|[1-9][0-9]{0,3})(?:\.[0-9]{1,6})?$")]
+
+
+class CpuRate(Frozen):
+    """Operator-configured CPU-only Salad rates (USD per hour), reviewed with the route.
+
+    A CPU-only container has no published GPU class rate to read, so the estimate comes from
+    these two operator rates. They are an estimate input, never invoice or cost proof.
+    """
+
+    vcpu_hour_usd: _Rate
+    memory_gb_hour_usd: _Rate
+
+    @model_validator(mode="after")
+    def positive(self):
+        if not (float(self.vcpu_hour_usd) > 0 and float(self.memory_gb_hour_usd) >= 0):
+            raise ValueError("CPU rates must be positive (memory may be zero)")
+        return self
+
+    def hourly_usd(self, cpu_millicores: int, memory_mb: int):
+        """Exact Decimal hourly rate of one container of this shape."""
+        from decimal import Decimal
+
+        return (
+            Decimal(self.vcpu_hour_usd) * Decimal(cpu_millicores) / 1000
+            + Decimal(self.memory_gb_hour_usd) * Decimal(memory_mb) / 1024
+        )
+
+
 class SaladExecution(Frozen):
     """Exact human-reviewed executable profile, not evidence of provider enforcement."""
 
@@ -93,6 +122,9 @@ class SaladExecution(Frozen):
     watchdog_profile: Digest
     max_cost_cents: int = Field(ge=0, le=10000)
     credit_exposure: Literal["unknown_blocks_new_work_credit_not_hard_cap"]
+    # Present only on a CPU-only route (no GPU class); absent keeps every GPU route's bytes and
+    # digests unchanged.
+    cpu_rate: CpuRate | None = None
     gateway: Literal[False] = False
     ssh: Literal[False] = False
     exec: Literal[False] = False
@@ -107,6 +139,8 @@ class SaladExecution(Frozen):
             data.pop("argv_binding", None)
         if self.workload is None:
             data.pop("workload", None)
+        if self.cpu_rate is None:
+            data.pop("cpu_rate", None)
         return data
 
     @model_validator(mode="after")
@@ -242,7 +276,12 @@ class ExecutionSelection(Frozen):
     def profile(self):
         if (self.target == "salad_container") != (self.salad is not None):
             raise ValueError("only Salad containers require the narrow Salad profile")
-        work = self.salad.execution.workload if self.salad and self.salad.execution else None
+        execution = self.salad.execution if self.salad else None
+        if execution is not None and execution.cpu_rate is not None and self.resources.gpu_count:
+            raise ValueError("CPU rates belong only to a CPU-only route")
+        # (A CPU-only route without rates still parses, so a stored proposal keeps working for
+        # stop and reconcile; admission and the transport require the rates.)
+        work = execution.workload if execution else None
         if work is not None:
             # A declared input is the reviewed data snapshot of this route, never another.
             if work.input is not None and work.input.snapshot_digest != self.manifests.data:

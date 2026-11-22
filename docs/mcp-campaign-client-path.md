@@ -22,15 +22,20 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_campaign_outputs` | `GET /campaigns/{id}/outputs` | `artifact:read` |
 | `tessera_campaign_logs` | `GET /campaigns/{id}/logs` | `campaign:logs` |
 | `tessera_campaign_budget` | `GET /campaigns/{id}/budget` | `budget:read` |
+| `tessera_campaign_retries` | `GET /campaigns/{id}/retries` | `campaign:read` |
 | `tessera_campaign_standing_status` | `GET /projects/{p}/agent-standing-status` | `campaign:read` |
 | `tessera_campaign_gate_decisions` | `GET /campaigns/{id}/gate-decisions` | `campaign:read` |
 | `tessera_validate_campaign_spec` | `POST /projects/{p}/campaign-specs/validate` | `campaign:submit` |
 | `tessera_campaign_grants` | `GET /campaigns/{id}/grants` | `campaign:logs` |
 | `tessera_reduce_campaign_budget` | `POST /campaigns/{id}/budget-reduction` | `campaign:cancel` |
 | `tessera_revoke_campaign_release` | `POST /campaigns/{id}/releases/{release}/revoke` | `campaign:cancel` |
+| `tessera_pause_campaign` | `POST /campaigns/{id}/pause` | `campaign:cancel` |
+| `tessera_resume_campaign` | `POST /campaigns/{id}/resume` | `campaign:cancel` |
+| `tessera_limit_campaign_concurrency` | `POST /campaigns/{id}/concurrency-limit` | `campaign:cancel` |
+| `tessera_cancel_campaign_stage` | `POST /campaigns/{id}/stages/{stage}/cancel` | `campaign:cancel` |
 | `tessera_prepare_stage_retry` | `GET /campaigns/{id}` and `/outputs` (offline build) | `campaign:read` + `artifact:read` (both needed to register it) |
 
-The last five are the steering tools of [ADR 0055](decisions/0055-mcp-steering-tools.md); the audit is in
+The last nine are the steering tools of [ADR 0055](decisions/0055-mcp-steering-tools.md) and [ADR 0061](decisions/0061-campaign-pause-concurrency-stage-cancel.md) (pause and resume, a lower-only concurrency limit, single-stage cancel); the audit is in
 [mcp-steering-gaps.md](mcp-steering-gaps.md). Validation is a dry run; the budget reduction and the
 release revocation only reduce authority and apply to the submitter's own campaigns; the retry tool
 builds a new spec and submits nothing. No tool approves, raises a cap, reconciles a grant or releases data.

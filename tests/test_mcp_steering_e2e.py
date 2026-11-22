@@ -313,3 +313,102 @@ def test_an_agent_steers_a_three_stage_campaign_with_a_gate_over_mcp_only(tmp_pa
         "tessera_reduce_campaign_budget",
         "tessera_cancel_campaign",
     } <= set(steer.calls)
+
+
+def test_an_agent_pauses_limits_and_cancels_a_stage_over_mcp_only(tmp_path):
+    from provider_trust_fixture import DERIVED, install_trust
+
+    sched = Sched(tmp_path)
+    world, env = sched.world, sched.env
+    cp.configure_providers({"local_docker": {"worker_principal_id": env.worker["id"]}})
+    install_trust({"local-docker": (DERIVED, [env.worker["id"]])})
+    steer = Steer(sched, tmp_path)
+    spec = _spec(
+        "steered", _stage(env, "s1"), _stage(env, "s2", upstream="s1"), _stage(env, "s3"), cap=10
+    )
+    submitted = steer("tessera_submit_campaign", spec=spec, idempotency_key="submit-steered")
+    c = submitted["id"]
+    assert _human_approve(env, submitted)  # HUMAN: the digest
+
+    def attempts():
+        return world.attempts(c)
+
+    # Lower-only concurrency: one stage at a time; raising it is refused.
+    steer(
+        "tessera_limit_campaign_concurrency",
+        campaign_id=c,
+        expected_revision=steer.revision(c),
+        max_concurrent_stages=1,
+        reason="one at a time",
+        idempotency_key="limit-1",
+    )
+    with pytest.raises(ToolError):
+        steer(
+            "tessera_limit_campaign_concurrency",
+            campaign_id=c,
+            expected_revision=steer.revision(c),
+            max_concurrent_stages=2,
+            reason="raise",
+            idempotency_key="limit-2",
+        )
+
+    # Pause before anything runs: the loop reserves nothing and says why.
+    steer(
+        "tessera_pause_campaign",
+        campaign_id=c,
+        expected_revision=steer.revision(c),
+        reason="hold",
+        idempotency_key="pause-1",
+    )
+    for _ in range(8):
+        world.runner.tick()
+    assert attempts() == [] and world.status(c) == "running"
+    assert {e["stage_key"] for e in _events(env, "campaign.stage_waiting_paused")} >= {"s1", "s3"}
+
+    steer(
+        "tessera_resume_campaign",
+        campaign_id=c,
+        expected_revision=steer.revision(c),
+        reason="go",
+        idempotency_key="resume-1",
+    )
+    # HUMAN: an operator pause. The agent cannot lift it; only a person can.
+    human = env.human()
+    body = {"expected_revision": steer.revision(c), "reason": "operator hold"}
+    assert env.store.pause_campaign(human, c, "h-pause", canonical_digest(body), body)[0] == 200
+    with pytest.raises(ToolError):
+        steer(
+            "tessera_resume_campaign",
+            campaign_id=c,
+            expected_revision=steer.revision(c),
+            reason="agent tries",
+            idempotency_key="resume-2",
+        )
+    body = {"expected_revision": steer.revision(c), "reason": "operator done"}
+    assert env.store.resume_campaign(human, c, "h-resume", canonical_digest(body), body)[0] == 200
+
+    # Cancel the dependent stage while it is still pending; the rest finishes on its own.
+    steer(
+        "tessera_cancel_campaign_stage",
+        campaign_id=c,
+        stage_key="s2",
+        expected_revision=steer.revision(c),
+        reason="not needed",
+        idempotency_key="cancel-s2",
+    )
+    world.tick_all(c)
+    assert world.stages(c) == {"s1": "succeeded", "s2": "cancelled", "s3": "succeeded"}
+    assert world.status(c) == "stopped", dump(world, c)
+    assert {a["stage_key"] for a in attempts()} == {"s1", "s3"}  # s2 never ran
+    receipt = steer("tessera_get_campaign_receipt", campaign_id=c)["receipt"]
+    assert receipt["steering"]["max_concurrent_stages"] == 1
+    assert receipt["steering"]["pause_count"] == 2  # the agent's and the operator's
+    assert [x["stage_key"] for x in receipt["steering"]["stage_cancels"]] == ["s2"]
+    for event in (
+        "campaign.concurrency_limited",
+        "campaign.paused",
+        "campaign.resumed",
+        "campaign.stage_cancel_requested",
+        "campaign.stage_cancelled",
+    ):
+        assert {e["campaign_id"] for e in _events(env, event)} == {c}, event

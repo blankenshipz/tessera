@@ -152,8 +152,8 @@ class WorkerGrantProvider:
             raise StepFailed("release_snapshot", "step_refused", "provider has no worker principal")
         return GrantRequest(worker, stage.grant_ttl_seconds)
 
-    def slot_free(self, rt: RunnerServices, ctx: Any, stage: NormalStage) -> bool:
-        """A slot is free while the worker holds fewer live grants than ``worker_slots``.
+    def free_slots(self, rt: RunnerServices, ctx: Any, stage: NormalStage) -> int:
+        """Slots left: ``worker_slots`` minus the worker's live grants (ADR 0048, ADR 0060).
 
         A grant that has expired does not occupy a slot; one that is unresolved and
         unexpired does, whatever campaign it came from, unless the worker reported that
@@ -173,7 +173,11 @@ class WorkerGrantProvider:
                 (worker,),
             )
         )
-        return live < self.descriptor.worker_slots
+        return max(self.descriptor.worker_slots - live, 0)
+
+    def slot_free(self, rt: RunnerServices, ctx: Any, stage: NormalStage) -> bool:
+        """A slot is free while the worker holds fewer live grants than ``worker_slots``."""
+        return self.free_slots(rt, ctx, stage) > 0
 
     def after_admit(self, rt: RunnerServices, ctx: Any, attempt: Mapping[str, Any]) -> None:
         return None

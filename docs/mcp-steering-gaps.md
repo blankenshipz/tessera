@@ -15,8 +15,9 @@ reconciles a grant or sends data to a destination.
 | Read logs | `tessera_campaign_logs` (Tessera keeps no raw stdout/stderr) | covered; no change | `campaign:logs` |
 | See why a slot or release is still held | none | `tessera_campaign_grants` -> `GET /campaigns/{id}/grants` (grant status, hold, settlement, expiry, revision; release id, status, revision) | `campaign:logs` |
 | Adjust budget | none (the cap is set at submit; the operator sets project limits) | `tessera_reduce_campaign_budget` -> `POST /campaigns/{id}/budget-reduction`: lowers an approved, unfinished campaign's cap; never raises it; never below held plus settled | `campaign:cancel`, submitter only |
-| Adjust concurrency | none | not exposed: concurrency is the operator's project limit (`execution_project_limits`), set by a human; a per-campaign limit would be a schema change | human / operator |
-| Cancel or stop | `tessera_cancel_campaign` (reduce-only) | covered; no change | `campaign:cancel`, submitter only |
+| Adjust concurrency | none | `tessera_limit_campaign_concurrency` -> `POST /campaigns/{id}/concurrency-limit` (ADR 0061): a lower-only per-campaign cap on stages running at once. The project limit (`execution_project_limits`) stays the operator's and applies on top | `campaign:cancel`, submitter only |
+| Pause and resume | none | `tessera_pause_campaign`, `tessera_resume_campaign` (ADR 0061): a pause stops new stage reservations and leaves running attempts alone; a person's pause is lifted only by a person | `campaign:cancel`, submitter only |
+| Cancel or stop | `tessera_cancel_campaign` (reduce-only) | covered; plus `tessera_cancel_campaign_stage` (ADR 0061) for one unfinished stage; dependents are skipped and the campaign ends `stopped` | `campaign:cancel`, submitter only |
 | Retry a failed stage | none | `tessera_prepare_stage_retry`: builds a NEW v2 spec for the stages that did not succeed (and anything that consumed them), pinning succeeded stages' outputs by digest as `kind: artifact` inputs. It reads only and submits nothing; the agent validates and submits it and a human approves its digest. A pin resolves only from a succeeded attempt in a terminal receipt whose output manifest is retained and custody-released: the runner does that when the stage succeeds, `tessera_campaign_outputs` shows it as `custody_released`, and the tool refuses an output that is not (a human revoking custody makes the pin fail) | registered with `campaign:read` + `artifact:read`; `campaign:submit` to submit |
 | Revoke a stale release | none (human route only) | `tessera_revoke_campaign_release` -> `POST /campaigns/{id}/releases/{release}/revoke` (annotated destructive): only after the campaign finished (or is cancelling), only a release one of its attempts used, only the submitter. The runner's own cleanup reads active releases each tick, so a release the agent revoked first is simply no longer listed; a revoke the runner sent from an older read gets a stale-revision refusal that does not stall the cancel (tested) | `campaign:cancel` |
 | Reconcile a grant | none (human, evidence-checked) | not exposed. A confirmed exit is resolved by the platform itself (ADR 0053); everything else needs a person's evidence. `tessera_campaign_grants` shows what is unresolved | human |
@@ -24,11 +25,8 @@ reconciles a grant or sends data to a destination.
 
 ## Open
 
-- A lower-only per-campaign concurrency limit and cancelling a single stage were considered and
-  not added: the first needs a new campaign column, a migration and a runner admission check, the
-  second a new stage state and unwind path in the runner. Neither is small or purely a tool
-  addition; each needs its own contract change and tests.
-- Pause and resume, and extending a deadline (human), are not exposed.
+- Extending a deadline (human) is not exposed, and a long pause counts against it. Raising a
+  concurrency limit or cap is human.
 - `tessera_prepare_stage_retry` refuses v1 specs, an input that reads several outputs of a stage
   it would pin (the mount layout is for a person to review), and an output with no single
   recorded digest. It cannot retry across a campaign that has no terminal receipt, because the

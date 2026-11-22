@@ -250,12 +250,18 @@ class SaladHTTPTransport:
             raise ValueError("reserved Salad names required")
         if r.cpu_millicores % 1000 or r.memory_mb < 1024 or r.disk_mb < 1024:
             raise ValueError("Salad resources cannot represent this selection exactly")
-        if r.gpu_count != 1:
+        if r.gpu_count == 0:
+            # CPU-only container (ADR 0062): no GPU class is requested, and cost is estimated
+            # from the operator's reviewed CPU rates, which must therefore be present.
+            if r.gpu_class is not None or p.execution.cpu_rate is None:
+                raise ValueError("a CPU-only Salad selection needs operator CPU rates and no GPU")
+        elif r.gpu_count != 1:
             raise ValueError("single GPU selection required")
-        try:
-            _uuid(r.gpu_class)
-        except _Failure:
-            raise ValueError("exact Salad GPU class UUID required") from None
+        else:
+            try:
+                _uuid(r.gpu_class)
+            except _Failure:
+                raise ValueError("exact Salad GPU class UUID required") from None
         self._factory = connection_factory
         self._digest = canonical_digest(s.model_dump(mode="json"))
         self._org = f"{PREFIX}/organizations/{p.organization}"
@@ -265,7 +271,7 @@ class SaladHTTPTransport:
             cpu=r.cpu_millicores // 1000,
             memory=r.memory_mb,
             storage_amount=r.disk_mb * 1024 * 1024,
-            gpu_classes=[r.gpu_class],
+            gpu_classes=[r.gpu_class] if r.gpu_count else [],
         )
         self._spec = dict(
             name=p.group,
@@ -457,6 +463,8 @@ class SaladHTTPTransport:
             raise _Failure("identity_mismatch")
         for key, value in self._resources.items():
             found = container["resources"].get(key)
+            if key == "gpu_classes" and value == [] and found in (None, []):
+                continue  # a CPU-only group: Salad may omit an empty GPU list
             if type(found) is not type(value) or found != value:
                 raise _Failure("identity_mismatch")
         if any(
@@ -526,7 +534,22 @@ class SaladHTTPTransport:
         ):
             raise _Failure("admission_denied")
 
+    def _cpu_rate(self):
+        """The reviewed operator CPU rate for this selection; no provider read exists for it."""
+        r = self._selection.resources
+        hourly = self._selection.salad.execution.cpu_rate.hourly_usd(r.cpu_millicores, r.memory_mb)
+        if not hourly.is_finite() or hourly <= 0:
+            raise _Failure("malformed_response")
+        return dict(
+            gpu_class_id=None,
+            hourly_price_usd=format(hourly, "f"),
+            price_basis="operator_cpu_rate_not_actual_cost",
+            resource_bounds="not_published",
+        )
+
     def _read_gpu_class(self, secret):
+        if self._selection.resources.gpu_count == 0:
+            return self._cpu_rate()
         status, data = self._request("GET", f"{self._org}/gpu-classes", secret)
         if status != 200:
             raise _Failure("malformed_response")
@@ -622,13 +645,19 @@ class SaladHTTPTransport:
             maximum = _integer(quota["container_replicas_quota"])
             used = _integer(quota["container_replicas_used"])
             gpu = self._read_gpu_class(secret)
-            _, availability = self._request(
-                "POST",
-                f"{self._org}/availability/sce-gpu-availability",
-                secret,
-                dict(self._resources, country_codes=self._spec["country_codes"]),
-            )
-            count = _integer(availability["available_gpu_high"])
+            if self._selection.resources.gpu_count == 0:
+                # Salad publishes a GPU availability read only; a CPU-only create is left to
+                # the provider's own allocation (a stalled one hits the route deadline). This
+                # constant is NOT evidence that capacity exists.
+                count = 1
+            else:
+                _, availability = self._request(
+                    "POST",
+                    f"{self._org}/availability/sce-gpu-availability",
+                    secret,
+                    dict(self._resources, country_codes=self._spec["country_codes"]),
+                )
+                count = _integer(availability["available_gpu_high"])
             return self._result(
                 dict(
                     group,

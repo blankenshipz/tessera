@@ -156,6 +156,37 @@ def test_check_stage_applies_the_profile_ceilings(world, provider):
         db.close()
 
 
+def test_enabled_infrastructure_retries_count_against_the_billable_task_ceiling(world, provider):
+    """A Salad stage's worst case is every attempt's hold, infrastructure retries included
+    (ADR 0058): exposure equal to the per-task ceiling with three enabled retries is refused,
+    while the same stage with the loop off, or a hold that fits all four attempts, passes."""
+    from tessera_control.campaign_models import RetryPolicy
+
+    stage = first_stage(world)
+    db = connection(world)
+    try:
+        project = db.execute("SELECT id FROM projects").fetchone()["id"]
+        ceiling = 100  # the fixture profile's max_task_cents (and its per-run ceiling)
+
+        def with_retry(exposure, **retry):
+            return stage.model_copy(
+                update={
+                    "max_exposure_cents": exposure,
+                    "retry": RetryPolicy(max_attempts=1, **retry),
+                }
+            )
+
+        provider.check_stage(db, project, with_retry(ceiling))  # one attempt: exactly the ceiling
+        provider.check_stage(db, project, with_retry(ceiling, infra_retries=0))
+        provider.check_stage(db, project, with_retry(ceiling // 4, infra_retries=3))  # 4 x 25
+        with pytest.raises(Conflict, match="per-task ceiling"):
+            provider.check_stage(db, project, with_retry(ceiling, infra_retries=3))
+        with pytest.raises(Conflict, match="per-task ceiling"):
+            provider.check_stage(db, project, with_retry(ceiling // 4 + 1, infra_retries=3))
+    finally:
+        db.close()
+
+
 def _adopt_approved_code(world, tmp_path):
     from tessera_control.snapshots import SnapshotStore
     from tessera_control.workspace import capture_workspace, inventory_digest

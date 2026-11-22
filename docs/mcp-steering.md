@@ -36,7 +36,13 @@ Then the agent, over MCP only:
 6. Spend control: `tessera_reduce_campaign_budget` lowers the cap (never below held plus
    settled, never up). `tessera_cancel_campaign` stops further spend; once it is cancelling or
    finished, `tessera_revoke_campaign_release` withdraws a data release one of its attempts used.
-   Each of these leaves an event (`campaign.budget_reduced`, `campaign.cancel_requested`,
+   `tessera_pause_campaign` holds new stage reservations while running attempts finish
+   (`tessera_resume_campaign` continues; a person's pause only a person lifts),
+   `tessera_limit_campaign_concurrency` caps how many stages run at once (lower-only), and
+   `tessera_cancel_campaign_stage` unwinds one unfinished stage, skipping what read it, so the
+   campaign ends `stopped` with reason `stage_cancelled`. The receipt of a steered campaign has a
+   `steering` section. Each of these leaves an event (`campaign.budget_reduced`, `campaign.paused`, `campaign.resumed`,
+   `campaign.concurrency_limited`, `campaign.stage_cancel_requested`, `campaign.cancel_requested`,
    `workspace.snapshot_release_revoked`) and the cancel ends in a terminal receipt.
 
 ## Where a person or operator CLI is still required
@@ -51,7 +57,7 @@ are not planned to change; the rest are gaps.
 | 3 | Record a gate `go` | a person's session, or the owner credential with an automation label where the operator started `tessera serve --accept-automation-gate-go`. No agent or MCP path | by design for the go; the opt-in is operator config |
 | 4 | A gate that needs no go (a pre-registered paired-delta `bound_outcome`) | a person creates the split lock and the standing approval | gap 11 |
 | 5 | Raise a cap, raise concurrency, extend a deadline | new approval / operator limits | by design |
-| 6 | Pause and resume, cancel one stage, per-campaign concurrency | not available | gap (needs runner changes) |
+| 6 | Pause and resume, cancel one stage, a lower-only per-campaign concurrency limit | `tessera_pause_campaign`, `tessera_resume_campaign`, `tessera_cancel_campaign_stage`, `tessera_limit_campaign_concurrency` (ADR 0061). Still human: lifting a pause a person set, raising a limit, extending a deadline | closed |
 | 7 | Reconcile a grant that is not a confirmed exit; restore a revoked release | a person with evidence | by design |
 | 8 | Infrastructure faults other than a worker-reported exit code (lost worker lease, hung container) | the test injects an exit code 137 through the fake worker only; recovery of a lost attempt is the platform's auto-reconcile (ADR 0053), not exercised here | gap, not proven |
 | 9 | Enrollment, token renewal and the runner/worker processes | operator CLI | by design |

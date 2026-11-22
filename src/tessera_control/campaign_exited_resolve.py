@@ -41,10 +41,15 @@ from datetime import datetime
 from typing import Any
 
 from .execution import reconcile_grant_row
-from .external_operations import current_operation_reconciliation
+from .external_operations import confirmed_exit_code, current_operation_reconciliation
 from .store import Conflict, canonical_digest
 
 EXIT_CONFIRMED_UNRESOLVED = "exit_confirmed_unresolved"
+# Exit codes that mean the infrastructure ended the container (the kernel's out-of-memory killer
+# or the engine, SIGKILL), not that the task failed. Unless the spec enabled infrastructure
+# retries (ADR 0058) they keep the transient, retried path; every other confirmed nonzero code
+# is a final failure carrying that code (ADR 0063). The spec's own codes replace this default.
+INFRA_EXIT_CODES = frozenset({137})
 GRACE_SECONDS = 120
 RESOLVABLE = ("admitted", "running", "unknown")
 UNRESOLVED_GRANT = ("active", "cancel_requested")
@@ -120,6 +125,8 @@ def assess(
     now: datetime,
     transient_codes: frozenset[int] | set[int] | tuple[int, ...] = (),
     free_worker_grant: bool = False,
+    infra_exit_codes: frozenset[int] | set[int] | tuple[int, ...] = INFRA_EXIT_CODES,
+    infra_retries_enabled: bool = False,
 ) -> Resolution | None:
     """A ``Resolution`` when every guard holds, else ``None`` (and the attempt is untouched).
 
@@ -168,7 +175,22 @@ def assess(
     hold = int(grant["max_exposure_cents"])
     cents = 0  # a non-billable worker-grant provider costs nothing, so never above the hold
     exit_code = receipt["exit_code"] if receipt is not None else None
-    if exit_code is not None and exit_code != 0:
+    if exit_code is None:
+        # No run receipt (a run that left no outputs never posts one): the worker reported
+        # the code with its confirmed exit before collecting.
+        exit_code = confirmed_exit_code(connection, operation_id)
+        if exit_code == 0:
+            exit_code = None  # an unreceipted zero is never recorded as if it were evidence
+    if exit_code in infra_exit_codes and receipt is None and not infra_retries_enabled:
+        # With infrastructure retries off this is the historical retry of a killed container.
+        # With them on, the exit is a final nonzero failure here and the runner reclassifies it
+        # under the spec's own bound (ADR 0058), so it never spends a scientific retry.
+        status, failure_class = "failed_transient", EXIT_CONFIRMED_UNRESOLVED
+        detail = (
+            f"exit_code:{exit_code}; infrastructure exit, the run receipt or outputs never "
+            "completed"
+        )
+    elif exit_code is not None and exit_code != 0:
         transient = exit_code in transient_codes
         status = "failed_transient" if transient else "failed_permanent"
         failure_class = "t2_declared_exit_code" if transient else "undeclared_exit_code"

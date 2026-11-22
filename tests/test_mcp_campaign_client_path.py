@@ -7,8 +7,9 @@ import json
 
 import httpx
 import pytest
+from mcp_required import require_mcp
 
-pytest.importorskip("mcp")
+require_mcp()
 
 from tessera_mcp.client import ControlClient  # noqa: E402
 from tessera_mcp.config import Config  # noqa: E402
@@ -107,6 +108,7 @@ def test_read_tools_hit_expected_routes(tmp_path):
     _call(server, "tessera_campaign_outputs", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_logs", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_budget", {"campaign_id": "c1"})
+    _call(server, "tessera_campaign_retries", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_standing_status", {})
     _call(server, "tessera_campaign_gate_decisions", {"campaign_id": "c1"})
     assert [(m, p, q) for m, p, q, _ in seen] == [
@@ -116,6 +118,7 @@ def test_read_tools_hit_expected_routes(tmp_path):
         ("GET", "/campaigns/c1/outputs", ""),
         ("GET", "/campaigns/c1/logs", ""),
         ("GET", "/campaigns/c1/budget", ""),
+        ("GET", "/campaigns/c1/retries", ""),
         ("GET", "/projects/proj1/agent-standing-status", ""),
         ("GET", "/campaigns/c1/gate-decisions", ""),
     ]
@@ -140,6 +143,7 @@ def test_tools_register_only_for_enrolled_scopes(tmp_path):
         "tessera_get_campaign",
         "tessera_list_campaigns",
         "tessera_get_campaign_receipt",
+        "tessera_campaign_retries",
         "tessera_campaign_standing_status",
         "tessera_campaign_gate_decisions",
     }

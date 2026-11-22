@@ -5,9 +5,10 @@ import json
 
 import httpx
 import pytest
+from mcp_required import require_mcp
 from pydantic import ValidationError
 
-pytest.importorskip("mcp")
+require_mcp()
 
 from tessera_mcp.client import ControlClient  # noqa: E402
 from tessera_mcp.config import Config  # noqa: E402

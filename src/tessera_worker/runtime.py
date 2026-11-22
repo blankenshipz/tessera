@@ -554,13 +554,16 @@ class CpuRuntime:
             provider_id = self.provider_dispatch.provider_id(self.operation)
         launch_error = result.launch_error if state == "unknown" and provider_id is None else None
         confirmed_exit = state == "exited" and observation.termination_confirmed
+        exit_code = (
+            observation.exit_code if confirmed_exit and type(observation.exit_code) is int else None
+        )
         # A confirmed exit control already accepted is never sent again: a resumed run (for
         # example after its egress journal could not be delivered) reuses the stored answer, so
         # control records one exit per operation, not one per attempt.
         response = self._delivered_exit() if confirmed_exit else None
         if response is None:
             payload, key, intent_id = self._observation_intent(
-                state, provider_id, confirmed_exit, launch_error
+                state, provider_id, confirmed_exit, launch_error, exit_code
             )
             self._begin_delivery(intent_id, confirmed_exit)
             try:
@@ -850,6 +853,7 @@ class CpuRuntime:
         provider_id: str | None,
         termination_confirmed: bool,
         launch_error: str | None = None,
+        exit_code: int | None = None,
     ) -> tuple[dict[str, Any], str, int]:
         if self.lease is None or self.operation is None:
             raise SupervisorError("Runtime has no bound operation.")
@@ -880,6 +884,8 @@ class CpuRuntime:
             }
             if launch_error is not None:
                 payload["launch_error"] = launch_error
+            if exit_code is not None:
+                payload["exit_code"] = exit_code
             encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
             key = (
                 "runtime-observation-"

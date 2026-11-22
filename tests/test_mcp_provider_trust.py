@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 
 import httpx
-import pytest
+from mcp_required import require_mcp
 
-pytest.importorskip("mcp")
+require_mcp()
 
 from tessera_mcp import server as mcp_server  # noqa: E402
 from tessera_mcp.client import ControlClient  # noqa: E402

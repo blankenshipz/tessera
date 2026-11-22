@@ -49,6 +49,42 @@ delegated steps) and refuses a malformed one. Optional runner hooks (`sweep`, `o
 A settlement whose provider is no longer registered fails closed and is recorded rather than
 skipping that provider's bookkeeping.
 
+### Placement across candidates
+
+Contract: [ADR 0060](decisions/0060-capacity-aware-stage-placement.md). A v2 stage may list
+`alternate_providers` after its own provider, in order, so independent stages spread over every
+registered provider instead of queueing for one slot:
+
+```json
+{"key": "featurize", "provider": "local-docker", "runtime": "docker-cpu-v1",
+ "alternate_providers": [
+   {"provider": "self-hosted", "runtime": "docker-cpu-v1"},
+   {"provider": "salad", "runtime": "salad-workload-v1",
+    "provider_config": {"...": "a Salad CPU profile"}, "max_exposure_cents": 20}],
+ "max_exposure_cents": 30, "...": "..."}
+```
+
+Each candidate is checked at submit and approval like the stage's own provider (registered, worker
+enrolled for the project, provider trust for every input, grant lifetime), so the approver
+approves every destination. A candidate's `max_exposure_cents` is its cost estimate and hold; it
+may not exceed the stage's, which stays the per-run cap.
+
+When the stage needs an attempt the runner takes the first candidate that is still registered,
+enrolled, trusted for the stage's inputs, fits the per-run cap, the campaign's remaining budget,
+the program budget and the project limits, and has a free slot (`worker_slots` minus live grants
+and attempts already placed there). If none fits it waits while a slot or a hold may still free
+up, and otherwise fails exactly as a single-provider stage would (budget refusal,
+`input_not_admitted`, `provider_unavailable`). It never chooses a provider the spec does not
+list. The choice and every skipped candidate's reason are a `campaign.stage_placed` event, the
+`placement` field of `tessera_get_campaign` and the attempt's `placement` section in the receipt.
+An agent can pin or exclude candidates for the next placement with
+`tessera_steer_campaign_placement`; each call replaces the previous one and can only filter the
+approved list. A stage without
+`alternate_providers` behaves exactly as before.
+
+Give each instance its own worker principal (a principal binds one provider in the trust file),
+and set `worker_slots` to the pollers that share it, so placement sees real capacity.
+
 ## The provider file
 
 `tessera serve --campaign-providers FILE` takes one closed, owner-only (0600), secret-free
@@ -228,6 +264,10 @@ amendment:
   is reconciled, never re-leased).
 
 ## Salad provider
+
+A Salad stage names an operator profile that is either a GPU profile (a `gpu_class`) or a CPU-only
+profile (`cpu_rate`, no GPU); a stage that declares `salad.gpu: false` runs only on the latter. See
+[campaigns](campaigns.md#salad-gpu-stages) and [ADR 0062](decisions/0062-salad-cpu-only-profiles.md).
 
 The Salad provider wraps the Salad stage driver; its settlement bases are unchanged
 (`unclaimed_zero`, `human_reconcile`, `human_charge`, `guardian_bounded_hold`; the last is

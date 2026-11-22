@@ -191,6 +191,32 @@ def upload_large_artifact(
         )
 
 
+def _held_parts(
+    status: dict[str, Any], chunk_count: int, chunk_bytes: int, size: int
+) -> dict[int, int]:
+    """Bytes control already holds of each partly received chunk, from its status reply.
+
+    A restarted worker continues each such chunk at that byte, so a part control confirmed is never
+    sent again and parts stay in order. An entry that cannot be a partial chunk is refused."""
+    held: dict[int, int] = {}
+    listed = status.get("partial_chunks", [])
+    if type(listed) is not list:
+        raise ArtifactTransferError("Artifact upload partial chunk list is not acceptable.")
+    for item in listed:
+        seq = item.get("seq") if isinstance(item, dict) else None
+        got = item.get("received_bytes") if isinstance(item, dict) else None
+        if (
+            type(seq) is not int
+            or type(got) is not int
+            or not 0 <= seq < chunk_count
+            or not 0 < got < min(chunk_bytes, size - seq * chunk_bytes)
+            or seq in held
+        ):
+            raise ArtifactTransferError("Artifact upload partial chunk entry is not acceptable.")
+        held[seq] = got
+    return held
+
+
 def _part_bytes(channel: Any, begun: dict[str, Any], chunk_bytes: int) -> int:
     """Raw bytes to send per request: what control and this worker's own channel can both carry.
 
@@ -274,15 +300,20 @@ def _stream_large(
         return next_seq
 
     progress(begun)
-    seq = progress(channel.post(base + "/status", {}, "artifact-status-" + uuid.uuid4().hex))
+    status = channel.post(base + "/status", {}, "artifact-status-" + uuid.uuid4().hex)
+    seq = progress(status)
+    held = _held_parts(status, chunk_count, chunk_bytes, size)
     while seq < chunk_count:
         chunk = handle.read_chunk(seq * chunk_bytes, chunk_bytes)
         chunk_digest = hashlib.sha256(chunk).hexdigest()
         chunk_path = f"{base}/chunks/{seq}"
-        if len(chunk) <= part_bytes:
+        start = held.pop(seq, 0)  # bytes of this chunk control already confirmed (a restart)
+        if start == 0 and len(chunk) <= part_bytes:
             parts: list[tuple[int | None, bytes]] = [(None, chunk)]
-        else:  # the path bounds a request below one chunk: send it in order, in parts
-            parts = [(at, chunk[at : at + part_bytes]) for at in range(0, len(chunk), part_bytes)]
+        else:  # in order, in parts, continuing from the first byte control does not hold
+            parts = [
+                (at, chunk[at : at + part_bytes]) for at in range(start, len(chunk), part_bytes)
+            ]
         for at, piece in parts:
             payload: dict[str, Any] = {
                 "content_base64": base64.b64encode(piece).decode("ascii"),
@@ -307,7 +338,10 @@ def _stream_large(
                 raise
             last = at is None or at + len(piece) == len(chunk)
             if not last and (
-                receipt.get("seq") != seq or receipt.get("chunk_received_bytes") != at + len(piece)
+                receipt.get("seq") != seq
+                or type(receipt.get("chunk_received_bytes")) is not int
+                # Control holds this part, and possibly more (a part it already had is a no-op).
+                or not at + len(piece) <= receipt["chunk_received_bytes"] < len(chunk)
             ):
                 raise ArtifactTransferError("Artifact chunk part receipt does not match.")
         if (

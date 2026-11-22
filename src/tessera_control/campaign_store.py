@@ -8,6 +8,7 @@ transaction per command, so state, events and the idempotency row commit togethe
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import sqlite3
@@ -18,7 +19,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from . import program_budget, provider_trust
+from . import campaign_placement, program_budget, provider_trust
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
 from .campaign_io import resolve_artifact
@@ -31,6 +32,7 @@ from .campaign_models import (
     normalize,
     parse_spec_json,
     spec_digest,
+    stage_candidates,
     stage_input_class,
     stage_output_class,
     stage_provider,
@@ -78,6 +80,24 @@ def _invalid(error: ValidationError) -> StoreError:
     first = error.errors()[0] if error.errors() else {}
     location = ".".join(str(part) for part in first.get("loc", ()))[:200]
     return StoreError(f"Invalid campaign request: {location}: {str(first.get('msg', ''))[:200]}")
+
+
+def infra_retry_policy(spec: Any) -> list[dict[str, Any]]:
+    """What an approver is agreeing to for infrastructure retries (ADR 0058), stage by stage.
+
+    The stored spec omits the policy fields at their defaults, so "off" would be invisible in
+    it; this states every stage's bound, the exit codes that count, the providers a retry may
+    move to and the attempts its holds are counted over, always."""
+    return [
+        {
+            "stage_key": stage.key,
+            "infra_retries": stage.retry.infra_retries,
+            "infra_exit_codes": list(stage.retry.infra_exit_codes),
+            "reroute_providers": list(stage.retry.reroute_providers),
+            "worst_case_attempts": stage.retry.max_attempts + stage.retry.infra_retries,
+        }
+        for stage in normalize(spec).stages
+    ]
 
 
 def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -253,10 +273,13 @@ class CampaignStore(
         spec: Any,
     ) -> None:
         normal = normalize(spec)
-        providers: dict[str, Any] = {}
-        for stage in normal.stages:
+        # ADR 0060: every approved candidate passes the checks the stage's own provider does,
+        # here and again whenever the runner places the stage.
+        candidates = [item for stage in normal.stages for item in stage_candidates(stage)]
+        providers: dict[tuple[str, str], Any] = {}
+        for stage in candidates:
             try:
-                provider = providers[stage.key] = stage_provider(stage.provider)
+                provider = providers[stage.key, stage.provider] = stage_provider(stage.provider)
             except KeyError:
                 raise Conflict(
                     f"Stage {stage.key!r} names unknown compute provider {stage.provider!r}."
@@ -299,7 +322,64 @@ class CampaignStore(
                         "Campaign input snapshot is not recorded public (ADR 0039) "
                         "and cannot be declared public."
                     )
-            self.check_stage_inputs(connection, stage, providers[stage.key], digest)
+            for candidate in stage_candidates(stage):
+                self.check_stage_inputs(
+                    connection, candidate, providers[stage.key, candidate.provider], digest
+                )
+            self._check_reroutes(connection, project_id, stage, digest)
+
+    def _check_reroutes(
+        self, connection: sqlite3.Connection, project_id: str, stage: Any, digest: Any
+    ) -> None:
+        """Every provider an infrastructure retry may move to is checked as the stage's own
+        is, at submit and approval (ADR 0058, ADR 0047)."""
+        for provider_id in stage.retry.reroute_providers:
+            self.check_reroute(connection, project_id, stage, provider_id, digest)
+
+    @staticmethod
+    def check_reroute(
+        connection: sqlite3.Connection,
+        project_id: str,
+        stage: Any,
+        provider_id: str,
+        digest: Any,
+    ) -> Any:
+        """One reroute target must be registered, an unbilled worker-grant provider of the
+        stage's runtime, pass the provider's own stage check and the trust narrowing, and be
+        trusted to receive the stage's inputs. Raises Conflict naming what failed; returns
+        the stage as it would run there. The runner repeats it when it reserves the retry, so
+        a registry or trust change after approval is honoured."""
+        try:
+            provider = stage_provider(provider_id)
+        except KeyError:
+            raise Conflict(
+                f"Stage {stage.key!r}: reroute provider {provider_id!r} is not registered."
+            ) from None
+        descriptor = provider.descriptor
+        if (
+            descriptor.kind != "worker_grant"
+            or descriptor.billable
+            or stage.runtime not in descriptor.runtimes
+        ):
+            raise Conflict(
+                f"Stage {stage.key!r}: reroute provider {provider_id!r} cannot run this "
+                "stage (it must be an unbilled worker-grant provider of the same runtime)."
+            )
+        moved = dataclasses.replace(
+            stage, provider=provider_id, worker_principal_id=None, provider_config={}
+        )
+        provider.check_stage(connection, project_id, moved)
+        try:
+            provider_trust.check_narrowing(
+                provider_id,
+                None if moved.send_classes is None else list(moved.send_classes),
+                CampaignStore.stage_worker(provider, moved),
+                connection=connection,
+            )
+        except ValueError as error:
+            raise Conflict(f"Stage {stage.key!r}: {error}") from None
+        CampaignStore.check_stage_inputs(connection, moved, provider, digest)
+        return moved
 
     # -- commands -------------------------------------------------------------------
 
@@ -371,7 +451,11 @@ class CampaignStore(
                     "stage_keys": [stage.key for stage in spec.stages],
                 },
             )
-            return 201, {**_summary(campaign), "spec": spec.model_dump(mode="json")}
+            return 201, {
+                **_summary(campaign),
+                "spec": spec.model_dump(mode="json"),
+                "infra_retry_policy": infra_retry_policy(spec),
+            }
 
         return self._mutate(
             principal, key, "POST", f"/projects/{project_id}/campaigns", digest, command
@@ -731,11 +815,15 @@ class CampaignStore(
             return {
                 **_summary(campaign),
                 "spec": json.loads(campaign["spec_json"]),
+                "infra_retry_policy": infra_retry_policy(parse_spec_json(campaign["spec_json"])),
                 "approval": next((a for a in approvals if a["status"] == "active"), None),
                 "approvals": approvals,
                 "stages": stages,
                 "attempts": attempts,
                 "intents": {"counts": counts, "items": intents},
+                # ADR 0060: where each stage with candidates was placed and why others were
+                # skipped, its steering and, while it waits, the reasons.
+                "placement": campaign_placement.status_view(connection, campaign),
             }
         finally:
             connection.close()
