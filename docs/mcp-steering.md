@@ -54,6 +54,30 @@ Then the agent, over MCP only:
    `campaign.concurrency_limited`, `campaign.stage_cancel_requested`, `campaign.cancel_requested`,
    `workspace.snapshot_release_revoked`) and the cancel ends in a terminal receipt.
 
+## Smoke test on a running Tessera ($0, dry run by default)
+
+`scripts/mcp_steering_smoke.py` drives one tiny local-docker campaign through the MCP tools
+against a running control plane and checks that every step left a record: validate and submit,
+read it back, a refused approval by the agent's own credential, a person's approval (the delegated
+decision), pause, resume, cancel, then the terminal receipt (it must record the pause and the
+approval) and a zero settled budget. It uses two credentials, an enrolled agent credential and a
+person's session credential used only for the approval. It makes no call and reads no credential
+unless run with `--execute` and the exact confirmation phrase.
+
+    scripts/mcp_steering_smoke.py                       # prints the plan and the exact spec
+    scripts/mcp_steering_smoke.py --execute --confirm mcp-steering-smoke-local-docker \
+        --control-url https://CONTROL --project-id PROJECT --destination DESTINATION \
+        --agent-token-file /abs/agent.token --person-token-file /abs/person.token \
+        --image REGISTRY/IMAGE@sha256:DIGEST [--snapshot-id ID] [--ca-file CA] \
+        [--receipt-file /abs/new-report.json]
+
+The agent credential needs the campaign scopes (submit, read, cancel), `snapshot:read` and
+`budget:read`; the image must be one the local docker provider allows. The campaign is paused
+right after approval and cancelled straight after the resume, so at most a local zero-cost
+container is reserved. It needs the campaign runner running to reach the terminal receipt and
+fails loudly if the campaign is not terminal within `--wait-seconds`. Its own test is
+`tests/test_mcp_steering_smoke.py` (an in-process control plane and a fake worker).
+
 ## Where a person or operator CLI is still required
 
 Found while writing the end-to-end test. "By design" items protect an authority boundary and

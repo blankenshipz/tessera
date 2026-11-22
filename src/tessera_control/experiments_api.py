@@ -15,6 +15,7 @@ from .experiments import EXPORT_DEFAULT_BYTES, EXPORT_MAX_BYTES, ExperimentStore
 from .experiments_models import (
     AdmitExperimentAttempt,
     AmendConclusion,
+    AssessAttemptResult,
     ClaimKubernetesDispatch,
     CreateConclusion,
     CreateExperiment,
@@ -179,6 +180,16 @@ def resolve_admitted_attempt(
     payload = body.model_dump(mode="json")
     return response(
         records.resolve_admitted_attempt(actor, attempt_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.post("/experiment-admitted-attempts/{attempt_id}/result-assessment")
+def assess_attempt_result(
+    attempt_id: str, body: AssessAttemptResult, actor: Actor, key: Key, records: Experiments
+) -> JSONResponse:
+    payload = body.model_dump(mode="json")
+    return response(
+        records.assess_attempt_result(actor, attempt_id, key, canonical_digest(payload), payload)
     )
 
 

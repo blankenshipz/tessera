@@ -34,7 +34,7 @@ def _downgrade_to_v80(db):
 
 def test_v80_migrates_to_81_preserving_code_reviews(tmp_path):
     assert CODE_REVIEW_SCHEMA_VERSION == 75
-    assert LATEST_SCHEMA_VERSION == CODE_REVIEW_SUBMIT_SCHEMA_VERSION == 81
+    assert CODE_REVIEW_SUBMIT_SCHEMA_VERSION == 81 <= LATEST_SCHEMA_VERSION
     fresh = tmp_path / "fresh"
     initialize_state(fresh)
     state = tmp_path / "old"
@@ -60,8 +60,8 @@ def test_v80_migrates_to_81_preserving_code_reviews(tmp_path):
         jobs_before = db.execute("SELECT * FROM review_jobs").fetchall()
         side_before = db.execute("SELECT * FROM code_review_jobs").fetchall()
         events_before = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    assert migrate_state(state) == 81
-    assert migrate_state(state) == 81
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(db_path) as db, sqlite3.connect(fresh / "tessera.sqlite3") as ref:
         assert db.execute(OBJECTS).fetchall() == ref.execute(OBJECTS).fetchall()
         assert db.execute("SELECT * FROM review_jobs").fetchall() == jobs_before
@@ -69,7 +69,10 @@ def test_v80_migrates_to_81_preserving_code_reviews(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == events_before
         assert db.execute("SELECT COUNT(*) FROM code_review_sources").fetchone()[0] == 0
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert db.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 81
+        assert (
+            db.execute("SELECT schema_version FROM schema_meta").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
         columns = {r[1] for r in db.execute("PRAGMA table_info(code_review_sources)")}
         assert columns == {
             "job_id",

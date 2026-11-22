@@ -113,6 +113,14 @@ class ResolveAdmittedAttempt(ExperimentRequest):
         return self
 
 
+class AssessAttemptResult(ExperimentRequest):
+    """A researcher's one-time record of what a succeeded run showed; never an approval."""
+
+    expected_revision: Revision
+    assessment: Literal["positive", "negative", "inconclusive"]
+    rationale: NonBlank4000
+
+
 class DispatchAdmittedAttempt(ExperimentRequest):
     """A human binds an already frozen Kubernetes package to one target."""
 

@@ -22,6 +22,7 @@ from .approval_trust import require_decision_actor
 from .experiments_models import (
     AdmitExperimentAttempt,
     AmendConclusion,
+    AssessAttemptResult,
     ClaimKubernetesDispatch,
     CreateConclusion,
     CreateExperiment,
@@ -245,6 +246,39 @@ def create_admitted_attempt_resolution_schema(connection: sqlite3.Connection) ->
         decided_at TEXT NOT NULL, decided_by_principal_id TEXT NOT NULL REFERENCES principals(id),
         CHECK ((outcome='succeeded') OR reason IS NOT NULL))"""
     )
+
+
+def create_attempt_result_assessment_schema(connection: sqlite3.Connection) -> None:
+    """Add the immutable researcher assessment of a succeeded admitted attempt.
+
+    An assessment is a researcher's record that a run which executed correctly showed a
+    positive, negative or inconclusive result.  It never relabels the operational outcome,
+    never approves anything and never grants authority.
+    """
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS research_attempt_result_assessments (
+        attempt_id TEXT PRIMARY KEY REFERENCES research_experiment_admitted_attempts(id),
+        assessment TEXT NOT NULL CHECK (assessment IN ('positive','negative','inconclusive')),
+        rationale TEXT NOT NULL,
+        expected_attempt_revision INTEGER NOT NULL CHECK (expected_attempt_revision >= 1),
+        decided_at TEXT NOT NULL,
+        decided_by_principal_id TEXT NOT NULL REFERENCES principals(id))"""
+    )
+    for event in ("UPDATE", "DELETE"):
+        connection.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS research_attempt_result_assessments_no_{event.lower()}
+            BEFORE {event} ON research_attempt_result_assessments
+            BEGIN SELECT RAISE(ABORT,'research_attempt_result_assessments rows are immutable'); END"""
+        )
+
+
+def _result_assessment(connection: sqlite3.Connection, attempt_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """SELECT assessment,rationale,decided_at,decided_by_principal_id
+        FROM research_attempt_result_assessments WHERE attempt_id=?""",
+        (attempt_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def create_admitted_attempt_observation_projection_schema(
@@ -1703,6 +1737,7 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                 outcome=body["outcome"],
                 resolved=True,
             )
+            updated["result_assessment"] = None
             updated["human_outcome"] = {
                 "outcome": body["outcome"],
                 "reason": body["reason"],
@@ -1732,6 +1767,85 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             key,
             "POST",
             f"/experiment-admitted-attempts/{attempt_id}/resolve",
+            digest,
+            command,
+        )
+
+    def assess_attempt_result(
+        self,
+        principal: dict[str, Any],
+        attempt_id: str,
+        key: str,
+        digest: str,
+        payload: dict[str, Any] | AssessAttemptResult,
+    ) -> tuple[int, dict[str, Any]]:
+        """Record a human, one-time result assessment of a succeeded admitted attempt."""
+        body = self._body(AssessAttemptResult, payload)
+
+        def command(
+            connection: sqlite3.Connection, actor: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            self._human(actor)
+            row = connection.execute(
+                """SELECT a.* FROM research_experiment_admitted_attempts a
+                JOIN research_experiments e ON e.id=a.experiment_id JOIN projects p ON p.id=e.project_id
+                WHERE a.id=? AND p.org_id=? AND (? IS NULL OR e.project_id=?)""",
+                (attempt_id, actor["org_id"], actor["project_id"], actor["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Admitted experiment attempt was not found.")
+            attempt = dict(row)
+            if attempt["revision"] != body["expected_revision"]:
+                raise Conflict("Admitted experiment attempt revision is no longer current.")
+            if attempt["outcome"] is None:
+                raise Conflict(
+                    "Admitted experiment attempt is not resolved; resolve it as succeeded first."
+                )
+            if attempt["outcome"] != "succeeded":
+                raise Conflict(
+                    "Only a succeeded attempt can be assessed; an operational failure, "
+                    "cancellation or unknown outcome is not a negative result."
+                )
+            if _result_assessment(connection, attempt_id) is not None:
+                raise Conflict("Admitted experiment attempt already has a result assessment.")
+            now = utc_now()
+            connection.execute(
+                """INSERT INTO research_attempt_result_assessments
+                (attempt_id,assessment,rationale,expected_attempt_revision,decided_at,
+                decided_by_principal_id) VALUES (?,?,?,?,?,?)""",
+                (
+                    attempt_id,
+                    body["assessment"],
+                    body["rationale"],
+                    body["expected_revision"],
+                    now,
+                    actor["id"],
+                ),
+            )
+            experiment = self._experiment(connection, actor, attempt["experiment_id"])
+            self._event(
+                connection,
+                actor,
+                experiment,
+                "experiment.attempt_result_assessed",
+                attempt["revision"],
+                {
+                    "experiment_id": attempt["experiment_id"],
+                    "admitted_attempt_id": attempt_id,
+                    "assessment": body["assessment"],
+                    "scientific_validity": "not_assessed",
+                },
+            )
+            result = dict(attempt)
+            result["result_assessment"] = _result_assessment(connection, attempt_id)
+            result["scientific_validity"] = "not_assessed"
+            return 200, result
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/experiment-admitted-attempts/{attempt_id}/result-assessment",
             digest,
             command,
         )
@@ -3059,6 +3173,7 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                     (admission["id"],),
                 ).fetchone()
                 admission["human_outcome"] = dict(decision) if decision is not None else None
+                admission["result_assessment"] = _result_assessment(connection, admission["id"])
                 if admission["operational_termination_confirmed"] is not None:
                     admission["operational_termination_confirmed"] = bool(
                         admission["operational_termination_confirmed"]

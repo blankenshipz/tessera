@@ -105,6 +105,12 @@ reference and fingerprint only. The service's start-up mapper then admits it as 
 unit of your own needs the two `LoadCredential=` lines. See
 [service credentials](../../docs/service-credentials.md).
 
+### First-call readiness
+
+Before the first model call, run `tessera-reasoning-readiness check` (see
+[first-call readiness](../../docs/first-call-readiness.md)). It is read-only, never reads the API key
+and never calls the model; it reports `ready_except_key` until the key credential is placed.
+
 ### Reasoning profile and separate harness admission
 
 Prepare `/etc/tessera/reasoning.json` from

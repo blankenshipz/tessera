@@ -161,6 +161,15 @@ A model API key for the reasoning service is installed with `tessera-service-cre
 standard input only; it writes the root-owned 0600 key file and the `model-credential` reference file, and a
 receipt with the reference and fingerprint). The start-up checks above are the admission: the installer adds
 none of its own. See [service credentials](service-credentials.md).
+## Before the first call
+
+`tessera-reasoning-readiness check` verifies everything the first receipted call needs except the key
+value (environment, profile, credential reference, the key file's shape without opening it, the egress
+allowlist, a writable receipts store, the control-plane slices and the spend limits) and reports
+`ready`, `ready_except_key`, `not_fully_checked` (a check could not run, for example without the
+control inputs; never a pass) or `not_ready`. It never reads the key or calls the model. See
+[first-call readiness](first-call-readiness.md) and
+[ADR 0109](decisions/0109-reasoning-first-call-readiness.md).
 
 ## Required secure operator handoff
 

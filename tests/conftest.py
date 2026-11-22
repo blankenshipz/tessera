@@ -76,3 +76,27 @@ def _campaign_providers_default():
         unregister_provider(provider_id)
     worker._REGISTERED.intersection_update({worker.LOCAL_DOCKER_PROVIDER})
     worker.register_from_config(None)
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_for_unlanded_schema_versions(monkeypatch):
+    """Tests only: a version this tree skips is bridged by a no-op advance.
+
+    Schema versions are reserved by the number allocator ahead of the merges that bring their
+    migrations (80 and 81 here). Production code never skips a version: a database at 79 is
+    refused as unsupported until those migrations are registered. This fixture lets the
+    migration tests walk the chain in the meantime, and does nothing once every version below
+    the latest has a real migration."""
+    from tessera_control import migrations
+
+    def advance(next_version):
+        def step(connection):
+            connection.execute(
+                "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (next_version,)
+            )
+
+        return step
+
+    for version in range(79, migrations.LATEST_SCHEMA_VERSION):
+        if version not in migrations.MIGRATIONS:
+            monkeypatch.setitem(migrations.MIGRATIONS, version, advance(version + 1))

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (CODE_REVIEW_SUBMIT_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 81
+# Literal: must equal the highest registered constant (ATTEMPT_ASSESSMENT_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 82
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1771,3 +1771,34 @@ def migrate_code_review_submit_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(CODE_REVIEW_SUBMIT_SCHEMA_VERSION - 1, migrate_code_review_submit_schema)
+
+
+# Attempt result assessment (README step 3): an immutable researcher assessment of a succeeded
+# admitted attempt, kept apart from operational failure. Additive and idempotent; registered
+# with setdefault. This single constant carries the version: if another change owns it when
+# branches merge, raise ATTEMPT_ASSESSMENT_SCHEMA_VERSION, LATEST_SCHEMA_VERSION (the literal
+# near the top) and the fresh-database INSERT in store.py. The version is the one the number
+# allocator reserved (82); versions 80 and 81 belong to other work and must be registered
+# before this one ships (a database cannot skip a version: it is refused as unsupported).
+# Like every schema bump here it clears the backup-health success markers, so the next backup
+# is taken on the new schema.
+ATTEMPT_ASSESSMENT_SCHEMA_VERSION = 82
+
+
+def migrate_attempt_assessment_schema(connection: sqlite3.Connection) -> None:
+    from .experiments import create_attempt_result_assessment_schema
+
+    create_attempt_result_assessment_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (ATTEMPT_ASSESSMENT_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(ATTEMPT_ASSESSMENT_SCHEMA_VERSION - 1, migrate_attempt_assessment_schema)

@@ -296,7 +296,9 @@ recorded on the platform (`POST /projects/{id}/agent-loop/pause`, scope `loop:pa
 record, not proof the loop stopped. A human still
 approves the digest and stages snapshots; an operator may enable `tessera_approve_campaign` on a
 separate `--approval-tool` server that holds a person's own session credential (the control API
-still refuses any agent credential and applies every admission check and cap). See
+still refuses any agent credential and applies every admission check and cap). A $0 end-to-end smoke of this steering path against a running Tessera (dry run by default;
+`scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md).
+See
 [docs/mcp-campaign-client-path.md](docs/mcp-campaign-client-path.md).
 
 Clients can also request a research or review job (`tessera_submit_review_job`) and read its findings
@@ -545,7 +547,8 @@ status, and [DESIGN.md](DESIGN.md) for authoritative contracts.
   one. A refusal is evaluated again once a person raises a limit or the UTC day rolls over. Only
   billed destinations use the ledger. Totals are readable through `tessera_model_spend`, every
   settlement is on the call's receipt, and a person resolves an open (uncertain) reservation through a
-  recorded route. Cost is computed from operator-pinned prices (an estimate, not an invoice); no live model
+  recorded route. `tessera-reasoning-readiness` checks everything a first receipted call needs except the
+  key value, read-only ([ADR 0109](docs/decisions/0109-reasoning-first-call-readiness.md)). Cost is computed from operator-pinned prices (an estimate, not an invoice); no live model
   call has been made to verify this.
 - Single runs outside campaigns have no automatic retry or scheduling; a failed or
   unknown run is reconciled by a person.

@@ -79,6 +79,15 @@ desktop control-response limit; callers need a separate bounded snapshot mechani
 for larger ledgers. The desktop's experiment export action saves this response
 through a native save dialog (see `desktop/README.md`).
 
+`POST /experiment-admitted-attempts/{id}/result-assessment` is human-only and records
+one immutable researcher assessment (`positive`, `negative` or `inconclusive`, with a
+rationale and `expected_revision`) of an attempt resolved `succeeded`. A `failed`,
+`cancelled`, `unknown` or unresolved attempt is refused with `409`, because an operational
+failure is not a negative result; agents and workers get `403`, a stale revision or a second
+assessment `409`. The attempt reads and the export show `result_assessment` (`null` when none).
+It is a researcher's record, not approval or authority, and `scientific_validity` stays
+`not_assessed` (ADR 0100).
+
 Routine worker polling remains in the operational observation journal and updates
 the admitted attempt's latest sample projection without appending a duplicate
 semantic transition or labbook event. State/observed-state/termination-confirmation

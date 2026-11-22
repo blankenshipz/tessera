@@ -137,7 +137,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 81);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 82);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -257,6 +257,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         create_admitted_attempt_evidence_schema,
         create_admitted_attempt_observation_projection_schema,
         create_admitted_attempt_resolution_schema,
+        create_attempt_result_assessment_schema,
         create_experiment_admission_schema,
         create_experiment_evidence_retention_schema,
         create_experiment_schema,
@@ -320,6 +321,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_admitted_attempt_resolution_schema(connection)
     create_admitted_attempt_observation_projection_schema(connection)
     create_admitted_attempt_evidence_schema(connection)
+    create_attempt_result_assessment_schema(connection)
     create_astra_schema(connection)
     create_astra_consumer_schema(connection)
     create_astra_status_schema(connection)
