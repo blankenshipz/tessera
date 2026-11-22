@@ -188,7 +188,7 @@ def _conclusions(connection, actor, experiment):
     return {
         "conclusions": _rows(
             connection,
-            "SELECT id,design_revision,statement,status,revision,created_at,updated_at,"
+            "SELECT id,design_revision,statement,decision,status,revision,created_at,updated_at,"
             "reviewed_at FROM research_conclusions WHERE experiment_id=? ORDER BY created_at,id",
             (experiment["id"],),
         ),

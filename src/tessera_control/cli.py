@@ -528,6 +528,16 @@ def parser() -> argparse.ArgumentParser:
         help="how often to scan campaigns for stuck conditions, 0 disables (default 300)",
     )
     serve.add_argument(
+        "--salad-credential-directory",
+        type=Path,
+        help=(
+            "absolute path of the Salad credential store (the private directory the guardian "
+            "resolves management credentials from). It is read for expiry metadata only, never "
+            "a value, so the health route and campaign admission can report an expired or "
+            "revoked credential up front; without it that state reads as unknown"
+        ),
+    )
+    serve.add_argument(
         "--salad-campaign-profiles",
         type=Path,
         help=(
@@ -1141,6 +1151,17 @@ def main() -> int:
                 provider_config["salad_profiles"] = load_profiles(
                     arguments.salad_campaign_profiles
                 ).model_dump(mode="json", by_alias=True)
+            if arguments.salad_credential_directory is not None:
+                if provider_config.get("salad_credential_directory") is not None:
+                    raise ValueError(
+                        "the salad credential directory comes from either --campaign-providers "
+                        "or --salad-credential-directory, not both"
+                    )
+                if not arguments.salad_credential_directory.is_absolute():
+                    raise ValueError("--salad-credential-directory must be an absolute path")
+                provider_config["salad_credential_directory"] = str(
+                    arguments.salad_credential_directory
+                )
             configure_providers(provider_config or None)
             from . import program_budget
             from .campaign_gates import configure_go_authority

@@ -392,6 +392,7 @@ export class ControlConnection {
   executionGrant(grantId) { return this.#request(`/execution-grants/${resourceId(grantId)}`); }
   revokeExecutionGrant(grantId, body, key) { return this.#request(`/execution-grants/${resourceId(grantId)}/revoke`, body, key); }
   experiment(experimentId) { return this.#request(`/experiments/${resourceId(experimentId)}`); }
+  experimentExport(experimentId) { return this.#request(`/experiments/${resourceId(experimentId)}/export`); }
   createExperiment(projectId, body, key) { return this.#request(`/projects/${resourceId(projectId)}/experiments`, body, key); }
   reviseExperiment(experimentId, body, key) { return this.#request(`/experiments/${resourceId(experimentId)}/designs`, body, key); }
   admitExperimentAttempt(variantId, body, key) { return this.#request(`/experiment-variants/${resourceId(variantId)}/admitted-attempts`, body, key); }

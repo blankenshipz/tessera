@@ -49,7 +49,9 @@ This end-to-end agent workflow is a design target, **not today's integrated alph
 Today you can use the local desktop/control service for versioned designs, studies,
 linked measurements, a baseline-versus-intervention comparison of the recorded numbers
 (difference, sample sizes and a 95% interval, never a verdict), human conclusions/corrections
-and exports. Bounded CPU execution
+(a researcher can record a continue/revise/reject decision on a conclusion, with each cited
+evidence link marked supporting, opposing or unstated; this is a record, not a verdict or
+approval) and exports. Bounded CPU execution
 uses a separate API/operator handoff; integrated planning, execution and agent
 critique remain unverified. See [capabilities and limits](docs/implemented-capabilities.md)
 for the implemented boundaries and the [tabular starter](docs/tabular-starter.md)
@@ -340,6 +342,13 @@ Tessera's built-in child, which calls the Messages API through the allowlisted c
 API-key credential held by reference, and the first run needs an operator-written policy
 ([example](docs/examples/code_review_policy.py)). A verdict never merges or approves anything, and
 with no runner configured the job stays `queued`. No live model call is part of the default tests.
+
+**Credential expiry (Salad).** A Salad management credential has a fixed lifetime. Tessera reports each
+credential's state and expiry (metadata only, never the value), refuses or fails a stage that needs an
+expired or revoked one up front with a recorded reason, and the owner of the private credential directory
+rotates it with `rotate` or `renew` on the enrollment tool, from a terminal and not through any API
+([ADR 0103](docs/decisions/0103-credential-expiry-health.md),
+[credential health](docs/credential-health.md)).
 
 **What still needs a human (Salad stages).** By default every Salad stage stops for a
 person at its source assessment and at each attempt's plan and source-use reviews; a bare

@@ -121,18 +121,61 @@ def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
     server.tool(annotations=write)(tessera_approve_campaign)
 
 
-def register_storage_retention_tool(server: FastMCP, client: ControlClient) -> None:
-    """Read-only retention status, only when the operator enables it (--storage-retention-tool).
+RETENTION_TOOL_SCOPES = {
+    "tessera_storage_retention_status": "retention:read",
+    "tessera_storage_retention_plan": "retention:read",
+    "tessera_storage_retention_apply": "retention:apply",
+}
 
-    The control API answers only a person's session credential (an agent credential gets a 403),
-    so run it as an operator server. It returns counts and digests, never paths or secrets.
+
+def register_storage_retention_tool(
+    server: FastMCP, client: ControlClient, actions: frozenset[str] | None = None
+) -> None:
+    """Retention tools: status by operator flag or ``retention:read``; plan and apply by scope.
+
+    ``actions`` is the credential's live enrolled scopes (None when the operator forced the
+    status tool on with --storage-retention-tool, which registers status only). Plan and apply
+    are registered only for an enrolled scope; the control API re-checks it on every call.
+    Nothing here sets a policy or a path: the operator's policy file alone selects what a plan
+    lists and an apply deletes. Responses carry no absolute paths.
     """
     read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+    held = actions or frozenset()
+    if actions is None or "retention:read" in held:
 
-    @server.tool(annotations=read)
-    async def tessera_storage_retention_status() -> dict[str, Any]:
-        """Show the storage retention policy state, the last run and any pending dry run."""
-        return await client.storage_retention_status()
+        @server.tool(annotations=read)
+        async def tessera_storage_retention_status() -> dict[str, Any]:
+            """Show the storage retention policy state, the last run and any pending dry run."""
+            return await client.storage_retention_status()
+
+    if "retention:read" in held:
+        plan = ToolAnnotations(
+            readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+        )
+
+        @server.tool(annotations=plan)
+        async def tessera_storage_retention_plan() -> dict[str, Any]:
+            """List what the operator's retention policy would delete now (a dry run).
+
+            Deletes nothing; it records a plan receipt. Returns run_id, plan_digest, every
+            candidate with its keep or delete decision and reasons, and a skipped count.
+            """
+            return await client.storage_retention_plan()
+
+    if "retention:apply" in held:
+        apply = ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+        )
+
+        @server.tool(annotations=apply)
+        async def tessera_storage_retention_apply(plan_digest: str) -> dict[str, Any]:
+            """Apply a plan you listed: deletes only what that plan contained, and only under the
+            operator's policy.
+
+            Needs the plan_digest from tessera_storage_retention_plan. It is refused (nothing
+            deleted, a refused receipt recorded) when the digest is stale or no policy exists.
+            """
+            return await client.storage_retention_apply(plan_digest)
 
 
 def register_provider_registration_tools(server: FastMCP, client: ControlClient) -> None:
@@ -664,6 +707,20 @@ def register_provider_trust_tools(server: FastMCP, client: ControlClient) -> Non
         """
         return await client.provider_trust()
 
+    @server.tool(
+        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+    )
+    async def tessera_credential_health() -> dict[str, Any]:
+        """Read the expiry state of each provider credential (metadata only, never a value).
+
+        Each item names the provider, profile, credential reference, version, state (`ok`,
+        `warning` within 24 h of expiry, `expired`, `revoked`, `version_mismatch` or `unknown`)
+        and the seconds remaining. An expired, revoked or mismatched Salad credential blocks
+        Salad stages up front, so check this before launching one. Rotating a credential is an
+        owner action with the enrollment tool; this tool changes nothing.
+        """
+        return await client.credential_health()
+
 
 def register_model_spend_tools(server: FastMCP, client: ControlClient) -> None:
     """Read-only view of model spend (ADR 0090): a budget separate from compute budgets."""
@@ -733,6 +790,7 @@ def create_server(
     person_enrollment_tool: bool = False,
     storage_retention_tool: bool = False,
     model_spend_resolve_tool: bool = False,
+    retention_actions: frozenset[str] | None = None,
 ) -> FastMCP:
     server = FastMCP(
         "Tessera research bench",
@@ -848,12 +906,12 @@ def create_server(
     if person_enrollment_tool:
         # Owner-only; run with the owner's own credential file.
         register_person_enrollment_tools(server, client)
-    if storage_retention_tool:
-        # Operator-enabled (--storage-retention-tool); the API still requires a person.
-        register_storage_retention_tool(server, client)
     if model_spend_resolve_tool:
         # Operator-enabled; the control API accepts it only from a person's session credential.
         register_model_spend_resolve_tool(server, client)
+    if storage_retention_tool or retention_actions:
+        # Status by --storage-retention-tool or retention:read; plan/apply by enrolled scope.
+        register_storage_retention_tool(server, client, retention_actions)
     if provider_trust_tools:
         # Registered only when the credential's live scopes include provider_trust:read.
         register_provider_trust_tools(server, client)
@@ -993,8 +1051,9 @@ def main(argv=None):
         "--storage-retention-tool",
         action="store_true",
         help=(
-            "register tessera_storage_retention_status (read-only). The control API answers only "
-            "a person's session credential, so run it as a separate operator server"
+            "register tessera_storage_retention_status (read-only) for a person's credential; "
+            "an agent credential enrolled with retention:read or retention:apply registers "
+            "the retention tools by scope without this flag"
         ),
     )
     parser.add_argument(
@@ -1071,6 +1130,11 @@ def main(argv=None):
         extra["storage_retention_tool"] = True
     if arguments.model_spend_resolve_tool:
         extra["model_spend_resolve_tool"] = True
+    live_retention = (
+        campaign_actions if campaign_actions is not None else _live_actions(client)
+    ) & frozenset(RETENTION_TOOL_SCOPES.values())
+    if live_retention:
+        extra["retention_actions"] = live_retention
     create_server(client, campaign_tools=campaign_tools, **extra).run(transport="stdio")
     return 0
 

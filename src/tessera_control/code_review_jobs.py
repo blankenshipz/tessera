@@ -242,6 +242,19 @@ def _snapshot_content(connection, row, item):
 RUNNER_REPORTED_OUTCOMES = ("completed", "failed", "late")
 
 
+def _checked_attempt(attempt):
+    """``None`` or an attempt number ``1..MAX_ATTEMPTS``; anything else is a ValueError."""
+    if attempt is None:
+        return None
+    if (
+        not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or not (1 <= attempt <= MAX_ATTEMPTS)
+    ):
+        raise ValueError(f"attempt must be an integer between 1 and {MAX_ATTEMPTS}")
+    return attempt
+
+
 class _LateReceipt:
     """Sentinel returned from a transaction that recorded a late receipt, so the append commits
     before the caller raises the Conflict."""
@@ -318,10 +331,20 @@ class CodeReviewRunStore:
         return row
 
     @staticmethod
-    def _late_attempt(connection, job_id, runner_id, now):
+    def _runner_attempt(row, attempt):
+        """On the live path, a reported attempt must be the job's current attempt."""
+        if attempt is not None and row["cr_attempts"] != attempt:
+            raise Conflict("Code review job is on a different attempt.")
+        return row
+
+    @staticmethod
+    def _late_attempt(connection, job_id, runner_id, now, attempt=None):
         """``(row, attempt)`` when ``runner_id`` held ``attempt`` of this code review and its
         lease has lapsed (expired, or reaped and cleared), and that attempt has no receipt or
-        runner-reported outcome yet; otherwise ``(row, None)``. Never changes anything."""
+        runner-reported outcome yet; otherwise ``(row, None)``. Never changes anything.
+
+        With ``attempt`` given, exactly that attempt is considered and ``runner_id`` must be
+        its recorded holder; without it, the latest attempt ``runner_id`` held is used."""
         row = connection.execute(
             "SELECT j.*, c.attempts AS cr_attempts, c.lease_owner AS cr_lease_owner, "
             "c.lease_expires_at AS cr_lease_expires_at, "
@@ -333,8 +356,21 @@ class CodeReviewRunStore:
         ).fetchone()
         if row is None or row["kind"] != "code_review" or not runner_id:
             return row, None
-        if row["state"] == "running" and row["cr_lease_owner"] == runner_id:
-            if row["cr_lease_expires_at"] is not None and row["cr_lease_expires_at"] >= now:
+        live = (
+            row["state"] == "running"
+            and row["cr_lease_owner"] == runner_id
+            and row["cr_lease_expires_at"] is not None
+            and row["cr_lease_expires_at"] >= now
+        )
+        if attempt is not None:
+            history = json.loads(row["cr_lease_history_json"] or "{}")
+            if history.get(str(attempt)) != runner_id:
+                return row, None  # this runner never held that attempt
+            if row["cr_lease_owner"] == runner_id and attempt == row["cr_attempts"]:
+                if live or row["state"] != "running":
+                    return row, None  # still this runner's live attempt: not late
+        elif row["state"] == "running" and row["cr_lease_owner"] == runner_id:
+            if live:
                 return row, None  # a valid lease: the normal path decides
             attempt = row["cr_attempts"]
         else:
@@ -352,12 +388,12 @@ class CodeReviewRunStore:
                 return row, None
         return row, attempt
 
-    def _record_late(self, connection, job_id, runner_id, reason, receipt, now):
+    def _record_late(self, connection, job_id, runner_id, reason, receipt, now, attempt=None):
         """Append a lapsed lease holder's receipt (state, findings and verdict unchanged) and
         return the sentinel; ``None`` when there is nothing to record."""
         if receipt is None:
             return None
-        row, attempt = self._late_attempt(connection, job_id, runner_id, now)
+        row, attempt = self._late_attempt(connection, job_id, runner_id, now, attempt)
         if attempt is None:
             return None
         entry = attempt_entry(row, attempt, "late", reason, receipt)
@@ -530,25 +566,42 @@ class CodeReviewRunStore:
 
         return self._system_read(work)
 
-    def requeue_vanished_code_review(self, job_id, runner_id, now, receipt=None):
-        return self._system(
-            lambda connection: self._vanished(
-                connection, self._runner_job(connection, job_id, runner_id), receipt
-            )
-        )
+    def requeue_vanished_code_review(self, job_id, runner_id, now, receipt=None, attempt=None):
+        """Record a vanished model child and requeue (or fail on the last attempt). A lapsed
+        lease holder's receipt is recorded as late (state unchanged) and the call is still a
+        Conflict, as for ``fail_code_review``."""
+        attempt = _checked_attempt(attempt)
 
-    def complete_code_review(self, job_id, runner_id, output, now):
+        def work(connection):
+            late = self._record_late(
+                connection, job_id, runner_id, "model_child_vanished", receipt, now, attempt
+            )
+            if late is not None:
+                return late
+            row = self._runner_attempt(
+                self._runner_job(connection, job_id, runner_id, now), attempt
+            )
+            return self._vanished(connection, row, receipt)
+
+        return self._system_late(work)
+
+    def complete_code_review(self, job_id, runner_id, output, now, attempt=None):
         """Store validated runner output. A lapsed lease holder's receipt is recorded as late
-        (no findings or verdict stored) and the call is still a Conflict."""
+        (no findings or verdict stored) and the call is still a Conflict. ``attempt``, when
+        given, is the attempt the runner ran: it must be the current one on the live path and
+        selects the attempt on the late path."""
+        attempt = _checked_attempt(attempt)
 
         def work(connection):
             receipt = output.get("receipt") if isinstance(output, dict) else None
             late = self._record_late(
-                connection, job_id, runner_id, "completed_after_lease", receipt, now
+                connection, job_id, runner_id, "completed_after_lease", receipt, now, attempt
             )
             if late is not None:
                 return late
-            row = self._runner_job(connection, job_id, runner_id, now)
+            row = self._runner_attempt(
+                self._runner_job(connection, job_id, runner_id, now), attempt
+            )
             body = self._validated_output(row, output)
             self._clear_lease(connection, job_id)
             # _store_output appends the completed attempt's receipt.
@@ -562,15 +615,18 @@ class CodeReviewRunStore:
 
         return self._system_late(work)
 
-    def fail_code_review(self, job_id, runner_id, reason, now, receipt=None):
+    def fail_code_review(self, job_id, runner_id, reason, now, receipt=None, attempt=None):
         if reason not in FAIL_REASONS:
             raise ValueError("unknown code review failure reason")
+        attempt = _checked_attempt(attempt)
 
         def work(connection):
-            late = self._record_late(connection, job_id, runner_id, reason, receipt, now)
+            late = self._record_late(connection, job_id, runner_id, reason, receipt, now, attempt)
             if late is not None:
                 return late
-            row = self._runner_job(connection, job_id, runner_id, now)
+            row = self._runner_attempt(
+                self._runner_job(connection, job_id, runner_id, now), attempt
+            )
             entry = attempt_entry(row, row["cr_attempts"], "failed", reason, receipt)
             append_attempt(connection, job_id, entry)
             self._clear_lease(connection, job_id)

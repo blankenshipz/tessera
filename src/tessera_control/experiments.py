@@ -133,6 +133,7 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
         revision INTEGER NOT NULL CHECK (revision >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         created_by_principal_id TEXT NOT NULL REFERENCES principals(id), reviewed_at TEXT,
         reviewed_by_principal_id TEXT REFERENCES principals(id),
+        decision TEXT CHECK (decision IS NULL OR decision IN ('continue','revise','reject')),
         FOREIGN KEY(experiment_id,design_revision)
         REFERENCES research_experiment_designs(experiment_id,revision))""",
         "CREATE INDEX IF NOT EXISTS research_conclusions_by_experiment ON research_conclusions(experiment_id,created_at,id)",
@@ -156,6 +157,7 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
         conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
         attempt_id TEXT NOT NULL REFERENCES research_experiment_attempts(id),
         artifact_id TEXT REFERENCES artifacts(id), measurement_id TEXT REFERENCES research_attempt_measurements(id),
+        stance TEXT CHECK (stance IS NULL OR stance IN ('supports','opposes')),
         PRIMARY KEY(conclusion_id,attempt_id,artifact_id,measurement_id),
         CHECK ((artifact_id IS NOT NULL AND measurement_id IS NULL) OR
                (artifact_id IS NULL AND measurement_id IS NOT NULL)))""",
@@ -299,6 +301,7 @@ def create_admitted_attempt_evidence_schema(connection: sqlite3.Connection) -> N
         conclusion_id TEXT NOT NULL REFERENCES research_conclusions(id),
         attempt_id TEXT NOT NULL REFERENCES research_experiment_admitted_attempts(id),
         artifact_id TEXT REFERENCES artifacts(id), measurement_id TEXT,
+        stance TEXT CHECK (stance IS NULL OR stance IN ('supports','opposes')),
         PRIMARY KEY(conclusion_id,attempt_id,artifact_id,measurement_id),
         CHECK ((artifact_id IS NOT NULL AND measurement_id IS NULL) OR
                (artifact_id IS NULL AND measurement_id IS NOT NULL)))""",
@@ -2340,8 +2343,8 @@ class ExperimentStore(EvidenceIngestMixin, Store):
 
     def _validate_evidence(
         self, connection: sqlite3.Connection, experiment_id: str, evidence: list[dict[str, Any]]
-    ) -> list[tuple[str, str, str | None, str | None, bool]]:
-        rows: list[tuple[str, str, str | None, str | None, bool]] = []
+    ) -> list[tuple[str, str, str | None, str | None, bool, str | None]]:
+        rows: list[tuple[str, str, str | None, str | None, bool, str | None]] = []
         for citation in evidence:
             legacy = connection.execute(
                 """SELECT a.id FROM research_experiment_attempts a JOIN research_experiment_variants v ON v.id=a.variant_id
@@ -2376,7 +2379,14 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                         "Conclusions may cite only artifacts linked to the cited attempt."
                     )
                 rows.append(
-                    (citation["attempt_id"], artifact_id, artifact_id, None, admitted is not None)
+                    (
+                        citation["attempt_id"],
+                        artifact_id,
+                        artifact_id,
+                        None,
+                        admitted is not None,
+                        citation.get("stance"),
+                    )
                 )
             for measurement_id in citation["measurement_ids"]:
                 if (
@@ -2396,6 +2406,7 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                         None,
                         measurement_id,
                         admitted is not None,
+                        citation.get("stance"),
                     )
                 )
         if len({(item[0], item[1]) for item in rows}) != len(rows):
@@ -2406,15 +2417,19 @@ class ExperimentStore(EvidenceIngestMixin, Store):
     def _write_conclusion_evidence(
         connection: sqlite3.Connection,
         conclusion_id: str,
-        evidence: list[tuple[str, str, str | None, str | None, bool]],
+        evidence: list[tuple[str, str, str | None, str | None, bool, str | None]],
     ) -> None:
         connection.executemany(
-            "INSERT INTO research_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,?,?)",
-            [(conclusion_id, item[0], item[2], item[3]) for item in evidence if not item[4]],
+            "INSERT INTO research_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id,stance) VALUES (?,?,?,?,?)",
+            [
+                (conclusion_id, item[0], item[2], item[3], item[5])
+                for item in evidence
+                if not item[4]
+            ],
         )
         connection.executemany(
-            "INSERT INTO research_admitted_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id) VALUES (?,?,?,?)",
-            [(conclusion_id, item[0], item[2], item[3]) for item in evidence if item[4]],
+            "INSERT INTO research_admitted_conclusion_evidence (conclusion_id,attempt_id,artifact_id,measurement_id,stance) VALUES (?,?,?,?,?)",
+            [(conclusion_id, item[0], item[2], item[3], item[5]) for item in evidence if item[4]],
         )
 
     def create_conclusion(
@@ -2459,8 +2474,15 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             )
             revision, now = conclusion["revision"] + 1, utc_now()
             connection.execute(
-                "UPDATE research_conclusions SET statement=?,revision=?,updated_at=? WHERE id=? AND revision=? AND status='draft'",
-                (body["statement"], revision, now, conclusion_id, body["expected_revision"]),
+                "UPDATE research_conclusions SET statement=?,decision=?,revision=?,updated_at=? WHERE id=? AND revision=? AND status='draft'",
+                (
+                    body["statement"],
+                    body["decision"],
+                    revision,
+                    now,
+                    conclusion_id,
+                    body["expected_revision"],
+                ),
             )
             connection.execute(
                 "DELETE FROM research_conclusion_evidence WHERE conclusion_id=?", (conclusion_id,)
@@ -2482,7 +2504,12 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             return 200, self._conclusion_response(
                 connection,
                 conclusion
-                | {"statement": body["statement"], "revision": revision, "updated_at": now},
+                | {
+                    "statement": body["statement"],
+                    "decision": body["decision"],
+                    "revision": revision,
+                    "updated_at": now,
+                },
             )
 
         return self._mutate(principal, key, "PUT", path, digest, command)
@@ -2516,6 +2543,7 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                 "experiment_id": experiment_id,
                 "design_revision": design_revision,
                 "statement": body["statement"],
+                "decision": body["decision"],
                 "status": "draft",
                 "revision": 1,
                 "created_at": now,
@@ -2527,9 +2555,9 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             connection.execute(
                 """INSERT INTO research_conclusions
                 (id,experiment_id,design_revision,statement,status,revision,created_at,updated_at,
-                 created_by_principal_id,reviewed_at,reviewed_by_principal_id)
+                 created_by_principal_id,reviewed_at,reviewed_by_principal_id,decision)
                 VALUES (:id,:experiment_id,:design_revision,:statement,:status,:revision,:created_at,
-                :updated_at,:created_by_principal_id,:reviewed_at,:reviewed_by_principal_id)""",
+                :updated_at,:created_by_principal_id,:reviewed_at,:reviewed_by_principal_id,:decision)""",
                 row,
             )
             self._write_conclusion_evidence(connection, ident, evidence)
@@ -2737,8 +2765,8 @@ class ExperimentStore(EvidenceIngestMixin, Store):
         result["evidence"] = [
             dict(item)
             for item in connection.execute(
-                """SELECT attempt_id,artifact_id,measurement_id FROM research_conclusion_evidence
-                WHERE conclusion_id=? UNION ALL SELECT attempt_id,artifact_id,measurement_id
+                """SELECT attempt_id,artifact_id,measurement_id,stance FROM research_conclusion_evidence
+                WHERE conclusion_id=? UNION ALL SELECT attempt_id,artifact_id,measurement_id,stance
                 FROM research_admitted_conclusion_evidence WHERE conclusion_id=?
                 ORDER BY attempt_id,artifact_id,measurement_id""",
                 (row["id"], row["id"]),

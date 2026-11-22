@@ -1094,6 +1094,217 @@ def test_late_call_from_non_owner_stores_nothing(world):  # noqa: F811
     assert ev["attempt"] == 1
 
 
+@pytest.mark.parametrize("second", ["live", "lapsed"])
+def test_late_report_names_its_attempt_for_a_reused_runner_id(world, second):  # noqa: F811
+    store = world.app.state.review_jobs
+    jid = world.submit(cr_job()).json()["id"]
+    store.claim_code_review("r1", 2, 60, 1000.0)
+    assert store.reap_expired_code_review_leases(1061.0) == [jid]
+    # The same runner id is handed the retry.
+    again = store.claim_code_review("r1", 2, 60, 1070.0)  # lease to 1130
+    assert again["id"] == jid and again["code_review"]["attempts"] == 2
+    now = 1071.0
+    if second == "lapsed":
+        assert store.reap_expired_code_review_leases(1131.0) == [jid]
+        now = 1132.0
+    before = job_state(world, jid)
+    spent = receipt(cost=30.5, cost_cents=31)
+    with pytest.raises(Conflict):
+        store.fail_code_review(jid, "r1", "model_failed", now, receipt=spent, attempt=1)
+    assert job_state(world, jid) == before
+    cr = attempts_of(world, jid)
+    expected = [(1, "vanished", None), (1, "late", normalized(spent))]
+    if second == "lapsed":
+        expected.insert(1, (2, "vanished", None))
+    assert [(e["attempt"], e["outcome"], e["receipt"]) for e in cr["attempt_receipts"]] == expected
+    assert cr["cost_cents_total"] == 31
+    ((ev, _),) = events(world, "review_job.late_receipt")
+    assert ev["attempt"] == 1
+    # Attempt 1 now has its receipt: a second late report for it stores nothing.
+    with pytest.raises(Conflict):
+        store.complete_code_review(jid, "r1", output(), now + 1, attempt=1)
+    assert len(attempts_of(world, jid)["attempt_receipts"]) == len(expected)
+    assert len(events(world, "review_job.late_receipt")) == 1
+    if second == "live":
+        # Attempt 2 was untouched and completes normally.
+        status, done = store.complete_code_review(jid, "r1", output(), now + 2, attempt=2)
+        assert status == 201 and done["job"]["state"] == "completed"
+        cr = attempts_of(world, jid)
+        assert [(e["attempt"], e["outcome"]) for e in cr["attempt_receipts"]] == [
+            (1, "vanished"),
+            (1, "late"),
+            (2, "completed"),
+        ]
+        assert cr["cost_cents_total"] == 32
+    else:
+        # Attempt 2's own late report is still accepted, once.
+        with pytest.raises(Conflict):
+            store.fail_code_review(jid, "r1", "model_failed", now + 2, receipt=receipt(), attempt=2)
+        cr = attempts_of(world, jid)
+        assert [(e["attempt"], e["outcome"]) for e in cr["attempt_receipts"]] == [
+            (1, "vanished"),
+            (2, "vanished"),
+            (1, "late"),
+            (2, "late"),
+        ]
+        assert cr["cost_cents_total"] == 32
+        assert job_state(world, jid)[:2] == ("failed", "model_child_vanished")
+
+
+def test_attempt_mismatch_on_live_lease_stores_nothing(world):  # noqa: F811
+    store = world.app.state.review_jobs
+    jid = world.submit(cr_job()).json()["id"]
+    store.claim_code_review("r1", 2, 60, 1000.0)
+    before = job_state(world, jid)
+    calls = (
+        lambda: store.complete_code_review(jid, "r1", output(), 1001.0, attempt=2),
+        lambda: store.fail_code_review(
+            jid, "r1", "model_failed", 1001.0, receipt=receipt(), attempt=2
+        ),
+        lambda: store.requeue_vanished_code_review(jid, "r1", 1001.0, receipt(), attempt=2),
+    )
+    for call in calls:
+        with pytest.raises(Conflict):
+            call()
+        assert job_state(world, jid) == before
+        cr = attempts_of(world, jid)
+        assert cr["attempt_receipts"] == [] and cr["verdict"] is None
+        assert cr["cost_cents_total"] == 0
+    assert count(world, "review_findings") == 0
+    assert events(world, "review_job.late_receipt") == []
+    # The lease is intact: the matching attempt completes.
+    status, done = store.complete_code_review(jid, "r1", output(), 1002.0, attempt=1)
+    assert status == 201 and done["job"]["state"] == "completed"
+
+
+def test_late_report_for_an_attempt_never_held_stores_nothing(world):  # noqa: F811
+    store = world.app.state.review_jobs
+    jid = world.submit(cr_job()).json()["id"]
+    store.claim_code_review("r1", 2, 60, 1000.0)
+    assert store.reap_expired_code_review_leases(1061.0) == [jid]
+    store.claim_code_review("r2", 2, 60, 1070.0)
+    assert store.reap_expired_code_review_leases(1131.0) == [jid]
+    before = job_state(world, jid)
+    calls = (
+        lambda: store.fail_code_review(
+            jid, "r1", "model_failed", 1132.0, receipt=receipt(), attempt=2
+        ),
+        lambda: store.complete_code_review(jid, "r1", output(), 1132.0, attempt=2),
+        lambda: store.fail_code_review(
+            jid, "r2", "model_failed", 1132.0, receipt=receipt(), attempt=1
+        ),
+        lambda: store.complete_code_review(jid, "r2", output(), 1132.0, attempt=1),
+    )
+    for call in calls:
+        with pytest.raises(Conflict):
+            call()
+    assert job_state(world, jid) == before
+    cr = attempts_of(world, jid)
+    assert [(e["attempt"], e["outcome"]) for e in cr["attempt_receipts"]] == [
+        (1, "vanished"),
+        (2, "vanished"),
+    ]
+    assert cr["cost_cents_total"] == 0
+    assert events(world, "review_job.late_receipt") == []
+
+
+@pytest.mark.parametrize("attempt", [0, 3, -1, True, "1", 1.0])
+def test_invalid_attempt_is_value_error(world, attempt):  # noqa: F811
+    store = world.app.state.review_jobs
+    jid = world.submit(cr_job()).json()["id"]
+    store.claim_code_review("r1", 2, 60, 1000.0)
+    before = job_state(world, jid)
+    calls = (
+        lambda: store.complete_code_review(jid, "r1", output(), 1001.0, attempt=attempt),
+        lambda: store.fail_code_review(
+            jid, "r1", "model_failed", 1001.0, receipt=receipt(), attempt=attempt
+        ),
+        lambda: store.requeue_vanished_code_review(jid, "r1", 1001.0, attempt=attempt),
+    )
+    for call in calls:
+        with pytest.raises(ValueError):
+            call()
+    assert job_state(world, jid) == before
+    assert attempts_of(world, jid)["attempt_receipts"] == []
+
+
+@pytest.mark.parametrize("attempt", [None, 1])
+def test_late_vanish_receipt_after_reaper_requeued_is_recorded(world, attempt):  # noqa: F811
+    store = world.app.state.review_jobs
+    jid = world.submit(cr_job()).json()["id"]
+    store.claim_code_review("r1", 2, 60, 1000.0)
+    assert store.reap_expired_code_review_leases(1061.0) == [jid]
+    store.claim_code_review("r2", 2, 60, 1070.0)
+    before = job_state(world, jid)
+    spent = receipt(cost=12.5, cost_cents=13)
+    with pytest.raises(Conflict):
+        store.requeue_vanished_code_review(jid, "r1", 1071.0, receipt=spent, attempt=attempt)
+    assert job_state(world, jid) == before
+    cr = attempts_of(world, jid)
+    assert [
+        (e["attempt"], e["outcome"], e["reason"], e["receipt"]) for e in cr["attempt_receipts"]
+    ] == [
+        (1, "vanished", "model_child_vanished", None),
+        (1, "late", "model_child_vanished", normalized(spent)),
+    ]
+    assert cr["cost_cents_total"] == 13
+    ((ev, _),) = events(world, "review_job.late_receipt")
+    assert ev["attempt"] == 1 and ev["reason"] == "model_child_vanished"
+    assert ev["receipt_digest"] == canonical_digest(normalized(spent))
+    # The current holder of attempt 2 is unaffected.
+    assert store.requeue_vanished_code_review(jid, "r2", 1072.0, attempt=2) == "failed"
+
+
+def test_late_vanish_receipt_from_non_holder_stores_nothing(world):  # noqa: F811
+    store = world.app.state.review_jobs
+    jid = world.submit(cr_job()).json()["id"]
+    store.claim_code_review("r1", 2, 60, 1000.0)
+    for now in (1061.0, 1062.0):  # expired but unreaped, then reaped and requeued
+        if now == 1062.0:
+            assert store.reap_expired_code_review_leases(now) == [jid]
+        before = job_state(world, jid)
+        for attempt in (None, 1):
+            with pytest.raises(Conflict):
+                store.requeue_vanished_code_review(
+                    jid, "r9", now, receipt=receipt(), attempt=attempt
+                )
+        assert job_state(world, jid) == before
+    cr = attempts_of(world, jid)
+    assert [e["outcome"] for e in cr["attempt_receipts"]] == ["vanished"]
+    assert cr["cost_cents_total"] == 0
+    assert events(world, "review_job.late_receipt") == []
+
+
+def test_expired_unreaped_vanish_records_late_receipt(world):  # noqa: F811
+    store = world.app.state.review_jobs
+    jid = world.submit(cr_job()).json()["id"]
+    store.claim_code_review("r1", 2, 60, 1000.0)  # lease to 1060
+    before = job_state(world, jid)
+    # Without a receipt an expired lease is a plain Conflict: the reaper owns the job.
+    with pytest.raises(Conflict):
+        store.requeue_vanished_code_review(jid, "r1", 1061.0)
+    assert job_state(world, jid) == before
+    assert attempts_of(world, jid)["attempt_receipts"] == []
+    with pytest.raises(Conflict):
+        store.requeue_vanished_code_review(jid, "r1", 1061.0, receipt=receipt(), attempt=1)
+    assert job_state(world, jid) == before == ("running", None, before[2])
+    cr = attempts_of(world, jid)
+    assert [(e["attempt"], e["outcome"], e["reason"]) for e in cr["attempt_receipts"]] == [
+        (1, "late", "model_child_vanished")
+    ]
+    assert cr["cost_cents_total"] == 1
+    assert events(world, "review_job.retry_scheduled") == []
+    assert len(events(world, "review_job.late_receipt")) == 1
+    # The reaper still requeues it; the late receipt is not counted twice.
+    assert store.reap_expired_code_review_leases(1062.0) == [jid]
+    cr = attempts_of(world, jid)
+    assert [(e["attempt"], e["outcome"]) for e in cr["attempt_receipts"]] == [
+        (1, "late"),
+        (1, "vanished"),
+    ]
+    assert cr["cost_cents_total"] == 1
+
+
 # -- custody content for the runner -------------------------------------------------------
 
 

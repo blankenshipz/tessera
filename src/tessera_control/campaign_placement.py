@@ -37,7 +37,16 @@ STEERED_EVENT = "campaign.placement_steered"
 # Reasons a candidate is skipped. A transient reason can clear without a person (a slot frees,
 # a hold settles); a permanent one cannot during this attempt.
 TRANSIENT_REASONS = frozenset(
-    {"no_free_slot", "project_limits", "exposure_open", "program_budget", "budget_in_flight"}
+    {
+        "no_free_slot",
+        "project_limits",
+        "exposure_open",
+        "program_budget",
+        "budget_in_flight",
+        # The provider's credential is expired, revoked or pinned at another version: it clears
+        # when an operator rotates it, so the stage waits or uses another candidate.
+        "credential_unavailable",
+    }
 )
 PERMANENT_REASONS = frozenset(
     {
@@ -235,6 +244,8 @@ def _check(
         try:
             provider.check_stage(connection, campaign["project_id"], stage)
         except Conflict as error:
+            if getattr(error, "credential_state", None) is not None:
+                return Skip(pid, "credential_unavailable", str(error)[:300])
             return Skip(pid, "not_enrolled", str(error)[:300])
         try:
             CampaignStore.check_stage_inputs(

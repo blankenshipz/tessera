@@ -2562,3 +2562,18 @@ test('researcher prompt, proposal registration, and plan approval remain separat
   assert.match(JSON.stringify(ui.get('events')), /Execution remains unauthorized/);
   assert.match(ui.get('notice').textContent, /Plan approval recorded\. No execution was started/);
 });
+
+test('experiment export is disabled until a complete ledger loads, then saves by id', async () => {
+  const data = experimentLedger(); const calls = [];
+  const ui = fixture({ experiment: async () => data,
+    saveExperimentExport: async (...args) => { calls.push(args); return { status: 'saved', basename: 'exp.json' }; } });
+  await ui.selectProject(project('p1'));
+  const button = ui.get('experiment-export');
+  assert.equal(button.disabled, true);
+  await ui.selectExperiment({ id: 'e1', goal: data.experiment.goal, current_design_revision: 2 });
+  assert.equal(button.disabled, false);
+  button.listeners.click(); await flush();
+  assert.equal(calls.length, 1); assert.equal(calls[0][1], 'e1');
+  assert.equal(ui.get('notice').textContent, 'Saved experiment export JSON: exp.json');
+  assert.equal(button.disabled, false);
+});

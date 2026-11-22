@@ -74,7 +74,7 @@ Deletion re-verifies the bundle it removes. Verification is tracked by directory
 A bundle kept without being read in full is labelled `unverified` in the plan, and the timer
 runs a full sweep (`backup_verify_interval_hours`, default 24; `tessera retention verify` by
 hand) that receipts which bundles would no longer restore, so a rotted young bundle is
-visible; status reports the last sweep (`backups`).
+visible; status reports the last sweep (`backups`). A sweep of an unreadable backup root fails (receipt `status: failed` with the reason, never "nothing wrong"); a failing sweep is logged and never blocks the plan; sweep receipts (`*.verify.json`) keep the newest 14.
 
 A refused apply (stale digest, no policy, `auto_apply` off) also writes a receipt, with
 `status: refused` and the reason. A failed deletion records its reason and, for an artifact
@@ -83,6 +83,27 @@ or output of any campaign, by digest, keeps an artifact.
 
 Known limit: under disk pressure the free-space reading shapes the plan, so its digest can
 change between listing and apply; apply then refuses and the plan is listed again.
+
+### Orphaned large artifacts (weights archives)
+
+A multi-gigabyte output is stored as chunk rows in the control database (ADR 0050). One that
+no manifest lists, whose lease is over and that is older than the operator's orphan age (or
+whose every manifest was rejected) was only ever freed by a person's reclaim call or an
+opportunistic worker sweep, so such archives stayed recorded and undeleted. Retention now
+lists them as `large_artifact` candidates and frees them with the existing atomic reclaim
+(its reason is re-checked under the write lock, it refuses while control is held after a
+restore, and the quarantine row stays as evidence). It is opt-in
+(`reclaim_orphaned_large_artifacts: true`), never shorter than the operator's orphan age,
+dry run first like everything else, and each reclaim is on the receipt with its size and
+digest.
+
+### Platform agents
+
+An external agent credential enrolled with `retention:read` may read status and list a plan
+(a dry run, receipted); one enrolled with `retention:apply` may apply a listed plan by its
+digest. Agents never set the policy or choose what is deleted: the operator's policy file
+selects, the digest binds the apply to what was listed, and a stale digest is refused and
+receipted. MCP tools: `tessera_storage_retention_status`, `_plan`, `_apply`.
 
 ## Consequences
 

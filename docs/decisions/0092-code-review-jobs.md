@@ -135,7 +135,11 @@ job. It never invents a receipt, finding or verdict.
   lease; an expired one is a conflict and the reaper handles the job. A receipt that the job's
   lease holder sends after its lease expired (even after the reaper requeued or failed the job) is
   still recorded as a `late` attempt receipt and counted in `cost_cents_total`, without changing the
-  job's state, findings or verdict; nobody else's late receipt is stored. The runner keeps renewing
+  job's state, findings or verdict; nobody else's late receipt is stored. The runner names the
+  attempt it ran on every report, and a late receipt is filed under exactly that attempt, only if
+  the store recorded this runner as its holder (runner ids are fresh per process). A late receipt
+  is kept even when it fails binding (it is flagged `bound: false`): it records spend and can never
+  complete a job. The runner keeps renewing
   through transient errors, and the child timeout must be shorter than the lease.
 - Retry: when the model child vanishes (killed by a signal, timed out or exited without a parseable
   result), the job is queued once more. A second vanish marks it `failed` with `model_child_vanished`.

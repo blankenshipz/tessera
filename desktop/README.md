@@ -239,6 +239,15 @@ cancel the save. This also works for held restored history. The file preserves t
 entire returned ledger envelope; it is not a reproduction bundle containing code,
 artifacts, reports, or environment files.
 
+The experiment view's export action (IPC `saveExperimentExport(connectionId,
+experimentId)`, `experiment-export.mjs`) calls `GET /experiments/{id}/export`
+through the control connection and uses a native save dialog to create a private
+JSON file the same way. It is read-only and holds no authority: it never writes
+the connection credential, and it refuses to overwrite an existing file. The file
+is the bounded response as returned (a `409` from the server's record or size
+bounds is reported, not truncated); it is a record of what is stored, not a
+verdict or evidence of scientific validity, and not a reproduction bundle.
+
 Run the dependency-free boundary tests with `npm test --prefix desktop`.
 Electron 44.2.0 and its dependencies are pinned in `package-lock.json`.
 Use Node 22.12 or newer, then `npm ci --prefix desktop` and

@@ -406,6 +406,8 @@ class ProvidersFile(_Strict):
     self_hosted: Annotated[list[SelfHostedInstance], Field(max_length=16)] = []  # noqa: RUF012
     # Read by the Salad provider module; opaque here.
     salad_profiles: Any = None
+    # Directory of the Salad credential store, read for expiry metadata only (never a value).
+    salad_credential_directory: str | None = None
     # Third-party vendor plugins: ``{entry point or module name: that plugin's config}``.
     # Read by ``campaign_providers.load_plugin``; opaque here.
     plugins: dict[str, Any] = {}  # noqa: RUF012

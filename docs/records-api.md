@@ -57,7 +57,15 @@ snapshot or export), so a change of plan records why it changed.
 omitted for compatibility it freezes the current design revision. A conclusion and
 its `POST /conclusions/{id}/review` response expose that `design_revision` and a
 complete `design_snapshot`. Supplying a different revision while reviewing or
-revising a conclusion is rejected. `GET /experiments/{id}/export` includes complete
+revising a conclusion is rejected. A conclusion may also carry an optional `decision`
+(`continue`, `revise` or `reject`), settable at create and while a draft and immutable once
+reviewed. Each cited evidence link has an optional `stance` (`supports` or `opposes`; null means
+unstated, and links recorded before it existed are not relabelled supporting); an
+`EvidenceCitation.stance` on a create or update body is inherited by that citation's artifact and
+measurement links. Responses and export show the decision and each link's stance. Neither is a
+review approval, authority, or scientific validity (`scientific_validity` stays `not_assessed`);
+nothing requires a decision before review, and agents cannot write conclusions. See
+[ADR 0104](decisions/0104-conclusion-decision-and-evidence-stance.md). `GET /experiments/{id}/export` includes complete
 historical designs, legacy attempts, admitted attempts with their complete append-only
 semantic state-transition histories and latest operational sample
 state/cursor/timestamp, linked operations, and every conclusion's snapshot and correction
@@ -68,7 +76,8 @@ links, artifacts, measurements, nested conclusion evidence, designs, variants,
 conclusions, or amendments) exceeds 1,000 records, or when its complete JSON exceeds
 `max_bytes`. `max_bytes` defaults to 1,000,000 and is capped at 4 MiB, matching the
 desktop control-response limit; callers need a separate bounded snapshot mechanism
-for larger ledgers.
+for larger ledgers. The desktop's experiment export action saves this response
+through a native save dialog (see `desktop/README.md`).
 
 Routine worker polling remains in the operational observation journal and updates
 the admitted attempt's latest sample projection without appending a duplicate

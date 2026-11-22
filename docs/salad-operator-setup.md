@@ -75,11 +75,31 @@ must run with the checkout installed (the local `.venv` is editable); elsewhere
 install the package first. The command has no network effects and does not validate
 the key. After 24 hours metadata inspection still works, but provider validation
 requires a fresh private reference. Expiry is not provider key revocation. Existing
-runtime workload/safety credentials are unchanged. Rotation of existing backend
-entries remains a separately administered resolver operation. Python/getpass creates
+runtime workload/safety credentials are unchanged. Rotation uses the same module's
+`rotate` and `renew` subcommands, below. Python/getpass creates
 immutable string copies; hidden entry and buffer wiping do not guarantee process
 memory erasure. Keep terminal/session recording, tracing and dumps disabled.
 
+
+### Rotating or renewing an enrolled key (owner terminal only)
+
+The management credential has a fixed lifetime; an expired one makes Salad runs fail (see
+[credential health](credential-health.md), which reports and refuses it up front). Run these as the user
+that owns the private 0700 credential directory; they have no API or MCP route.
+
+```sh
+# the next version of an existing, unrevoked reference (hidden prompt; add --secret-stdin to pipe it)
+$REPO/.venv/bin/python -m tessera_operator.salad_enroll rotate \
+  --credential-directory DIR --reference credential-ref:salad-management --expires-in-hours 24
+# the same key, a later expiry (at most 24 hours per call)
+$REPO/.venv/bin/python -m tessera_operator.salad_enroll renew \
+  --credential-directory DIR --reference credential-ref:salad-management --expires-in-hours 24
+```
+
+`--secret-stdin` takes one pipe or file on stdin (never a terminal): at most 4096 printable ASCII bytes,
+one trailing newline stripped. The key is never an argument or environment variable and is never printed;
+output is the reference, previous version, new version and expiry. Afterwards set the profile's
+`credential_version` to the new version and restart the control, guardian and executor services.
 ### example-org scope and project selection
 
 `salad_discover_projects(credential_reference="credential-ref:salad-management",
@@ -124,7 +144,7 @@ increments the version, rejects stale versions and revoked records, and returns
 metadata only. Ordinary `resolve` still rejects expired references. Persist the
 non-secret before/after version and authorization receipt, then CAS-update the
 operator configuration's version pin; inspect metadata before retrying an uncertain
-renewal. Renewal grants no control credential, delegation approval or spending.
+renewal. Renewal grants no control credential, delegation approval or spending. The `renew` subcommand of `tessera_operator.salad_enroll` (above) is the supported way to call it.
 
 ## Normal use, exit and return
 

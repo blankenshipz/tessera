@@ -34,6 +34,10 @@ from .storage_retention_models import (
 log = logging.getLogger(__name__)
 
 
+VERIFY_SUFFIX = ".verify.json"  # sweep receipts are findable without reading every receipt
+VERIFY_KEEP = 14
+
+
 class RetentionError(ValueError):
     """The policy or a requested apply is not acceptable; nothing was deleted."""
 
@@ -90,6 +94,12 @@ def build_plan(state_dir: Path, policy: RetentionPolicy | None, *, now: datetime
         found, bad = list_artifact_candidates(state_dir, policy, now=now)
         candidates += found
         skipped += bad
+    if policy.reclaim_orphaned_large_artifacts:
+        from .storage_retention_large import list_large_candidates
+
+        found, bad = list_large_candidates(state_dir, policy, now=now)
+        candidates += found
+        skipped += bad
     return Plan(now.isoformat(), policy_digest(policy), candidates, skipped)
 
 
@@ -100,7 +110,11 @@ def _reason(error: Exception) -> str:
 
     if isinstance(error, RetentionError | Conflict | NotFound | StoreError):
         return str(error)[:300]
-    if type(error).__name__ in {"BackupRetentionError", "RetentionDeleteError"}:
+    if type(error).__name__ in {
+        "BackupRetentionError",
+        "RetentionDeleteError",
+        "LargeReclaimError",
+    }:
         return str(error)[:300]
     return type(error).__name__
 
@@ -126,6 +140,7 @@ def run(
     now: datetime | None = None,
     delete_backup: Callable[..., dict] | None = None,
     delete_artifact: Callable[..., dict] | None = None,
+    delete_large: Callable[..., dict] | None = None,
 ) -> dict[str, Any]:
     """Plan, and in ``apply`` mode delete; every run leaves a receipt, rewritten per deletion.
 
@@ -133,8 +148,8 @@ def run(
     if the fresh plan no longer matches, nothing is deleted. The timer passes the digest of
     its own fresh plan, which is allowed only when the policy sets ``auto_apply``.
     """
-    if mode not in {"dry_run", "apply"} or trigger not in {"timer", "manual"}:
-        raise RetentionError("mode is dry_run or apply; trigger is timer or manual")
+    if mode not in {"dry_run", "apply"} or trigger not in {"timer", "manual", "agent"}:
+        raise RetentionError("mode is dry_run or apply; trigger is timer, manual or agent")
     policy = load_policy(state_dir)
     started = (now or _now()).isoformat()
     run_id = uuid.uuid4().hex
@@ -176,6 +191,7 @@ def run(
 
         remove_backup = delete_backup or backup_delete
         remove_artifact = delete_artifact or artifact_delete
+        remove_large = delete_large
         backend = None
         if delete_backup is None and any(c.kind == "backup" for c in plan.deletions()):
             # Plan to delete gap: the bundles that must survive are re-hashed once more, right
@@ -197,6 +213,12 @@ def run(
                 if candidate.kind == "backup":
                     assert policy is not None and policy.backup_root is not None
                     removed = remove_backup(Path(policy.backup_root), candidate)
+                elif candidate.kind == "large_artifact":
+                    if remove_large is None:
+                        from .storage_retention_large import delete_large as large_delete
+
+                        remove_large = large_delete
+                    removed = remove_large(state_dir, candidate, run_id=run_id)
                 else:
                     backend = backend or _artifact_backend(state_dir)
                     removed = remove_artifact(state_dir, backend, candidate, run_id=run_id)
@@ -257,13 +279,16 @@ def verify(state_dir: Path, *, trigger: str = "manual", now: datetime | None = N
         "finished_at": _now().isoformat(),
         "mode": "verify",
         "trigger": trigger,
-        "status": "complete",
+        "status": "failed" if "error" in result else "complete",
         **result,
     }
     moment = started.astimezone(UTC)
-    _write_receipt(
-        receipt_dir(state_dir), f"{moment.strftime('%Y%m%dT%H%M%S%f')}Z-{run_id}.json", receipt
-    )
+    directory = receipt_dir(state_dir)
+    name = f"{moment.strftime('%Y%m%dT%H%M%S%f')}Z-{run_id}{VERIFY_SUFFIX}"
+    _write_receipt(directory, name, receipt)
+    # About one a day: keep the newest few, so sweeps do not pile up beside plan receipts.
+    for old in sorted(directory.glob(f"*{VERIFY_SUFFIX}"), reverse=True)[VERIFY_KEEP:]:
+        old.unlink(missing_ok=True)
     return receipt
 
 
@@ -271,15 +296,13 @@ def _verify_due(state_dir: Path, policy: RetentionPolicy, now: datetime) -> bool
     if policy.backup_root is None:
         return False
     try:
-        names = sorted(receipt_dir(state_dir).glob("*.json"), reverse=True)[:60]
+        newest = sorted(receipt_dir(state_dir).glob(f"*{VERIFY_SUFFIX}"), reverse=True)[:3]
     except OSError:
         return True
-    for path in names:
+    for path in newest:  # a damaged newest receipt falls back to the one before it
         try:
-            receipt = json.loads(path.read_text())
-            if receipt.get("mode") == "verify":
-                done = datetime.fromisoformat(receipt["finished_at"])
-                return (now - done).total_seconds() >= policy.backup_verify_interval_hours * 3600
+            done = datetime.fromisoformat(json.loads(path.read_text())["finished_at"])
+            return (now - done).total_seconds() >= policy.backup_verify_interval_hours * 3600
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return True
@@ -290,8 +313,11 @@ def tick(state_dir: Path, last_dry_digest: str | None) -> str | None:
     policy = load_policy(state_dir)
     if policy is None:
         return last_dry_digest
-    if _verify_due(state_dir, policy, _now()):
-        verify(state_dir, trigger="timer")
+    try:
+        if _verify_due(state_dir, policy, _now()):
+            verify(state_dir, trigger="timer")
+    except Exception as error:  # noqa: BLE001 - a failing sweep must never block the plan
+        log.error("storage retention sweep failed: %s", type(error).__name__)
     plan = build_plan(state_dir, policy)
     if not plan.deletions():
         return None

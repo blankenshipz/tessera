@@ -84,7 +84,7 @@ def test_a_bad_status_or_digest_is_refused(db):
 
 
 def test_schema_version_and_migration_from_76_converge_with_a_fresh_database(tmp_path):
-    assert MODEL_SPEND_SCHEMA_VERSION == LATEST_SCHEMA_VERSION
+    assert MODEL_SPEND_SCHEMA_VERSION <= LATEST_SCHEMA_VERSION
     fresh, migrated = tmp_path / "fresh", tmp_path / "migrated"
     initialize_state(fresh)
     initialize_state(migrated)
@@ -139,7 +139,7 @@ def test_a_resolution_must_be_one_of_the_four_kinds(db):
 
 @pytest.mark.parametrize("version", [74, 75, 76])
 def test_a_populated_database_migrates_to_the_ledger_schema_preserving_its_rows(tmp_path, version):
-    assert MODEL_SPEND_SCHEMA_VERSION == 77 == LATEST_SCHEMA_VERSION
+    assert MODEL_SPEND_SCHEMA_VERSION == 77 <= LATEST_SCHEMA_VERSION
     fresh, old = tmp_path / "fresh", tmp_path / "old"
     initialize_state(fresh)
     initialize_state(old)

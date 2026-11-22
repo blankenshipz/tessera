@@ -64,6 +64,7 @@ def _read(path: Path) -> dict[str, Any] | None:
             return {
                 "mode": "verify",
                 "finished_at": receipt.get("finished_at"),
+                "status": str(receipt.get("status"))[:20],
                 "restorable": _int(receipt.get("restorable")),
                 "unrestorable_count": len(unrestorable) if isinstance(unrestorable, list) else 0,
             }
@@ -100,6 +101,7 @@ def retention_status(state_dir: Path) -> dict[str, Any]:
         "last_verified_at": sweeps[0]["finished_at"] if sweeps else None,
         "restorable": sweeps[0]["restorable"] if sweeps else None,
         "unrestorable": sweeps[0]["unrestorable_count"] if sweeps else None,
+        "last_sweep_status": sweeps[0]["status"] if sweeps else None,
         "skipped_in_last_plan": runs[0]["_skipped"] if runs else None,
     }
     pending = None

@@ -83,7 +83,8 @@ force. It binds that attempt number: a placed attempt does not move.
 ### 3. When nothing fits
 
 Reasons are transient (`no_free_slot`, `project_limits`, `exposure_open`, `program_budget`,
-`budget_in_flight`, meaning a hold now in flight may settle below its estimate) or permanent for
+`budget_in_flight`, meaning a hold now in flight may settle below its estimate; `credential_unavailable`,
+an expired, revoked or version-mismatched provider credential that an operator can rotate) or permanent for
 this attempt (`excluded_by_steering`, `not_pinned`, `unregistered`, `provider_invalid`,
 `not_enrolled`, `untrusted`, `over_run_cap`, `over_campaign_budget`, `plan_mismatch`).
 

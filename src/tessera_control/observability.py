@@ -405,9 +405,17 @@ class OperatorObservabilityStore(Store):
                         "severity": "warning",
                     }
                 )
+            from . import credential_health
+
+            credentials = credential_health.summarize(credential_health.collect())
+            if credentials["expired_count"]:
+                alerts.append({"code": "credential_expired", "severity": "critical"})
+            elif credentials["warning_count"]:
+                alerts.append({"code": "credential_expiring", "severity": "warning"})
             return {
                 "projection_at": utc_now(),
                 "alerts": alerts,
+                "credentials": credentials,
                 "workers": {
                     "stale_count": stale,
                     "unknown_freshness_count": unknown_worker_freshness,

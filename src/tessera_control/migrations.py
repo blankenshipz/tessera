@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (MODEL_SPEND_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 77
+# Literal: must equal the highest registered constant (CONCLUSION_DECISION_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 78
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1580,3 +1580,41 @@ def migrate_model_spend_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(MODEL_SPEND_SCHEMA_VERSION - 1, migrate_model_spend_schema)
+
+
+# Conclusion decision and evidence stance (schema 78). Additive and idempotent: a nullable
+# human-recorded decision on conclusions and a nullable per-link stance (NULL means unstated).
+# If another change owns this version when branches merge, raise CONCLUSION_DECISION_SCHEMA_VERSION
+# (and LATEST_SCHEMA_VERSION and the fresh-database INSERT in store.py).
+CONCLUSION_DECISION_SCHEMA_VERSION = 78
+
+_STANCE_COLUMN = "stance TEXT CHECK (stance IS NULL OR stance IN ('supports','opposes'))"
+
+
+def migrate_conclusion_decision_schema(connection: sqlite3.Connection) -> None:
+    additions = (
+        (
+            "research_conclusions",
+            "decision",
+            "decision TEXT CHECK (decision IS NULL OR decision IN ('continue','revise','reject'))",
+        ),
+        ("research_conclusion_evidence", "stance", _STANCE_COLUMN),
+        ("research_admitted_conclusion_evidence", "stance", _STANCE_COLUMN),
+    )
+    for table, column, definition in additions:
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (CONCLUSION_DECISION_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(CONCLUSION_DECISION_SCHEMA_VERSION - 1, migrate_conclusion_decision_schema)

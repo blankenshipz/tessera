@@ -9,6 +9,7 @@ import { runControlIssuance, nativeIssuanceDialogs } from './control-issuance.mj
 import { NamespaceLifecycle } from './astra-namespace.mjs';
 import { validateSender } from './ipc-policy.mjs';
 import { saveStudyExport } from './study-export.mjs';
+import { saveExperimentExport } from './experiment-export.mjs';
 import { saveReleasedArtifact } from './artifact-save.mjs';
 import contract from './ipc-contract.cjs';
 import { runProtectedHelper, validateProtectedRequest } from './protected-secrets.mjs';
@@ -220,6 +221,13 @@ const handlers = {
         current: (id, study, version) => selectedStudy?.id === id &&
           selectedStudy.studyId === study && selectedStudy.selection === version });
      } finally { exporting = false; }
+   },
+   saveExperimentExport: async experimentId => {
+    if (exporting) throw new Error('An export is already in progress.');
+    exporting = true;
+    try {
+      return await saveExperimentExport({ dialog, window, connection, id: connection.status()?.id, experimentId });
+    } finally { exporting = false; }
    },
    saveReleasedArtifact: async (manifestId, artifactId) => {
      if (retrievingArtifact) throw new Error('An artifact retrieval is already in progress.');

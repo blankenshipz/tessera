@@ -544,7 +544,12 @@ class CodeReviewRunner:
         if remaining <= 0:
             # Earlier attempts already spent the budget: a retry would spend it twice.
             self.store.fail_code_review(
-                job_id, self.runner_id, "budget_exceeded", self.clock(), receipt=None
+                job_id,
+                self.runner_id,
+                "budget_exceeded",
+                self.clock(),
+                receipt=None,
+                attempt=attempt,
             )
             return
         try:
@@ -552,7 +557,9 @@ class CodeReviewRunner:
                 job, self.store.code_review_inputs(job_id, self.runner_id, self.clock())
             )
         except (StoreError, ValueError, TypeError, KeyError, AttributeError):
-            self.store.fail_code_review(job_id, self.runner_id, "input_unavailable", self.clock())
+            self.store.fail_code_review(
+                job_id, self.runner_id, "input_unavailable", self.clock(), attempt=attempt
+            )
             return
         directory = tempfile.mkdtemp(prefix="tessera-code-review-")
         try:
@@ -570,14 +577,14 @@ class CodeReviewRunner:
                 receipt = read_receipt_file(receipt_path)
         finally:
             shutil.rmtree(directory, ignore_errors=True)
-        self._report(job, outcome, receipt)
+        self._report(job, outcome, receipt, attempt)
 
-    def _report(self, job: dict, outcome: ChildOutcome, receipt: dict | None) -> None:
+    def _report(self, job: dict, outcome: ChildOutcome, receipt: dict | None, attempt: int) -> None:
         job_id = job["id"]
         if outcome.kind == "completed":
             try:
                 self.store.complete_code_review(
-                    job_id, self.runner_id, outcome.output, self.clock()
+                    job_id, self.runner_id, outcome.output, self.clock(), attempt=attempt
                 )
             except ReviewRefused as refused:
                 if refused.status != 422:
@@ -588,16 +595,16 @@ class CodeReviewRunner:
                 )
                 reason = "budget_exceeded" if over else "failed_output_invalid"
                 self.store.fail_code_review(
-                    job_id, self.runner_id, reason, self.clock(), receipt=receipt
+                    job_id, self.runner_id, reason, self.clock(), receipt=receipt, attempt=attempt
                 )
         elif outcome.kind == "vanished":
             self.store.requeue_vanished_code_review(
-                job_id, self.runner_id, self.clock(), receipt=receipt
+                job_id, self.runner_id, self.clock(), receipt=receipt, attempt=attempt
             )
         else:
             reason = CHILD_FAILURE_REASONS.get(outcome.detail, "model_failed")
             self.store.fail_code_review(
-                job_id, self.runner_id, reason, self.clock(), receipt=receipt
+                job_id, self.runner_id, reason, self.clock(), receipt=receipt, attempt=attempt
             )
 
     def drain(self, timeout: float | None = None) -> None:

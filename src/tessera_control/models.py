@@ -197,9 +197,11 @@ class ExternalAgentScope(StrictRequest):
                 "campaign:submit_cleared",
                 "model_spend:read",
                 "model_spend:record",
+                "retention:read",
+                "retention:apply",
             ]
         ],
-        Field(min_length=1, max_length=25),
+        Field(min_length=1, max_length=27),
     ]
     destination: NonBlank200
 

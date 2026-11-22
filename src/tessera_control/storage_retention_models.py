@@ -30,6 +30,10 @@ class RetentionPolicy(BaseModel):
     # the keep-last floor are selected, oldest first, until the threshold is met.
     disk_free_min_bytes: int | None = Field(default=None, ge=1)
     artifact_max_age_days: int | None = Field(default=None, ge=1, le=36_500)
+    # Opt in: free the chunk bytes of large artifacts (for example weights archives) that no
+    # manifest lists, whose lease is over and that are older than the operator's orphan age,
+    # or whose every manifest was rejected. The quarantine row stays as evidence.
+    reclaim_orphaned_large_artifacts: bool = False
     # The timer only reports (dry run) unless this is true; a person can always apply by hand.
     auto_apply: bool = False
     # How often the timer fully re-hashes every backup (restore's own validation) and receipts
@@ -42,7 +46,7 @@ class RetentionPolicy(BaseModel):
 class Candidate:
     """One thing the policy would delete (or must keep), with why."""
 
-    kind: Literal["backup", "artifact"]
+    kind: Literal["backup", "artifact", "large_artifact"]
     ref: str  # backup id, or artifact id
     path: str  # backup directory (relative to backup_root) or object key; no absolute paths
     size_bytes: int

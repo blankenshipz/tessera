@@ -323,19 +323,25 @@ def plan_backups(
 
 
 def verify_all(root: Path) -> dict[str, Any]:
-    """Fully verify every bundle (restore's validation): how many restore, and which do not."""
+    """Fully verify every bundle (restore's validation): how many restore, and which do not.
+
+    An unreadable backup root is reported as ``error`` (the sweep then fails), never as
+    "nothing is wrong"."""
     entries, skipped = list_backups(root, verify=True)
-    return {
+    result: dict[str, Any] = {
         "restorable": len(entries),
         "unrestorable": [
             s
             for s in skipped
-            if "restore would reject" in s["reason"]
-            or "incomplete" in s["reason"]
-            or "manifest" in s["reason"]
+            if s["path"] != "."
+            and any(w in s["reason"] for w in ("restore would reject", "incomplete", "manifest"))
         ],
         "skipped": len(skipped),
     }
+    unreadable = [s for s in skipped if s["path"] == "."]
+    if unreadable:
+        result["error"] = unreadable[0]["reason"]
+    return result
 
 
 def reverify_kept(root: Path, plan: list[Candidate]) -> None:

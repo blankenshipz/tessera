@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
@@ -74,6 +74,50 @@ REVIEW_REASON = (
 )
 
 
+# Credential states that stop a stage up front (the sibling credential health module owns the
+# states; 'unknown' and 'warning' never block: this is an early guard and the guardian stays
+# the authority when the credential is resolved).
+CREDENTIAL_BLOCKING_STATES = frozenset({"expired", "revoked", "version_mismatch"})
+_CREDENTIAL_CODES = {
+    "expired": "credential_expired",
+    "revoked": "credential_revoked",
+    "version_mismatch": "credential_version_mismatch",
+}
+
+
+def credential_blocked(state: Any) -> bool:
+    """Whether a ``credential_state`` answer is one that refuses a stage."""
+    return isinstance(state, dict) and state.get("state") in CREDENTIAL_BLOCKING_STATES
+
+
+def credential_code(state: dict[str, Any]) -> str:
+    return _CREDENTIAL_CODES.get(str(state.get("state")), "credential_unavailable")
+
+
+def credential_message(state: dict[str, Any]) -> str:
+    """The sanitized refusal text for a blocking credential state: the reference, version and
+    time only (never a value), and what the operator does next."""
+    code = credential_code(state)
+    reference, profile = state.get("reference"), state.get("profile")
+    if code == "credential_version_mismatch":
+        return (
+            f"{code}: profile {profile} pins the Salad management credential {reference} at "
+            f"version {state.get('pinned_version')} but the enrolled credential is version "
+            f"{state.get('version')}; update the profile credential_version "
+            "(docs/salad-operator-setup.md)."
+        )
+    when = state.get("expires_at")
+    stamp = "an unknown time"
+    if isinstance(when, int | float) and math.isfinite(when):
+        stamp = datetime.fromtimestamp(when, UTC).strftime("%Y-%m-%d %H:%M UTC")
+    verb = "was revoked" if code == "credential_revoked" else f"expired at {stamp}"
+    return (
+        f"{code}: the Salad management credential {reference} version {state.get('version')} "
+        f"{verb} (profile {profile}); rotate it (docs/salad-operator-setup.md / the enrollment "
+        "tool) and update the profile credential_version."
+    )
+
+
 def salad_config(spec_stage: Any) -> SaladStageSpec:
     """The stage's Salad fields: ``.salad`` (spec v1) or ``provider_config`` (normal form)."""
     found = getattr(spec_stage, "salad", None)
@@ -107,6 +151,17 @@ def _resolve_build(decision_id: str, revision: int, kind: str, digest: str, pre_
         )
 
     return build
+
+
+def _credential_event(state: dict[str, Any]) -> dict[str, Any]:
+    """Event payload: states, reference, version and time; never any credential value."""
+    return {
+        "state": state.get("state"),
+        "reference": state.get("reference"),
+        "version": state.get("version"),
+        "expires_at": state.get("expires_at"),
+        "reason": credential_message(state) if credential_blocked(state) else state.get("reason"),
+    }
 
 
 class SaladStageDriver:
@@ -323,12 +378,46 @@ class SaladStageDriver:
 
     # -- stage scaffold (before the first reservation) ------------------------------
 
+    def _credential_state(self, spec_stage: StageSpec) -> dict[str, Any] | None:
+        """The provider's metadata-only credential state for the stage's profile, or None when
+        the provider cannot say (no credential directory, older provider): never blocks."""
+        from .campaign_providers import get_provider
+
+        try:
+            provider = get_provider("salad")
+            state_of = getattr(provider, "credential_state", None)
+            if state_of is None:
+                return None
+            state = state_of(self.profile(spec_stage))
+        except Exception:  # noqa: BLE001 - the early guard never fails a stage by itself
+            return None
+        return state if isinstance(state, dict) else None
+
     def scaffold(self, ctx: _Ctx, key: str) -> str:
         """``ready``, ``progress`` (a step ran) or ``waiting`` (a human must act)."""
         spec_stage = self._spec(ctx, key)
         salad = salad_config(spec_stage)
         row = self._stage_row(ctx, key)
         project = ctx.campaign["project_id"]
+        state = self._credential_state(spec_stage)
+        if credential_blocked(state):
+            # Refused up front, before any step, hold or reservation, with the reason on the
+            # campaign (stop_reason) and an event, instead of failing deep in the run.
+            self.runner.emit_once(
+                ctx,
+                "campaign.stage_credential_blocked",
+                {"stage_key": key},
+                _credential_event(state),
+            )
+            self.runner._stage_failed(ctx, key, credential_code(state))
+            return "waiting"
+        if isinstance(state, dict) and state.get("state") == "warning":
+            self.runner.emit_once(
+                ctx,
+                "campaign.stage_credential_warning",
+                {"stage_key": key},
+                _credential_event(state),
+            )
         if row["study_id"] is None:
             result = self.runner._step(
                 ctx,

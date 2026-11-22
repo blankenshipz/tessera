@@ -34,7 +34,12 @@ from .campaign_providers import (
     register_provider,
     unregister_provider,
 )
-from .campaign_salad import SaladStageDriver, salad_config
+from .campaign_salad import (
+    SaladStageDriver,
+    credential_blocked,
+    credential_message,
+    salad_config,
+)
 from .campaign_store import SALAD_REFUSAL
 from .models import ExecutionSpec
 from .salad_campaign_profiles import (
@@ -79,6 +84,15 @@ def _hosts_declared(config: SaladStageSpec) -> bool:
     return bool(egress.fetches or egress.redirect_hosts)
 
 
+class CredentialBlocked(Conflict):
+    """A 409 for a stage whose provider credential cannot be used (placement skips such a
+    candidate as ``credential_unavailable``; submit and approval show the message)."""
+
+    def __init__(self, message: str, state: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.credential_state = state
+
+
 class SaladRouteProvider:
     descriptor = ProviderDescriptor(
         provider_id=PROVIDER_ID,
@@ -93,8 +107,54 @@ class SaladRouteProvider:
     )
     config_model = SaladStageSpec
 
-    def __init__(self, profiles: SaladCampaignProfiles | None = None) -> None:
+    def __init__(
+        self,
+        profiles: SaladCampaignProfiles | None = None,
+        credential_directory: str | None = None,
+    ) -> None:
         self.profiles = profiles
+        self.credential_directory = credential_directory
+
+    # -- credential expiry (metadata only; never a value) -------------------------------
+
+    def credential_state(self, profile: Any, now: float | None = None) -> dict[str, Any]:
+        """Expiry state of the profile's pinned management credential. Never raises."""
+        import time
+
+        from . import credential_health
+        from .salad_secret_files import PrivateFileSecretResolver
+
+        when = time.time() if now is None else now
+        metadata = None
+        if self.credential_directory:
+            resolver = None
+            try:
+                resolver = PrivateFileSecretResolver(self.credential_directory)
+                metadata = resolver.read_metadata(profile.credential_reference)
+            except Exception:  # noqa: BLE001 - unreadable store is "unknown", not a crash
+                metadata = None
+            finally:
+                if resolver is not None:
+                    resolver.close()
+        state = credential_health.evaluate(
+            metadata, when, pinned_version=profile.credential_version
+        )
+        if metadata is None:
+            state["reason"] = (
+                "no credential directory is configured for this service"
+                if not self.credential_directory
+                else "the credential store could not be read by this service"
+            )
+        return {
+            "provider_id": PROVIDER_ID,
+            "profile": profile.name,
+            "reference": profile.credential_reference,
+            **state,
+        }
+
+    def credential_health(self, now: float | None = None) -> list[dict[str, Any]]:
+        profiles = self.profiles.profiles if self.profiles is not None else []
+        return [self.credential_state(profile, now) for profile in profiles]
 
     def driver(self, rt: RunnerServices) -> SaladStageDriver:
         """One driver per runner services object. It lives in the runner's own
@@ -181,6 +241,14 @@ class SaladRouteProvider:
         except ValueError as error:
             raise ValueError(f"{label}: adapted stage: {error}") from None
 
+    def _check_credential(self, profile: Any) -> None:
+        """Refuse up front when the profile's credential is expired, revoked or pinned at a
+        version that is not the enrolled one (metadata only; unknown or warning never refuses)."""
+        state_of = getattr(self, "credential_state", None)
+        state = state_of(profile) if state_of is not None else None
+        if credential_blocked(state):
+            raise CredentialBlocked(credential_message(state), state)
+
     def check_stage(self, connection: sqlite3.Connection, project_id: str, stage: Any) -> None:
         """Operator profile ceilings for one Salad stage; every refusal is a 409.
 
@@ -212,6 +280,7 @@ class SaladRouteProvider:
                 else "Salad stage declares no GPU and needs a CPU-only profile."
             )
         self._check_worker(connection, project["org_id"], project_id, config.worker_principal_id)
+        self._check_credential(profile)
         if _hosts_declared(config) and any(
             provider_trust.admission_basis(connection, source.snapshot_id) != "public_only"
             for source in stage.inputs
@@ -424,11 +493,12 @@ _REGISTERED: list[bool] = []
 
 def register_provider_instance(
     profiles: SaladCampaignProfiles | None = None,
+    credential_directory: str | None = None,
 ) -> ComputeProvider:
     """Register (or replace, when this module registered it before) the ``salad`` provider."""
     if _REGISTERED:
         unregister_provider(PROVIDER_ID)
-    instance = register_provider(SaladRouteProvider(profiles))
+    instance = register_provider(SaladRouteProvider(profiles, credential_directory))
     if not _REGISTERED:
         _REGISTERED.append(True)
     return instance
@@ -451,7 +521,10 @@ def register_from_config(config: dict | None) -> None:
             pass
         else:
             raise ValueError(f"Provider id {PROVIDER_ID!r} is already registered")
-    register_provider_instance(profiles)
+    directory = (config or {}).get("salad_credential_directory")
+    if directory is not None and (not isinstance(directory, str) or not directory.startswith("/")):
+        raise ValueError("salad_credential_directory must be an absolute path")
+    register_provider_instance(profiles, directory)
 
 
 def config_sections() -> tuple[ConfigSection, ...]:

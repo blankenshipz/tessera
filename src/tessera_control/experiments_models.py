@@ -170,6 +170,8 @@ class EvidenceCitation(ExperimentRequest):
     attempt_id: Identifier
     artifact_ids: Annotated[list[Identifier], Field(max_length=128)] = []
     measurement_ids: Annotated[list[Identifier], Field(max_length=128)] = []
+    # Omitted means "unstated"; every link written from this citation inherits it.
+    stance: Literal["supports", "opposes"] | None = None
 
     @model_validator(mode="after")
     def needs_linked_evidence(self) -> EvidenceCitation:
@@ -188,6 +190,7 @@ class CreateConclusion(ExperimentRequest):
     # Older clients can omit this while the store still freezes the current design.
     # New clients should name the design context they reviewed explicitly.
     design_revision: Revision | None = None
+    decision: Literal["continue", "revise", "reject"] | None = None
 
 
 class UpdateConclusion(CreateConclusion):

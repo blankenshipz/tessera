@@ -174,6 +174,17 @@ class ControlClient:
     async def storage_retention_status(self):
         return await self._request("GET", "/storage-retention/status")
 
+    async def storage_retention_plan(self):
+        return await self._request("POST", "/storage-retention/plan", body={})
+
+    async def storage_retention_apply(self, plan_digest):
+        return await self._request(
+            "POST",
+            "/storage-retention/apply",
+            body={"plan_digest": plan_digest},
+            relay_refusal=True,
+        )
+
     async def list_campaign_providers(self):
         return await self._request("GET", "/admin/campaign-providers")
 
@@ -217,6 +228,9 @@ class ControlClient:
 
     async def provider_trust(self):
         return await self._request("GET", "/admin/provider-trust")
+
+    async def credential_health(self):
+        return await self._request("GET", "/credential-health")
 
     async def campaign(self, campaign_id):
         return await self._request("GET", "/campaigns/" + segment(campaign_id))

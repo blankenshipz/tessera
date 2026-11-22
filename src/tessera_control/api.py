@@ -110,6 +110,7 @@ def create_app(
     from .astra_status_api import router as astra_status_router
     from .autonomy_api import router as autonomy_router
     from .capability_api import router as capability_router
+    from .credential_health_api import router as credential_health_router
     from .credential_lease_api import router as credential_lease_router
     from .credential_leases import _FakeSecretBackend
     from .dataset_ingestion import DatasetIngestionStore
@@ -138,6 +139,7 @@ def create_app(
     from .skills import SkillStore
     from .snapshot_releases import SnapshotReleaseStore
     from .snapshots import SnapshotStore
+    from .storage_retention_api import router as storage_retention_router
 
     deployment = deployment or DeploymentConfig.local()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -227,6 +229,9 @@ def create_app(
     from .model_spend_api import router as model_spend_router
 
     app.include_router(model_spend_router)
+    app.state.storage_retention_state_dir = state_dir
+    app.include_router(storage_retention_router)
+    app.include_router(credential_health_router)
     app.state.external_agents = ExternalAgentStore(state_dir)
     app.include_router(external_agent_router)
     app.state.agent_authority = AgentAuthorityStore(state_dir)
@@ -375,17 +380,6 @@ def create_app(
     @app.get("/me")
     def me(actor: Annotated[dict[str, Any], Depends(principal)]) -> dict[str, Any]:
         return store.me(actor)
-
-    @app.get("/storage-retention/status")
-    def storage_retention_status(
-        actor: Annotated[dict[str, Any], Depends(principal)],
-    ) -> dict[str, Any]:
-        """Read-only retention summary (no paths or refs); a person's credential only."""
-        if actor.get("kind") == "worker" or actor.get("role") != "human":
-            raise Forbidden("A human credential is required.")
-        from .storage_retention_status import retention_status
-
-        return retention_status(state_dir)
 
     @app.get("/recovery")
     def recovery(actor: Annotated[dict[str, Any], Depends(principal)]) -> dict[str, Any]:

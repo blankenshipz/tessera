@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -214,3 +216,39 @@ def test_the_sweep_shows_a_rotted_young_bundle_that_a_plan_never_reads(tmp_path)
     assert [r["mode"] for r in receipts(state)].count("verify") == 1
     storage_retention.tick(state, None)
     assert [r["mode"] for r in receipts(state)].count("verify") == 1
+
+
+def test_a_sweep_of_an_unreadable_backup_root_fails_loudly(tmp_path):
+    from tessera_control.storage_retention_status import retention_status
+
+    state, root = setup(tmp_path, backup_max_age_days=30)
+    for child in list(root.iterdir()):
+        shutil.rmtree(child)
+    root.rmdir()  # the configured root is gone
+    receipt = storage_retention.verify(state)
+    assert receipt["status"] == "failed" and "unreadable" in receipt["error"]
+    assert retention_status(state)["backups"]["last_sweep_status"] == "failed"
+
+
+def test_a_failing_sweep_does_not_block_the_plan(tmp_path, monkeypatch):
+    state, root = setup(tmp_path, backup_max_age_days=30)
+
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(storage_retention, "verify", broken)
+    digest = storage_retention.tick(state, None)
+    assert digest  # the plan was still built and reported
+    assert [r["mode"] for r in receipts(state)] == ["dry_run"]
+
+
+def test_sweep_receipts_are_pruned_and_a_plan_flood_does_not_trigger_an_early_sweep(tmp_path):
+    state, root = setup(tmp_path, backup_max_age_days=30)
+    for _ in range(storage_retention.VERIFY_KEEP + 3):
+        storage_retention.verify(state)
+    sweeps = list((state / RECEIPT_DIR).glob("*.verify.json"))
+    assert len(sweeps) == storage_retention.VERIFY_KEEP
+    for _ in range(70):  # many newer plan receipts
+        storage_retention.run(state, mode="dry_run", trigger="manual")
+    policy = storage_retention.load_policy(state)
+    assert storage_retention._verify_due(state, policy, datetime.now(UTC)) is False

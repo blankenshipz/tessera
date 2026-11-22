@@ -89,6 +89,17 @@ sha256 with `tessera_campaign_outputs`.
 - Receipts and statuses are recorded platform state, not scientific verdicts. Never claim a
   campaign ran without reading its receipt.
 
+## Storage retention scopes
+
+An agent enrolled with `retention:read` gets `tessera_storage_retention_status`
+(`GET /storage-retention/status`) and `tessera_storage_retention_plan`
+(`POST /storage-retention/plan`, a dry run that records a receipt and deletes nothing). One enrolled
+with `retention:apply` also gets `tessera_storage_retention_apply` (`POST /storage-retention/apply`
+with a `plan_digest`), which deletes only what that still-current plan listed and only under the
+operator's policy file; a stale digest or missing policy is a 409 and a refused receipt. Agents
+never set policy or paths, workers are refused, and responses carry no absolute paths.
+`--storage-retention-tool` still registers the status tool for a person's credential.
+
 ## Harness catalog warning
 
 The pinned OpenCode harness catalog (`PERMITTED_TOOLS`, 22 tools) does not list any campaign,

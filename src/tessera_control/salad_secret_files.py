@@ -117,6 +117,36 @@ class PrivateFileSecretResolver:
             secret.zeroize()
             return SecretMetadata(checked_at=self._now(), **metadata)
 
+    def read_metadata(self, reference):
+        """The metadata header only, as a dict. The secret bytes are never read or held.
+
+        For health and expiry checks: a malformed or unreadable header raises the same
+        sanitized error as every other read; nothing about the file is echoed."""
+        with self._locked() as directory:
+            fd = os.open(self._name(reference), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                self._private(os.fstat(fd))
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    header = stream.readline(1025)
+                if not header.endswith(b"\n") or len(header) > 1024:
+                    raise ValueError("credential unavailable")
+                metadata = json.loads(header)
+                if (
+                    not isinstance(metadata, dict)
+                    or set(metadata) != {"version", "expires_at", "revoked", "purpose"}
+                    or type(metadata["version"]) is not int
+                    or type(metadata["revoked"]) is not bool
+                    or metadata["purpose"] != "salad_management"
+                    or type(metadata["expires_at"]) not in {int, float}
+                    or not math.isfinite(metadata["expires_at"])
+                ):
+                    raise ValueError("credential unavailable")
+                return dict(metadata)
+            except Exception:
+                raise ValueError("credential unavailable") from None
+            finally:
+                os.close(fd)
+
     def resolve(self, reference, version):
         with self._locked() as directory:
             metadata, secret = self._read(directory, self._name(reference))

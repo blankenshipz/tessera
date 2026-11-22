@@ -98,7 +98,12 @@ not grant authority or request execution.
    selected experiment's inventory, then **Load released preview**. **Save exact
    released bytes** opens the artifact-save path.
    **Export reproduction bundle record** creates a control-plane record, not a
-   filesystem bundle. Full experiment-chain JSON export remains API-first.
+   filesystem bundle. To save the full experiment-chain JSON, use the experiment
+   view's experiment export action: it reads `GET /experiments/{id}/export` through the
+   control connection and saves the bounded JSON with a native save dialog to a new
+   filename (existing files are never replaced). It is a record of what is stored,
+   not a verdict or scientific validity, and a `409` (collection or size bound
+   exceeded) is shown rather than a truncated file.
 6. To export a separate study ledger, open **Research ledger** → **New study**,
    enter purpose and protocol, choose exploratory/confirmatory mode, then choose
    **Create study**. Select it and choose **Save study ledger JSON**. This exports
@@ -146,7 +151,7 @@ Earlier evaluation inspected an operator-authorized CPU result. The current UI
 gallery instead uses controlled test records with a real isolated local backend:
 no experiment execution or model calls. Selectors/save destinations are simulated;
 the captures do not establish native dialogs or scientific validity.
-Execution, study-ledger JSON and reproduction-bundle records are distinct exports.
+Execution, experiment-chain JSON, study-ledger JSON and reproduction-bundle records are distinct exports.
 
 Production identity, genuine agent reasoning, independent-host operation and
 scientific acceptance remain separate. See [capabilities and limits](implemented-capabilities.md)

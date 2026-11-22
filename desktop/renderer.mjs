@@ -599,7 +599,7 @@ function clearContext({ preserveConnectionForm = false } = {}) {
   for (const name of ['projects-more', 'tasks-more', 'workers-more', 'artifacts-more', 'events-more', 'threads-more', 'messages-more', 'decisions-more', 'remote-workflows-more', 'studies-more']) $(name).hidden = true;
   $('experiments-more').hidden = true;
   $('experiment-title').textContent = 'Select an experiment';
-  $('experiment-revise').disabled = $('conclusion-new').disabled = true;
+  $('experiment-revise').disabled = $('conclusion-new').disabled = $('experiment-export').disabled = true;
   $('study-title').textContent = 'Select a study'; $('program-review').hidden = true; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
   if (!preserveConnectionForm) resetConnectionForm();
@@ -686,7 +686,7 @@ async function selectProject(project) {
   $('message-form').hidden = true; $('message-form').reset(); $('harness-context').hidden = true; clearHarnessBinding(); $('thread-title').textContent = 'Select a thread';
   $('study-title').textContent = 'Select a study';
   $('experiment-title').textContent = 'Select an experiment';
-  $('experiment-revise').disabled = $('conclusion-new').disabled = true;
+  $('experiment-revise').disabled = $('conclusion-new').disabled = $('experiment-export').disabled = true;
   $('study-export').hidden = true;
   $('program-review').hidden = true; $('variant-new').hidden = true; $('study-close').hidden = true; $('source-new').hidden = $('finding-new').hidden = true;
   resetAuthoringForms();
@@ -1932,7 +1932,7 @@ async function selectExperiment(experiment) {
   // experiment's cards before the next read settles, rather than showing them
   // as context for the newly selected experiment.
   activeExperimentLedger = null;
-  $('experiment-revise').disabled = $('conclusion-new').disabled = true;
+  $('experiment-revise').disabled = $('conclusion-new').disabled = $('experiment-export').disabled = true;
   workbenchEntries = workbenchEntries.filter(item => item.source !== 'projection');
   renderWorkbenchEntries();
    $('experiment-title').textContent = experiment.goal;
@@ -1951,13 +1951,14 @@ async function selectExperiment(experiment) {
     renderExperimentLedger(ledger);
     $('experiment-revise').disabled = !canMutate();
     $('conclusion-new').disabled = !canMutate();
+    $('experiment-export').disabled = false; // read-only; not gated on canMutate
     workbenchEntries = [...workbenchEntries.filter(item => item.source !== 'projection'), ...workbenchEvidenceEntries(ledger)];
     renderWorkbenchEntries();
     $('experiment-detail').setAttribute('aria-busy', 'false');
   } catch (error) {
     if (version === epoch && project === activeProject && experiment === activeExperiment && requestVersion === readVersion.experiment) {
       $('experiment-detail').replaceChildren(element('p', 'Could not load a complete current experiment ledger. Partial, stale, or digest-inconsistent records are not shown; use Refresh to retry.', 'muted'));
-      $('experiment-revise').disabled = $('conclusion-new').disabled = true;
+      $('experiment-revise').disabled = $('conclusion-new').disabled = $('experiment-export').disabled = true;
       $('experiment-detail').setAttribute('aria-busy', 'false');
       throw error;
     }
@@ -2464,6 +2465,23 @@ for (const kind of ['source', 'assessment', 'correction', 'finding', 'finding-ac
     });
   });
 }
+$('experiment-export').addEventListener('click', () => guarded(async () => {
+  const version = epoch; const experiment = activeExperiment; const ledger = activeExperimentLedger;
+  const button = $('experiment-export');
+  if (button.disabled) return;
+  if (!experiment || !ledger) throw new Error('Select an experiment first.');
+  const current = () => version === epoch && experiment === activeExperiment && ledger === activeExperimentLedger;
+  button.disabled = true;
+  try {
+    const result = await api.saveExperimentExport(connectionId, experiment.id);
+    if (!current() || result.status === 'stale') return;
+    if (result.status === 'cancelled') { notice('Experiment export cancelled.'); return; }
+    if (result.status !== 'saved' || typeof result.basename !== 'string') throw new Error('Experiment export failed.');
+    notice(`Saved experiment export JSON: ${result.basename}`);
+  } catch (error) {
+    if (current()) throw error;
+  } finally { if (current()) button.disabled = false; }
+}));
 $('study-export').addEventListener('click', () => guarded(async () => {
   const version = epoch; const study = activeStudy; const selection = studyEpoch;
   const button = $('study-export');

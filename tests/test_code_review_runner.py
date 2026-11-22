@@ -67,6 +67,7 @@ class FakeStore:
         self.global_running = global_running  # running jobs owned by other hosts
         self.renewals = []
         self.max_seen = 0
+        self.passed_attempts = []  # (operation, attempt) per terminal call
 
     def add(self, job_id, budget=100, **overrides):
         job = {
@@ -159,13 +160,15 @@ class FakeStore:
         j["state"], j["reason"] = "failed", "model_child_vanished"
         return "failed"
 
-    def requeue_vanished_code_review(self, job_id, runner_id, now, receipt=None):
+    def requeue_vanished_code_review(self, job_id, runner_id, now, receipt=None, attempt=None):
+        self.passed_attempts.append(("requeue", attempt))
         with self.lock:
             j = self._owned(job_id, runner_id, now)
             self._receipt(j, "vanished", "model_child_vanished", receipt)
             return self._vanish(j)
 
-    def complete_code_review(self, job_id, runner_id, output, now):
+    def complete_code_review(self, job_id, runner_id, output, now, attempt=None):
+        self.passed_attempts.append(("complete", attempt))
         with self.lock:
             j = self._owned(job_id, runner_id, now)
             if self.complete_error:
@@ -174,7 +177,8 @@ class FakeStore:
             j.update(state="completed", output=output, lease_owner=None)
             return self._record(j)
 
-    def fail_code_review(self, job_id, runner_id, reason, now, receipt=None):
+    def fail_code_review(self, job_id, runner_id, reason, now, receipt=None, attempt=None):
+        self.passed_attempts.append(("fail", attempt))
         if reason not in FAIL_REASONS:
             raise ValueError("unknown code review failure reason")
         with self.lock:
@@ -1357,7 +1361,7 @@ def test_late_lease_conflict_passes_the_receipt_once_and_changes_nothing_else(fa
     if failure == "complete":
         outcome = ChildOutcome.completed(GOOD)
 
-        def late(job_id, runner_id, output, now):
+        def late(job_id, runner_id, output, now, attempt=None):
             passed.append(output["receipt"])
             raise Conflict("code review lease expired")
 
@@ -1365,7 +1369,7 @@ def test_late_lease_conflict_passes_the_receipt_once_and_changes_nothing_else(fa
     else:
         outcome = ChildOutcome.failed("model_failed", receipt=RECEIPT)
 
-        def late(job_id, runner_id, reason, now, receipt=None):
+        def late(job_id, runner_id, reason, now, receipt=None, attempt=None):
             passed.append(receipt)
             raise Conflict("code review lease expired")
 
@@ -1375,3 +1379,80 @@ def test_late_lease_conflict_passes_the_receipt_once_and_changes_nothing_else(fa
     run_all(r)
     assert passed == [RECEIPT]
     assert r.in_flight == 0
+
+
+def test_attempt_is_passed_on_every_terminal_call():
+    # complete
+    s = FakeStore()
+    s.add("j1")
+    run_all(make(s, ScriptModel(ChildOutcome.completed(GOOD))))
+    assert s.passed_attempts == [("complete", 1)]
+    # 422 -> fail after the failed complete
+    s = FakeStore()
+    s.add("j1")
+    s.complete_error = ReviewRefused("failed_output_invalid", 422)
+    run_all(make(s, ScriptModel(ChildOutcome.completed(GOOD))))
+    assert s.passed_attempts == [("complete", 1), ("fail", 1)]
+    # child failure
+    s = FakeStore()
+    s.add("j1")
+    run_all(make(s, ScriptModel(ChildOutcome.failed("model_failed"))))
+    assert s.passed_attempts == [("fail", 1)]
+    # adapter crash
+    s = FakeStore()
+    s.add("j1")
+
+    def boom(extra):
+        raise RuntimeError("adapter")
+
+    run_all(make(s, ScriptModel(boom)))
+    assert s.passed_attempts == [("fail", 1)]
+    # vanish, then the retry carries attempt 2
+    s = FakeStore()
+    s.add("j1")
+    run_all(make(s, ScriptModel(ChildOutcome.vanished(), ChildOutcome.completed(GOOD))))
+    run_all(make(s, ScriptModel(ChildOutcome.completed(GOOD))))
+    assert s.passed_attempts == [("requeue", 1), ("complete", 2)]
+
+
+def test_attempt_is_passed_when_no_attempt_was_launched():
+    s = FakeStore()
+    s.add("j1")
+    s.inputs_error = StoreError("custody")
+    m = ScriptModel()
+    run_all(make(s, m))
+    assert m.attempts == [] and s.passed_attempts == [("fail", 1)]
+    s = FakeStore()
+    s.add("j1", budget=100)
+    s.job("j1")["cost_cents_total"] = 100
+    m = ScriptModel()
+    run_all(make(s, m))
+    assert m.attempts == [] and s.passed_attempts == [("fail", 1)]
+
+
+def test_cli_gives_each_runner_process_a_fresh_id(tmp_path, monkeypatch):
+    # Late reports are attributed by (runner id, attempt); ids must never be reused.
+    ids = []
+
+    class FakeRunner:
+        def __init__(self, store, model, policy, **kwargs):
+            ids.append(kwargs["runner_id"])
+
+        def run_once(self):
+            raise KeyboardInterrupt
+
+        def drain(self):
+            pass
+
+    import re
+
+    import tessera_control.review_jobs as review_jobs
+
+    monkeypatch.setattr(review_jobs, "ReviewJobStore", lambda path: object())
+    monkeypatch.setattr(crr, "CodeReviewRunner", FakeRunner)
+    environment = _creds(tmp_path)
+    for _ in range(2):
+        rc = crr.main(_args(tmp_path), environment=environment, policy=_AdmitAll())
+        assert rc == 0
+    assert len(ids) == 2 and ids[0] != ids[1]
+    assert all(re.fullmatch(r"runner-[0-9a-f]{32}", i) for i in ids)

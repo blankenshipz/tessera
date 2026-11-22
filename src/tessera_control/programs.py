@@ -27,6 +27,13 @@ def _rows(conn, sql, parameters):
     return rows
 
 
+def omit_unset_decision(conclusions):
+    """Keep digests of decision-less conclusions identical to the pre-decision row shape."""
+    for conclusion in conclusions:
+        if conclusion.get("decision") is None:
+            conclusion.pop("decision", None)
+
+
 def program_basis(conn, actor, study_id):
     study = ResearchStore._study(conn, actor, study_id)
     basis = {"study": study}
@@ -71,6 +78,7 @@ def program_basis(conn, actor, study_id):
                 f"SELECT * FROM {table} WHERE experiment_id=? ORDER BY rowid",
                 (experiment_id,),
             )
+        omit_unset_decision(item["conclusions"])
         basis["executions"].append(item)
         if len(json.dumps(basis).encode()) > 1_000_000:
             raise Conflict("Program context exceeds its byte limit; no partial review is allowed.")
