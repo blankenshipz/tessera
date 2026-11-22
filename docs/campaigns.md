@@ -137,6 +137,42 @@ tools and their scopes are in [mcp-campaign-client-path.md](mcp-campaign-client-
 Never give campaign scopes to an OpenCode harness credential: the pinned tool catalog would
 then block with `catalog_inventory_changed`.
 
+## Approved submissions for the agent loop
+
+A person can record an *approved submission*: a spec digest they reviewed, or a failed campaign to
+rerun, with a per-run budget cap and an expiry
+([ADR 0093](decisions/0093-agent-loop-submits-owner-approved-campaigns.md)). The agent loop, or a
+session with the scope `campaign:submit_cleared`, then turns a pending record into a campaign.
+The approver on that campaign is the person who made the record; the agent never approves, widens a
+cap or changes the digest. The feature is off by default: until an operator enables it every submit is
+refused `feature_disabled`. While a kill-switch marker file exists the runner pauses new submissions. Each
+submit, refusal and cancel is recorded and appears in the campaign receipt. `tessera_list_pending_submissions`,
+`tessera_read_submission` and `tessera_cancel_submission` show and stop what the loop will do next.
+
+### Running the submit runner
+
+`tessera-submit-runner` calls the submit action on a schedule. It is off until an operator starts it,
+and control must also run with `tessera serve --agent-submissions` (otherwise every submit is refused
+`feature_disabled`). It runs no model: it only consumes records a person approved.
+
+```
+export TESSERA_CONTROL_URL=http://localhost:8080
+export TESSERA_AGENT_TOKEN_FILE=/etc/tessera/credentials/submit-runner-agent-token
+export TESSERA_PROJECT_ID=example-project
+export TESSERA_AGENT_DESTINATION=example-destination
+tessera-submit-runner --journal /var/lib/tessera/submit-runner/journal.jsonl \
+  --kill-switch /etc/tessera/submit-runner.kill --interval-seconds 60
+```
+
+`--journal` and `--kill-switch` are required. `--max-submissions-per-tick`, `--max-attempts-per-tick`
+and `--max-ticks` bound the work, and `--once` runs a single tick. The runner refuses to start if
+`ANTHROPIC_API_KEY` is set. Exit codes: 0 stopped, 2 configuration refused, 3 halted. The journal is
+a private, append-only JSONL log of receipts. While the kill-switch file exists (or its state is ambiguous, e.g. a missing parent directory)
+the runner pauses without exiting, calls neither the action nor the control plane, and resumes by
+itself when the file is removed; exit 0 comes only from a stop request, and exit 3 after repeated
+failed ticks. Campaigns already submitted are untouched. An example unit (manual start, admission marker, token
+passed as a credential) is in [`deploy/systemd`](../deploy/systemd/README.md).
+
 ## What the runner does
 
 `tessera serve` ticks the runner every 2 s (`--campaign-tick-seconds`, 0.2 to 60;
@@ -299,6 +335,23 @@ lineage node and edge ids, `verdict {operational, scientific_verdict}` and
 `receipt_digest`, plus `chained_inputs` when an input was resolved from a predecessor's receipt
 (ADR 0080). `scientific_verdict` is `pending_human_approval` or `not_assessed`.
 Do not report a campaign as run without reading its receipt.
+
+## Code as an input
+
+A stage's own code is a content-addressed input, not part of an image
+([ADR 0095](decisions/0095-stage-code-as-input-artifacts.md)). A v2 stage may name one of its
+`snapshot` inputs as `code_input`: the snapshot holding the stage's code, pinned by digest and mounted by
+the usual input path (`/inputs`, or `/inputs/<name>/`) into a generic runtime image that holds only
+dependencies. Submit and approval refuse a `code_input` that is not a snapshot input of the stage, is
+empty, or carries a code approval that no longer matches its files. The receipt's stage entry then has a
+`code` block (input name, snapshot id and digest, `code_digest`, the file count (an integer; file
+paths never appear on receipts), whether a valid human code approval covers it, and the image
+digest) and each attempt a `code_transfer` block (provider, worker, code digest, image digest,
+trust policy digest, admission basis, `granted`, and the approval state recorded at grant time).
+The runner writes one `campaign.code_granted` event per attempt, in the same transaction as the
+grant, with ids and digests only; a grant does not prove the worker fetched the code. This does not approve code (a
+human still does, and a composed snapshot loses an approval), it builds no image, and a stage without
+`code_input` is unchanged.
 
 ## Standing approvals and scheduled starts
 

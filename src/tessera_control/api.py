@@ -88,6 +88,9 @@ def create_app(
     agent_sandbox_backend: Any = None,
     campaign_runner_interval: float | None = None,
     campaign_scheduler: bool = True,
+    campaign_stuck_scan_seconds: float = 300.0,
+    review_single_owner: bool = False,
+    storage_retention: bool = False,
 ) -> FastAPI:
     """Build a control API with an explicit serving profile around initialized state."""
 
@@ -221,6 +224,9 @@ def create_app(
     app.state.admin = AdminStore(state_dir)
     app.include_router(admin_router)
     app.include_router(provider_registration_router)
+    from .model_spend_api import router as model_spend_router
+
+    app.include_router(model_spend_router)
     app.state.external_agents = ExternalAgentStore(state_dir)
     app.include_router(external_agent_router)
     app.state.agent_authority = AgentAuthorityStore(state_dir)
@@ -229,7 +235,9 @@ def create_app(
     from .review_jobs import NoDestinationsPolicy, ReviewJobStore
     from .review_jobs_api import router as review_jobs_router
 
+    app.state.review_single_owner = review_single_owner
     app.state.review_jobs = ReviewJobStore(state_dir)
+    app.state.review_jobs.single_owner = review_single_owner
     app.state.review_policy = NoDestinationsPolicy()
     app.include_router(review_jobs_router)
     from .agent_loop_control import AgentLoopControlStore
@@ -237,6 +245,11 @@ def create_app(
 
     app.state.agent_loop_control = AgentLoopControlStore(state_dir)
     app.include_router(agent_loop_control_router)
+    from .people import PeopleStore
+    from .people_api import router as people_router
+
+    app.state.people = PeopleStore(state_dir)
+    app.include_router(people_router)
     from .agent_research_results import AgentResultStore
     from .agent_research_results_api import router as agent_results_router
 
@@ -255,8 +268,11 @@ def create_app(
     from .egress_journal_api import router as egress_journal_router
     from .snapshot_chunks import ChunkedSnapshotStore
     from .snapshot_chunks_api import router as snapshot_chunks_router
+    from .stage_watch import StageWatchStore
+    from .stage_watch_api import router as stage_watch_router
 
     app.state.egress_journal = EgressJournalStore(state_dir)
+    app.state.stage_watch = StageWatchStore(state_dir)
     app.state.dataset_staging = DatasetStagingStore(state_dir)
     app.state.chunked_snapshots = ChunkedSnapshotStore(state_dir)
     app.state.remote_execution = RemoteExecutionStore(state_dir)
@@ -268,6 +284,7 @@ def create_app(
     app.include_router(execution_run_receipt_router)
     app.include_router(provider_inputs_router)
     app.include_router(egress_journal_router)
+    app.include_router(stage_watch_router)
     app.include_router(dataset_staging_router)
     app.include_router(snapshot_chunks_router)
     app.include_router(credential_lease_router)
@@ -284,11 +301,21 @@ def create_app(
     app.state.campaigns = CampaignStore(state_dir)
     app.state.snapshot_composition = SnapshotCompositionStore(state_dir)
     app.include_router(campaign_router)
+    from .campaign_stuck_api import router as campaign_stuck_router
+
+    app.include_router(campaign_stuck_router)
     from .agent_campaign_reads import AgentCampaignReads
     from .agent_campaign_reads_api import router as agent_campaign_reads_router
 
     app.state.agent_campaign_reads = AgentCampaignReads(state_dir)
     app.include_router(agent_campaign_reads_router)
+    from .campaign_submissions import AgentSubmissionConfig, CampaignSubmissionStore
+    from .campaign_submissions_api import router as campaign_submissions_router
+
+    app.state.campaign_submissions = CampaignSubmissionStore(state_dir)
+    # Off by default (ADR 0093): serve, or the embedding operator, replaces it.
+    app.state.agent_submission = AgentSubmissionConfig()
+    app.include_router(campaign_submissions_router)
     app.include_router(snapshot_composition_router)
     app.include_router(worker_grants_router)
     from .salad_unclaimed import SaladUnclaimedStore
@@ -348,6 +375,17 @@ def create_app(
     @app.get("/me")
     def me(actor: Annotated[dict[str, Any], Depends(principal)]) -> dict[str, Any]:
         return store.me(actor)
+
+    @app.get("/storage-retention/status")
+    def storage_retention_status(
+        actor: Annotated[dict[str, Any], Depends(principal)],
+    ) -> dict[str, Any]:
+        """Read-only retention summary (no paths or refs); a person's credential only."""
+        if actor.get("kind") == "worker" or actor.get("role") != "human":
+            raise Forbidden("A human credential is required.")
+        from .storage_retention_status import retention_status
+
+        return retention_status(state_dir)
 
     @app.get("/recovery")
     def recovery(actor: Annotated[dict[str, Any], Depends(principal)]) -> dict[str, Any]:
@@ -546,18 +584,40 @@ def create_app(
 
         @asynccontextmanager
         async def runner_lifespan(application: FastAPI):
-            from . import campaign_runner
+            from . import campaign_runner, campaign_stuck
 
             handle = campaign_runner.start_background(
                 state_dir, campaign_runner_interval, scheduler=campaign_scheduler
+            )
+            scanner = campaign_stuck.start_background(
+                state_dir / "tessera.sqlite3", campaign_stuck_scan_seconds
             )
             try:
                 async with previous_lifespan(application) as state:
                     yield state
             finally:
+                scanner.stop()
                 handle.stop()
 
         app.router.lifespan_context = runner_lifespan
+
+    if storage_retention:
+        # Retention timer: reports (dry run) or, only when the operator's policy sets
+        # auto_apply, applies; composed with the existing lifespan like the runner.
+        retention_previous = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def retention_lifespan(application: FastAPI):
+            from . import storage_retention as retention
+
+            handle = retention.start_background(state_dir)
+            try:
+                async with retention_previous(application) as state:
+                    yield state
+            finally:
+                handle.stop()
+
+        app.router.lifespan_context = retention_lifespan
 
     return app
 

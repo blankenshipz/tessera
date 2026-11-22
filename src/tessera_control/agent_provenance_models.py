@@ -97,6 +97,32 @@ class RateLimitObservation(BaseModel):
         return {k: v for k, v in handler(self).items() if v is not None}
 
 
+class ToolTurnObservation(BaseModel):
+    """Content-free counts for one model turn's tool calls (digest-only journal aggregate).
+
+    Counts follow the tool-row status model (ADR 0083): ``calls`` is every row of the turn;
+    ``errors``, ``denied`` and ``uncertain`` count those statuses; ``unrun`` counts rows
+    refused with ``turn_limit_reached`` and ``refused`` every other refusal (a fence code);
+    ``truncated`` counts truncated results. ``refused`` and ``uncertain`` are optional for
+    records written before they existed and, like other absent metadata, omitted when
+    absent; the runtime always writes both.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    turn: int = Field(ge=1, le=16)
+    calls: int = Field(ge=0, le=64)
+    errors: int = Field(ge=0, le=64)
+    denied: int = Field(ge=0, le=64)
+    truncated: int = Field(ge=0, le=64)
+    unrun: int = Field(ge=0, le=64)
+    refused: int | None = Field(default=None, ge=0, le=64)
+    uncertain: int | None = Field(default=None, ge=0, le=64)
+
+    @model_serializer(mode="wrap")
+    def omit_absent_counts(self, handler):
+        return {k: v for k, v in handler(self).items() if v is not None}
+
+
 class AgentProvenanceRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -143,6 +169,7 @@ class AgentProvenanceRecord(BaseModel):
         | None
     ) = None
     rate_limit: RateLimitObservation | None = None
+    tool_turn: ToolTurnObservation | None = None
 
     @model_serializer(mode="wrap")
     def omit_absent_harness_metadata(self, handler):
@@ -155,6 +182,8 @@ class AgentProvenanceRecord(BaseModel):
             value.pop("guard_phase", None)
         if value.get("rate_limit") is None:
             value.pop("rate_limit", None)
+        if value.get("tool_turn") is None:
+            value.pop("tool_turn", None)
         return value
 
 

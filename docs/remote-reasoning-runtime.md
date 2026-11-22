@@ -79,13 +79,61 @@ default.
 **Caps and receipts.** Before each billed call Tessera counts input tokens with the Messages API
 `count_tokens` endpoint on the same host, then refuses the call (`model_call_cap_exceeded`,
 nothing billed) if input tokens, worst-case cost, the UTC-day token or cost cap, or the grant's
-remaining budget would be exceeded. The daily totals are re-checked after the call. Cost is
+remaining budget would be exceeded. Pending reservations of other calls count toward those
+caps. Just before the billed request Tessera writes that call's receipt row as `status: pending`
+holding its worst case (counted input + `max_output_tokens_per_call`, `cost_cents_estimate_max`),
+added to the run totals and the UTC-day ledger in the same transaction. The response settles
+the row in place, again in one transaction: the actual usage, the worst-case charge of a
+substituted model, or the reservation kept for an unknown outcome
+(`reserved_worst_case_estimate`, `uncertain`). A 429, 529, quota/billing error or 4xx releases
+it (`status: void`, zero tokens and cost, kept for audit). If the process dies mid-call, the
+next tick turns the still-pending row into that call's `uncertain` receipt (already counted,
+never resent) and halts the run `model_call_uncertain`. The printed receipt lists every row with
+its `status`. The daily totals are re-checked after the call. Cost is
 computed from the prices you pin in the profile; keep them current. A 429, 529 or billing error
 is recorded and backed off with the same model; a model the response reports that does not match
 the configured one halts the run. See [ADR 0083](decisions/0083-model-call-receipts.md).
 
-**Known gap.** This runtime sends one user message and uses no tools; the profile's
-`permissions` must be exactly deny-all.
+**Tool use.** With the deny-all `permissions` alone, the runtime sends one user message and
+offers no tools. The profile may instead allow exact Tessera MCP tools (see the tools variant
+below). Tools are Tessera's own, run through the same `tessera_mcp` server with the same agent
+token (read by file path, never in argv or logs) and the control API re-checks scopes on every
+call. Deny by default: only allowed tools are offered or executed, and `tool_catalog_sha256`
+pins the offered tool list (a mismatch blocks with `tool_catalog_changed`). `max_steps` bounds
+model turns; `limits.max_tool_calls` and `limits.max_tool_result_bytes` bound tool use. Each
+turn has its own model-call receipt row (`turn`, `stop_reason`, `tool_use_count`), and each tool
+call has exactly one `tool_calls` receipt row carrying `name`, `input_sha256`, `result_sha256`,
+`is_error`, `truncated`, `allowed`, `status` and `skip_reason`; digests only, inputs and results
+are never stored or journalled. `status` is the whole model (there is no `executed` flag): an
+allowed call gets an intent row (`started`) before it runs, completed exactly once to
+`succeeded`, `error` or `uncertain`; an unlisted or disallowed call is `denied`; a call that is
+not run is `refused` with `skip_reason` (a fence code, or `turn_limit_reached` for tools
+requested on the last allowed turn, whose model receipt also carries `unrun_tool_count`). A call
+whose outcome is unknown (timeout, transport loss, or a crash before completion; rows still
+`started` at the next tick become `uncertain`) is never retried and halts the run
+`tool_call_uncertain`. Each tool-using turn also enqueues one aggregated provenance record once
+all its rows are terminal (kind `tool`, `tool_id` `tessera_tool_turn`, a digest over that turn's
+tool receipts and a `tool_turn` count object: calls, errors, denied, truncated, unrun, refused,
+uncertain); a turn cut off by a crash gets it when its rows are marked `uncertain`. The outbox
+stays at most 64 with 8 slots reserved, so after the bound one `tessera_tool_turn_overflow`
+record is written and further tool turns are journal-only. Per-call and daily caps and the
+grant budget are counted across turns and checked before each billed turn. The kill switch
+(stop request, grant revocation or expiry, run duration, grant budget, daily cap) is checked
+before each billed turn and before EACH tool call: if it trips, that call and the rest of the
+turn's requested calls are recorded `refused` with the fence code, none runs, and the run halts
+with that code. A definite rejection after turn 1 backs off and resumes at the rejected turn
+without replaying turns or tool calls; an uncertain outcome is never replayed. The paused loop
+is durable: the conversation snapshot is kept in a private file `<state_dir>/pending/<run_id>.json`
+(0600, in a 0700 directory), only its sha256 is journalled (`loop_parks`), and after a restart
+the supervisor verifies the digest, that the snapshot's totals equal the run totals and that its
+`tool_calls_used` equals the journal's answered tool rows (`succeeded`, `error`, `denied`)
+before resuming at the parked turn (`loop_resumes` receipt with `restored_from_disk`, plus a
+`resume.N` provenance record). A missing or invalid file halts `model_resume_state_invalid`; a
+`started` row found at the next tick halts `tool_call_uncertain` before any restore. The file is
+deleted when the loop completes, halts or is stopped. Egress is unchanged: the
+model host only on the model-runtime allowlist, tool calls to the control plane through the
+existing MCP server. Gap: the OpenAI/OpenCode path already runs tools in its harness and does
+not get per-tool-call digest receipts. See [ADR 0083](decisions/0083-model-call-receipts.md).
 
 **Upgrading.** Existing OpenAI deployments must install the `openai.conf` drop-in before
 updating the unit file; the base unit now loads `model-credential` and `anthropic-api-key`, and
@@ -95,7 +143,7 @@ must create both credential files (steps 1 and 2) and switch the profile; then
 drop-in does.
 
 **Deploy order.** Upgrade the control plane before the reasoning supervisor. The control-side
-provenance model rejects unknown fields (the new `rate_limit` provenance records), so an older control
+provenance model rejects unknown fields (the new `rate_limit` and `tool_turn` provenance fields), so an older control
 plane would reject them until the run's outbox bound halts it.
 
 **Egress.** `api.anthropic.com:443` is on the model-runtime allowlist and Tessera's own
@@ -313,10 +361,51 @@ current published prices before use.
 
 `max_output_tokens_per_call` is at most 32768, `max_cost_cents_per_call` at most 5000 and
 `daily_cost_cap_cents` at most 100000; all `limits` values are positive integers and the prices
-are non-negative numbers (cents per million tokens). `permissions` must be exactly the deny-all
-rule shown (no tool use in this runtime yet). Harness fields (`harness_url`, `agent`,
+are non-negative numbers (cents per million tokens). An optional
+`substitution_pricing_cents_per_mtok` (same four keys and validation; every price at least the
+corresponding `pricing_cents_per_mtok` one) prices a reply from a different model: that call is
+charged `max(actual tokens at these prices, cost_cents_estimate_max)`. Absent, the actual is
+priced at the pinned prices (the reservation still floors the charge). It joins the policy
+digest only when present, and a rejected value is never echoed. Two optional `limits` bound the streamed
+billed call (ADR 0083). The first is `stream_idle_timeout_seconds`, an integer 10–300, default
+60: the longest gap between response bytes. The second is `request_timeout_seconds`, an integer
+30–3600, default `min(3600, 120 + 0.1 * max_output_tokens_per_call)`: the whole call. A call that
+idles or overruns ends `model_call_uncertain` with the worst case reserved. Each is part of the
+policy only when set. `permissions` must be the deny-all rule shown, optionally followed by
+exact `tessera_*` allows (tools variant below); no other rule shape is accepted. Harness fields
+(`harness_url`, `agent`,
 `workspace`, `version`, `schema_sha256`) are not used. Optional `fable_approval_id` and
 `input_digests` apply as above.
+
+Optional `control_ca_file`: an absolute path to a PEM CA bundle used to verify the control URL
+(for a private CA). It is validated as an absolute path and passed to Tessera's MCP server child
+only as `TESSERA_CONTROL_CA_FILE`; it is not a secret and adds no egress. Omit it to use the
+system trust store.
+
+Tools variant: change `permissions`, `max_steps` and `limits` as follows and keep every other
+field (add the optional `control_ca_file`, e.g. `"/etc/tessera/control-ca.pem"`, only if the
+control URL uses a private CA). `tool_catalog_sha256` and both tool limits are required when any allow is present.
+
+```json
+{
+  "max_steps": 6,
+  "permissions": [
+    {"action": "*", "resource": "*", "effect": "deny"},
+    {"action": "tessera_list_contexts", "resource": "*", "effect": "allow"},
+    {"action": "tessera_read_context", "resource": "*", "effect": "allow"}
+  ],
+  "tool_catalog_sha256": "<64-hex printed by tessera-reasoning catalog>",
+  "limits": {
+    "max_output_tokens_per_call": 4096,
+    "max_input_tokens_per_call": 20000,
+    "max_cost_cents_per_call": 50,
+    "daily_token_cap": 200000,
+    "daily_cost_cap_cents": 500,
+    "max_tool_calls": 8,
+    "max_tool_result_bytes": 16384
+  }
+}
+```
 
 Optional OpenAI alternative (OpenCode V2 harness; included ChatGPT OAuth, no `credential_ref`):
 

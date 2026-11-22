@@ -53,6 +53,27 @@ class FakeOpener:
         return item
 
 
+class FakeStreamResponse(FakeResponse):
+    """The billed call streams: one read1 per scripted chunk, then EOF."""
+
+    def __init__(self, events):
+        super().__init__(200, b"")
+        self._chunks = [f"data: {json.dumps(e)}\n\n".encode() for e in events]
+
+    def read1(self, n=-1):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+def stream_of(body):
+    start = dict(body, content=[], stop_reason=None)
+    events = [{"type": "message_start", "message": start}]
+    for index, block in enumerate(body["content"]):
+        events.append({"type": "content_block_start", "index": index, "content_block": block})
+        events.append({"type": "content_block_stop", "index": index})
+    events.append({"type": "message_delta", "delta": {"stop_reason": body["stop_reason"]}})
+    return [*events, {"type": "message_stop"}]
+
+
 # -- transport ---------------------------------------------------------------------------------
 
 
@@ -284,7 +305,7 @@ def test_dated_model_variant_is_accepted(creds):
 
 
 @pytest.mark.parametrize(
-    "model", ["claude-haiku-4-5", "claude-sonnet-4-5-2025092", "claude-sonnet-4-5-latest", None]
+    "model", ["claude-haiku-4-5", "claude-sonnet-4-5-2025092", "claude-sonnet-4-5-latest"]
 )
 def test_model_substitution_halts(creds, model):
     reasoning = adapter(creds, FakeTransport(count(), message(model=model)))
@@ -434,7 +455,9 @@ def test_egress_refusal_is_sanitized(creds):
 
 
 def test_adapter_with_real_transport_and_fake_opener_end_to_end(creds):
-    opener = FakeOpener(FakeResponse(200, {"input_tokens": 10}), FakeResponse(200, message()[2]))
+    opener = FakeOpener(
+        FakeResponse(200, {"input_tokens": 10}), FakeStreamResponse(stream_of(message()[2]))
+    )
     reasoning = adapter(creds, AllowlistedTransport("anthropic", opener=opener))
     reasoning.prompt(ROW, "hi")
     urls = [r.full_url for r, _ in opener.calls]
@@ -509,6 +532,110 @@ def test_usage_accumulates_per_row(creds):
     assert observed["cost"] == pytest.approx(2 * 0.105)
 
 
+# -- tool profile validation ---------------------------------------------------------------------
+
+DENY = {"action": "*", "resource": "*", "effect": "deny"}
+
+
+def tool_profile(**change):
+    found = profile(max_tool_calls=4, max_tool_result_bytes=4096)
+    found |= {
+        "permissions": [DENY, {"action": "tessera_read", "resource": "*", "effect": "allow"}],
+        "tool_catalog_sha256": "b" * 64,
+        "max_steps": 4,
+    }
+    return found | change
+
+
+def test_valid_tool_profile_and_allowed_set():
+    from tessera_agent.anthropic_messages import allowed_tools, validate_anthropic_profile
+
+    validate_anthropic_profile(tool_profile())
+    assert allowed_tools(tool_profile()) == frozenset({"tessera_read"})
+    assert allowed_tools(profile()) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        ({"permissions": []}, "anthropic_permissions_invalid"),
+        (
+            {"permissions": [{"action": "tessera_read", "resource": "*", "effect": "allow"}]},
+            "anthropic_permissions_invalid",
+        ),
+        (
+            {"permissions": [DENY, {"action": "bash", "resource": "*", "effect": "allow"}]},
+            "anthropic_permissions_invalid",
+        ),
+        (
+            {"permissions": [DENY, {"action": "tessera_*", "resource": "*", "effect": "allow"}]},
+            "anthropic_permissions_invalid",
+        ),
+        (
+            {"permissions": [DENY, {"action": "tessera_read", "resource": "x", "effect": "allow"}]},
+            "anthropic_permissions_invalid",
+        ),
+        (
+            {"permissions": [DENY, {"action": "skill", "resource": "s", "effect": "allow"}]},
+            "anthropic_permissions_invalid",
+        ),
+        (
+            {
+                "permissions": [
+                    DENY,
+                    {"action": "tessera_read", "resource": "*", "effect": "allow", "x": 1},
+                ]
+            },
+            "anthropic_permissions_invalid",
+        ),
+        (
+            {
+                "permissions": [
+                    DENY,
+                    {"action": "tessera_read", "resource": "*", "effect": "allow"},
+                    {"action": "tessera_read", "resource": "*", "effect": "allow"},
+                ]
+            },
+            "anthropic_permissions_invalid",
+        ),
+        ({"tool_catalog_sha256": None}, "anthropic_tool_catalog_invalid"),
+        ({"tool_catalog_sha256": "B" * 64}, "anthropic_tool_catalog_invalid"),
+        ({"max_steps": None}, "anthropic_limits_invalid"),
+        ({"max_steps": 17}, "anthropic_limits_invalid"),
+        ({"limits": profile(max_tool_result_bytes=4096)["limits"]}, "anthropic_limits_invalid"),
+        (
+            {"limits": profile(max_tool_calls=65, max_tool_result_bytes=4096)["limits"]},
+            "anthropic_limits_invalid",
+        ),
+        (
+            {"limits": profile(max_tool_calls=4, max_tool_result_bytes=65537)["limits"]},
+            "anthropic_limits_invalid",
+        ),
+    ],
+)
+def test_invalid_tool_profile_is_refused(change, code):
+    from tessera_agent.anthropic_messages import validate_anthropic_profile
+
+    with pytest.raises(ValueError) as caught:
+        validate_anthropic_profile(tool_profile(**change))
+    assert str(caught.value) == code
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tool_catalog_sha256": "b" * 64},
+        {"limits": profile(max_tool_calls=4)["limits"]},
+        {"max_steps": 0},
+    ],
+)
+def test_tool_settings_without_allows_are_refused(change):
+    from tessera_agent.anthropic_messages import validate_anthropic_profile
+
+    with pytest.raises(ValueError):
+        validate_anthropic_profile(profile() | change)
+
+
 # -- billed calls that halt: what the supervisor receipts (review rv-rmd3 finding 1) ----------
 
 WORST_CENTS = (100 * 300 + 1000 * 1500) / 1e6  # counted input + output cap at pinned prices
@@ -523,6 +650,7 @@ def assert_reserved(billed, outcome_class):
         "cost": pytest.approx(WORST_CENTS),
         "reported_model": None,
         "cost_cents_estimate_max": pytest.approx(WORST_CENTS),
+        "turn": 1,  # The tool loop's turn; a single-call prompt is turn 1.
     }
 
 
@@ -547,7 +675,8 @@ def test_substituted_model_carries_actual_usage_and_reported_model(creds):
         adapter(creds, transport).prompt(ROW, "hi")
     billed = caught.value.billed_call
     assert billed["outcome_class"] == "model_substituted"
-    assert billed["cost_basis"] == "computed_from_pinned_prices"
+    # Charged as the worst case: max(actual, counted input + output cap), at least the estimate.
+    assert billed["cost_basis"] == "worst_case_for_substituted_model"
     assert billed["usage"] == {
         "input": 100,
         "output": 900,
@@ -555,28 +684,34 @@ def test_substituted_model_carries_actual_usage_and_reported_model(creds):
         "cache_write": 0,
         "reasoning": 0,
     }
-    assert billed["tokens"] == 1000
-    assert billed["cost"] == pytest.approx((100 * 300 + 900 * 1500) / 1e6)
+    assert billed["tokens"] == 1100
+    assert billed["cost"] == pytest.approx(WORST_CENTS)
     assert billed["reported_model"] == "anthropic/claude-haiku-4-5"
     assert billed["cost_cents_estimate_max"] == pytest.approx(WORST_CENTS)
     assert caught.value.request_sent is None
     assert_no_secret(caught.value, billed)
 
 
-@pytest.mark.parametrize("model", [None, "Not A Model Id!"])
-def test_substituted_model_never_echoes_an_invalid_identifier(creds, model):
-    transport = FakeTransport(count(), message(model=model))
+def test_substituted_model_never_echoes_an_invalid_identifier(creds):
+    transport = FakeTransport(count(), message(model="Not A Model Id!"))
     with pytest.raises(RuntimeBlocked, match="model_substituted") as caught:
         adapter(creds, transport).prompt(ROW, "hi")
     assert caught.value.billed_call["reported_model"] is None
-    assert caught.value.billed_call["tokens"] == 150
+    assert caught.value.billed_call["tokens"] == 1100
 
 
-def test_substituted_model_without_usage_reserves_worst_case(creds):
+def test_missing_model_is_an_unusable_body_and_uncertain(creds):
+    transport = FakeTransport(count(), message(model=None))
+    with pytest.raises(RuntimeBlocked, match="model_call_uncertain") as caught:
+        adapter(creds, transport).prompt(ROW, "hi")
+    assert_reserved(caught.value.billed_call, "uncertain")
+
+
+def test_substituted_model_without_usage_is_uncertain_and_reserved(creds):
     reply = (200, {}, {"model": "claude-haiku-4-5", "content": []})
-    with pytest.raises(RuntimeBlocked, match="model_substituted") as caught:
+    with pytest.raises(RuntimeBlocked, match="model_call_uncertain") as caught:
         adapter(creds, FakeTransport(count(), reply)).prompt(ROW, "hi")
-    assert_reserved(caught.value.billed_call, "model_substituted")
+    assert_reserved(caught.value.billed_call, "uncertain")
 
 
 def test_output_unrecorded_carries_actual_usage(creds):
@@ -629,14 +764,24 @@ def test_transport_passes_per_request_timeout_to_the_opener():
     assert [timeout for _, timeout in opener.calls] == [412.5, COUNT_TIMEOUT_SECONDS]
 
 
-def test_real_transport_end_to_end_uses_derived_timeouts(creds):
-    opener = FakeOpener(FakeResponse(200, {"input_tokens": 10}), FakeResponse(200, message()[2]))
-    reasoning = adapter(creds, AllowlistedTransport("anthropic", opener=opener))
+def test_real_transport_end_to_end_streams_with_idle_timeout(creds):
+    sink = []
+    opener = FakeOpener(
+        FakeResponse(200, {"input_tokens": 10}), FakeStreamResponse(stream_of(message()[2]))
+    )
+    reasoning = adapter(
+        creds,
+        AllowlistedTransport("anthropic", opener=opener),
+        output_sink=lambda row, text: sink.append(text),
+    )
     reasoning.prompt(ROW, "hi")
-    assert [timeout for _, timeout in opener.calls] == [30, pytest.approx(100.0)]
+    # count_tokens: fixed 30 s; the streamed billed call: the 60 s idle timeout per read.
+    assert [timeout for _, timeout in opener.calls] == [30, 60]
+    assert json.loads(opener.calls[1][0].data)["stream"] is True
+    assert sink == ["COMPLETION-TEXT"]
 
 
-@pytest.mark.parametrize("configured", [30, 45, 600])
+@pytest.mark.parametrize("configured", [30, 45, 600, 3600])
 def test_configured_request_timeout_overrides_the_derived_default(creds, configured):
     transport = FakeTransport(count(10), message())
     limits = {"max_output_tokens_per_call": 32768, "request_timeout_seconds": configured}
@@ -645,7 +790,7 @@ def test_configured_request_timeout_overrides_the_derived_default(creds, configu
     assert transport.timeouts == [COUNT_TIMEOUT_SECONDS, configured]
 
 
-@pytest.mark.parametrize("bad", [0, 29, 601, 60.0, "120", True, None])
+@pytest.mark.parametrize("bad", [0, 29, 3601, 60.0, "120", True, None])
 def test_invalid_request_timeout_is_refused_without_echo(creds, bad):
     with pytest.raises(ValueError) as caught:
         adapter(creds, FakeTransport(), limits={"request_timeout_seconds": bad})

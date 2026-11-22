@@ -6,17 +6,19 @@ Prompt text is never stored, only its pinned digest; finding text is untrusted d
 
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from .models import NonBlank200, NonBlank4000, Sha256Digest, StrictRequest, StrictRevision
 
-JOB_KINDS = ("plan_review", "dataset_scout", "technique_scout", "pre_gate_review")
+JOB_KINDS = ("plan_review", "dataset_scout", "technique_scout", "pre_gate_review", "code_review")
 TIERS = ("haiku", "sonnet", "opus", "fable")
 # ADR 0047 class names. Control derives a snapshot's class from its stored record; a client never
 # supplies one. Snapshots resolve to public or private_derived (ADR 0039).
 DATA_CLASSES = ("public", "private_code_approved", "private_derived")
 MAX_BUDGET_CENTS = 10000
 MAX_FINDINGS = 200
+VERDICTS = ("MERGE", "MERGE-WITH-FOLLOWUPS", "CHANGES-REQUIRED")
+TOKEN_KEYS = ("input", "output", "reasoning", "cache_read", "cache_write", "total")
 
 
 class ReviewInput(StrictRequest):
@@ -24,8 +26,32 @@ class ReviewInput(StrictRequest):
     digest: Sha256Digest
 
 
+class CodeReviewSubject(StrictRequest):
+    """A content-addressed code snapshot (or base..head diff) and a pinned rubric (ADR 0092).
+
+    Only digests: code and rubric text never reach control.
+    """
+
+    mode: Literal["snapshot", "diff"]
+    head_digest: Sha256Digest
+    base_digest: Sha256Digest | None = None
+    rubric_digest: Sha256Digest
+
+    @model_validator(mode="after")
+    def base_rules(self):
+        if self.mode == "diff" and self.base_digest is None:
+            raise ValueError("a diff review needs base_digest")
+        if self.mode == "snapshot" and self.base_digest is not None:
+            raise ValueError("a snapshot review takes no base_digest")
+        if self.base_digest is not None and self.base_digest == self.head_digest:
+            raise ValueError("base_digest must differ from head_digest")
+        return self
+
+
 class SubmitReviewJob(StrictRequest):
-    kind: Literal["plan_review", "dataset_scout", "technique_scout", "pre_gate_review"]
+    kind: Literal[
+        "plan_review", "dataset_scout", "technique_scout", "pre_gate_review", "code_review"
+    ]
     title: NonBlank200
     inputs: Annotated[list[ReviewInput], Field(min_length=1, max_length=16)]
     prompt_digest: Sha256Digest
@@ -33,6 +59,23 @@ class SubmitReviewJob(StrictRequest):
     tier: Literal["haiku", "sonnet", "opus", "fable"]
     budget_cents: Annotated[int, Field(strict=True, ge=0, le=MAX_BUDGET_CENTS)]
     egress: Literal["none", "model_runtime"] = "none"
+    code_review: CodeReviewSubject | None = None
+
+    @model_validator(mode="after")
+    def code_review_subject(self):
+        if (self.kind == "code_review") != (self.code_review is not None):
+            raise ValueError("code_review subject is required for, and only for, kind code_review")
+        if self.code_review is not None:
+            # Binding: every subject digest is a declared input, so data class, sealed-holdout
+            # refusal and destination policy apply to it.
+            bound = {item.digest for item in self.inputs}
+            subject = self.code_review
+            named = [subject.head_digest, subject.rubric_digest]
+            if subject.base_digest is not None:
+                named.append(subject.base_digest)
+            if any(digest not in bound for digest in named):
+                raise ValueError("code_review digests must each be the digest of an input")
+        return self
 
 
 class ApproveReviewTier(StrictRequest):
@@ -56,10 +99,65 @@ class ReviewFinding(StrictRequest):
     confidence: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 
 
+UInt = Annotated[int, Field(strict=True, ge=0, le=2**63 - 1)]
+LimitKey = Annotated[str, Field(min_length=1, max_length=64)]
+LimitValue = (
+    Annotated[int, Field(strict=True, ge=0)]
+    | Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
+)
+# ``cost`` is in cents; these bases are money spent against the job budget, so ``cost_cents``
+# is required and bounded by it.
+BILLED_COST_BASES = ("reported_cost", "computed_from_pinned_prices")
+
+
+class ModelCallReceipt(StrictRequest):
+    """Model-call receipt for a code review (ADR 0083 fields). No prompt, completion, error
+    text or credential: any other key is refused.
+
+    Both identity bases are unverified: ``provider_response_model`` is what the provider's
+    response named, not proof of the model that ran.
+    """
+
+    model_configured: NonBlank200
+    model_reported: Annotated[str, Field(max_length=200)] | None = None
+    model_identity_basis: Literal["harness_reported_unverified", "provider_response_model"]
+    tier: Literal["haiku", "sonnet", "opus", "fable"]
+    input_digests: Annotated[dict[NonBlank200, Sha256Digest], Field(max_length=32)]
+    tokens: dict[
+        Literal["input", "output", "reasoning", "cache_read", "cache_write", "total"],
+        UInt,
+    ]
+    cost: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
+    cost_basis: Literal[
+        "included_subscription_usage", "reported_cost", "computed_from_pinned_prices"
+    ]
+    cost_cents: UInt | None = None
+    policy_sha256: Sha256Digest
+    attempts: Annotated[int, Field(strict=True, ge=1, le=2)]
+    # Optional ADR 0083 fields (digests, counters and caps only).
+    run_id: NonBlank200 | None = None
+    seq: Annotated[int, Field(strict=True, ge=1, le=2**63 - 1)] | None = None
+    input_class: Literal["public", "private_code_approved", "private_derived"] | None = None
+    prompt_sha256: Sha256Digest | None = None
+    profile_sha256: Sha256Digest | None = None
+    input_sha256: Sha256Digest | None = None
+    output_sha256: Sha256Digest | None = None
+    limits: Annotated[dict[LimitKey, LimitValue], Field(max_length=16)] | None = None
+    daily_tokens_after: UInt | None = None
+    daily_cost_cents_after: LimitValue | None = None  # cents; the producer may sum fractional cents
+    cost_cents_estimate_max: LimitValue | None = (
+        None  # cents; the producer may sum fractional cents
+    )
+    observed_at: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] | None = None
+
+
 class IngestFindings(StrictRequest):
     findings: Annotated[list[ReviewFinding], Field(max_length=MAX_FINDINGS)]
     review_md_digest: Sha256Digest | None = None
     receipt_digest: Sha256Digest | None = None
+    # Code review only (ADR 0092); refused for other kinds by the store.
+    verdict: Literal["MERGE", "MERGE-WITH-FOLLOWUPS", "CHANGES-REQUIRED"] | None = None
+    receipt: ModelCallReceipt | None = None
 
     @field_validator("findings")
     @classmethod

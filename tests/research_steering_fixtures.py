@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tessera_agent.anthropic_messages import COUNT_URL, AnthropicMessagesReasoning
@@ -170,3 +170,49 @@ def seed_private_snapshot(database: Path, project_id: str, snapshot_id: str, dig
             "actor_principal_id) VALUES (?,?,?,'{}','t',(SELECT id FROM principals LIMIT 1))",
             (snapshot_id, project_id, digest),
         )
+
+
+def enrol_person(client, owner_headers: dict, token: str, label: str = "decider") -> None:
+    """Enrol a second person through the real owner-only endpoint (POST /people): a human
+    session that is its own enrolment root (it can resolve findings the owner's agents posted)."""
+    response = client.post(
+        "/people",
+        headers={**owner_headers, "Idempotency-Key": "enrol-" + label},
+        json={
+            "token": token,
+            "label": label,
+            "expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        },
+    )
+    assert response.status_code == 201, response.text
+
+
+def second_root_agent(env, token: str, actions: list[str], destination: str) -> None:
+    """An agent credential issued by a SECOND enrolment root, so control treats it as another
+    person than the owner's agents (the reviewer may not be the submitter's person)."""
+    from tessera_control.store import canonical_digest
+
+    ident = hashlib.sha256(token.encode()).hexdigest()[:16]
+    with sqlite3.connect(env.state / "tessera.sqlite3") as connection:
+        org = connection.execute("SELECT org_id FROM principals LIMIT 1").fetchone()[0]
+        connection.execute(
+            "INSERT INTO principals (id,org_id,role,token_hash,revoked_at,created_at) "
+            "VALUES (?,?,'human',?,NULL,'2026-01-01T00:00:00Z')",
+            ("principal_" + ident, org, hashlib.sha256((token + "-root").encode()).hexdigest()),
+        )
+        connection.execute(
+            "INSERT INTO credentials (id,principal_id,kind,audience,project_id,parent_id,"
+            "expires_at,revoked_at,created_at,created_by_principal_id) "
+            "VALUES (?,?,'local_owner','control',NULL,NULL,NULL,NULL,"
+            "'2026-01-01T00:00:00Z',NULL)",
+            ("credential_" + ident, "principal_" + ident),
+        )
+    root = env.plain.authenticate(token + "-root")
+    body = {
+        "kind": "agent",
+        "audience": "control",
+        "project_id": env.project["id"],
+        "expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        "external_agent": {"actions": actions, "destination": destination},
+    }
+    env.plain.issue_credential(root, "cred-" + ident, canonical_digest(body), body, token)

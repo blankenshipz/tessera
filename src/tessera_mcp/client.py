@@ -15,6 +15,14 @@ class ControlError(Exception):
     pass
 
 
+class ControlRefusal(ControlError):
+    """A 409 submission refusal carrying the control's stable ``reason`` code."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"Refused (HTTP 409): {reason}")
+        self.reason = reason
+
+
 MAX_ARTIFACT_BYTES = 65536
 MAX_CONTEXT_JSON_BYTES = 128 * 1024
 
@@ -31,7 +39,15 @@ class ControlClient:
         self.transport = transport
 
     async def _request(
-        self, method, path, *, body=None, key=None, max_bytes=2 * 1024 * 1024, relay_refusal=False
+        self,
+        method,
+        path,
+        *,
+        body=None,
+        key=None,
+        max_bytes=2 * 1024 * 1024,
+        relay_refusal=False,
+        raise_refusal=False,
     ):
         headers = {
             "Authorization": "Bearer " + self.config.token(),
@@ -53,6 +69,14 @@ class ControlClient:
                 else True,
             ) as client:
                 async with client.stream(method, path, json=body, headers=headers) as response:
+                    if response.status_code == 409 and raise_refusal:
+                        raw = await response.aread()
+                        try:
+                            reason = json.loads(raw[:8192]).get("reason")
+                        except (ValueError, AttributeError):
+                            reason = None
+                        if isinstance(reason, str) and reason:
+                            raise ControlRefusal(reason[:100])
                     if response.status_code == 409 and relay_refusal:
                         # Only for routes whose refusal body is {status, reason} operator text
                         # (provider registration): the model needs the reason to fix its request.
@@ -147,6 +171,9 @@ class ControlClient:
             key=idempotency_key,
         )
 
+    async def storage_retention_status(self):
+        return await self._request("GET", "/storage-retention/status")
+
     async def list_campaign_providers(self):
         return await self._request("GET", "/admin/campaign-providers")
 
@@ -157,6 +184,35 @@ class ControlClient:
             body=body,
             key=idempotency_key,
             relay_refusal=True,
+        )
+
+    async def model_spend(self, project_id=None, days=7):
+        """Model-spend totals for a project (read only; limits are set by a person)."""
+        if type(days) is not int or not 1 <= days <= 90:
+            raise ControlError("days must be an integer from 1 to 90")
+        project = segment(project_id or self.config.project_id)
+        return await self._request("GET", f"/model-spend?project_id={project}&days={days}")
+
+    async def resolve_model_spend(self, call_id, outcome, actual_cents, reason, idempotency_key):
+        """Close an open model-spend reservation as not_sent or spent (a person's credential)."""
+        if outcome not in ("not_sent", "spent"):
+            raise ControlError("outcome must be not_sent or spent")
+        if (outcome == "spent") != (actual_cents is not None):
+            raise ControlError("actual_cents is required for, and only for, outcome spent")
+        if actual_cents is not None and (
+            type(actual_cents) not in (int, float) or not 0 <= actual_cents <= 10**9
+        ):
+            raise ControlError("actual_cents must be a number of cents from 0 up")
+        if not isinstance(reason, str) or not 1 <= len(reason) <= 500:
+            raise ControlError("reason must be 1 to 500 characters")
+        body = {"outcome": outcome, "reason": reason}
+        if actual_cents is not None:
+            body["actual_cents"] = actual_cents
+        return await self._request(
+            "POST",
+            f"/model-spend/reservations/{segment(call_id)}/resolution",
+            body=body,
+            key=idempotency_key,
         )
 
     async def provider_trust(self):
@@ -171,6 +227,36 @@ class ControlClient:
         project = segment(self.config.project_id)
         return await self._request(
             "GET", f"/projects/{project}/campaigns?offset={offset}&limit={limit}"
+        )
+
+    STUCK_STATUSES = ("open", "acknowledged", "resolved", "all")
+
+    async def list_stuck(self, status="open", limit=50):
+        """Stuck-campaign findings of this project (campaign:read); read only."""
+        if status not in self.STUCK_STATUSES or not 1 <= limit <= 200:
+            raise ControlError("Stuck findings need a known status and limit 1–200")
+        project = segment(self.config.project_id)
+        return await self._request(
+            "GET", f"/projects/{project}/campaign-stuck?status={status}&limit={limit}"
+        )
+
+    async def scan_stuck(self, idempotency_key):
+        """Run the platform's detector now (detections are recorded on receipts)."""
+        project = segment(self.config.project_id)
+        return await self._request(
+            "POST", f"/projects/{project}/campaign-stuck/scan", body={}, key=idempotency_key
+        )
+
+    async def acknowledge_stuck(self, finding_id, note, idempotency_key):
+        """Mark one finding seen (campaign:cancel); the campaign itself is untouched."""
+        if not isinstance(note, str) or len(note) > 500:
+            raise ControlError("A note is at most 500 characters")
+        project = segment(self.config.project_id)
+        return await self._request(
+            "POST",
+            f"/projects/{project}/campaign-stuck/{segment(finding_id)}/acknowledge",
+            body={"note": note},
+            key=idempotency_key,
         )
 
     async def campaign_receipt(self, campaign_id):
@@ -297,6 +383,35 @@ class ControlClient:
             key=idempotency_key,
         )
 
+    async def list_pending_submissions(self, project_id, offset=0, limit=50):
+        if not 0 <= offset or not 1 <= limit <= 100:
+            raise ControlError("Pagination requires offset >= 0 and limit 1–100")
+        return await self._request(
+            "GET",
+            f"/projects/{segment(project_id)}/submission-approvals"
+            f"?status=pending&offset={offset}&limit={limit}",
+        )
+
+    async def read_submission(self, approval_id):
+        return await self._request("GET", f"/submission-approvals/{segment(approval_id)}")
+
+    async def cancel_submission(self, approval_id, expected_revision, reason, idempotency_key):
+        return await self._request(
+            "POST",
+            f"/submission-approvals/{segment(approval_id)}/cancel",
+            body={"expected_revision": expected_revision, "reason": reason},
+            key=idempotency_key,
+        )
+
+    async def submit_cleared_campaign(self, approval_id, expected_revision, idempotency_key):
+        return await self._request(
+            "POST",
+            f"/submission-approvals/{segment(approval_id)}/submit",
+            body={"expected_revision": expected_revision},
+            key=idempotency_key,
+            raise_refusal=True,
+        )
+
     async def approve_campaign(
         self, campaign_id, expected_revision, expected_spec_digest, idempotency_key
     ):
@@ -324,3 +439,35 @@ class ControlClient:
         if not 0 <= offset or not 1 <= limit <= 100:
             raise ControlError("Pagination requires offset >= 0 and limit 1–100")
         return f"/projects/{segment(self.config.project_id)}/{name}?offset={offset}&limit={limit}"
+
+
+class SubmissionActionClient:
+    """Synchronous adapter giving CampaignSubmitAction list_pending/submit over a ControlClient.
+
+    It exposes no approve, create or widen call.
+    """
+
+    def __init__(self, client: ControlClient, refused=None):
+        """``refused(reason)`` builds the exception for a refusal (SubmitRefused by default)."""
+        self._client = client
+        self._refused = refused
+
+    def list_pending(self, project_id):
+        import asyncio
+
+        return asyncio.run(self._client.list_pending_submissions(project_id, 0, 100))
+
+    def submit(self, approval_id, expected_revision, idempotency_key):
+        import asyncio
+
+        refused = self._refused
+        if refused is None:
+            from tessera_agent.campaign_submit_action import SubmitRefused as refused
+        try:
+            return asyncio.run(
+                self._client.submit_cleared_campaign(
+                    approval_id, expected_revision, idempotency_key
+                )
+            )
+        except ControlRefusal as refusal:
+            raise refused(refusal.reason) from None

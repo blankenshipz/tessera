@@ -82,7 +82,7 @@ from .campaign_providers import (
     Waiting,
     provider_ids,
 )
-from .campaign_receipts import build_receipt
+from .campaign_receipts import CODE_GRANTED_EVENT, build_receipt, code_delivery, code_summary
 from .campaign_settlement import (
     BASES,
     FrameSettlement,
@@ -98,6 +98,7 @@ from .campaign_steps import (
     StepTransient,
 )
 from .campaign_store import CampaignStore
+from .code_approval import snapshot_code_approval
 from .data_class import DataClassRefused
 from .execution import reconcile_grant_row
 from .experiment_budgets import budget_status
@@ -192,6 +193,14 @@ def _is_busy(error: sqlite3.OperationalError) -> bool:
 
 def _iso(value: datetime) -> str:
     return _utc_string(value.replace(microsecond=0))
+
+
+def _approval_digest(approval: dict[str, Any] | None) -> str | None:
+    """The digest of a snapshot's recorded code approval (its files, approver, decision class
+    and time), so the grant names which approval stood without copying file paths."""
+    if approval is None:
+        return None
+    return canonical_digest({k: v for k, v in approval.items() if k != "valid"})
 
 
 def _approval_expiry(ctx: _Ctx) -> datetime | None:
@@ -2753,8 +2762,66 @@ class CampaignRunner:
                 },
             ),
         )
-        self._set_attempt(attempt["id"], grant_id=result.response["id"], status="granted")
+        with self.store.runner_connection() as connection:
+            # The grant and its code record are one write (AGENTS.md): a crash leaves both or
+            # neither, so a receipt never shows a grant whose code record is missing.
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                grant_id=result.response["id"],
+                status="granted",
+            )
+            self._record_code_grant_in(
+                connection, ctx, stage, spec_stage, attempt, request.worker_principal_id
+            )
         return True
+
+    def _record_code_grant_in(
+        self,
+        connection: sqlite3.Connection,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: NormalStage,
+        attempt: dict[str, Any],
+        worker_principal_id: str,
+    ) -> None:
+        """Record, in the caller's grant transaction, that the platform granted the attempt's
+        worker access to the stage's pinned code input (ADR 0095): the digests, the provider,
+        the trust basis and the code approval as it stood at grant time. Ids and digests only,
+        never the files, argv or any bytes. It records the grant, not that the worker fetched
+        the input."""
+        summary = code_summary(connection, spec_stage)
+        if summary is None:
+            return
+        row = connection.execute(
+            """SELECT provider_id, trust_policy_digest, admission_basis
+            FROM campaign_stage_attempts WHERE id=?""",
+            (attempt["id"],),
+        ).fetchone()
+        delivery = code_delivery(
+            summary,
+            provider_id=row["provider_id"] or spec_stage.provider,
+            worker_principal_id=worker_principal_id,
+            trust_policy_digest=row["trust_policy_digest"],
+            admission_basis=row["admission_basis"],
+        )
+        approval = snapshot_code_approval(connection, summary["snapshot_id"])
+        self._emit_once_in(
+            connection,
+            ctx,
+            CODE_GRANTED_EVENT,
+            {"stage_key": stage["stage_key"], "attempt": attempt["attempt"]},
+            {
+                "attempt_id": attempt["id"],
+                "input": summary["input"],
+                "snapshot_id": summary["snapshot_id"],
+                **delivery,
+                "approved": approval is not None and approval.get("valid") is True,
+                "approval_digest": _approval_digest(approval),
+            },
+        )
 
     def _release_too_short(
         self, ctx: _Ctx, key: str, spec_stage: NormalStage, attempt: dict[str, Any]

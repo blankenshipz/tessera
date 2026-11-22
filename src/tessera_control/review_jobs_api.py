@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 
 from .external_agent_api import Actor, Key
-from .review_jobs import ReviewRefused
+from .review_jobs import ReviewForbidden, ReviewRefused
 from .review_jobs_models import ApproveReviewTier, ResolveReviewFinding, SubmitReviewJob
 
 router = APIRouter()
@@ -15,6 +15,11 @@ router = APIRouter()
 def _response(call):
     try:
         status, body = call()
+    except ReviewForbidden as refusal:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": str(refusal), "reason": refusal.reason},
+        )
     except ReviewRefused as refusal:
         return JSONResponse(
             status_code=refusal.status,
@@ -43,8 +48,12 @@ def jobs(
     actor: Actor,
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
+    kind: Literal[
+        "plan_review", "dataset_scout", "technique_scout", "pre_gate_review", "code_review"
+    ]
+    | None = None,
 ):
-    return {"jobs": request.app.state.review_jobs.list_jobs(actor, project_id, offset, limit)}
+    return {"jobs": request.app.state.review_jobs.list_jobs(actor, project_id, offset, limit, kind)}
 
 
 @router.get("/review-jobs/{job_id}")

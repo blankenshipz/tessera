@@ -21,14 +21,24 @@ submitted a job, or that supplied its findings, can never resolve those findings
 """
 
 import json
+import math
 import uuid
 
 from pydantic import ValidationError
 
 from .agent_research import AgentResearchStore
 from .approval_trust import require_decision_actor
+from .code_review_jobs import (
+    CodeReviewRunStore,
+    append_attempt,
+    attempt_entry,
+    code_review_record,
+    create_code_review_schema,
+    receipt_bound,
+)
 from .data_class import snapshot_data_class
 from .review_jobs_models import (
+    BILLED_COST_BASES,
     ApproveReviewTier,
     IngestFindings,
     ResolveReviewFinding,
@@ -45,6 +55,15 @@ REFUSAL_REASONS = (
     "input_not_found",
     "input_digest_mismatch",
 )
+# The runner's launch-time policy re-check may also fail without a policy reason code; a code
+# review also does not start without the pinned prompt, model egress and a supported destination.
+NOT_START_REASONS = (
+    *REFUSAL_REASONS,
+    "policy_check_failed",
+    "prompt_not_pinned",
+    "egress_not_permitted",
+    "destination_not_supported",
+)
 JOB_STATES = (
     "awaiting_approval",
     "queued",
@@ -56,13 +75,25 @@ JOB_STATES = (
 )
 
 
+class ReviewForbidden(Forbidden):
+    """A separation-of-duties refusal (403) with a stable reason code."""
+
+    def __init__(self, reason: str):
+        super().__init__(
+            f"The submitter or reviewer of a job, or the same person, cannot act on it ({reason})."
+        )
+        self.reason = reason
+
+
 class ReviewRefused(Conflict):
     """A policy (409) or output-validation (422) refusal carrying a stable reason code."""
 
-    def __init__(self, reason: str, status: int = 409):
+    def __init__(self, reason: str, status: int = 409, detail: str | None = None):
         super().__init__(reason)
         self.reason = reason
         self.status = status
+        # Internal sub-cause for the runner (e.g. ``budget_exceeded``); never a response field.
+        self.detail = detail
 
 
 def _declared_partitions(node, found):
@@ -77,38 +108,120 @@ def _declared_partitions(node, found):
             _declared_partitions(value, found)
 
 
-def _sealed_digests(connection, project_id):
-    """Holdout partitions the project declares or claims, in any campaign status, plus the
-    digests of lineage nodes recorded as descending (any relation) from one of them."""
+_LINEAGE_WALK_LIMIT = 10000
+
+
+def _sealed_inputs(connection, project_id, digests):
+    """The subset of ``digests`` that is, or is recorded in lineage as derived from, a holdout
+    partition the project declares or claims (any campaign status).
+
+    Only rows that can concern these digests are read: claims through their unique index, specs
+    only when their text contains a candidate digest, and lineage upward from the inputs. A walk
+    that exceeds its bound fails closed (every input counts as sealed)."""
+    digests = sorted(set(digests))
+    if not digests:
+        return set()
+    ancestors = {}  # candidate digest -> the input digests it is an ancestor-or-self of
+    rows = list(
+        connection.execute(
+            """WITH RECURSIVE up(id, root) AS (
+                SELECT n.id, n.sha256 FROM artifact_lineage_nodes n
+                WHERE n.project_id=? AND n.sha256 IN (SELECT value FROM json_each(?))
+                UNION
+                SELECT e.parent_node_id, u.root FROM artifact_lineage_edges e
+                JOIN up u ON e.child_node_id=u.id WHERE e.project_id=?
+                LIMIT ?)
+            SELECT n.sha256, u.root FROM up u JOIN artifact_lineage_nodes n ON n.id=u.id""",
+            (project_id, json.dumps(digests), project_id, _LINEAGE_WALK_LIMIT + 1),
+        )
+    )
+    if len(rows) > _LINEAGE_WALK_LIMIT:
+        return set(digests)
+    for digest in digests:
+        ancestors.setdefault(digest, set()).add(digest)
+    for digest, root in rows:
+        ancestors.setdefault(digest, set()).add(root)
+    candidates = json.dumps(sorted(ancestors))
     sealed = {
         r[0]
         for r in connection.execute(
-            "SELECT DISTINCT partition_digest FROM campaign_holdout_claims WHERE project_id=?",
-            (project_id,),
+            "SELECT DISTINCT partition_digest FROM campaign_holdout_claims "
+            "WHERE project_id=? AND partition_digest IN (SELECT value FROM json_each(?))",
+            (project_id, candidates),
         )
     }
+    declared = set()
     for row in connection.execute(
-        "SELECT spec_json FROM campaigns WHERE project_id=?", (project_id,)
+        "SELECT spec_json FROM campaigns WHERE project_id=? AND EXISTS "
+        "(SELECT 1 FROM json_each(?) j WHERE instr(spec_json, j.value) > 0)",
+        (project_id, candidates),
     ):
         try:
-            _declared_partitions(json.loads(row[0]), sealed)
+            _declared_partitions(json.loads(row[0]), declared)
         except (TypeError, ValueError):
             continue
-    if sealed:
-        sealed |= {
-            r[0]
-            for r in connection.execute(
-                """WITH RECURSIVE down(id) AS (
-                    SELECT id FROM artifact_lineage_nodes
-                    WHERE project_id=? AND sha256 IN (SELECT value FROM json_each(?))
-                    UNION
-                    SELECT e.child_node_id FROM artifact_lineage_edges e
-                    JOIN down d ON e.parent_node_id=d.id WHERE e.project_id=?)
-                SELECT n.sha256 FROM artifact_lineage_nodes n JOIN down d ON d.id=n.id""",
-                (project_id, json.dumps(sorted(sealed)), project_id),
-            )
-        }
-    return sealed
+    sealed |= declared & set(ancestors)
+    return set().union(*(ancestors[d] for d in sealed)) if sealed else set()
+
+
+_CHAIN_LIMIT = 64
+DISTINCT_PERSON = "distinct_person"
+SINGLE_OWNER = "single_owner_opt_in"
+
+
+def _enrolment_roots(connection, principal_id):
+    """The root principals (no creating principal) reached by walking the credential chain
+    (``created_by_principal_id`` and the parent credential's principal) upward. Returns
+    ``(roots, exceeded)``; ``exceeded`` means the bounded walk did not finish."""
+    seen, todo, roots = set(), [principal_id], set()
+    while todo:
+        current = todo.pop()
+        if current is None or current in seen:
+            continue
+        if len(seen) >= _CHAIN_LIMIT:
+            return roots, True
+        seen.add(current)
+        parents = set()
+        for row in connection.execute(
+            "SELECT c.created_by_principal_id, p.principal_id FROM credentials c "
+            "LEFT JOIN credentials p ON p.id=c.parent_id WHERE c.principal_id=?",
+            (current,),
+        ):
+            parents.update(x for x in row if x is not None and x != current)
+        if parents:
+            todo.extend(parents)
+        else:
+            roots.add(current)
+    return roots, False
+
+
+def _same_person(connection, left, right):
+    """Two principals are one person when their enrolment-root sets intersect. A walk that
+    exceeds its bound fails closed (same person)."""
+    if left == right:
+        return True
+    left_roots, left_over = _enrolment_roots(connection, left)
+    right_roots, right_over = _enrolment_roots(connection, right)
+    return left_over or right_over or bool(left_roots & right_roots)
+
+
+def _separation(connection, caller_id, others, single_owner):
+    """The recorded basis for a separation-of-duties check, or Forbidden.
+
+    By default the caller must be a different person from every principal in ``others``.
+    With the deployment's single-owner opt-in only the identical principal is refused and the
+    same person through another credential is allowed, recorded as ``single_owner_opt_in``."""
+    basis = DISTINCT_PERSON
+    for other in others:
+        if other is None:
+            continue
+        if other == caller_id:
+            raise ReviewForbidden("same_principal")
+        if _same_person(connection, caller_id, other):
+            if not single_owner:
+                raise ReviewForbidden("same_person")
+            basis = SINGLE_OWNER
+    return basis
 
 
 class NoDestinationsPolicy:
@@ -130,7 +243,7 @@ def create_review_jobs_schema(connection):
         credential_id TEXT NOT NULL REFERENCES credentials(id),
         actor_id TEXT NOT NULL REFERENCES principals(id),
         kind TEXT NOT NULL CHECK(kind IN
-            ('plan_review','dataset_scout','technique_scout','pre_gate_review')),
+            ('plan_review','dataset_scout','technique_scout','pre_gate_review','code_review')),
         title TEXT NOT NULL, inputs_json TEXT NOT NULL,
         prompt_digest TEXT NOT NULL CHECK(length(prompt_digest)=64),
         destination_id TEXT NOT NULL,
@@ -142,6 +255,7 @@ def create_review_jobs_schema(connection):
         reason TEXT, revision INTEGER NOT NULL CHECK(revision>=1),
         digest TEXT NOT NULL CHECK(length(digest)=64),
         receipt_digest TEXT, review_md_digest TEXT, findings_actor_id TEXT,
+        findings_separation_basis TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
     connection.execute("""CREATE TABLE IF NOT EXISTS review_job_approvals (
         job_id TEXT PRIMARY KEY REFERENCES review_jobs(id),
@@ -166,7 +280,9 @@ def create_review_jobs_schema(connection):
         credential_kind TEXT NOT NULL,
         decision TEXT NOT NULL CHECK(decision IN ('accept','reject')),
         rationale TEXT NOT NULL, finding_digest TEXT NOT NULL,
-        job_digest TEXT NOT NULL, subject_digests_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        job_digest TEXT NOT NULL, subject_digests_json TEXT NOT NULL, created_at TEXT NOT NULL,
+        separation_basis TEXT NOT NULL CHECK(separation_basis IN
+            ('distinct_person','single_owner_opt_in')))""")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS review_jobs_project ON review_jobs(org_id,project_id,sequence)"
     )
@@ -196,9 +312,13 @@ def create_review_jobs_schema(connection):
         "OR NEW.job_id IS NOT OLD.job_id BEGIN "
         "SELECT RAISE(ABORT,'review finding content is immutable'); END"
     )
+    create_code_review_schema(connection)
 
 
-class ReviewJobStore(AgentResearchStore):
+class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
+    #: Deployment opt-in (``tessera serve --review-single-owner``); set by ``create_app``.
+    single_owner = False
+
     # -- shared helpers -------------------------------------------------------------------
 
     @staticmethod
@@ -225,6 +345,10 @@ class ReviewJobStore(AgentResearchStore):
             "digest": row["digest"],
             "receipt_digest": row["receipt_digest"],
             "review_md_digest": row["review_md_digest"],
+            "findings_separation_basis": row["findings_separation_basis"],
+            "code_review": (
+                code_review_record(connection, row["id"]) if row["kind"] == "code_review" else None
+            ),
             "submitter_credential_id": row["credential_id"],
             "submitter_principal_id": row["actor_id"],
             "approval": dict(approval) if approval else None,
@@ -256,11 +380,13 @@ class ReviewJobStore(AgentResearchStore):
                     "finding_digest": decision["finding_digest"],
                     "job_digest": decision["job_digest"],
                     "subject_digests": json.loads(decision["subject_digests_json"]),
+                    "separation_basis": decision["separation_basis"],
                     "created_at": decision["created_at"],
                 }
                 if decision
                 else None
             ),
+            "separation_basis": decision["separation_basis"] if decision else None,
             "created_at": row["created_at"],
             "untrusted_text": True,
             "advisory": True,
@@ -295,6 +421,10 @@ class ReviewJobStore(AgentResearchStore):
 
     def submit(self, principal, project_id, key, payload, policy):
         body = self._body(SubmitReviewJob, payload)
+        subject = body.pop("code_review", None)
+        if subject is not None:
+            # Other kinds keep their ADR 0084 job digest; a code review binds its subject.
+            body["code_review"] = subject
 
         def guard(connection, actor):
             if actor["role"] == "agent":
@@ -318,7 +448,7 @@ class ReviewJobStore(AgentResearchStore):
                     raise ReviewRefused("input_digest_mismatch")
                 derived = snapshot_data_class(connection, item["snapshot_id"])["data_class"]
                 inputs.append({**item, "data_class": derived})
-            sealed = _sealed_digests(connection, project_id)
+            sealed = _sealed_inputs(connection, project_id, [i["digest"] for i in inputs])
             if any(item["digest"] in sealed for item in inputs):
                 raise ReviewRefused("input_sealed")
             classes = sorted({item["data_class"] for item in inputs})
@@ -357,6 +487,19 @@ class ReviewJobStore(AgentResearchStore):
                     now,
                 ),
             )
+            if subject is not None:
+                connection.execute(
+                    "INSERT INTO code_review_jobs (job_id,org_id,mode,base_digest,head_digest,"
+                    "rubric_digest) VALUES (?,?,?,?,?,?)",
+                    (
+                        ident,
+                        actor["org_id"],
+                        subject["mode"],
+                        subject["base_digest"],
+                        subject["head_digest"],
+                        subject["rubric_digest"],
+                    ),
+                )
             self._event(
                 connection,
                 actor,
@@ -425,10 +568,13 @@ class ReviewJobStore(AgentResearchStore):
 
     def _runner(self, connection, actor, row):
         """A human, a worker credential, or a findings-scoped agent that is not the submitter."""
-        if actor["role"] == "human" or actor["kind"] == "worker":
+        if actor["kind"] == "worker":
             return
-        if actor["id"] == row["actor_id"] or actor["credential_id"] == row["credential_id"]:
-            raise Forbidden("A review job's submitter cannot run it.")
+        if actor["credential_id"] == row["credential_id"]:
+            raise ReviewForbidden("same_principal")
+        _separation(connection, actor["id"], [row["actor_id"]], self.single_owner)
+        if actor["role"] == "human":
+            return
         self._scope(connection, actor, "review:findings")
 
     def _transition(self, principal, job_id, key, action, allowed, state, reason=None, **columns):
@@ -444,6 +590,10 @@ class ReviewJobStore(AgentResearchStore):
             row = guard(connection, actor)
             if row["state"] not in allowed:
                 raise Conflict(f"Review job cannot move from {row['state']} to {state}.")
+            if state == "running" and row["kind"] == "code_review":
+                # Only the leased runner claim may start a code review: a lease-less running job
+                # would hold a concurrency slot that is never reaped (ADR 0092).
+                raise Conflict("A code review job is started only by the runner's claim.")
             self._bump(connection, job_id, state, row["revision"], reason, **columns)
             self._event(
                 connection,
@@ -504,69 +654,25 @@ class ReviewJobStore(AgentResearchStore):
             self._scope(connection, actor, "review:findings")
             row = self._load_job(connection, actor, job_id)
             self._project(connection, actor, row["project_id"])
-            if row["credential_id"] == actor["credential_id"] or row["actor_id"] == actor["id"]:
-                raise Forbidden("A review job's submitter cannot supply its findings.")
-            return row
+            if row["credential_id"] == actor["credential_id"]:
+                raise ReviewForbidden("same_principal")
+            basis = _separation(connection, actor["id"], [row["actor_id"]], self.single_owner)
+            return row, basis
 
         def command(connection, actor):
-            row = guard(connection, actor)
+            row, basis = guard(connection, actor)
             if row["state"] not in ("queued", "running"):
                 raise Conflict("Review job is not accepting findings.")
-            try:
-                body = IngestFindings.model_validate(payload).model_dump(mode="json")
-            except ValidationError as error:
-                raise ReviewRefused("failed_output_invalid", 422) from error
-            now = utc_now()
-            for item in body["findings"]:
+            body = self._validated_output(row, payload)
+            if row["kind"] == "code_review":
                 connection.execute(
-                    "INSERT INTO review_findings (id,job_id,org_id,project_id,finding_key,"
-                    "finding_json,digest,state,revision,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,'open',1,?,?)",
-                    (
-                        "review_finding_" + uuid.uuid4().hex,
-                        job_id,
-                        actor["org_id"],
-                        row["project_id"],
-                        item["id"],
-                        json.dumps(item),
-                        canonical_digest({"job_digest": row["digest"], "finding": item}),
-                        now,
-                        now,
-                    ),
+                    "UPDATE code_review_jobs SET lease_owner=NULL,lease_expires_at=NULL "
+                    "WHERE job_id=?",
+                    (job_id,),
                 )
-            self._bump(
-                connection,
-                job_id,
-                "completed",
-                row["revision"],
-                None,
-                receipt_digest=body["receipt_digest"],
-                review_md_digest=body["review_md_digest"],
-                findings_actor_id=actor["id"],
+            return self._store_output(
+                connection, actor, row, body, findings_actor_id=actor["id"], basis=basis
             )
-            self._event(
-                connection,
-                actor,
-                row["project_id"],
-                None,
-                "review_job.completed",
-                row["revision"] + 1,
-                {"job_id": job_id, "findings": len(body["findings"])},
-            )
-            return 201, {
-                "job": self._job_record(
-                    connection,
-                    connection.execute(
-                        "SELECT * FROM review_jobs WHERE id=?", (job_id,)
-                    ).fetchone(),
-                ),
-                "findings": [
-                    self._finding_record(connection, f)
-                    for f in connection.execute(
-                        "SELECT * FROM review_findings WHERE job_id=? ORDER BY sequence", (job_id,)
-                    )
-                ],
-            }
 
         return self._mutate(
             principal,
@@ -577,6 +683,149 @@ class ReviewJobStore(AgentResearchStore):
             command,
             replay_guard=lambda c, a, r: guard(c, a),
         )
+
+    @staticmethod
+    def _validated_output(row, payload):
+        """Validate reviewer output for ``row``; the one rule set for HTTP ingest and the runner.
+
+        Every violation is ``ReviewRefused("failed_output_invalid", 422)`` before any write.
+        """
+
+        def refuse(detail=None):
+            return ReviewRefused("failed_output_invalid", 422, detail)
+
+        try:
+            body = IngestFindings.model_validate(payload).model_dump(mode="json")
+        except ValidationError as error:
+            raise refuse() from error
+        if row["kind"] != "code_review":
+            if body.pop("verdict") is not None or body.pop("receipt") is not None:
+                raise refuse()
+            return body
+        findings, verdict, receipt = body["findings"], body["verdict"], body["receipt"]
+        if verdict is None or receipt is None:
+            raise refuse()
+        if [item["id"] for item in findings] != [str(n) for n in range(1, len(findings) + 1)]:
+            raise refuse()
+        severities = {item["severity"] for item in findings}
+        if "blocking" in severities and verdict != "CHANGES-REQUIRED":
+            raise refuse()
+        if verdict == "MERGE" and severities & {"major", "blocking"}:
+            raise refuse()
+        if receipt["tier"] != row["tier"]:
+            raise refuse()
+        # The receipt must name this job's inputs, its most private class and its destination
+        # (and, for anthropic, pinned prices and the provider-reported model).
+        if not receipt_bound(row, receipt):
+            raise refuse()
+        basis, cents = receipt["cost_basis"], receipt["cost_cents"]
+        if basis in BILLED_COST_BASES and (cents is None or cents > row["budget_cents"]):
+            raise refuse("budget_exceeded")
+        # ``cost`` is cents; a recorded integer may not understate the computed price.
+        if basis == "computed_from_pinned_prices" and cents < math.ceil(receipt["cost"]):
+            raise refuse()
+        # ADR 0083: included usage is the OpenAI included-OAuth mode reporting zero cost.
+        if basis == "included_subscription_usage" and receipt["cost"] != 0:
+            raise refuse()
+        digest = canonical_digest(receipt)
+        if body["receipt_digest"] is not None and body["receipt_digest"] != digest:
+            raise refuse()
+        body["receipt_digest"] = digest
+        return body
+
+    def _store_output(
+        self, connection, actor, row, body, system_actor=None, findings_actor_id=None, basis=None
+    ):
+        """Store validated findings (and a code review's verdict and receipts), complete the job
+        and write its event, inside the caller's transaction."""
+        job_id = row["id"]
+        now = utc_now()
+        for item in body["findings"]:
+            connection.execute(
+                "INSERT INTO review_findings (id,job_id,org_id,project_id,finding_key,"
+                "finding_json,digest,state,revision,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,'open',1,?,?)",
+                (
+                    "review_finding_" + uuid.uuid4().hex,
+                    job_id,
+                    row["org_id"],
+                    row["project_id"],
+                    item["id"],
+                    json.dumps(item),
+                    canonical_digest({"job_digest": row["digest"], "finding": item}),
+                    now,
+                    now,
+                ),
+            )
+        event = {"job_id": job_id, "findings": len(body["findings"])}
+        if system_actor is not None:
+            event["actor"] = system_actor
+        if basis is not None:
+            event["separation_basis"] = basis
+        if row["kind"] == "code_review":
+            side = connection.execute(
+                "SELECT * FROM code_review_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            review_receipt = {
+                "job_digest": row["digest"],
+                "mode": side["mode"],
+                "base_digest": side["base_digest"],
+                "head_digest": side["head_digest"],
+                "rubric_digest": side["rubric_digest"],
+                "verdict": body["verdict"],
+                "findings_digest": canonical_digest({"findings": body["findings"]}),
+                "model_call": body["receipt"],
+            }
+            review_digest = canonical_digest(review_receipt)
+            connection.execute(
+                "UPDATE code_review_jobs SET verdict=?,receipt_json=?,review_receipt_json=?,"
+                "review_receipt_digest=? WHERE job_id=?",
+                (
+                    body["verdict"],
+                    json.dumps(body["receipt"], sort_keys=True),
+                    json.dumps(review_receipt, sort_keys=True),
+                    review_digest,
+                    job_id,
+                ),
+            )
+            append_attempt(
+                connection,
+                job_id,
+                attempt_entry(row, max(side["attempts"], 1), "completed", None, body["receipt"]),
+            )
+            event.update(verdict=body["verdict"], review_receipt_digest=review_digest)
+        self._bump(
+            connection,
+            job_id,
+            "completed",
+            row["revision"],
+            None,
+            receipt_digest=body["receipt_digest"],
+            review_md_digest=body["review_md_digest"],
+            findings_actor_id=findings_actor_id,
+            findings_separation_basis=basis,
+        )
+        self._event(
+            connection,
+            actor,
+            row["project_id"],
+            None,
+            "review_job.completed",
+            row["revision"] + 1,
+            event,
+        )
+        return 201, {
+            "job": self._job_record(
+                connection,
+                connection.execute("SELECT * FROM review_jobs WHERE id=?", (job_id,)).fetchone(),
+            ),
+            "findings": [
+                self._finding_record(connection, f)
+                for f in connection.execute(
+                    "SELECT * FROM review_findings WHERE job_id=? ORDER BY sequence", (job_id,)
+                )
+            ],
+        }
 
     def resolve(self, principal, finding_id, key, payload):
         body = self._body(ResolveReviewFinding, payload)
@@ -594,8 +843,12 @@ class ReviewJobStore(AgentResearchStore):
             job = connection.execute(
                 "SELECT * FROM review_jobs WHERE id=?", (row["job_id"],)
             ).fetchone()
-            if actor["id"] in (job["actor_id"], job["findings_actor_id"]):
-                raise Forbidden("The submitter or reviewer of a job cannot resolve its findings.")
+            basis = _separation(
+                connection,
+                actor["id"],
+                [job["actor_id"], job["findings_actor_id"]],
+                self.single_owner,
+            )
             if body["expected_digest"] != row["digest"]:
                 raise Conflict("Review finding digest changed.")
             existing = connection.execute(
@@ -613,7 +866,7 @@ class ReviewJobStore(AgentResearchStore):
                 raise Conflict("Review finding revision changed.")
             subjects = [item["digest"] for item in json.loads(job["inputs_json"])]
             connection.execute(
-                "INSERT INTO review_finding_decisions VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO review_finding_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     finding_id,
                     actor["org_id"],
@@ -625,6 +878,7 @@ class ReviewJobStore(AgentResearchStore):
                     job["digest"],
                     json.dumps(subjects),
                     utc_now(),
+                    basis,
                 ),
             )
             connection.execute(
@@ -652,6 +906,7 @@ class ReviewJobStore(AgentResearchStore):
                     "finding_digest": row["digest"],
                     "job_digest": job["digest"],
                     "subject_digests": subjects,
+                    "separation_basis": basis,
                 },
             )
             return 201, self._resolution(connection, row)
@@ -689,7 +944,7 @@ class ReviewJobStore(AgentResearchStore):
         finally:
             connection.close()
 
-    def list_jobs(self, principal, project_id, offset=0, limit=100):
+    def list_jobs(self, principal, project_id, offset=0, limit=100, kind=None):
         connection = _connect(self.database_path)
         try:
             connection.execute("BEGIN")
@@ -699,8 +954,8 @@ class ReviewJobStore(AgentResearchStore):
                 self._job_record(connection, row)
                 for row in connection.execute(
                     "SELECT * FROM review_jobs WHERE org_id=? AND project_id=? "
-                    "ORDER BY sequence LIMIT ? OFFSET ?",
-                    (actor["org_id"], project_id, limit, offset),
+                    "AND (? IS NULL OR kind=?) ORDER BY sequence LIMIT ? OFFSET ?",
+                    (actor["org_id"], project_id, kind, kind, limit, offset),
                 )
             ]
         finally:

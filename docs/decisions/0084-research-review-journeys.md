@@ -1,13 +1,14 @@
 # ADR 0084: client-requested research and review jobs
 
 Status: proposed (schema v73 for the records and routes). Extends the research journey and the
-agent plane that [ADR 0033](0033-freeze-over-built-planes.md) froze, as amended by ADR 0082. Builds
+agent plane that [ADR 0033](0033-freeze-over-built-planes.md) froze, as proposed to be amended by ADR 0082 (in flight). Builds
 on [ADR 0055](0055-mcp-steering-tools.md) (scoped MCP tools), [ADR 0065](0065-operator-enabled-mcp-approval-tool.md)
 (flag-gated human tool) and [ADR 0068](0068-sealed-holdout-evaluation-stages.md) (sealed inputs).
-Depends on ADR 0082 (Anthropic as a registered model destination, the freeze amendment, and the
-destination registry), and refers to ADR 0083 (receipts for every model call) and ADR 0085 (standing
-loop and auto-created jobs) by number and by the minimal interfaces below. None of those three is
-required for the records and routes in this slice.
+Relates to ADR 0082 (proposed, in flight: Anthropic as an operator-attested model destination, the
+freeze amendment, and the destination registry), ADR 0083 (proposed, in flight: receipts for every
+model call) and ADR 0085 (standing loop and auto-created jobs), cited by number and by the minimal
+interfaces below. None of them is on main or required for the records and routes in this slice, and
+this record stands on its own without them.
 
 ## Context
 
@@ -17,11 +18,11 @@ model ran, on which inputs, under which policy or at what cost, and a finding ha
 human decision. A client (an agent credential or a person) has no first-class way to ask for such a
 job, and no way to read or resolve its findings.
 
-Decided 2026-11-22: Tessera's own agent loop uses Anthropic as a registered model destination, and
+Decided 2026-11-22: Tessera's own agent loop uses Anthropic as an operator-attested model destination, and
 the existing research journey is reused rather than replaced. This record reuses the journey for
 client-requested jobs (a single reviewer role, a pinned prompt, digest-pinned inputs, a tier from
 policy) and adds durable findings, an immutable decision record and the safety invariants (honest
-receipts, no self-review, no private data sent anywhere unregistered). Which policy applies to which
+receipts, no self-review, no private data sent to a destination that is not operator-attested). Which policy applies to which
 trigger, and the automatic creation of jobs when a plan is admitted or advanced, belong to ADR 0085
 and are not decided here.
 
@@ -53,7 +54,7 @@ refusals are HTTP 409 with a stable `reason` in the body:
 
 | `reason` | Meaning |
 | --- | --- |
-| `destination_not_enrolled` | the destination id is not registered for review jobs (the default) |
+| `destination_not_enrolled` | the destination id is not an enrolled operator-attested model destination (the default) |
 | `tier_exceeds_policy` | the requested tier is above what policy admits for the destination |
 | `data_class_not_allowed_for_destination` | an input's class is not admitted for the destination |
 | `budget_exceeds_policy` | the budget is above the policy limit (the API also caps it at 10000 cents) |
@@ -70,7 +71,7 @@ check(destination_id, tier, data_classes, budget_cents) -> str | None
 It returns `None` when the job is admitted and otherwise one of the reason codes above. The default
 policy admits nothing: it returns `destination_not_enrolled`, so a control plane with no destination
 registry refuses every submit truthfully. The destination registry (the operator-enrolled model
-destination of ADR 0082) is a dependency that is not part of this slice; when it lands it replaces
+destination) (ADR 0082, proposed, in flight) is a dependency that is not part of this slice; when it lands it replaces
 the default by setting `app.state.review_policy`, and tests inject a stub. The input checks
 (`input_not_found`, `input_digest_mismatch`, `input_sealed`) are made by control before the hook, and
 the `data_classes` passed to `check` are the derived ones, never client-stated.
@@ -78,7 +79,7 @@ the `data_classes` passed to `check` are the derived ones, never client-stated.
 ### 3. Tier policy and per-job human approval
 
 The tier is one of `haiku`, `sonnet`, `opus`, `fable`. Sonnet or Opus are the defaults, Haiku is for
-cheap checks, and a downshift is never silent (ADR 0082, ADR 0083). A job at tier `fable` is created
+cheap checks, and a downshift is never silent (ADR 0082 and ADR 0083, proposed, in flight). A job at tier `fable` is created
 as `awaiting_approval` and moves to `queued` only when a human calls
 `POST /review-jobs/{id}/approve-tier` with the job's `expected_revision` and a rationale. The
 approval is a per-job record, human only: an agent credential gets 403, and the reviewer cannot
@@ -87,28 +88,32 @@ approve. Every other tier is created `queued`.
 ### 4. Egress and data classes
 
 In this slice nothing egresses: no runner exists and no model is called. Private inputs
-(`private_code_approved` or `private_derived`) are refused unless the policy admits a registered
-destination whose registry entry lists the derived class. The default policy, which refuses all,
+(`private_code_approved` or `private_derived`) are refused unless the policy admits an operator-attested
+model destination whose entry lists the derived class. The default policy, which refuses all,
 therefore refuses every private input, and private-input review stays refused until the destination
-registry of ADR 0082 lands. This relies on the amendment
-recorded in [ADR 0047](0047-agent-routed-data-destinations.md): an operator-registered model
-destination is a registered destination, not a public-internet exception.
+registry (ADR 0082, proposed, in flight) lands. This relies on the amendment recorded in
+[ADR 0047](0047-agent-routed-data-destinations.md): an operator-attested model destination is a
+class separate from provider trust, not a public-internet exception, and the campaign-stage
+invariant is unchanged.
 
 The job `egress` field is `none` (the default) or `model_runtime`. `none` means no stage egress.
-`model_runtime` means only the registered model destination, reached through the model-runtime
+`model_runtime` means only the operator-attested model destination, reached through the model-runtime
 allowlist, never a general host. A job with a private input may use only these two values and cannot
 ask for anything wider. The model-runtime allowlist is separate from the sandbox and campaign-stage
 allowlists ([ADR 0034](0034-governed-sandbox-egress-and-dataset-staging.md)). A survey that needs
 public web fetching is a separate allowlisted step; it is never a reason to widen a model call.
-Credentials stay references. The reasoning unit must refuse to start if `ANTHROPIC_API_KEY` is set;
-that check belongs to the supervisor (ADR 0082) and is not changed here.
+Credentials stay references: a model destination's credential is a service-scoped reference held by
+the reasoning service, never a value in a spec, receipt, log, shell or environment file. The
+supervisor's startup checks (ADR 0082, proposed) own the credential kind and the refusal to start
+with a stray ambient key; neither is changed here.
 
 ### 5. Findings are proposals, not verdicts
 
 After a job's reviewer finishes, the reviewer posts the content of `findings.json` to
 `POST /review-jobs/{id}/findings` (scoped action `review:findings`). Control accepts it only for a job in
-`queued` or `running`, and only from a credential that is not the job's submitter (a self-submit is
-403). Validation is all or nothing: up to 200 findings with unique ids, each with `id`, `severity`
+`queued` or `running`, and only from a credential that is not the job's submitter and, by default, is not
+the same person as the submitter: it shares no enrolment root with it (a self-submit and a same-root
+poster are 403; see below for the deployment consequences). Validation is all or nothing: up to 200 findings with unique ids, each with `id`, `severity`
 (`info`, `minor`, `major`, `blocking`), `category`, a `claim` of at most 4096 characters, an
 `evidence` list (`source` one of `subject`, `context`, `citation`, optional `digest`, `locator`,
 `uri`) and a `confidence` from 0 to 1. Optional `review_md_digest` and `receipt_digest` are
@@ -119,9 +124,53 @@ control never fetches a URI, and the MCP tools mark the text as untrusted.
 A person resolves a finding with `POST /review-findings/{id}/resolve` (`accept` or `reject`, a
 rationale, the finding's `expected_revision` and `expected_digest`). Resolve is human only, through
 the same role guard used to promote or decline proposals plus `require_decision_actor`; agents, workers
-and the reviewer get 403. Resolve also refuses the principal that submitted the job and the principal
-that ingested its findings, even when that principal is a human (403), so one actor cannot both
-request and accept a review. Control writes an
+and the reviewer get 403. Resolve also separates people, not only credentials. A caller's person is its enrolment root: control
+walks the credential chain (each credential's creating principal) up to the principal or principals
+with no creating principal. Two callers whose roots intersect are the same person. By default (403, reason
+`same_person`) resolve refuses a caller who is the same person as the job's submitter or as whoever
+posted the findings, so sibling credentials created by one owner do not count as a second person.
+A chain deeper than the walk's bound fails closed: it is refused rather than treated as unrelated. The same person
+rule applies to findings ingest and the runner's state calls (`mark_running`): a credential sharing a root with the
+job's submitter cannot post its findings (403). A separately enrolled root is a different person. Control does not
+verify that two roots are two humans; it only knows enrolment lineage.
+
+Enrolment. Only the owner can issue agent credentials, so every agent or session the owner creates shares the
+owner's root. A second root comes from owner-only person enrolment (`POST /people`; see
+[docs/people-enrollment.md](../people-enrollment.md)): a human principal whose session credential is its own
+enrolment root (kind `human_session`, no parent, no creating principal) with an `enrolled_people` row. That
+person cannot issue credentials, enrol people or act as the root owner, but is a person for human-only decisions
+such as resolving findings. Enrol, renew (at most 7 days from now; never reviving a revoked or expired credential)
+and revoke (`POST /credentials/{id}/revoke`) are audited in the same transaction; the client-generated token is
+stored only as a hash and is never echoed, logged or audited.
+
+What works in default mode today, exactly. Only an agent credential holding `review:findings` can post findings, and
+only the owner issues agent credentials, so every posting agent is under the owner's root. The complete default flow
+therefore needs three roots: an enrolled person P submits the job, an owner-enrolled reviewer agent posts the
+findings (root differs from P's), and a second enrolled person Q resolves them (the owner's sessions share the
+poster's root so they get 403 `same_person`, and P is the submitter so gets 403 `same_principal`). What does not work: a job submitted by an
+owner-enrolled agent or by the owner's own session can never receive findings in default mode (the posting agent
+shares the submitter's root, 403), so there is nothing to resolve; with one person enrolled, nothing completes. The
+deployment then uses the opt-in below. Workers cannot post findings (they cannot hold the scope), and a person's
+session cannot post them either. A person's own agent path (an enrolled person owning agents that review under a
+distinct root) does not exist yet: see open question 8.
+
+A deployment-level opt-in, `tessera serve --review-single-owner` (off by default), relaxes this to
+refuse only the identical principal (the submitter or the ingesting reviewer principal itself). Every
+decision is labelled: the decision row, its event, the resolve response and reads carry `separation_basis`
+(`distinct_person`, or `single_owner_opt_in` when the opt-in let the decision through); the job always carries
+`findings_separation_basis` (`distinct_person` or `single_owner_opt_in`, always recorded when findings are ingested); and the
+control status (`GET /external-agent/status`, shown by `tessera_mcp status`) reports `review_single_owner`.
+Plainly: in a one-person deployment, where one owner enrolled the submitting agent, the reviewer and every
+session, nobody can post and resolve findings across owner-enrolled agents until findings come from outside the
+submitter's root (and a person is enrolled to resolve) or the opt-in is enabled; with the opt-in on that fact is
+visible on every decision.
+
+Restore. A restored state gets a new self-rooted owner. Persons and roots recorded before a restore must not be
+treated as the same person as the new owner (the same human could otherwise resolve pre-restore jobs as
+`distinct_person`); `enrolled_people` roots survive a restore only as recorded rows, not as live identities. Today this cannot be exercised through the API: a restored state is held and refuses every write,
+including resolve, so a promotion path would need its own separation test.
+
+The opt-in does not make the decision independent; it labels it. Control writes an
 immutable decision row (actor, rationale, the finding digest and the job's subject digests) and an
 event in one transaction, idempotent on its key. Resolving never changes a plan, proposal, campaign
 or gate: every resolve response carries `"advisory": true` and `"execution_authorized": false`. To act
@@ -138,8 +187,8 @@ is a recorded cap, not a reservation, until the runner lands (open question 6). 
 attached a job stays `queued` and is never shown as completed, and a provider-disabled path stays
 truthful. A job stores a receipt digest only when the runner supplies one; control never invents
 one. The receipt fields expected from ADR 0083 are `model`, `tier`, `input_digests`, `tokens`,
-`cost_or_usage` and `policy_digest`, with included subscription usage recorded as such rather than as
-a dollar figure. Model identity is what was configured or reported, not verified.
+`cost_or_usage` and `policy_digest`, with any usage the vendor does not price recorded as tokens
+rather than as a dollar figure. Model identity is what was configured or reported, not verified.
 
 ### 7. Invariants
 
@@ -188,14 +237,19 @@ calls in default tests.
 
 ## Open questions
 
-1. How the operator-registered destination registry maps an enrolled model destination to the
-   admitted tiers and data classes (ADR 0082 owns the registry; this ADR fixes only `check`).
+1. How the operator-attested destination registry maps an enrolled model destination to the
+   admitted tiers and data classes (ADR 0082, proposed, owns the registry; this ADR fixes only `check`).
 2. Whether a submission should hold a plan's approval until its review finishes, or only report
    it. This ADR only reports.
 3. Whether an unlock requirement (in the style of ADR 0049/0051) may later require a `completed`
    review on the current subject digest with no open `blocking` finding.
 4. Who may hold a delegated decision label for resolve, and whether it is separate from the campaign
    approval label.
+   Still open: whether the single-owner opt-in should expire or need periodic re-confirmation, and
+   whether a decision made under it should carry a distinct delegated decision label. Enrolment
+   roots approximate people; they do not prove two humans.
+8. Whether an enrolled person should be able to own agents under their own root (a person's own agent path), so
+   that findings can be posted in default mode with fewer than three enrolled roots, or without the opt-in. Not built.
 5. How to catch derivations from a holdout partition that were never recorded in artifact lineage
    (`input_sealed` matches declared and claimed partitions and their recorded lineage descendants).
 6. Whether `budget_cents` should become a reservation against the project budget once the runner

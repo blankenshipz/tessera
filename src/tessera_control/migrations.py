@@ -8,7 +8,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 73
+CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
+# Literal: must equal the highest registered constant (MODEL_SPEND_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 77
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1432,9 +1434,7 @@ MIGRATIONS.setdefault(HOLDOUT_SCHEMA_VERSION - 1, migrate_holdout_schema)
 
 
 # Review jobs (schema 73): client-requested research/review jobs, findings and human
-# decisions (ADR 0084). Additive and idempotent; registered with setdefault. If another change
-# owns this version when branches merge, raise REVIEW_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION
-# and the fresh-database INSERT in store.py).
+# decisions (ADR 0084). Additive and idempotent; registered with setdefault.
 REVIEW_SCHEMA_VERSION = 73
 
 
@@ -1442,6 +1442,9 @@ def migrate_review_schema(connection: sqlite3.Connection) -> None:
     from .review_jobs import create_review_jobs_schema
 
     create_review_jobs_schema(connection)
+    from .people import create_people_schema
+
+    create_people_schema(connection)
     connection.execute(
         """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
         WHERE singleton=1 AND EXISTS (
@@ -1454,3 +1457,126 @@ def migrate_review_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(REVIEW_SCHEMA_VERSION - 1, migrate_review_schema)
+
+
+# Stuck-campaign findings (schema 74, ADR 0091). Additive and idempotent; registered with
+# setdefault. If another change owns this version when branches merge, raise
+# STUCK_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION and the fresh-database INSERT in store.py).
+STUCK_SCHEMA_VERSION = 74
+
+
+def migrate_stuck_schema(connection: sqlite3.Connection) -> None:
+    from .campaign_stuck import create_stuck_schema
+
+    create_stuck_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (STUCK_SCHEMA_VERSION,)
+    )
+
+
+MIGRATIONS.setdefault(STUCK_SCHEMA_VERSION - 1, migrate_stuck_schema)
+
+
+# Code review jobs (schema 75, ADR 0092). Widens the review_jobs kind CHECK to admit
+# 'code_review' by a same-id rebuild and adds the code_review_jobs side table (with
+# attempt_receipts_json) and the code_review_runners host-bound table. Idempotent;
+# registered with setdefault. If another change owns this version when branches merge, raise
+# CODE_REVIEW_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION and the fresh-database INSERT in store.py).
+CODE_REVIEW_SCHEMA_VERSION = 75
+
+
+def migrate_code_review_schema(connection: sqlite3.Connection) -> None:
+    from .review_jobs import create_review_jobs_schema
+
+    preexisting = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+    row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='review_jobs'"
+    ).fetchone()
+    if row is not None and "'code_review'" not in row[0]:
+        # review_findings, review_job_approvals and code_review_jobs reference review_jobs.
+        # Defer the check to COMMIT and re-insert the same ids into a table of the same name.
+        # The copied columns are those the old table has and the new definition keeps, read
+        # from the tables themselves so a column added by any earlier migration is preserved.
+        connection.execute("PRAGMA defer_foreign_keys=ON")
+        old_columns = [r[1] for r in connection.execute("PRAGMA table_info(review_jobs)")]
+        connection.execute("CREATE TABLE review_jobs_v74 AS SELECT * FROM review_jobs")
+        connection.execute("DROP TABLE review_jobs")
+        create_review_jobs_schema(connection)
+        new_columns = {r[1] for r in connection.execute("PRAGMA table_info(review_jobs)")}
+        copied = ",".join(c for c in old_columns if c in new_columns)
+        connection.execute(
+            f"INSERT INTO review_jobs ({copied}) SELECT {copied} FROM review_jobs_v74"
+        )
+        connection.execute("DROP TABLE review_jobs_v74")
+    create_review_jobs_schema(connection)
+    if len(connection.execute("PRAGMA foreign_key_check").fetchall()) > preexisting:
+        raise ValueError("Migration v75 introduced foreign key violations.")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (CODE_REVIEW_SCHEMA_VERSION,)
+    )
+
+
+MIGRATIONS.setdefault(CODE_REVIEW_SCHEMA_VERSION - 1, migrate_code_review_schema)
+
+
+# Approved campaign submissions (ADR 0093): a human's recorded approval an agent may consume
+# once, plus its append-only decisions. Additive and idempotent; registered with setdefault.
+# If another change owns this version when branches merge, renumber
+# CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION (LATEST_SCHEMA_VERSION follows it; also the
+# fresh-database INSERT literal in store.py).
+
+
+def migrate_submission_schema(connection: sqlite3.Connection) -> None:
+    from .campaign_submissions import create_submission_schema
+
+    create_submission_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION - 1, migrate_submission_schema)
+
+
+# Model-spend limits and ledger (ADR 0090). Additive and idempotent; registered with setdefault.
+# This single constant carries the version: if another change owns it when branches merge,
+# raise MODEL_SPEND_SCHEMA_VERSION, LATEST_SCHEMA_VERSION (the literal near the top) and the
+# fresh-database INSERT in store.py.
+MODEL_SPEND_SCHEMA_VERSION = 77
+
+
+def migrate_model_spend_schema(connection: sqlite3.Connection) -> None:
+    from .model_spend import create_model_spend_schema
+
+    create_model_spend_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (MODEL_SPEND_SCHEMA_VERSION,)
+    )
+
+
+MIGRATIONS.setdefault(MODEL_SPEND_SCHEMA_VERSION - 1, migrate_model_spend_schema)

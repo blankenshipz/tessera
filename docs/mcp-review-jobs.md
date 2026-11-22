@@ -68,6 +68,64 @@ say-so (control never does).
 only on a separate server started with `--review-decision-tool` that holds a person's own session
 credential. It reads the finding first and refuses, sending nothing, if the stored digest differs
 from the `expected_digest` the caller named; the control API then applies the human-only check (an
-agent credential, a worker, the reviewer and the job's submitter get 403) and records an immutable
+agent credential, a worker and the reviewer get 403; see "Who may resolve" below for the person separation) and records an immutable
 decision with the actor, rationale and digests. The response says `"advisory": true` and
 `"execution_authorized": false`: a resolve never changes a plan, proposal, campaign or gate.
+
+### Who may resolve
+
+By default resolve is refused (403, reason `same_person`) for the same person as the job's submitter
+or as whoever posted the findings, and posting findings (and the runner's state calls) is refused for a
+credential that shares a root with the job's submitter. A person is an enrolment root: control walks the
+credential chain to the principals with no creating principal, and callers with intersecting roots are the same
+person. A chain deeper than the walk's bound fails closed. Control cannot verify that two roots are two humans.
+
+Only the owner issues agent credentials, so every agent and session the owner creates shares the owner's root. A
+second person is enrolled by the owner ([people-enrollment.md](people-enrollment.md)). Only an agent holding `review:findings` can post
+findings, so posting agents share the owner's root. The complete default flow needs three roots: an enrolled person
+submits, an owner-enrolled reviewer agent posts, and a second enrolled person resolves (the owner's sessions get 403
+`same_person`; the submitter gets 403 `same_principal`). A job submitted by an owner-enrolled agent or by the owner's session cannot receive
+findings in default mode. The operator can use `tessera serve --review-single-owner` (off by default), which refuses
+only the identical principal. A person's own agent path does not exist yet and is an open question in the ADR.
+
+Everything is recorded: `separation_basis` on the decision, its event, the resolve response and reads is
+`distinct_person` or `single_owner_opt_in`; the job always shows `findings_separation_basis` (the same two
+values); and `review_single_owner` appears in `GET /external-agent/status` and `tessera_mcp status`.
+
+## Enrolling a person (operator opt-in)
+
+`tessera_enroll_person`, `tessera_list_people` and `tessera_renew_person` are registered only on a separate
+server started with `--person-enrollment-tool` and the owner's credential file. Enrol generates the token,
+writes the person's credential file (mode 0600, created exclusively) and returns only ids, label, expiry and
+the file path, never the token. See [people-enrollment.md](people-enrollment.md). These are not review agent tools.
+
+## Code review jobs
+
+`kind: code_review` reviews a content-addressed head snapshot, or the change between a base digest
+and a head digest, against a pinned rubric ([ADR 0092](decisions/0092-code-review-jobs.md)). Submit
+adds a `code_review` object: `mode` (`snapshot` or `diff`), `head_digest`, `base_digest` (required
+for `diff`, absent for `snapshot`, different from the head) and `rubric_digest`. It is required for
+this kind and refused for every other. Each of those digests must also be listed in `inputs`, so
+derived data class, sealed-holdout refusal and policy apply to them. Head and base digests must be
+snapshots already in the project's custody (`input_not_found` otherwise). `tessera_list_review_jobs` takes an
+optional `kind` filter. There are no new tools or scopes.
+
+A completed code review carries numbered findings (ids `1` to `n`), a verdict (`MERGE`,
+`MERGE-WITH-FOLLOWUPS` or `CHANGES-REQUIRED`) and a model-call receipt, and the job shows a review
+receipt digest. A blocking finding requires `CHANGES-REQUIRED`; `MERGE` allows no major or blocking
+finding. The verdict and findings are advisory and untrusted text: they never merge, approve or
+unlock anything. Accept or reject findings with `tessera_resolve_review_finding` as above.
+
+A separate runner executes these jobs (at most 2 at once by default, 1 to 8 configurable, the
+minimum across runners on the host, only with enough free memory, with one automatic retry if the
+model process vanishes). With no runner configured, a code review stays `queued`. The runner starts
+only Tessera's built-in model child, which calls the Anthropic Messages API through the allowlisted
+client with an API-key credential held by reference (`--model-profile` and
+`--credential-name anthropic-api-key`; the credential directory must hold only that file), never an
+environment variable. Egress must be `model_runtime` and the destination `anthropic`. The receipt
+tier must equal the job tier, its input digests and class must match the job's inputs, and a billed
+cost (`cost_cents`) over the budget fails the job; the job shows `attempt_receipts` and
+`cost_cents_total` even for failed attempts. The runner needs an operator-written
+`--policy module:attribute`;
+[docs/examples/code_review_policy.py](examples/code_review_policy.py) is an example to copy, not a
+default. A runner-completed job records no findings actor.

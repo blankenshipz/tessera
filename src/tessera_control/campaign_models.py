@@ -570,6 +570,11 @@ class StageV2(_Strict):
     # keeps the digest.
     memory_bytes: MemoryBytes | None = None
     expected_duration_seconds: Annotated[int, Field(strict=True, ge=1, le=7 * 86_400)] | None = None
+    # ADR 0095: the name of one of this stage's pinned ``snapshot`` inputs that carries the
+    # stage's code (a content-addressed input mounted like any other, run by a generic deps-only
+    # image). Naming it makes the code's digest and files part of the receipt. Absent keeps the
+    # digest.
+    code_input: Key | None = None
 
     @model_validator(mode="after")
     def _distinct_tags(self) -> StageV2:
@@ -594,6 +599,8 @@ class StageV2(_Strict):
             value.pop("memory_bytes", None)
         if self.expected_duration_seconds is None:
             value.pop("expected_duration_seconds", None)
+        if self.code_input is None:
+            value.pop("code_input", None)
         if self.evaluation is None:
             value.pop("evaluation", None)
         if self.send_classes is None:
@@ -743,6 +750,8 @@ class NormalStage:
     # nothing enforces them.
     memory_bytes: int | None = None
     expected_duration_seconds: int | None = None
+    # ADR 0095: the pinned snapshot input that carries the stage's code, or None.
+    code_input: str | None = None
 
     @property
     def holdout(self) -> HoldoutClaimSpec | None:
@@ -993,6 +1002,7 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                 placement_tags=tuple(stage.placement_tags or ()),
                 memory_bytes=stage.memory_bytes,
                 expected_duration_seconds=stage.expected_duration_seconds,
+                code_input=stage.code_input,
             )
         )
     return NormalSpec(
@@ -1119,6 +1129,17 @@ def validate_structure(spec: NormalSpec) -> None:
             {o.path for o in stage.outputs}
         ) != len(stage.outputs):
             raise ValueError(f"Stage {stage.key} output names and paths must be unique")
+        if stage.code_input is not None:
+            named = [item for item in stage.inputs if item.name == stage.code_input]
+            if not named:
+                raise ValueError(
+                    f"Stage {stage.key} code_input {stage.code_input!r} names no input of the stage"
+                )
+            if named[0].kind != "snapshot":
+                raise ValueError(
+                    f"Stage {stage.key} code_input {stage.code_input!r} must be a pinned snapshot "
+                    f"input, not a {named[0].kind} input (its digest is not known at submit)"
+                )
         for item in stage.inputs:
             if item.kind != "stage":
                 continue

@@ -17,6 +17,7 @@ from tessera_control import campaign_provider_worker as worker
 from tessera_control import campaign_providers as cp
 from tessera_control.agent_campaign_reads import AgentCampaignReads
 from tessera_control.campaign_models import parse_spec, spec_digest
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.snapshots import SnapshotStore
 from tessera_control.store import Conflict, canonical_digest
 from tessera_control.workspace import capture_workspace, inventory_digest
@@ -788,8 +789,8 @@ def test_migration_71_to_72_adds_the_claim_table_and_its_triggers(tmp_path):
                 db.execute(f"DROP TRIGGER {name}")
         db.execute("DROP TABLE campaign_holdout_claims")
         db.execute("UPDATE schema_meta SET schema_version=71")
-    assert migrate_database(path, _connect) == 72
-    assert migrate_database(path, _connect) == 72  # a second run is a no-op
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION  # a second run is a no-op
     validate_database(path)
     assert dict(sqlite3.connect(path).execute(query).fetchall()) == fresh
     campaign = env.query("SELECT * FROM campaigns")[0]

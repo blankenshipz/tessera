@@ -20,6 +20,13 @@ allowing a registered model destination for a stage with non-public input is an 
 spec-validation rule ("no egress for a non-public stage"), which this draft does not make. Closes no
 [ADR 0033](0033-freeze-over-built-planes.md) freeze: see "Freeze" below.
 
+Implementation status: the first slice (S1 contract digest + S2 observe-only watcher, library, off
+by default, not wired into the default worker service) is implemented; see
+[the stage watcher](../stage-watcher.md). No ADR 0033 amendment text is requested by this slice
+because it adds no provider call, spend or egress beyond the injected report sink; the owner still
+decides whether an amendment is needed. Everything else in this record (actions, model calls,
+Salad sidecar, escalation) remains a draft and inactive.
+
 ## Context
 
 Tessera has two kinds of decision-maker today and a gap between them.

@@ -145,6 +145,12 @@ def enroll(args, transport_factory=LocalHTTP):
         scope["actions"].append("budget:read")
     if getattr(args, "allow_campaigns", False):
         scope["actions"] += ["campaign:submit", "campaign:read", "campaign:cancel"]
+    if getattr(args, "allow_campaign_submit_cleared", False):
+        # Consuming a human's recorded approved submission (ADR 0093). Never part of
+        # --allow-campaigns: the operator opts in separately.
+        for action in ("campaign:submit_cleared", "campaign:read", "campaign:cancel"):
+            if action not in scope["actions"]:
+                scope["actions"].append(action)
     if getattr(args, "allow_campaign_evidence", False):
         scope["actions"] += ["snapshot:read", "artifact:read", "campaign:logs"]
     if getattr(args, "allow_review_jobs", False):
@@ -318,6 +324,7 @@ def main(argv=None):
     parser.add_argument("--allow-results", action="store_true")
     parser.add_argument("--allow-budget", action="store_true")
     parser.add_argument("--allow-campaigns", action="store_true")
+    parser.add_argument("--allow-campaign-submit-cleared", action="store_true")
     parser.add_argument("--allow-campaign-evidence", action="store_true")
     parser.add_argument("--allow-review-jobs", action="store_true")
     parser.add_argument("--allow-review-findings", action="store_true")

@@ -29,7 +29,10 @@ Key = Annotated[str, Depends(idempotency_key)]
 
 @router.get("/external-agent/status")
 def status(request: Request, actor: Actor):
-    return request.app.state.external_agents.status(actor)
+    return {
+        **request.app.state.external_agents.status(actor),
+        "review_single_owner": bool(getattr(request.app.state, "review_single_owner", False)),
+    }
 
 
 @router.post("/projects/{project_id}/agent-proposals")

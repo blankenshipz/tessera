@@ -10,6 +10,7 @@ generic placeholder: `/etc/tessera` (configuration), `/var/lib/tessera` (state),
 | `tessera-development-poll.service` | `python -m tessera_worker.cli development-poll` (same as `tessera-worker development-poll`) |
 | `tessera-salad-executor.service` | `python -m tessera_control.campaign_salad_executor` |
 | `tessera-salad-guardian.service` | `python -m tessera_control.salad_safety_service --run` |
+| `tessera-submit-runner.service` | `tessera-submit-runner`: submits owner-approved campaign records on a schedule (manual start, not in the target) |
 | `tessera.target` | groups the three services |
 | `tessera-health-check@.service` + `tessera-health-check-*.timer` | optional freshness probes |
 
@@ -68,3 +69,43 @@ The guardian has no health file. Check it through its own authenticated
 endpoint as described in `docs/salad-safety-service.md`; `Restart=on-failure`
 covers crashes. Exit code 2 (configuration or prerequisite refused) is not
 retried (`RestartPreventExitStatus=2`).
+
+## Submit runner (manual start)
+
+`tessera-submit-runner.service` runs the campaign-submit action of the agent
+loop ([ADR 0093](../../docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md))
+on a schedule. It only turns records a person already approved into campaigns;
+it runs no model and never approves anything. It is not part of
+`tessera.target` and has no `[Install]` section, so `systemctl enable` does
+nothing for it. Its settings:
+
+- Admission: it starts only if the marker `/etc/tessera/submit-runner.admitted`
+  exists (`ConditionPathExists=`; without it systemd skips the start).
+- Credential: the agent token file is passed with `LoadCredential=` and the unit
+  gives the program only its path (`TESSERA_AGENT_TOKEN_FILE`). The other
+  `Environment=` lines (`TESSERA_CONTROL_URL`, `TESSERA_PROJECT_ID`,
+  `TESSERA_AGENT_DESTINATION`) are non-secret references; edit them for your
+  host. The program refuses to start if `ANTHROPIC_API_KEY` is set.
+- Writes: only `/var/lib/tessera/submit-runner` (the append-only journal of
+  receipts). `StateDirectory=tessera/submit-runner` makes systemd create that
+  directory (mode 0700) and nothing else under `/var/lib/tessera` is writable.
+  The kill-switch marker `/etc/tessera/submit-runner.kill` is only read, so
+  `/etc/tessera` must exist.
+- Exit 0 means stopped, 2 a configuration refusal and 3 halted; the unit does
+  not restart on 2 or 3.
+
+Control must also run with `tessera serve --agent-submissions`; otherwise every
+submit is refused `feature_disabled`.
+
+Start: `touch /etc/tessera/submit-runner.admitted`, then
+`systemctl start tessera-submit-runner.service`.
+
+Stop new submissions at once: `touch /etc/tessera/submit-runner.kill`. While
+the marker exists (or its state is ambiguous, for example its parent directory
+is missing) the runner pauses without exiting and calls neither the action nor
+the control plane; it resumes by itself when the marker is removed. It exits 0
+only on a stop request (SIGTERM) and halts with exit 3 after repeated failed
+ticks.
+Campaigns that were already submitted keep running and are untouched. To stop
+the process: `systemctl stop tessera-submit-runner.service`; to withdraw
+admission, remove the marker file.

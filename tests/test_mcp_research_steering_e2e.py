@@ -34,7 +34,9 @@ from research_steering_fixtures import (  # noqa: E402
     JOB_DESTINATION,
     PROMPT,
     ReviewPolicy,
+    enrol_person,
     fake_model_call,
+    second_root_agent,
     seed_private_snapshot,
 )
 
@@ -82,8 +84,15 @@ class Rig:
             "steerer": ["review:read", "loop:pause"],
             "reviewer": ["review:findings", "review:read"],
         }.items():
-            env.agent(actions, name)
-        env.human()
+            if name == "reviewer":
+                # Another person (enrolment root) than the loop that submitted the jobs.
+                second_root_agent(env, f"synthetic-{name}-token-" + "x" * 30, actions, DESTINATION)
+            else:
+                env.agent(actions, name)
+        owner = {
+            "Authorization": (env.state / "owner.header").read_text().split(": ", 1)[1].strip()
+        }
+        enrol_person(self.http, owner, "synthetic-human-token-" + "x" * 30)
         self.loop_server = self._server("loop", review_tools=True)
         self.marker = tmp_path / "loop-kill"  # OPERATOR: the kill-switch marker file
         self.ledger_path = tmp_path / "loop-calls.sqlite"

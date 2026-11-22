@@ -624,26 +624,29 @@ def test_reservation_alone_pushes_past_the_daily_cost_cap(tmp_path, creds):
     assert len(transport.messages()) == 1
 
 
-def test_substituted_model_receipts_actual_usage_and_counts_today(tmp_path, creds):
+def test_substituted_model_receipts_worst_case_and_counts_today(tmp_path, creds):
     # Review probe 2: a 200 naming another model (400 in / 900 out) is billed and receipted.
+    # rv-rmd4 finding 1: priced at max(actual at pinned prices, reserved worst case) per
+    # dimension: 1300 actual tokens > 1100 reserved, but 1.47 actual cents < 1.53 reserved.
     transport = Transport(ok(model="claude-haiku-4-5", input_tokens=400, output_tokens=900))
     store, supervisor, _, _ = setup(tmp_path, creds, transport)
     row = supervisor.tick("run1", PROMPT)
     assert row["reason"] == "model_substituted"
     (call,) = store.model_calls("run1")
     actual = (400 * 300 + 900 * 1500) / 1e6
+    assert actual < WORST_CENTS
     assert call["outcome_class"] == "model_substituted"
-    assert call["cost_basis"] == "computed_from_pinned_prices"
+    assert call["cost_basis"] == "worst_case_for_substituted_model"
     assert call["model_reported"] == "anthropic/claude-haiku-4-5"
     assert call["tokens"]["input"] == 400 and call["tokens"]["output"] == 900
     assert call["tokens"]["total"] == 1300
-    assert call["cost"] == pytest.approx(actual)
+    assert call["cost"] == pytest.approx(WORST_CENTS)
     assert call["output_sha256"] is None
     assert not (tmp_path / "state" / "outputs").exists()  # the completion is never kept
     assert call["daily_tokens_after"] == 1300
     day = store.daily_usage("2026-11-22")
-    assert day["tokens"] == 1300 and day["cost_cents"] == pytest.approx(actual)
-    assert store.get("run1")["cost"] == pytest.approx(actual)
+    assert day["tokens"] == 1300 and day["cost_cents"] == pytest.approx(WORST_CENTS)
+    assert store.get("run1")["cost"] == pytest.approx(WORST_CENTS)
     assert_no_secrets(store, tmp_path)
 
 
@@ -800,8 +803,24 @@ def test_main_selects_anthropic_adapter(tmp_path, creds, monkeypatch, capsys):
         def __init__(self, *args, **kwargs):
             pass
 
-        def call(self, method, path, body=None):
-            return grant()
+        def call(self, method, path, body=None, key=None):
+            # A billed run settles on the control plane's model-spend ledger (model-spend ledger).
+            if path == "/model-spend/reservations":
+                return {
+                    "allowed": True,
+                    "call_id": "call1",
+                    "status": "reserved",
+                    "reserved_micro_cents": 1,
+                }
+            if path.endswith("/settlement"):
+                return {
+                    "call_id": "call1",
+                    "status": "settled",
+                    "settled_micro_cents": 1,
+                    "over_reservation": False,
+                    "cap_exceeded": False,
+                }
+            return {**grant(), "project_id": "project1"}
 
     def adapter(profile, *, credentials_dir):
         built.append(credentials_dir)
@@ -823,6 +842,8 @@ def test_main_selects_anthropic_adapter(tmp_path, creds, monkeypatch, capsys):
     assert code == 0 and built == [creds]
     receipt = json.loads(out)
     (call,) = receipt["model_calls"]
+    assert call["spend_ledger"]["status"] == "settled"
+    assert [r["state"] for r in receipt["spend_ledger"]] == ["settled"]
     assert call["cost_basis"] == "computed_from_pinned_prices"
     assert call["output_sha256"] == hashlib.sha256(COMPLETION.encode()).hexdigest()
     for secret in (API_KEY, PROMPT, COMPLETION, "SENTINEL-AGENT-TOKEN"):

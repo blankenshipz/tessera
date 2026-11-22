@@ -1,0 +1,47 @@
+# Example unit; every path is a generic placeholder (see README.md).
+# Manual start only: there is deliberately no [Install] section, so enabling
+# or starting tessera.target never starts it. Contains no secret: the agent
+# credential is an owner-only file passed with LoadCredential=.
+[Unit]
+Description=Tessera campaign-submit runner (admitted, manual start only)
+After=network-online.target
+Wants=network-online.target
+# Admission: an operator creates this empty marker file to allow a start.
+ConditionPathExists=/etc/tessera/submit-runner.admitted
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=tessera
+Group=tessera
+UMask=0077
+StateDirectory=tessera/submit-runner
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/tessera/submit-runner
+LoadCredential=agent-token:/etc/tessera/credentials/submit-runner-agent-token
+# Non-secret references only; %d is the unit's credentials directory.
+Environment=TESSERA_CONTROL_URL=http://localhost:8080
+Environment=TESSERA_AGENT_TOKEN_FILE=%d/agent-token
+Environment=TESSERA_PROJECT_ID=example-project
+Environment=TESSERA_AGENT_DESTINATION=example-destination
+ExecStart=/opt/tessera/.venv/bin/tessera-submit-runner --journal /var/lib/tessera/submit-runner/journal.jsonl --kill-switch /etc/tessera/submit-runner.kill --interval-seconds 60
+# Exit 2 (configuration refused) and 3 (halted) will not fix themselves.
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/tessera/submit-runner

@@ -237,7 +237,10 @@ configured, registered providers without a per-run approval; data never goes to 
 internet or an unregistered destination in any mode, because non-public inputs cannot use
 egress or workload fetch hosts and every transfer is recorded on the receipt (the egress
 proxy journals a tunnel when it is admitted and again at close, so an interrupted tunnel is
-recorded with unknown bytes rather than missing, [ADR 0057](docs/decisions/0057-egress-tunnel-opened-record.md)). A stage input is a snapshot, the
+recorded with unknown bytes rather than missing, [ADR 0057](docs/decisions/0057-egress-tunnel-opened-record.md)). A stage's own code is a content-addressed input too: a stage may name one of its snapshot inputs as
+`code_input`, so private code reaches any provider as a digest-pinned input in a generic deps-only image
+instead of being baked into an image pushed to a registry, and the receipt records the code and image
+digests and the delivery ([ADR 0095](docs/decisions/0095-stage-code-as-input-artifacts.md)). A stage input is a snapshot, the
 declared output of an earlier stage (any provider), or an `artifact` pinned by campaign,
 stage, output and sha256 from an earlier campaign (or a `receipt_output` reference to a value on a succeeded campaign's receipt, resolved and pinned at submit, [ADR 0080](docs/decisions/0080-campaign-inputs-from-a-predecessor-receipt.md)); every input and output is indexed in
 `campaign_stage_io`. A stage may also list ordered `alternate_providers`; the runner then places
@@ -259,6 +262,11 @@ one sha256 over the whole file, 4 MiB chunks, bounded memory, and an operator-co
 ceiling (default 8 GiB per artifact). A Salad stage's guardian input path follows the same bound and is tested against a fake control serving a virtual 3 GiB artifact; no live Salad pull of that size has been run, and a Salad stage's own outputs stay at 16 MiB.
 Example systemd units for the poller, Salad executor and guardian are in
 [`deploy/systemd`](deploy/systemd/README.md).
+A person can record an approved submission (a reviewed spec digest or a failed campaign to rerun);
+the optional `tessera-submit-runner` then turns pending records into campaigns on a schedule, only
+when an operator starts it and `tessera serve --agent-submissions` is set
+([ADR 0093](docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md)). It runs no model and
+approves nothing.
 
 Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes v1 and v2
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
@@ -292,16 +300,46 @@ still refuses any agent credential and applies every admission check and cap). S
 Clients can also request a research or review job (`tessera_submit_review_job`) and read its findings
 (`tessera_list_review_jobs`, `tessera_read_review_job`, `tessera_list_review_findings`,
 `tessera_read_review_finding`; [ADR 0084](docs/decisions/0084-research-review-journeys.md),
-[docs/mcp-review-jobs.md](docs/mcp-review-jobs.md)). Findings are a proposal, not a verdict: only a
-person accepts or rejects one (`tessera_resolve_review_finding`, on a separate `--review-decision-tool`
-server; an agent credential gets 403), and resolving never approves or changes a plan, campaign or
-gate. The person who submitted a job or ingested its findings cannot resolve them either. Inputs are
-`{snapshot_id, digest}` only: control checks the snapshot in your project and derives its data class
-from the stored record. Submit is refused unless the destination is enrolled, the tier and budget are
-within policy and the derived classes are allowed; none is enrolled by default, so private-input
-review stays refused until the destination registry (ADR 0082) lands. The control plane records jobs
-and findings but runs no model itself and sends nothing anywhere, so a job with no runner attached
-stays `queued`.
+[docs/mcp-review-jobs.md](docs/mcp-review-jobs.md)). Inputs are `{snapshot_id, digest}` only: control checks
+the snapshot in your project and derives its data class from the stored record. Submit is refused unless the
+destination is an operator-attested model destination, the tier and budget are within policy and the derived
+classes are listed for it; none is enrolled by default, so every submit stays refused until an operator enrolls
+one (a separate destination class, not a public-internet exception). The control plane records jobs and
+findings but runs no model itself and sends nothing anywhere, so a job with no runner attached stays `queued`.
+
+Findings are a proposal, not a verdict: only a person accepts or rejects one
+(`tessera_resolve_review_finding`, on a separate `--review-decision-tool` server; an agent credential gets
+403), and resolving never approves or changes a plan, campaign or gate. By default the person rule applies to
+findings ingest and runner calls as well as to resolve: where a person is an enrolment root, a credential that
+shares a root with the job's submitter cannot post its findings, and one that shares a root with the submitter
+or with whoever posted them cannot resolve them (403 `same_person`). Only the root owner issues agent
+credentials, so agents and sessions the owner creates all share the owner's root: in default mode an
+owner-enrolled agent cannot post findings for a job another owner-enrolled agent submitted. A job submitted by
+an owner-enrolled agent or the owner's own session can never receive findings in default mode. Alternatively
+the operator starts the server with `--review-single-owner` (off by default), which refuses only the identical
+principal; every decision then records `separation_basis: single_owner_opt_in` (otherwise `distinct_person`)
+and the status shows `review_single_owner`.
+
+A second person can be enrolled by the owner (`POST /people`,
+[docs/people-enrollment.md](docs/people-enrollment.md); `tessera_enroll_person` on a separate
+`--person-enrollment-tool` server). Their credential lasts at most 7 days: a person's root credential must
+carry a non-NULL expiry within 7 days, and a parentless session is valid only with an enrolled-person row.
+That person has their own root, cannot issue credentials, enrol people or act as owner, and can resolve
+findings. Only an agent holding `review:findings` can post findings, and only the owner issues agents, so the
+complete default flow needs three roots: an enrolled person submits, an owner-enrolled reviewer agent posts,
+and a second enrolled person resolves. With one person enrolled nothing completes; a person's own agent path
+does not exist yet, which is an open question in the ADR.
+
+A `code_review` job ([ADR 0092](docs/decisions/0092-code-review-jobs.md)) reviews a content-addressed
+head snapshot or a base-to-head diff against a pinned rubric, with the digests bound to the job's
+inputs. A separate runner executes it on the registered model destination (host-wide concurrency
+bound, free-memory admission, one retry if the model process vanishes); the result is numbered
+findings, an advisory verdict (`MERGE`, `MERGE-WITH-FOLLOWUPS`, `CHANGES-REQUIRED`) and a model-call
+receipt bound to the job's inputs, with a receipt kept for every attempt. The runner starts only
+Tessera's built-in child, which calls the Messages API through the allowlisted client with an
+API-key credential held by reference, and the first run needs an operator-written policy
+([example](docs/examples/code_review_policy.py)). A verdict never merges or approves anything, and
+with no runner configured the job stays `queued`. No live model call is part of the default tests.
 
 **What still needs a human (Salad stages).** By default every Salad stage stops for a
 person at its source assessment and at each attempt's plan and source-use reviews; a bare
@@ -336,6 +374,15 @@ attempt, an unclear billable frame or a guardian disagreement. A stage refuses t
 maximum duration plus the settle margin, and an ambiguous billable frame is never settled
 automatically (on a guardian-bounded or provider-billed basis) without a guardian verdict;
 a human-recorded charge or reconcile can still settle it.
+
+**Stuck campaigns.** The control plane flags campaigns that need attention (blocked, paused with a
+lapsed delegation, an attempt with an unknown outcome, stale execution leases, no live runner, or
+no change past a configurable age) with a reason code, a suggested next action and a receipt, and
+shows them through `tessera_mcp` and to the standing agent loop as candidate work. The detector
+only records: it never cancels, resumes, resolves or retries anything, and a person or existing
+policy still decides ([ADR 0091](docs/decisions/0091-campaign-stuck-detector.md); the agent-loop
+work source is available and tested but not yet wired into a running loop; nothing here has run
+against a live deployment).
 
 ## Quickstart
 
@@ -405,11 +452,15 @@ simulator evidence does not close those gates.
 
 Console scripts installed by the package, one line each:
 
-- `tessera`: `init`, `serve`, `migrate`, `backup`, `restore`, `campaign`, `workspace`,
+- `tessera`: `init`, `serve`, `migrate`, `backup`, `restore`, `retention`, `campaign`, `workspace`,
   `admin` (including `provider-trust`), `agent-proposal`, `agent-sandbox`,
   `connection-tunnel`, plus lab setup commands (`minikube-provision`, `astra-*`).
+  `tessera retention plan|apply|verify` prunes old backups and unreferenced artifacts by an
+  operator policy: a dry run first, never the last restorable backup or anything a live
+  campaign, lineage or hold references, every deletion on a receipt (ADR 0089, `docs/recovery.md`).
 - `tessera-worker` / `tessera-worker-daemon`: worker CLI (`development-poll`) and its
   supervised daemon.
+  An optional, observe-and-report-only stage watcher library (off by default, not wired into the default worker) is described in [docs/stage-watcher.md](docs/stage-watcher.md).
 - `tessera-mcp`: MCP server for agent clients.
 - `tessera-salad-operator` / `tessera-salad-cleanup`: human-only Salad setup and cleanup.
 - `tessera-salad-executor` / `tessera-salad-guardian`: supervised Salad campaign executor and spend guardian (units in `deploy/systemd/`, launchd templates in `deploy/launchd/`).
@@ -445,8 +496,8 @@ status, and [DESIGN.md](DESIGN.md) for authoritative contracts.
   supervisor, OpenCode harness binding) is unfrozen by
   [ADR 0082](docs/decisions/0082-agent-loop-anthropic-destination.md).
 - The reasoning runtime reaches a model only through an enrolled destination: the Anthropic
-  Messages API by API-key reference (the default; Tessera's own client, no Claude subscription
-  or Claude Code), or optionally OpenAI included ChatGPT OAuth. It refuses to start when
+  Messages API by API-key reference (the default and only Anthropic mode;
+  Tessera's own client), or optionally OpenAI included ChatGPT OAuth. It refuses to start when
   `ANTHROPIC_API_KEY` is set; the key is a systemd credential only. The Anthropic host is on the
   model-runtime allowlist and Tessera's transport enforces it (https only, exact host and port,
   environment proxies ignored, redirects refused); host firewalling remains recommended defence
@@ -454,9 +505,30 @@ status, and [DESIGN.md](DESIGN.md) for authoritative contracts.
   input, output and cost caps, daily token and cost caps and the grant budget are checked, and
   every model call has an append-only receipt with computed cost and output hash
   ([ADR 0083](docs/decisions/0083-model-call-receipts.md)); rate limits back off with the same
-  model, never a downshift. This runtime uses no tools yet. For OpenAI the pinned harness
-  connects and no network-level enforcement for it is implemented. No reasoning run is claimed
+  model, never a downshift. Tool use is deny by default: an operator may allow exact Tessera MCP
+  tools (same agent token and control-plane scope checks), pinned by a tool-catalog digest and
+  bounded by `max_steps`, a tool-call cap and a result-size cap; each turn and tool call is
+  receipted by digest only, caps count across turns, and the kill switch is checked before each
+  turn and each tool call. Every requested tool call has one row whose status is the whole
+  model: an intent row (`started`) before it runs, completed once to `succeeded`, `error` or
+  `uncertain` (never retried; the run halts), or `denied`, or `refused` with a fence code or
+  `turn_limit_reached` for tools requested on the last turn. A loop paused by a rate limit is
+  durable across restarts (private pending file, digest journalled and verified before
+  resuming), and each tool-using turn adds one bounded aggregated provenance record once its
+  rows are terminal. The OpenAI/OpenCode path runs tools in its harness without per-tool digest receipts.
+  For OpenAI the pinned harness connects and no network-level enforcement for it is implemented. No reasoning run is claimed
   until an operator admits one.
+- Model spend is a budget of its own, separate from compute, Salad and grant budgets
+  ([ADR 0090](docs/decisions/0090-model-spend-ledger.md), [operator page](docs/model-spend.md)):
+  a person sets per-call and UTC-daily limits per project and model destination; the supervisor
+  reserves each call's worst case in the control plane before it is made and settles the computed
+  cost afterwards. A call over a limit, or with no limit configured or the ledger unreachable, is
+  refused before anything is sent (fail closed), and the model is never silently changed to a cheaper
+  one. A refusal is evaluated again once a person raises a limit or the UTC day rolls over. Only
+  billed destinations use the ledger. Totals are readable through `tessera_model_spend`, every
+  settlement is on the call's receipt, and a person resolves an open (uncertain) reservation through a
+  recorded route. Cost is computed from operator-pinned prices (an estimate, not an invoice); no live model
+  call has been made to verify this.
 - Single runs outside campaigns have no automatic retry or scheduling; a failed or
   unknown run is reconciled by a person.
 - Provider activation is disabled by default; no hosted service or production

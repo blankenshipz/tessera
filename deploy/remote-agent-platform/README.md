@@ -138,13 +138,16 @@ the environment names are fixed:
   not enabled at boot.
 - Optional profile `input_class` (`public` | `private_code_approved` | `private_derived`;
   missing reads as `private_derived`) is recorded on per-call model receipts.
+- Optional profile `control_ca_file` (absolute path to a PEM CA bundle for the control URL,
+  e.g. under `/etc/tessera/`; validated as an absolute path) is passed to the MCP server child
+  only as `TESSERA_CONTROL_CA_FILE`.
 - **Upgrading:** existing OpenAI deployments must install the `openai.conf` drop-in (above)
   before updating the unit file, because the base unit now loads `model-credential` and
   `anthropic-api-key` and systemd refuses to start if those sources are missing. Existing
   deployments moving to Anthropic must create both credential files and switch the profile;
   then `systemctl daemon-reload`.
 - **Deploy order:** upgrade the control plane before the reasoning supervisor. The control-side
-  provenance model rejects unknown fields (the new `rate_limit` provenance records), so an older
+  provenance model rejects unknown fields (the new `rate_limit` records and `tool_turn` field), so an older
   control plane would reject them until the run's outbox bound halts it.
 - **Egress:** `api.anthropic.com:443` is on the model-runtime allowlist and Tessera's transport
   enforces it (https only, exact host and port checked before connecting, environment proxies
@@ -153,8 +156,29 @@ the environment names are fixed:
   network-level enforcement for it is implemented; host firewalling is the operator's
   responsibility.
 - Per-call and daily token/cost caps are enforced before each billed call and every call is
-  receipted ([ADR 0083](../../docs/decisions/0083-model-call-receipts.md)). This runtime uses no
-  tools yet: profile `permissions` must be exactly deny-all.
+  receipted ([ADR 0083](../../docs/decisions/0083-model-call-receipts.md)).
+- **Tool use (Anthropic runtime):** deny by default. With deny-all `permissions` no tools are
+  offered. The profile may allow exact `tessera_*` tools, which run through the existing
+  `tessera_mcp` server with the same agent token file (`agent-token` in the credentials
+  directory; never argv or logs); then `tool_catalog_sha256`, `limits.max_tool_calls` and
+  `limits.max_tool_result_bytes` are required and `max_steps` bounds turns. Each turn and each
+  tool call is receipted by digest only (no inputs or results), one row per call with a
+  `status`: an intent row (`started`) is written before the call and completed once to
+  `succeeded`, `error` or `uncertain`; denied calls are `denied`; calls not run are `refused`
+  with a `skip_reason` (a fence code, or `turn_limit_reached` for tools requested on the last
+  allowed turn). A call with an unknown outcome (timeout, transport loss, crash; `started` rows
+  at the next tick become `uncertain`) is never retried and halts the run `tool_call_uncertain`.
+  Caps and budget count across turns, and the kill switch is checked before each turn and before
+  each tool call; if it trips, that call and the rest of the turn's calls are recorded `refused`
+  with the fence code, none runs, and the run halts with that code. Each tool-using turn adds
+  one aggregated provenance record once its rows are terminal (bounded; one overflow record, then
+  journal-only). A definite rejection after turn 1 backs off and resumes without replaying turns
+  or tool calls, including after a restart: the paused conversation is kept in a private
+  `<state_dir>/pending/<run_id>.json` (0600; only its digest is journalled), verified against the
+  journal and run totals before resuming, and deleted when the run ends; invalid state halts
+  `model_resume_state_invalid`. No egress is added: tool calls go to
+  the control plane. The OpenAI/OpenCode path runs tools in its harness and has no per-tool
+  digest receipts (gap). See [the runbook](../../docs/remote-reasoning-runtime.md).
 - Startup exits 78 (no restart) if `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or
   `CLAUDE_API_KEY` is present in the unit environment, before the profile is read.
   The key is supplied only through the credential file; do not add `Environment=`/`EnvironmentFile=` for them.

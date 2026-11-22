@@ -335,26 +335,43 @@ def _check(runner, connection, row, now) -> tuple[str | None, Any]:
     return None, spec
 
 
-def _start(connection, row, spec, now, trigger, evaluations=()) -> str:
+def insert_approved_campaign(
+    connection,
+    *,
+    org_id: str,
+    project_id: str,
+    spec,
+    spec_json: str,
+    spec_digest_value: str,
+    budget_cap_cents: int,
+    principal_id: str,
+    credential_id: str | None,
+    trust_policy_digest: str,
+    decision_class: str,
+    automation_label: str,
+    standing_approval_id: str | None,
+    now,
+) -> tuple[str, str, str]:
+    """Insert a running campaign, its stages and the approval row a human decision stands
+    behind (standing approvals, ADR 0042; approved submissions, ADR 0093).
+
+    The approving principal is always the human who made the recorded decision. Returns
+    ``(campaign_id, approval_id, expires_at)``; the caller writes its own events."""
     stamp = _iso(now)
     normal = normalize(spec)
-    per_start = row["per_start_budget_cap_cents"]
     campaign_id = "campaign_" + uuid.uuid4().hex
     approval_id = "approval_" + uuid.uuid4().hex
-    index = row["starts_used"] + 1
-    kind = "scheduled" if trigger is None else trigger["kind"]
-    retry_number = trigger["retry_number"] if trigger is not None and kind == "retry" else 0
     connection.execute(
         """INSERT INTO campaigns VALUES (?,?,?,?,?, 'running', NULL, ?, 0, 0, 2, ?, ?, ?, ?)""",
         (
             campaign_id,
-            row["org_id"],
-            row["project_id"],
-            row["spec_json"],
-            row["spec_digest"],
-            per_start,
-            row["created_by_principal_id"],
-            row["created_credential_id"],
+            org_id,
+            project_id,
+            spec_json,
+            spec_digest_value,
+            budget_cap_cents,
+            principal_id,
+            credential_id,
             stamp,
             stamp,
         ),
@@ -383,15 +400,41 @@ def _start(connection, row, spec, now, trigger, evaluations=()) -> str:
         (
             approval_id,
             campaign_id,
-            row["spec_digest"],
-            row["created_by_principal_id"],
-            CLASS_STANDING_APPROVAL,
-            f"standing_approval:{row['id']}",
+            spec_digest_value,
+            principal_id,
+            decision_class,
+            automation_label,
             stamp,
             expires,
-            row["trust_policy_digest"],
-            row["id"],
+            trust_policy_digest,
+            standing_approval_id,
         ),
+    )
+    return campaign_id, approval_id, expires
+
+
+def _start(connection, row, spec, now, trigger, evaluations=()) -> str:
+    stamp = _iso(now)
+    normal = normalize(spec)
+    per_start = row["per_start_budget_cap_cents"]
+    index = row["starts_used"] + 1
+    kind = "scheduled" if trigger is None else trigger["kind"]
+    retry_number = trigger["retry_number"] if trigger is not None and kind == "retry" else 0
+    campaign_id, approval_id, expires = insert_approved_campaign(
+        connection,
+        org_id=row["org_id"],
+        project_id=row["project_id"],
+        spec=spec,
+        spec_json=row["spec_json"],
+        spec_digest_value=row["spec_digest"],
+        budget_cap_cents=per_start,
+        principal_id=row["created_by_principal_id"],
+        credential_id=row["created_credential_id"],
+        trust_policy_digest=row["trust_policy_digest"],
+        decision_class=CLASS_STANDING_APPROVAL,
+        automation_label=f"standing_approval:{row['id']}",
+        standing_approval_id=row["id"],
+        now=now,
     )
     connection.execute(
         """INSERT INTO campaign_standing_starts (standing_approval_id, start_index, campaign_id,
@@ -602,6 +645,7 @@ __all__ = [
     "CreateStandingApproval",
     "RevokeStandingApproval",
     "abandon_triggers",
+    "insert_approved_campaign",
     "run_scheduler",
     "running_campaigns",
 ]

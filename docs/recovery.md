@@ -196,3 +196,27 @@ The full `tests/test_recovery_program_records.py` additionally checks migration 
 held migration, altered dataset bytes/schema/foreign keys, and incompatible
 schema/watermark manifests. All inputs and credentials are disposable synthetic
 fixtures; these checks do not attest to the contents of a live backup.
+
+## Retention of backups and unreferenced artifacts
+
+Backups and placed objects are pruned by policy, not by hand (ADR 0094). Put
+`storage-retention.json` in the state directory, for example:
+
+```json
+{"backup_root": "/safe/place", "backup_keep_last": 5, "backup_max_age_days": 30,
+ "disk_free_min_bytes": 10000000000, "artifact_max_age_days": 90}
+```
+
+```sh
+uv run --locked tessera retention plan  --state-dir .tessera          # dry run, prints a plan digest
+uv run --locked tessera retention apply --state-dir .tessera --plan-digest <digest>
+```
+
+The newest verified backup is never deleted, and no artifact that a live campaign, lineage,
+manifest, checkpoint or unreleased hold references (or that is held). Apply deletes only what
+the listed plan contained. Each run writes a private receipt under `storage-retention/` with the
+size and digest of every deletion. `tessera serve` reports a changed plan on a timer and applies
+only when `auto_apply` is true. Status: `GET /storage-retention/status`, MCP
+`tessera_storage_retention_status`.
+
+`tessera retention verify` re-hashes every backup with restore's own validation and receipts which would not restore; the serve timer runs it daily (`backup_verify_interval_hours`) and status reports the last sweep.

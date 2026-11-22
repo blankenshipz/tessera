@@ -90,6 +90,9 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_campaign_retries",
         "tessera_campaign_standing_status",
         "tessera_campaign_gate_decisions",
+        # Platform stuck-campaign findings: read-only list (the acknowledge tool has no "campaign"
+        # in its name; both are covered in test_mcp_campaign_stuck.py).
+        "tessera_list_stuck_campaigns",
         # ADR 0068: read-only holdout claims and scored metrics.
         "tessera_campaign_holdout",
         "tessera_campaign_holdout_claims",
@@ -107,6 +110,8 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_rerun_campaign",
         # ADR 0060: filters a stage's approved provider candidates.
         "tessera_steer_campaign_placement",
+        # ADR 0093: an agent submits a campaign a person already cleared (one-shot).
+        "tessera_submit_cleared_campaign",
     }
     assert "tessera_list_snapshots" in tools
     assert tools["tessera_get_campaign"].annotations.readOnlyHint is True

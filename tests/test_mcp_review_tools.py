@@ -334,3 +334,48 @@ def test_cli_explicit_campaign_flag_still_registers_review(tmp_path, monkeypatch
     module, built = _cli(tmp_path, monkeypatch, lambda client: pytest.fail("no live read"))
     assert module.main(["--approval-tool"]) == 0
     assert "review_tools" not in built[0]
+
+
+def test_resolve_same_person_403_is_an_error_and_separation_basis_passes_through(tmp_path):
+    body = {"advisory": True, "separation_basis": "single_owner_opt_in"}
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"digest": D})
+        if request.headers["idempotency-key"] == "same":
+            return httpx.Response(403, json={"detail": "same_person"})
+        return httpx.Response(200, json=body)
+
+    server = _server(tmp_path, handler, review_decision_tool=True)
+    args = {
+        "finding_id": "f_1",
+        "decision": "accept",
+        "rationale": "r",
+        "expected_revision": 1,
+        "expected_digest": D,
+    }
+    assert (
+        _call(server, "tessera_resolve_review_finding", {**args, "idempotency_key": "ok"}) == body
+    )
+    # The adapter never relays denial bodies: a 403 surfaces as an error, status only.
+    with pytest.raises(ToolError, match="HTTP 403") as excinfo:
+        _call(server, "tessera_resolve_review_finding", {**args, "idempotency_key": "same"})
+    assert "same_person" not in str(excinfo.value)
+
+
+def test_descriptions_mention_separation_basis(tmp_path):
+    server = _server(tmp_path, _ok, review_tools=True, review_decision_tool=True)
+    tools = {t.name: t.description for t in asyncio.run(server.list_tools())}
+    for name in ("tessera_resolve_review_finding", "tessera_read_review_finding"):
+        assert (
+            "separation_basis" in tools[name]
+            and "person" in tools[name]
+            and "enrolment" in " ".join(tools[name].split())
+        )
+    assert "findings_separation_basis" in tools["tessera_read_review_job"]
+
+
+def test_status_passes_review_single_owner_through(tmp_path):
+    status = {"actions": [], "review_single_owner": True}
+    server = _server(tmp_path, lambda request: httpx.Response(200, json=status))
+    assert _call(server, "tessera_status", {}) == status

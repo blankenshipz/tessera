@@ -9,6 +9,7 @@ import os
 import secrets
 import sqlite3
 import stat
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -832,19 +833,11 @@ def restore_state(
         _BYTE_LIMIT.reset(token)
 
 
-def _restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
-    start = time.monotonic()
-    manifest = _read_manifest(backup)
-    _deadline(start)
-    if (
-        state_dir.exists()
-        or state_dir.is_symlink()
-        or state_dir.parent.is_symlink()
-        or not state_dir.parent.is_dir()
-    ):
-        raise StoreError("Restore destination must be a new directory under a regular parent.")
-    state_dir.mkdir(mode=0o700)
-    os.chmod(state_dir, 0o700)
+def _stage_verified(backup: Path, state_dir: Path, manifest: dict[str, Any], start: float) -> Path:
+    """Copy and verify everything a restore needs into a private directory (no fencing).
+
+    Shared by restore and by `verify_restorable`, so a retention policy counts a backup
+    only if exactly this passes."""
     staged = state_dir / "restored.sqlite3"
     copied = 0
     digest = hashlib.sha256()
@@ -882,6 +875,23 @@ def _restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
                 _copy_bundle_object(source_objects, destination_objects, entry, start)
         if any(entry["availability"] == "present" for entry in manifest["objects"]):
             _fsync_directory(destination_objects)
+    return staged
+
+
+def _restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
+    start = time.monotonic()
+    manifest = _read_manifest(backup)
+    _deadline(start)
+    if (
+        state_dir.exists()
+        or state_dir.is_symlink()
+        or state_dir.parent.is_symlink()
+        or not state_dir.parent.is_dir()
+    ):
+        raise StoreError("Restore destination must be a new directory under a regular parent.")
+    state_dir.mkdir(mode=0o700)
+    os.chmod(state_dir, 0o700)
+    staged = _stage_verified(backup, state_dir, manifest, start)
     token = secrets.token_urlsafe(32)
     now = utc_now()
     connection = _connect(staged)
@@ -959,3 +969,22 @@ def _restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
     _fsync_directory(state_dir.parent)
     _deadline(start)
     return database, state_dir / OWNER_HEADER_NAME
+
+
+def verify_restorable(backup: Path) -> dict[str, Any]:
+    """Run restore's own validation on a backup without restoring it; return its manifest.
+
+    Raises ``StoreError`` (or OSError/sqlite errors) when restore would reject the bundle.
+    The size bound is the largest an operator may configure."""
+    require_sqlite_runtime()
+    token = _BYTE_LIMIT.set(MAX_CONFIGURABLE_BACKUP_BYTES)
+    try:
+        start = time.monotonic()
+        manifest = _read_manifest(backup)
+        with tempfile.TemporaryDirectory(prefix="tessera-verify-") as scratch:
+            stage = Path(scratch) / "stage"
+            stage.mkdir(mode=0o700)
+            _stage_verified(backup, stage, manifest, start)
+        return manifest
+    finally:
+        _BYTE_LIMIT.reset(token)

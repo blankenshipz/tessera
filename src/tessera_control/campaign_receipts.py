@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from typing import Any
@@ -12,12 +13,84 @@ from .campaign_io import stage_io
 from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
 from .campaign_placement import placements as recorded_placements
 from .campaign_rerun import lineage_of
-from .code_approval import input_classes
+from .campaign_submissions import submission_receipt_section
+from .code_approval import input_classes, snapshot_code_approval
+from .stage_watch import watch_receipt_section
 from .store import canonical_digest
 
 # Version 2 (ADR 0040): per-attempt provider, runtime, trust and settlement fields, the
 # evidence kind and digest, and the stage I/O index. Version 1 receipts stay as written.
 RECEIPT_VERSION = 2
+
+
+def code_summary(connection: sqlite3.Connection, spec_stage: Any) -> dict[str, Any] | None:
+    """The stage's declared code input as recorded: its pinned snapshot, the digest of its files,
+    whether a valid human code approval covers it, and the image the code runs in.
+
+    ``None`` unless the stage declares ``code_input``, so every other receipt is unchanged. Only
+    recorded values are read: an unreadable manifest gives a null ``code_digest`` and a zero file
+    count, never a guess, and file names are never copied out. The same function builds the receipt
+    section and the delivery event, so they cannot disagree."""
+    name = getattr(spec_stage, "code_input", None)
+    if not name:
+        return None
+    source = next((i for i in spec_stage.inputs if i.name == name and i.kind == "snapshot"), None)
+    if source is None:
+        return None
+    files: list[dict[str, Any]] | None = None
+    row = connection.execute(
+        "SELECT manifest_json FROM source_snapshots WHERE id=?", (source.snapshot_id,)
+    ).fetchone()
+    if row is not None:
+        try:
+            entries = json.loads(row[0])["entries"]
+            files = sorted(
+                (
+                    {"path": e["relative_path"], "sha256": e["sha256"], "size": e["size"]}
+                    for e in entries
+                ),
+                key=lambda f: f["path"],
+            )
+        except (KeyError, TypeError, ValueError):
+            files = None
+    code_digest = None
+    if files is not None:
+        pairs = [[f["path"], f["sha256"]] for f in files]
+        code_digest = hashlib.sha256(
+            json.dumps(pairs, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    approval = snapshot_code_approval(connection, source.snapshot_id) if row is not None else None
+    image = spec_stage.image
+    return {
+        "input": name,
+        "snapshot_id": source.snapshot_id,
+        "snapshot_digest": source.digest,
+        "code_digest": code_digest,
+        # The count only: private file paths and per-file hashes never appear on a receipt;
+        # ``code_digest`` binds the exact content.
+        "files": len(files or []),
+        "approved": approval is not None and approval.get("valid") is True,
+        "image_digest": image.split("@", 1)[1] if "@" in image else None,
+    }
+
+
+def code_delivery(
+    summary: dict[str, Any],
+    *,
+    provider_id: str | None,
+    worker_principal_id: str | None,
+    trust_policy_digest: str | None,
+    admission_basis: str | None,
+) -> dict[str, Any]:
+    """The record of where a stage's code went: shared by the attempt's receipt and the event."""
+    return {
+        "provider_id": provider_id,
+        "worker_principal_id": worker_principal_id,
+        "code_digest": summary["code_digest"],
+        "image_digest": summary["image_digest"],
+        "trust_policy_digest": trust_policy_digest,
+        "admission_basis": admission_basis,
+    }
 
 
 def _json(value: str | None, default: Any) -> Any:
@@ -131,6 +204,24 @@ def _placed_runtime(spec_stage: Any, provider_id: str | None) -> str:
         return spec_stage.runtime
 
 
+# ADR 0095: the platform granted an attempt's worker access to the stage's pinned code input.
+# Written in the grant's own transaction; records the grant and the code approval as it stood
+# then, not that the worker fetched the input.
+CODE_GRANTED_EVENT = "campaign.code_granted"
+
+
+def _code_grant(connection: sqlite3.Connection, attempt: sqlite3.Row) -> dict[str, Any] | None:
+    """The attempt's recorded code grant event, or ``None`` when none was written."""
+    row = connection.execute(
+        """SELECT payload_json FROM events WHERE event_type=?
+        AND json_extract(payload_json, '$.campaign_id') = ?
+        AND json_extract(payload_json, '$.stage_key') = ?
+        AND json_extract(payload_json, '$.attempt') = ? ORDER BY cursor LIMIT 1""",
+        (CODE_GRANTED_EVENT, attempt["campaign_id"], attempt["stage_key"], attempt["attempt"]),
+    ).fetchone()
+    return None if row is None else json.loads(row["payload_json"])
+
+
 def _attempt_entry(
     connection: sqlite3.Connection,
     attempt: sqlite3.Row,
@@ -140,6 +231,7 @@ def _attempt_entry(
     io_rows: list[dict[str, Any]],
     grants: dict[str, str],
     placed: dict[tuple[str, int], dict[str, Any]] | None = None,
+    code_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     kind, digest = _evidence(attempt)
     provider_id = attempt["provider_id"] or stage["provider_id"] or spec_stage.provider
@@ -179,6 +271,23 @@ def _attempt_entry(
     egress = _egress_entry(connection, attempt, spec_stage)
     if egress is not None:
         entry["egress"] = egress
+    if code_info is not None:
+        # The code's transfer: where it went, under which trust setting. ``granted`` and the
+        # approval come only from the recorded grant event, never from the grant id, the stage's
+        # status or today's approval state; with no event they are false and unknown (null).
+        granted = _code_grant(connection, attempt)
+        entry["code_transfer"] = {
+            **code_delivery(
+                code_info,
+                provider_id=provider_id,
+                worker_principal_id=entry["worker_principal_id"],
+                trust_policy_digest=attempt["trust_policy_digest"],
+                admission_basis=attempt["admission_basis"],
+            ),
+            "granted": granted is not None,
+            "approved": None if granted is None else granted.get("approved"),
+            "approval_digest": None if granted is None else granted.get("approval_digest"),
+        }
     decision = (placed or {}).get((attempt["stage_key"], attempt["attempt"]))
     if decision is not None:
         # ADR 0060: the candidate chosen and why each other one was skipped.
@@ -299,6 +408,7 @@ def build_receipt(
             }
         )
         spec_stage = normal.stage(stage["stage_key"])
+        code_info = code_summary(connection, spec_stage)
         stage_rows.append(
             {
                 "stage_key": stage["stage_key"],
@@ -313,10 +423,19 @@ def build_receipt(
                     "data_class": stage["input_data_class"],
                     **code,
                 },
+                **({} if code_info is None else {"code": code_info}),
                 "output_data_class": stage["output_data_class"],
                 "attempts": [
                     _attempt_entry(
-                        connection, attempt, stage, spec_stage, code, io_rows, grants, placed
+                        connection,
+                        attempt,
+                        stage,
+                        spec_stage,
+                        code,
+                        io_rows,
+                        grants,
+                        placed,
+                        code_info,
                     )
                     for attempt in attempts
                     if attempt["stage_key"] == stage["stage_key"]
@@ -368,8 +487,13 @@ def build_receipt(
             **_chained_inputs(current["spec_json"]),
             **({"unlock": unlock} if unlock["requirements"] else {}),
             **steering_receipt_section(connection, campaign_id),
+            # ADR 0093: the approved submission this campaign was created from and its
+            # decisions; absent otherwise, so existing receipts keep their shape.
+            **submission_receipt_section(connection, campaign_id),
             # ADR 0068: the one-time holdout claims and their scored values; absent otherwise.
             **holdout_receipt_section(connection, campaign_id),
+            # ADR 0087: unverified worker stage watch claims; absent when none was reported.
+            **watch_receipt_section(connection, campaign_id),
             "verdict": {"operational": operational, "scientific_verdict": scientific},
             "evidence_class": "operational",
             # Reviews resolved by delegation, citing the approval (ADR 0044); absent when

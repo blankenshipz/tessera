@@ -1,5 +1,6 @@
 """Client-requested review jobs, findings and human decisions (ADR 0084). Synthetic only."""
 
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -51,6 +52,46 @@ def _enroll(client, owner, project, actions, destination="openai:personal"):
     )
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {token}", "X-Agent-Destination": destination}
+
+
+def enrol_person(client, owner, label="second person"):
+    """Enrol a second person through the real owner-only endpoint (POST /people): a human
+    session that is its own enrolment root. It cannot issue credentials."""
+    token = secrets.token_urlsafe(32)
+    response = client.post(
+        "/people",
+        headers={**owner, "Idempotency-Key": secrets.token_hex(8)},
+        json={
+            "token": token,
+            "label": label,
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert response.status_code == 201, response.text
+    return {"Authorization": f"Bearer {token}"}
+
+
+def enrol_second_root(db, owner, client):
+    """Raw-SQL second root OWNER (no creating principal). Only for a reviewer root that must
+    itself issue agent credentials, which an enrolled person cannot; resolvers use enrol_person.
+    """
+    token = secrets.token_urlsafe(32)
+    with sqlite3.connect(db) as conn:
+        org = conn.execute("SELECT org_id FROM principals LIMIT 1").fetchone()[0]
+        ident = secrets.token_hex(8)
+        conn.execute(
+            "INSERT INTO principals (id,org_id,role,token_hash,revoked_at,created_at) "
+            "VALUES (?,?,'human',?,NULL,'2026-01-01T00:00:00Z')",
+            ("principal_" + ident, org, hashlib.sha256(token.encode()).hexdigest()),
+        )
+        conn.execute(
+            "INSERT INTO credentials (id,principal_id,kind,audience,project_id,parent_id,"
+            "expires_at,revoked_at,created_at,created_by_principal_id) "
+            "VALUES (?,?,'local_owner','control',NULL,NULL,NULL,NULL,"
+            "'2026-01-01T00:00:00Z',NULL)",
+            ("credential_" + ident, "principal_" + ident),
+        )
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _seed(db, project, snapshot_id, digest, data_class=None):
@@ -109,7 +150,9 @@ def world(tmp_path):
         "/projects", headers={**owner, "Idempotency-Key": "p"}, json={"name": "R"}
     ).json()["id"]
     submitter = _enroll(client, owner, project, ["review:submit", "review:read"])
-    reviewer = _enroll(client, owner, project, ["review:findings", "review:read"])
+    # The reviewer belongs to a second person (enrolment root); the resolver to a third.
+    reviewer_root = {**enrol_second_root(state / "tessera.sqlite3", owner, client)}
+    reviewer = _enroll(client, reviewer_root, project, ["review:findings", "review:read"])
 
     class W:
         pass
@@ -122,6 +165,7 @@ def world(tmp_path):
         w.db, project, sid, digest, data_class
     )
     w.seed()
+    w.resolver = {**enrol_person(w.client, w.owner), **AUTO}
 
     def post(path, headers, body, key=None):
         return client.post(
@@ -340,7 +384,7 @@ def test_resolve_human_only_and_changes_nothing_else(world):
             for t in ("tasks", "campaigns", "agent_research_records", "review_jobs")
         }
         job_before = db.execute("SELECT * FROM review_jobs").fetchall()
-    h = {**world.owner, **AUTO}
+    h = world.resolver
     bad = world.post(path, h, resolve_body(f, expected_digest="e" * 64))
     assert bad.status_code == 409
     assert world.post(path, h, resolve_body(f, expected_revision=2)).status_code == 409
@@ -377,7 +421,7 @@ def test_resolve_reject(world):
     _, f = ingested(world)
     r = world.post(
         f"/review-findings/{f['id']}/resolve",
-        {**world.owner, **AUTO},
+        world.resolver,
         resolve_body(f, decision="reject"),
     )
     assert r.status_code == 201 and r.json()["state"] == "rejected"
@@ -410,8 +454,12 @@ def test_cross_tenant_and_project_reads_denied(world):
 
 def test_runner_seams_and_atomicity(world):
     store = world.app.state.review_jobs
-    principal = world.app.state.review_jobs.authenticate(world.owner["Authorization"].split()[1])
+    principal = store.authenticate(world.owner["Authorization"].split()[1])
+    runner = store.authenticate(world.resolver["Authorization"].split()[1])
     j = world.submit().json()
+    with pytest.raises(Forbidden):  # the owner created the submitting agent
+        store.mark_running(principal, j["id"], "r0")
+    principal_owner, principal = principal, runner
     assert store.mark_running(principal, j["id"], "r1")[1]["state"] == "running"
     with pytest.raises(Exception, match="cannot move"):
         store.mark_running(principal, j["id"], "r2")
@@ -426,7 +474,7 @@ def test_runner_seams_and_atomicity(world):
             "BEGIN SELECT RAISE(ABORT,'boom'); END"
         )
     with pytest.raises(sqlite3.Error):
-        store.submit(principal, world.project, "z", job(), Policy())
+        store.submit(principal_owner, world.project, "z", job(), Policy())
     with sqlite3.connect(world.db) as db:
         assert db.execute("SELECT COUNT(*) FROM review_jobs").fetchone()[0] == 1
         assert (
@@ -436,7 +484,8 @@ def test_runner_seams_and_atomicity(world):
 
 
 def test_resolve_refuses_submitter_and_reviewer_principals(world):
-    """A human who submitted a job cannot resolve it; a different human can."""
+    """A human who submitted a job cannot resolve it, nor can the owner who created the
+    submitting credential, nor a sibling session of that owner; a second enrolment root can."""
     human = _enroll_human(world)
     created = world.submit(who=human).json()
     r = world.post(
@@ -445,21 +494,55 @@ def test_resolve_refuses_submitter_and_reviewer_principals(world):
     f = r.json()["findings"][0]
     path = f"/review-findings/{f['id']}/resolve"
     assert world.post(path, {**human, **AUTO}, resolve_body(f)).status_code == 403
-    assert world.post(path, {**world.owner, **AUTO}, resolve_body(f)).status_code == 201
+    # The owner created the submitting credential: same actor along the chain.
+    assert world.post(path, {**world.owner, **AUTO}, resolve_body(f)).status_code == 403
+    # A sibling human session of the same owner is the same person: refused by default.
+    other = _enroll_human(world)
+    refused = world.post(path, {**other, **AUTO}, resolve_body(f))
+    assert refused.status_code == 403 and refused.json()["reason"] == "same_person"
+    # A second enrolment root is a different person.
+    second = enrol_person(world.client, world.owner)
+    ok = world.post(path, {**second, **AUTO}, resolve_body(f))
+    assert ok.status_code == 201 and ok.json()["separation_basis"] == "distinct_person"
+
+
+def test_chain_rule_both_directions_and_runner_seams(world):
+    store = world.app.state.review_jobs
+    f_owner = world.submit().json()  # submitted by an agent the owner enrolled
+    r = world.post(
+        f"/review-jobs/{f_owner['id']}/findings", world.reviewer, {"findings": [finding()]}
+    )
+    # reviewer belongs to another person: ingest allowed, the submitting owner may not resolve
+    assert r.status_code == 201
+    path = f"/review-findings/{r.json()['findings'][0]['id']}/resolve"
+    owner = {**world.owner, **AUTO}
+    assert world.post(path, owner, resolve_body(r.json()["findings"][0])).status_code == 403
+    # a person submitting directly cannot ingest findings through an agent they created
+    mine = world.submit(who=world.owner).json()
+    mine_agent = _enroll(world.client, world.owner, world.project, ["review:findings"])
+    denied = world.post(
+        f"/review-jobs/{mine['id']}/findings", mine_agent, {"findings": [finding()]}
+    )
+    assert denied.status_code == 403 and denied.json()["reason"] == "same_person"
+    token = mine_agent["Authorization"].split()[1]
+    reviewer = store.authenticate(token)
+    reviewer["agent_destination"] = "openai:personal"
+    with pytest.raises(Forbidden):
+        store.mark_running(reviewer, mine["id"], "chain")
 
 
 def test_resolve_refuses_human_who_ingested_findings(world):
     jid, f = ingested(world)
     store = world.app.state.review_jobs
+    resolver = store.authenticate(world.resolver["Authorization"].split()[1])
     with sqlite3.connect(world.db) as db:
         reviewer_principal = db.execute(
             "SELECT findings_actor_id FROM review_jobs WHERE id=?", (jid,)
         ).fetchone()[0]
-        owner_principal = db.execute("SELECT id FROM principals WHERE role='human'").fetchone()[0]
-        db.execute("UPDATE review_jobs SET findings_actor_id=? WHERE id=?", (owner_principal, jid))
-    assert reviewer_principal and store
+        db.execute("UPDATE review_jobs SET findings_actor_id=? WHERE id=?", (resolver["id"], jid))
+    assert reviewer_principal
     path = f"/review-findings/{f['id']}/resolve"
-    assert world.post(path, {**world.owner, **AUTO}, resolve_body(f)).status_code == 403
+    assert world.post(path, world.resolver, resolve_body(f)).status_code == 403
 
 
 def _enroll_human(world):
@@ -611,3 +694,37 @@ def test_runner_seams_accept_trusted_non_human_runners(world):
     assert (
         store.mark_not_started(reviewer, k["id"], "r3", "no_capacity")[1]["state"] == "not_started"
     )
+
+
+def test_sealed_check_does_not_parse_unrelated_specs(world, monkeypatch):
+    spec = {"stages": [{"evaluation": {"holdout": {"partition_digest": "9" * 64}}}]}
+    with sqlite3.connect(world.db) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        columns = [r[1] for r in db.execute("PRAGMA table_info(campaigns)") if r[3]]
+        for n in range(30):
+            values = {
+                "id": f"camp{n}",
+                "project_id": world.project,
+                "spec_json": json.dumps(spec | {"n": n}),
+                "status": "submitted",
+            }
+            for c in columns:
+                values.setdefault(
+                    c, "0" * 64 if "digest" in c else 1 if "cap" in c or c == "revision" else "x"
+                )
+            db.execute(
+                f"INSERT INTO campaigns ({','.join(values)}) "
+                f"VALUES ({','.join('?' * len(values))})",
+                list(values.values()),
+            )
+    from tessera_control import review_jobs
+
+    calls = []
+    real = review_jobs.json.loads
+    monkeypatch.setattr(review_jobs.json, "loads", lambda *a, **k: calls.append(a) or real(*a, **k))
+    assert world.submit().status_code == 201
+    assert not any("partition_digest" in str(a) for a in calls)
+    world.seed("held9", "9" * 64)
+    r = world.submit(job(inputs=[{"snapshot_id": "held9", "digest": "9" * 64}]))
+    assert r.status_code == 409 and r.json()["reason"] == "input_sealed"
+    assert sum("partition_digest" in str(a) for a in calls) == 30

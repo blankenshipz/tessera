@@ -496,6 +496,15 @@ def parser() -> argparse.ArgumentParser:
             help="operator size bound for the backup (default 1 GiB, at most 64 GiB); "
             "a restore needs a bound that covers the backup",
         )
+    retention = subcommands.add_parser(
+        "retention", help="storage retention: list (dry run) or apply the policy"
+    )
+    retention.add_argument("action", choices=["plan", "apply", "verify"])
+    retention.add_argument("--state-dir", required=True, type=Path)
+    retention.add_argument(
+        "--plan-digest",
+        help="apply only the plan with this digest (as printed by `retention plan`)",
+    )
     serve = subcommands.add_parser("serve")
     serve.add_argument("--state-dir", required=True, type=Path)
     serve.add_argument("--port", required=True, type=int, choices=range(1, 65_536))
@@ -511,6 +520,12 @@ def parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         help="campaign runner tick interval, 0.2-60 (ADR 0038)",
+    )
+    serve.add_argument(
+        "--campaign-stuck-scan-seconds",
+        type=float,
+        default=300.0,
+        help="how often to scan campaigns for stuck conditions, 0 disables (default 300)",
     )
     serve.add_argument(
         "--salad-campaign-profiles",
@@ -545,6 +560,22 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
+        "--agent-submissions",
+        action="store_true",
+        help=(
+            "let a credential with campaign:submit_cleared consume a human's approved "
+            "campaign submission (default: off; needs --agent-submission-kill-switch) (ADR 0093)"
+        ),
+    )
+    serve.add_argument(
+        "--agent-submission-kill-switch",
+        type=Path,
+        help=(
+            "marker file: while it exists (or its state is ambiguous) every approved-submission "
+            "consume is refused"
+        ),
+    )
+    serve.add_argument(
         "--accept-automation-gate-go",
         action="store_true",
         help=(
@@ -562,6 +593,14 @@ def parser() -> argparse.ArgumentParser:
         "--no-campaign-scheduler",
         action="store_true",
         help="run the campaign runner without starting campaigns from standing approvals",
+    )
+    serve.add_argument(
+        "--review-single-owner",
+        action="store_true",
+        help=(
+            "single-owner deployment: let one person resolve review findings of jobs they "
+            "submitted through another credential (recorded as single_owner_opt_in)"
+        ),
     )
     return command
 
@@ -1009,6 +1048,28 @@ def main() -> int:
             print(f"migrate failed: {error}", file=sys.stderr)
             return 1
         return 0
+    if arguments.command == "retention":
+        from . import storage_retention
+
+        try:
+            if arguments.action == "verify":
+                result = storage_retention.verify(arguments.state_dir)
+            elif arguments.action == "plan":
+                result = storage_retention.run(
+                    arguments.state_dir, mode="dry_run", trigger="manual"
+                )
+            else:
+                result = storage_retention.run(
+                    arguments.state_dir,
+                    mode="apply",
+                    trigger="manual",
+                    expect_plan_digest=arguments.plan_digest,
+                )
+        except (storage_retention.RetentionError, OSError) as error:
+            print(f"retention failed: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, sort_keys=True, indent=1))
+        return 0 if result["status"] == "complete" else 1
     if arguments.command == "backup":
         try:
             print(
@@ -1042,6 +1103,13 @@ def main() -> int:
             print("serve configuration error: --campaign-tick-seconds is 0.2-60", file=sys.stderr)
             return 2
         runner_interval = None if arguments.no_campaign_runner else arguments.campaign_tick_seconds
+        if arguments.agent_submissions and arguments.agent_submission_kill_switch is None:
+            print(
+                "serve configuration error: --agent-submissions needs "
+                "--agent-submission-kill-switch",
+                file=sys.stderr,
+            )
+            return 2
         try:
             deployment = serving_config(
                 arguments.bind_host, arguments.trusted_host, arguments.public_origin
@@ -1138,10 +1206,23 @@ def main() -> int:
                 agent_sandbox_backend=sandbox_backend,
                 campaign_runner_interval=runner_interval,
                 campaign_scheduler=not arguments.no_campaign_scheduler,
+                campaign_stuck_scan_seconds=max(0.0, arguments.campaign_stuck_scan_seconds),
+                review_single_owner=arguments.review_single_owner,
+                storage_retention=True,
             )
             # The state is initialized and current (create_app checked it): audit the load.
             record_at_start(_database_path(arguments.state_dir), trust_policy)
             app.state.provider_trust_path = arguments.provider_trust
+            from .campaign_submissions import AgentSubmissionConfig
+
+            app.state.agent_submission = AgentSubmissionConfig(
+                enabled=bool(arguments.agent_submissions),
+                kill_switch_path=(
+                    None
+                    if arguments.agent_submission_kill_switch is None
+                    else str(arguments.agent_submission_kill_switch)
+                ),
+            )
             app.state.campaign_providers_path = arguments.campaign_providers
             if owner is not None:
                 previous_lifespan = app.router.lifespan_context

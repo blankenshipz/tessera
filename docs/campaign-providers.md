@@ -102,6 +102,15 @@ Check the argv before opting in: glued short flags (`-o/outputs/x`) and paths in
 not rewritten, and a hard-coded `/work/...` differs from the Salad work directory. It is verified with
 fakes only: no adapted stage has run on Salad.
 
+### Code reaches a provider as an input
+
+The same stage runs on local Docker, a self-hosted server or Salad because its code is an input, not
+part of an image ([ADR 0095](decisions/0095-stage-code-as-input-artifacts.md)). Name the snapshot that
+holds the code as the stage's `code_input`; the provider receives it through its normal input path (on
+Salad, the staged-input ticket and the adapter's launcher above) and runs it in a generic image pinned
+by digest. Private code is never baked into an image pushed to a registry, and the receipt records the
+code digest and the image digest. Provider trust still decides which providers may receive the input.
+
 ### Placement across candidates
 
 Contract: [ADR 0060](decisions/0060-capacity-aware-stage-placement.md). A v2 stage may list

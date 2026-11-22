@@ -382,6 +382,7 @@ class CampaignStore(
                         "Campaign input snapshot is not recorded public (ADR 0039) "
                         "and cannot be declared public."
                     )
+            self._check_code_input(connection, stage)
             for candidate in placement_candidates(stage):
                 self.check_stage_inputs(
                     connection, candidate, providers[stage.key, candidate.provider], digest
@@ -393,6 +394,36 @@ class CampaignStore(
             check_unclaimed(connection, project_id, spec, campaign_id)
         except ValueError as error:
             raise Conflict(str(error)) from None
+
+    @staticmethod
+    def _check_code_input(connection: sqlite3.Connection, stage: Any) -> None:
+        """ADR 0095: a stage's code input is a non-empty pinned snapshot whose code approval, if
+        it has one, still matches its files. Trust and destination checks are the ordinary
+        input checks (``check_stage_inputs``); this only refuses a bundle that cannot be code."""
+        if stage.code_input is None:
+            return
+        from .code_approval import _entries, snapshot_code_approval
+
+        source = next(
+            (i for i in stage.inputs if i.name == stage.code_input and i.kind == "snapshot"), None
+        )
+        if source is None:  # validate_structure refuses this; fail closed if it ever slips
+            raise Conflict(f"Stage {stage.key!r}: code_input is not a pinned snapshot input.")
+        try:
+            files = _entries(connection, source.snapshot_id)
+        except (ValueError, TypeError, KeyError):
+            files = []
+        if not files:
+            raise Conflict(
+                f"Stage {stage.key!r}: code_input {stage.code_input!r} holds no files, so it "
+                "cannot carry the stage's code."
+            )
+        approval = snapshot_code_approval(connection, source.snapshot_id)
+        if approval is not None and approval.get("valid") is not True:
+            raise Conflict(
+                f"Stage {stage.key!r}: code_input {stage.code_input!r} has a code approval that "
+                "does not match its files."
+            )
 
     def _check_reroutes(
         self, connection: sqlite3.Connection, project_id: str, stage: Any, digest: Any

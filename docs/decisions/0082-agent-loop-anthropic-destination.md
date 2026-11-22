@@ -100,10 +100,14 @@ in which private inputs default to local or self-hosted models. This record reco
    hosts. Public web research, if a job needs it, is a separate step on the existing
    allowlist; it is never routed through a model call.
 
-   **No tool use yet.** The Anthropic runtime sends a single user message and uses no tools.
-   Its profile `permissions` must be exactly deny-all
-   (`[{"action":"*","resource":"*","effect":"deny"}]`); allowing tools is a gap, to be added by
-   an explicit contract change and tests.
+   **Tool use (amended by [ADR 0083](0083-model-call-receipts.md)).** The Anthropic runtime
+   may run a bounded multi-turn tool loop. It is deny by default: the profile `permissions`
+   start with `{"action":"*","resource":"*","effect":"deny"}` and may then add exact
+   `tessera_*` allows; with no allows the runtime sends a single user message and offers no
+   tools, as before. The only tools are Tessera's own MCP tools, reached through the existing
+   `tessera_mcp` server with the same agent token (read by file path) and the same control-plane
+   scope checks. No tool host is added to any egress allowlist. The tool contract, receipts and
+   limits are in ADR 0083.
 
 6. **Relation to ADR 0047.** The Anthropic destination is not "registered" in ADR 0047's
    sense (a provider in the provider-trust file). By owner direction, 2026-11-22, it is an

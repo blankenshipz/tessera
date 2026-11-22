@@ -19,6 +19,7 @@ from tessera_mcp.client import ControlClient
 from tessera_mcp.config import Config
 from tessera_mcp.generated_outputs import register_generated_output_tools
 from tessera_mcp.mcp_workflow import register_workflow
+from tessera_mcp.people_tools import register_person_enrollment_tools
 from tessera_mcp.results import register_result_tools
 from tessera_mcp.review_tools import (
     REVIEW_ACTIONS,
@@ -40,6 +41,9 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_budget": "budget:read",
     "tessera_campaign_retries": "campaign:read",
     "tessera_campaign_standing_status": "campaign:read",
+    # Platform stuck-campaign detections: listing is read-only; acknowledging marks one seen.
+    "tessera_list_stuck_campaigns": "campaign:read",
+    "tessera_acknowledge_stuck": "campaign:cancel",
     "tessera_campaign_gate_decisions": "campaign:read",
     # ADR 0068: read-only one-time holdout claims and their scored metrics.
     "tessera_campaign_holdout": "campaign:read",
@@ -61,6 +65,12 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_steer_campaign_placement": "campaign:cancel",
     # Project limits and spend: the ceiling a budget or concurrency reduction works within.
     "tessera_project_spend": "budget:read",
+    # ADR 0093: approved submissions. A person records the approval; the agent only consumes or
+    # cancels it. There is no tool that creates, approves or widens one.
+    "tessera_list_pending_submissions": "campaign:read",
+    "tessera_read_submission": "campaign:read",
+    "tessera_cancel_submission": "campaign:cancel",
+    "tessera_submit_cleared_campaign": "campaign:submit_cleared",
 }
 # Further scopes a tool needs besides its own: it is registered only when all are enrolled, so a
 # tool never appears in the list only to fail at runtime.
@@ -109,6 +119,20 @@ def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
         return await client.approve_campaign(campaign_id, revision, expected_spec_digest, key)
 
     server.tool(annotations=write)(tessera_approve_campaign)
+
+
+def register_storage_retention_tool(server: FastMCP, client: ControlClient) -> None:
+    """Read-only retention status, only when the operator enables it (--storage-retention-tool).
+
+    The control API answers only a person's session credential (an agent credential gets a 403),
+    so run it as an operator server. It returns counts and digests, never paths or secrets.
+    """
+    read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+
+    @server.tool(annotations=read)
+    async def tessera_storage_retention_status() -> dict[str, Any]:
+        """Show the storage retention policy state, the last run and any pending dry run."""
+        return await client.storage_retention_status()
 
 
 def register_provider_registration_tools(server: FastMCP, client: ControlClient) -> None:
@@ -236,6 +260,33 @@ def register_campaign_tools(
     async def tessera_list_campaigns(offset: int = 0, limit: int = 50) -> dict[str, Any]:
         """List campaign summaries in this project (campaign:read), oldest first."""
         return await client.list_campaigns(offset, limit)
+
+    async def tessera_list_stuck_campaigns(
+        status: str = "open", limit: int = 50, scan: bool = False
+    ) -> dict[str, Any]:
+        """List campaigns the platform found stuck (campaign:read): blocked, paused, unknown.
+
+        Each finding is a platform detection with a reason code (campaign_blocked,
+        delegation_lapsed, attempt_outcome_unknown, stale_execution_lease, runner_lease_stale,
+        no_progress), a suggested next action, its evidence ids and ages, and a receipt
+        digest. status is open, acknowledged, resolved or all. scan=True first asks the
+        platform to run its detector now (the detection is itself recorded). This tool takes
+        no action on any campaign: use the campaign tools you are authorized for to act.
+        """
+        if scan:
+            await client.scan_stuck(str(uuid.uuid4()))
+        return await client.list_stuck(status, limit)
+
+    async def tessera_acknowledge_stuck(
+        finding_id: str, idempotency_key: str, note: str = ""
+    ) -> dict[str, Any]:
+        """Mark one stuck finding as seen (campaign:cancel); the campaign is untouched.
+
+        Acknowledging records who saw it and why on the finding's receipt and removes it from
+        the open work list; it does not pause, resume, cancel or change any campaign, and a
+        finding that stops and later recurs reopens. Persist idempotency_key on reconnect.
+        """
+        return await client.acknowledge_stuck(finding_id, note, idempotency_key)
 
     async def tessera_get_campaign_receipt(campaign_id: str) -> dict[str, Any]:
         """Read the campaign receipt (campaign:read): the recorded evidence of what ran.
@@ -506,6 +557,38 @@ def register_campaign_tools(
             campaign_id, expected_revision, stage_key, pin, exclude or [], reason, idempotency_key
         )
 
+    async def tessera_list_pending_submissions(offset: int = 0, limit: int = 50) -> dict[str, Any]:
+        """List approved submissions of this project that are still pending (ADR 0093).
+
+        Each was approved by a person with a per-run budget cap and an expiry; read its
+        revision here, then submit it with tessera_submit_cleared_campaign.
+        """
+        return await client.list_pending_submissions(client.config.project_id, offset, limit)
+
+    async def tessera_read_submission(approval_id: str) -> dict[str, Any]:
+        """Read one approved submission and its append-only decisions (submitted, refused...)."""
+        return await client.read_submission(approval_id)
+
+    async def tessera_cancel_submission(
+        approval_id: str, expected_revision: int, reason: str, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Cancel a pending approved submission. Reduce-only; it cannot be undone by an agent."""
+        return await client.cancel_submission(
+            approval_id, expected_revision, reason, idempotency_key
+        )
+
+    async def tessera_submit_cleared_campaign(
+        approval_id: str, expected_revision: int, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Consume a person-approved submission: creates the campaign it describes.
+
+        This grants nothing new: the approval's digest, per-run cap and expiry were fixed by
+        the person who recorded it. The control plane refuses (with a stable reason) when the
+        feature is off, the kill switch is engaged, the approval expired or changed, or a
+        budget check fails. A refusal is final for this call: do not retry it in a loop.
+        """
+        return await client.submit_cleared_campaign(approval_id, expected_revision, idempotency_key)
+
     # A revoked release cannot be restored by an agent: only a human issues a new one.
     destructive = ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
@@ -520,11 +603,16 @@ def register_campaign_tools(
         "tessera_limit_campaign_concurrency",
         "tessera_cancel_campaign_stage",
         "tessera_steer_campaign_placement",
+        "tessera_acknowledge_stuck",
+        "tessera_cancel_submission",
+        "tessera_submit_cleared_campaign",
     }
     for function in (
         tessera_submit_campaign,
         tessera_get_campaign,
         tessera_list_campaigns,
+        tessera_list_stuck_campaigns,
+        tessera_acknowledge_stuck,
         tessera_get_campaign_receipt,
         tessera_list_snapshots,
         tessera_campaign_outputs,
@@ -548,6 +636,10 @@ def register_campaign_tools(
         tessera_cancel_campaign_stage,
         tessera_steer_campaign_placement,
         tessera_project_spend,
+        tessera_list_pending_submissions,
+        tessera_read_submission,
+        tessera_cancel_submission,
+        tessera_submit_cleared_campaign,
     ):
         if wanted(function.__name__):
             if function.__name__ == "tessera_revoke_campaign_release":
@@ -573,11 +665,63 @@ def register_provider_trust_tools(server: FastMCP, client: ControlClient) -> Non
         return await client.provider_trust()
 
 
+def register_model_spend_tools(server: FastMCP, client: ControlClient) -> None:
+    """Read-only view of model spend (ADR 0090): a budget separate from compute budgets."""
+
+    @server.tool(
+        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+    )
+    async def tessera_model_spend(project_id: str | None = None, days: int = 7) -> dict[str, Any]:
+        """Read model-call spend for a project: limits, today, by day and open reservations.
+
+        These are totals of model spend (cents computed from the operator's pinned prices; an
+        estimate, not an invoice) and are separate from compute, Salad and grant budgets. Per-call
+        and daily limits are set by a person and enforced before each model call; this tool cannot
+        change them, and a model that hits a limit is refused, never switched to a cheaper one.
+        Defaults to the configured project; `days` is 1 to 90.
+        """
+        return await client.model_spend(project_id, days)
+
+
+def register_model_spend_resolve_tool(server: FastMCP, client: ControlClient) -> None:
+    """The reservation-resolution tool, only when the operator turns it on.
+
+    A thin client of ``POST /model-spend/reservations/{id}/resolution``. The control API still
+    decides: it refuses any credential that is not a person's session (an ordinary agent
+    credential gets a 403), so run it as a separate operator server with its own credential file.
+    """
+    write = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    )
+
+    async def tessera_resolve_model_spend_reservation(
+        call_id: str,
+        outcome: str,
+        reason: str,
+        actual_cents: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Close an open model-spend reservation the supervisor could not (a person's credential).
+
+        An uncertain model call leaves its reservation open and counted against the day's cap
+        until a person decides. Say `not_sent` if the call never reached the provider (the budget
+        is freed) or `spent` with `actual_cents` if it did (recorded as spent, even above the cap).
+        The reason (1 to 500 characters) is recorded on the call and on a control event. Needs a
+        person's session credential: the control API refuses an agent credential. A fresh
+        idempotency key is used per call unless you supply one to replay a lost answer.
+        """
+        key = idempotency_key or "resolve-spend-" + uuid.uuid4().hex
+        return await client.resolve_model_spend(call_id, outcome, actual_cents, reason, key)
+
+    server.tool(annotations=write)(tessera_resolve_model_spend_reservation)
+
+
 def create_server(
     client: ControlClient,
     *,
     campaign_tools: bool = False,
     provider_trust_tools: bool = False,
+    model_spend_tools: bool = False,
     campaign_actions: frozenset[str] | None = None,
     approval_tool: bool = False,
     provider_registration_tools: bool = False,
@@ -586,6 +730,9 @@ def create_server(
     review_decision_tool: bool = False,
     agent_loop_marker: Path | None = None,
     agent_loop_ledger: Path | None = None,
+    person_enrollment_tool: bool = False,
+    storage_retention_tool: bool = False,
+    model_spend_resolve_tool: bool = False,
 ) -> FastMCP:
     server = FastMCP(
         "Tessera research bench",
@@ -698,9 +845,21 @@ def create_server(
         register_agent_loop_tools(server, agent_loop_marker, agent_loop_ledger, client)
     elif agent_loop_ledger is not None:
         raise ValueError("agent_loop_ledger requires agent_loop_marker.")
+    if person_enrollment_tool:
+        # Owner-only; run with the owner's own credential file.
+        register_person_enrollment_tools(server, client)
+    if storage_retention_tool:
+        # Operator-enabled (--storage-retention-tool); the API still requires a person.
+        register_storage_retention_tool(server, client)
+    if model_spend_resolve_tool:
+        # Operator-enabled; the control API accepts it only from a person's session credential.
+        register_model_spend_resolve_tool(server, client)
     if provider_trust_tools:
         # Registered only when the credential's live scopes include provider_trust:read.
         register_provider_trust_tools(server, client)
+    if model_spend_tools:
+        # Registered only when the credential's live scopes include model_spend:read.
+        register_model_spend_tools(server, client)
     return server
 
 
@@ -711,6 +870,16 @@ CAMPAIGN_ACTIONS = frozenset(set(CAMPAIGN_TOOL_SCOPES.values()) - {"budget:read"
 
 
 PROVIDER_TRUST_ACTIONS = frozenset({"provider_trust:read"})
+MODEL_SPEND_ACTIONS = frozenset({"model_spend:read"})
+
+
+def _has_model_spend_scope(client: ControlClient) -> bool:
+    """One live status read; any failure leaves the tool unregistered (fail closed)."""
+    try:
+        status = anyio.run(client.status)
+        return bool(set(status["actions"]) & MODEL_SPEND_ACTIONS)
+    except Exception:
+        return False
 
 
 def _has_provider_trust_scope(client: ControlClient) -> bool:
@@ -761,6 +930,15 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--model-spend-tools",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "force the read-only model-spend tool on or off; by default it is registered only "
+            "when the credential's live scopes include model_spend:read"
+        ),
+    )
+    parser.add_argument(
         "--approval-tool",
         action="store_true",
         help=(
@@ -802,6 +980,32 @@ def main(argv=None):
         type=Path,
         help="loop ledger file the status tool reads read-only; requires --agent-loop-marker",
     )
+    parser.add_argument(
+        "--person-enrollment-tool",
+        action="store_true",
+        help=(
+            "register tessera_enroll_person, tessera_list_people and tessera_renew_person. The "
+            "control API accepts them only from the owner, so run this as a separate operator "
+            "server with the owner's own credential file; alone it exposes no other tools"
+        ),
+    )
+    parser.add_argument(
+        "--storage-retention-tool",
+        action="store_true",
+        help=(
+            "register tessera_storage_retention_status (read-only). The control API answers only "
+            "a person's session credential, so run it as a separate operator server"
+        ),
+    )
+    parser.add_argument(
+        "--model-spend-resolve-tool",
+        action="store_true",
+        help=(
+            "register tessera_resolve_model_spend_reservation (a person closes an open model-spend "
+            "reservation). The control API accepts it only from a person's session credential, so "
+            "run it as a separate operator server with its own credential file"
+        ),
+    )
     arguments = parser.parse_args(argv)
     if arguments.agent_loop_ledger is not None and arguments.agent_loop_marker is None:
         parser.error("--agent-loop-ledger requires --agent-loop-marker")
@@ -816,7 +1020,12 @@ def main(argv=None):
     client = ControlClient(config)
     campaign_tools = arguments.campaign_tools
     campaign_actions = None
-    if campaign_tools is None and (arguments.approval_tool or arguments.review_decision_tool):
+    if campaign_tools is None and (
+        arguments.approval_tool
+        or arguments.review_decision_tool
+        or arguments.person_enrollment_tool
+        or arguments.model_spend_resolve_tool
+    ):
         campaign_tools = False  # a decision flag alone is a decision-only server
     live = None
     if campaign_tools is None:
@@ -824,19 +1033,31 @@ def main(argv=None):
         campaign_tools = bool(live & CAMPAIGN_ACTIONS)
         campaign_actions = live
     approve_only = arguments.approval_tool  # an approval server never exposes agent review tools
-    if live is None and not (arguments.review_decision_tool or approve_only):
+    if live is None and not (
+        arguments.review_decision_tool
+        or arguments.person_enrollment_tool
+        or arguments.model_spend_resolve_tool
+        or approve_only
+    ):
         live = _live_actions(client)  # explicit --campaign-tools[/-no]: review still follows scopes
     provider_trust_tools = arguments.provider_trust_tools
     if provider_trust_tools is None:
         provider_trust_tools = _has_provider_trust_scope(client)
+    model_spend_tools = arguments.model_spend_tools
+    if model_spend_tools is None:
+        model_spend_tools = _has_model_spend_scope(client)
     # Pass the flag only when set so the default catalog call is unchanged.
     extra = {"provider_trust_tools": True} if provider_trust_tools else {}
+    if model_spend_tools:
+        extra["model_spend_tools"] = True
     if campaign_tools and campaign_actions is not None:
         extra["campaign_actions"] = campaign_actions
     if arguments.approval_tool:
         extra["approval_tool"] = True
     if arguments.provider_registration_tools:
         extra["provider_registration_tools"] = True
+    if arguments.person_enrollment_tool:
+        extra["person_enrollment_tool"] = True
     if arguments.review_decision_tool:
         extra["review_decision_tool"] = True
     elif live is not None and live & REVIEW_ACTIONS:
@@ -846,6 +1067,10 @@ def main(argv=None):
         extra["agent_loop_marker"] = arguments.agent_loop_marker
         if arguments.agent_loop_ledger is not None:
             extra["agent_loop_ledger"] = arguments.agent_loop_ledger
+    if arguments.storage_retention_tool:
+        extra["storage_retention_tool"] = True
+    if arguments.model_spend_resolve_tool:
+        extra["model_spend_resolve_tool"] = True
     create_server(client, campaign_tools=campaign_tools, **extra).run(transport="stdio")
     return 0
 

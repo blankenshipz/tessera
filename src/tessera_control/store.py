@@ -47,6 +47,7 @@ class Conflict(StoreError):
 
 # Hard bound on a worker credential's total life, enforced at renewal (issue is <=24 h).
 MAX_WORKER_CREDENTIAL_LIFETIME = timedelta(days=7)
+MAX_PERSON_CREDENTIAL_LIFETIME = timedelta(days=7)
 
 
 class Forbidden(StoreError):
@@ -136,7 +137,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 73);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 77);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -388,6 +389,18 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .review_jobs import create_review_jobs_schema
 
     create_review_jobs_schema(connection)
+    from .campaign_stuck import create_stuck_schema
+
+    create_stuck_schema(connection)
+    from .people import create_people_schema
+
+    create_people_schema(connection)
+    from .campaign_submissions import create_submission_schema
+
+    create_submission_schema(connection)
+    from .model_spend import create_model_spend_schema
+
+    create_model_spend_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
@@ -611,7 +624,23 @@ class Store:
                         if renewal["expires_at"] != expires_at or renewed_at < created_at:
                             raise Forbidden("Unauthorized")
                         created_at = renewed_at
-                if expiry > created_at + timedelta(hours=24) or expiry <= datetime.now(UTC):
+                lifetime = timedelta(hours=24)
+                if credential["kind"] == "human_session" and credential["parent_id"] is None:
+                    # An enrolled person's own root credential: up to seven days from issue
+                    # or from the owner's last renewal.
+                    person = connection.execute(
+                        "SELECT renewed_at FROM enrolled_people WHERE principal_id=?",
+                        (credential["principal_id"],),
+                    ).fetchone()
+                    if person is None:
+                        raise Forbidden("Unauthorized")
+                    lifetime = MAX_PERSON_CREDENTIAL_LIFETIME
+                    if person["renewed_at"] is not None:
+                        try:
+                            created_at = max(created_at, _parse_utc(person["renewed_at"]))
+                        except ValueError as error:
+                            raise Forbidden("Unauthorized") from error
+                if expiry > created_at + lifetime or expiry <= datetime.now(UTC):
                     raise Forbidden("Unauthorized")
             credential_id = credential["parent_id"]
         return principal
@@ -635,7 +664,19 @@ class Store:
                 and expires_at is None
             )
         elif kind == "human_session":
-            valid = role == "human" and audience == "control" and parent_id is not None
+            valid = role == "human" and audience == "control"
+            if parent_id is None:
+                # Only an owner-enrolled person (people.py) is its own enrolment root.
+                valid = (
+                    valid
+                    and project_id is None
+                    and expires_at is not None
+                    and connection.execute(
+                        "SELECT 1 FROM enrolled_people WHERE principal_id=?",
+                        (credential["principal_id"],),
+                    ).fetchone()
+                    is not None
+                )
         elif kind == "agent":
             valid = (
                 role == "agent"

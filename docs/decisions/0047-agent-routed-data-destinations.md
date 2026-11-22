@@ -59,13 +59,14 @@ work across providers (for example private derived training data on a GPU provid
   non-public input on a provider whose egress is provider-wide; it must receive those bytes
   through a snapshot instead.
 
-## Addendum (2026-11-22): operator-registered model destinations
+## Amendment: review jobs (2026-11-22)
 
-This addendum clarifies decision 3 and does not change it. The hard invariant concerns the public
-internet and unregistered destinations. An operator-registered model destination (enrolled by the
-operator, limited to the classes its registry entry lists, and reached only through a model-runtime
-allowlist that is not the stage or sandbox allowlist) is a registered destination, never a
-public-internet exception. A private class may reach it only if the registry entry lists that
-class. Stage specs still cannot declare egress for non-public inputs. The destination registry is
-decided in ADR 0082; client-requested review jobs ([ADR 0084](0084-research-review-journeys.md))
-rely on it and refuse private inputs until it exists.
+Client-requested review jobs ([ADR 0084](0084-research-review-journeys.md)) may name an
+operator-attested model destination. That is a destination class separate from provider trust,
+and this record's word "registered" does not describe it. It is not a public-internet exception:
+the campaign-stage invariant of decision 3 is unchanged, and stage specs still cannot declare
+egress for non-public inputs. A job's private input reaches such a destination only if the
+destination entry lists the input's derived class, and the destination is reached only through a
+model-runtime allowlist that is not the stage or sandbox allowlist. Credentials are held by
+reference only. This is an amendment to this record, not a clarification of it. Until an operator
+enrolls a destination, review jobs with private inputs stay refused.

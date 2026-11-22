@@ -34,6 +34,7 @@ from tessera_control.code_approval import (
 )
 from tessera_control.data_class import require_public_input
 from tessera_control.dataset_staging import DatasetStagingStore
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.salad_workload_admission import check_workload_admission
 from tessera_control.snapshot_chunks import ChunkedSnapshotStore
 from tessera_control.snapshots import SnapshotStore
@@ -715,7 +716,7 @@ def test_v62_migration_leaves_existing_snapshots_unapproved(tmp_path):
             f"SELECT {listed} FROM snapshot_data_classes ORDER BY snapshot_id"
         ).fetchall()
     assert len(snapshots) >= 2
-    assert migrate_state(state) == 73
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with closing(sqlite3.connect(db_path)) as db:
         assert db.execute("SELECT count(*) FROM snapshot_code_approvals").fetchone() == (0,)
         assert db.execute("SELECT id, digest FROM source_snapshots ORDER BY id").fetchall() == (
@@ -882,7 +883,6 @@ def test_code_approval_is_immutable_and_fails_closed_when_tampered(tmp_path, tru
 
 
 def test_v62_migration_adds_the_approval_record_and_converges(tmp_path):
-    from tessera_control.migrations import LATEST_SCHEMA_VERSION
     from tessera_control.store import initialize_state, migrate_state
 
     fresh = tmp_path / "fresh"
@@ -893,7 +893,7 @@ def test_v62_migration_adds_the_approval_record_and_converges(tmp_path):
             "UPDATE operator_backup_health SET last_success_at='synthetic',last_backup_id='old'"
         )
         db.commit()
-    assert migrate_state(migrated) == LATEST_SCHEMA_VERSION == 73
+    assert migrate_state(migrated) == LATEST_SCHEMA_VERSION
     assert migrate_state(migrated) == LATEST_SCHEMA_VERSION
     names = (
         "snapshot_code_approvals",

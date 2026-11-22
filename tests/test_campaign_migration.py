@@ -72,7 +72,7 @@ def test_migration_rebuilds_releases_keeps_rows_and_references(tmp_path):
     path = env.state / "tessera.sqlite3"
     with pytest.raises(Exception, match="newer|unsupported|migrat|older"):
         validate_database(path)
-    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION == 73
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION
     validate_database(path)
     connection = _connect(path)
     try:
@@ -106,7 +106,7 @@ def test_migration_rebuilds_releases_keeps_rows_and_references(tmp_path):
         connection.execute("INSERT INTO campaign_runner_lease VALUES (1, 'h', 'x')")
     finally:
         connection.close()
-    assert migrate_database(path, _connect) == 73  # already current: no-op
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION  # already current: no-op
 
 
 def test_migrated_shapes_match_a_fresh_database_for_backup_validation(tmp_path):
@@ -162,7 +162,7 @@ def test_v62_without_data_classes_converges_at_v65(tmp_path):
         raw.execute("UPDATE schema_meta SET schema_version=62")
     finally:
         raw.close()
-    assert migrate_database(path, _connect) == 73
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION
     validate_database(path)
     connection = _connect(path)
     try:
@@ -198,7 +198,7 @@ def test_code_approval_v63_migrates_to_v65(tmp_path):
         raw.execute("UPDATE schema_meta SET schema_version=63")
     finally:
         raw.close()
-    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION == 73
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION
     validate_database(path)
     connection = _connect(path)
     try:
@@ -208,7 +208,9 @@ def test_code_approval_v63_migrates_to_v65(tmp_path):
         assert connection.execute("SELECT count(*) FROM campaigns").fetchone()[0] == 0
     finally:
         connection.close()
-    assert migrate_database(path, _connect) == 73  # convergent: a second run is a no-op
+    assert (
+        migrate_database(path, _connect) == LATEST_SCHEMA_VERSION
+    )  # convergent: a second run is a no-op
 
 
 def test_campaign_v63_without_code_approvals_converges_at_v65(tmp_path):
@@ -221,7 +223,7 @@ def test_campaign_v63_without_code_approvals_converges_at_v65(tmp_path):
         raw.execute("UPDATE schema_meta SET schema_version=63")
     finally:
         raw.close()
-    assert migrate_database(path, _connect) == 73
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION
     validate_database(path)
     connection = _connect(path)
     try:
@@ -265,8 +267,8 @@ def test_v66_to_v67_adds_standing_tables_and_column(tmp_path):
         )
     }
     _downgrade_to_v66(path)
-    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION == 73
-    assert migrate_database(path, _connect) == 73  # a second run is a no-op
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION
+    assert migrate_database(path, _connect) == LATEST_SCHEMA_VERSION  # a second run is a no-op
     validate_database(path)
     connection = _connect(path)
     try:
