@@ -47,6 +47,9 @@ Backend = Literal["docker-local-cpu-v1", "salad-gpu-v1"]
 # A stage's scratch request (ADR 0059): 1 MiB to 64 GiB, granted only within the provider's
 # operator ceiling. Absent means the operator's default.
 ScratchBytes = Annotated[int, Field(strict=True, ge=1024 * 1024, le=64 * 1024**3)]
+# A stage's declared working-set estimate (ADR 0088): read only by placement, to tell heavy stages
+# from light ones. Neither a request nor a limit; the provider's own limits still apply.
+MemoryBytes = Annotated[int, Field(strict=True, ge=1024 * 1024, le=2048 * 1024**3)]
 Cents = Annotated[int, Field(strict=True, ge=0, le=5000)]
 
 # Experiment budget ceiling (experiment_budget_models.py ceiling_cents le=5000): a stage's
@@ -502,6 +505,9 @@ class EvaluationSpec(_Strict):
 
 # ADR 0060: a stage may name further provider candidates after its own, in order.
 MAX_ALTERNATE_PROVIDERS = 4
+# ADR 0070: a stage's placement tags, matched by an operator placement preference.
+MAX_PLACEMENT_TAGS = 8
+PlacementTag = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
 
 
 class ProviderCandidate(_Strict):
@@ -554,10 +560,40 @@ class StageV2(_Strict):
     ) = None
     # ADR 0068: an evaluation stage and its one-time holdout claim; absent keeps the digest.
     evaluation: EvaluationSpec | None = None
+    # ADR 0070: declarative labels an operator placement preference may match (for example
+    # ``heavy``). They never name a destination or change a check; absent keeps the digest.
+    placement_tags: (
+        Annotated[list[PlacementTag], Field(min_length=1, max_length=MAX_PLACEMENT_TAGS)] | None
+    ) = None
+    # ADR 0088: the stage's declared memory and expected runtime estimates, read only by default
+    # placement (neither is a request or a limit; ``max_duration_seconds`` stays the cap). Absent
+    # keeps the digest.
+    memory_bytes: MemoryBytes | None = None
+    expected_duration_seconds: Annotated[int, Field(strict=True, ge=1, le=7 * 86_400)] | None = None
+
+    @model_validator(mode="after")
+    def _distinct_tags(self) -> StageV2:
+        if self.placement_tags is not None and len(set(self.placement_tags)) != len(
+            self.placement_tags
+        ):
+            raise ValueError(f"Stage {self.key} placement_tags must be distinct")
+        if self.expected_duration_seconds is not None and self.expected_duration_seconds > int(
+            self.max_duration_seconds
+        ):
+            raise ValueError(
+                f"Stage {self.key} expected_duration_seconds exceeds its max_duration_seconds"
+            )
+        return self
 
     @model_serializer(mode="wrap")
     def _omit_absent(self, handler):
         value = handler(self)
+        if self.placement_tags is None:
+            value.pop("placement_tags", None)
+        if self.memory_bytes is None:
+            value.pop("memory_bytes", None)
+        if self.expected_duration_seconds is None:
+            value.pop("expected_duration_seconds", None)
         if self.evaluation is None:
             value.pop("evaluation", None)
         if self.send_classes is None:
@@ -701,6 +737,12 @@ class NormalStage:
     alternates: tuple[NormalCandidate, ...] = ()
     # ADR 0068: an evaluation stage (and its one-time holdout claim).
     evaluation: EvaluationSpec | None = None
+    # ADR 0070: labels an operator placement preference may match; never a destination.
+    placement_tags: tuple[str, ...] = ()
+    # ADR 0088: declared memory and expected-runtime estimates (v2 only); placement reads them,
+    # nothing enforces them.
+    memory_bytes: int | None = None
+    expected_duration_seconds: int | None = None
 
     @property
     def holdout(self) -> HoldoutClaimSpec | None:
@@ -948,6 +990,9 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                     for item in stage.alternate_providers or ()
                 ),
                 evaluation=stage.evaluation,
+                placement_tags=tuple(stage.placement_tags or ()),
+                memory_bytes=stage.memory_bytes,
+                expected_duration_seconds=stage.expected_duration_seconds,
             )
         )
     return NormalSpec(

@@ -988,6 +988,7 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
             # wait, where the transport's own exact read decides.
             polls = 0
             stopped_since = None
+            settle_started = clock()
             for _ in range(max_polls):
                 heartbeat()
                 state = observe() or state
@@ -1009,6 +1010,9 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
                 "polls": polls,
                 "provider_status": state["provider_status"],
                 "settled": state.get("termination_confirmed", True) is True,
+                # What the wait cost: a group that never reports settled (counts Salad did not
+                # send) spends the whole bound before every start; this makes that visible.
+                "waited_seconds": round(clock() - settle_started, 1),
             }
             if state["provider_status"] != "stopped":
                 raise ValueError("create unresolved")

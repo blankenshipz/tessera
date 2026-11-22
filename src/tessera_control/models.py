@@ -190,9 +190,13 @@ class ExternalAgentScope(StrictRequest):
                 "snapshot:read",
                 "artifact:read",
                 "campaign:logs",
+                "review:submit",
+                "review:read",
+                "review:findings",
+                "loop:pause",
             ]
         ],
-        Field(min_length=1, max_length=18),
+        Field(min_length=1, max_length=22),
     ]
     destination: NonBlank200
 

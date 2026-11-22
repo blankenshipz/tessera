@@ -3332,3 +3332,98 @@ def test_unclosed_refusals_journal_only_the_exception_class(capsys):
         "guardian https refusal: TimeoutError",
     ]
     assert "secret" not in err and "/srv" not in err
+
+
+def test_the_loops_own_observation_does_not_confirm_a_stop_on_incomplete_counts(tmp_path):
+    """Pins the observation guard on its own: with the allocation unchanged (so nothing else
+    keeps the operation unknown), a stopped, change-free group whose counts Salad never sent
+    is not reported stopped by the loop, so no stop is confirmed and nothing reconciles."""
+    tmp_path.chmod(0o700)
+    clock = [100.0]
+    key = ec.generate_private_key(ec.SECP256R1())
+    provider = Provider()
+    provider.state = "running"
+    s = make_service(tmp_path, lambda: clock[0], key, provider)
+    try:
+        b = reservation()
+        s.loop()
+        s.admin(b)
+        s.admin(
+            dict(
+                operation="bind",
+                reservation=b["reservation"],
+                provider_id=GROUP,
+                allocation_id=None,
+            )
+        )
+        for _ in range(3):
+            clock[0] += 5
+            s.loop()
+        provider.state = "stopped"
+        provider.counts_complete = False
+        for _ in range(4):
+            clock[0] += 40
+            s.loop()
+        status = s.admin(dict(operation="status", reservation=b["reservation"]))
+        assert status["status"] != "reconciled"
+        kinds = [k for (k,) in s.guardian.db.execute("SELECT kind FROM events")]
+        assert "provider_confirmed_stop" not in kinds and "exact_terminal" not in kinds
+    finally:
+        s.close()
+
+
+def test_counts_salad_did_not_send_are_the_only_thing_between_a_stopped_read_and_a_confirmed_stop(
+    tmp_path,
+):
+    """The same stopped, change-free, instance-free group is a confirmed stop (the loop's own
+    observation reconciles it) only once the counts are complete: until then neither the
+    observation path nor an operator's reconcile accepts it, and no stop event is recorded."""
+    tmp_path.chmod(0o700)
+    clock = [100.0]
+    key = ec.generate_private_key(ec.SECP256R1())
+    provider = Provider()
+    provider.state = "running"
+    s = make_service(tmp_path, lambda: clock[0], key, provider)
+    try:
+        b = reservation()
+        s.loop()
+        s.admin(b)
+        s.admin(
+            dict(
+                operation="bind",
+                reservation=b["reservation"],
+                provider_id=GROUP,
+                allocation_id=None,
+            )
+        )
+        s.loop()
+        provider.machine = "e" * 32
+        clock[0] += 5
+        s.loop()
+        provider.state = "stopped"
+        provider.counts_complete = False  # Salad never sent the counts: the transport zero-filled
+        for _ in range(4):
+            clock[0] += 40
+            s.loop()
+        status = s.admin(dict(operation="status", reservation=b["reservation"]))
+        assert status["status"] == "unknown" and status["orphan"] is True  # observation path
+        with pytest.raises(ValueError, match="reconcile_requires_exact_stopped_group"):
+            s.admin(
+                dict(
+                    operation="reconcile",
+                    reservation=b["reservation"],
+                    attestation="operator: portal shows the group stopped",
+                )
+            )  # reconcile path
+        kinds = [k for (k,) in s.guardian.db.execute("SELECT kind FROM events")]
+        assert "provider_confirmed_stop" not in kinds and "exact_terminal" not in kinds
+        # The only change: the provider now reports every count (all zero). It is confirmed.
+        provider.counts_complete = True
+        for _ in range(2):
+            clock[0] += 40
+            s.loop()
+        status = s.admin(dict(operation="status", reservation=b["reservation"]))
+        assert status["status"] == "reconciled"
+        assert status["reason"] == "provider_confirmed_exact_group_stopped"
+    finally:
+        s.close()

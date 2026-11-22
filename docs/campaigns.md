@@ -181,6 +181,11 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   mid-run with `ENOSPC`. The scratch is memory-backed, so the worker also needs a memory
   limit that holds it. The receipt records `scratch: {requested_bytes, granted_bytes}` per
   attempt; Salad and other providers that do not grant scratch refuse the field.
+- **Placement tags (ADR 0070).** A v2 stage may set `placement_tags` (1 to 8 distinct lowercase
+  labels, for example `["heavy"]`). They are part of the approved spec (absent unless set, so
+  existing digests are unchanged) and are read only by the operator's placement preference
+  ([campaign providers](campaign-providers.md#placement-preference-by-resource-class)), which may
+  reorder a stage's approved `alternate_providers` candidates; they name no destination.
 - **Grant lifetime and slots (ADR 0048).** A stage whose `grant_ttl_seconds` is shorter than
   `max_duration_seconds` plus 300 s is refused at submit and approval
   (`grant_shorter_than_stage_duration`). The runner issues a grant, and so starts its

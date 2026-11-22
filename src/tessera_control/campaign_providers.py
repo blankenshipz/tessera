@@ -68,6 +68,34 @@ class ProviderDescriptor:
 
 
 @dataclass(frozen=True)
+class PlacementCapability:
+    """What a provider is, for default placement (ADR 0088), reported per stage candidate.
+
+    ``tier`` is ``local`` (capacity the operator hosts) or ``remote`` (rented capacity), and
+    ``hardware`` is ``cpu`` or ``gpu``. A provider reports it from its own registration and the
+    stage's configuration through the optional ``placement_capability(stage)`` method; placement
+    reads only this, never a vendor name."""
+
+    tier: Literal["local", "remote"]
+    hardware: Literal["cpu", "gpu"]
+
+
+def placement_capability_of(provider: Any, stage: Any) -> PlacementCapability | None:
+    """The provider's own report for this stage candidate, else what its descriptor implies
+    (a worker-grant provider is local CPU), else None (placement leaves it where it is)."""
+    report = getattr(provider, "placement_capability", None)
+    if callable(report):
+        try:
+            found = report(stage)
+        except Exception:  # noqa: BLE001 - an unreadable stage config is not placed first
+            return None
+        return found if isinstance(found, PlacementCapability) else None
+    if provider.descriptor.kind == "worker_grant":
+        return PlacementCapability("local", "cpu")
+    return None
+
+
+@dataclass(frozen=True)
 class GrantRequest:
     worker_principal_id: str
     ttl_seconds: int
@@ -286,6 +314,34 @@ def load_builtin_providers(configure: Callable[[str], None] | None = None) -> No
             configure(module.__name__)
 
 
+@dataclass(frozen=True)
+class ConfigSection:
+    """Where a provider's entries live in the operator file and how they are checked (ADR 0081).
+
+    A provider module (built in or a plugin) returns these from an optional module-level
+    ``config_sections()``, so adding a vendor never edits the registration code or the runner.
+    ``path`` locates a list of entries keyed by ``key_field``, or one object when ``key_field``
+    is None. ``validate`` re-checks the whole document after a change and raises ValueError;
+    ``describe`` returns the non-secret fields worth listing; ``worker`` names the principal the
+    entry grants to (for the provider trust readout)."""
+
+    name: str
+    provider: str
+    path: tuple[str, ...]
+    key_field: str | None
+    model: type[BaseModel]
+    validate: Callable[[dict[str, Any]], None]
+    describe: Callable[[dict[str, Any]], dict[str, Any]]
+    worker: Callable[[dict[str, Any]], str | None] = lambda entry: None  # noqa: E731
+    container: Callable[[], dict[str, Any]] | None = None
+    # "organization": entries name their ``org_id`` and an organization's human may manage its
+    # own; "deployment" (the default): shared by every organization, so only the deployment's
+    # root owner may change them through the API.
+    scope: Literal["organization", "deployment"] = "deployment"
+    # The provider id an entry registers under, when it is not the section's (self-hosted: its id).
+    provider_of: Callable[[dict[str, Any]], str] | None = None
+
+
 ENTRY_POINT_GROUP = "tessera.campaign_providers"
 PLUGIN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 _PLUGIN_MODULES: dict[str, str] = {}
@@ -363,7 +419,14 @@ def load_providers_file(path: Any) -> dict[str, Any]:
 
 
 def configure_providers(config: dict[str, Any] | None) -> None:
-    """Load the built-in provider modules and register each from the operator document."""
+    """Load the built-in provider modules and register each from the operator document.
+
+    Then install the operator's ``placement_preferences`` (ADR 0070); absent clears them."""
+    from . import campaign_placement_preference
+
+    section = (config or {}).get("placement_preferences")
+    campaign_placement_preference.parse(section)  # refuse a malformed section before effects
     load_builtin_providers(lambda name: importlib.import_module(name).register_from_config(config))
-    for name, section in sorted(((config or {}).get("plugins") or {}).items()):
-        load_plugin(name, section)
+    for name, section_ in sorted(((config or {}).get("plugins") or {}).items()):
+        load_plugin(name, section_)
+    campaign_placement_preference.configure(section, provider_ids())

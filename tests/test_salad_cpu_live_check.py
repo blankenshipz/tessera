@@ -653,7 +653,7 @@ def test_the_credential_is_read_by_reference_from_the_operator_directory(files, 
         sleep=clock.sleep,
     )  # fmt: skip
     assert receipt["shape_ok"] is True and TOKEN.decode() not in json.dumps(receipt)
-    assert not any(secret._buffer)  # wiped after the run, like the token-file path
+    assert secret.is_wiped()  # wiped after the run, like the token-file path
 
 
 def test_a_wrong_version_or_a_missing_reference_is_refused_without_detail(files, tmp_path):
@@ -818,4 +818,14 @@ def test_main_wipes_a_credential_it_read_when_the_run_cannot_start(files, tmp_pa
     with pytest.raises(ZeroDivisionError):
         tool.main(argv(files, *flags))
     (secret,) = seen
-    assert not any(secret._buffer)  # wiped by main's own finally, not by run_live
+    assert secret.is_wiped()  # wiped by main's own finally, not by run_live
+
+
+def test_secret_buffer_reports_a_wipe_without_exposing_its_bytes():
+    from tessera_control.salad_secrets import SecretBuffer
+
+    buffer = SecretBuffer(bytearray(TOKEN))
+    assert buffer.is_wiped() is False
+    buffer.zeroize()
+    assert buffer.is_wiped() is True
+    assert TOKEN.decode() not in repr(buffer)

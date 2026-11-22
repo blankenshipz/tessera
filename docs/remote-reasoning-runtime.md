@@ -1,6 +1,7 @@
 # Standalone governed reasoning runtime
 
-This is a new OpenCode **V2** HTTP reasoning adapter and durable supervisor, not
+This is a durable reasoning supervisor with two runtimes: a direct Anthropic Messages API
+client (default) and an OpenCode **V2** HTTP adapter (optional OpenAI path). It is not
 the deterministic `tessera_agent.coordinator`, the synthetic OpenCode adapter or
 the V1.18.30 provider-disabled context-delivery service. It is installed by the
 ordinary Tessera Python distribution; no repository checkout is required to run
@@ -18,6 +19,93 @@ in [deploy/remote-agent-platform](../deploy/remote-agent-platform/README.md). Th
 keep reasoning manual-start/admission-gated, separate users/private state, and
 never install or start an OpenCode harness implicitly. Linux service execution
 remains separate from the static/synthetic profile checks.
+
+## Anthropic Messages API by key reference (ADR 0082, ADR 0083)
+
+The default destination is the Anthropic Messages API, called directly by Tessera's own
+client in `tessera-reasoning`. There is no Claude subscription login, no Claude Code
+runtime and no OpenCode harness on this path (a Claude Code runtime could later be a
+separate optional provider). The API key is held only as a systemd credential and is never
+an environment variable, shell variable, repository or env file, argv, log, journal or
+receipt. OpenAI included ChatGPT OAuth through the OpenCode V2 harness stays the optional
+drop-in alternative; the OpenCode path refuses Anthropic.
+
+Generic operator procedure (all paths operator-supplied; no automatic start):
+
+1. Create the key file, root-owned and mode 0600, at
+   `/etc/tessera/credentials/reasoning-anthropic-api-key`. Preferred: create it with a root
+   editor, for example `sudoedit /etc/tessera/credentials/reasoning-anthropic-api-key`
+   (or `sudo -e`), then set the mode and owner with `sudo chmod 0600` and `sudo chown root:root`
+   if the editor created it with other defaults. If you must paste on stdin, disable terminal
+   echo first so the key is neither shown nor left in scrollback:
+   `stty -echo; sudo install -m 0600 -o root -g root /dev/stdin
+   /etc/tessera/credentials/reasoning-anthropic-api-key; stty echo` (paste the key, press
+   Enter, then Ctrl-D). Do not `export` it, do not put it in a shell variable, a repository file, an `Environment=`
+   or `EnvironmentFile=` line, or a command-line argument. The base unit loads it as
+   `LoadCredential=anthropic-api-key:...` and Tessera reads `$CREDENTIALS_DIRECTORY/anthropic-api-key`
+   at call time, keeping it in memory only.
+2. Write the reference file `/etc/tessera/credentials/reasoning-model-credential` (private,
+   non-empty) containing exactly the profile's `credential_ref` (one line, trailing newline
+   allowed), for example `anthropic-api-key://OWNER/REFERENCE`. OWNER and REFERENCE are operator
+   labels, not secrets. Tessera compares it and never logs it.
+3. Write `/etc/tessera/reasoning.json` (see the Anthropic profile below): the model, the
+   `credential_ref`, `limits` and operator-pinned `pricing_cents_per_mtok`. Fable additionally
+   needs `fable_approval_id`. Optional `input_class`
+   (`public` | `private_code_approved` | `private_derived`; missing reads as `private_derived`)
+   is recorded on receipts. Optional `input_digests` and `project_id` feed the sealed-holdout
+   check, which refuses a sealed input before the prompt is sent.
+4. Confirm the unit environment has none of `ANTHROPIC_API_KEY`,
+   `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_API_KEY`; startup refuses (exit 78) otherwise.
+5. Create the admission marker: `sudo install -m 0600 /dev/null /etc/tessera/reasoning.admitted`.
+6. Start one bounded run through the manual unit
+   (`sudo systemctl start tessera-reasoning.service`). The unit has no `[Install]` section, so it
+   is manual-start and not enabled at boot.
+7. Check `sudo systemctl status tessera-reasoning.service` and `tessera-reasoning status` (the
+   state directory is `/var/lib/tessera-reasoning`): it prints one receipt row per model call,
+   including tokens, computed cost, limits in force and the day's totals. The completion text
+   is in a private output file in the state directory, not in the journal.
+8. Stop with `sudo systemctl stop tessera-reasoning.service` and remove the marker.
+   Never `enable` the unit or attach it to a boot target.
+
+*Alternative, OpenAI included ChatGPT OAuth:* install the optional drop-in
+`install -m 0644 deploy/remote-agent-platform/tessera-reasoning.service.d/openai.conf.example
+/etc/systemd/system/tessera-reasoning.service.d/openai.conf`, then `systemctl daemon-reload`.
+It resets the list with an empty `LoadCredential=` and re-adds only profile, prompt,
+agent-token and harness-password, so no Anthropic credential is loaded. Verify with
+`systemctl show -p LoadCredential tessera-reasoning`. Use the OpenAI profile and the approved
+harness described below. Remove the drop-in and `daemon-reload` to return to the Anthropic
+default.
+
+**Caps and receipts.** Before each billed call Tessera counts input tokens with the Messages API
+`count_tokens` endpoint on the same host, then refuses the call (`model_call_cap_exceeded`,
+nothing billed) if input tokens, worst-case cost, the UTC-day token or cost cap, or the grant's
+remaining budget would be exceeded. The daily totals are re-checked after the call. Cost is
+computed from the prices you pin in the profile; keep them current. A 429, 529 or billing error
+is recorded and backed off with the same model; a model the response reports that does not match
+the configured one halts the run. See [ADR 0083](decisions/0083-model-call-receipts.md).
+
+**Known gap.** This runtime sends one user message and uses no tools; the profile's
+`permissions` must be exactly deny-all.
+
+**Upgrading.** Existing OpenAI deployments must install the `openai.conf` drop-in before
+updating the unit file; the base unit now loads `model-credential` and `anthropic-api-key`, and
+systemd refuses to start if those sources are missing. Existing deployments moving to Anthropic
+must create both credential files (steps 1 and 2) and switch the profile; then
+`systemctl daemon-reload`. The base unit no longer loads `harness-password`; only the OpenAI
+drop-in does.
+
+**Deploy order.** Upgrade the control plane before the reasoning supervisor. The control-side
+provenance model rejects unknown fields (the new `rate_limit` provenance records), so an older control
+plane would reject them until the run's outbox bound halts it.
+
+**Egress.** `api.anthropic.com:443` is on the model-runtime allowlist and Tessera's own
+transport enforces it: https only, exact host and port checked with
+`model_runtime_egress_allowed` before it connects, environment proxies ignored, redirects
+refused (`model_egress_refused`). Host firewalling of the service remains recommended defence in
+depth. No sandbox or campaign-stage egress is added. For an OpenAI profile the pinned harness
+connects, admission relies on the pinned effective harness config digest and guard evidence
+(`openai_only`, `chatgpt_endpoint`), and network-level enforcement for the harness process is not
+implemented (host firewalling is the operator's responsibility).
 
 ## Required secure operator handoff
 
@@ -39,7 +127,8 @@ remains separate from the static/synthetic profile checks.
    `tessera_<tool>` MCP actions it needs. V2 MCP permission resources are `*`;
    destination enforcement belongs to the separately authenticated Tessera MCP
    credential, not an invented OpenCode permission resource.
-4. Owner-bound included ChatGPT OAuth on that dedicated harness. The operator must
+4. Owner-bound subscription login on that dedicated harness (OpenAI path only): OpenAI
+   included ChatGPT OAuth. The Anthropic default needs no harness. The operator must
    verify no API-key provider credential, paid-credit fallback, provider-selection
    plugin or account sharing is possible. `account_mode` below is an explicit
    operator attestation, **not** cryptographic billing proof. The runtime never
@@ -78,7 +167,7 @@ Inspection on 2026-10-04 found:
 - The wrapper hard-codes HOME, config and XDG paths. External XDG/profile overrides
   are discarded. There is no observed `--profile` flag. Do not bypass the wrapper
   or call its raw binary to evade subscription guards.
-- The checked guard source admits only OpenAI ChatGPT OAuth methods
+- The checked guard source (OpenAI route) admits OpenAI ChatGPT OAuth methods
   `chatgpt-browser`/`chatgpt-headless`, checks same-account quota admission and
   prohibits API-key/custom-endpoint fallback. Its presence is metadata, not a
   live admission result. No provider credential contents were inspected.
@@ -179,6 +268,57 @@ Create a mode-0600 JSON profile outside the repository and a mode-0600 prompt
 file (at most 8192 bytes). Replace every placeholder with operator-approved facts;
 calculate `prompt_sha256` from the exact UTF-8 prompt bytes. Canonical schema digest
 uses `json.dumps(schema, sort_keys=True, separators=(",", ":"))` SHA-256.
+
+Anthropic profile (default; direct Messages API, no harness fields). The numbers in
+`limits` and `pricing_cents_per_mtok` are placeholders: the prices are operator-pinned, so check
+current published prices before use.
+
+```json
+{
+  "run_id": "research-run-001",
+  "model": {"providerID": "anthropic", "id": "APPROVED_MODEL_ID"},
+  "account_mode": "anthropic-api-key-ref",
+  "credential_ref": "anthropic-api-key://OWNER/REFERENCE",
+  "input_class": "private_derived",
+  "control_url": "https://CONTROL_ORIGIN",
+  "project_id": "EXACT_ENROLLED_PROJECT_ID",
+  "agent_token_env": "TESSERA_REASONING_AGENT_TOKEN",
+  "grant_id": "APPROVED_GRANT_ID",
+  "revision": 1,
+  "epoch": 1,
+  "subject_credential_id": "ENROLLED_AGENT_CREDENTIAL_ID",
+  "destination": "EXACT_DESTINATION",
+  "prompt_sha256": "EXACT_PROMPT_SHA256",
+  "max_steps": 3,
+  "max_tokens": 8192,
+  "max_duration_seconds": 120,
+  "permissions": [
+    {"action": "*", "resource": "*", "effect": "deny"}
+  ],
+  "limits": {
+    "max_output_tokens_per_call": 4096,
+    "max_input_tokens_per_call": 20000,
+    "max_cost_cents_per_call": 50,
+    "daily_token_cap": 200000,
+    "daily_cost_cap_cents": 500
+  },
+  "pricing_cents_per_mtok": {
+    "input": 300,
+    "output": 1500,
+    "cache_read": 30,
+    "cache_write": 375
+  }
+}
+```
+
+`max_output_tokens_per_call` is at most 32768, `max_cost_cents_per_call` at most 5000 and
+`daily_cost_cap_cents` at most 100000; all `limits` values are positive integers and the prices
+are non-negative numbers (cents per million tokens). `permissions` must be exactly the deny-all
+rule shown (no tool use in this runtime yet). Harness fields (`harness_url`, `agent`,
+`workspace`, `version`, `schema_sha256`) are not used. Optional `fable_approval_id` and
+`input_digests` apply as above.
+
+Optional OpenAI alternative (OpenCode V2 harness; included ChatGPT OAuth, no `credential_ref`):
 
 ```json
 {

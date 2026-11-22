@@ -7,20 +7,33 @@ Only references in the manager-provided CREDENTIALS_DIRECTORY are read.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import stat
 import sys
 from pathlib import Path
 
+from .model_destinations import (
+    RUNTIME_ANTHROPIC_MESSAGES,
+    DestinationRefused,
+    destination,
+    refuse_api_key_environment,
+)
 from .remote_reasoning_runtime import validate_profile
 from .remote_reasoning_store import ReasoningStore, private_file
 
 _FORWARDED = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
-_REASONING_REFS = {
-    "agent_token_env": ("TESSERA_REASONING_AGENT_TOKEN", "agent-token"),
-    "harness_token_env": ("TESSERA_REASONING_HARNESS_TOKEN", "harness-password"),
-}
+# Manager-provided file (systemd LoadCredential=model-credential:...) holding the
+# profile's opaque anthropic-api-key:// reference. Tessera compares it in constant
+# time and never forwards it into any output or the child environment.
+MODEL_CREDENTIAL_FILE = "model-credential"
+# Manager-provided Anthropic API key (LoadCredential=anthropic-api-key:...). Startup
+# only checks it is a private non-empty regular file; the supervisor reads it at call
+# time. It is never placed in the child environment, argv or any output.
+ANTHROPIC_API_KEY_FILE = "anthropic-api-key"
+_AGENT_REF = ("agent_token_env", "TESSERA_REASONING_AGENT_TOKEN", "agent-token")
+_HARNESS_REF = ("harness_token_env", "TESSERA_REASONING_HARNESS_TOKEN", "harness-password")
 
 
 class StartupBlocked(ValueError):
@@ -38,6 +51,55 @@ def credential_root(environment: dict[str, str]) -> Path:
     return path
 
 
+def refuse_forbidden_environment(environment: dict[str, str]) -> None:
+    """Fail closed on any API-key fallback variable before any profile is read."""
+    try:
+        refuse_api_key_environment(environment)
+    except DestinationRefused:
+        raise StartupBlocked("api_key_environment_present") from None
+
+
+def require_model_credential(root: Path, profile: dict) -> None:
+    """Anthropic profiles need the manager-provided reference file.
+
+    The file must hold exactly the profile's opaque credential_ref (one trailing
+    newline allowed). Neither value is ever echoed, logged or forwarded.
+    """
+    if profile["model"]["providerID"] != "anthropic":
+        return
+    try:
+        content = private_file(root / MODEL_CREDENTIAL_FILE)
+    except (OSError, ValueError):
+        raise StartupBlocked("missing_or_invalid_model_credential_reference") from None
+    if not content.strip():
+        raise StartupBlocked("missing_or_invalid_model_credential_reference")
+    if content.endswith(b"\n"):
+        content = content[:-1]
+    expected = profile.get("credential_ref")
+    if (
+        not isinstance(expected, str)
+        or any(b <= 32 or b >= 127 for b in content)
+        or not expected.isascii()
+        or not hmac.compare_digest(content, expected.encode("ascii"))
+    ):
+        raise StartupBlocked("model_credential_reference_mismatch")
+
+
+def require_api_key_file(root: Path) -> None:
+    """Stat-level check only: a private, owned, non-empty regular file. Never echoed."""
+    try:
+        info = (root / ANTHROPIC_API_KEY_FILE).lstat()
+    except OSError:
+        raise StartupBlocked("missing_or_invalid_model_api_key_credential") from None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_mode & 0o077
+        or info.st_uid != os.getuid()
+        or not 0 < info.st_size <= 64 * 1024
+    ):
+        raise StartupBlocked("missing_or_invalid_model_api_key_credential")
+
+
 def token_reference(root: Path, name: str) -> str:
     token = private_file(root / name).decode("ascii").rstrip("\n")
     if not token or len(token) > 4096 or any(ord(c) <= 32 or ord(c) >= 127 for c in token):
@@ -49,6 +111,7 @@ def launch_spec(mode: str, state_dir: Path, environment: dict[str, str]):
     """Return only a fixed Python module argv and allowlisted child environment."""
     if mode not in {"reasoning", "a2a"} or not state_dir.is_absolute():
         raise StartupBlocked("unsupported_service_profile")
+    refuse_forbidden_environment(environment)
     root = credential_root(environment)
     profile_path = root / "profile"
     profile = json.loads(private_file(profile_path))
@@ -57,8 +120,18 @@ def launch_spec(mode: str, state_dir: Path, environment: dict[str, str]):
     child["PYTHONNOUSERSITE"] = "1"
     if mode == "reasoning":
         validate_profile(profile)
-        for field, (variable, reference) in _REASONING_REFS.items():
-            if profile[field] != variable:
+        require_model_credential(root, profile)
+        found = destination(profile["model"]["providerID"], profile["account_mode"])
+        references = [_AGENT_REF]
+        if found.runtime == RUNTIME_ANTHROPIC_MESSAGES:
+            # Direct Messages API: no harness password or harness token.
+            require_api_key_file(root)
+            # The child reads the key from the same manager directory at call time.
+            child["CREDENTIALS_DIRECTORY"] = str(root)
+        else:
+            references.append(_HARNESS_REF)
+        for field, variable, reference in references:
+            if profile.get(field) != variable:
                 raise StartupBlocked("unsupported_credential_environment_name")
             child[variable] = token_reference(root, reference)
         private_file(root / "prompt")  # Runtime enforces prompt digest/length.
@@ -106,6 +179,7 @@ def main(argv=None):
     try:
         if not args.state_dir.is_absolute():
             raise StartupBlocked("absolute_service_state_required")
+        refuse_forbidden_environment(dict(os.environ))
         if args.mode == "research":
             # Packaging may expose this fixed entrypoint, but no source manifest
             # or environment switch can substitute for installed admission.

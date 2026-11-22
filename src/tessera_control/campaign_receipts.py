@@ -195,6 +195,9 @@ def _attempt_entry(
                 "recorded_at",
             )
         }
+        if decision.get("preference") is not None:
+            # ADR 0070: the operator rule that ordered the approved candidates.
+            entry["placement"]["preference"] = decision["preference"]
     try:
         extra = stage_provider(provider_id).receipt_fields(connection, dict(attempt))
     except KeyError:

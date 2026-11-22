@@ -127,6 +127,7 @@ def create_app(
     from .observability import OperatorObservabilityStore
     from .provider_inputs import ProviderInputStore
     from .provider_inputs_api import router as provider_inputs_router
+    from .provider_registration_api import router as provider_registration_router
     from .remote_execution import RemoteExecutionStore
     from .remote_execution_api import router as remote_execution_router
     from .research_api import router as research_router
@@ -219,11 +220,23 @@ def create_app(
     app.include_router(capture_context_router)
     app.state.admin = AdminStore(state_dir)
     app.include_router(admin_router)
+    app.include_router(provider_registration_router)
     app.state.external_agents = ExternalAgentStore(state_dir)
     app.include_router(external_agent_router)
     app.state.agent_authority = AgentAuthorityStore(state_dir)
     app.state.agent_research = AgentResearchStore(state_dir)
     app.include_router(agent_authority_router)
+    from .review_jobs import NoDestinationsPolicy, ReviewJobStore
+    from .review_jobs_api import router as review_jobs_router
+
+    app.state.review_jobs = ReviewJobStore(state_dir)
+    app.state.review_policy = NoDestinationsPolicy()
+    app.include_router(review_jobs_router)
+    from .agent_loop_control import AgentLoopControlStore
+    from .agent_loop_control_api import router as agent_loop_control_router
+
+    app.state.agent_loop_control = AgentLoopControlStore(state_dir)
+    app.include_router(agent_loop_control_router)
     from .agent_research_results import AgentResultStore
     from .agent_research_results_api import router as agent_results_router
 

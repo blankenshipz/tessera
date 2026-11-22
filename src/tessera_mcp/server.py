@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -13,11 +14,17 @@ from mcp.types import ToolAnnotations
 
 from tessera_control.campaign_models import AnyCampaignSpec
 from tessera_control.models import ExecutionSpec
+from tessera_mcp.agent_loop_tools import register_agent_loop_tools
 from tessera_mcp.client import ControlClient
 from tessera_mcp.config import Config
 from tessera_mcp.generated_outputs import register_generated_output_tools
 from tessera_mcp.mcp_workflow import register_workflow
 from tessera_mcp.results import register_result_tools
+from tessera_mcp.review_tools import (
+    REVIEW_ACTIONS,
+    register_review_decision_tools,
+    register_review_tools,
+)
 from tessera_mcp.stage_retry import RetryRefused, build_retry_spec
 
 # Scope each read tool needs; a tool is registered only when its scope is enrolled.
@@ -104,6 +111,58 @@ def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
     server.tool(annotations=write)(tessera_approve_campaign)
 
 
+def register_provider_registration_tools(server: FastMCP, client: ControlClient) -> None:
+    """Provider registration tools, only when the operator turns them on (ADR 0081).
+
+    Thin clients of ``/admin/campaign-providers``. The control API decides: a change needs a
+    person's session credential (an agent credential gets a 403), is validated against the
+    provider's own schema, refuses unknown destinations and secret-shaped values, and is audited.
+    """
+    read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+    write = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    )
+
+    @server.tool(annotations=read)
+    async def tessera_list_providers() -> dict[str, Any]:
+        """List the registered provider entries and profiles (no secrets are held in them).
+
+        Returns the providers file digest (pass it as expected_digest to a change), the known
+        sections, each entry's non-secret summary (resource class, cost caps, allowed image
+        digests, credential reference) and the recent audit. Provider trust is not shown here.
+        """
+        return await client.list_campaign_providers()
+
+    @server.tool(annotations=write)
+    async def tessera_register_provider(
+        action: str,
+        section: str,
+        entry: dict[str, Any],
+        key: str | None = None,
+        expected_digest: str | None = None,
+        dry_run: bool = False,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Add or update one provider or profile entry (a person's credential).
+
+        action is add or update; section is one of those tessera_list_providers shows (for
+        example salad-profile or self-hosted). Configuration holds credential references
+        (credential-ref:NAME), never secrets; secret-shaped values are refused. This tool does
+        not change provider trust: the result reports which data classes the current setting
+        admits for the entry's worker and the exact trust entry to add. Changes apply at the
+        next serve start. Use dry_run to validate only; expected_digest guards against a
+        concurrent edit. A fresh idempotency key is used per call unless you supply one.
+        """
+        body = {"action": action, "section": section, "entry": entry, "dry_run": dry_run}
+        if key is not None:
+            body["key"] = key
+        if expected_digest is not None:
+            body["expected_digest"] = expected_digest
+        return await client.register_campaign_provider(
+            body, idempotency_key or "register-provider-" + uuid.uuid4().hex
+        )
+
+
 def register_campaign_tools(
     server: FastMCP, client: ControlClient, actions: frozenset[str] | None = None
 ) -> None:
@@ -168,6 +227,9 @@ def register_campaign_tools(
         platform state, not evidence of a scientific result. ``placement`` lists, for each
         stage with alternate_providers, the candidate each attempt was placed on, why every
         other candidate was skipped, any steering and, while it waits, the reasons.
+        ``placement_preference`` shows the operator's rules for heavy stages and, per stage a
+        rule matches, the preferred providers it lists and whether the rule ``applies`` (it
+        reorders only a stage's approved alternates; it never adds a destination).
         """
         return await client.campaign(campaign_id)
 
@@ -518,6 +580,12 @@ def create_server(
     provider_trust_tools: bool = False,
     campaign_actions: frozenset[str] | None = None,
     approval_tool: bool = False,
+    provider_registration_tools: bool = False,
+    review_tools: bool = False,
+    review_actions: frozenset[str] | None = None,
+    review_decision_tool: bool = False,
+    agent_loop_marker: Path | None = None,
+    agent_loop_ledger: Path | None = None,
 ) -> FastMCP:
     server = FastMCP(
         "Tessera research bench",
@@ -616,6 +684,20 @@ def create_server(
     if approval_tool:
         # Independent of the campaign tools: an approve-only server exposes no submit or cancel.
         register_approval_tool(server, client)
+    if provider_registration_tools:
+        # Operator-enabled (--provider-registration-tools); the API still requires a person.
+        register_provider_registration_tools(server, client)
+    if review_tools:
+        # Opt-in like the campaign tools: PERMITTED_TOOLS (the harness catalog) is unchanged.
+        register_review_tools(server, client, review_actions)
+    if review_decision_tool:
+        # Human-only; independent of the agent review tools (ADR 0084).
+        register_review_decision_tools(server, client)
+    if agent_loop_marker is not None:
+        # Opt-in (ADR 0089): PERMITTED_TOOLS is unchanged. Pause and status only; no resume.
+        register_agent_loop_tools(server, agent_loop_marker, agent_loop_ledger, client)
+    elif agent_loop_ledger is not None:
+        raise ValueError("agent_loop_ledger requires agent_loop_marker.")
     if provider_trust_tools:
         # Registered only when the credential's live scopes include provider_trust:read.
         register_provider_trust_tools(server, client)
@@ -688,7 +770,41 @@ def main(argv=None):
             "operator server with its own credential file, not with the submitting agent's"
         ),
     )
+    parser.add_argument(
+        "--provider-registration-tools",
+        action="store_true",
+        help=(
+            "register tessera_list_providers and tessera_register_provider. The control API "
+            "accepts a change only from a person's session credential, so run it as a separate "
+            "operator server with its own credential file, not with an agent's"
+        ),
+    )
+    parser.add_argument(
+        "--review-decision-tool",
+        action="store_true",
+        help=(
+            "register tessera_resolve_review_finding and tessera_approve_review_job_tier "
+            "(ADR 0084). The control API accepts them only from a person's session credential, "
+            "so run this as a separate operator server with its own credential file"
+        ),
+    )
+    parser.add_argument(
+        "--agent-loop-marker",
+        type=Path,
+        help=(
+            "register tessera_agent_loop_status and tessera_pause_agent_loop for the standing "
+            "agent loop's kill-switch marker file (ADR 0089). Pause only: lifting a pause is "
+            "the operator deleting the marker"
+        ),
+    )
+    parser.add_argument(
+        "--agent-loop-ledger",
+        type=Path,
+        help="loop ledger file the status tool reads read-only; requires --agent-loop-marker",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.agent_loop_ledger is not None and arguments.agent_loop_marker is None:
+        parser.error("--agent-loop-ledger requires --agent-loop-marker")
     # MCP SDK exception logging can include caller arguments. Never emit it to host logs.
     logging.disable(logging.CRITICAL)
     try:
@@ -700,12 +816,16 @@ def main(argv=None):
     client = ControlClient(config)
     campaign_tools = arguments.campaign_tools
     campaign_actions = None
-    if campaign_tools is None and arguments.approval_tool:
-        campaign_tools = False  # --approval-tool alone is an approve-only server
+    if campaign_tools is None and (arguments.approval_tool or arguments.review_decision_tool):
+        campaign_tools = False  # a decision flag alone is a decision-only server
+    live = None
     if campaign_tools is None:
         live = _live_actions(client)
         campaign_tools = bool(live & CAMPAIGN_ACTIONS)
         campaign_actions = live
+    approve_only = arguments.approval_tool  # an approval server never exposes agent review tools
+    if live is None and not (arguments.review_decision_tool or approve_only):
+        live = _live_actions(client)  # explicit --campaign-tools[/-no]: review still follows scopes
     provider_trust_tools = arguments.provider_trust_tools
     if provider_trust_tools is None:
         provider_trust_tools = _has_provider_trust_scope(client)
@@ -715,6 +835,17 @@ def main(argv=None):
         extra["campaign_actions"] = campaign_actions
     if arguments.approval_tool:
         extra["approval_tool"] = True
+    if arguments.provider_registration_tools:
+        extra["provider_registration_tools"] = True
+    if arguments.review_decision_tool:
+        extra["review_decision_tool"] = True
+    elif live is not None and live & REVIEW_ACTIONS:
+        extra["review_tools"] = True
+        extra["review_actions"] = live & REVIEW_ACTIONS
+    if arguments.agent_loop_marker is not None:
+        extra["agent_loop_marker"] = arguments.agent_loop_marker
+        if arguments.agent_loop_ledger is not None:
+            extra["agent_loop_ledger"] = arguments.agent_loop_ledger
     create_server(client, campaign_tools=campaign_tools, **extra).run(transport="stdio")
     return 0
 

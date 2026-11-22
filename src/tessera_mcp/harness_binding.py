@@ -12,6 +12,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
 
+from tessera_agent.model_destinations import (
+    QUALIFIED_MODEL,
+    RUNTIME_OPENCODE,
+    DestinationRefused,
+    destination_for_account_mode,
+    require_runtime,
+    split_model,
+)
 from tessera_mcp.config import Config
 
 SERVER_NAME = "tessera"
@@ -71,6 +79,29 @@ _SCOPES = {
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 _MODEL = re.compile(r"^openai/[A-Za-z0-9][A-Za-z0-9._-]{0,100}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _admit_destination(account_mode, models):
+    """Derive the provider from the account mode and admit every listed model."""
+    try:
+        # Anthropic runs only through Tessera's direct Messages API runtime, never on this
+        # OpenCode harness path.
+        found = require_runtime(destination_for_account_mode(account_mode), RUNTIME_OPENCODE)
+        for qualified in models:
+            provider, _ = split_model(qualified)
+            if provider != found.provider_id:
+                raise DestinationRefused("provider_account_mode_mismatch")
+    except DestinationRefused:
+        raise BindingBlocked("model_destination_not_admitted") from None
+    return found
+
+
+def _manifest_provider(manifest):
+    try:
+        found = destination_for_account_mode(manifest.get("account_mode", ACCOUNT_MODE))
+        return require_runtime(found, RUNTIME_OPENCODE).provider_id
+    except DestinationRefused:
+        raise BindingBlocked("model_destination_not_admitted") from None
 
 
 class BindingBlocked(ValueError):
@@ -160,6 +191,7 @@ def generate_binding(
     permitted_tools: tuple[str, ...],
     max_steps: int = 8,
     ca_file: str | None = None,
+    account_mode: str = ACCOUNT_MODE,
 ) -> HarnessBinding:
     """Generate a V2 project config, skill bytes and admission manifest without I/O.
 
@@ -184,10 +216,14 @@ def generate_binding(
         not approved_models
         or len(approved_models) > 16
         or len(set(approved_models)) != len(approved_models)
-        or any(not _MODEL.fullmatch(item) for item in approved_models)
+        or any(
+            not isinstance(item, str) or not QUALIFIED_MODEL.fullmatch(item)
+            for item in approved_models
+        )
         or model not in approved_models
     ):
         raise BindingBlocked("model_outside_included_oauth_allowlist")
+    found = _admit_destination(account_mode, approved_models)
     if (
         not permitted_tools
         or len(set(permitted_tools)) != len(permitted_tools)
@@ -227,7 +263,7 @@ def generate_binding(
     permissions.extend({"action": action, "resource": "*", "effect": "allow"} for action in actions)
     policies = [
         {"action": "provider.use", "resource": "*", "effect": "deny"},
-        {"action": "provider.use", "resource": "openai", "effect": "allow"},
+        {"action": "provider.use", "resource": found.provider_id, "effect": "allow"},
         {"action": "permission", "resource": "*", "effect": "deny"},
         {"action": "permission", "resource": "skill:" + SKILL_ID, "effect": "allow"},
     ]
@@ -271,7 +307,7 @@ def generate_binding(
     encoded = _json(config)
     manifest = {
         "version": "tessera-opencode-v2-binding-v1",
-        "account_mode": ACCOUNT_MODE,
+        "account_mode": found.account_mode,
         "harness_version": harness_version,
         "harness_schema_sha256": harness_schema_sha256,
         "installed_build_sha256": installed_build_sha256,
@@ -381,14 +417,16 @@ def verify_binding(
         raise BindingBlocked("selected_skill_pin_changed")
     if catalog_sha256(observed_catalog) != manifest["catalog_sha256"]:
         raise BindingBlocked("observed_catalog_pin_changed")
+    provider = _manifest_provider(manifest)
     if (
-        account_mode != ACCOUNT_MODE
+        account_mode != manifest["account_mode"]
         or included_oauth_verified is not True
-        or provider_id != "openai"
-        or "openai/" + model_id != manifest["model"]
-        or "openai/" + model_id not in manifest["approved_models"]
+        or provider_id != provider
+        or provider + "/" + model_id != manifest["model"]
+        or provider + "/" + model_id not in manifest["approved_models"]
     ):
         raise BindingBlocked("included_oauth_model_admission_missing")
+    _admit_destination(account_mode, manifest["approved_models"])
     if not isinstance(principal_status, dict) or not isinstance(
         principal_status.get("actions"), list
     ):
@@ -441,7 +479,7 @@ def verify_binding_v2(binding, *, verifier, evidence, expected):
         or manifest["installed_build_sha256"] != pins.build
         or manifest["harness_schema_sha256"] != pins.harness_schema
         or verifier.scope.role != manifest["role"]
-        or "openai/" + verifier.model != manifest["model"]
+        or _manifest_provider(manifest) + "/" + verifier.model != manifest["model"]
         or manifest["model"] not in manifest["approved_models"]
         or verifier.scope.credential != manifest["subject_credential_id"]
         or verifier.scope.project != manifest["project_id"]

@@ -229,7 +229,7 @@ def test_data_class_v61_migration_marks_existing_snapshots_private_derived(tmp_p
         db.execute(
             "UPDATE operator_backup_health SET last_success_at='synthetic',last_backup_id='old'"
         )
-    assert migrate_state(migrated) == LATEST_SCHEMA_VERSION == 72
+    assert migrate_state(migrated) == LATEST_SCHEMA_VERSION == 73
     assert migrate_state(migrated) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(fresh / "tessera.sqlite3") as expected:
         with sqlite3.connect(migrated / "tessera.sqlite3") as actual:

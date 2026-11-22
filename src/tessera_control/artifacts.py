@@ -7,12 +7,16 @@ import binascii
 import hashlib
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
-from .artifact_limits import operator_limits
+from .artifact_limits import (
+    MAX_EXTENDED_HOLD_SECONDS,
+    OUTPUT_REGISTRATION_GRACE_SECONDS,
+    operator_limits,
+)
 from .migrations import plan_digest, plan_payload
 from .models import ExecutionSpec
 from .store import (
@@ -322,16 +326,34 @@ class ArtifactStore(Store):
         )
         return artifact_bytes + staged_bytes + chunked_bytes
 
-    def _late(self, connection: sqlite3.Connection, grant: sqlite3.Row, lease: sqlite3.Row) -> int:
+    def _late(
+        self,
+        connection: sqlite3.Connection,
+        grant: sqlite3.Row,
+        lease: sqlite3.Row,
+        *,
+        registered_at: str | None = None,
+        manifest: bool = False,
+    ) -> int:
+        """1 when output is late. ``registered_at`` is when the artifact's upload began (now, for a
+        single request); a manifest takes its lateness from its artifacts, not from this call."""
         task = connection.execute(
             "SELECT revision, status, current_plan_digest FROM tasks WHERE id = ?",
             (grant["task_id"],),
         ).fetchone()
         try:
+            now = self._now()
+            expired = (
+                _parse_utc(grant["expires_at"]) <= now or _parse_utc(lease["expires_at"]) <= now
+            )
             return int(
                 grant["status"] != "active"
-                or _parse_utc(grant["expires_at"]) <= self._now()
-                or _parse_utc(lease["expires_at"]) <= self._now()
+                or (
+                    expired
+                    and not self._exited_inside_grant(
+                        connection, grant, lease, now, None if manifest else registered_at or now
+                    )
+                )
                 or grant["epoch"] != lease["epoch"]
                 or task is None
                 or task["revision"] != grant["task_revision"]
@@ -340,6 +362,50 @@ class ArtifactStore(Store):
             )
         except (TypeError, ValueError, KeyError):
             return 1
+
+    @staticmethod
+    def _exited_inside_grant(
+        connection: sqlite3.Connection,
+        grant: sqlite3.Row,
+        lease: sqlite3.Row,
+        now: datetime,
+        registered_at: datetime | str | None = None,
+    ) -> bool:
+        """True when the run's confirmed exit was recorded inside the grant and lease lifetime.
+
+        Outputs of such a run are still the run's own, however long they take to arrive, so an
+        expiry that came after the exit does not make them late while the grant is still active
+        and the hold of ADR 0064 (bounded by ``MAX_EXTENDED_HOLD_SECONDS`` after the exit) lasts.
+        An artifact must also have registered its upload within
+        ``OUTPUT_REGISTRATION_GRACE_SECONDS`` of that exit, on control's clock: the exit report
+        and the receipt's finish time are the worker's word, but when the upload began is not, so a
+        worker that reports an exit early and keeps computing is late unless it registers inside
+        the grace (``registered_at`` is None for a manifest, which follows its artifacts).
+        The grant's tenant, epoch and plan checks in ``_late`` are unchanged (ADR 0086)."""
+        rows = connection.execute(
+            """SELECT observed_state, termination_confirmed, recorded_at FROM execution_observations
+            WHERE lease_id=? AND epoch=? ORDER BY rowid""",
+            (lease["id"], lease["epoch"]),
+        ).fetchall()
+        if (
+            not rows
+            or rows[-1]["observed_state"] != "exited"
+            or not rows[-1]["termination_confirmed"]
+        ):
+            return False
+        exited = min(
+            _parse_utc(row["recorded_at"])
+            for row in rows
+            if row["observed_state"] == "exited" and row["termination_confirmed"]
+        )
+        within = min(_parse_utc(grant["expires_at"]), _parse_utc(lease["expires_at"]))
+        if registered_at is not None:
+            registered = (
+                _parse_utc(registered_at) if isinstance(registered_at, str) else registered_at
+            )
+            if registered > exited + timedelta(seconds=OUTPUT_REGISTRATION_GRACE_SECONDS):
+                return False
+        return exited <= within and now < exited + timedelta(seconds=MAX_EXTENDED_HOLD_SECONDS)
 
     def _insert_artifact(
         self,
@@ -351,6 +417,7 @@ class ArtifactStore(Store):
         content: bytes,
         *,
         size: int | None = None,
+        registered_at: str | None = None,
     ) -> dict[str, Any]:
         """Insert a quarantined artifact; ``size`` is given only for chunk-stored bytes.
 
@@ -385,7 +452,7 @@ class ArtifactStore(Store):
             "created_at": utc_now(),
             "status": "quarantined",
             "classification": "unclassified",
-            "late": self._late(connection, grant, lease),
+            "late": self._late(connection, grant, lease, registered_at=registered_at),
         }
         connection.execute(
             """INSERT INTO artifacts (id, project_id, task_id, grant_id, lease_id,
@@ -635,7 +702,13 @@ class ArtifactStore(Store):
                 (utc_now(), upload_id),
             )
             return 201, self._insert_artifact(
-                connection, actor, lease, grant, body, row["staged_content"]
+                connection,
+                actor,
+                lease,
+                grant,
+                body,
+                row["staged_content"],
+                registered_at=row["created_at"],
             )
 
         return self._mutate(

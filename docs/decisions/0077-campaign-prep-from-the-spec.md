@@ -67,6 +67,11 @@ unreadable manifest, public data without evidence) carries no hint. The owner mo
 - An artifact's digest is known only if the artifact exists when the spec is submitted.
 - Image building, and listing a provider in trust, remain operator work.
 
+The adapter's `tenant` argument is required (`expand_spec`, `expand_with_registered`): a caller that has
+an organization passes `(org_id, project_id)` and a profile of any other organization is unknown to it;
+`None` is for offline validation only and must be written out. Offline checks outside this repository
+that call `expand_spec` must pass `tenant=None`.
+
 ## Tests
 
 `tests/test_salad_prep_automation.py`: composed digest equal to the runner's for several snapshot and

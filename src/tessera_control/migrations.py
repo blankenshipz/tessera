@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 72
+LATEST_SCHEMA_VERSION = 73
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1429,3 +1429,28 @@ def migrate_holdout_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(HOLDOUT_SCHEMA_VERSION - 1, migrate_holdout_schema)
+
+
+# Review jobs (schema 73): client-requested research/review jobs, findings and human
+# decisions (ADR 0084). Additive and idempotent; registered with setdefault. If another change
+# owns this version when branches merge, raise REVIEW_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION
+# and the fresh-database INSERT in store.py).
+REVIEW_SCHEMA_VERSION = 73
+
+
+def migrate_review_schema(connection: sqlite3.Connection) -> None:
+    from .review_jobs import create_review_jobs_schema
+
+    create_review_jobs_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (REVIEW_SCHEMA_VERSION,)
+    )
+
+
+MIGRATIONS.setdefault(REVIEW_SCHEMA_VERSION - 1, migrate_review_schema)

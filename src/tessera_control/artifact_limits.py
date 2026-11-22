@@ -27,6 +27,14 @@ CHUNK_BYTES = 4 * MiB
 DEFAULT_MAX_ARTIFACT_BYTES = 8 * GiB
 DEFAULT_MAX_PROJECT_BYTES = 32 * GiB
 ABSOLUTE_MAX_ARTIFACT_BYTES = 1024 * GiB
+# The longest an exited run's outputs may still arrive after control recorded its exit: the hold
+# of an exited attempt past its grant's expiry (ADR 0064) and the limit of the not-late rule for
+# its artifacts and manifest (ADR 0086).
+MAX_EXTENDED_HOLD_SECONDS = 2 * 3600
+# How long after control recorded a run's confirmed exit its outputs may still register (begin an
+# upload) and ride the hold or the not-late rule (ADRs 0064, 0086). A worker that reports its exit
+# and then keeps computing gains at most this much before it must register.
+OUTPUT_REGISTRATION_GRACE_SECONDS = 120
 
 # The control service refuses a request body above this (a reverse proxy in front may bound it
 # lower: set this to the smaller of the two). It also decides how large a part of a large-artifact

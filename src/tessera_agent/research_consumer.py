@@ -17,6 +17,12 @@ from tessera_control.public_capture import CaptureBinding
 from tessera_mcp.harness_binding import verify_binding
 from tessera_mcp.mcp_workflow import Consume, Observation, ReviewRequest
 
+from .model_destinations import (
+    RUNTIME_OPENCODE,
+    DestinationRefused,
+    destination_for_account_mode,
+    require_runtime,
+)
 from .research_consumer_store import ConsumerBlocked, canonical
 
 
@@ -119,7 +125,16 @@ class ResearchConsumer:
         # No effect or public-output read until installed MCP/skill/config/principal
         # observations have passed the existing full binding verifier.
         manifest = json.loads(self.harness_binding.manifest)
-        if manifest["model"] != "openai/" + self.binding["model_id"]:
+        try:
+            provider = require_runtime(
+                destination_for_account_mode(
+                    manifest.get("account_mode", "included-chatgpt-oauth")
+                ),
+                RUNTIME_OPENCODE,
+            ).provider_id
+        except DestinationRefused:
+            raise ConsumerBlocked("consumer_model_changed") from None
+        if manifest["model"] != provider + "/" + self.binding["model_id"]:
             raise ConsumerBlocked("consumer_model_changed")
         if self.admission_version == "v2":
             verifier = self.observation_reader.verifier

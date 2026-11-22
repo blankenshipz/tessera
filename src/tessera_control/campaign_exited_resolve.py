@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from .artifact_limits import MAX_EXTENDED_HOLD_SECONDS, OUTPUT_REGISTRATION_GRACE_SECONDS
 from .execution import reconcile_grant_row
 from .external_operations import confirmed_exit_code, current_operation_reconciliation
 from .store import Conflict, canonical_digest
@@ -57,13 +58,12 @@ EXIT_CONFIRMED_UNRESOLVED = "exit_confirmed_unresolved"
 # retries (ADR 0058) they keep the transient, retried path; every other confirmed nonzero code
 # is a final failure carrying that code (ADR 0063). The spec's own codes replace this default.
 INFRA_EXIT_CODES = frozenset({137})
-GRACE_SECONDS = 120
+GRACE_SECONDS = OUTPUT_REGISTRATION_GRACE_SECONDS
 # A large upload whose held bytes have not changed for this long no longer counts as arriving.
 UPLOAD_STALL_SECONDS = 600
 # Past its grant's expiry an exited attempt is held for its outputs at most this long after control
 # recorded the exit, and never beyond the campaign's approval window: a trickle of bytes cannot
 # keep a slot and a grant open for the upload's own 24 hours (ADR 0064).
-MAX_EXTENDED_HOLD_SECONDS = 2 * 3600
 RESOLVABLE = ("admitted", "running", "unknown")
 UNRESOLVED_GRANT = ("active", "cancel_requested")
 
@@ -177,8 +177,13 @@ def uploads_arriving(
     now: datetime,
     progress: UploadProgress | None = None,
     deadline: datetime | None = None,
+    exit_recorded: datetime | None = None,
 ) -> bool:
     """True while this grant's outputs are still reaching control (ADR 0064).
+
+    With ``exit_recorded`` the first ``GRACE_SECONDS`` after the exit always count, whether or not
+    the grant has expired: the worker reports the exit before it hashes and registers its outputs,
+    so nothing is open yet (ADR 0086).
 
     An open large upload that has not expired counts while its held bytes changed within the
     stall window (always, when no ``progress`` watcher is given); a completed upload or an
@@ -190,6 +195,11 @@ def uploads_arriving(
     is not coarser than one request and survives a worker restart that resumes mid-chunk. A single
     whole-chunk request is bounded by the worker's own request timeout (seconds), far below the
     stall window."""
+    if exit_recorded is not None and (now - exit_recorded).total_seconds() < GRACE_SECONDS:
+        if progress is not None:  # keep watching, so a stall window is measured from first sight
+            for upload in open_uploads(connection, grant_id):
+                progress.last_change(upload["id"], held_bytes(connection, upload["id"]), now)
+        return True
     if deadline is not None and now >= deadline:
         return False
     for upload in open_uploads(connection, grant_id):
@@ -295,16 +305,16 @@ def assess(
     ).fetchone()
     exit_recorded = exit_recorded_at(connection, seen)
     deadline = hold_deadline(grant, exit_recorded, approval_expires)
-    if uploads_arriving(connection, grant_id, now, progress, deadline):
+    pre_registration = (
+        exit_recorded if attempt["status"] != "unknown" and manifest is None else None
+    )
+    if uploads_arriving(connection, grant_id, now, progress, deadline, pre_registration):
         return None  # outputs are still reaching control: closing now would discard them
     if attempt["status"] != "unknown":  # admitted or running: the normal flow may still collect it
         if receipt is not None:
             return None  # the normal flow collects and settles it
-        if now < _parse(grant["expires_at"]):
-            if _collecting(connection, grant_id, now):
-                return None  # a live lease or an upload in progress: the worker is still at it
-            if (now - exit_recorded_at(connection, seen)).total_seconds() < GRACE_SECONDS:
-                return None  # the receipt and manifest may still arrive
+        if now < _parse(grant["expires_at"]) and _collecting(connection, grant_id, now):
+            return None  # a live lease or an upload in progress: the worker is still at it
     hold = int(grant["max_exposure_cents"])
     cents = 0  # a non-billable worker-grant provider costs nothing, so never above the hold
     exit_code = receipt["exit_code"] if receipt is not None else None

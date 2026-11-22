@@ -30,7 +30,9 @@ class ControlClient:
         self.config = config
         self.transport = transport
 
-    async def _request(self, method, path, *, body=None, key=None, max_bytes=2 * 1024 * 1024):
+    async def _request(
+        self, method, path, *, body=None, key=None, max_bytes=2 * 1024 * 1024, relay_refusal=False
+    ):
         headers = {
             "Authorization": "Bearer " + self.config.token(),
             "X-Agent-Destination": self.config.destination,
@@ -51,6 +53,16 @@ class ControlClient:
                 else True,
             ) as client:
                 async with client.stream(method, path, json=body, headers=headers) as response:
+                    if response.status_code == 409 and relay_refusal:
+                        # Only for routes whose refusal body is {status, reason} operator text
+                        # (provider registration): the model needs the reason to fix its request.
+                        raw = await response.aread()
+                        try:
+                            reason = json.loads(raw[:8192]).get("reason")
+                        except (ValueError, AttributeError):
+                            reason = None
+                        if isinstance(reason, str):
+                            raise ControlError(f"Refused (HTTP 409): {reason[:500]}")
                     if response.status_code not in {200, 201}:
                         # Never load/relay denial bodies, which could contain protected content.
                         raise ControlError(
@@ -133,6 +145,18 @@ class ControlClient:
             f"/projects/{segment(self.config.project_id)}/campaigns",
             body=body,
             key=idempotency_key,
+        )
+
+    async def list_campaign_providers(self):
+        return await self._request("GET", "/admin/campaign-providers")
+
+    async def register_campaign_provider(self, body, idempotency_key):
+        return await self._request(
+            "POST",
+            "/admin/campaign-providers",
+            body=body,
+            key=idempotency_key,
+            relay_refusal=True,
         )
 
     async def provider_trust(self):

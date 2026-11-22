@@ -990,7 +990,14 @@ class LargeArtifactStore(ArtifactStore):
                 (utc_now(), upload_id),
             )
             return 201, self._insert_artifact(
-                connection, actor, lease, grant, body, b"", size=manifest["size"]
+                connection,
+                actor,
+                lease,
+                grant,
+                body,
+                b"",
+                size=manifest["size"],
+                registered_at=row["created_at"],
             )
 
         try:

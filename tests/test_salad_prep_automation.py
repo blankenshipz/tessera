@@ -46,7 +46,7 @@ def fake_entries(files=None, art=None):
 
 
 def expanded(world, entries, **over):
-    return expand_spec(parse_spec(spec_of(world, **over)), world.profiles, entries)
+    return expand_spec(parse_spec(spec_of(world, **over)), world.profiles, entries, tenant=None)
 
 
 def config(spec):

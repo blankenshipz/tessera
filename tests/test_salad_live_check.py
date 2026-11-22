@@ -1355,8 +1355,22 @@ def test_start_waits_until_the_group_reads_settled_not_just_stopped():
     receipt = drive(session, max_polls=8)
     first = session.actions.index("start")
     assert session.actions[:first].count("observe") == 4  # three unsettled reads, one settled
-    assert receipt["prestart_settle"] == {"polls": 4, "provider_status": "stopped", "settled": True}
+    assert receipt["prestart_settle"] == {
+        "polls": 4,
+        "provider_status": "stopped",
+        "settled": True,
+        "waited_seconds": 0.0,
+    }
     assert receipt["status"] == "passed"
+
+
+def test_the_settle_block_is_a_closed_set_of_plain_values():
+    receipt = drive_clocked(UnsettledSession(unsettled=10_000), max_polls=40, max_seconds=400)
+    block = receipt["prestart_settle"]
+    assert set(block) == {"polls", "provider_status", "settled", "waited_seconds"}
+    assert type(block["polls"]) is int and type(block["settled"]) is bool
+    assert type(block["waited_seconds"]) is float and block["waited_seconds"] >= 0
+    assert block["provider_status"] in {"stopped", "running", "pending", "unknown"}
 
 
 def test_a_group_that_stays_stopped_but_unsettled_is_handed_to_start_after_the_bound():
@@ -1366,3 +1380,4 @@ def test_a_group_that_stays_stopped_but_unsettled_is_handed_to_start_after_the_b
     assert receipt["prestart_settle"]["settled"] is False
     assert receipt["prestart_settle"]["provider_status"] == "stopped"
     assert session.now >= 45  # it waited the bounded settle window first
+    assert receipt["prestart_settle"]["waited_seconds"] >= 45  # and the receipt says what it cost

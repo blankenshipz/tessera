@@ -42,6 +42,29 @@ What a client with every tool enrolled still cannot do:
   deadline); reconcile a grant that is not a confirmed exit; stage or release data (human).
 - Read artifact bytes: outputs are metadata and digests only; bytes need a human-released snapshot.
 - Pause or limit one stage rather than the campaign (only single-stage cancel exists).
+- Research/review jobs (ADR 0084): a job has no cancel route although the state `cancelled`
+  exists; no spend, held or settled figure is recorded (`budget_cents` is the cap only) and
+  `tessera_project_spend` does not count jobs; `review.md` is not retrievable, only its digest;
+  tool registration is all-or-nothing, so a read-only credential sees the submit tool (the
+  control API then refuses it) although its doc says a tool registers only with its own scope.
+  Ingesting findings is deliberately not an MCP tool, and nothing in the tree runs a job: the
+  runner seams (`mark_running`, `mark_failed`) have no route and no code turns a model call's
+  output into findings, so the research steering test supplies both.
+- A review job's `receipt_digest` is a claim, not a check: control stores whatever 64-hex digest
+  the reviewer identity posts and does not compare it to the model-call receipt (ADR 0083), which
+  lives in the reasoning journal on the operator's host. Status: unverified, so treat a
+  `completed` job as "findings posted", not as "a model run is proven", until the digest is
+  compared with that receipt by a person or a later check. The research steering test pins that
+  the digest it posts is the real receipt's, but cannot make control verify it.
+- The standing agent loop (ADR 0085) can be paused and read through `tessera_pause_agent_loop`
+  and `tessera_agent_loop_status` (ADR 0089). A pause needs the `loop:pause` scope and is recorded
+  on the platform as an `agent_loop.paused` event naming the principal (a request record, not
+  proof the loop saw it); resuming, resetting a halt and resolving an uncertain call are the
+  operator's. No code connects the loop to the control API: its work
+  source, its model call and its submitter are written by the host that runs it.
+- The model destination is Anthropic, called directly through the Messages API by an API-key
+  reference (ADR 0082); the key is read from a private credential file, never from the
+  environment, and the loop refuses to run with an API-key environment variable set.
 
 Limits of what exists:
 
@@ -70,12 +93,24 @@ duplicated here; this table is rechecked when those land.
 | Adjust budget | `tessera_reduce_campaign_budget` | present (lower-only, never below held plus settled) |
 | Adjust concurrency | `tessera_limit_campaign_concurrency` | present (lower-only; ADR 0061) |
 | Adjust placement preference | `tessera_steer_campaign_placement` | present (filters approved candidates, never adds one; ADR 0060) |
-| Approve within delegation | `tessera_approve_campaign` | present, operator-enabled (`--approval-tool`, which alone is an approve-only server; [ADR 0065](decisions/0065-operator-enabled-mcp-approval-tool.md)), a person's credential only; unlock conditions and pre-approvals not exposed; `tessera_campaign_standing_status` shows standing approvals read-only |
+| Approve within delegation | `tessera_approve_campaign` | present, operator-enabled; see note 1 |
 | Pause / resume | `tessera_pause_campaign`, `tessera_resume_campaign` | present (ADR 0061) |
 | Stop / cancel | `tessera_cancel_campaign`, `tessera_cancel_campaign_stage`, `tessera_revoke_campaign_release` | present |
 | Rerun failed stages | `tessera_prepare_stage_retry` (builds a new spec; submits nothing), `tessera_rerun_campaign` | present: a server-side re-run submits a new campaign for the failed stages ([ADR 0069](decisions/0069-rerun-a-finished-campaign.md)); its cap is bounded by what the whole re-run tree has committed and `tessera_get_campaign` shows `rerun_tree` ([ADR 0074](decisions/0074-rerun-spend-is-bounded-across-the-chain.md)) |
 | Claim sealed holdout scoring | `tessera_campaign_holdout`, `tessera_campaign_holdout_claims` | read-only views, see [ADR 0068](decisions/0068-sealed-holdout-evaluation-stages.md). No tool opens, reopens or releases a claim: the runner opens it, once per scope |
 | Retrieve outcomes | `tessera_get_campaign_receipt`, `tessera_campaign_outputs`, `tessera_campaign_gate_decisions`, `tessera_experiment_results`, `tessera_program_results` | present; output bytes stay behind a human-released snapshot |
+| Research/review jobs: submit, list, read, list and read findings | `tessera_submit_review_job`, `tessera_list_review_jobs`, `tessera_read_review_job`, `tessera_list_review_findings`, `tessera_read_review_finding` | present (ADR 0084; opt-in, scopes `review:submit`, `review:read`) |
+| Research/review jobs: accept or reject a finding, approve a tier | `tessera_resolve_review_finding`, `tessera_approve_review_job_tier` | present; a person's session credential on a `--review-decision-tool` server only, by design |
+| Pause and inspect the standing agent loop | `tessera_pause_agent_loop`, `tessera_agent_loop_status` | present, opt-in (`--agent-loop-marker`; [ADR 0089](decisions/0089-mcp-agent-loop-pause-and-status.md)); pause only, a person lifts it |
+
+Notes:
+
+1. `tessera_approve_campaign` is operator-enabled with `--approval-tool`, which alone makes an
+   approve-only server ([ADR 0065](decisions/0065-operator-enabled-mcp-approval-tool.md)). It
+   takes a person's credential only. Unlock conditions and pre-approvals are not exposed, and
+   `tessera_campaign_standing_status` shows standing approvals read-only.
+2. References to a change that has not landed are plain text; update or remove them when it
+   lands.
 
 `tessera_project_spend` (`GET /projects/{p}/agent-spend`):
 without it a client could read one campaign's cap but not the ceiling it works within. It
@@ -88,7 +123,3 @@ nothing, and ADR 0047's destination rules are untouched.
 
 When a tool is still on another change, mark it "(pending)" here: the consistency test fails
 while a "(pending)" tool is registered, until the marker is removed.
-
-Still missing on purpose (human authority): approving with an unlock condition or pre-approvals,
-recording a gate go or no-go, creating a standing approval, raising a cap or limit, extending a
-deadline, reconciling a grant that is not a confirmed exit, staging or releasing data.

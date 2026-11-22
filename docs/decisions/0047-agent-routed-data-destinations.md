@@ -1,5 +1,16 @@
 # 0047 — Agents route data across configured providers, never to the public internet
 
+## Amendment (2026-11-22)
+
+By owner direction, 2026-11-22, the reasoning plane's enrolled model destinations
+([ADR 0082](0082-agent-loop-anthropic-destination.md)) are an operator-attested destination
+class, separate from provider trust: they are not providers in the provider-trust file and
+this record's "registered" does not describe them. The hard public-internet invariant is
+unchanged for campaign stages. Sealed holdout data (ADR 0068) is never admissible as a model
+input; for the reasoning plane that is now checked in code before the prompt is sent
+(`refuse_sealed_inputs`, failing closed). The Anthropic destination is called directly through
+Tessera's Messages API client with an API-key reference; no subscription login is involved.
+
 ## Status
 
 Implemented (no schema change). Extends the provider trust setting of
@@ -47,3 +58,14 @@ work across providers (for example private derived training data on a GPU provid
 - A workload that must download public bytes (model weights, packages) cannot take
   non-public input on a provider whose egress is provider-wide; it must receive those bytes
   through a snapshot instead.
+
+## Addendum (2026-11-22): operator-registered model destinations
+
+This addendum clarifies decision 3 and does not change it. The hard invariant concerns the public
+internet and unregistered destinations. An operator-registered model destination (enrolled by the
+operator, limited to the classes its registry entry lists, and reached only through a model-runtime
+allowlist that is not the stage or sandbox allowlist) is a registered destination, never a
+public-internet exception. A private class may reach it only if the registry entry lists that
+class. Stage specs still cannot declare egress for non-public inputs. The destination registry is
+decided in ADR 0082; client-requested review jobs ([ADR 0084](0084-research-review-journeys.md))
+rely on it and refuse private inputs until it exists.

@@ -21,9 +21,11 @@ from .campaign_delegation import STEP_TABLE
 from .campaign_models import SALAD_BACKEND, SALAD_RUNTIME, SALAD_TARGET, SaladStageSpec
 from .campaign_providers import (
     ComputeProvider,
+    ConfigSection,
     GrantRequest,
     Observation,
     OutputLimits,
+    PlacementCapability,
     PrepareResult,
     ProviderDescriptor,
     RunnerServices,
@@ -36,6 +38,8 @@ from .campaign_salad import SaladStageDriver, salad_config
 from .campaign_store import SALAD_REFUSAL
 from .models import ExecutionSpec
 from .salad_campaign_profiles import (
+    PROFILES_SCHEMA,
+    SaladCampaignProfile,
     SaladCampaignProfiles,
     stage_has_nonpublic_input,
 )
@@ -118,6 +122,10 @@ class SaladRouteProvider:
             raise ValueError(f"{label}: the workload contract declares provider-wide egress")
         if not stage.inputs:
             raise ValueError(f"{label}: a Salad stage needs at least one input")
+        if getattr(stage, "scratch_bytes", None) is not None:
+            # Salad grants no scratch request (ADR 0059): its disk is the profile's. Refused
+            # rather than ignored, so a placed stage never runs without the scratch it asked for.
+            raise ValueError(f"{label}: scratch_bytes is not granted by Salad")
         if stage.retry.transient_exit_codes:
             raise ValueError(f"{label}: Salad stages have no exit code to classify as transient")
         if stage.max_exposure_cents < 1:
@@ -369,6 +377,10 @@ class SaladRouteProvider:
             (cents, stamp, attempt_id),
         )
 
+    def placement_capability(self, stage: Any) -> PlacementCapability:
+        """Rented capacity; CPU or GPU as the stage's own Salad block says (ADR 0088)."""
+        return PlacementCapability("remote", "gpu" if salad_config(stage).gpu else "cpu")
+
     def sweep(self, rt: RunnerServices) -> None:
         """Confirm bounded-hold settlements of terminal campaigns (events only)."""
         self.driver(rt).sweep_unconfirmed()
@@ -440,6 +452,46 @@ def register_from_config(config: dict | None) -> None:
         else:
             raise ValueError(f"Provider id {PROVIDER_ID!r} is already registered")
     register_provider_instance(profiles)
+
+
+def config_sections() -> tuple[ConfigSection, ...]:
+    """Salad campaign profiles in the operator file (ADR 0081)."""
+
+    def validate(document: dict) -> None:
+        if document.get("salad_profiles") is not None:
+            SaladCampaignProfiles.model_validate(document["salad_profiles"])
+
+    def describe(entry: dict) -> dict:
+        profile = SaladCampaignProfile.model_validate(entry)
+        return {
+            "resource_class": "gpu" if profile.gpu else "cpu",
+            "gpu_class": profile.gpu_class,
+            "cpu_millicores": profile.cpu_millicores,
+            "memory_mb": profile.memory_mb,
+            "disk_mb": profile.disk_mb,
+            "route_max_seconds": profile.route_max_seconds,
+            "max_run_cents": profile.max_run_cents,
+            "max_task_cents": profile.max_task_cents,
+            "allowed_image_digests": list(profile.allowed_image_digests),
+            "credential_reference": profile.credential_reference,
+            "custody_host": profile.custody_host,
+            "stage_adapter": getattr(profile, "stage_adapter", None) is not None,
+        }
+
+    return (
+        ConfigSection(
+            name="salad-profile",
+            provider=PROVIDER_ID,
+            path=("salad_profiles", "profiles"),
+            key_field="name",
+            model=SaladCampaignProfile,
+            validate=validate,
+            describe=describe,
+            worker=lambda entry: entry.get("worker_principal_id"),
+            container=lambda: {"schema": PROFILES_SCHEMA, "profiles": []},
+            scope="organization",
+        ),
+    )
 
 
 try:

@@ -1,0 +1,19 @@
+# Optional drop-in for an OpenAI included-ChatGPT-OAuth profile.
+# Install:
+#   install -m 0644 openai.conf.example \
+#     /etc/systemd/system/tessera-reasoning.service.d/openai.conf
+#   systemctl daemon-reload
+# It resets the credential list with an empty LoadCredential= and re-adds only the
+# four OpenAI-path references (the harness password is loaded only here), so neither the Anthropic
+# API key nor the model-credential reference is loaded.
+# Verify with: systemctl show -p LoadCredential tessera-reasoning
+# This drop-in adds no [Install] section. Startup still refuses an API-key variable
+# or an unadmitted model.
+# To return to the Anthropic default (direct Messages API), remove the drop-in and run
+# systemctl daemon-reload.
+[Service]
+LoadCredential=
+LoadCredential=profile:/etc/tessera/reasoning.json
+LoadCredential=prompt:/etc/tessera/reasoning-prompt.txt
+LoadCredential=agent-token:/etc/tessera/credentials/reasoning-agent-token
+LoadCredential=harness-password:/etc/tessera/credentials/reasoning-harness-password

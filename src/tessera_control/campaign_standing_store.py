@@ -89,7 +89,7 @@ class StandingApprovalCommands:
             spec = expand_with_registered(
                 body.spec,
                 self.adapter_entries(connection, live, project_id),
-                (live["org_id"], project_id),
+                tenant=(live["org_id"], project_id),
             )
             if any(
                 getattr(source, "kind", None) == "receipt_output"

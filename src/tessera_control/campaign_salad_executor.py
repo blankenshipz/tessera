@@ -1,4 +1,4 @@
-"""Operator-run executor for Salad GPU campaign stages (ADR 0038 amendment).
+"""Operator-run executor for Salad campaign stages, GPU and CPU (ADR 0038 amendment).
 
 Runs on the trusted Linux server with the trusted-server worker credential. It leases and
 packages admitted Salad grants, keeps leases alive, runs each started route through the
@@ -6,6 +6,10 @@ unchanged ``salad_live_check --run`` subprocess, imports sealed custody, uploads
 files through the worker artifact/manifest stores, reports the provider-confirmed exit and
 records its outcome. It never approves, starts, settles, resolves a decision or records a
 charge, and it never calls create/start outside the live driver.
+
+One executor serves every operator profile its config names (``profile`` or ``profiles``,
+ADR 0070) for its worker principal, so a CPU profile (ADR 0062) placed beside a GPU one is
+leased and run by the same process; work for a profile it does not name is refused.
 
     python -m tessera_control.campaign_salad_executor --config FILE [--once] [--health-file PATH]
 """
@@ -22,13 +26,20 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from .salad_campaign_profiles import (
     DATA_POLICIES,
@@ -49,6 +60,7 @@ SUBPROCESS_GRACE_SECONDS = 300
 KEEPALIVE_PHASES = ("leased", "route_started", "executing")
 _IDENT = re.compile(r"[a-zA-Z0-9_-]{1,200}\Z")
 _Path = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+_ProfileName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
 
 
 class _Closed(BaseModel):
@@ -67,7 +79,9 @@ class ExecutorConfig(_Closed):
     schema_id: Annotated[str, Field(alias="schema")]
     state_dir: _Path
     profiles_file: _Path
-    profile: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
+    # Exactly one of ``profile`` (one name) and ``profiles`` (up to eight distinct names).
+    profile: _ProfileName | None = None
+    profiles: Annotated[list[_ProfileName], Field(min_length=1, max_length=8)] | None = None
     worker_credential_file: _Path
     credential_directory: _Path
     guardian_socket: _Path
@@ -84,6 +98,18 @@ class ExecutorConfig(_Closed):
     guardian_retry_seconds: Annotated[int, Field(ge=0, le=30)] = 2
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
+
+    @model_validator(mode="after")
+    def _one_profile_field(self) -> ExecutorConfig:
+        if (self.profile is None) == (self.profiles is None):
+            raise ValueError("name profile or profiles, not both")
+        if self.profiles is not None and len(set(self.profiles)) != len(self.profiles):
+            raise ValueError("profiles must be distinct")
+        return self
+
+    @property
+    def profile_names(self) -> tuple[str, ...]:
+        return (self.profile,) if self.profile is not None else tuple(self.profiles or ())
 
 
 def load_config(path: Path | str) -> ExecutorConfig:
@@ -147,7 +173,8 @@ class ControlPort(Protocol):
 
 
 RouteRunner = Callable[[Path, Path, int], "dict[str, Any] | None"]
-Importer = Callable[[str, Path], "list[dict[str, Any]]"]
+# ``(route id, destination, the profile the attempt's stage names)``.
+Importer = Callable[[str, Path, SaladCampaignProfile], "list[dict[str, Any]]"]
 
 
 class RouteTimeout(Exception):
@@ -198,7 +225,7 @@ class SaladCampaignExecutor:
     def __init__(
         self,
         config: ExecutorConfig,
-        profile: SaladCampaignProfile,
+        profile: SaladCampaignProfile | Sequence[SaladCampaignProfile],
         control: ControlPort,
         *,
         worker_principal_id: str,
@@ -207,9 +234,16 @@ class SaladCampaignExecutor:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.sleep = sleep
-        if profile.worker_principal_id != worker_principal_id:
+        chosen = (profile,) if isinstance(profile, SaladCampaignProfile) else tuple(profile)
+        if not chosen or len({item.name for item in chosen}) != len(chosen):
+            raise ValueError("The executor needs distinct profiles.")
+        if any(item.worker_principal_id != worker_principal_id for item in chosen):
             raise ValueError("The profile belongs to a different worker principal.")
-        self.config, self.profile, self.control = config, profile, control
+        # Every profile this executor serves, by name; ``profile`` is the first (one-profile
+        # configurations read it as before).
+        self.profiles: Mapping[str, SaladCampaignProfile] = {item.name: item for item in chosen}
+        self.profile = chosen[0]
+        self.config, self.control = config, control
         self.route_runner, self.importer = route_runner, importer
         self.work_directory = Path(config.work_directory)
         self._leases: dict[str, tuple[str, int]] = {}
@@ -249,6 +283,10 @@ class SaladCampaignExecutor:
     def _note(self, action: str, attempt_id: str | None, detail: str = "") -> None:
         self.log.append({"action": action, "attempt_id": attempt_id, "detail": detail})
 
+    def _profile_for(self, item: dict[str, Any]) -> SaladCampaignProfile | None:
+        """The served profile the attempt's stage names, or None (never another one)."""
+        return self.profiles.get(item.get("profile") or "")
+
     # -- steps 2 and 3: lease, package, keepalive -------------------------------------------
 
     def _lease_and_package(self, item: dict[str, Any], pending: set[str]) -> None:
@@ -256,11 +294,12 @@ class SaladCampaignExecutor:
         if grant not in pending and attempt not in self._leases:
             self._note("not_pending", attempt)
             return
-        if item["profile"] != self.profile.name:
+        profile = self._profile_for(item)
+        if profile is None:
             self._note("refused_profile", attempt, "different_profile")
             return
         plan = self.control.plan(grant)
-        if not 1 <= plan["budget_cents"] <= self.profile.max_task_cents:
+        if not 1 <= plan["budget_cents"] <= profile.max_task_cents:
             self._note("refused_budget", attempt, "plan_budget_above_profile")
             return
         if attempt not in self._leases:
@@ -314,13 +353,15 @@ class SaladCampaignExecutor:
 
     def _verified_selection(self, item: dict[str, Any], state: dict[str, Any]):
         """Re-derive the exact selection from the operator profile; refuse on any mismatch."""
+        profile = self._profile_for(item)
+        if profile is None:
+            return None
         proposal = state["proposal"]
         selection = proposal["selection"]
         execution = selection["salad"]["execution"]
         if (
             execution.get("argv_binding") != "workload_v1"
-            or (state["org_id"], state["project_id"])
-            != (self.profile.org_id, self.profile.project_id)
+            or (state["org_id"], state["project_id"]) != (profile.org_id, profile.project_id)
             or proposal["operation_id"] != item["operation_id"]
             or not state.get("approved_by")
             or state["desired"] == "stop"
@@ -342,7 +383,7 @@ class SaladCampaignExecutor:
         plan = self.control.plan(item["grant_id"])
         contract = WorkloadContractV1.model_validate(execution["workload"])
         derived = derive_selection(
-            self.profile,
+            profile,
             contract,
             operation_id=proposal["operation_id"],
             epoch=proposal["epoch"],
@@ -356,14 +397,16 @@ class SaladCampaignExecutor:
         )
         if derived.model_dump(mode="json") != selection:
             return None
-        if not 1 <= plan["budget_cents"] <= self.profile.max_task_cents:
+        if not 1 <= plan["budget_cents"] <= profile.max_task_cents:
             return None
-        return derived, plan
+        return derived, plan, profile
 
-    def _write_live_config(self, route_id, state, derived, plan, directory: Path) -> Path:
+    def _write_live_config(
+        self, route_id, state, derived, plan, directory: Path, profile: SaladCampaignProfile
+    ) -> Path:
         from .salad_live_check import MAX_POLLS
 
-        policy = proxy_policy(self.profile, derived)
+        policy = proxy_policy(profile, derived)
         policy_json = policy.model_dump(mode="json")
         policy_json["management"] = policy.management.model_dump(mode="json")
         max_seconds = derived.resources.max_seconds
@@ -406,7 +449,7 @@ class SaladCampaignExecutor:
         if verified is None:
             self._note("refused_selection_mismatch", attempt)
             return
-        derived, plan = verified
+        derived, plan, profile = verified
         directory = self._route_dir(route_id)
         if directory.exists():
             # A directory means a prior pass already launched (or tried to): never re-run.
@@ -421,7 +464,7 @@ class SaladCampaignExecutor:
         receipts = directory / "receipts"
         receipts.mkdir(mode=0o700)
         (directory / "outputs").mkdir(mode=0o700)
-        config_path = self._write_live_config(route_id, state, derived, plan, directory)
+        config_path = self._write_live_config(route_id, state, derived, plan, directory, profile)
         try:
             receipt = self.route_runner(
                 config_path,
@@ -516,8 +559,11 @@ class SaladCampaignExecutor:
         return final
 
     def _import_and_upload(self, item, state, lease) -> str:
+        profile = self._profile_for(item)
+        if profile is None:
+            raise ValueError("the attempt's profile is not served here")
         directory = self._route_dir(item["route_id"]) / "outputs"
-        files = self.importer(item["route_id"], directory)
+        files = self.importer(item["route_id"], directory, profile)
         for entry in files:
             data = (directory / entry["name"]).read_bytes()
             if hashlib.sha256(data).hexdigest() != entry["sha256"] or len(data) != entry["bytes"]:
@@ -762,10 +808,12 @@ def project_guardian_final(
     return projected
 
 
-def trusted_importer(config: ExecutorConfig, profile: SaladCampaignProfile, worker, state_dir):
+def trusted_importer(config: ExecutorConfig, worker, state_dir):
     """Importer over a TrustedSaladServer using the independent custody HTTPS client."""
 
-    def import_route(route_id: str, destination: Path) -> list[dict[str, Any]]:
+    def import_route(
+        route_id: str, destination: Path, profile: SaladCampaignProfile
+    ) -> list[dict[str, Any]]:
         from .remote_execution import RemoteExecutionStore
         from .salad_live_check import _private_bytes
         from .salad_secret_files import PrivateFileSecretResolver
@@ -798,10 +846,11 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
     from .salad_live_check import _private_bytes
     from .store import Store
 
-    profile = load_profiles(config.profiles_file).get(config.profile)
-    if profile is None:
+    loaded = load_profiles(config.profiles_file)
+    profiles = [loaded.get(name) for name in config.profile_names]
+    if any(profile is None for profile in profiles):
         raise ValueError("Unknown Salad campaign profile.")
-    if config.custody.host != profile.custody_host:
+    if any(config.custody.host != profile.custody_host for profile in profiles):
         raise ValueError("Custody host differs from the profile.")
     state_dir = Path(config.state_dir)
     worker = Store(state_dir).authenticate_worker(
@@ -815,10 +864,10 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
 
     return SaladCampaignExecutor(
         config,
-        profile,
+        profiles,
         StoreControl(state_dir, worker, guardian_status),
         worker_principal_id=worker["id"],
-        importer=trusted_importer(config, profile, worker, state_dir),
+        importer=trusted_importer(config, worker, state_dir),
     )
 
 

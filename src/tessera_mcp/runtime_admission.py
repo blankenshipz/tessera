@@ -16,6 +16,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from tessera_agent.model_destinations import (
+    DESTINATIONS,
+    RUNTIME_OPENCODE,
+    DestinationRefused,
+    require_runtime,
+    split_model,
+)
+
 
 class AdmissionDenied(ValueError):
     pass
@@ -123,6 +131,21 @@ class LocalChecks(Closed):
     model: str
 
 
+AnyLocalChecks = LocalChecks
+
+
+def expected_provider(model):
+    """Provider of the pinned model: qualified ``provider/id``, else legacy OpenAI."""
+    if isinstance(model, str) and "/" not in model:
+        return "openai"
+    try:
+        provider = split_model(model)[0]
+        # Evidence for a destination not enrolled on the OpenCode harness is denied.
+        return require_runtime(DESTINATIONS[provider], RUNTIME_OPENCODE).provider_id
+    except DestinationRefused:
+        return None
+
+
 class Quota(Closed):
     outcome: Literal["passed"]
     checked_at: str
@@ -170,7 +193,7 @@ class Evidence(Closed):
     valid_until: str
     scope: Scope
     pins: Pins
-    local: LocalChecks
+    local: AnyLocalChecks
     quota: Quota
     financial: Financial
     provider_facts: ProviderFacts
@@ -219,7 +242,7 @@ class TerminalExpectation:
 class CurrentLocalState:
     """Independent current native check execution and quota, never receipt echo."""
 
-    local: LocalChecks
+    local: AnyLocalChecks
     quota: Quota
     executed_at: datetime
     expected: "TerminalExpectation"
@@ -444,6 +467,7 @@ class RuntimeAdmissionVerifier:
                 evidence.scope != self.scope
                 or evidence.pins != self.pins
                 or evidence.local.model != self.model
+                or evidence.local.provider != expected_provider(self.model)
             ):
                 raise AdmissionDenied("scope_model_or_full_runtime_pins_changed")
             if (

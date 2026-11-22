@@ -47,7 +47,10 @@ validates the descriptor (id pattern, kind and target agree, positive output lim
 delegated steps) and refuses a malformed one. Optional runner hooks (`sweep`, `on_settled`,
 `experiment_ready`) form the `ProviderHooks` protocol; the runner skips any a provider lacks.
 A settlement whose provider is no longer registered fails closed and is recorded rather than
-skipping that provider's bookkeeping.
+skipping that provider's bookkeeping. A provider may also implement the optional method
+`placement_capability(stage) -> PlacementCapability(tier: local|remote, hardware: cpu|gpu)` to tell
+default placement (ADR 0088) what a candidate is; without it the provider is `other` and stays
+where the spec put it, so a new vendor needs no change to placement.
 
 ### Adapting a local-docker CPU stage to Salad
 
@@ -135,6 +138,69 @@ approved list. A stage without
 Give each instance its own worker principal (a principal binds one provider in the trust file),
 and set `worker_slots` to the pollers that share it, so placement sees real capacity.
 
+### Placement preference by resource class
+
+Contract: [ADR 0070](decisions/0070-salad-first-placement-preference.md). The
+provider file may carry `placement_preferences`, so heavy stages try a preferred provider first
+without every spec author ordering their candidates:
+
+```json
+{"schema": "tessera.campaign-providers.v1",
+ "placement_preferences": {"rules": [
+   {"name": "heavy",
+    "when": {"min_duration_seconds": 1800, "any_tags": ["heavy"]},
+    "prefer": ["salad", "local-docker"]}]}}
+```
+
+A stage matches a rule when any stated criterion holds: its `max_duration_seconds` or
+`scratch_bytes` is at least the bound, or it declares one of the tags in its `placement_tags`
+(a spec field, for example `"placement_tags": ["heavy"]` on a memory-heavy stage; stages have no
+memory request of their own). The first matching rule moves the listed providers that the stage
+already names (its own provider and `alternate_providers`) to the front in the rule's order; the
+rest keep the spec order. It only reorders approved candidates: it never adds a provider, skips
+a check, or changes a hold, and a stage without alternates is unaffected. Every check above still
+runs, so a preferred provider that is busy, untrusted, unenrolled or over budget falls back to the
+next. A placement a rule ordered carries `preference` (rule, criteria matched, spec order and the
+order used) on its `campaign.stage_placed` event and receipt. Rules are validated strictly at
+start (at most 8; each `prefer` 1 to 5 registered provider ids); absent, placement is unchanged.
+Salad grants no `scratch_bytes` and refuses a stage that sets it, so a `min_scratch_bytes` rule
+suits providers that grant scratch (local or self-hosted workers), not Salad.
+`tessera_get_campaign` shows the rules under `placement_preference`, with each matching stage
+and whether the rule `applies` to it (a stage must list the preferred provider as an alternate).
+
+### Default placement by stage class
+
+Contract: [ADR 0088](decisions/0088-default-placement-by-stage-class.md). With no operator rule
+matching, a stage that lists `alternate_providers` is classed from what its approved spec
+declares: `egress_bound` (declares `egress`), `gpu` (tag `gpu`), `heavy` (declared `memory_bytes`
+of at least 1.5 GiB, declared `expected_duration_seconds` of at least 1800 (signal
+`long_expected_runtime`), or a `heavy` or `training` tag), else `light` (no signal). Heavy tries a
+remote CPU candidate first, gpu a remote GPU one, and egress-bound stages (which cannot list a
+rented-capacity alternate at submit anyway; see
+`test_a_stage_that_declares_egress_and_lists_a_salad_alternate_is_refused_at_submit`) keep remote candidates behind the
+others. A light stage is not reordered: it keeps the order its spec wrote, so put the local
+provider first in the spec to keep light stages local. What a candidate is comes from the
+provider's own report (`PlacementCapability`): a worker-grant provider is local CPU, the Salad
+provider is remote and CPU or GPU per the stage's Salad block, and a provider with no report is
+`other` and stays where the spec put it. Candidate kinds on the receipt are `remote_cpu`,
+`remote_gpu`, `local`, `other` and `unknown`. `memory_bytes` (1 MiB to 2 TiB) and
+`expected_duration_seconds` (1 to 604800, not above `max_duration_seconds`) are declared
+estimates read only by placement, not requests or limits, and absent from the serialized spec
+unless set; `max_duration_seconds` is a cap and never a signal. The heavy and GPU tag lists
+(`heavy`, `training`, `gpu`) are fixed generic labels, not operator-configurable (known limit).
+The policy only reorders candidates the spec already lists and the human approved: the spec must
+list the Salad candidate (ADR 0076's `adapt` form helps), it still needs its own review or
+pre-approval, and the checks above still run, so an unregistered, unenrolled, untrusted or
+over-cap or over-budget remote candidate is skipped with its reason and the local provider is
+tried next. A matching operator rule wins. Turn it off with
+`"placement_preferences": {"default_policy": false}`; set `heavy_memory_bytes` and
+`long_runtime_seconds` (default 1800) beside it to change the thresholds; `rules` is optional. To
+read a decision, open `placement.preference` on the receipt attempt or the `campaign.stage_placed`
+event: `source: default_policy`, `class`, `signals`, `kinds`, `spec_order`, `order`, `reordered`,
+`chosen` and `fell_back` (each skipped candidate and why). `tessera_get_campaign` shows a
+`default_policy` block under `placement_preference` (enabled, thresholds, and per stage the
+class, signals, order and whether it applies).
+
 ## The provider file
 
 `tessera serve --campaign-providers FILE` takes one closed, owner-only (0600), secret-free
@@ -146,6 +212,67 @@ credential *reference*, and a worker credential is a file path. The file is read
 
 Provider ids and worker principal ids are placeholders for enrolled principals; the
 deployment's real file is not kept in the repository.
+
+### Registering providers and profiles
+
+Contract: [ADR 0081](decisions/0081-validated-provider-registration.md). Instead of editing the file by
+hand, add, update and list its entries through one validated operation:
+
+```
+tessera providers list   --file /path/to/campaign-providers.json
+tessera providers add    --file /path/to/campaign-providers.json --section salad-profile --entry-file cpu.json
+tessera providers update --file /path/to/campaign-providers.json --section salad-profile --key cpu-2c-4g \
+    --entry-json '{"max_run_cents": 40}' --expected-digest <digest from list> [--dry-run] \
+    [--provider-trust /path/to/provider-trust.json]
+tessera providers audit  --file /path/to/campaign-providers.json
+```
+
+The same operation is `GET` and `POST /admin/campaign-providers` (writes are human-only and
+idempotent) and, when the operator enables `provider_registration_tools`, the MCP tools
+`tessera_list_providers` and `tessera_register_provider`. Sections are `salad-profile`, `self-hosted`,
+`local-docker` and `plugin` (a vendor plugin may add its own through `config_sections()`).
+
+Who may write through the API depends on the section. A `salad-profile` belongs to its organization:
+a human of that organization may add one for its own organization and project and a worker principal
+of that project, and change only profiles it owns (another organization's name is "not
+available", though that tells a caller the name is taken).
+`local-docker`, `self-hosted`, `plugin` and plugin sections are deployment-wide, so only the
+deployment's root owner may change them through the API; the offline command is for whoever owns the
+file. A `self-hosted` instance registers and is trusted under its own `id`, which the list and the trust
+readout use. `GET` hides worker principal ids on deployment-wide entries from other callers.
+
+A CPU and a GPU Salad profile (example values; the credential is a reference, never a value):
+
+```json
+{"name": "cpu-2c-4g", "org_id": "org-example", "project_id": "project-example",
+ "worker_principal_id": "worker-example", "salad_organization": "example-org",
+ "salad_project": "example-project", "country": "US",
+ "cpu_rate": {"vcpu_hour_usd": "0.005", "memory_gb_hour_usd": "0.001"},
+ "cpu_millicores": 2000, "memory_mb": 4096, "disk_mb": 8192, "route_max_seconds": 4200,
+ "capability_environment_id": "salad-cpu-campaign",
+ "artifact_destination": "artifact-ref:quarantine", "checkpoint_destination": "checkpoint-ref:external",
+ "monitor_profile": "<64 hex>", "watchdog_profile": "<64 hex>",
+ "custody_host": "custody.example-tailnet.ts.net",
+ "credential_reference": "credential-ref:salad-management", "credential_version": 1,
+ "allowed_image_digests": ["sha256:<64 hex>"], "max_run_cents": 50, "max_task_cents": 50}
+```
+
+The GPU profile is the same with `"gpu_class": "<GPU class UUID>"` instead of `cpu_rate`.
+
+Refused before anything is written: an unknown section, provider or plugin (or one that is not
+installed); a field the provider's model does not define; an image not given as a `sha256:` digest;
+a cost ceiling or resource outside the provider's limits; a secret-like field name or a
+credential-shaped or high-entropy value; a duplicate name on add, a missing one on update; a changed
+key field; a document that is invalid as a whole; a file changed since `--expected-digest`; and, in
+the API, a Salad profile whose project is not in the caller's organization or whose worker is not a
+registered worker of that project, and a `local-docker` or `self-hosted` worker principal the control
+database does not know (a plugin section has no such check). The write is atomic and
+owner-only, and appends a hash-chained record to `<file>.audit.jsonl`. A change applies at the next
+`serve` start. A result reports which data classes the current provider trust setting admits for the
+entry's worker and what to merge into its trust entry; provider trust stays operator-edited
+([provider trust](provider-trust.md)). The service user must be able to write the file and its
+directory for API writes (otherwise they are refused; the offline command then edits the file).
+Profiles given through `--salad-campaign-profiles` are not editable here.
 
 ## Self-hosted provider
 
@@ -289,6 +416,12 @@ owner. The stage's `/work` tmpfs is mode 1777 and is writable by any user.
 The credential file must be a private regular file (0600, owned by the service user), and
 the config file must not be a symlink or group- or world-writable. The individual flags
 (`--control-url`, `--credential-file`, and so on) still work for a one-off run.
+
+One Salad executor serves every profile its config names: `"profile": "gpu-main"` as before,
+or `"profiles": ["gpu-main", "cpu-main"]` (exactly one of the two; all for the executor's worker
+principal and custody host). Work for a profile it does not name is refused (`refused_profile`)
+and waits at `awaiting_lease` until the grant expires, so list every profile that stages may use,
+including a CPU profile that heavy stages are placed on ([ADR 0070](decisions/0070-salad-first-placement-preference.md)).
 
 ## Service loop contract
 

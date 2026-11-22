@@ -17,7 +17,16 @@ WorkingDirectory=/var/lib/tessera-reasoning
 LoadCredential=profile:/etc/tessera/reasoning.json
 LoadCredential=prompt:/etc/tessera/reasoning-prompt.txt
 LoadCredential=agent-token:/etc/tessera/credentials/reasoning-agent-token
-LoadCredential=harness-password:/etc/tessera/credentials/reasoning-harness-password
+# Default provider: Anthropic Messages API, called directly by Tessera's own client (ADR 0082).
+# anthropic-api-key is a root-owned 0600 operator file holding the API key. Tessera reads it from
+# $CREDENTIALS_DIRECTORY at call time, keeps it in memory only and sends it only to the allowlisted
+# API host; it never reaches the environment, argv, logs, journal or receipts. model-credential is a
+# private file naming the anthropic-api-key:// reference and must equal the profile's credential_ref.
+# No API-key environment variable is accepted: startup refuses ANTHROPIC_API_KEY,
+# ANTHROPIC_AUTH_TOKEN and CLAUDE_API_KEY. The harness password is loaded only by the OpenAI
+# drop-in. For an OpenAI profile install the openai drop-in.
+LoadCredential=model-credential:/etc/tessera/credentials/reasoning-model-credential
+LoadCredential=anthropic-api-key:/etc/tessera/credentials/reasoning-anthropic-api-key
 ExecStart=/opt/tessera/venv/bin/python -m tessera_agent.service_startup reasoning --state-dir /var/lib/tessera-reasoning
 ExecStop=/opt/tessera/venv/bin/python -m tessera_agent.service_startup reasoning-stop --state-dir /var/lib/tessera-reasoning
 Restart=on-failure

@@ -11,6 +11,11 @@ re-run tree's spend bound (ADR 0074) and outcome and receipt retrieval, with eve
 call; approval is `tessera_approve_campaign` on an approve-only server holding a person's own
 credential, and an agent credential is refused there.
 
+`tests/test_mcp_research_steering_e2e.py` does the same for the research loop: the loop's own
+agent creates review jobs when a plan is admitted and advanced, a client pauses the loop with
+`tessera_pause_agent_loop`, the fake model call writes a model-call receipt whose digest lands on
+the job, a reviewer identity ingests findings, and a person accepts one and rejects another.
+
 ## Runbook
 
 One-time operator setup (a person, once per project):

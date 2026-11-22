@@ -698,3 +698,18 @@ def check_narrowing(
             f"send_classes {outside} exceed what the provider trust setting allows "
             f"provider {provider_id!r} to receive"
         )
+
+
+def audit_operator_event(
+    connection: sqlite3.Connection,
+    event_type: str,
+    decision: str,
+    actor: str,
+    payload: dict[str, Any],
+    now: str,
+) -> int:
+    """Append one operator audit event (per organization) for a deployment-wide setting change.
+
+    The public form of the provider setting's own audit writer, used by provider registration
+    (ADR 0081). The payload must never hold secret or entry values."""
+    return _audit(connection, event_type, decision, actor, payload, now)

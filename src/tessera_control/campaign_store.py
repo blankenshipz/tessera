@@ -485,7 +485,7 @@ class CampaignStore(
             spec = expand_with_registered(
                 body.spec,
                 self.adapter_entries(connection, live, project_id),
-                (live["org_id"], project_id),
+                tenant=(live["org_id"], project_id),
             )
             # ADR 0080: receipt_output references become pinned artifact inputs before the
             # spec is digested, so approval binds the exact bytes and lineage.
@@ -1048,6 +1048,8 @@ class CampaignStore(
                 # ADR 0060: where each stage with candidates was placed and why others were
                 # skipped, its steering and, while it waits, the reasons.
                 "placement": campaign_placement.status_view(connection, campaign),
+                # ADR 0070: the operator's placement preference and the stages it covers.
+                "placement_preference": campaign_placement.preference_view(campaign),
                 # ADR 0068: one-time holdout claims this campaign opened, with scored values.
                 "holdout_claims": campaign_claims(connection, campaign_id),
             }

@@ -303,7 +303,7 @@ class ArtifactManifestStore(ArtifactStore):
                 "created_at": utc_now(),
                 "status": "quarantined",
                 "classification": "unclassified",
-                "late": int(bool(self._late(connection, grant, lease)) or any_late),
+                "late": int(bool(self._late(connection, grant, lease, manifest=True)) or any_late),
             }
             connection.execute(
                 """INSERT INTO artifact_manifests

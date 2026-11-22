@@ -21,6 +21,7 @@ from .code_approval import grant_input_classes
 from .data_class import OUTPUT_DATA_CLASS
 from .execution import MAX_OBSERVATION_FUTURE_SKEW, UNRESOLVED_GRANT_STATUSES, ExecutionStore
 from .execution_models import ExecutionRequest, Identifier, Revision
+from .external_operations import current_operation_reconciliation
 from .store import Conflict, NotFound, StoreError, _connect, _parse_utc, _utc_string, utc_now
 
 Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -257,6 +258,24 @@ class ExecutionRunReceiptStore(ExecutionStore):
                 or grant["status"] not in UNRESOLVED_GRANT_STATUSES
             ):
                 raise Conflict("Run receipt authority is no longer current.")
+            exited = connection.execute(
+                """SELECT min(recorded_at) FROM execution_observations
+                WHERE lease_id=? AND epoch=? AND observed_state='exited'
+                AND termination_confirmed=1""",
+                (lease["id"], lease["epoch"]),
+            ).fetchone()[0]
+            if exited is not None and finished > _parse_utc(exited) + MAX_OBSERVATION_FUTURE_SKEW:
+                # A container that finished after control recorded its confirmed exit was still
+                # running when its exit was reported, so its outputs never rode the hold (ADR 0086).
+                raise Conflict("Run receipt finished after the recorded exit.")
+            seen = current_operation_reconciliation(connection, operation_id)
+            if seen is not None and seen["contradiction_state"] in {
+                "same_time_contradiction",
+                "later_adverse_observation",
+            }:
+                # Control's own record shows the container running or unknown again after the
+                # confirmed exit: the exit report cannot be the end of this run (ADR 0086).
+                raise Conflict("Run receipt contradicts a later observation of the container.")
             provider_kind = ADAPTER_PROVIDER_KINDS.get(operation["adapter_version"])
             if provider_kind is None:
                 raise Conflict("No observed-provider receipt mapping for this adapter.")

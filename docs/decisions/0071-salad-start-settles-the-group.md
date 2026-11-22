@@ -69,7 +69,12 @@ the strict parse treated as malformed.
   the count keys instead of only "admission denied".
 - For such a group the executor's pre-start poll never sees the guardian's settled reading and
   waits its full 45 s before every start (bounded, heartbeat kept); that is the honest cost of not
-  confirming from counts that were not sent.
+  confirming from counts that were not sent. The live-check receipt records the wait
+  (`prestart_settle.waited_seconds`), so its cost is visible; revisit the bound once the first
+  live CPU run shows what Salad sends for such a group.
+- Both places that read the counts (the loop's own observation and an operator reconcile) refuse an
+  incomplete read; one test pins each, with the allocation unchanged so nothing else masks the
+  observation guard. The settle block on the receipt is a closed set of plain values.
 - Not covered: whether Salad reports CPU group counts the way the fake here does has to be
   confirmed by a live run; the tolerant parse fails closed on every real instance count it can
   see.

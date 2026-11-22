@@ -77,9 +77,9 @@ def test_pure_expansion_scopes_by_tenant_only_when_given_one(tmp_path, near):
     world = cpu_world(tmp_path, near, **FOREIGN)
     spec = parse_spec(spec_of(world))
     with pytest.raises(Conflict, match="unknown profile"):
-        expand_spec(spec, world.profiles, None, ("org_mine", "proj_mine"))
-    assert expand_spec(spec, world.profiles) is not spec  # no tenant: unchanged behaviour
-    assert expand_spec(spec, world.profiles, None, ("org_other", "proj_other")) is not spec
+        expand_spec(spec, world.profiles, None, tenant=("org_mine", "proj_mine"))
+    assert expand_spec(spec, world.profiles, tenant=None) is not spec  # offline: no tenant
+    assert expand_spec(spec, world.profiles, None, tenant=("org_other", "proj_other")) is not spec
 
 
 # -- 2. standing approvals expand the request ---------------------------------------------------

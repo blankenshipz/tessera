@@ -273,9 +273,15 @@ def expand_spec(
     spec: Any,
     profiles: SaladCampaignProfiles | None,
     entries: InputEntries | None = None,
-    tenant: tuple[str, str] | None = None,
+    *,
+    tenant: tuple[str, str] | None,
 ) -> Any:
-    """``spec`` with every adapter request replaced by its derived candidate (else ``spec``)."""
+    """``spec`` with every adapter request replaced by its derived candidate (else ``spec``).
+
+    ``tenant`` is required: a caller that has an organization passes ``(org_id, project_id)``, and
+    a profile of any other organization or project is then treated as unknown. ``None`` is for
+    offline validation only (no organization exists to check) and must be written out, so a new
+    caller cannot skip the check by forgetting the argument."""
     if not isinstance(spec, CampaignSpecV2):
         return spec
     for own in spec.stages:
@@ -344,11 +350,13 @@ def expand_spec(
 
 
 def expand_with_registered(
-    spec: Any, entries: InputEntries | None = None, tenant: tuple[str, str] | None = None
+    spec: Any, entries: InputEntries | None = None, *, tenant: tuple[str, str] | None
 ) -> Any:
-    """``expand_spec`` with the profiles of the registered Salad provider (None when absent)."""
+    """``expand_spec`` with the profiles of the registered Salad provider (None when absent).
+
+    ``tenant`` is required, as for ``expand_spec``."""
     try:
         provider = stage_provider(SALAD_PROVIDER)
     except KeyError:
         provider = None
-    return expand_spec(spec, getattr(provider, "profiles", None), entries, tenant)
+    return expand_spec(spec, getattr(provider, "profiles", None), entries, tenant=tenant)

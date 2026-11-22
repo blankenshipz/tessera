@@ -1,5 +1,12 @@
 # 0033 — Freeze over-built planes until real experiments pass Outcome 1's gate
 
+## Amendment (2026-11-22)
+
+By owner direction, 2026-11-22, the freeze is lifted for the agent and reasoning plane
+only, so Tessera can run an on-platform agent loop with Anthropic as an enrolled model
+destination. See [ADR 0082](0082-agent-loop-anthropic-destination.md). Every other plane
+below is unchanged.
+
 ## Status
 
 Accepted (2026-11-18, owner direction to act on the Fable concept review §3.3).

@@ -155,7 +155,7 @@ def test_the_manifest_and_receipt_get_a_grace_after_the_last_byte_lands(tmp_path
 def test_an_expired_open_upload_no_longer_holds_the_attempt(tmp_path):
     world, attempt, reach, lease, upload_id = _setup(tmp_path)
     world.env.execute("UPDATE snapshot_chunk_uploads SET expires_at=?", PAST)
-    assert _assess(world, attempt["id"], cer.UploadProgress(), at=_t(1)) is not None
+    assert _assess(world, attempt["id"], cer.UploadProgress(), at=_t(5)) is not None
 
 
 def test_the_runner_does_not_mark_the_attempt_unknown_or_resolve_it_while_uploading(tmp_path):
@@ -281,7 +281,7 @@ def test_part_by_part_growth_of_one_chunk_counts_as_progress_and_survives_a_rest
 def test_the_receipt_evidence_counts_open_and_expired_uploads_separately(tmp_path):
     world, attempt, reach, lease, upload_id = _setup(tmp_path)
     world.env.execute("UPDATE snapshot_chunk_uploads SET expires_at=?", PAST)  # now expired
-    verdict = _assess(world, attempt["id"], cer.UploadProgress(), at=_t(1))
+    verdict = _assess(world, attempt["id"], cer.UploadProgress(), at=_t(5))
     assert verdict.evidence["open_uploads"] == {"unexpired": 0, "expired": 1}
     assert verdict.evidence["hold_ended_by"] is None
     assert "still open" not in verdict.detail  # an expired upload is not described as open

@@ -114,7 +114,7 @@ class CampaignSteeringCommands:
             spec = expand_with_registered(
                 body.spec,
                 self.adapter_entries(connection, live, project_id),
-                (live["org_id"], project_id),
+                tenant=(live["org_id"], project_id),
             )
             # ADR 0080: resolve receipt_output references read-only, exactly as submit does.
             spec = self._resolve_receipt_refs(

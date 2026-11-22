@@ -24,6 +24,7 @@ from .campaign_models import (
     NormalStage,
 )
 from .campaign_providers import (
+    ConfigSection,
     GrantRequest,
     Observation,
     OutputLimits,
@@ -408,6 +409,61 @@ class ProvidersFile(_Strict):
     # Third-party vendor plugins: ``{entry point or module name: that plugin's config}``.
     # Read by ``campaign_providers.load_plugin``; opaque here.
     plugins: dict[str, Any] = {}  # noqa: RUF012
+    # ADR 0070: operator placement preference by resource class. Validated strictly by
+    # ``campaign_placement_preference`` when the file is loaded; opaque here.
+    placement_preferences: Any = None
+
+
+def config_sections() -> tuple[ConfigSection, ...]:
+    """The ``local-docker`` and ``self_hosted`` entries of the operator file (ADR 0081)."""
+
+    def validate(document: dict) -> None:
+        parsed = ProvidersFile.model_validate(document)
+        ids = [item.id for item in parsed.self_hosted]
+        if len(set(ids)) != len(ids) or set(ids) & _RESERVED_IDS:
+            raise ValueError("self_hosted ids must be unique and not local-docker or salad")
+
+    def describe_instance(entry: dict) -> dict:
+        item = SelfHostedInstance.model_validate(entry)
+        return {
+            "resource_class": "cpu",
+            "runtimes": list(item.runtimes),
+            "worker_slots": item.worker_slots,
+            "max_scratch_bytes": item.max_scratch_bytes,
+            "max_total_output_bytes": item.output_limits.max_total_bytes,
+        }
+
+    def describe_local(entry: dict) -> dict:
+        item = LocalDockerConfig.model_validate(entry)
+        return {
+            "resource_class": "cpu",
+            "worker_slots": item.worker_slots,
+            "max_scratch_bytes": item.max_scratch_bytes,
+        }
+
+    return (
+        ConfigSection(
+            name="self-hosted",
+            provider="self-hosted",
+            path=("self_hosted",),
+            key_field="id",
+            model=SelfHostedInstance,
+            validate=validate,
+            describe=describe_instance,
+            worker=lambda entry: entry.get("worker_principal_id"),
+            provider_of=lambda entry: entry.get("id", "self-hosted"),
+        ),
+        ConfigSection(
+            name="local-docker",
+            provider=LOCAL_DOCKER_PROVIDER,
+            path=("local_docker",),
+            key_field=None,
+            model=LocalDockerConfig,
+            validate=validate,
+            describe=describe_local,
+            worker=lambda entry: entry.get("worker_principal_id"),
+        ),
+    )
 
 
 def _descriptor(

@@ -84,6 +84,19 @@ class RemoteProvenanceIdentities(BaseModel):
     destination_digest: str | None = None
 
 
+class RateLimitObservation(BaseModel):
+    """Content-free supervisor-observed model rate-limit/quota backoff metadata."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    backoff_until: float = Field(allow_inf_nan=False)
+    tier: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+    policy_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_serializer(mode="wrap")
+    def omit_absent_metadata(self, handler):
+        return {k: v for k, v in handler(self).items() if v is not None}
+
+
 class AgentProvenanceRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -124,9 +137,12 @@ class AgentProvenanceRecord(BaseModel):
             "canceled",
             "outcome_unknown",
             "invalid_request",
+            "model_rate_limited",
+            "model_quota_exhausted",
         ]
         | None
     ) = None
+    rate_limit: RateLimitObservation | None = None
 
     @model_serializer(mode="wrap")
     def omit_absent_harness_metadata(self, handler):
@@ -137,6 +153,8 @@ class AgentProvenanceRecord(BaseModel):
             value.pop("generated_output", None)
         if value.get("guard_phase") is None:
             value.pop("guard_phase", None)
+        if value.get("rate_limit") is None:
+            value.pop("rate_limit", None)
         return value
 
 

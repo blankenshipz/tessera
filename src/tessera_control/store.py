@@ -136,7 +136,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 72);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 73);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -385,6 +385,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .campaign_holdout import create_holdout_schema
 
     create_holdout_schema(connection)
+    from .review_jobs import create_review_jobs_schema
+
+    create_review_jobs_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .provenance_client import sanitize_envelope, stable_key
@@ -25,6 +27,41 @@ def private_file(path: Path) -> bytes:
         return os.read(fd, 64 * 1024 + 1)
     finally:
         os.close(fd)
+
+
+RATE_LIMIT_CONDITIONS = frozenset({"model_rate_limited", "model_quota_exhausted"})
+MODEL_CALL_FIELDS = frozenset(
+    {
+        "model_configured",
+        "model_reported",
+        "model_identity_basis",
+        "tier",
+        "prompt_sha256",
+        "profile_sha256",
+        "input_sha256",
+        "input_digests",
+        "policy_sha256",
+        "input_class",
+        "tokens",
+        "cost",
+        "cost_basis",
+        # Billed (Anthropic Messages API) receipts only.
+        "limits",
+        "daily_tokens_after",
+        "daily_cost_cents_after",
+        "cost_cents_estimate_max",
+        "output_sha256",
+        # Billed calls that halt the run: model_substituted, output_unrecorded, uncertain.
+        "outcome_class",
+    }
+)
+# Effect outcomes. ``not_sent`` is a definite upstream rejection (or a local refusal
+# before sending): the request was not accepted, so a later attempt is not a replay.
+EFFECT_OUTCOMES = frozenset({"acknowledged", "uncertain", "not_sent"})
+
+
+def utc_day(now: float) -> str:
+    return datetime.fromtimestamp(now, UTC).date().isoformat()
 
 
 class ReasoningStore:
@@ -45,9 +82,11 @@ class ReasoningStore:
                 raise ValueError("Journal database must be a private owned regular file.")
         finally:
             os.close(fd)
+        self.directory = directory
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA synchronous=FULL")
+        self._migrate()
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS runs (
             id TEXT PRIMARY KEY, binding TEXT NOT NULL, digest TEXT NOT NULL,
@@ -56,6 +95,7 @@ class ReasoningStore:
             reason TEXT, tokens INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS effects (
             run_id TEXT NOT NULL, boundary TEXT NOT NULL, outcome TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY(run_id,boundary), FOREIGN KEY(run_id) REFERENCES runs(id));
           CREATE TABLE IF NOT EXISTS admitted_prompt_inputs (
             run_id TEXT PRIMARY KEY, digest TEXT NOT NULL, references_json TEXT NOT NULL);
@@ -63,7 +103,50 @@ class ReasoningStore:
             record_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, key TEXT NOT NULL,
             body TEXT NOT NULL, delivery TEXT NOT NULL DEFAULT 'pending',
             code TEXT, sequence INTEGER);
+          CREATE TABLE IF NOT EXISTS model_calls (
+            run_id TEXT NOT NULL, seq INTEGER NOT NULL, receipt_json TEXT NOT NULL,
+            observed_at REAL NOT NULL, day TEXT NOT NULL,
+            tokens_delta INTEGER NOT NULL DEFAULT 0, cost_cents_delta REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(run_id,seq), FOREIGN KEY(run_id) REFERENCES runs(id));
+          CREATE TABLE IF NOT EXISTS model_rate_limits (
+            run_id TEXT NOT NULL, seq INTEGER NOT NULL, condition TEXT NOT NULL,
+            backoff_until REAL NOT NULL, observed_at REAL NOT NULL,
+            PRIMARY KEY(run_id,seq), FOREIGN KEY(run_id) REFERENCES runs(id));
         """)
+
+    def _columns(self, table: str) -> set[str]:
+        return {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate(self):
+        """Open older state dirs: per-run model_calls become append-only (run_id, seq)."""
+        old = self._columns("model_calls")
+        if old and "seq" not in old:
+            # Legacy rows were included-usage receipts: their token totals count toward
+            # the day's ledger; their cost was never billed in cents.
+            self.db.executescript("""
+              BEGIN IMMEDIATE;
+              ALTER TABLE model_calls RENAME TO model_calls_v1;
+              CREATE TABLE model_calls (
+                run_id TEXT NOT NULL, seq INTEGER NOT NULL, receipt_json TEXT NOT NULL,
+                observed_at REAL NOT NULL, day TEXT NOT NULL,
+                tokens_delta INTEGER NOT NULL DEFAULT 0, cost_cents_delta REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(run_id,seq), FOREIGN KEY(run_id) REFERENCES runs(id));
+              INSERT INTO model_calls(run_id,seq,receipt_json,observed_at,day,tokens_delta)
+                SELECT run_id, 1, receipt_json, observed_at,
+                  strftime('%Y-%m-%d', observed_at, 'unixepoch'),
+                  CASE WHEN json_type(receipt_json,'$.tokens.total')='integer'
+                         THEN json_extract(receipt_json,'$.tokens.total')
+                       WHEN json_type(receipt_json,'$.tokens')='integer'
+                         THEN json_extract(receipt_json,'$.tokens')
+                       ELSE 0 END
+                FROM model_calls_v1;
+              DROP TABLE model_calls_v1;
+              COMMIT;
+            """)
+        effects = self._columns("effects")
+        if effects and "attempt" not in effects:
+            self.db.execute("ALTER TABLE effects ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+            self.db.commit()
 
     def close(self):
         self.db.close()
@@ -133,24 +216,52 @@ class ReasoningStore:
         ).fetchone()
         return row[0] if row else None
 
-    def begin(self, run_id: str, boundary: str) -> bool:
-        """A previous pending/uncertain effect is not permission to replay it."""
+    def attempts(self, run_id: str, boundary: str) -> int:
+        row = self.db.execute(
+            "SELECT attempt FROM effects WHERE run_id=? AND boundary=?", (run_id, boundary)
+        ).fetchone()
+        return row[0] if row else 0
+
+    @staticmethod
+    def _attempt_name(name: str, attempt: int) -> str:
+        return name if attempt <= 1 else f"{name}.{attempt}"
+
+    def begin(self, run_id: str, boundary: str, tool_prefix: str = "opencode.session.") -> bool:
+        """A previous pending/uncertain effect is not permission to replay it.
+
+        Only a definitely rejected (``not_sent``) intent may be attempted again.
+        """
         with self.db:
             cursor = self.db.execute(
-                "INSERT OR IGNORE INTO effects VALUES(?,?,'pending')", (run_id, boundary)
+                "INSERT OR IGNORE INTO effects(run_id,boundary,outcome) VALUES(?,?,'pending')",
+                (run_id, boundary),
             )
+            if not cursor.rowcount:
+                cursor = self.db.execute(
+                    "UPDATE effects SET outcome='pending', attempt=attempt+1 "
+                    "WHERE run_id=? AND boundary=? AND outcome='not_sent'",
+                    (run_id, boundary),
+                )
             if cursor.rowcount:
                 self._record(
                     run_id,
-                    boundary + ".requested",
+                    self._attempt_name(boundary + ".requested", self.attempts(run_id, boundary)),
                     "tool",
                     "requested",
-                    tool="opencode.session." + boundary,
+                    tool=tool_prefix + boundary,
                 )
         return cursor.rowcount == 1
 
-    def finish(self, run_id: str, boundary: str, outcome: str):
-        if outcome not in {"acknowledged", "uncertain"}:
+    def finish(
+        self,
+        run_id: str,
+        boundary: str,
+        outcome: str,
+        *,
+        error: str | None = None,
+        tool_prefix: str = "opencode.session.",
+    ):
+        if outcome not in EFFECT_OUTCOMES:
             raise ValueError("Invalid effect outcome.")
         if self.effect(run_id, boundary) not in {"pending", "uncertain"}:
             raise ValueError("Effect completion requires a persisted intent.")
@@ -161,11 +272,19 @@ class ReasoningStore:
             )
             self._record(
                 run_id,
-                boundary + "." + outcome,
+                self._attempt_name(boundary + "." + outcome, self.attempts(run_id, boundary)),
                 "tool",
-                "succeeded" if outcome == "acknowledged" else "unknown",
-                tool="opencode.session." + boundary,
-                error="transport_failure" if outcome == "uncertain" else None,
+                "succeeded"
+                if outcome == "acknowledged"
+                else "failed"
+                if outcome == "not_sent"
+                else "unknown",
+                tool=tool_prefix + boundary,
+                error="transport_failure"
+                if outcome == "uncertain"
+                else (error or "provider_failure")
+                if outcome == "not_sent"
+                else None,
             )
             if boundary == "create" and outcome == "acknowledged":
                 self._record(run_id, "session.started", "agent", "started")
@@ -201,7 +320,13 @@ class ReasoningStore:
                     else "revoked"
                     if reason == "grant_revoked"
                     else "budget_exceeded"
-                    if reason in {"budget_exhausted", "usage_fence"}
+                    if reason
+                    in {
+                        "budget_exhausted",
+                        "usage_fence",
+                        "daily_cap_exceeded",
+                        "model_call_cap_exceeded",
+                    }
                     else "canceled"
                     if reason == "stop_requested"
                     else "permission_denied"
@@ -230,7 +355,117 @@ class ReasoningStore:
         with self.db:
             self.db.execute("UPDATE runs SET tokens=?,cost=? WHERE id=?", (tokens, cost, run_id))
 
-    def _record(self, run_id, transition, kind, outcome, *, tool=None, error=None):
+    def model_call(
+        self,
+        run_id: str,
+        receipt: dict,
+        now: float,
+        *,
+        tokens_delta: int = 0,
+        cost_cents_delta: float = 0.0,
+        only_if_changed: bool = False,
+    ) -> int | None:
+        """Append one metadata-only model-call receipt row (run_id, seq); never updates.
+
+        Only the allowlisted fields are stored; callers never pass prompts,
+        completions or credentials, and unknown keys are refused. The deltas feed the
+        day's (UTC) ledger. ``only_if_changed`` skips a row identical to the run's
+        latest receipt (a re-polled cumulative session observation is not a new call).
+        Returns the new seq, or None when skipped.
+        """
+        self.get(run_id)
+        if not isinstance(receipt, dict) or set(receipt) - MODEL_CALL_FIELDS:
+            raise ValueError("Unknown model-call receipt field.")
+        if (
+            type(tokens_delta) is not int
+            or tokens_delta < 0
+            or type(cost_cents_delta) not in {int, float}
+            or not math.isfinite(cost_cents_delta)
+            or cost_cents_delta < 0
+        ):
+            raise ValueError("Invalid model-call usage delta.")
+        encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self.db:
+            latest = self.db.execute(
+                "SELECT receipt_json FROM model_calls WHERE run_id=? ORDER BY seq DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if only_if_changed and latest is not None and latest[0] == encoded:
+                return None
+            seq = self.next_model_call_seq(run_id)
+            self.db.execute(
+                "INSERT INTO model_calls(run_id,seq,receipt_json,observed_at,day,tokens_delta,"
+                "cost_cents_delta) VALUES(?,?,?,?,?,?,?)",
+                (run_id, seq, encoded, now, utc_day(now), tokens_delta, float(cost_cents_delta)),
+            )
+        return seq
+
+    def next_model_call_seq(self, run_id: str) -> int:
+        return self.db.execute(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM model_calls WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+
+    def model_calls(self, run_id: str) -> list[dict]:
+        return [
+            {
+                **json.loads(row["receipt_json"]),
+                "seq": row["seq"],
+                "observed_at": row["observed_at"],
+            }
+            for row in self.db.execute(
+                "SELECT seq,receipt_json,observed_at FROM model_calls WHERE run_id=? ORDER BY seq",
+                (run_id,),
+            )
+        ]
+
+    def daily_usage(self, day: str) -> dict:
+        """The UTC day's model-call tokens and billed cents across every run in this state dir."""
+        tokens, cents = self.db.execute(
+            "SELECT COALESCE(SUM(tokens_delta),0), COALESCE(SUM(cost_cents_delta),0) "
+            "FROM model_calls WHERE day=?",
+            (day,),
+        ).fetchone()
+        return {"tokens": int(tokens), "cost_cents": float(cents)}
+
+    def rate_limit(self, run_id: str, condition: str, backoff_until: float, now: float):
+        if condition not in RATE_LIMIT_CONDITIONS or not math.isfinite(backoff_until):
+            raise ValueError("Invalid rate-limit observation.")
+        with self.db:
+            seq = self.db.execute(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM model_rate_limits WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            self.db.execute(
+                "INSERT INTO model_rate_limits VALUES(?,?,?,?,?)",
+                (run_id, seq, condition, backoff_until, now),
+            )
+            receipt = self.db.execute(
+                "SELECT receipt_json FROM model_calls WHERE run_id=? ORDER BY seq DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            known = json.loads(receipt[0]) if receipt else {}
+            observed = {"backoff_until": float(backoff_until)}
+            for field in ("tier", "policy_sha256"):
+                if known.get(field) is not None:
+                    observed[field] = known[field]
+            # One outbox record per event row, in the same transaction as the event.
+            self._record(
+                run_id,
+                f"rate_limit.{seq}",
+                "model",
+                "failed",
+                error=condition,
+                rate_limit=observed,
+            )
+
+    def latest_rate_limit(self, run_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT condition,backoff_until FROM model_rate_limits WHERE run_id=? "
+            "ORDER BY seq DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return None if row is None else {"condition": row[0], "backoff_until": row[1]}
+
+    def _record(self, run_id, transition, kind, outcome, *, tool=None, error=None, rate_limit=None):
         """Called in the same SQLite transaction as the observed state/effect."""
         row = self.get(run_id)
         binding = json.loads(row["binding"])
@@ -270,6 +505,8 @@ class ReasoningStore:
             "remote": {"message_id": row["message_id"]},
             "error_code": error,
         }
+        if rate_limit is not None:
+            record["rate_limit"] = rate_limit
         body = sanitize_envelope(record, proof)
         self.db.execute(
             "INSERT INTO provenance_outbox(record_id,run_id,key,body) VALUES(?,?,?,?)",

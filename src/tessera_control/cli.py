@@ -467,6 +467,9 @@ def parser() -> argparse.ArgumentParser:
 
     add_agent_proposal_commands(subcommands)
     _add_campaign_commands(subcommands)
+    from .provider_registration_cli import add_parser as add_providers_command
+
+    add_providers_command(subcommands)
     from .provider_trust_cli import add_provider_trust_commands
 
     add_provider_trust_commands(subcommands)
@@ -968,6 +971,10 @@ def main() -> int:
         return run_agent_proposal(arguments)
     if arguments.command == "campaign":
         return run_campaign(arguments)
+    if arguments.command == "providers":
+        from .provider_registration_cli import run as run_providers
+
+        return run_providers(arguments)
     if arguments.command == "admin":
         from .provider_trust_cli import run_provider_trust
 
@@ -1135,6 +1142,7 @@ def main() -> int:
             # The state is initialized and current (create_app checked it): audit the load.
             record_at_start(_database_path(arguments.state_dir), trust_policy)
             app.state.provider_trust_path = arguments.provider_trust
+            app.state.campaign_providers_path = arguments.campaign_providers
             if owner is not None:
                 previous_lifespan = app.router.lifespan_context
 

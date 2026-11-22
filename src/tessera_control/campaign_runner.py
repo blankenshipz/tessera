@@ -1448,6 +1448,7 @@ class CampaignRunner:
                     decision.steering,
                     self._on_candidate(ctx.spec.stage(key), budget.provider_id).max_exposure_cents,
                     budget_refusal=True,
+                    preference=decision.preference,
                 ),
             )
             return self._reserve(ctx, key)
@@ -2943,6 +2944,7 @@ class CampaignRunner:
                 self.now(),
                 self.upload_progress,
                 deadline,
+                None if seen["manifest"] else recorded,
             )
 
     def _do_observe(

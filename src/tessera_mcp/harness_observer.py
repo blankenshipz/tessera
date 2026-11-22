@@ -17,7 +17,18 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 
-from tessera_mcp.harness_binding import ACCOUNT_MODE, HarnessBinding, verify_binding
+from tessera_agent.model_destinations import (
+    RUNTIME_OPENCODE,
+    ModelDestination,
+    destination_for_account_mode,
+    require_runtime,
+)
+from tessera_mcp.harness_binding import (
+    ACCOUNT_MODE,
+    HarnessBinding,
+    _manifest_provider,
+    verify_binding,
+)
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 _MISSING = (
@@ -28,6 +39,23 @@ _MISSING = (
     "installed_build_and_mcp_sdk_identity_unavailable",
     "active_included_oauth_route_and_no_paid_fallback_unavailable",
 )
+
+
+def _account_route_admitted(account: dict, destination: ModelDestination) -> bool:
+    """Exact subscription-route evidence for one enrolled destination (ADR 0082 §9)."""
+    return (
+        account["method"] == "oauth"
+        and account["provider_id"] == destination.provider_id
+        and account["route"] == destination.billing_route
+        and account["policy"] == destination.guard_policy()
+    )
+
+
+def _expected_provider(manifest):
+    try:
+        return _manifest_provider(manifest)
+    except ValueError:
+        return None
 
 
 class ObservationBlocked(ValueError):
@@ -234,8 +262,8 @@ class V2PublicHarnessObserver:
             not isinstance(model, dict)
             or set(model) != {"providerID", "id"}
             or not isinstance(model.get("id"), str)
-            or model["providerID"] != "openai"
-            or "openai/" + model["id"] != self.expected["model"]
+            or model["providerID"] != _expected_provider(self.expected)
+            or model["providerID"] + "/" + model["id"] != self.expected["model"]
         ):
             raise ObservationBlocked("research_model_changed")
         principal = self._get(self.control_get, "/external-agent/status", bound=16384)
@@ -770,6 +798,10 @@ class V2AttestedHarnessObserver(V2PluginHarnessObserver):
                 != public["registered_harness_catalog"]
             ):
                 raise ValueError()
+            destination = require_runtime(
+                destination_for_account_mode(self.expected.get("account_mode", ACCOUNT_MODE)),
+                RUNTIME_OPENCODE,
+            )
             account = _exact(
                 measured["account"],
                 "connection_id method provider_id model_id route "
@@ -787,18 +819,11 @@ class V2AttestedHarnessObserver(V2PluginHarnessObserver):
                 or account["method"] != "oauth"
                 or account["provider_id"] != measured["provider_id"]
                 or account["model_id"] != measured["model_id"]
-                or account["route"] != "chatgpt-included"
+                or not _account_route_admitted(account, destination)
                 or account["entitlement_reference"] != trust.entitlement_reference
                 or account["entitlement_sha256"] != trust.entitlement_sha256
                 or account["policy_sha256"] != trust.policy_sha256
                 or _digest(account["policy"]) != trust.policy_sha256
-                or account["policy"]
-                != {
-                    "allowed_auth_methods": ["oauth"],
-                    "billing_routes": ["chatgpt-included"],
-                    "on_unknown": "deny",
-                    "on_exhausted": "stop",
-                }
             ):
                 raise ValueError()
             hooks = _exact(
@@ -833,7 +858,7 @@ class V2AttestedHarnessObserver(V2PluginHarnessObserver):
                 "observed_catalog": catalog,
                 "provider_id": measured["provider_id"],
                 "model_id": measured["model_id"],
-                "account_mode": ACCOUNT_MODE,
+                "account_mode": self.expected.get("account_mode", ACCOUNT_MODE),
                 # Derived only after issuer-bound route/entitlement/policy/connection checks.
                 "included_oauth_verified": True,
                 "observed_harness_version": measured["harness_version"],

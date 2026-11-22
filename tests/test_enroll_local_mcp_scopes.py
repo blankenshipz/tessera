@@ -26,6 +26,11 @@ def test_each_flag_adds_exactly_one_action(args, flag, action):  # noqa: F811
     assert _actions(args) == [*DEFAULT, action]
 
 
+def test_loop_pause_flag_adds_exactly_one_action(args):  # noqa: F811
+    args.allow_loop_pause = True
+    assert _actions(args) == [*DEFAULT, "loop:pause"]
+
+
 def test_both_flags(args):  # noqa: F811
     args.allow_results = args.allow_budget = True
     assert _actions(args) == [*DEFAULT, "results:read", "budget:read"]

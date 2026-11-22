@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import program_budget
+from . import campaign_placement_preference, program_budget
 from .campaign_infra_retry import INFRA_PREFIX
 from .campaign_models import NormalStage, _validate_provider, stage_on_candidate, stage_provider
 from .store import Conflict
@@ -79,13 +79,15 @@ class Decision:
     not_evaluated: tuple[str, ...] = field(default=())
     # Chosen only to record the campaign budget refusal no candidate could avoid.
     budget_refusal: bool = False
+    # ADR 0070: the operator placement preference rule that ordered the candidates, if any.
+    preference: dict[str, Any] | None = None
 
     @property
     def waiting(self) -> bool:
         return self.chosen is None and any(s.reason in TRANSIENT_REASONS for s in self.skipped)
 
     def payload(self, stage_key: str, attempt: int) -> dict[str, Any]:
-        return {
+        value = {
             "stage_key": stage_key,
             "attempt": attempt,
             "candidates": list(self.candidates),
@@ -96,6 +98,9 @@ class Decision:
             "steering": self.steering,
             "budget_refusal": self.budget_refusal,
         }
+        if self.preference is not None:  # absent keeps every earlier payload unchanged
+            value["preference"] = self.preference
+        return value
 
 
 # -- steering ------------------------------------------------------------------------------
@@ -282,7 +287,9 @@ def reroute_due(base: NormalStage, attempts: list[Mapping[str, Any]]) -> bool:
 
 
 def candidate_order(
-    base: NormalStage, attempts: list[Mapping[str, Any]]
+    base: NormalStage,
+    attempts: list[Mapping[str, Any]],
+    order: tuple[str, ...] | None = None,
 ) -> tuple[tuple[str, ...], dict[str, Skip]]:
     """The order the candidates are tried in for the stage's next attempt, and the candidates
     that may not be used for it at all (ADR 0060 section 5a, one list with ADR 0058).
@@ -295,8 +302,13 @@ def candidate_order(
       first untried reroute target, returning to the stage's own provider when none is left).
 
     A ``retry.reroute_providers`` target is used only for an infrastructure retry, or to stay
-    where an earlier infrastructure retry moved the stage (``infra_retry_only`` otherwise)."""
-    ids = base.candidate_ids
+    where an earlier infrastructure retry moved the stage (``infra_retry_only`` otherwise).
+
+    ``order`` is the candidate list an operator placement preference produced (ADR 0070), a
+    permutation of ``base.candidate_ids``; the retry rules above apply on top of it."""
+    ids = base.candidate_ids if order is None else order
+    if sorted(ids) != sorted(base.candidate_ids):
+        raise ValueError("a placement order must be a permutation of the approved candidates")
     latest = attempts[-1] if attempts else None
     excluded: dict[str, Skip] = {}
     if not reroute_due(base, attempts):
@@ -326,10 +338,13 @@ def decide(
     attempts: list[Mapping[str, Any]] | None = None,
 ) -> Decision:
     """Choose the first approved candidate, in ``candidate_order``, that every existing check
-    admits now (deterministic: the same recorded state gives the same choice)."""
+    admits now. Deterministic for the same recorded state and the same operator placement
+    preference (ADR 0070), which is held in process from the provider file and recorded on
+    each placement it orders."""
     with rt.connection() as connection:
         steering = steering_for(connection, ctx.campaign, base.key)
-    ids, excluded = candidate_order(base, list(attempts or ()))
+    ordered, preference = campaign_placement_preference.preferred_order(base)
+    ids, excluded = candidate_order(base, list(attempts or ()), ordered)
     skipped: list[Skip] = []
     for index, pid in enumerate(ids):
         stage = stage_on_candidate(base, pid)
@@ -347,9 +362,27 @@ def decide(
                 steering,
                 stage.max_exposure_cents,
                 ids[index + 1 :],
+                preference=_with_outcome(preference, pid, skipped),
             )
         skipped.append(skip)
-    return Decision(ids, None, tuple(skipped), steering)
+    return Decision(
+        ids, None, tuple(skipped), steering, preference=_with_outcome(preference, None, skipped)
+    )
+
+
+def _with_outcome(
+    preference: dict[str, Any] | None, chosen: str | None, skipped: list[Skip]
+) -> dict[str, Any] | None:
+    """A default-policy record also says where the attempt went and why it fell back (ADR 0088):
+    the candidates tried before the chosen one, each with the check that skipped it. An operator
+    rule's record is left exactly as it was."""
+    if preference is None or preference.get("source") != "default_policy":
+        return preference
+    return {
+        **preference,
+        "chosen": chosen,
+        "fell_back": [item.payload() for item in skipped],
+    }
 
 
 def failure_reason(decision: Decision) -> str:
@@ -445,3 +478,14 @@ def status_view(connection: sqlite3.Connection, campaign: Mapping[str, Any]) -> 
             }
         )
     return view
+
+
+def preference_view(campaign: Mapping[str, Any]) -> dict[str, Any]:
+    """Read-only (ADR 0070): the operator placement preference and the stages it covers."""
+    from .campaign_models import normalize, parse_spec_json
+
+    try:
+        stages = normalize(parse_spec_json(campaign["spec_json"])).stages
+    except Exception:  # noqa: BLE001 - a status read never fails on a stored spec
+        stages = ()
+    return campaign_placement_preference.status_view(stages)

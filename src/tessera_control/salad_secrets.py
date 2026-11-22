@@ -29,6 +29,10 @@ class SecretBuffer:
         for i in range(len(self._buffer)):
             self._buffer[i] = 0
 
+    def is_wiped(self) -> bool:
+        """True once every byte is zero (a check for wipe tests; it reveals nothing else)."""
+        return not any(self._buffer)
+
     def contains_in(self, value: bytes):
         return any(self._buffer) and self._buffer in value
 

@@ -9,6 +9,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .model_destinations import (
+    RUNTIME_OPENCODE,
+    DestinationRefused,
+    destination_for_account_mode,
+    require_runtime,
+    split_model,
+)
 from .remote_reasoning_store import private_file
 from .research_consumer_store import ConsumerBlocked
 
@@ -60,7 +67,7 @@ class RoleReferences(BaseModel):
     run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
     context_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
     policy_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
-    model: str = Field(pattern=r"^openai/[A-Za-z0-9][A-Za-z0-9_.-]{0,100}$")
+    model: str = Field(pattern=r"^(?:openai|anthropic)/[A-Za-z0-9][A-Za-z0-9_.-]{0,100}$")
     agent_token_file: str
     harness_password_file: str
     binding_manifest_file: str
@@ -134,12 +141,31 @@ class ResearchReferences(BaseModel):
     schema_version: Literal["tessera-research-service-references-v1"]
     journey_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
     project_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
-    account_mode: Literal["included-chatgpt-oauth"]
+    account_mode: Literal["included-chatgpt-oauth", "anthropic-api-key-ref"]
     control_origin: str
     control_ca_file: str
     planner: RoleReferences
     critic: RoleReferences
     coding_origins: list[str] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def enrolled_model_destination(self):
+        try:
+            found = destination_for_account_mode(self.account_mode)
+            try:
+                require_runtime(found, RUNTIME_OPENCODE)
+            except DestinationRefused:
+                raise ValueError(
+                    "Anthropic destinations run through Tessera's direct Messages API "
+                    "runtime, not the OpenCode research journey."
+                ) from None
+            for role in (self.planner, self.critic):
+                provider, _ = split_model(role.model)
+                if provider != found.provider_id:
+                    raise DestinationRefused("provider_account_mode_mismatch")
+        except DestinationRefused:
+            raise ValueError("Model destination is not enrolled for this account mode.") from None
+        return self
 
     _origin = field_validator("control_origin")(RoleReferences.origin.__func__)
     _reference = field_validator("control_ca_file")(RoleReferences.reference.__func__)
@@ -194,7 +220,10 @@ def create_journey(references, state_dir, factory):
             or role.binding["actor_principal_id"] != expected.principal_id
             or role.binding["context_id"] != expected.context_id
             or role.binding["project_id"] != config.project_id
-            or "openai/" + role.binding["model_id"] != expected.model
+            or destination_for_account_mode(config.account_mode).provider_id
+            + "/"
+            + role.binding["model_id"]
+            != expected.model
         ):
             journey.close()
             raise ConsumerBlocked("installed_role_reference_changed")

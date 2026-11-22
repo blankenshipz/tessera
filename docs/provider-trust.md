@@ -231,6 +231,20 @@ as usual ([ADR 0056](decisions/0056-executor-enrollment-into-an-existing-project
   recorded at enrollment; route summaries flag when the installed code differs. Rotate if
   the registration should describe the new build.
 
+## Provider registration reports admission, never changes it
+
+`tessera providers add|update` and the matching API and MCP tools
+([ADR 0081](decisions/0081-validated-provider-registration.md)) validate and write the
+`--campaign-providers` file only. With `--provider-trust` (or the running service) a result lists the
+data classes this setting admits for the entry's worker and, when `private_derived` is not admitted,
+says what to merge into the entry here. A `self-hosted` instance is trusted under its own `id`, so the
+readout and hint use that id. The readout is evaluated against the providers registered now; a provider
+added by registration registers at the next start, and under `all_registered_providers` the result adds
+an `after_restart` note (every class if the worker is already listed under that id, otherwise public
+only). Nothing in registration edits this file. Because registering a provider id can make it a
+destination under that mode, the API lets only the deployment's root owner change deployment-wide
+entries (`local-docker`, `self-hosted`, plugins).
+
 ## Reading the setting
 
 Reads, each returning the setting, its digest and its load time: `GET

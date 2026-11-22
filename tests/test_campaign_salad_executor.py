@@ -203,6 +203,7 @@ class Harness:
         self.control = control or FakeControl()
         self.runs = []
         self.imports = []
+        self.import_profiles = []
         self.config = config_for(tmp_path)
         self.receipt = receipt
 
@@ -215,7 +216,8 @@ class Harness:
             assert not list(Path(receipt_dir).iterdir())
             return self.receipt
 
-        def importer(route_id, destination):
+        def importer(route_id, destination, profile):
+            self.import_profiles.append(profile.name)
             self.imports.append(route_id)
             (Path(destination) / "output.json").write_bytes(OUTPUT)
             return [
@@ -704,3 +706,96 @@ def test_main_max_cycles_bounds_the_loop(tmp_path, monkeypatch):
     args = ["--config", "x", "--max-cycles", "2", "--health-file", str(health)]
     assert module.main(args) == 0
     assert json.loads(health.read_text())["loops"] == 2
+
+
+# -- several profiles in one executor (ADR 0070) -----------------------------------------------
+
+
+def _cpu_profile():
+    from test_salad_cpu_profile import cpu_profile_data
+
+    return SaladCampaignProfile.model_validate(cpu_profile_data())
+
+
+def test_one_executor_runs_a_cpu_profile_beside_a_gpu_profile(tmp_path):
+    cpu = _cpu_profile()
+    h = Harness(tmp_path, profile=[PROFILE, cpu])
+    assert set(h.executor.profiles) == {"gpu-main", "cpu-main"}
+    h.control.final = dict(FINAL)
+    h.control.state = route_state(
+        proposal=dict(
+            operation_id=OPERATION, epoch=3, selection=selection(cpu).model_dump(mode="json")
+        )
+    )
+    h.control.items = [item("route_started", profile="cpu-main")]
+    assert [a["action"] for a in h.executor.run_once()] == ["outcome_recorded"]
+    # The route ran with the CPU profile's policy, and custody was imported under it.
+    assert h.runs[0]["timeout"] == cpu.route_max_seconds + module.SUBPROCESS_GRACE_SECONDS
+    assert h.import_profiles == ["cpu-main"]
+    # A GPU selection presented under the CPU stage's profile never runs.
+    h2 = Harness(tmp_path / "second", profile=[PROFILE, cpu])
+    h2.control.items = [item("route_started", profile="cpu-main")]
+    assert [a["action"] for a in h2.executor.run_once()] == ["refused_selection_mismatch"]
+    assert h2.runs == []
+
+
+def test_work_for_a_profile_the_executor_does_not_serve_is_refused(tmp_path):
+    h = Harness(tmp_path, profile=[PROFILE, _cpu_profile()])
+    h.control.items = [item("awaiting_lease", route_id=None, operation_id=None, profile="other")]
+    assert [(a["action"], a["detail"]) for a in h.executor.run_once()] == [
+        ("refused_profile", "different_profile")
+    ]
+    assert h.control.calls == []
+    h.control.items = [item("awaiting_lease", route_id=None, operation_id=None, profile="cpu-main")]
+    assert [a["action"] for a in h.executor.run_once()] == ["packaged"]
+
+
+def test_the_config_names_profile_or_profiles_and_build_loads_each(tmp_path, monkeypatch):
+    one = config_for(tmp_path)
+    base = one.model_dump(mode="json", by_alias=True)
+    assert one.profile_names == ("gpu-main",)
+    many = ExecutorConfig.model_validate(
+        {**base, "profile": None, "profiles": ["gpu-main", "cpu-main"]}
+    )
+    assert many.profile_names == ("gpu-main", "cpu-main")
+    for bad in (
+        {**base, "profiles": ["cpu-main"]},
+        {**base, "profile": None},
+        {**base, "profile": None, "profiles": ["cpu-main", "cpu-main"]},
+        {**base, "profile": None, "profiles": []},
+    ):
+        with pytest.raises(ValueError):
+            ExecutorConfig.model_validate(bad)
+    with pytest.raises(ValueError, match="distinct"):
+        SaladCampaignExecutor(
+            many, [PROFILE, PROFILE], FakeControl(), worker_principal_id=WORKER, importer=None
+        )
+
+    cpu = _cpu_profile()
+    loaded = {"gpu-main": PROFILE, "cpu-main": cpu}
+
+    class FakeProfiles:
+        def get(self, name):
+            return loaded.get(name)
+
+    class FakeStore:
+        def __init__(self, state_dir):
+            pass
+
+        def authenticate_worker(self, token):
+            return {"id": WORKER}
+
+    import tessera_control.salad_live_check as live
+    import tessera_control.store as store
+
+    monkeypatch.setattr(store, "Store", FakeStore)
+    monkeypatch.setattr(live, "_private_bytes", lambda path, cap: b"token")
+    monkeypatch.setattr(module, "load_profiles", lambda path: FakeProfiles())
+    monkeypatch.setattr(module, "StoreControl", lambda *a: FakeControl())
+    built = module.build_executor(many)
+    assert list(built.profiles) == ["gpu-main", "cpu-main"]
+    unknown = ExecutorConfig.model_validate(
+        {**base, "profile": None, "profiles": ["gpu-main", "x"]}
+    )
+    with pytest.raises(ValueError, match="Unknown"):
+        module.build_executor(unknown)

@@ -180,3 +180,13 @@ def test_salad_excluded_by_steering_makes_the_stage_wait_for_the_cpu_host(tmp_pa
     world.tick_until(lambda: world.attempt() is not None)
     assert world.attempt()["provider_id"] == NEAR
     assert world.row("SELECT 1 FROM campaign_salad_stages") is None
+
+
+def test_a_salad_candidate_refuses_a_scratch_request(tmp_path, near):
+    """Salad grants no scratch (ADR 0059, ADR 0070): a stage that asks for scratch and lists
+    Salad is refused at submit rather than run there without it."""
+    world = SaladWorld(tmp_path)
+    near(world, 1)
+    stage = {**_stage(world.env), "scratch_bytes": 128 * 1024 * 1024}
+    with pytest.raises(Exception, match="scratch_bytes is not granted by Salad"):
+        world.env.submit(spec=salad_spec_v2(world.env, [stage]))

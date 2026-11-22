@@ -147,6 +147,14 @@ def enroll(args, transport_factory=LocalHTTP):
         scope["actions"] += ["campaign:submit", "campaign:read", "campaign:cancel"]
     if getattr(args, "allow_campaign_evidence", False):
         scope["actions"] += ["snapshot:read", "artifact:read", "campaign:logs"]
+    if getattr(args, "allow_review_jobs", False):
+        scope["actions"] += ["review:submit", "review:read"]
+    if getattr(args, "allow_review_findings", False):
+        scope["actions"] += [
+            a for a in ("review:findings", "review:read") if a not in scope["actions"]
+        ]
+    if getattr(args, "allow_loop_pause", False):
+        scope["actions"].append("loop:pause")
     scope = ExternalAgentScope.model_validate(scope).model_dump(mode="json")
     options = {
         "origin": args.control_url.rstrip("/"),
@@ -311,6 +319,9 @@ def main(argv=None):
     parser.add_argument("--allow-budget", action="store_true")
     parser.add_argument("--allow-campaigns", action="store_true")
     parser.add_argument("--allow-campaign-evidence", action="store_true")
+    parser.add_argument("--allow-review-jobs", action="store_true")
+    parser.add_argument("--allow-review-findings", action="store_true")
+    parser.add_argument("--allow-loop-pause", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     try:

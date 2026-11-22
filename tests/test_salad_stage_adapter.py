@@ -119,7 +119,7 @@ def spec_of(world, **over):
 
 def expanded(world, **over):
     spec = parse_spec(spec_of(world, **over))
-    return expand_spec(spec, world.profiles)
+    return expand_spec(spec, world.profiles, tenant=None)
 
 
 def candidate(spec):
@@ -165,7 +165,7 @@ def test_expansion_is_deterministic_and_a_spec_without_a_request_is_unchanged(tm
     world = cpu_world(tmp_path, near)
     assert spec_digest(expanded(world)) == spec_digest(expanded(world))
     plain = parse_spec(spec_of(world, alternate_providers=None))
-    assert expand_spec(plain, world.profiles) is plain
+    assert expand_spec(plain, world.profiles, tenant=None) is plain
     assert "adapted" not in json.dumps(plain.model_dump(mode="json"))
     # An explicit candidate without the flag serializes exactly as before.
     config = SaladStageSpec.model_validate(candidate(expanded(world)).provider_config)
@@ -227,7 +227,7 @@ def test_an_input_from_another_stage_is_refused(tmp_path, near):
         ],
     )
     with pytest.raises(Conflict, match="another stage's output"):
-        expand_spec(parse_spec(spec), world.profiles)
+        expand_spec(parse_spec(spec), world.profiles, tenant=None)
 
 
 def test_a_profile_that_is_not_opened_to_adapted_stages_is_refused(tmp_path, near):
@@ -239,14 +239,16 @@ def test_a_gpu_profile_cannot_adapt(tmp_path, near):
     near(world, 0)
     with pytest.raises(Conflict, match="not a CPU-only profile"):
         expand_spec(
-            parse_spec(spec_of(world, alternate_providers=[request("gpu-main")])), world.profiles
+            parse_spec(spec_of(world, alternate_providers=[request("gpu-main")])),
+            world.profiles,
+            tenant=None,
         )
 
 
 def test_no_profiles_at_all_is_refused(tmp_path, near):
     world = cpu_world(tmp_path, near)
     with pytest.raises(Conflict, match="no Salad profile is configured"):
-        expand_spec(parse_spec(spec_of(world)), None)
+        expand_spec(parse_spec(spec_of(world)), None, tenant=None)
 
 
 def test_the_adapter_is_only_for_a_salad_candidate(tmp_path, near):
@@ -320,7 +322,7 @@ def test_the_expansion_does_not_mutate_its_input(tmp_path, near):
     world = cpu_world(tmp_path, near)
     spec = parse_spec(spec_of(world))
     before = copy.deepcopy(spec.model_dump(mode="json"))
-    expand_spec(spec, world.profiles)
+    expand_spec(spec, world.profiles, tenant=None)
     assert spec.model_dump(mode="json") == before
 
 
@@ -376,3 +378,14 @@ def test_a_private_input_runs_on_salad_when_trust_admits_it_and_the_placement_is
     config = stored["stages"][0]["alternate_providers"][0]["provider_config"]
     assert config["adapted"] is True
     assert config["workload"]["egress"]["fetches"] == []
+
+
+def test_the_tenant_argument_cannot_be_forgotten(tmp_path, near):
+    from tessera_control.campaign_salad_adapter import expand_with_registered
+
+    world = cpu_world(tmp_path, near)
+    spec = parse_spec(spec_of(world))
+    with pytest.raises(TypeError):
+        expand_spec(spec, world.profiles)
+    with pytest.raises(TypeError):
+        expand_with_registered(spec)

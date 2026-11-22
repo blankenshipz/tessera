@@ -224,6 +224,12 @@ still operator-built and pinned by digest, Tessera builds none;
 Salad run of an adapted stage). A vendor is a plugin: the operator's
 `--campaign-providers` file names it (entry point group `tessera.campaign_providers` or a
 dotted module) and gives it a config section, so adding one never edits the runner.
+Providers and their profiles are added, updated and listed through one validated, audited operation
+(`tessera providers`, the control API and operator-enabled MCP tools; no secrets, credentials by
+reference, unknown providers refused, [ADR 0081](docs/decisions/0081-validated-provider-registration.md)).
+Through the API a human manages only its own organization's Salad profiles (checked against the
+database), and deployment-wide entries (local-docker, self-hosted, plugins) need the deployment's root
+owner. A change applies at the next start, and provider trust remains operator-edited.
 Descriptors are validated at registration. `--provider-trust` sets which data classes each
 provider's worker may receive (public only by default). With the owner-set mode
 `all_registered_providers` (ADR 0047), agents and specs route any data class among the
@@ -242,7 +248,10 @@ a single-provider stage would; it never picks a provider the approved spec does 
 and each skipped candidate's reason are on the receipt and in `tessera_get_campaign`, and
 `tessera_steer_campaign_placement` can pin or exclude candidates. ADR 0058's reroute targets
 are part of the same list, used only for an infrastructure retry ([ADR
-0060](docs/decisions/0060-capacity-aware-stage-placement.md)). Each attempt is settled once through
+0060](docs/decisions/0060-capacity-aware-stage-placement.md)). An operator rule in the provider file
+can put a preferred provider (a Salad CPU or GPU profile) first for long, large-scratch or
+`heavy`-tagged stages, among the candidates the spec already lists, with the host as fallback
+([ADR 0070](docs/decisions/0070-salad-first-placement-preference.md)). With no matching rule, a built-in default policy orders a stage's approved alternates by what the stage declares (heavy work, by declared memory, expected runtime or tag, tries a remote CPU candidate first, GPU a remote GPU one, internet-fetching work keeps remote candidates last, and a stage with no such signal keeps the order its spec wrote), only among destinations the spec already lists, with every check intact and the decision on the receipt; the operator can turn it off ([ADR 0088](docs/decisions/0088-default-placement-by-stage-class.md)). Each attempt is settled once through
 a single settlement path with a closed basis enum, and a finished or failed attempt releases its
 hold immediately.
 Outputs above 16 MiB, such as model weights, use chunked [large-artifact custody](docs/large-artifacts.md):
@@ -268,11 +277,31 @@ concurrency limit and cancelling a single stage
 ([ADR 0061](docs/decisions/0061-campaign-pause-concurrency-stage-cancel.md):
 `tessera_pause_campaign`, `tessera_resume_campaign`, `tessera_limit_campaign_concurrency`,
 `tessera_cancel_campaign_stage`) are recorded as events and on the receipt; approval, cap or
-concurrency increases and grant reconciliation stay human. A human still
+concurrency increases and grant reconciliation stay human. An operator may also start the
+server with `--agent-loop-marker PATH` (and `--agent-loop-ledger PATH`) to expose
+`tessera_agent_loop_status` and `tessera_pause_agent_loop` for the standing agent loop's local
+kill switch ([ADR 0089](docs/decisions/0089-mcp-agent-loop-pause-and-status.md)): pause only,
+no resume tool (a person deletes the marker), and it cancels nothing in flight. A pause can also be
+recorded on the platform (`POST /projects/{id}/agent-loop/pause`, scope `loop:pause`): a request
+record, not proof the loop stopped. A human still
 approves the digest and stages snapshots; an operator may enable `tessera_approve_campaign` on a
 separate `--approval-tool` server that holds a person's own session credential (the control API
 still refuses any agent credential and applies every admission check and cap). See
 [docs/mcp-campaign-client-path.md](docs/mcp-campaign-client-path.md).
+
+Clients can also request a research or review job (`tessera_submit_review_job`) and read its findings
+(`tessera_list_review_jobs`, `tessera_read_review_job`, `tessera_list_review_findings`,
+`tessera_read_review_finding`; [ADR 0084](docs/decisions/0084-research-review-journeys.md),
+[docs/mcp-review-jobs.md](docs/mcp-review-jobs.md)). Findings are a proposal, not a verdict: only a
+person accepts or rejects one (`tessera_resolve_review_finding`, on a separate `--review-decision-tool`
+server; an agent credential gets 403), and resolving never approves or changes a plan, campaign or
+gate. The person who submitted a job or ingested its findings cannot resolve them either. Inputs are
+`{snapshot_id, digest}` only: control checks the snapshot in your project and derives its data class
+from the stored record. Submit is refused unless the destination is enrolled, the tier and budget are
+within policy and the derived classes are allowed; none is enrolled by default, so private-input
+review stays refused until the destination registry (ADR 0082) lands. The control plane records jobs
+and findings but runs no model itself and sends nothing anywhere, so a job with no runner attached
+stays `queued`.
 
 **What still needs a human (Salad stages).** By default every Salad stage stops for a
 person at its source assessment and at each attempt's plan and source-use reviews; a bare
@@ -387,7 +416,11 @@ Console scripts installed by the package, one line each:
 - `tessera-garage-operator`: fixed-target stdio operator for a self-hosted control host
   (host and user come from `TESSERA_GARAGE_HOST` / `TESSERA_GARAGE_USER`).
 - `tessera-k8s-operator`: fixed-target operator for a local Docker Desktop control namespace (admission, backup, activation; some tools write).
-- `tessera-reasoning`, `tessera-a2a-peer`: remote reasoning runtime and A2A peer (frozen).
+- `tessera-reasoning`: manually started, admission-gated reasoning runtime (default: the Anthropic
+  Messages API called directly with an API key held only as a systemd credential reference;
+  optional: OpenAI included ChatGPT OAuth through the OpenCode V2 harness,
+  [ADR 0082](docs/decisions/0082-agent-loop-anthropic-destination.md)).
+- `tessera-a2a-peer`: A2A peer (frozen).
 
 ## Architecture
 
@@ -406,9 +439,24 @@ status, and [DESIGN.md](DESIGN.md) for authoritative contracts.
 ## Limits and safety
 
 - Several planes (Salad guardian stack, capability broker, Kubernetes/minikube
-  plumbing, Astra, OpenCode harness, A2A peer) are frozen to bug and security fixes by
+  plumbing, Astra, A2A peer) are frozen to bug and security fixes by
   [ADR 0033](docs/decisions/0033-freeze-over-built-planes.md) and are lab code, not
-  maintained product surfaces.
+  maintained product surfaces. The agent and reasoning plane (research journey, reasoning
+  supervisor, OpenCode harness binding) is unfrozen by
+  [ADR 0082](docs/decisions/0082-agent-loop-anthropic-destination.md).
+- The reasoning runtime reaches a model only through an enrolled destination: the Anthropic
+  Messages API by API-key reference (the default; Tessera's own client, no Claude subscription
+  or Claude Code), or optionally OpenAI included ChatGPT OAuth. It refuses to start when
+  `ANTHROPIC_API_KEY` is set; the key is a systemd credential only. The Anthropic host is on the
+  model-runtime allowlist and Tessera's transport enforces it (https only, exact host and port,
+  environment proxies ignored, redirects refused); host firewalling remains recommended defence
+  in depth, and no sandbox or campaign-stage egress is added. Before each billed call, per-call
+  input, output and cost caps, daily token and cost caps and the grant budget are checked, and
+  every model call has an append-only receipt with computed cost and output hash
+  ([ADR 0083](docs/decisions/0083-model-call-receipts.md)); rate limits back off with the same
+  model, never a downshift. This runtime uses no tools yet. For OpenAI the pinned harness
+  connects and no network-level enforcement for it is implemented. No reasoning run is claimed
+  until an operator admits one.
 - Single runs outside campaigns have no automatic retry or scheduling; a failed or
   unknown run is reconciled by a person.
 - Provider activation is disabled by default; no hosted service or production

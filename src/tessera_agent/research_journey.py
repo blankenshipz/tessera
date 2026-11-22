@@ -499,12 +499,23 @@ class ResearchJourney:
         self._cancel(self._poll(), reconcile=True)
         self.stage("cancel_requested")
 
+    @staticmethod
+    def _model_calls(consumer):
+        """Metadata-only model-call receipts from the role's reasoning journal."""
+        reader = getattr(getattr(consumer.store, "runtime", None), "model_calls", None)
+        calls = reader(consumer.run_id) if callable(reader) else []
+        return calls if isinstance(calls, list) else []
+
     def receipt(self):
         return {
             "journey_id": self.id,
             "stage": self.store.journey(self.id)["stage"],
             "planner_run": self.planner.run_id,
             "critic_run": self.critic.run_id,
+            "model_calls": {
+                role: self._model_calls(consumer)
+                for role, consumer in (("planner", self.planner), ("critic", self.critic))
+            },
             "model_understanding_verified": False,
             "provider_termination_verified": False,
         }
