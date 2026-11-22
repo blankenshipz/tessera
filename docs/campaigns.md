@@ -67,7 +67,22 @@ covered by that test.
 A human approves the exact digest and revision
 (`tessera campaign approve --campaign-id C --expected-revision N --expected-spec-digest D
 --automation-label L`; the owner credential needs the automation label, as for any
-decision). Approval records the approver, decision class and expiry (at most
+decision). Approving by id is enough for a batch client: leave out `--expected-revision`
+and the CLI reads the campaign's current revision, and leave out `--idempotency-key` and it
+generates a fresh key for each call (printed on stderr); the digest is always stated, so the
+human still approves exactly what they reviewed. **One key per approval:** an idempotency key
+belongs to one campaign and one request. Replaying it for the same request returns the
+earlier answer, and reusing it with a different body or for a different campaign is refused
+with HTTP 409 and applies nothing, so a scripted loop that forgets to vary its key fails
+loudly instead of leaving campaigns unapproved. An agent's MCP session can never approve: it is
+an external-agent credential, which is not a human decision (ADR 0038, ADR 0055). An operator
+may run a separate `tessera-mcp --approval-tool` server with a person's own session credential
+([ADR 0065](decisions/0065-operator-enabled-mcp-approval-tool.md)). Its
+`tessera_approve_campaign` reads the current revision, requires the digest to be named, uses a
+fresh idempotency key per call (or the caller's, with `expected_revision`, to replay) and goes
+through the same route, so every admission check, the program cap and the one-key-per-approval
+rule apply unchanged. Unlock conditions and pre-approvals stay on the CLI.
+Approval records the approver, decision class and expiry (at most
 `deadline_seconds`, never past 7 days). The runner then acts as the approver: each step is
 written as an intent row first, then executed inside the store's own transaction by a
 check that requires an exactly matching intent. The marker is in-process only; no HTTP
@@ -171,6 +186,12 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   worker-grant provider is resolved this way. An `admitted` or `running` attempt waits while a run
   receipt appears, its lease is live or a large-artifact upload is in progress (until the grant
   expires), and 120 s after control recorded the exit, so a late receipt is not overtaken.
+  Whatever its status, an attempt is also held while its outputs are still arriving, even after
+  its grant has expired ([ADR 0064](decisions/0064-hold-an-exited-attempt-while-outputs-upload.md)):
+  an open large upload that gained bytes within the last 10 minutes, or an upload or artifact that
+  finished within 120 s. It is closed once those finish, stall or expire, and in any case at most
+  2 hours after the exit was recorded once its grant has expired, and never past the approval window
+  (a trickle of bytes cannot hold a slot for the upload's own 24 hours).
   An attempt with no such evidence stays `unknown` for a person. It is shown on the receipt as
   `exit_resolved`, never as a pass or a measurement.
 - **Refused launches (ADR 0046).** An unknown attempt whose worker reported a refused

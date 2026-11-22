@@ -223,7 +223,7 @@ class CampaignSteeringCommands:
             stage = next((s for s in normal.stages if s.key == body.stage_key), None)
             if stage is None:
                 raise NotFound("Stage was not found on this campaign.")
-            if not stage.alternates:
+            if not stage.has_candidates:
                 raise Conflict("This stage names one provider; there is nothing to steer.")
             named = set(stage.candidate_ids)
             unknown = sorted({*body.exclude, *([body.pin] if body.pin else [])} - named)
@@ -231,8 +231,14 @@ class CampaignSteeringCommands:
                 raise Conflict(
                     f"Only the stage's approved candidates can be steered; not {unknown}."
                 )
+            reroute_only = set(stage.reroute_ids) - set(stage.placement_ids)
+            if body.pin in reroute_only:
+                raise Conflict(
+                    f"{body.pin} is a reroute target (ADR 0058): it serves only infrastructure "
+                    "retries and cannot be pinned."
+                )
             allowed = allowed_after_steering(stage.candidate_ids, body.pin, list(body.exclude))
-            if not allowed:
+            if not [pid for pid in allowed if pid not in reroute_only]:
                 raise Conflict(
                     "Steering would leave the stage no candidate; cancel the campaign instead."
                 )

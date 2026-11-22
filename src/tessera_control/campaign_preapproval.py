@@ -43,6 +43,7 @@ NOT_PENDING = "review_not_pending"
 ATTEMPT_CAP = "attempt_cap"
 TOTAL_CAP = "total_cap"
 NOT_APPROVE = "not_approve"
+WRONG_PROVIDER = "wrong_provider"
 
 _DENIED = "Campaign pre-approval does not authorize this review."
 
@@ -164,13 +165,49 @@ def stage_preapproval(
     return None if row is None else dict(row)
 
 
-def _stage_exposure(connection: sqlite3.Connection, campaign: Any, stage_key: str) -> int | None:
+def _stage_exposure(
+    connection: sqlite3.Connection,
+    campaign: Any,
+    stage_key: str,
+    provider_id: str | None = None,
+) -> int | None:
+    """The cent hold of the stage on the provider the attempt was placed on (ADR 0066).
+
+    ``None`` (fail closed to the human path) for a provider the approved spec does not name for
+    this stage, one that is not registered, or one that is not a Salad route: a pre-approval
+    never reaches an unregistered or unapproved destination."""
     from .campaign_delegation import _normal_spec
+    from .campaign_models import stage_on_candidate, stage_provider
 
     try:
-        return int(_normal_spec(campaign).stage(stage_key).max_exposure_cents)
+        stage = _normal_spec(campaign).stage(stage_key)
+        provider_id = provider_id or stage.provider
+        if provider_id != stage.provider:
+            stage = stage_on_candidate(stage, provider_id)
+        # The same re-check for every provider, the stage's own included (ADR 0066 section 3).
+        if stage_provider(provider_id).descriptor.kind != "salad_route":
+            return None
+        return int(stage.max_exposure_cents)
     except (StopIteration, ValueError, KeyError):
         return None
+
+
+def covered_provider(
+    connection: sqlite3.Connection, pre: dict[str, Any], stage_provider_id: str | None
+) -> str | None:
+    """The provider this pre-approval names, as recorded on the approve event (ADR 0066).
+
+    An entry approved before alternates could be named (no ``provider_id`` recorded) covers the
+    stage's own provider only."""
+    row = connection.execute(
+        """SELECT json_extract(p.value, '$.provider_id') AS provider_id
+        FROM events e, json_each(e.payload_json, '$.preapprovals') p
+        WHERE e.event_type='campaign.approved'
+        AND json_extract(e.payload_json, '$.campaign_id')=?
+        AND json_extract(p.value, '$.id')=? LIMIT 1""",
+        (pre["campaign_id"], pre["id"]),
+    ).fetchone()
+    return (row["provider_id"] if row is not None else None) or stage_provider_id
 
 
 def _bound(scope: dict[str, Any], kind: str, salad: Any) -> bool:
@@ -229,7 +266,8 @@ def evaluate(
             return Verdict(DIGEST_MISMATCH, pre, digest)
         return Verdict(None, pre, digest)
     attempt = connection.execute(
-        """SELECT a.attempt AS attempt FROM campaign_salad_attempts sa
+        """SELECT a.attempt AS attempt, a.provider_id AS provider_id
+        FROM campaign_salad_attempts sa
         JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
         WHERE a.campaign_id=? AND a.stage_key=? AND
         ((? = 'plan' AND sa.plan_decision_id=?)
@@ -243,6 +281,15 @@ def evaluate(
         return Verdict(UNBOUND_SCOPE, pre)
     if decision["status"] != "pending":
         return Verdict(NOT_PENDING, pre)
+    from .campaign_delegation import _normal_spec
+
+    try:
+        own = _normal_spec(campaign).stage(stage_key).provider
+    except (StopIteration, ValueError, KeyError):
+        return Verdict(UNBOUND_SCOPE, pre)
+    if (attempt["provider_id"] or own) != covered_provider(connection, pre, own):
+        # An entry covers only the candidate it names: another one waits for a person.
+        return Verdict(WRONG_PROVIDER, pre, attempt=attempt["attempt"])
     try:
         scope = json.loads(decision["scope_json"])
     except ValueError:
@@ -255,7 +302,7 @@ def evaluate(
         return Verdict(DIGEST_MISMATCH, pre, digest, attempt=attempt["attempt"])
     cents = 0
     if kind == KIND_PLAN:
-        cents = _stage_exposure(connection, campaign, stage_key) or 0
+        cents = _stage_exposure(connection, campaign, stage_key, attempt["provider_id"]) or 0
         if cents < 1 or cents > pre["max_attempt_cents"]:
             return Verdict(ATTEMPT_CAP, pre, digest, cents, attempt["attempt"])
         used = connection.execute(
@@ -373,7 +420,7 @@ def preview_for_campaign(
     stages (ADR 0044). Grants nothing; nothing is written."""
     from pathlib import Path
 
-    from .campaign_models import normalize, parse_spec_json, stage_provider
+    from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
     from .campaign_provider_salad import SaladRouteProvider
     from .campaign_runner import CampaignRunner, _Ctx
     from .salad_campaign_profiles import load_profiles
@@ -391,15 +438,24 @@ def preview_for_campaign(
     for stage in spec.stages:
         if stage_key is not None and stage.key != stage_key:
             continue
-        try:
-            salad = stage_provider(stage.provider).descriptor.kind == "salad_route"
-        except KeyError:
-            salad = False
-        if salad:
+        # The stage's own provider, then each Salad alternate it names (ADR 0066): a human
+        # binds the digests of the candidate they are willing to have placed.
+        for index, candidate in enumerate(
+            (stage.provider, *(a.provider for a in stage.alternates))
+        ):
+            try:
+                salad = stage_provider(candidate).descriptor.kind == "salad_route"
+            except KeyError:
+                salad = False
+            if not salad:
+                continue
+            placed = stage_on_candidate(stage, candidate)
             result.append(
                 {
-                    **driver.preview_review_digests(ctx, stage.key),
-                    "max_attempt_cents": stage.max_exposure_cents,
+                    **driver.preview_review_digests(
+                        ctx, stage.key, None if index == 0 else candidate
+                    ),
+                    "max_attempt_cents": placed.max_exposure_cents,
                     "max_total_cents": spec.budget_cap_cents,
                 }
             )

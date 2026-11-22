@@ -47,7 +47,9 @@ does not establish that the method is sound or the conclusion is justified.
 
 This end-to-end agent workflow is a design target, **not today's integrated alpha**.
 Today you can use the local desktop/control service for versioned designs, studies,
-linked measurements, human conclusions/corrections and exports. Bounded CPU execution
+linked measurements, a baseline-versus-intervention comparison of the recorded numbers
+(difference, sample sizes and a 95% interval, never a verdict), human conclusions/corrections
+and exports. Bounded CPU execution
 uses a separate API/operator handoff; integrated planning, execution and agent
 critique remain unverified. See [capabilities and limits](docs/implemented-capabilities.md)
 for the implemented boundaries and the [tabular starter](docs/tabular-starter.md)
@@ -207,15 +209,17 @@ proxy journals a tunnel when it is admitted and again at close, so an interrupte
 recorded with unknown bytes rather than missing, [ADR 0057](docs/decisions/0057-egress-tunnel-opened-record.md)). A stage input is a snapshot, the
 declared output of an earlier stage (any provider), or an `artifact` pinned by campaign,
 stage, output and sha256 from an earlier campaign; every input and output is indexed in
-`campaign_stage_io`. A stage may also list ordered `alternate_providers`; the runner then
-places each attempt on the first candidate that is registered, enrolled for the project, trusted
-for the stage's inputs, within the per-run cap and the remaining campaign and program budget, and
-has a free slot, so independent stages run concurrently on different providers. Otherwise it waits
-or fails as a single-provider stage would; it never picks a provider the approved spec does not
-list. The choice and each skipped candidate's reason are on the receipt and in
-`tessera_get_campaign`, and `tessera_steer_campaign_placement` can pin or exclude candidates
-([ADR 0060](docs/decisions/0060-capacity-aware-stage-placement.md)). Each attempt is settled once through a single settlement path with a
-closed basis enum, and a finished or failed attempt releases its hold immediately.
+`campaign_stage_io`. A stage may also list ordered `alternate_providers`; the runner then places
+each attempt on the first candidate that is registered, enrolled for the project, trusted for the
+stage's inputs, within the per-run cap and the remaining campaign and program budget, and has a free
+slot, so independent stages run concurrently on different providers. Otherwise it waits or fails as
+a single-provider stage would; it never picks a provider the approved spec does not list. The choice
+and each skipped candidate's reason are on the receipt and in `tessera_get_campaign`, and
+`tessera_steer_campaign_placement` can pin or exclude candidates. ADR 0058's reroute targets
+are part of the same list, used only for an infrastructure retry ([ADR
+0060](docs/decisions/0060-capacity-aware-stage-placement.md)). Each attempt is settled once through
+a single settlement path with a closed basis enum, and a finished or failed attempt releases its
+hold immediately.
 Outputs above 16 MiB, such as model weights, use chunked [large-artifact custody](docs/large-artifacts.md):
 one sha256 over the whole file, 4 MiB chunks, bounded memory, and an operator-configurable
 ceiling (default 8 GiB per artifact). A Salad stage's guardian input path follows the same bound and is tested against a fake control serving a virtual 3 GiB artifact; no live Salad pull of that size has been run, and a Salad stage's own outputs stay at 16 MiB.
@@ -236,7 +240,9 @@ concurrency limit and cancelling a single stage
 `tessera_pause_campaign`, `tessera_resume_campaign`, `tessera_limit_campaign_concurrency`,
 `tessera_cancel_campaign_stage`) are recorded as events and on the receipt; approval, cap or
 concurrency increases and grant reconciliation stay human. A human still
-approves the digest and stages snapshots. See
+approves the digest and stages snapshots; an operator may enable `tessera_approve_campaign` on a
+separate `--approval-tool` server that holds a person's own session credential (the control API
+still refuses any agent credential and applies every admission check and cap). See
 [docs/mcp-campaign-client-path.md](docs/mcp-campaign-client-path.md).
 
 **What still needs a human (Salad stages).** By default every Salad stage stops for a
@@ -248,7 +254,10 @@ never in the spec: it binds the exact digests of those reviews (see them with
 then resolves a review as `campaign_delegated` only when the content recomputed from the
 stored row equals a bound digest, the entry is unexpired and the ceilings hold; any
 mismatch, expiry or overrun leaves the review for a human. A changed spec, source or
-provider needs a fresh approval and a fresh entry; an operator profile can only narrow this
+provider needs a fresh approval and a fresh entry; an entry may name one of a stage's Salad
+`alternate_providers` (`provider`), so a stage placed there is covered within the same digests
+and ceilings ([ADR 0066](docs/decisions/0066-preapproval-covers-salad-alternates.md)); an
+operator profile can only narrow this
 (`preapprove_reviews: false`). Provider trust and the data-class guard still apply, and
 every delegated review is cited on the receipt with the approval id. A person is still
 required for: approving each campaign digest (and each re-approval), staging inputs with
@@ -260,8 +269,9 @@ evidence, bounded at two identical repeats per stage; a reboot or an unreported 
 needs a person, see
 [ADR 0046](docs/decisions/0046-automatic-not-started-reconciliation.md); and an attempt whose
 worker confirmed the exit with no contradiction, which the runner resolves, releasing its grant
-and slot and never recording a pass, see
-[ADR 0053](docs/decisions/0053-resolve-attempts-on-confirmed-exit.md)),
+and slot and never recording a pass (and not while its outputs are still arriving; a stalled upload, or one past the hold ceiling, no longer holds it), see
+[ADR 0053](docs/decisions/0053-resolve-attempts-on-confirmed-exit.md) and
+[ADR 0064](docs/decisions/0064-hold-an-exited-attempt-while-outputs-upload.md)),
 and anything the delegation declines, including an over-budget
 attempt, an unclear billable frame or a guardian disagreement. A stage refuses to start
 (`deadline_too_short`) when the remaining approval or credential window cannot hold its

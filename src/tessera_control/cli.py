@@ -8,6 +8,7 @@ import os
 import sqlite3
 import stat
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -164,11 +165,22 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
     )
     actions = command.add_subparsers(dest="campaign_action", required=True)
 
-    def common(sub: argparse.ArgumentParser, *, mutating: bool, label: bool = False) -> None:
+    def common(
+        sub: argparse.ArgumentParser,
+        *,
+        mutating: bool,
+        label: bool = False,
+        optional_key: bool = False,
+    ) -> None:
         sub.add_argument("--owner-header", type=Path, required=True)
         sub.add_argument("--control-url", default="http://127.0.0.1:8765")
         if mutating:
-            sub.add_argument("--idempotency-key", required=True)
+            sub.add_argument(
+                "--idempotency-key",
+                required=not optional_key,
+                help="reuse only to retry the identical request; a batch must use one per call"
+                + (" (default: a fresh random key)" if optional_key else ""),
+            )
         if label:
             sub.add_argument(
                 "--automation-label",
@@ -182,9 +194,13 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
     common(submit, mutating=True)
     approve = actions.add_parser("approve", help="human approval of one exact spec digest")
     approve.add_argument("--campaign-id", required=True)
-    approve.add_argument("--expected-revision", type=int, required=True)
+    approve.add_argument(
+        "--expected-revision",
+        type=int,
+        help="default: the campaign's current revision, read just before approving",
+    )
     approve.add_argument("--expected-spec-digest", required=True)
-    common(approve, mutating=True, label=True)
+    common(approve, mutating=True, label=True, optional_key=True)
     get = actions.add_parser("get")
     get.add_argument("--campaign-id", required=True)
     common(get, mutating=False)
@@ -391,8 +407,18 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
                 raise ReviewError(f"Invalid campaign spec: {type(error).__name__}") from None
             call = ("POST", f"/projects/{project}/campaigns", body, key)
         elif action == "approve":
+            if not key:
+                # A fresh key per call, so a batch can never replay one campaign's approval.
+                key = "approve-" + uuid.uuid4().hex
+                print(f"idempotency-key: {key}", file=sys.stderr)
+            revision = arguments.expected_revision
+            if revision is None:
+                read_status, current = transport("GET", f"/campaigns/{campaign}", None, None)
+                if not (200 <= read_status < 300 and isinstance(current, dict)):
+                    raise ReviewError("Could not read the campaign's current revision")
+                revision = current["revision"]
             body = ApproveCampaign(
-                expected_revision=arguments.expected_revision,
+                expected_revision=revision,
                 expected_spec_digest=arguments.expected_spec_digest,
             )
             body = approve_payload(body)

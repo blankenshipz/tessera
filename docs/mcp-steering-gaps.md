@@ -32,3 +32,19 @@ reconciles a grant or sends data to a destination.
   recorded digest. It cannot retry across a campaign that has no terminal receipt, because the
   platform resolves artifact pins from that receipt.
 - A campaign with no active approval still skips the confirmed-exit resolution (ADR 0053 item 9).
+
+## Audit against the steering list (approval tool)
+
+| Steering action | Tool | State |
+| --- | --- | --- |
+| Submit | `tessera_submit_campaign`, `tessera_validate_campaign_spec` | present |
+| Inspect | `tessera_get_campaign`, `tessera_list_campaigns`, `tessera_campaign_logs`, `tessera_campaign_grants`, `tessera_campaign_budget`, `tessera_campaign_standing_status` | present |
+| Approve | `tessera_approve_campaign` | present, operator-enabled (`--approval-tool`, which alone is an approve-only server; [ADR 0065](decisions/0065-operator-enabled-mcp-approval-tool.md)), person's credential only; unlock conditions and pre-approvals not exposed |
+| Adjust | `tessera_reduce_campaign_budget` | present (lower-only). A per-campaign concurrency limit is not implemented here; it lands with the separate pause/resume work |
+| Pause / resume | none here | not implemented here; it lands with the separate pause/resume work, which has its own ADR |
+| Stop / cancel | `tessera_cancel_campaign`, `tessera_revoke_campaign_release` | present; cancelling a single stage is not implemented here; it lands with the separate pause/resume work, which has its own ADR |
+| Retrieve outcomes and receipts | `tessera_get_campaign_receipt`, `tessera_campaign_outputs`, `tessera_campaign_gate_decisions` | present |
+
+Still missing on purpose (human authority): approving with an unlock condition or pre-approvals,
+recording a gate go or no-go, creating a standing approval, raising a cap or limit, extending a
+deadline, reconciling a grant that is not a confirmed exit, staging or releasing data.

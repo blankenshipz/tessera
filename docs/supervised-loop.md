@@ -124,7 +124,15 @@ The agent reads recorded state with the result tools (needs `results:read`):
 - `tessera_experiment_results(experiment_id)` calls
   `GET /projects/{project_id}/agent-results/experiments/{experiment_id}`. Sections:
   `attempts`, `measurements`, `artifacts`, `checkpoints`, `acceptances`,
-  `conclusions`, `budget`.
+  `conclusions`, `comparison`, `budget`. `comparison` is README workflow step 5: per design
+  revision and measurement name recorded on both arms, the difference of means (intervention
+  minus baseline) over succeeded attempts, one value per attempt (several measurements of a
+  name on one attempt are averaged), with both sample sizes and, when each arm has at least two
+  attempts and some spread, a Welch 95% interval (`not_estimable_…` below two, `degenerate_no_spread`
+  when every value is equal). Each arm shows its admitted/recorded attempt counts and sources, and
+  `mixed_provenance` flags a mix; one-arm-only names and the attempts that did not succeed
+  are listed separately, `truncated` plus the `*_total` counts flag a capped list, and `decision` is always `none` (it is arithmetic on recorded numbers,
+  not a verdict or a recommendation).
 - `tessera_program_results(study_id)` calls
   `GET /projects/{project_id}/agent-results/studies/{study_id}`. Sections:
   `program_reviews` (with gates and evaluations), `experiments`, `budget` roll-up.

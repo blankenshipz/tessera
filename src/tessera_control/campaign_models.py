@@ -582,9 +582,25 @@ class NormalStage:
         return [item.path for item in self.outputs]
 
     @property
-    def candidate_ids(self) -> tuple[str, ...]:
-        """Every provider the approved spec lets this stage run on, in placement order."""
+    def placement_ids(self) -> tuple[str, ...]:
+        """The stage's own provider and its ``alternate_providers``: any attempt may use them."""
         return (self.provider, *(item.provider for item in self.alternates))
+
+    @property
+    def reroute_ids(self) -> tuple[str, ...]:
+        """ADR 0058 ``retry.reroute_providers``: one candidate list with the others (ADR 0060
+        section 5a), usable only by an infrastructure retry and under ADR 0058's limits."""
+        return tuple(self.retry.reroute_providers)
+
+    @property
+    def candidate_ids(self) -> tuple[str, ...]:
+        """Every provider the approved spec lets this stage run on, in candidate order."""
+        return (*self.placement_ids, *self.reroute_ids)
+
+    @property
+    def has_candidates(self) -> bool:
+        """True when the runner places this stage (it names more than one provider)."""
+        return len(self.candidate_ids) > 1
 
 
 def stage_on_candidate(stage: NormalStage, provider_id: str) -> NormalStage:
@@ -595,6 +611,12 @@ def stage_on_candidate(stage: NormalStage, provider_id: str) -> NormalStage:
     name is a programming error (KeyError): nothing outside the approved list is reachable."""
     if provider_id == stage.provider:
         return stage
+    if provider_id in stage.reroute_ids and provider_id not in stage.placement_ids:
+        # ADR 0058: another worker-grant instance of the same runtime. It runs with its own
+        # worker principal and without the stage's provider_config, at the stage's own hold.
+        return dataclasses.replace(
+            stage, provider=provider_id, worker_principal_id=None, provider_config={}
+        )
     for item in stage.alternates:
         if item.provider == provider_id:
             return dataclasses.replace(
@@ -615,6 +637,12 @@ def stage_on_candidate(stage: NormalStage, provider_id: str) -> NormalStage:
 def stage_candidates(stage: NormalStage) -> tuple[NormalStage, ...]:
     """Each approved candidate of a stage, as the stage would run on it, in order."""
     return tuple(stage_on_candidate(stage, pid) for pid in stage.candidate_ids)
+
+
+def placement_candidates(stage: NormalStage) -> tuple[NormalStage, ...]:
+    """The stage's own provider and alternates as it would run on each (reroute targets are
+    checked by ADR 0058's ``check_reroute`` instead)."""
+    return tuple(stage_on_candidate(stage, pid) for pid in stage.placement_ids)
 
 
 @dataclass(frozen=True)
@@ -939,11 +967,6 @@ def validate_structure(spec: NormalSpec) -> None:
         reroutes = stage.retry.reroute_providers
         if len(set(reroutes)) != len(reroutes) or stage.provider in reroutes:
             raise ValueError(f"Stage {stage.key}: reroute_providers must be distinct from it")
-        if reroutes and stage.alternates:
-            raise ValueError(
-                f"Stage {stage.key}: use alternate_providers (ADR 0060) or "
-                "retry.reroute_providers (ADR 0058) to move a stage between providers, not both"
-            )
         banned = set(reroutes) & set(spec.forbid_providers)
         if banned:
             raise ValueError(
@@ -995,7 +1018,7 @@ def validate_structure(spec: NormalSpec) -> None:
                 "has non-public inputs"
             )
         if _PROVIDER_CHECKS.get():
-            for candidate in stage_candidates(stage):
+            for candidate in placement_candidates(stage):
                 _validate_provider(candidate)
 
 
@@ -1051,6 +1074,9 @@ class StagePreapproval(_Strict):
     """Opt-in Salad review pre-approval for one stage (ADR 0044); approve body only."""
 
     stage_key: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+    # The Salad candidate this covers when it is not the stage's own provider: one of the
+    # stage's ``alternate_providers`` (ADR 0066). Absent keeps every earlier body's digest.
+    provider: ProviderId | None = None
     source_assessment_digest: Sha256Digest
     plan_digest: Sha256Digest
     source_use_digest: Sha256Digest

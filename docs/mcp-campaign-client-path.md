@@ -33,12 +33,14 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_resume_campaign` | `POST /campaigns/{id}/resume` | `campaign:cancel` |
 | `tessera_limit_campaign_concurrency` | `POST /campaigns/{id}/concurrency-limit` | `campaign:cancel` |
 | `tessera_cancel_campaign_stage` | `POST /campaigns/{id}/stages/{stage}/cancel` | `campaign:cancel` |
+| `tessera_approve_campaign` (only with `--approval-tool`) | `GET /campaigns/{id}`, `POST /campaigns/{id}/approve` | a person's session credential; no enrollable scope grants it |
 | `tessera_prepare_stage_retry` | `GET /campaigns/{id}` and `/outputs` (offline build) | `campaign:read` + `artifact:read` (both needed to register it) |
 
-The last nine are the steering tools of [ADR 0055](decisions/0055-mcp-steering-tools.md) and [ADR 0061](decisions/0061-campaign-pause-concurrency-stage-cancel.md) (pause and resume, a lower-only concurrency limit, single-stage cancel); the audit is in
+The grants, budget-reduction, release-revocation, pause, resume, concurrency and stage-cancel tools, and the retry tool, are the steering tools of [ADR 0055](decisions/0055-mcp-steering-tools.md) and [ADR 0061](decisions/0061-campaign-pause-concurrency-stage-cancel.md) (pause and resume, a lower-only concurrency limit, single-stage cancel); the audit is in
 [mcp-steering-gaps.md](mcp-steering-gaps.md). Validation is a dry run; the budget reduction and the
 release revocation only reduce authority and apply to the submitter's own campaigns; the retry tool
-builds a new spec and submits nothing. No tool approves, raises a cap, reconciles a grant or releases data.
+builds a new spec and submits nothing. No tool raises a cap, reconciles a grant or releases data, and
+none approves unless an operator starts the separate `--approval-tool` server described below.
 
 `tessera_campaign_standing_status` shows why a scheduled or follow-on start did or did not happen
 (status, window, limits, started campaigns, pending/abandoned triggers) so an agent need not
@@ -90,3 +92,12 @@ tools and the harness blocks with `catalog_inventory_changed`. Use a separate cr
 
 Enrollment: `scripts/enroll_local_mcp.py --allow-campaigns` (submit/read/cancel) and
 `--allow-campaign-evidence` (`snapshot:read`, `artifact:read`, `campaign:logs`).
+
+`tessera_approve_campaign` ([ADR 0065](decisions/0065-operator-enabled-mcp-approval-tool.md)) is off unless
+the operator starts a separate server with `--approval-tool` and a person's session credential file
+(never the submitting agent's). That flag alone gives an approve-only server with no submit or cancel
+tool; add `--campaign-tools` to expose those as well. It names the exact spec digest,
+reads the current revision, uses a fresh idempotency key per call unless one is supplied, and returns
+the approval record. The control API makes every decision: an agent credential gets HTTP 403, a stale
+revision or digest, an unapproved state, a reused key or an exceeded program/campaign cap gets 409,
+and nothing is written. Unlock conditions and pre-approvals are not exposed.

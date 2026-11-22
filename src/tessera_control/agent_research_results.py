@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .experiment_budgets import budget_status
+from .experiment_comparison import comparison_section
 from .external_agents import ExternalAgentStore
 from .programs import program_history
 from .store import Conflict, NotFound, _connect
@@ -306,6 +307,7 @@ for _section in (
     ResultSection("checkpoints", "experiment", RESULTS_SCOPE, _checkpoints),
     ResultSection("acceptances", "experiment", RESULTS_SCOPE, _acceptances),
     ResultSection("conclusions", "experiment", RESULTS_SCOPE, _conclusions),
+    ResultSection("comparison", "experiment", RESULTS_SCOPE, comparison_section),
     ResultSection("budget", "experiment", BUDGET_SCOPE, _budget),
     ResultSection("program_reviews", "program", RESULTS_SCOPE, _program_reviews),
     ResultSection("experiments", "program", RESULTS_SCOPE, _program_experiments),

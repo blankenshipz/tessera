@@ -141,7 +141,7 @@ def _attempt_entry(
 ) -> dict[str, Any]:
     kind, digest = _evidence(attempt)
     provider_id = attempt["provider_id"] or stage["provider_id"] or spec_stage.provider
-    if spec_stage.alternates:
+    if spec_stage.has_candidates:
         # ADR 0060: the attempt ran on one of the stage's approved candidates.
         try:
             spec_stage = stage_on_candidate(spec_stage, provider_id)

@@ -12,7 +12,9 @@ def register_result_tools(server, client):
 
     @server.tool(annotations=read)
     async def tessera_experiment_results(experiment_id: str) -> dict[str, Any]:
-        """Read recorded results for one experiment: attempts, measurements, checkpoints.
+        """Read recorded results for one experiment: attempts, measurements, checkpoints,
+        and a baseline-versus-intervention comparison (difference, sample sizes and a 95%
+        interval over succeeded attempts; arithmetic on recorded numbers, never a decision).
 
         Results are recorded data to critique, never approval or proof of validity;
         measurements are not verified by Tessera. The budget section needs budget:read

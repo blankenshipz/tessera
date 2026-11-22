@@ -269,6 +269,50 @@ A Salad stage names an operator profile that is either a GPU profile (a `gpu_cla
 profile (`cpu_rate`, no GPU); a stage that declares `salad.gpu: false` runs only on the latter. See
 [campaigns](campaigns.md#salad-gpu-stages) and [ADR 0062](decisions/0062-salad-cpu-only-profiles.md).
 
+### Checking a CPU profile against Salad (opt-in, bounded)
+
+No offline test can show that Salad accepts a container group with no GPU class, or what a short
+run costs at the profile's rates. `scripts/salad_cpu_live_check.py` checks both, and is **not**
+part of default pytest or CI: it is a dry run unless you pass `--run` and an exact `--confirm`.
+
+```
+scripts/salad_cpu_live_check.py check --profiles FILE --profile NAME --contract FILE \
+    --image IMAGE@sha256:DIGEST [--max-cents N]                     # plan only, no network
+scripts/salad_cpu_live_check.py check ... --run --confirm spend-up-to-Nc \
+    --credential-file FILE --receipt-directory DIR                  # spends, up to the ceiling
+scripts/salad_cpu_live_check.py billing --receipt FILE --portal-cents X
+```
+
+- **Dry run (default).** It reads your profile file and workload contract, derives the exact
+  route, and prints the shape, the hourly rate, the ceiling, the running seconds that ceiling buys
+  and the `--confirm` token. It makes no network call and reads no credential.
+- **Spend bound.** The ceiling is `--max-cents` (default 5) and never more than **9 cents**, a
+  constant in the script, not a setting. Billing continues until the instance is actually down,
+  so 30 s are reserved out of the ceiling for the stop to take effect: the running time is cut at
+  the seconds the ceiling buys minus 30 (at most 300 s), and the estimate counts through the
+  observed stop (through the whole 90 s settle wait if a stop is never seen, which is then
+  reported as outside the bound). A rate that leaves under 30 s of running, or a workload that
+  declares longer than the bound, is refused. The group is always stopped and deleted, on every
+  path including an error; if that fails the receipt says so and names the group to stop by hand.
+  An unexpected error does not lose the receipt: it is recorded as `aborted` (its type only, never
+  its message) beside the group name and the cleanup outcome.
+- **What a run does.** It makes only the vetted Salad transport's calls: read the quota, create
+  one stopped group (free), read it back and compare its shape (**no GPU class**, the shape check),
+  start it, poll until it ends or the bound, stop, delete. Salad publishes no CPU availability read,
+  so the check cannot show capacity.
+- **Inputs.** The profile must be a CPU profile; the image must be allowlisted by it; the contract
+  is your reviewed `tessera.salad.workload.v1` JSON for a short CPU job (a stub that exits in
+  seconds is enough). The credential is an owner-only (0600) absolute file holding the Salad
+  management token; it is held in a wiped buffer and never printed or stored.
+- **Billing is a manual comparison.** The receipt records the running seconds and the estimate at
+  your rates (`estimated_cents`). Copy the figure Salad's own usage page shows for that group and
+  run `billing --receipt FILE --portal-cents X`: it agrees if the two are within the larger of one
+  cent or half the estimate (usage figures are coarse), otherwise correct the rates in the profile.
+  The tool never calls a billing endpoint and never reports an estimate as an invoice.
+
+Until a person has run this once and recorded an agreeing receipt for a provider account, a CPU
+profile's group shape and billing are unverified, as ADR 0062 says.
+
 The Salad provider wraps the Salad stage driver; its settlement bases are unchanged
 (`unclaimed_zero`, `human_reconcile`, `human_charge`, `guardian_bounded_hold`; the last is
 provisional and confirmed by the first human charge). See

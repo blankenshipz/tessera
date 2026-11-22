@@ -2,7 +2,8 @@
 
 Status: accepted. No schema change. Builds on ADR 0038 (campaign runner), 0040 (providers and
 data-class routing), 0045 (program budget), 0047 (agent-routed data destinations), 0048 (grant
-lifetime and slot release), 0053 (resolving a confirmed exit) and 0055 (steering tools).
+lifetime and slot release), 0053 (resolving a confirmed exit), 0055 (steering tools) and 0058
+(infrastructure retries, whose reroute list it absorbs, section 5a).
 
 ## Context
 
@@ -64,11 +65,15 @@ The evaluation is deterministic: the same recorded state yields the same choice.
 attempt placed but not yet granted counts against its provider's slots, independent stages in one
 tick go to different providers and run concurrently.
 
-The chosen provider's `prepare` (scaffolding such as Salad's, which may take several ticks or
-wait for a person) must return `ready` before anything is reserved there. A candidate that ran an
-earlier attempt of the stage is prepared; any other is prepared again on every tick until it is
-ready, also when a retry moves to it. The recorded placement says where, never whether that work
-finished.
+The chosen provider's `prepare` (scaffolding such as Salad's, which may take several ticks or wait
+for a person) runs before every reservation on this path and must return `ready` before anything
+is reserved there. No earlier attempt is taken as proof that a provider is still prepared, so a
+stage that moves A -> B -> A asks A again. This relies on the provider contract that `prepare` is
+idempotent: once a provider's preparation of a stage stands it returns `ready` without effects
+(the worker provider always does; Salad's scaffold is kept per stage, never torn down, and only
+re-reads the source verdict). The recorded placement says where, never whether that work finished.
+One exception: the unavoidable budget refusal of section 3 records its `refused_budget` attempt
+without calling `prepare`, because that attempt takes no hold, release or grant and runs nothing.
 
 The choice is recorded in one transaction as the stage's current `provider_id` and a
 `campaign.stage_placed` event carrying the candidates, the chosen provider, its hold, every
@@ -101,12 +106,12 @@ writes; a human may use it too) calls `POST /campaigns/{id}/placement-steering` 
 optional `pin` and an `exclude` list. Only the stage's approved candidates may be named, at least
 one must remain, and a stage with no alternates is refused. It is revision-guarded, idempotent and
 recorded as `campaign.placement_steered`; a later call replaces the previous steering (no pin and
-an empty exclude clears it, back to the approved list). It applies to the next placement; an attempt
-already placed keeps its provider. Steering is not reduce-only over time: because the latest call
-replaces the previous one, an agent can re-allow a candidate it excluded earlier. It is always a
-filter over the approved list, so it can never reach a provider the approved spec does not name and
-never widens authority beyond that approval. The spec-level counterpart is the existing `forbid_providers` plus the order of
-the candidates.
+an empty exclude clears it, back to the approved list). It applies to the next placement; an
+attempt already placed keeps its provider. Steering is not reduce-only over time: because the
+latest call replaces the previous one, an agent can re-allow a candidate it excluded earlier. It
+is always a filter over the approved list, so it can never reach a provider the approved spec does
+not name and never widens authority beyond that approval. The spec-level counterpart is the
+existing `forbid_providers` plus the order of the candidates.
 
 ### 5. Retries and slot release
 
@@ -118,28 +123,41 @@ rest), so the planned and the executed run never differ. The task's budget uses 
 holds its slot claim; ADR 0048/0053 slot release frees a provider's slot as before, and the next
 placement sees it.
 
-### 5a. Follow-up: one candidate list for placement and infrastructure reroute
+### 5a. One candidate list for placement and infrastructure reroute
 
-Decided; the unification itself is not yet implemented. **Until then (batch integration of
-ADR 0058 and this ADR) the two are mutually exclusive on a stage:** a stage with
-`alternate_providers` is placed by this ADR, every retry (an infrastructure retry included,
-bounded by `retry.infra_retries`) is placed across the approved candidates, and a stage with
-`retry.reroute_providers` keeps ADR 0058's reroute; a spec naming both for one stage is refused
-at validation. The resolved composition lives in `campaign_runner` (`_spec_stage`, `_reserve`,
-`_place_and_reserve`) and `campaign_store._check_references`.
+ADR 0058's `retry.reroute_providers` and `alternate_providers` feed one ordered candidate list,
+and every attempt, including an infrastructure retry, is placed by `decide` with the same checks
+and records (`campaign.stage_placed`, the receipt's `placement`, the `placement` status field).
+The candidate list is the stage's own provider, then `alternate_providers`, then
+`reroute_providers`; the order an attempt tries them in is:
 
-Planned: The infrastructure retry of ADR 0058 moves a retry along its own
-`retry.reroute_providers` list. There will be one placement mechanism: `retry.reroute_providers`
-feeds the same ordered candidate list as `alternate_providers`, and every rerouted retry is placed
-by `decide` with the same checks and records (`campaign.stage_placed`, receipt `placement`).
-ADR 0058's limits keep applying to a candidate reached only through `reroute_providers`: it is
-used only for an infrastructure retry, never for a first attempt or a scientific retry, it counts
-against `retry.infra_retries`, and it must be an unbilled worker-grant provider of the stage's
-runtime unless the approval covers a billable one (as a billable `alternate_providers` entry is
-covered by its approved estimate). The runner seam is the stage's current `provider_id` (this
-change) versus the latest attempt's `provider_id` (ADR 0058); the work waits for the ADR 0058
-fixes in progress on the infrastructure-retry branch, which change that code, and is not
-part of this change.
+- a first attempt: the list in order;
+- a retry after a task (scientific) failure: where the last attempt ran first (ADR 0058: it
+  stays there), then the rest in order;
+- a retry after an infrastructure failure: candidates the infrastructure has not failed yet
+  first, in order, then those it has. With no alternates this is ADR 0058's order exactly: the
+  first untried reroute target, returning to the stage's own provider when none is left.
+
+ADR 0058's limits keep applying to a candidate named only in `reroute_providers`:
+
+- it is used only for an infrastructure retry, or to stay where one moved the stage; for any
+  other attempt it is skipped as `infra_retry_only` (never for a first attempt);
+- each placement re-runs ADR 0058's `check_reroute` on it (registered, an unbilled worker-grant
+  provider of the stage's runtime, the provider's stage check, trust narrowing and input
+  admission) and skips it as `reroute_refused` when that fails, so a billable destination is
+  reachable only as an `alternate_providers` entry, approved with its estimate;
+- it runs with its own worker principal, without the stage's `provider_config`, at the stage's
+  own hold, and infrastructure retries stay bounded by `retry.infra_retries`;
+- steering may exclude it but never pin it, and must leave the stage's own provider or an
+  alternate.
+
+A stage with reroute targets but no `alternate_providers` is placed only when a reroute can
+apply: its last attempt was an infrastructure failure, or ran on a reroute target. Its first
+attempt and its other retries keep the single-provider path exactly as ADR 0058 had it (reserved
+on the stage's own provider, waiting there for a slot at grant time, no placement record). When
+a reroute does apply, the target is also checked for a free slot, the budgets and the project
+limits before it is chosen; when it cannot run now the next candidate in the order is tried, and
+the stage waits only if none can.
 
 ### 6. Visibility
 
@@ -153,7 +171,9 @@ section with the same fields, and the attempt's and stage's `runtime` are the ch
 - Independent CPU stages spread across registered, enrolled, trusted providers with free slots,
   inside the approved spec, with each choice explained on the receipt.
 - A candidate Salad (or other billable) provider is approved like any stage provider and holds its
-  own estimate; Salad review pre-approvals still apply only to stages whose own provider is Salad.
+  own estimate; a Salad review pre-approval covers a Salad candidate that its approve-body entry
+  names ([ADR 0066](0066-preapproval-covers-salad-alternates.md)); an alternate with no bound
+  entry waits for a person (fail closed).
 - A placed attempt does not move if its provider's slot is taken by another campaign before its
   grant; it waits there as a single-provider stage does.
 - Trust narrowed after approval intersects with the approval-time setting; if that setting is not
@@ -178,3 +198,13 @@ excluded by steering makes the stage wait for the CPU host instead of degrading.
 `tests/test_campaign_placement_prepare.py`: a transient failure moves the retry to a candidate
 whose `prepare` reports progress, then waits for a person; nothing is held, reserved or granted
 there until it is ready, and the retry then runs there.
+
+`tests/test_campaign_placement_reroute.py`: an infrastructure retry placed on the reroute target
+and recorded; a first attempt of a stage with only reroute targets keeping the single-provider
+path (reserved on its own provider and waiting there for a slot, nothing placed); the candidate
+order and `infra_retry_only` rule for a stage with both alternates and reroute targets; a reroute
+target that stopped qualifying skipped as `reroute_refused`, returning to the stage's own
+provider; steering refusing to pin a reroute target; and a stage moving A -> B -> A asking A's
+`prepare` again (nothing is reserved while it waits). ADR 0058's
+`tests/test_campaign_infra_retry.py` passes unchanged except its overlay test, which now calls the
+unified `stage_on_candidate`.

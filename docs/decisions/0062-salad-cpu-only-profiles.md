@@ -58,9 +58,13 @@ route's resources allow `gpu_count: 0`, and the resource check names a CPU-only 
 
 ## Follow-up
 
-A bounded, opt-in live harness (kept out of default pytest, run by the operator against their own
-Salad account with a small cap) should confirm the CPU group shape and the billing at the
-operator's rates before a CPU profile is relied on. Until then both are documented as unverified.
+`scripts/salad_cpu_live_check.py` is the bounded, opt-in live check (a dry run by default, outside
+default pytest, at most 9 cents, always stops and deletes its group; see the
+[provider page](../campaign-providers.md#checking-a-cpu-profile-against-salad-opt-in-bounded)). It
+confirms the CPU group shape and compares the billing at the operator's rates with a figure a person
+copies from Salad's usage page. It has not been run against Salad: until a person runs it and records
+an agreeing receipt, both stay documented as unverified. Its tests use a stateful in-process fake of
+the container-group API behind the transport's connection factory.
 
 ## Tests
 

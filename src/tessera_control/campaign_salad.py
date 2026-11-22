@@ -20,7 +20,13 @@ from typing import TYPE_CHECKING, Any
 
 from . import campaign_preapproval, provider_trust
 from . import execution_frames as frames
-from .campaign_models import SALAD_TARGET, TERMINAL_CAMPAIGN, SaladStageSpec, StageSpec
+from .campaign_models import (
+    SALAD_TARGET,
+    TERMINAL_CAMPAIGN,
+    SaladStageSpec,
+    StageSpec,
+    stage_on_candidate,
+)
 from .campaign_settlement import apply_late_charge, confirm_settlement
 from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
@@ -557,12 +563,17 @@ class SaladStageDriver:
             "intended_use": "Workload provenance for one operational stage run only",
         }
 
-    def preview_review_digests(self, ctx: _Ctx, key: str) -> dict[str, str]:
+    def preview_review_digests(
+        self, ctx: _Ctx, key: str, provider_id: str | None = None
+    ) -> dict[str, str]:
         """The three digests a human binds in ``preapprovals`` for this stage (ADR 0044).
 
         Read-only: builds the scopes with placeholder run-minted ids through the same code
-        the runner uses to propose them, then digests the cores."""
-        spec_stage = self._spec(ctx, key)
+        the runner uses to propose them, then digests the cores. ``provider_id`` names a Salad
+        alternate of the stage (ADR 0066); absent, the stage's own provider."""
+        spec_stage = ctx.spec.stage(key)
+        if provider_id is not None:
+            spec_stage = stage_on_candidate(spec_stage, provider_id)
         salad = salad_config(spec_stage)
         snapshot = next(i for i in spec_stage.inputs if i.kind == "snapshot")
         placeholder = {
@@ -583,6 +594,7 @@ class SaladStageDriver:
         template = salad.program.source.model_dump(mode="json")
         return {
             "stage_key": key,
+            **({} if provider_id is None else {"provider": provider_id}),
             "source_assessment_digest": campaign_preapproval.source_core_digest(
                 {
                     "uri": template["uri"],

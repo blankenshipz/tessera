@@ -25,6 +25,13 @@ Every guard must hold, and nothing is invented:
   ``exited`` before it collects, uploads and posts the receipt); otherwise it is given
   ``GRACE_SECONDS``, measured from when control recorded the confirmed exit, for the receipt
   and manifest to arrive;
+* whatever the attempt's status and whether or not its grant has expired, it is held while an
+  output upload for it is still arriving (ADR 0064): a large chunked upload that is open,
+  unexpired and has made progress within ``UPLOAD_STALL_SECONDS`` (``UploadProgress`` watches the
+  bytes control holds, so a restarted worker resuming its upload counts as progress), or an
+  upload or artifact that finished within ``GRACE_SECONDS`` (the manifest and receipt follow it).
+  It is closed only after the uploads finish and the grace passes, or an upload stalls or
+  expires;
 * the cost is recorded and never above the hold: a worker-grant provider costs nothing
   (``local_zero``), and the recorded figure is clamped to the grant's hold.
 
@@ -37,7 +44,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .execution import reconcile_grant_row
@@ -51,6 +58,12 @@ EXIT_CONFIRMED_UNRESOLVED = "exit_confirmed_unresolved"
 # is a final failure carrying that code (ADR 0063). The spec's own codes replace this default.
 INFRA_EXIT_CODES = frozenset({137})
 GRACE_SECONDS = 120
+# A large upload whose held bytes have not changed for this long no longer counts as arriving.
+UPLOAD_STALL_SECONDS = 600
+# Past its grant's expiry an exited attempt is held for its outputs at most this long after control
+# recorded the exit, and never beyond the campaign's approval window: a trickle of bytes cannot
+# keep a slot and a grant open for the upload's own 24 hours (ADR 0064).
+MAX_EXTENDED_HOLD_SECONDS = 2 * 3600
 RESOLVABLE = ("admitted", "running", "unknown")
 UNRESOLVED_GRANT = ("active", "cancel_requested")
 
@@ -105,7 +118,121 @@ def _collecting(connection: sqlite3.Connection, grant_id: str, now: datetime) ->
     return False
 
 
-def _recorded(connection: sqlite3.Connection, seen: dict[str, Any]) -> datetime:
+class UploadProgress:
+    """Watches how many bytes control holds for each open upload, to tell progress from a stall.
+
+    The chunk store keeps no per-write timestamp, so the runner (long-lived, ticking every few
+    seconds) records when it last saw an upload's held bytes change. A runner that has just
+    started has seen nothing, so an upload is first treated as having just progressed: a restart
+    delays a resolution by at most one stall window and never closes an upload early."""
+
+    MAX_TRACKED = 1024
+
+    def __init__(self, stall_seconds: int = UPLOAD_STALL_SECONDS) -> None:
+        self.stall_seconds = stall_seconds
+        self._seen: dict[str, tuple[int, datetime]] = {}
+
+    def last_change(self, upload_id: str, held: int, now: datetime) -> datetime:
+        previous = self._seen.get(upload_id)
+        if previous is None or previous[0] != held:
+            if len(self._seen) >= self.MAX_TRACKED and upload_id not in self._seen:
+                self._seen.pop(next(iter(self._seen)))
+            self._seen[upload_id] = (held, now)
+            return now
+        return previous[1]
+
+    def forget(self, upload_id: str) -> None:
+        self._seen.pop(upload_id, None)
+
+
+def open_uploads(connection: sqlite3.Connection, grant_id: str) -> list[sqlite3.Row]:
+    """Large artifact uploads of the grant's leases that are still ``uploading``."""
+    return connection.execute(
+        """SELECT u.id, u.expires_at FROM snapshot_chunk_uploads u JOIN execution_leases l
+        ON l.id = json_extract(u.manifest_json, '$.lease_id')
+        WHERE l.grant_id=? AND u.status='uploading'
+        AND json_extract(u.manifest_json, '$.kind') = 'artifact'""",
+        (grant_id,),
+    ).fetchall()
+
+
+def hold_deadline(
+    grant: sqlite3.Row | dict[str, Any],
+    exit_recorded: datetime,
+    approval_expires: datetime | None = None,
+) -> datetime:
+    """The latest moment outputs can still hold an exited attempt (ADR 0064).
+
+    The grant's own lifetime always counts (as before this ADR); beyond it the hold runs at most
+    ``MAX_EXTENDED_HOLD_SECONDS`` from the recorded exit and never past the approval window."""
+    extended = exit_recorded + timedelta(seconds=MAX_EXTENDED_HOLD_SECONDS)
+    if approval_expires is not None:
+        extended = min(extended, approval_expires)
+    return max(_parse(grant["expires_at"]), extended)
+
+
+def uploads_arriving(
+    connection: sqlite3.Connection,
+    grant_id: str,
+    now: datetime,
+    progress: UploadProgress | None = None,
+    deadline: datetime | None = None,
+) -> bool:
+    """True while this grant's outputs are still reaching control (ADR 0064).
+
+    An open large upload that has not expired counts while its held bytes changed within the
+    stall window (always, when no ``progress`` watcher is given); a completed upload or an
+    artifact that landed within ``GRACE_SECONDS`` counts too, because the manifest and the run
+    receipt are posted right after the last byte. Nothing holds at or after ``deadline``.
+
+    The held bytes are every chunk row of the upload, including a chunk that is only partly
+    stored (a worker sending a chunk in parts, ADR 0050): each part moves the number, so progress
+    is not coarser than one request and survives a worker restart that resumes mid-chunk. A single
+    whole-chunk request is bounded by the worker's own request timeout (seconds), far below the
+    stall window."""
+    if deadline is not None and now >= deadline:
+        return False
+    for upload in open_uploads(connection, grant_id):
+        if now >= _parse(upload["expires_at"]):
+            continue
+        if progress is None:
+            return True
+        if (
+            now - progress.last_change(upload["id"], held_bytes(connection, upload["id"]), now)
+        ).total_seconds() < progress.stall_seconds:
+            return True
+    if progress is not None:  # a finished upload needs no more watching
+        for done in connection.execute(
+            """SELECT u.id FROM snapshot_chunk_uploads u JOIN execution_leases l
+            ON l.id = json_extract(u.manifest_json, '$.lease_id')
+            WHERE l.grant_id=? AND u.status='completed'
+            AND json_extract(u.manifest_json, '$.kind') = 'artifact'""",
+            (grant_id,),
+        ):
+            progress.forget(done["id"])
+    latest = connection.execute(
+        """SELECT max(t) FROM (
+            SELECT a.created_at AS t FROM artifacts a JOIN execution_leases l ON l.id=a.lease_id
+            WHERE l.grant_id=?
+            UNION ALL
+            SELECT u.completed_at FROM snapshot_chunk_uploads u JOIN execution_leases l
+            ON l.id = json_extract(u.manifest_json, '$.lease_id')
+            WHERE l.grant_id=? AND json_extract(u.manifest_json, '$.kind') = 'artifact'
+            UNION ALL
+            SELECT au.completed_at FROM artifact_uploads au JOIN execution_leases l
+            ON l.id = au.lease_id WHERE l.grant_id=?)""",
+        (grant_id, grant_id, grant_id),
+    ).fetchone()[0]
+    return latest is not None and (now - _parse(latest)).total_seconds() < GRACE_SECONDS
+
+
+def held_bytes(connection: sqlite3.Connection, upload_id: str) -> int:
+    return connection.execute(
+        "SELECT coalesce(sum(size), 0) FROM snapshot_chunks WHERE owner_id=?", (upload_id,)
+    ).fetchone()[0]
+
+
+def exit_recorded_at(connection: sqlite3.Connection, seen: dict[str, Any]) -> datetime:
     """When control recorded the exit (its own clock), else the reported time."""
     cursor = str(seen["cursor"])
     if cursor.startswith("observation:"):
@@ -127,6 +254,8 @@ def assess(
     free_worker_grant: bool = False,
     infra_exit_codes: frozenset[int] | set[int] | tuple[int, ...] = INFRA_EXIT_CODES,
     infra_retries_enabled: bool = False,
+    progress: UploadProgress | None = None,
+    approval_expires: datetime | None = None,
 ) -> Resolution | None:
     """A ``Resolution`` when every guard holds, else ``None`` (and the attempt is untouched).
 
@@ -164,13 +293,17 @@ def assess(
     manifest = connection.execute(
         "SELECT id FROM artifact_manifests WHERE grant_id=?", (grant_id,)
     ).fetchone()
+    exit_recorded = exit_recorded_at(connection, seen)
+    deadline = hold_deadline(grant, exit_recorded, approval_expires)
+    if uploads_arriving(connection, grant_id, now, progress, deadline):
+        return None  # outputs are still reaching control: closing now would discard them
     if attempt["status"] != "unknown":  # admitted or running: the normal flow may still collect it
         if receipt is not None:
             return None  # the normal flow collects and settles it
         if now < _parse(grant["expires_at"]):
             if _collecting(connection, grant_id, now):
                 return None  # a live lease or an upload in progress: the worker is still at it
-            if (now - _recorded(connection, seen)).total_seconds() < GRACE_SECONDS:
+            if (now - exit_recorded_at(connection, seen)).total_seconds() < GRACE_SECONDS:
                 return None  # the receipt and manifest may still arrive
     hold = int(grant["max_exposure_cents"])
     cents = 0  # a non-billable worker-grant provider costs nothing, so never above the hold
@@ -202,7 +335,15 @@ def assess(
             if receipt is None
             else "the worker confirmed the exit after the attempt had gone unknown; run again"
         )
+    still_open = [u for u in open_uploads(connection, grant_id) if now < _parse(u["expires_at"])]
+    expired_open = len(open_uploads(connection, grant_id)) - len(still_open)
+    if still_open:
+        why = "the hold ceiling was reached" if now >= deadline else "no bytes arrived in time"
+        detail = f"{detail}; {len(still_open)} output upload(s) were still open ({why})"
     evidence = {
+        # Exactly what was open when the attempt was settled, and why the hold ended.
+        "open_uploads": {"unexpired": len(still_open), "expired": expired_open},
+        "hold_ended_by": (None if not still_open else "ceiling" if now >= deadline else "stall"),
         "attempt_id": attempt_id,
         "grant_id": grant_id,
         "operation_id": operation_id,

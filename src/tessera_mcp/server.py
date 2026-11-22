@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import sys
+import uuid
 from typing import Any
 
 import anyio
@@ -52,10 +53,51 @@ CAMPAIGN_TOOL_SCOPES = {
 ALSO_REQUIRES = {"tessera_prepare_stage_retry": frozenset({"artifact:read"})}
 
 
+def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
+    """The approval tool, only when the operator turns it on (``--approval-tool``).
+
+    It is a thin client of ``POST /campaigns/{id}/approve``. The control API still decides: it
+    refuses any credential that is not a person's session (so an ordinary agent credential gets
+    a 403 here), re-checks the revision and spec digest, the program cap, the budget and trust
+    checks, and records the approval. Nothing is checked or skipped in this adapter that the CLI
+    path does not also check; unlock conditions and pre-approvals are not exposed.
+    """
+    write = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    )
+
+    async def tessera_approve_campaign(
+        campaign_id: str,
+        expected_spec_digest: str,
+        idempotency_key: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Approve ONE exact spec digest of a submitted campaign (a person's credential).
+
+        Reads the campaign's current revision, refuses before sending anything if the spec digest
+        you name is not the stored one, then asks the control API to approve that revision. Spend
+        limits, the program cap, trust and every other admission check run on the control plane
+        exactly as for the CLI; a refusal changes nothing. A fresh idempotency key is used per
+        call unless you supply one. To replay a call whose answer you lost, send the SAME key and
+        the revision you read before (expected_revision): the identical request returns the same
+        approval once; a key is never valid for another campaign. Returns the approval record.
+        """
+        campaign = await client.campaign(campaign_id)
+        if campaign.get("spec_digest") != expected_spec_digest:
+            raise ValueError(
+                "The spec digest you named is not the campaign's current one; nothing was sent."
+            )
+        key = idempotency_key or "approve-" + uuid.uuid4().hex
+        revision = campaign["revision"] if expected_revision is None else expected_revision
+        return await client.approve_campaign(campaign_id, revision, expected_spec_digest, key)
+
+    server.tool(annotations=write)(tessera_approve_campaign)
+
+
 def register_campaign_tools(
     server: FastMCP, client: ControlClient, actions: frozenset[str] | None = None
 ) -> None:
-    """Campaign tools (ADR 0038). No approval tool exists: a human approves the digest.
+    """Campaign tools (ADR 0038). No approval tool unless the operator enables one (see below).
 
     ``actions`` is the credential's live scope set; ``None`` (forced on) registers all tools
     and the control API still enforces each scope.
@@ -395,6 +437,7 @@ def create_server(
     campaign_tools: bool = False,
     provider_trust_tools: bool = False,
     campaign_actions: frozenset[str] | None = None,
+    approval_tool: bool = False,
 ) -> FastMCP:
     server = FastMCP(
         "Tessera research bench",
@@ -490,6 +533,9 @@ def create_server(
         # Opt-in: the OpenCode harness catalog (PERMITTED_TOOLS) is a frozen plane and does
         # not list these tools, so the default catalog is unchanged.
         register_campaign_tools(server, client, campaign_actions)
+    if approval_tool:
+        # Independent of the campaign tools: an approve-only server exposes no submit or cancel.
+        register_approval_tool(server, client)
     if provider_trust_tools:
         # Registered only when the credential's live scopes include provider_trust:read.
         register_provider_trust_tools(server, client)
@@ -530,7 +576,8 @@ def main(argv=None):
             "Runtime references: TESSERA_CONTROL_URL, TESSERA_AGENT_TOKEN_FILE, "
             "TESSERA_PROJECT_ID, TESSERA_AGENT_DESTINATION. Remote control requires HTTPS. "
             "Optional TESSERA_CONTROL_CA_FILE references a public PEM CA trust bundle. "
-            "Use a private agent credential file, never a human token."
+            "Use a private agent credential file; a person's credential only for a separate "
+            "--approval-tool server."
         ),
     )
     parser.add_argument(
@@ -551,6 +598,16 @@ def main(argv=None):
             "registered only when the credential's live scopes include provider_trust:read"
         ),
     )
+    parser.add_argument(
+        "--approval-tool",
+        action="store_true",
+        help=(
+            "register tessera_approve_campaign. Alone it makes an approve-only server (no "
+            "submit or cancel tools); add --campaign-tools to expose those too. The control API "
+            "accepts approval only from a person's session credential, so run it as a separate "
+            "operator server with its own credential file, not with the submitting agent's"
+        ),
+    )
     arguments = parser.parse_args(argv)
     # MCP SDK exception logging can include caller arguments. Never emit it to host logs.
     logging.disable(logging.CRITICAL)
@@ -563,6 +620,8 @@ def main(argv=None):
     client = ControlClient(config)
     campaign_tools = arguments.campaign_tools
     campaign_actions = None
+    if campaign_tools is None and arguments.approval_tool:
+        campaign_tools = False  # --approval-tool alone is an approve-only server
     if campaign_tools is None:
         live = _live_actions(client)
         campaign_tools = bool(live & CAMPAIGN_ACTIONS)
@@ -574,6 +633,8 @@ def main(argv=None):
     extra = {"provider_trust_tools": True} if provider_trust_tools else {}
     if campaign_tools and campaign_actions is not None:
         extra["campaign_actions"] = campaign_actions
+    if arguments.approval_tool:
+        extra["approval_tool"] = True
     create_server(client, campaign_tools=campaign_tools, **extra).run(transport="stdio")
     return 0
 

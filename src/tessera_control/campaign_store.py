@@ -31,8 +31,8 @@ from .campaign_models import (
     SubmitCampaign,
     normalize,
     parse_spec_json,
+    placement_candidates,
     spec_digest,
-    stage_candidates,
     stage_input_class,
     stage_output_class,
     stage_provider,
@@ -275,7 +275,7 @@ class CampaignStore(
         normal = normalize(spec)
         # ADR 0060: every approved candidate passes the checks the stage's own provider does,
         # here and again whenever the runner places the stage.
-        candidates = [item for stage in normal.stages for item in stage_candidates(stage)]
+        candidates = [item for stage in normal.stages for item in placement_candidates(stage)]
         providers: dict[tuple[str, str], Any] = {}
         for stage in candidates:
             try:
@@ -322,7 +322,7 @@ class CampaignStore(
                         "Campaign input snapshot is not recorded public (ADR 0039) "
                         "and cannot be declared public."
                     )
-            for candidate in stage_candidates(stage):
+            for candidate in placement_candidates(stage):
                 self.check_stage_inputs(
                     connection, candidate, providers[stage.key, candidate.provider], digest
                 )
@@ -472,6 +472,21 @@ class CampaignStore(
             if live["role"] != "human":
                 raise Forbidden("A human must approve a campaign.")
             require_decision_actor(live, forbidden=Forbidden)
+            # A key already used to approve another campaign is a client bug (a batch helper
+            # reusing one key): refuse it loudly instead of letting the second approval pass
+            # as if it were the first. The same key and campaign with another body is refused
+            # by the idempotency check itself (409).
+            reused = connection.execute(
+                """SELECT 1 FROM idempotency WHERE principal_id=? AND org_id=?
+                AND idempotency_key=? AND method='POST' AND path LIKE '/campaigns/%/approve'
+                AND path<>? LIMIT 1""",
+                (live["id"], live["org_id"], key, f"/campaigns/{campaign_id}/approve"),
+            ).fetchone()
+            if reused is not None:
+                raise Conflict(
+                    "Idempotency key was already used to approve a different campaign; "
+                    "use a fresh key for each approval."
+                )
             if (
                 campaign["revision"] != body.expected_revision
                 or campaign["spec_digest"] != body.expected_spec_digest
@@ -622,7 +637,7 @@ class CampaignStore(
             return []
         if not forward:
             raise Conflict("A cleanup re-approval cannot carry review pre-approvals.")
-        from .campaign_models import normalize, stage_provider
+        from .campaign_models import normalize, stage_on_candidate, stage_provider
 
         normal = normalize(spec)
         cap = approval["expires_at"]
@@ -633,11 +648,20 @@ class CampaignStore(
             seen.add(entry.stage_key)
             try:
                 stage = normal.stage(entry.stage_key)
-                billable = stage_provider(stage.provider).descriptor.kind == "salad_route"
             except (StopIteration, ValueError, KeyError):
                 raise Conflict("Pre-approval names an unknown stage.") from None
+            # The stage's own provider, or one Salad alternate it names (ADR 0066). Only a
+            # candidate of the approved spec is reachable, and only while it is registered.
+            wanted = entry.provider or stage.provider
+            if wanted != stage.provider and wanted not in {a.provider for a in stage.alternates}:
+                raise Conflict("Pre-approval provider is not a candidate of that stage.")
+            try:
+                billable = stage_provider(wanted).descriptor.kind == "salad_route"
+            except KeyError:
+                raise Conflict("Pre-approval provider is not registered.") from None
             if not billable:
                 raise Conflict("Pre-approvals apply to Salad stages only.")
+            stage = stage_on_candidate(stage, wanted)
             if entry.max_total_cents < entry.max_attempt_cents:
                 raise Conflict("max_total_cents must be at least max_attempt_cents.")
             if entry.max_total_cents > normal.budget_cap_cents:
@@ -672,7 +696,9 @@ class CampaignStore(
                 :max_total_cents,:expires_at,:created_at)""",
                 row,
             )
-            declared.append({k: v for k, v in row.items() if k != "created_at"})
+            declared.append(
+                {k: v for k, v in row.items() if k != "created_at"} | {"provider_id": wanted}
+            )
         return declared
 
     def cancel_campaign(self, principal, campaign_id, key, digest, payload) -> tuple[int, dict]:

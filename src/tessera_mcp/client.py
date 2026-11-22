@@ -246,6 +246,19 @@ class ControlClient:
             key=idempotency_key,
         )
 
+    async def approve_campaign(
+        self, campaign_id, expected_revision, expected_spec_digest, idempotency_key
+    ):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/approve",
+            body={
+                "expected_revision": expected_revision,
+                "expected_spec_digest": expected_spec_digest,
+            },
+            key=idempotency_key,
+        )
+
     async def revoke_campaign_release(
         self, campaign_id, release_id, expected_revision, reason, idempotency_key
     ):

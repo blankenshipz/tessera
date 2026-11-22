@@ -14,7 +14,7 @@ the organizing workflow, not a promise of one-click execution.
 | Boundary | Implemented | Important limit |
 |---|---|---|
 | Local control | Authenticated API, tenant-scoped records, revisions, transactional events and idempotency | Bootstrap-owner bearer possession is not federated human login; owner rotation/account recovery is not provided |
-| Research ledger | Versioned designs, studies, variants, linked measurements, conclusions/corrections and bounded exports | A design or human-entered result is not an execution receipt or scientific validation |
+| Research ledger | Versioned designs, studies, variants, linked measurements, a baseline-versus-intervention comparison with an uncertainty interval (arithmetic on recorded numbers, no decision), conclusions/corrections and bounded exports | A design or human-entered result is not an execution receipt or scientific validation |
 | Desktop | Connect, project/design/study records, result inspection, quarantine review, separate custody release and export | Execution needs an API/operator handoff; native picker/save acceptance is distinct from renderer simulation |
 | Execution | Separately approved grants, target-bound admission, ordinary worker dispatch, durable operation journals and collection | Owned Docker Desktop CPU journeys are laptop-local; they do not prove independent-host or laptop-off support |
 | Artifacts | Bounded intake, retained project objects, quarantine, explicit retrieval release and exact-byte access | Release does not classify data, approve publication or accept science; retention is not automatic deletion |

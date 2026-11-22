@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 from campaign_runner_harness import World, dump, stage_spec
 
@@ -165,6 +166,8 @@ def test_a_confirmed_exit_without_a_receipt_is_resolved_and_the_stage_retries_on
         "UPDATE execution_grants SET expires_at='2000-01-01T00:00:00Z' WHERE id=?",
         attempt["grant_id"],
     )
+    # The outputs landed a moment ago: the receipt gets its grace after the last byte (ADR 0064).
+    world.runner.now = lambda: datetime.now(UTC) + timedelta(minutes=5)
     world.runner.tick()
     first = world.attempts(cid)[0]
     assert (first["status"], first["failure_class"]) == (
@@ -199,6 +202,7 @@ def test_a_single_attempt_stage_whose_exit_was_confirmed_fails_instead_of_hangin
         "UPDATE execution_grants SET expires_at='2000-01-01T00:00:00Z' WHERE id=?",
         attempt["grant_id"],
     )
+    world.runner.now = lambda: datetime.now(UTC) + timedelta(minutes=5)  # past the grace (ADR 0064)
     world.tick_all(cid, worker=False)
     assert world.status(cid) == "failed", dump(world, cid)
     assert _classes(world, cid) == [("failed_transient", "exit_confirmed_unresolved")]

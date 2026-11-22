@@ -92,6 +92,16 @@ a stage that depends on provider-specific configuration should not name a rerout
 Nothing outside the approved list is ever chosen, so no data reaches an unregistered
 destination.
 
+**Placement (ADR 0060 section 5a).** The reroute list is now part of the stage's one candidate
+list and every retry is placed by ADR 0060's placement: the order and the limits above are kept
+(`check_reroute` at each placement, infrastructure retries only, unbilled worker-grant targets,
+no `provider_config`), and the choice and every skipped target's reason are recorded as a
+`campaign.stage_placed` event and in the receipt. A target that cannot run now (no free slot, the
+budget, the project limits) is passed over for the next candidate instead of being waited on.
+Only a retry a reroute can apply to (the last attempt was an infrastructure failure, or ran on a
+target) is placed this way; every other attempt of a stage without `alternate_providers` runs
+exactly as described above.
+
 ### 5. Seeing and stopping it
 
 `tessera_campaign_retries` (`GET /campaigns/{id}/retries`, `campaign:read`) returns, per

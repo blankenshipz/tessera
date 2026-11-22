@@ -41,8 +41,14 @@ from .campaign_autoreconcile import (
     repeat_count,
 )
 from .campaign_delegation import approver_is_live
+from .campaign_exited_resolve import (
+    UploadProgress,
+    exit_recorded_at,
+    hold_deadline,
+    release_grant,
+    uploads_arriving,
+)
 from .campaign_exited_resolve import assess as assess_exited
-from .campaign_exited_resolve import release_grant
 from .campaign_infra_retry import INFRA_CONTAINER_KILLED, INFRA_PREFIX, infra_attempts
 from .campaign_io import (
     IoEntry,
@@ -180,6 +186,10 @@ def _iso(value: datetime) -> str:
     return _utc_string(value.replace(microsecond=0))
 
 
+def _approval_expiry(ctx: _Ctx) -> datetime | None:
+    return None if ctx.approval is None else _parse_utc(ctx.approval["expires_at"])
+
+
 class CampaignRunner:
     def __init__(
         self,
@@ -206,6 +216,8 @@ class CampaignRunner:
         self._settlement_blocked: dict[str, str | None] = {}
         # Where the next expired-grant release scan carries on (ADR 0048).
         self._release_cursor: tuple[str, str] | None = None
+        # Which open output uploads are still gaining bytes (ADR 0064).
+        self.upload_progress = UploadProgress()
 
     # -- tick -----------------------------------------------------------------------
 
@@ -520,36 +532,18 @@ class CampaignRunner:
             self._touch(connection, "campaign_stage_attempts", "id=?", (attempt_id,), **fields)
 
     def _spec_stage(self, ctx: _Ctx, key: str) -> NormalStage:
-        """The stage as it runs now (ADR 0058, ADR 0060).
+        """The stage as it runs now: on the candidate it was last placed on (ADR 0060).
 
-        A stage with alternates runs on the candidate it was last placed on; a stage without
-        them runs on the provider its latest attempt was given (an infrastructure retry may
-        have been rerouted along its approved ``reroute_providers``)."""
+        A stage that names one provider (no alternates, no ADR 0058 reroute targets) always runs
+        on it, unchanged."""
         base = ctx.spec.stage(key)
-        if base.alternates:
-            row = self._one(
-                "SELECT provider_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
-                (ctx.campaign["id"], key),
-            )
-            return self._on_candidate(base, None if row is None else row["provider_id"])
-        latest = self._one(
-            """SELECT provider_id FROM campaign_stage_attempts WHERE campaign_id=?
-            AND stage_key=? ORDER BY attempt DESC LIMIT 1""",
+        if not base.has_candidates:
+            return base
+        row = self._one(
+            "SELECT provider_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
             (ctx.campaign["id"], key),
         )
-        if latest is None or not latest["provider_id"]:
-            return base
-        return self._on_provider(base, latest["provider_id"])
-
-    @staticmethod
-    def _on_provider(stage: NormalStage, provider_id: str) -> NormalStage:
-        """The stage for another provider instance of the same runtime; the instance names
-        its own worker principal, never the original's."""
-        if provider_id == stage.provider:
-            return stage
-        return dataclasses.replace(
-            stage, provider=provider_id, worker_principal_id=None, provider_config={}
-        )
+        return self._on_candidate(base, None if row is None else row["provider_id"])
 
     @staticmethod
     def _on_candidate(base: NormalStage, provider_id: str | None) -> NormalStage:
@@ -654,9 +648,8 @@ class CampaignRunner:
         row = self._one("SELECT spec_json FROM campaigns WHERE id=?", (attempt["campaign_id"],))
         assert row is not None
         stage = normalize(parse_spec_json(row["spec_json"])).stage(attempt["stage_key"])
-        if stage.alternates:
-            return self._on_candidate(stage, attempt["provider_id"])
-        return self._on_provider(stage, attempt["provider_id"] or stage.provider)
+        # ``attempt`` may be a dict or an sqlite3.Row; both index by column name.
+        return self._on_candidate(stage, attempt["provider_id"])
 
     def stage_failed(self, ctx: _Ctx, key: str, reason: str) -> bool:
         return self._stage_failed(ctx, key, reason)
@@ -1231,9 +1224,10 @@ class CampaignRunner:
         # ADR 0060: a stage with alternates is placed afresh whenever it needs a new attempt;
         # placement itself skips an unregistered candidate. Otherwise the stage's (or the live
         # attempt's) provider must still be registered.
-        placing = bool(spec_stage.alternates) and (
-            status == "pending" or latest is None or latest["status"] == "failed_transient"
-        )
+        base = ctx.spec.stage(key)
+        placing = (
+            bool(base.alternates) or (base.has_candidates and placement.reroute_due(base, attempts))
+        ) and (status == "pending" or latest is None or latest["status"] == "failed_transient")
         if not placing:
             try:
                 self._provider(spec_stage)
@@ -1294,11 +1288,18 @@ class CampaignRunner:
 
     def _place_and_reserve(self, ctx: _Ctx, key: str, *, prepare: bool = False) -> bool:
         """Place the stage's next attempt on an approved candidate, prepare it there and
-        reserve its hold. A stage with no alternates keeps the single-provider path."""
+        reserve its hold. A stage that names one provider keeps the single-provider path.
+
+        ADR 0060 section 5a: ``alternate_providers`` and ADR 0058's ``retry.reroute_providers``
+        are one candidate list, so an infrastructure retry is placed here like any attempt. A
+        stage with reroute targets but no alternates is placed only when a reroute can apply;
+        its other attempts keep the single-provider path exactly as ADR 0058 had it."""
         if self._reservation_held_back(ctx, key):
             return False
         base = ctx.spec.stage(key)
-        if not base.alternates:
+        if not base.has_candidates or (
+            not base.alternates and not placement.reroute_due(base, self._attempts(ctx, key))
+        ):
             if prepare:
                 progress = self._provider(base).prepare(self, ctx, key)
                 if progress != "ready":
@@ -1322,15 +1323,13 @@ class CampaignRunner:
         except KeyError:
             return self._stage_failed(ctx, key, "provider_unavailable")
         # A provider's preparation (Salad scaffolding, for example) may take several ticks or
-        # wait for a person. An attempt is reserved on a provider only after its ``prepare``
-        # returned ``ready``, so a candidate that ran an earlier attempt of this stage is
-        # prepared; any other candidate is prepared again every tick until it is ready. The
-        # recorded placement says where, never whether that work finished.
-        prepared_on = {a["provider_id"] for a in self._attempts(ctx, key)}
-        if prepare or chosen not in prepared_on:
-            progress = provider.prepare(self, ctx, key)
-            if progress != "ready":
-                return progress == "progress"
+        # wait for a person, so it runs before every reservation on this path until it says
+        # ``ready``; nothing is reserved before. No earlier attempt is taken as proof that the
+        # provider is still prepared (a stage may move A -> B -> A): ``prepare`` is idempotent
+        # and returns ``ready`` without effects once its work stands (ComputeProvider).
+        progress = provider.prepare(self, ctx, key)
+        if progress != "ready":
+            return progress == "progress"
         return self._reserve(ctx, key)
 
     def _decide_placement(
@@ -1362,7 +1361,9 @@ class CampaignRunner:
                     mismatched[pid] = placement.Skip(
                         pid, "plan_mismatch", "differs from the stage's task plan"
                     )
-        return placement.decide(self, ctx, base, exposure_open, extra_skip=mismatched)
+        return placement.decide(
+            self, ctx, base, exposure_open, extra_skip=mismatched, attempts=self._attempts(ctx, key)
+        )
 
     def _record_placement(
         self, ctx: _Ctx, key: str, number: int, decision: placement.Decision
@@ -1400,7 +1401,9 @@ class CampaignRunner:
         budget = next((s for s in decision.skipped if s.reason == "over_campaign_budget"), None)
         if budget is not None:
             # A truthful budget refusal on the first candidate the cap refused: the recorded
-            # attempt and stop reason are the single-provider ones (ADR 0038).
+            # attempt and stop reason are the single-provider ones (ADR 0038). ``prepare`` is
+            # deliberately not run: the refused attempt takes no hold, release or grant and runs
+            # nothing, so the provider is never asked to scaffold work that will not happen.
             self._record_placement(
                 ctx,
                 key,
@@ -1462,65 +1465,13 @@ class CampaignRunner:
                 return True
         return False
 
-    def _retry_provider(self, ctx: _Ctx, key: str, attempts: list[dict[str, Any]]) -> str:
-        """The provider the next attempt runs on (ADR 0058).
-
-        A scientific retry stays where the last attempt ran. After an infrastructure failure
-        the next attempt moves, in the spec's order, to the first reroute provider not yet
-        tried that still passes every reroute check (registered, unbilled worker-grant provider
-        of the stage's runtime, the provider's own stage check, trust narrowing and input
-        admission, as at approval); with none left it returns to the stage's own provider.
-        Only providers the approved spec names are ever chosen."""
-        base = ctx.spec.stage(key)
-        if not attempts:
-            return base.provider
-        latest = attempts[-1]
-        current = latest["provider_id"] or base.provider
-        if not str(latest["failure_class"] or "").startswith(INFRA_PREFIX):
-            return current
-        tried = {
-            a["provider_id"] or base.provider
-            for a in attempts
-            if str(a["failure_class"] or "").startswith(INFRA_PREFIX)
-        }
-        for candidate in (base.provider, *base.retry.reroute_providers):
-            if candidate in tried:
-                continue
-            try:
-                stage_provider(candidate)
-                if candidate != base.provider:
-                    with self.store.runner_connection() as connection:
-                        CampaignStore.check_reroute(
-                            connection,
-                            ctx.campaign["project_id"],
-                            base,
-                            candidate,
-                            (ctx.approval or {}).get("trust_policy_digest"),
-                        )
-            except (KeyError, Conflict) as error:
-                log.warning(
-                    "campaign %s stage %s: reroute provider %s skipped: %s",
-                    ctx.campaign["id"],
-                    key,
-                    candidate,
-                    type(error).__name__,
-                )
-                continue
-            return candidate
-        return base.provider
-
     def _reserve(self, ctx: _Ctx, key: str) -> bool:
         if self._reservation_held_back(ctx, key):
             return False
         attempts = self._attempts(ctx, key)
-        if ctx.spec.stage(key).alternates:
-            # ADR 0060: placement already chose and recorded this attempt's provider; an
-            # infrastructure retry is placed like any retry, across the approved candidates.
-            spec_stage = self._spec_stage(ctx, key)
-            target = spec_stage.provider
-        else:
-            target = self._retry_provider(ctx, key, attempts)
-            spec_stage = self._on_provider(ctx.spec.stage(key), target)
+        # Placed already (ADR 0060; an infrastructure retry's reroute too, ADR 0058).
+        spec_stage = self._spec_stage(ctx, key)
+        target = spec_stage.provider
         # ADR 0040 at reservation: nothing is held for a stage whose inputs the provider
         # instance is not trusted to receive (a 409-class refusal naming provider and worker).
         try:
@@ -1548,7 +1499,7 @@ class CampaignRunner:
                 },
             )
         try:
-            return self._reserve_hold(ctx, key, hold, target)
+            return self._reserve_hold(ctx, key, hold, spec_stage.provider)
         except _ExposureBlocked:
             # An attempt with unresolved provider exposure blocks new positive holds.
             self.emit_once(
@@ -2762,6 +2713,19 @@ class CampaignRunner:
                 "manifest": dict(manifest) if manifest else None,
             }
 
+    def _outputs_arriving(self, ctx: _Ctx, attempt: dict[str, Any], seen: dict[str, Any]) -> bool:
+        """Whether this exited attempt's outputs are still reaching control (ADR 0064)."""
+        with self.store.runner_connection() as connection:
+            recorded = exit_recorded_at(connection, seen["reconciliation"])
+            deadline = hold_deadline(seen["grant"], recorded, _approval_expiry(ctx))
+            return uploads_arriving(
+                connection,
+                attempt["grant_id"],
+                self.now(),
+                self.upload_progress,
+                deadline,
+            )
+
     def _do_observe(
         self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage, attempt: dict[str, Any]
     ) -> bool:
@@ -2839,6 +2803,10 @@ class CampaignRunner:
             )
             return True
         receipt, manifest = seen["receipt"], seen["manifest"]
+        if (receipt is None or (manifest is None and receipt["exit_code"] == 0)) and (
+            self._outputs_arriving(ctx, attempt, seen)
+        ):
+            raise _Waiting  # outputs still uploading: do not mark it unknown (ADR 0064)
         if receipt is None:
             if expired:
                 self._set_attempt(
@@ -3686,6 +3654,8 @@ class CampaignRunner:
                 free_worker_grant=free,
                 infra_exit_codes=frozenset(stage.retry.infra_exit_codes),
                 infra_retries_enabled=stage.retry.infra_retries > 0,
+                progress=self.upload_progress,
+                approval_expires=_approval_expiry(ctx),
             )
             if verdict is None:
                 return False

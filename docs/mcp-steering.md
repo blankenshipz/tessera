@@ -64,6 +64,8 @@ are not planned to change; the rest are gaps.
 | 10 | A gate between stages of one campaign | does not exist: a gate is an unlock between campaigns (stages 1-2 are one campaign, stage 3 the next). The retry of a gated campaign is a plain submission and a person approves its digest; the unlock is not re-applied | design note |
 | 11 | Gate on a measurement without a go | a measurement only narrows a go or a bound outcome (ADR 0051), so some human or opted-in script act always precedes a gated start | by design |
 
-No tool approves a spec, records a go, raises a cap, reconciles a grant or releases data; the
+No steering tool approves a spec, records a go, raises a cap, reconciles a grant or releases data (the
+operator-enabled approval tool of ADR 0065 runs only on a separate server holding a person's own
+credential, and the test does not register it); the
 end-to-end test marks each human act `HUMAN` and asserts the approval count does not change
 while the runner advances the stages.

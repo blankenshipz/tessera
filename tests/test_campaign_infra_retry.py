@@ -343,20 +343,26 @@ def test_the_stage_experiment_budget_ceiling_covers_every_attempt_it_may_make(tm
 def test_a_rerouted_attempt_drops_the_stage_provider_settings(tmp_path):
     import dataclasses
 
-    from tessera_control.campaign_models import normalize
-    from tessera_control.campaign_runner import CampaignRunner
+    from tessera_control.campaign_models import normalize, stage_on_candidate
 
     world = World(tmp_path)
     spec = world.env.spec()
     spec["stages"] = [stage_spec(world.env, "s1", metrics=METRIC)]
     stage = normalize(CampaignSpec.model_validate(spec)).stage("s1")
+    # ADR 0060 section 5a: a reroute target is a placement candidate with ADR 0058's overlay.
     configured = dataclasses.replace(
-        stage, provider_config={"region": "elsewhere"}, worker_principal_id="worker_original"
+        stage,
+        provider_config={"region": "elsewhere"},
+        worker_principal_id="worker_original",
+        retry=stage.retry.model_copy(update={"reroute_providers": ["lab-box"]}),
     )
-    moved = CampaignRunner._on_provider(configured, "lab-box")
-    assert moved.provider == "lab-box"
+    moved = stage_on_candidate(configured, "lab-box")
+    assert moved.provider == "lab-box" and moved.runtime == configured.runtime
     assert moved.provider_config == {} and moved.worker_principal_id is None
-    assert CampaignRunner._on_provider(configured, configured.provider) is configured
+    assert moved.max_exposure_cents == configured.max_exposure_cents
+    assert stage_on_candidate(configured, configured.provider) is configured
+    with pytest.raises(KeyError):  # never a provider the approved spec does not name
+        stage_on_candidate(configured, "elsewhere-box")
 
 
 def test_a_killed_exit_resolved_on_the_confirmed_exit_is_retried_too(tmp_path):

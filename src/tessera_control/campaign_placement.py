@@ -12,8 +12,9 @@ single-provider stage would when no candidate can ever pass. The decision, with 
 other candidate was skipped, is recorded as a ``campaign.stage_placed`` event and copied into
 the receipt.
 
-A stage with no alternates is never routed through ``decide``: it keeps its single-provider
-behaviour, events and receipts unchanged.
+A stage with no alternates is routed through ``decide`` only when an ADR 0058 reroute can apply
+(``reroute_due``: its last attempt was an infrastructure failure, or ran on a reroute target).
+Otherwise it keeps its single-provider behaviour, events and receipts unchanged.
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import program_budget
-from .campaign_models import NormalStage, _validate_provider, stage_candidates, stage_provider
+from .campaign_infra_retry import INFRA_PREFIX
+from .campaign_models import NormalStage, _validate_provider, stage_on_candidate, stage_provider
 from .store import Conflict
 
 PLACED_EVENT = "campaign.stage_placed"
@@ -48,6 +50,9 @@ PERMANENT_REASONS = frozenset(
         "over_run_cap",
         "over_campaign_budget",
         "plan_mismatch",
+        # ADR 0058 limits on a candidate listed only in ``retry.reroute_providers``.
+        "infra_retry_only",
+        "reroute_refused",
     }
 )
 
@@ -199,6 +204,22 @@ def _check(
         provider = stage_provider(pid)
     except KeyError:
         return Skip(pid, "unregistered", "not in the provider registry")
+    if pid not in base.placement_ids:
+        # ADR 0058's own reservation-time check for a reroute target: registered, an unbilled
+        # worker-grant provider of the stage's runtime, its stage check, trust narrowing and
+        # input admission. A billable destination needs ``alternate_providers`` (approved with
+        # its estimate) instead.
+        with rt.connection() as connection:
+            try:
+                CampaignStore.check_reroute(
+                    connection,
+                    campaign["project_id"],
+                    base,
+                    pid,
+                    (ctx.approval or {}).get("trust_policy_digest"),
+                )
+            except Conflict as error:
+                return Skip(pid, "reroute_refused", str(error)[:300])
     try:
         _validate_provider(stage)
     except ValueError as error:
@@ -246,30 +267,81 @@ def _check(
     return None
 
 
+def _infra(attempt: Mapping[str, Any] | None) -> bool:
+    return attempt is not None and str(attempt["failure_class"] or "").startswith(INFRA_PREFIX)
+
+
+def reroute_due(base: NormalStage, attempts: list[Mapping[str, Any]]) -> bool:
+    """True when the next attempt may use a ``reroute_providers`` target (ADR 0058): the last
+    attempt was an infrastructure failure, or an earlier one moved the stage onto a target."""
+    latest = attempts[-1] if attempts else None
+    return _infra(latest) or (
+        latest is not None and (latest["provider_id"] or base.provider) in base.reroute_ids
+    )
+
+
+def candidate_order(
+    base: NormalStage, attempts: list[Mapping[str, Any]]
+) -> tuple[tuple[str, ...], dict[str, Skip]]:
+    """The order the candidates are tried in for the stage's next attempt, and the candidates
+    that may not be used for it at all (ADR 0060 section 5a, one list with ADR 0058).
+
+    - A first attempt tries the stage's own provider, then ``alternate_providers``.
+    - A retry after a task (scientific) failure tries first where the last attempt ran
+      (ADR 0058: it stays there), then the rest in order.
+    - A retry after an infrastructure failure tries the candidates not yet failed by the
+      infrastructure first, in order, then those that were (ADR 0058's reroute order: the
+      first untried reroute target, returning to the stage's own provider when none is left).
+
+    A ``retry.reroute_providers`` target is used only for an infrastructure retry, or to stay
+    where an earlier infrastructure retry moved the stage (``infra_retry_only`` otherwise)."""
+    ids = base.candidate_ids
+    latest = attempts[-1] if attempts else None
+    excluded: dict[str, Skip] = {}
+    if not reroute_due(base, attempts):
+        for pid in base.reroute_ids:
+            if pid not in base.placement_ids:
+                excluded[pid] = Skip(pid, "infra_retry_only", "only for an infrastructure retry")
+    if latest is None:
+        return ids, excluded
+    if _infra(latest):
+        tried = {a["provider_id"] or base.provider for a in attempts if _infra(a)}
+        return (
+            tuple(p for p in ids if p not in tried) + tuple(p for p in ids if p in tried),
+            excluded,
+        )
+    current = latest["provider_id"] or base.provider
+    if current in ids:
+        return (current, *(p for p in ids if p != current)), excluded
+    return ids, excluded
+
+
 def decide(
     rt: Any,
     ctx: Any,
     base: NormalStage,
     exposure_open: Callable[[sqlite3.Connection], bool],
     extra_skip: Mapping[str, Skip] | None = None,
+    attempts: list[Mapping[str, Any]] | None = None,
 ) -> Decision:
-    """Choose the first approved candidate every existing check admits now (deterministic:
-    the same recorded state gives the same choice)."""
+    """Choose the first approved candidate, in ``candidate_order``, that every existing check
+    admits now (deterministic: the same recorded state gives the same choice)."""
     with rt.connection() as connection:
         steering = steering_for(connection, ctx.campaign, base.key)
-    candidates = stage_candidates(base)
-    ids = tuple(stage.provider for stage in candidates)
+    ids, excluded = candidate_order(base, list(attempts or ()))
     skipped: list[Skip] = []
-    for index, stage in enumerate(candidates):
+    for index, pid in enumerate(ids):
+        stage = stage_on_candidate(base, pid)
         skip = (
-            steered_skip(stage.provider, steering)
-            or (extra_skip or {}).get(stage.provider)
+            excluded.get(pid)
+            or steered_skip(pid, steering)
+            or (extra_skip or {}).get(pid)
             or _check(rt, ctx, base, stage, exposure_open)
         )
         if skip is None:
             return Decision(
                 ids,
-                stage.provider,
+                pid,
                 tuple(skipped),
                 steering,
                 stage.max_exposure_cents,
@@ -282,10 +354,15 @@ def decide(
 def failure_reason(decision: Decision) -> str:
     """The stage failure for a decision no candidate can ever pass, in the single-provider
     vocabulary where one applies."""
-    reasons = {item.reason for item in decision.skipped}
-    if reasons <= {"untrusted", "excluded_by_steering", "not_pinned"} and "untrusted" in reasons:
+    # Candidates that could never serve this attempt do not change the verdict.
+    reasons = {item.reason for item in decision.skipped} - {
+        "excluded_by_steering",
+        "not_pinned",
+        "infra_retry_only",
+    }
+    if reasons == {"untrusted"}:
         return "input_not_admitted"
-    if reasons <= {"unregistered", "provider_invalid", "excluded_by_steering", "not_pinned"}:
+    if reasons and reasons <= {"unregistered", "provider_invalid", "reroute_refused"}:
         return "provider_unavailable"
     return "no_eligible_provider"
 
@@ -334,7 +411,7 @@ def status_view(connection: sqlite3.Connection, campaign: Mapping[str, Any]) -> 
     recorded_all = placements(connection, campaign)
     view = []
     for stage in normal.stages:
-        if not stage.alternates:
+        if not stage.has_candidates:
             continue
         waiting = _latest(connection, campaign, WAITING_EVENT, stage.key)
         mine = [item for item in recorded_all if item.get("stage_key") == stage.key]
@@ -345,6 +422,7 @@ def status_view(connection: sqlite3.Connection, campaign: Mapping[str, Any]) -> 
             {
                 "stage_key": stage.key,
                 "candidates": list(stage.candidate_ids),
+                "infra_retry_only": [p for p in stage.reroute_ids if p not in stage.placement_ids],
                 "steering": steering_for(connection, campaign, stage.key),
                 "placements": mine,
                 "waiting": None
