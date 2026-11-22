@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import campaign_placement_preference, program_budget
+from . import campaign_heavy_guard, campaign_placement_preference, program_budget
 from .campaign_infra_retry import INFRA_PREFIX
 from .campaign_models import NormalStage, _validate_provider, stage_on_candidate, stage_provider
 from .store import Conflict
@@ -46,6 +46,9 @@ TRANSIENT_REASONS = frozenset(
         # The provider's credential is expired, revoked or pinned at another version: it clears
         # when an operator rotates it, so the stage waits or uses another candidate.
         "credential_unavailable",
+        # ADR 0107: a heavy stage's local candidate refused by the operator; clears when a
+        # remote candidate qualifies.
+        campaign_heavy_guard.REFUSED_REASON,
     }
 )
 PERMANENT_REASONS = frozenset(
@@ -90,6 +93,8 @@ class Decision:
     budget_refusal: bool = False
     # ADR 0070: the operator placement preference rule that ordered the candidates, if any.
     preference: dict[str, Any] | None = None
+    # ADR 0107: the heavy-stage guard's warning (chosen local) or refusal (waiting), if any.
+    heavy_guard: dict[str, Any] | None = None
 
     @property
     def waiting(self) -> bool:
@@ -109,6 +114,8 @@ class Decision:
         }
         if self.preference is not None:  # absent keeps every earlier payload unchanged
             value["preference"] = self.preference
+        if self.heavy_guard is not None:  # absent keeps every earlier payload unchanged
+            value["heavy_guard"] = self.heavy_guard
         return value
 
 
@@ -354,9 +361,11 @@ def decide(
     each placement it orders."""
     with rt.connection() as connection:
         steering = steering_for(connection, ctx.campaign, base.key)
+        guard = campaign_heavy_guard.applies(connection, ctx.campaign, base)
     ordered, preference = campaign_placement_preference.preferred_order(base)
     ids, excluded = candidate_order(base, list(attempts or ()), ordered)
     skipped: list[Skip] = []
+    refusal: dict[str, Any] | None = None
     for index, pid in enumerate(ids):
         stage = stage_on_candidate(base, pid)
         skip = (
@@ -365,6 +374,18 @@ def decide(
             or (extra_skip or {}).get(pid)
             or _check(rt, ctx, base, stage, exposure_open)
         )
+        warning = None
+        if skip is None and guard is not None and guard.is_local(pid):
+            # ADR 0107: a heavy stage reached a local candidate while a remote profile is
+            # registered: record why (warn), or skip it so the stage waits (refuse).
+            codes, detail = campaign_heavy_guard.reasons(
+                guard, base, pid, skipped, steering, preference
+            )
+            if guard.mode == "refuse":
+                refusal = campaign_heavy_guard.record(guard, codes, detail, refused=True)
+                skip = Skip(pid, campaign_heavy_guard.REFUSED_REASON, ",".join(codes))
+            else:
+                warning = campaign_heavy_guard.record(guard, codes, detail)
         if skip is None:
             return Decision(
                 ids,
@@ -374,10 +395,16 @@ def decide(
                 stage.max_exposure_cents,
                 ids[index + 1 :],
                 preference=_with_outcome(preference, pid, skipped),
+                heavy_guard=warning,
             )
         skipped.append(skip)
     return Decision(
-        ids, None, tuple(skipped), steering, preference=_with_outcome(preference, None, skipped)
+        ids,
+        None,
+        tuple(skipped),
+        steering,
+        preference=_with_outcome(preference, None, skipped),
+        heavy_guard=refusal,
     )
 
 

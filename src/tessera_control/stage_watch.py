@@ -10,6 +10,9 @@ is added: the record is an event, and the bounds below are read back from the ev
 Bounds, all per operation and failing closed (numbers in ``stage_watch_limits``, shared
 with the worker's stage contract):
 
+Every refusal raised here carries a closed ``reason`` code (``stage_watch_limits.REASON_STATUS``
+gives its HTTP status) so the worker can tell a permanent refusal from a transient one.
+
 * ``seq`` must increase; a report at or below the last recorded ``seq`` is refused
   (an exact idempotent replay returns its stored response instead).
 * ``observed_at`` may not be earlier than the lease's ``issued_at``, may not be earlier than
@@ -41,8 +44,10 @@ from .execution import (
     ExecutionStore,
 )
 from .stage_watch_limits import (
+    MAX_DECISIONS_PER_OPERATION,
     MAX_REPORTS_PER_OPERATION,
     MIN_ROUTINE_INTERVAL_SECONDS,
+    REASON_STATUS,
     ROUTINE_KINDS,
     TERMINAL_RESERVE,
 )
@@ -55,15 +60,27 @@ ROUTINE_INTERVAL = timedelta(seconds=MIN_ROUTINE_INTERVAL_SECONDS)
 ROUTINE_BUDGET = MAX_REPORTS_PER_OPERATION - TERMINAL_RESERVE
 
 
+MISMATCH_DETAIL = "Stage watch report does not match the external operation."
 TOO_EARLY_DETAIL = "observed_at is ahead of the control clock; retry"
 
 
-class TooEarly(StoreError):
-    """A report dated past the control clock plus skew; the route answers 425 (retryable).
+KEY_CONFLICT_DETAIL = "Idempotency key was already used with a different request."
+
+
+class WatchRefused(StoreError):
+    """A refused watch report with a closed ``reason`` code; the route answers
+    ``REASON_STATUS[reason]`` with ``{"detail", "reason"}``.
 
     Raised inside ``_mutate``, so the transaction rolls back with no event and no idempotency
-    record, and the identical body under the same key is accepted later.
+    record. Only ``too_early`` is transient: the identical body under the same key is accepted
+    once the control clock catches up.
     """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        if reason not in REASON_STATUS:
+            raise ValueError(f"unknown watch refusal reason {reason!r}")
+        super().__init__(detail)
+        self.reason = reason
 
 
 def _watch_events(
@@ -105,10 +122,14 @@ class StageWatchStore(ExecutionStore):
                 or operation["worker_principal_id"] != worker["id"]
                 or operation["org_id"] != worker["org_id"]
             ):
-                raise NotFound("External operation was not found.")
-            self._fence_recovered_operation(connection, operation_id)
+                # Same code and 404 for another worker's operation: no existence oracle.
+                raise WatchRefused("unknown_operation", "External operation was not found.")
+            try:
+                self._fence_recovered_operation(connection, operation_id)
+            except Conflict as error:
+                raise WatchRefused("worker_fenced", str(error)) from None
             if operation["lease_id"] != payload["lease_id"]:
-                raise Conflict("Stage watch report does not match the external operation.")
+                raise WatchRefused("lease_mismatch", MISMATCH_DETAIL)
             lease = connection.execute(
                 "SELECT * FROM execution_leases WHERE id=?", (operation["lease_id"],)
             ).fetchone()
@@ -117,34 +138,46 @@ class StageWatchStore(ExecutionStore):
                 or lease["epoch"] != payload["expected_epoch"]
                 or operation["epoch"] != lease["epoch"]
             ):
-                raise Conflict("Stage watch report epoch is no longer current.")
-            grant = self._grant(connection, worker, operation["grant_id"])
+                raise WatchRefused("stale_epoch", "Stage watch report epoch is no longer current.")
+            try:
+                grant = self._grant(connection, worker, operation["grant_id"])
+            except NotFound as error:
+                # The worker's credential no longer covers the grant's project.
+                raise WatchRefused("wrong_worker", str(error)) from None
             if (
                 grant["worker_principal_id"] != worker["id"]
                 or grant["project_id"] != operation["project_id"]
                 or lease["grant_id"] != grant["id"]
             ):
-                raise Conflict("Stage watch report does not match the external operation.")
+                raise WatchRefused("grant_mismatch", MISMATCH_DETAIL)
             if grant["status"] not in UNRESOLVED_GRANT_STATUSES:
-                raise Conflict("Execution authority has already been reconciled.")
+                raise WatchRefused(
+                    "grant_reconciled", "Execution authority has already been reconciled."
+                )
             observed_at = _parse_utc(payload["observed_at"])
             if observed_at < _parse_utc(lease["issued_at"]):
-                raise Conflict("Stage watch report timestamp is outside the accepted window.")
+                raise WatchRefused(
+                    "before_lease", "Stage watch report timestamp is outside the accepted window."
+                )
             if observed_at > self._now() + MAX_OBSERVATION_FUTURE_SKEW:
                 # Transient: the same body is accepted once the control clock catches up.
-                raise TooEarly(TOO_EARLY_DETAIL)
+                raise WatchRefused("too_early", TOO_EARLY_DETAIL)
             recorded = _watch_events(connection, operation["project_id"], operation_id)
             if recorded and (
                 payload["seq"] <= recorded[-1]["seq"]
                 or observed_at < _parse_utc(recorded[-1]["observed_at"])
             ):
-                raise Conflict("Stage watch reports cannot be reported out of order.")
+                raise WatchRefused(
+                    "out_of_order", "Stage watch reports cannot be reported out of order."
+                )
             kind = payload["kind"]
             if kind in ROUTINE_KINDS:
                 if len(recorded) >= ROUTINE_BUDGET:
-                    raise Conflict("Routine watch report budget exhausted.")
+                    raise WatchRefused(
+                        "routine_budget_exhausted", "Routine watch report budget exhausted."
+                    )
             elif len(recorded) >= MAX_REPORTS_PER_OPERATION:
-                raise Conflict("Stage watch report budget exhausted.")
+                raise WatchRefused("budget_exhausted", "Stage watch report budget exhausted.")
             base = {"seq": payload["seq"], "kind": kind, "operation_id": operation_id}
             if kind in ROUTINE_KINDS:
                 same = [item for item in recorded if item["kind"] == kind]
@@ -191,24 +224,32 @@ def watch_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> d
 
     Only events of the campaign's project are read (every watch event is written under its
     operation's project, which is the grant's project), through ``events_by_project_cursor``.
+
+    An attempt with recorded watch decision requests (ADR 0111) also gets a ``decisions`` list
+    (at most ``MAX_DECISIONS_PER_OPERATION``); every one is ``admission: "not_admitted"``, an
+    advisory record of what the agent asked. An attempt with decisions but no reports gets an
+    entry with zero counts and no ``first_seen``/``last_seen``. Without decisions every entry
+    keeps its earlier shape.
     """
+    from .stage_watch_decisions import DECISION_EVENT_TYPE, decision_receipt_entry
+
     rows = connection.execute(
-        """SELECT a.stage_key, a.attempt, a.operation_id, e.payload_json
+        """SELECT a.stage_key, a.attempt, a.operation_id, e.event_type, e.payload_json
         FROM campaigns c
         JOIN campaign_stage_attempts a ON a.campaign_id = c.id
         JOIN events e
-        ON e.project_id = c.project_id AND e.event_type = ?
+        ON e.project_id = c.project_id AND e.event_type IN (?, ?)
         AND json_extract(e.payload_json, '$.operation_id') = a.operation_id
         AND json_extract(e.payload_json, '$.grant_id') = a.grant_id
         WHERE c.id = ? AND a.operation_id IS NOT NULL
         ORDER BY a.stage_key, a.attempt, e.cursor""",
-        (EVENT_TYPE, campaign_id),
+        (EVENT_TYPE, DECISION_EVENT_TYPE, campaign_id),
     ).fetchall()
     if not rows:
         return {}
     attempts: dict[tuple[str, int], dict[str, Any]] = {}
     for row in rows:
-        report = json.loads(row["payload_json"])
+        record = json.loads(row["payload_json"])
         entry = attempts.setdefault(
             (row["stage_key"], row["attempt"]),
             {
@@ -216,8 +257,8 @@ def watch_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> d
                 "attempt": row["attempt"],
                 "operation_id": row["operation_id"],
                 "counts_by_kind": dict.fromkeys(WATCH_KINDS, 0),
-                "first_seen": report["observed_at"],
-                "last_seen": report["observed_at"],
+                "first_seen": None,
+                "last_seen": None,
                 "last_stuck_counters": None,
                 "last_failed_counters": None,
                 "last_counters_seen": None,
@@ -225,6 +266,14 @@ def watch_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> d
                 "reports_recorded": 0,
             },
         )
+        if row["event_type"] == DECISION_EVENT_TYPE:
+            decisions = entry.setdefault("decisions", [])
+            if len(decisions) < MAX_DECISIONS_PER_OPERATION:
+                decisions.append(decision_receipt_entry(record))
+            continue
+        report = record
+        if entry["first_seen"] is None:
+            entry["first_seen"] = report["observed_at"]
         entry["counts_by_kind"][report["kind"]] += 1
         entry["last_seen"] = report["observed_at"]
         if report["kind"] in ("stuck", "failed"):

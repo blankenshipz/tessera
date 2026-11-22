@@ -469,7 +469,7 @@ Console scripts installed by the package, one line each:
   campaign, lineage or hold references, every deletion on a receipt (ADR 0089, `docs/recovery.md`).
 - `tessera-worker` / `tessera-worker-daemon`: worker CLI (`development-poll`) and its
   supervised daemon.
-  An optional, observe-and-report-only stage watcher library (off by default, not wired into the default worker) is described in [docs/stage-watcher.md](docs/stage-watcher.md).
+  An optional, observe-and-report-only stage watcher library (disabled by default; opt-in per run with `--stage-watcher` plus a kill-switch path, and the default worker is unchanged without it; an executor option covers Salad runs) is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.
 - `tessera-mcp`: MCP server for agent clients.
 - `tessera-salad-operator` / `tessera-salad-cleanup`: human-only Salad setup and cleanup.
 - `tessera-salad-executor` / `tessera-salad-guardian`: supervised Salad campaign executor and spend guardian (units in `deploy/systemd/`, launchd templates in `deploy/launchd/`).

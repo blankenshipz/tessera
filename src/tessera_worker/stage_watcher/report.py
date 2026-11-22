@@ -8,13 +8,17 @@ log line, a prompt, a destination or a credential.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
-from tessera_control.stage_watch_limits import TERMINAL_KINDS
+from tessera_control.stage_watch_limits import (
+    PERMANENT_REASONS,
+    REASON_STATUS,
+    TERMINAL_KINDS,
+)
 from tessera_worker.control_channel import ControlChannelError
 
 ReportKind = Literal["heartbeat", "progress", "stuck", "failed"]
@@ -160,19 +164,45 @@ class ReportSink(Protocol):
 
 DeliveryOutcome = Literal["delivered", "refused", "transient"]
 
-# The only statuses that settle a report as refused: control understood the report and no
-# retry under the same key can change its answer. ``stuck``/``failed`` settle only on these;
-# every other status (401/403 whatever the message, 408, 409, 425, 429, other 4xx, 5xx, or no
-# answer) is retried under the same key until the outbox's 24 h abandon deadline, because an
-# expired credential, a clock skew or a busy control plane can clear on retry.
+# The statuses that settle a report as refused on their own: control understood the report
+# and no retry under the same key can change its answer. For ``stuck``/``failed`` every other
+# status (401/403, 408, 409, 425, 429, other 4xx, 5xx, or no answer) is retried under the same
+# key until the outbox's 24 h abandon deadline, unless control's reason code says the refusal
+# is permanent (``reason_settles``), because an expired credential, a clock skew or a busy
+# control plane can clear on retry.
 TERMINAL_REFUSAL_STATUSES: frozenset[int] = frozenset({400, 404, 410, 413, 422})
 # Routine kinds also settle on 409 (control's routine budget, or an out-of-order report).
 ROUTINE_REFUSAL_STATUSES: frozenset[int] = TERMINAL_REFUSAL_STATUSES | {409}
+# The only statuses a reason code can settle: 401 never does (a credential refresh fixes it),
+# and a code settles only with the status control pairs it with in ``REASON_STATUS``.
+REASON_REFUSAL_STATUSES: frozenset[int] = frozenset({403, 404, 409})
+_REASON_TOKEN = re.compile(r"[a-z][a-z_]{0,40}")
 
 
 def refusal_statuses(kind: str) -> frozenset[int]:
-    """The statuses that settle a report of ``kind`` as refused (everything else retries)."""
+    """The statuses that settle a report of ``kind`` without a reason code."""
     return TERMINAL_REFUSAL_STATUSES if kind in TERMINAL_KINDS else ROUTINE_REFUSAL_STATUSES
+
+
+def reason_settles(status: object, reason: object) -> bool:
+    """True when control's ``reason`` code names a permanent refusal for this ``status``.
+
+    The code must be in control's closed ``PERMANENT_REASONS`` and be the one control answers
+    with exactly this status (``REASON_STATUS``), and the status must be 403, 404 or 409. An
+    unknown, missing, mismatched or transient code (``too_early``) settles nothing.
+    """
+    if isinstance(status, bool) or not isinstance(status, int):
+        return False
+    if status not in REASON_REFUSAL_STATUSES or not isinstance(reason, str):
+        return False
+    return reason in PERMANENT_REASONS and REASON_STATUS.get(reason) == status
+
+
+def settles(kind: str, status: object, reason: object = None) -> bool:
+    """Whether a refusal with ``status`` (and control's ``reason`` code) settles ``kind``."""
+    if isinstance(status, bool) or not isinstance(status, int):
+        return False
+    return status in refusal_statuses(kind) or reason_settles(status, reason)
 
 
 @dataclass(frozen=True)
@@ -180,16 +210,20 @@ class DeliveryResult:
     """What one delivery attempt established.
 
     - ``delivered``: control accepted the report (2xx).
-    - ``refused``: control definitely and permanently refused this report (a status in
-      ``refusal_statuses(kind)``). It is settled as refused, counted, and never retried or
-      resent under another key.
-    - ``transient``: anything else (network error, timeout, 5xx, 401/403, 408/425/429, a
-      malformed reply, and 409 or another 4xx for ``stuck``/``failed``). The report stays
-      pending and is retried under the SAME key.
+    - ``refused``: control definitely and permanently refused this report (``settles``: a
+      status in ``refusal_statuses(kind)``, or a 403/404/409 whose ``reason`` code is a
+      permanent one for that status). It is settled as refused, counted, and never retried
+      or resent under another key.
+    - ``transient``: anything else (network error, timeout, 5xx, 401, 403/409 without a
+      permanent reason code, 408/425/429, a malformed reply, and another 4xx for
+      ``stuck``/``failed``). The report stays pending and is retried under the SAME key.
+
+    ``reason`` is control's refusal code when it sent a short token, else None.
     """
 
     outcome: DeliveryOutcome
     status: int | None = None
+    reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in ("delivered", "refused", "transient"):
@@ -200,43 +234,99 @@ class DeliveryResult:
             raise ValueError("status must be None or an integer.")
         if self.outcome == "refused" and (self.status is None or not 400 <= self.status < 500):
             raise ValueError("a refusal carries the 4xx status control answered.")
+        if self.reason is not None and (
+            not isinstance(self.reason, str) or not _REASON_TOKEN.fullmatch(self.reason)
+        ):
+            raise ValueError("reason must be None or a short lowercase token.")
 
 
 DELIVERED = DeliveryResult("delivered")
 TRANSIENT = DeliveryResult("transient")
 
 
-def classify_status(status: int | None, kind: str) -> DeliveryResult:
-    """Map a control error status for a report of ``kind`` to a delivery result.
+def classify_status(status: int | None, kind: str, reason: str | None = None) -> DeliveryResult:
+    """Map a control error status (and its reason code) for ``kind`` to a delivery result.
 
-    None means no HTTP answer. Only the status is used, never a message.
+    None means no HTTP answer. Only the status and the closed reason code are used, never a
+    message; a reason that is not a short token is ignored.
     """
+    if not isinstance(reason, str) or not _REASON_TOKEN.fullmatch(reason):
+        reason = None
     if isinstance(status, bool) or not isinstance(status, int):
         return TRANSIENT
-    if status in refusal_statuses(kind):
-        return DeliveryResult("refused", status)
-    return DeliveryResult("transient", status)
+    if settles(kind, status, reason):
+        return DeliveryResult("refused", status, reason)
+    return DeliveryResult("transient", status, reason)
 
 
 class WatchReportSink(Protocol):
     def deliver(self, report: WatchReport) -> DeliveryResult: ...
 
 
+# The shortest HTTP timeout a post is given, however little of the caller's budget is left.
+MIN_POST_TIMEOUT_SECONDS = 0.05
+
+
+def _positive(value: object) -> float | None:
+    """``value`` as a float when it is a positive finite number, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if 0 < value < float("inf") else None
+
+
+def effective_post_timeout(
+    channel: object,
+    timeout_seconds: float | None,
+    remaining: Callable[[], float | None] | None,
+) -> float | None:
+    """The HTTP timeout for one post: the smallest of ``timeout_seconds``, the channel's own
+    ``timeout_seconds`` and, when ``remaining`` is given, the caller's remaining time budget
+    (never below ``MIN_POST_TIMEOUT_SECONDS``). None: the channel's own default."""
+    timeout = _positive(timeout_seconds)
+    channel_timeout = _positive(getattr(channel, "timeout_seconds", None))
+    if channel_timeout is not None:
+        timeout = channel_timeout if timeout is None else min(timeout, channel_timeout)
+    if remaining is not None:
+        left = remaining()
+        if left is not None:
+            left = max(MIN_POST_TIMEOUT_SECONDS, float(left))
+            timeout = left if timeout is None else min(timeout, left)
+    return timeout
+
+
 class ControlSink:
     """Deliver one report through the worker's control channel.
 
     The channel returns normally only on a 2xx reply (the route answers 201): that is
-    ``delivered``. A ``ControlChannelError`` is classified by its status alone
-    (``classify_status``): only a permanent status for the report's kind is ``refused``.
-    Anything else, including 401/403 (the channel refreshes its credential), 408/425/429, 5xx,
-    a timeout, a transport error, and 409 for ``stuck``/``failed``, is ``transient``: the
-    report stays in the durable outbox and is redelivered under the SAME idempotency key; it
-    is never replayed under another key.
+    ``delivered``. A ``ControlChannelError`` is classified by its status and control's reason
+    code (``classify_status``): a permanent status for the report's kind, or a 403/404/409
+    whose code is a permanent one for that status, is ``refused``. Anything else, including
+    401 and 403 without such a code (the channel refreshes its credential), 408/425/429, 5xx,
+    a timeout, a transport error, and 409 for ``stuck``/``failed`` without a permanent code
+    (``too_early``, unknown or none), is ``transient``: the report stays in the durable
+    outbox and is redelivered under the SAME idempotency key; it is never replayed under
+    another key.
+
+    The HTTP timeout of each post is the smallest of ``timeout_seconds``, the channel's own
+    ``timeout_seconds`` (the channel refuses a longer one) and, when ``remaining`` is given,
+    the caller's remaining time budget (never below ``MIN_POST_TIMEOUT_SECONDS``).
     """
 
-    def __init__(self, channel: ReportSink, *, timeout_seconds: float | None = None):
+    def __init__(
+        self,
+        channel: ReportSink,
+        *,
+        timeout_seconds: float | None = None,
+        remaining: Callable[[], float | None] | None = None,
+    ):
         self.channel = channel
         self.timeout_seconds = timeout_seconds
+        self.remaining = remaining
+
+    def effective_timeout(self) -> float | None:
+        """The timeout for the next post (None: the channel's own default)."""
+        return effective_post_timeout(self.channel, self.timeout_seconds, self.remaining)
 
     def deliver(self, report: WatchReport) -> DeliveryResult:
         try:
@@ -244,10 +334,12 @@ class ControlSink:
                 watch_reports_path(report.operation_id),
                 report.to_body(),
                 report.idempotency_key,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=self.effective_timeout(),
             )
         except ControlChannelError as error:
-            return classify_status(error.status, report.kind)
+            return classify_status(
+                error.status, report.kind, getattr(error, "refusal_reason", None)
+            )
         except Exception:
             return TRANSIENT
         return DELIVERED if isinstance(reply, dict) else TRANSIENT

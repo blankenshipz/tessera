@@ -42,7 +42,7 @@ def _downgrade_to_v77(path: Path, version: int = 77) -> None:
 
 
 def test_v77_database_gains_nullable_columns_idempotently(tmp_path: Path) -> None:
-    assert CONCLUSION_DECISION_SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 78
+    assert CONCLUSION_DECISION_SCHEMA_VERSION == 78 < LATEST_SCHEMA_VERSION
     state = tmp_path / "state"
     initialize_state(state)
     path = state / "tessera.sqlite3"

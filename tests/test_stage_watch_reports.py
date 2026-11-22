@@ -19,7 +19,10 @@ from tessera_control.stage_watch import EVENT_TYPE, _watch_events, watch_receipt
 from tessera_control.stage_watch_limits import (
     MAX_REPORTS_PER_OPERATION,
     MIN_ROUTINE_INTERVAL_SECONDS,
+    PERMANENT_REASONS,
+    REASON_STATUS,
     TERMINAL_RESERVE,
+    TRANSIENT_REASONS,
 )
 from tessera_control.store import _connect, _parse_utc, canonical_digest
 
@@ -56,11 +59,24 @@ class Harness:
         } | overrides
 
     def post(self, body: dict, *, key: str = "k1", token: str = "worker-token", op=None):
-        return self.client.post(
+        response = self.client.post(
             f"/worker/operations/{op or self.operation_id}/watch-reports",
             json=body,
             headers={"Authorization": f"Bearer {token}", "Idempotency-Key": key},
         )
+        # Every refusal through this harness, in every test, carries a closed reason whose
+        # status is the one the shared table names; schema errors (422) carry none.
+        if response.status_code in (404, 409, 425):
+            reply = response.json()
+            assert set(reply) == {"detail", "reason"}, reply
+            assert reply["reason"] in PERMANENT_REASONS | TRANSIENT_REASONS
+            assert response.status_code == REASON_STATUS[reply["reason"]]
+        return response
+
+    def refused(self, body: dict, reason: str, detail: str, **kwargs) -> None:
+        response = self.post(body, **kwargs)
+        assert response.status_code == REASON_STATUS[reason], response.text
+        assert response.json() == {"detail": detail, "reason": reason}
 
     def events(self) -> list[dict]:
         with _connect(self.state / "tessera.sqlite3") as connection:
@@ -265,7 +281,10 @@ def test_report_ahead_of_the_control_clock_is_too_early_then_accepted(watch: Har
     late = watch.body(seq=2, kind="failed", at=16)  # 6 s ahead, past the 5 s skew
     refused = watch.post(late, key="late")
     assert refused.status_code == 425
-    assert refused.json() == {"detail": "observed_at is ahead of the control clock; retry"}
+    assert refused.json() == {
+        "detail": "observed_at is ahead of the control clock; retry",
+        "reason": "too_early",
+    }
     assert watch.events() == []
     assert _idempotency_rows(watch, "late") == 0
     # 4 s ahead is inside the skew and accepted.
@@ -496,3 +515,153 @@ def test_receipt_section_absent_without_reports_and_counted_with_them(tmp_path: 
         }
     finally:
         connection.close()
+
+
+MISMATCH = "Stage watch report does not match the external operation."
+NOT_FOUND = "External operation was not found."
+
+
+def test_reason_codes_are_closed_and_partitioned() -> None:
+    assert set(REASON_STATUS) == PERMANENT_REASONS | TRANSIENT_REASONS
+    assert not PERMANENT_REASONS & TRANSIENT_REASONS
+    assert TRANSIENT_REASONS == {"too_early"} and REASON_STATUS["too_early"] == 425
+    assert {REASON_STATUS[reason] for reason in PERMANENT_REASONS} == {404, 409}
+
+
+def test_each_refusal_names_its_reason_and_keeps_its_detail(watch: Harness) -> None:
+    fx._worker(watch.state, watch.owner, watch.project["id"], "other-token")
+    watch.refused(watch.body(), "unknown_operation", NOT_FOUND, op="0" * 32)
+    # Another worker's operation is indistinguishable from a missing one.
+    watch.refused(watch.body(), "unknown_operation", NOT_FOUND, token="other-token")
+    watch.refused(watch.body(lease_id="other-lease"), "lease_mismatch", MISMATCH, key="k2")
+    watch.refused(
+        watch.body(expected_epoch=watch.lease["epoch"] + 1),
+        "stale_epoch",
+        "Stage watch report epoch is no longer current.",
+        key="k3",
+    )
+    watch.refused(
+        watch.body(at=-60),
+        "before_lease",
+        "Stage watch report timestamp is outside the accepted window.",
+        key="k4",
+    )
+    watch.refused(
+        watch.body(at=3600),
+        "too_early",
+        "observed_at is ahead of the control clock; retry",
+        key="k5",
+    )
+    # Owner credentials on the worker route are an auth failure: no reason, so not definite.
+    owner = (watch.state / "owner.header").read_text().strip().split(": ", 1)[1]
+    response = watch.client.post(
+        f"/worker/operations/{watch.operation_id}/watch-reports",
+        json=watch.body(),
+        headers={"Authorization": owner, "Idempotency-Key": "k6"},
+    )
+    assert response.status_code in {401, 403} and "reason" not in response.json()
+    # Recorded reports: out of order, then the idempotency key reused with another body.
+    assert watch.post(watch.body(kind="stuck", seq=5, at=2), key="ok").status_code == 201
+    order = "Stage watch reports cannot be reported out of order."
+    watch.refused(watch.body(kind="stuck", seq=5, at=3), "out_of_order", order, key="k7")
+    watch.refused(watch.body(kind="stuck", seq=6, at=1), "out_of_order", order, key="k8")
+    watch.refused(
+        watch.body(kind="stuck", seq=6, at=3),
+        "key_conflict",
+        "Idempotency key was already used with a different request.",
+        key="ok",
+    )
+    assert len(watch.events()) == 1
+
+
+def test_grant_refusals_name_their_reason(watch: Harness) -> None:
+    fx._worker(watch.state, watch.owner, watch.project["id"], "other-token")
+    with _connect(watch.state / "tessera.sqlite3") as connection:
+        connection.execute("UPDATE execution_grants SET worker_principal_id='worker-other-token'")
+        connection.commit()
+    watch.refused(watch.body(), "grant_mismatch", MISMATCH, key="g1")
+    with _connect(watch.state / "tessera.sqlite3") as connection:
+        connection.execute("UPDATE execution_grants SET worker_principal_id='worker-worker-token'")
+        connection.execute("UPDATE execution_grants SET status='reconciled'")
+        connection.commit()
+    watch.refused(
+        watch.body(),
+        "grant_reconciled",
+        "Execution authority has already been reconciled.",
+        key="g2",
+    )
+    assert watch.events() == []
+
+
+def test_worker_outside_the_grant_project_is_wrong_worker(watch: Harness) -> None:
+    with _connect(watch.state / "tessera.sqlite3") as connection:
+        org_id = connection.execute("SELECT org_id FROM projects").fetchone()[0]
+        other = _other_project(connection, org_id)
+        connection.execute(
+            "UPDATE credentials SET project_id=? WHERE principal_id='worker-worker-token'",
+            (other,),
+        )
+        connection.commit()
+    watch.refused(watch.body(), "wrong_worker", "Project was not found.")
+    assert watch.events() == []
+
+
+def test_fenced_operation_is_worker_fenced(watch: Harness) -> None:
+    with _connect(watch.state / "tessera.sqlite3") as connection:
+        op = connection.execute(
+            "SELECT * FROM external_operations WHERE operation_id=?", (watch.operation_id,)
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO execution_recovery_reconciliations
+            (id, org_id, project_id, task_id, grant_id, lease_id, epoch, operation_id,
+             original_worker_principal_id, identity_loss_reason, state, revision,
+             created_at, updated_at)
+            VALUES ('rec', ?, ?, ?, ?, ?, ?, ?, ?, 'worker_retired', 'identity_lost', 1,
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')""",
+            (
+                op["org_id"],
+                op["project_id"],
+                op["task_id"],
+                op["grant_id"],
+                op["lease_id"],
+                op["epoch"],
+                op["operation_id"],
+                op["worker_principal_id"],
+            ),
+        )
+        connection.commit()
+    watch.refused(
+        watch.body(),
+        "worker_fenced",
+        "Original worker identity is fenced pending independent recovery.",
+    )
+
+
+def test_budget_refusals_name_their_reason(watch: Harness) -> None:
+    watch.fill(MAX_REPORTS_PER_OPERATION)
+    seq, at = MAX_REPORTS_PER_OPERATION + 1, 60 * MAX_REPORTS_PER_OPERATION
+    watch.refused(
+        watch.body(seq=seq, kind="heartbeat", at=at),
+        "routine_budget_exhausted",
+        "Routine watch report budget exhausted.",
+        key="h",
+    )
+    watch.refused(
+        watch.body(seq=seq, kind="failed", at=at),
+        "budget_exhausted",
+        "Stage watch report budget exhausted.",
+        key="f",
+    )
+
+
+def test_replay_of_an_accepted_report_still_returns_the_stored_201(watch: Harness) -> None:
+    first = watch.post(watch.body(kind="failed"), key="r")
+    assert first.status_code == 201
+    # Control-side state that would now refuse a new report does not change the replay.
+    with _connect(watch.state / "tessera.sqlite3") as connection:
+        connection.execute("UPDATE execution_grants SET status='reconciled'")
+        connection.commit()
+    replay = watch.post(watch.body(kind="failed"), key="r")
+    assert replay.status_code == 201 and replay.json() == first.json()
+    assert "reason" not in replay.json()
+    assert len(watch.events()) == 1

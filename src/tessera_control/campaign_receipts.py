@@ -8,6 +8,7 @@ import sqlite3
 from typing import Any
 
 from .campaign_gates import unlock_receipt_section
+from .campaign_heavy_guard import recorded as recorded_heavy_guards
 from .campaign_holdout import receipt_section as holdout_receipt_section
 from .campaign_io import stage_io
 from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
@@ -232,6 +233,7 @@ def _attempt_entry(
     grants: dict[str, str],
     placed: dict[tuple[str, int], dict[str, Any]] | None = None,
     code_info: dict[str, Any] | None = None,
+    guards: dict[tuple[str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     kind, digest = _evidence(attempt)
     provider_id = attempt["provider_id"] or stage["provider_id"] or spec_stage.provider
@@ -307,6 +309,14 @@ def _attempt_entry(
         if decision.get("preference") is not None:
             # ADR 0070: the operator rule that ordered the approved candidates.
             entry["placement"]["preference"] = decision["preference"]
+    # ADR 0107: a heavy stage that fell back to a local provider while a remote profile was
+    # registered carries the warning (from its placement, or for a one-provider stage from the
+    # recorded warning event).
+    guard = (decision or {}).get("heavy_guard") or (guards or {}).get(
+        (attempt["stage_key"], attempt["attempt"])
+    )
+    if guard is not None:
+        entry.setdefault("placement", {})["heavy_guard"] = guard
     try:
         extra = stage_provider(provider_id).receipt_fields(connection, dict(attempt))
     except KeyError:
@@ -387,6 +397,7 @@ def build_receipt(
         (item["stage_key"], item["attempt"]): item
         for item in recorded_placements(connection, current)
     }
+    guards = recorded_heavy_guards(connection, current)
     grants = {
         row["id"]: row["worker_principal_id"]
         for row in connection.execute(
@@ -436,6 +447,7 @@ def build_receipt(
                         grants,
                         placed,
                         code_info,
+                        guards,
                     )
                     for attempt in attempts
                     if attempt["stage_key"] == stage["stage_key"]

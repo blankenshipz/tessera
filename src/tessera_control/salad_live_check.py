@@ -118,7 +118,7 @@ def _config(path):
     }
     if (
         type(value) is not dict
-        or set(value) != keys
+        or set(value) - {WATCH_SIGNALS_KEY} != keys
         or value["schema"] != "tessera.salad.live-config.v1"
     ):
         raise ValueError("closed server config required")
@@ -169,7 +169,57 @@ def _config(path):
     socket_path = Path(value["guardian_socket"])
     if not socket_path.is_absolute() or ".." in socket_path.parts:
         raise ValueError("explicit guardian socket required")
+    if WATCH_SIGNALS_KEY in value:
+        _watch_signals_path(value[WATCH_SIGNALS_KEY])
     return value, policy, hashlib.sha256(raw).hexdigest()
+
+
+# Optional, off when absent (ADR 0111): where the stage watcher reads this route's
+# non-secret signal snapshot. The file need not exist yet; its directory must be private.
+WATCH_SIGNALS_KEY = "watch_signals_file"
+
+
+def _watch_signals_path(value):
+    if (
+        type(value) is not str
+        or not 0 < len(value) <= 4096
+        or "\x00" in value
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json", Path(value).name)
+    ):
+        raise ValueError("private watch signals file required")
+    path = Path(value)
+    os.close(_private_path(path.parent, directory=True))
+    return path
+
+
+def _observe_watch(path, *, state, evidence, polls):
+    """Write one stage-watch signal snapshot after a successful poll; never raises.
+
+    Read-only and spend-neutral: it only maps values this loop already holds
+    (``signals_from_poll``: no identifier, name, secret or money) and writes one private
+    file. Any failure is swallowed so it can never change the run or its receipt.
+    """
+    if path is None:
+        return
+    try:
+        from datetime import UTC, datetime
+
+        from tessera_worker.stage_watcher.signals import write_signal_snapshot
+
+        from .salad_watch_signals import signals_from_poll
+
+        now = datetime.now(UTC)
+        signals = signals_from_poll(
+            provider_status=state.get("provider_status"),
+            termination_confirmed=state.get("termination_confirmed") is True,
+            stop_confirmed=evidence.get("stop_confirmed") is True,
+            provider_stop_confirmed=evidence.get("provider_stop_confirmed") is True,
+            poll_count=polls,
+            now=now,
+        )
+        write_signal_snapshot(path, signals, clock=lambda: now)
+    except Exception:
+        pass
 
 
 class SaladLiveSession:
@@ -832,7 +882,17 @@ def _guardian_code(error):
     return guardian_refusal_code(error)
 
 
-def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep, clock):
+def _drive(
+    session,
+    *,
+    route_id,
+    source_revision,
+    max_seconds,
+    max_polls,
+    sleep,
+    clock,
+    watch_signals_file=None,
+):
     """Internal orchestration seam; isolated fake sessions prove only local behavior.
 
     Session.dispatch MUST be the existing RemoteDispatcher.dispatch. Evidence and
@@ -902,6 +962,12 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
     beats = {"ok_at": None, "transient": 0}
     observes = {"failed": 0}
     evidence = {"output_retained": False}
+    # Successful observe-and-evidence passes; read only by the optional watch snapshot.
+    watch = {"polls": 0}
+
+    def watch_poll(polled, proof):
+        watch["polls"] += 1
+        _observe_watch(watch_signals_file, state=polled, evidence=proof, polls=watch["polls"])
 
     def observe():
         """dispatch("observe"), or None after a bounded transient provider read failure."""
@@ -1034,6 +1100,7 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
                 continue
             state = observed
             evidence = session.evidence(route_id)
+            watch_poll(state, evidence)
             receipt["financial"] = _financial(evidence.get("financial", {}))
             receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
             receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
@@ -1088,6 +1155,7 @@ def _drive(session, *, route_id, source_revision, max_seconds, max_polls, sleep,
             for _ in range(max_polls):
                 state = dispatch("observe")
                 evidence = session.evidence(route_id)
+                watch_poll(state, evidence)
                 receipt["financial"] = _financial(evidence.get("financial", {}))
                 receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
                 receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
@@ -1241,6 +1309,7 @@ def run(session, *, route_id, source_revision, receipt_directory, max_seconds=30
         max_polls=max_polls,
         sleep=time.sleep,
         clock=time.monotonic,
+        watch_signals_file=session.config.get(WATCH_SIGNALS_KEY),
     )
     _write_receipt(receipt_directory, receipt)
     return receipt

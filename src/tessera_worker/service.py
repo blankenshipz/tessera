@@ -403,9 +403,13 @@ class DevelopmentWorkerService:
         provider: Provider | None = None,
         sleep: Any = time.sleep,
         clock: Any = time.monotonic,
+        stage_watch: Any | None = None,
     ) -> None:
         self.config = config
         self.clock = clock
+        # Optional, off by default (ADR 0087): a StageWatchConfig. None or disabled never
+        # imports the stage watcher.
+        self.stage_watch = stage_watch
         self.root = _private_directory(config.workspace_root)
         self.output_root = _private_directory(config.development_output_root)
         self.token = read_private_credential(config.credential_file)
@@ -496,6 +500,7 @@ class DevelopmentWorkerService:
                 development_profile=profile,
                 provider=self.provider,
             ) as runtime:
+                self._attach_stage_watch(runtime, adapter)
                 result = runtime.recover(lease_id, epoch)
                 return self._drive(runtime, result)
 
@@ -515,8 +520,27 @@ class DevelopmentWorkerService:
             development_profile=profile,
             provider=self.provider,
         ) as runtime:
+            self._attach_stage_watch(runtime, adapter)
             result = runtime.start(lease_id, epoch)
             return self._drive(runtime, result)
+
+    def _attach_stage_watch(self, runtime: DevelopmentCpuRuntime, adapter: Any) -> None:
+        """Give the supervisor an observe-and-report stage watch runner, only when enabled.
+
+        Local Docker only (no remote provider). The runner reports through the worker's own
+        control channel (not the credential watch, so a refused watch report never marks this
+        run's credential as rejected) and keeps its outbox under this worker's private root.
+        It never raises and never changes an execution result.
+        """
+        if self.stage_watch is None or not getattr(self.stage_watch, "enabled", False):
+            return
+        if self.provider is not None:
+            return
+        from .stage_watch_runner import build_stage_watch_runner
+
+        runtime.supervisor.watch_runner = build_stage_watch_runner(
+            self.stage_watch, state_dir=self.root, channel=self.channel, adapter=adapter
+        )
 
     def _drive(self, runtime: DevelopmentCpuRuntime, result: DriverResult) -> dict[str, Any]:
         # None: renew on the first pass. start() leases afresh, but recover() resumes a lease

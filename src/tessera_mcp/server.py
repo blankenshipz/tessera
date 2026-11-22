@@ -296,7 +296,10 @@ def register_campaign_tools(
         other candidate was skipped, any steering and, while it waits, the reasons.
         ``placement_preference`` shows the operator's rules for heavy stages and, per stage a
         rule matches, the preferred providers it lists and whether the rule ``applies`` (it
-        reorders only a stage's approved alternates; it never adds a destination).
+        reorders only a stage's approved alternates; it never adds a destination). A stage's
+        ``heavy_guard`` (present only when recorded) is the latest warning (a heavy stage placed
+        on a local executor although a Salad profile is registered) or refusal (it waits for a
+        remote candidate), with its mode, reasons, signals and whether it is still waiting.
         """
         return await client.campaign(campaign_id)
 
@@ -311,10 +314,11 @@ def register_campaign_tools(
 
         Each finding is a platform detection with a reason code (campaign_blocked,
         delegation_lapsed, attempt_outcome_unknown, stale_execution_lease, runner_lease_stale,
-        no_progress), a suggested next action, its evidence ids and ages, and a receipt
-        digest. status is open, acknowledged, resolved or all. scan=True first asks the
-        platform to run its detector now (the detection is itself recorded). This tool takes
-        no action on any campaign: use the campaign tools you are authorized for to act.
+        no_progress, heavy_stage_on_local, heavy_stage_refused_local), a suggested next action,
+        its evidence ids and ages, and a receipt digest. status is open, acknowledged, resolved
+        or all. scan=True first asks the platform to run its detector now (the detection is
+        itself recorded). This tool takes no action on any campaign: use the campaign tools you
+        are authorized for to act.
         """
         if scan:
             await client.scan_stuck(str(uuid.uuid4()))

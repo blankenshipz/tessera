@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import errno
+import io
 import json
 import os
 import stat
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
 from tessera_control.stage_watch_limits import (
     MAX_REPORTS_PER_OPERATION,
+    PERMANENT_REASONS,
+    REASON_STATUS,
     TERMINAL_RESERVE,
+    TRANSIENT_REASONS,
     routine_limit,
 )
-from tessera_worker.control_channel import ControlChannelError
+from tessera_worker.control_channel import ControlChannelError, HttpControlChannel
 from tessera_worker.stage_watcher import (
     BODY_KEYS,
     COUNTER_KEYS,
@@ -32,7 +37,9 @@ from tessera_worker.stage_watcher import (
     WatchReport,
     classify_status,
     idempotency_key,
+    reason_settles,
     routine_cap,
+    settles,
 )
 
 OPERATION_ID = "0123456789abcdef0123456789abcdef"
@@ -344,7 +351,6 @@ def test_no_stuck_without_a_progress_signal(tmp_path):
         {"state": "exited", "exit_code": 1},
         {"state": "exited", "exit_code": 137, "oom_killed": True},
         {"state": "exited", "exit_code": 0, "oom_killed": True},
-        {"state": "exited", "exit_code": None},
     ],
 )
 def test_failed_on_bad_exit(tmp_path, terminal):
@@ -1051,8 +1057,8 @@ class FakeControl:
     def post(self, path, body, key, *, timeout_seconds=None):
         self.posts.append((key, body))
         if self.answers:
-            status = self.answers.pop(0)
-            raise ControlChannelError("control rejected request", status)
+            status, reason = _answer(self.answers.pop(0))
+            raise ControlChannelError("control rejected request", status, refusal_reason=reason)
         if key in self.replies:
             return self.replies[key]
         at = datetime.fromisoformat(body["observed_at"])
@@ -1069,6 +1075,11 @@ class FakeControl:
         self.recorded.append(body)
         self.replies[key] = {"recorded": True}
         return self.replies[key]
+
+
+def _answer(answer: int | tuple[int, str | None]) -> tuple[int, str | None]:
+    """A queued control answer: a status, or a (status, reason code) pair."""
+    return answer if isinstance(answer, tuple) else (answer, None)
 
 
 def _control_harness(tmp_path, control: FakeControl | None = None, **contract) -> Harness:
@@ -1268,3 +1279,293 @@ def test_flush_delivers_after_done_without_sampling_until_finished(tmp_path):
     assert h.probe.calls == calls  # flush never samples
     assert h.sink.delivered == [failed]
     assert h.watcher.pending_count == 0 and h.watcher.finished
+
+
+# -- control's machine-readable refusal reasons (rv-epx3 follow-up 1) ------------------------
+
+SETTLING_409_REASONS = [
+    "stale_epoch",
+    "grant_reconciled",
+    "before_lease",
+    "out_of_order",
+    "budget_exhausted",
+]
+ALL_409_REASONS = sorted(code for code in PERMANENT_REASONS if REASON_STATUS[code] == 409)
+
+
+def test_reason_codes_match_the_shared_control_limits():
+    assert set(SETTLING_409_REASONS) <= set(ALL_409_REASONS)
+    assert TRANSIENT_REASONS == {"too_early"} and not TRANSIENT_REASONS & PERMANENT_REASONS
+    # Control pairs these with 404 (not an existence oracle), so 404 settles them anyway.
+    assert REASON_STATUS["wrong_worker"] == REASON_STATUS["unknown_operation"] == 404
+    assert 401 not in REASON_STATUS.values()
+
+
+@pytest.mark.parametrize("kind", ["stuck", "failed"])
+@pytest.mark.parametrize("reason", ALL_409_REASONS)
+def test_classify_settles_a_terminal_409_only_with_a_permanent_reason(kind, reason):
+    assert classify_status(409, kind, reason) == DeliveryResult("refused", 409, reason)
+    assert settles(kind, 409, reason) and reason_settles(409, reason)
+    assert classify_status(409, kind).outcome == "transient"
+    # The same code under another status is not the refusal control describes.
+    for status in (401, 403, 425, 429, 503):  # (404 settles a closing report by itself)
+        assert classify_status(status, kind, reason).outcome == "transient"
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        (409, None),
+        (409, "too_early"),
+        (409, "unknown_operation"),  # a permanent code, but control sends it with 404
+        (409, "wrong_worker"),  # a permanent code, but control sends it with 403
+        (409, "not_a_reason_code"),
+        (409, "Stale_epoch"),
+        (409, "stale epoch"),
+        (409, "stale_epoch\n"),
+        (409, "stale_epoch" + "_" * 40),
+        (425, "too_early"),
+        (403, None),
+        (403, "stale_epoch"),
+        (401, "wrong_worker"),
+        (401, "stale_epoch"),
+    ],
+)
+def test_classify_keeps_a_terminal_report_pending_without_a_matching_permanent_reason(
+    status, reason
+):
+    result = classify_status(status, "failed", reason)
+    assert result.outcome == "transient" and result.status == status
+    assert not settles("failed", status, reason)
+
+
+def test_classify_ignores_a_reason_that_is_not_a_short_token():
+    assert classify_status(409, "failed", "Stale epoch.") == DeliveryResult("transient", 409)
+    assert classify_status(409, "failed", 7) == DeliveryResult("transient", 409)  # type: ignore[arg-type]
+    for bad in ("Stale", "a b", "x" * 42, 1):
+        with pytest.raises(ValueError):
+            DeliveryResult("refused", 409, bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("kind", ["heartbeat", "progress", "stuck", "failed"])
+def test_wrong_worker_settles_only_with_its_404_and_401_or_403_never_do(kind):
+    assert classify_status(404, kind, "wrong_worker") == DeliveryResult(
+        "refused", 404, "wrong_worker"
+    )
+    for status in (401, 403):  # control never pairs a permanent code with these
+        for reason in (None, "wrong_worker", "stale_epoch"):
+            assert classify_status(status, kind, reason).outcome == "transient"
+    assert classify_status(409, kind, "worker_fenced") == DeliveryResult(
+        "refused", 409, "worker_fenced"
+    )
+
+
+def _http_error_channel(status: int, body: bytes) -> HttpControlChannel:
+    def opener(request, timeout):
+        raise HTTPError(request.full_url, status, "refused", {}, io.BytesIO(body))
+
+    return HttpControlChannel("https://control.example", "worker-token", opener=opener)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            b'{"detail": "Stage watch report epoch is no longer current.", '
+            b'"reason": "stale_epoch"}',
+            "stale_epoch",
+        ),
+        (b'{"detail": "x", "reason": "Stale epoch is no longer current."}', None),
+        (b'{"detail": "x", "reason": "stale_epoch\\n"}', None),
+        (b'{"detail": "x", "reason": ["stale_epoch"]}', None),
+        (b'{"detail": "stale_epoch"}', None),  # never the detail text
+        (b'{"detail": "x", "code": "stale_epoch"}', None),  # never any other field
+        (b'["stale_epoch"]', None),
+        (b"stale_epoch", None),
+        (b'{"reason": "' + b"a" * 42 + b'"}', None),
+    ],
+)
+def test_channel_keeps_only_a_short_reason_token_from_a_refusal_body(body, expected):
+    channel = _http_error_channel(409, body)
+    with pytest.raises(ControlChannelError) as raised:
+        channel.post(f"/worker/operations/{OPERATION_ID}/watch-reports", {}, "k")
+    error = raised.value
+    assert (error.status, error.refusal_reason, error.reason) == (
+        409,
+        expected,
+        "control rejected request",
+    )
+    assert "no longer current" not in str(error) and "stale_epoch" not in str(error)
+
+
+@pytest.mark.parametrize("reason", SETTLING_409_REASONS)
+def test_failed_answered_409_with_a_permanent_reason_is_settled_at_once(tmp_path, reason):
+    h = _control_harness(tmp_path)
+    h.control.answers = [503] * 3  # the heartbeat stays pending this tick
+    [heartbeat] = h.watcher.tick()
+    h.control.answers = [(409, reason)]
+    h.clock.advance(1)
+    failed = _fail_next(h)
+    outbox = WatchOutbox(h.outbox_path)
+    assert outbox.refused_status(failed.seq) == 409 and outbox.gaps().refused == 1
+    # The refused failed (flushed first) did not block the earlier heartbeat behind it.
+    assert h.control.recorded == [heartbeat.to_body()] and outbox.pending() == []
+    posts = len(h.control.posts)
+    assert [key for key, _ in h.control.posts].count(failed.idempotency_key) == 1
+    h.clock.advance(60)
+    h.watcher.tick()
+    assert len(h.control.posts) == posts  # never resent
+    assert h.watcher.finished
+
+
+@pytest.mark.parametrize(
+    "answer", [409, (409, "too_early"), (409, "no_such_code"), (409, "unknown_operation")]
+)
+def test_failed_answered_409_without_a_permanent_reason_is_retried_under_the_same_key(
+    tmp_path, answer
+):
+    h = _control_harness(tmp_path)
+    h.control.answers = [answer] * 3
+    failed = _fail_next(h)
+    outbox = WatchOutbox(h.outbox_path)
+    assert outbox.refused_status(failed.seq) is None and outbox.gaps().refused == 0
+    assert [r.seq for r in outbox.pending()] == [failed.seq]
+    h.clock.advance(5)
+    h.watcher.tick()
+    assert h.control.recorded == [failed.to_body()]
+    assert {key for key, _ in h.control.posts} == {failed.idempotency_key}
+    assert len(h.control.posts) == 4 and h.watcher.finished
+
+
+@pytest.mark.parametrize(
+    ("answer", "settled"),
+    [((404, "wrong_worker"), True), ((403, "wrong_worker"), False), (403, False)],
+)
+def test_failed_wrong_worker_settles_only_with_the_status_control_pairs_it_with(
+    tmp_path, answer, settled
+):
+    h = _control_harness(tmp_path)
+    h.control.answers = [answer] * 3
+    failed = _fail_next(h)
+    outbox = WatchOutbox(h.outbox_path)
+    status, _ = _answer(answer)
+    assert outbox.refused_status(failed.seq) == (status if settled else None)
+    assert len(h.control.posts) == (1 if settled else 3)
+
+
+@pytest.mark.parametrize("reason", [None, "wrong_worker", "stale_epoch"])
+def test_failed_answered_401_never_settles(tmp_path, reason):
+    h = _control_harness(tmp_path)
+    h.control.answers = [(401, reason)] * 3
+    failed = _fail_next(h)
+    outbox = WatchOutbox(h.outbox_path)
+    assert outbox.refused_status(failed.seq) is None
+    assert [r.seq for r in outbox.pending()] == [failed.seq]
+
+
+@pytest.mark.parametrize(
+    ("result", "settled"),
+    [
+        (DeliveryResult("refused", 409, "stale_epoch"), True),
+        (DeliveryResult("refused", 409, "worker_fenced"), True),
+        (DeliveryResult("refused", 403, "wrong_worker"), False),
+        (DeliveryResult("refused", 409, "too_early"), False),
+        (DeliveryResult("refused", 409, "unknown_operation"), False),
+        (DeliveryResult("refused", 401, "wrong_worker"), False),
+    ],
+)
+def test_a_sink_settles_a_failed_only_on_what_classify_settles(tmp_path, result, settled):
+    h = Harness(tmp_path)
+    h.sink = ScriptedSink({0: [result] * 3})
+    h.watcher = h.build()
+    _fail_next(h)
+    outbox = WatchOutbox(h.outbox_path)
+    assert (outbox.refused_status(0) == result.status) is settled
+    assert len(h.sink.attempts) == (1 if settled else 3)
+
+
+def test_outbox_mark_refused_accepts_exactly_what_classify_settles(tmp_path):
+    outbox = WatchOutbox(tmp_path / "o.sqlite")
+    outbox.record(_report(kind="failed"))
+    for status, reason in [
+        (409, None),
+        (409, "too_early"),
+        (409, "unknown_operation"),
+        (401, "wrong_worker"),
+        (403, None),
+        (403, "stale_epoch"),
+    ]:
+        assert classify_status(status, "failed", reason).outcome == "transient"
+        with pytest.raises(ValueError):
+            outbox.mark_refused(0, status, T0, reason=reason)
+    assert [r.seq for r in outbox.pending()] == [0]
+    assert classify_status(409, "failed", "grant_reconciled").outcome == "refused"
+    outbox.mark_refused(0, 409, T0, reason="grant_reconciled")
+    assert outbox.refused_status(0) == 409 and outbox.gaps().refused == 1
+
+
+# -- a closing report held behind a later pending one (rv-epx3 follow-up 2) -----------------
+
+
+def test_expired_failed_is_held_by_a_fresh_later_report_until_that_one_expires(tmp_path):
+    outbox = WatchOutbox(tmp_path / "o.sqlite")
+    hour = timedelta(hours=1)
+    outbox.record(_report(seq=0, kind="failed", observed_at=T0))
+    outbox.record(_report(seq=1, kind="heartbeat", observed_at=T0 + 20 * hour))
+    # The failed is 25 h old, but the later report is fresh and pending: keep both.
+    assert outbox.abandon_expired(T0 + 25 * hour) == 0
+    assert [(r.seq, r.kind) for r in outbox.pending()] == [(0, "failed"), (1, "heartbeat")]
+    assert outbox.gaps().dropped == 0
+    # Once the later report expires too, both are abandoned in the same pass and counted.
+    assert outbox.abandon_expired(T0 + 44 * hour) == 2
+    gaps = outbox.gaps()
+    assert outbox.pending() == [] and (gaps.abandoned, gaps.dropped) == (2, 2)
+
+
+@pytest.mark.parametrize("settle", ["delivered", "refused"])
+def test_a_settled_later_report_no_longer_holds_an_expired_failed(tmp_path, settle):
+    outbox = WatchOutbox(tmp_path / "o.sqlite")
+    hour = timedelta(hours=1)
+    outbox.record(_report(seq=0, kind="failed", observed_at=T0))
+    outbox.record(_report(seq=1, kind="heartbeat", observed_at=T0 + 20 * hour))
+    if settle == "delivered":
+        outbox.mark_delivered(1, T0 + 20 * hour)
+    else:
+        outbox.mark_refused(1, 409, T0 + 20 * hour)
+    assert outbox.abandon_expired(T0 + 25 * hour) == 1
+    gaps = outbox.gaps()
+    assert outbox.pending() == [] and (gaps.abandoned, gaps.dropped) == (1, 1)
+
+
+def test_pending_orders_closing_reports_first_then_by_seq(tmp_path):
+    outbox = WatchOutbox(tmp_path / "o.sqlite")
+    kinds = ["heartbeat", "stuck", "progress", "failed", "heartbeat"]
+    for seq, kind in enumerate(kinds):
+        outbox.record(_report(seq=seq, kind=kind, observed_at=T0 + timedelta(seconds=seq)))
+    assert [r.seq for r in outbox.pending()] == [1, 3, 0, 2, 4]
+
+
+def test_a_fresh_later_closing_report_also_holds_an_expired_one(tmp_path):
+    outbox = WatchOutbox(tmp_path / "o.sqlite")
+    hour = timedelta(hours=1)
+    outbox.record(_report(seq=0, kind="stuck", observed_at=T0))
+    outbox.record(_report(seq=1, kind="failed", observed_at=T0 + 20 * hour))
+    assert outbox.abandon_expired(T0 + 25 * hour) == 0
+    assert [r.seq for r in outbox.pending()] == [0, 1]
+    assert outbox.abandon_expired(T0 + 44 * hour) == 2
+
+
+def test_a_reason_code_never_settles_a_401_even_if_control_paired_it_with_401(monkeypatch):
+    from tessera_worker.stage_watcher import report as report_module
+
+    monkeypatch.setattr(report_module, "REASON_STATUS", {"stale_epoch": 401})
+    assert classify_status(401, "failed", "stale_epoch").outcome == "transient"
+    assert classify_status(401, "heartbeat", "stale_epoch").outcome == "transient"
+
+
+def test_channel_error_keeps_only_a_token_refusal_reason():
+    assert ControlChannelError("x", 409, refusal_reason="stale_epoch").refusal_reason == (
+        "stale_epoch"
+    )
+    for bad in ("Stale epoch.", "stale_epoch\n", "a" * 42, 7, None):
+        assert ControlChannelError("x", 409, refusal_reason=bad).refusal_reason is None  # type: ignore[arg-type]

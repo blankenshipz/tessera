@@ -210,6 +210,47 @@ event: `source: default_policy`, `class`, `signals`, `kinds`, `spec_order`, `ord
 `default_policy` block under `placement_preference` (enabled, thresholds, and per stage the
 class, signals, order and whether it applies).
 
+### Heavy-stage placement guard
+
+Contract: [ADR 0107](decisions/0107-heavy-stage-placement-guard.md). When a heavy stage is placed
+on a local or self-hosted candidate (after it passed every other check) while a Salad profile is
+registered for the project, placement records a warning; nothing is recorded when a remote
+candidate is chosen.
+
+Heavy signals: ADR 0088's `declared_memory`, `long_expected_runtime`, `tag:heavy` and
+`tag:training`, plus `tag:pretraining`, `large_inputs` and `large_outputs`. `large_inputs` is the sum
+of the pinned input sizes the store knows for the campaign's organization and project (snapshot
+manifest sizes and artifact `size_bytes`); unknown sizes are ignored and stage-to-stage inputs are
+not counted. `large_outputs` is the stage's summed declared output `max_bytes` limits, which is a
+cap, not an estimate. The threshold is `heavy_memory_bytes` (default 1.5 GiB). A GPU tag alone is
+not heavy, and egress-bound stages are never guarded.
+
+Reasons, in order: `credential_unavailable`, `no_fitting_profile`, `remote_skipped`,
+`operator_override` (an operator rule put local first, the default policy is off, or a steering
+pin or exclusion), `not_listed`, `remote_not_tried` (a remote candidate is listed after the chosen
+local one with no operator action).
+
+Recording: once per attempt, in the placement transaction, the event
+`campaign.heavy_stage_local_fallback` (`stage_key`, `attempt`, `provider_id`, `mode`, `signals`,
+`reasons`, `detail` as `[{provider_id, reason}]`) and `placement.heavy_guard` on the
+`campaign.stage_placed` payload and the receipt attempt. Stages without alternates are also guarded
+before reservation (reason `not_listed`; the receipt `placement` is `{heavy_guard}` from the
+event). Set the operator choice beside the other preferences:
+
+```json
+"placement_preferences": {"heavy_local_fallback": "refuse"}
+```
+
+`warn` (default, also when absent) keeps placement as it was and only records the warning.
+`refuse` skips the local candidate with the transient reason `heavy_local_refused` (detail: the
+reason codes); with no other candidate the stage waits and the `campaign.stage_waiting_placement`
+event carries `heavy_guard {warning: false, refused: true, ...}`. It is placed when a remote
+candidate qualifies; a single-provider stage in `refuse` mode waits until the operator switches to
+`warn`. Non-heavy stages and projects without a usable Salad profile are unchanged.
+`tessera_get_campaign` shows per stage `heavy_guard {mode, reasons, signals, provider_id?, waiting,
+recorded_at}` only when an event exists. The [stuck detector](campaign-stuck.md) flags
+`heavy_stage_on_local` and `heavy_stage_refused_local`.
+
 ## The provider file
 
 `tessera serve --campaign-providers FILE` takes one closed, owner-only (0600), secret-free

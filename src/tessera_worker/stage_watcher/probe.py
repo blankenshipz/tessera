@@ -46,6 +46,15 @@ def _optional_count(name: str, value: object) -> None:
 
 @dataclass(frozen=True)
 class ProbeSample:
+    """One read-only observation of the attempt's workload.
+
+    ``progress_marker`` is an internal liveness counter for probes with no byte or CPU
+    counters (it is never a report counter). Any change in it counts as progress, and its
+    presence alone makes ``has_progress_signal`` true. For a remote provider the marker is
+    advanced by the provider-side driver once per successful poll, so a ``stuck`` built on it
+    means "the provider-side driver stopped observing", not "the workload stalled".
+    """
+
     state: ProbeState
     observed_at: datetime
     exit_code: int | None = None
@@ -54,6 +63,7 @@ class ProbeSample:
     cpu_ms: int | None = None
     mem_bytes: int | None = None
     restarts: int = 0
+    progress_marker: int | None = None
 
     def __post_init__(self) -> None:
         if self.state not in PROBE_STATES:
@@ -66,7 +76,7 @@ class ProbeSample:
             raise ValueError("exit_code must be None or an integer.")
         if not isinstance(self.oom_killed, bool):
             raise ValueError("oom_killed must be a bool.")
-        for name in ("output_bytes", "cpu_ms", "mem_bytes"):
+        for name in ("output_bytes", "cpu_ms", "mem_bytes", "progress_marker"):
             _optional_count(name, getattr(self, name))
         if isinstance(self.restarts, bool) or not isinstance(self.restarts, int):
             raise ValueError("restarts must be a non-negative integer.")
@@ -75,7 +85,11 @@ class ProbeSample:
 
     @property
     def has_progress_signal(self) -> bool:
-        return self.output_bytes is not None or self.cpu_ms is not None
+        return (
+            self.output_bytes is not None
+            or self.cpu_ms is not None
+            or self.progress_marker is not None
+        )
 
 
 class ComputeProbe(Protocol):

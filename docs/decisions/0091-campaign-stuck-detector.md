@@ -94,3 +94,5 @@ not be read by the platform's own agent loop.
 no side effects on campaigns), `tests/test_campaign_stuck_api.py` (routes, scopes, tenant
 isolation, human-only settings, idempotency), `tests/test_mcp_campaign_stuck.py` (the two tools),
 `tests/test_stuck_work_source.py` and `tests/test_stuck_loop_integration.py` (the loop's work source, alone and against the real routes). Focused tests only; no live calls.
+
+Amended by [ADR 0107](0107-heavy-stage-placement-guard.md), which adds the codes `heavy_stage_on_local` and `heavy_stage_refused_local` (a schema migration widens the findings code check).

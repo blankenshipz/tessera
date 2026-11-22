@@ -26,7 +26,7 @@ this attempt tried them in a different order than the spec wrote.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -108,6 +108,9 @@ class PlacementPreferences(_Closed):
         Annotated[int, Field(strict=True, ge=1024 * 1024, le=2048 * 1024**3)] | None
     ) = None
     long_runtime_seconds: Annotated[int, Field(strict=True, ge=1, le=86_400)] | None = None
+    # ADR 0107: what a heavy stage placed on a local candidate while a remote profile is
+    # registered does: ``warn`` (placed, with a recorded warning) or ``refuse`` (it waits).
+    heavy_local_fallback: Literal["warn", "refuse"] = "warn"
 
     @model_validator(mode="after")
     def _distinct(self) -> PlacementPreferences:
@@ -159,6 +162,16 @@ def _thresholds() -> tuple[int, int]:
         else (prefs.long_runtime_seconds)
     )
     return memory, seconds
+
+
+def heavy_bytes_threshold() -> int:
+    """The heavy threshold in bytes (``heavy_memory_bytes``, default 1.5 GiB)."""
+    return _thresholds()[0]
+
+
+def heavy_local_fallback() -> str:
+    """``warn`` (the default, also when no section is configured) or ``refuse`` (ADR 0107)."""
+    return "warn" if _ACTIVE is None else _ACTIVE.heavy_local_fallback
 
 
 def default_enabled() -> bool:

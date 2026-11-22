@@ -117,6 +117,9 @@ class CpuSupervisor:
         self._recovered_operations: set[str] = set()
         self._guard = threading.RLock()
         self._closed = False
+        # Optional, off by default (ADR 0087): an observe-and-report stage watch runner
+        # (tessera_worker.stage_watch_runner). None leaves every path below unchanged.
+        self.watch_runner: object | None = None
         try:
             self._initialize()
         except Exception:
@@ -129,6 +132,11 @@ class CpuSupervisor:
             if self._closed:
                 return
             self._closed = True
+            if self.watch_runner is not None:
+                try:
+                    self.watch_runner.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             if self._lock_fd is not None:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
                 os.close(self._lock_fd)
@@ -142,6 +150,9 @@ class CpuSupervisor:
 
     def drive_once(self, operation: CpuOperation, lease: Lease) -> DriverResult:
         """Perform at most one create and one start, after fresh authorization."""
+        return self._watched(operation, lease, self._drive_once(operation, lease))
+
+    def _drive_once(self, operation: CpuOperation, lease: Lease) -> DriverResult:
         with self._guard:
             self._require_open()
             row = self._bind(operation, lease)
@@ -189,6 +200,9 @@ class CpuSupervisor:
 
     def reconcile(self, operation: CpuOperation, lease: Lease) -> DriverResult:
         """Observe a prior intent without ever issuing another start."""
+        return self._watched(operation, lease, self._reconcile(operation, lease))
+
+    def _reconcile(self, operation: CpuOperation, lease: Lease) -> DriverResult:
         with self._guard:
             self._require_open()
             row = self._bind(operation, lease)
@@ -238,6 +252,9 @@ class CpuSupervisor:
 
     def tick(self, operation: CpuOperation, lease: Lease) -> DriverResult:
         """Recheck live authority and bounded duration for an existing operation."""
+        return self._watched(operation, lease, self._tick(operation, lease))
+
+    def _tick(self, operation: CpuOperation, lease: Lease) -> DriverResult:
         with self._guard:
             self._require_open()
             row = self._bind(operation, lease)
@@ -252,7 +269,30 @@ class CpuSupervisor:
         """Request termination; call it terminal only after provider confirmation."""
         with self._guard:
             self._require_open()
-            return self._cancel(operation, reason)
+            result = self._cancel(operation, reason)
+        return self._watched(operation, None, result)
+
+    def _watched(
+        self, operation: CpuOperation, lease: Lease | None, result: DriverResult
+    ) -> DriverResult:
+        """Let the optional stage watch runner observe; it never changes ``result``.
+
+        A running operation gets a watcher (idempotent), an ended one is handed back to the
+        runner to finish its reports, and every call gives the runner one bounded tick. Any
+        runner failure is swallowed: the watcher can never affect execution.
+        """
+        runner = self.watch_runner
+        if runner is None:
+            return result
+        try:
+            if result.phase == "running" and lease is not None:
+                runner.on_start(operation, lease)  # type: ignore[attr-defined]
+            elif result.phase in {"terminal", "denied"}:
+                runner.on_end(operation.operation_id)  # type: ignore[attr-defined]
+            runner.tick()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return result
 
     def run_until_terminal(
         self,

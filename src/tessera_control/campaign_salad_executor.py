@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -75,6 +76,35 @@ class CustodyConfig(_Closed):
     certificate_sha256: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 
 
+class StageWatcherBlock(_Closed):
+    """Optional, off unless ``enabled`` (ADR 0111): watch each route, report descriptively.
+
+    Bounds are ``tessera_worker.stage_watch_config.StageWatchConfig``'s (checked here); an
+    omitted bound takes its default. Without ``kill_switch_path`` no watcher starts.
+    """
+
+    enabled: bool
+    kill_switch_path: _Path | None = None
+    silent_seconds: int | None = None
+    heartbeat_seconds: int | None = None
+    max_reports: int | None = None
+
+    def watch_config_fields(self) -> dict[str, Any]:
+        return {
+            name: value
+            for name, value in self.model_dump().items()
+            if value is not None or name == "kill_switch_path"
+        }
+
+    @model_validator(mode="after")
+    def _same_bounds_as_the_worker(self) -> StageWatcherBlock:
+        # Configuration only: this module imports no watcher code.
+        from tessera_worker.stage_watch_config import StageWatchConfig
+
+        StageWatchConfig(**self.watch_config_fields())
+        return self
+
+
 class ExecutorConfig(_Closed):
     schema_id: Annotated[str, Field(alias="schema")]
     state_dir: _Path
@@ -96,6 +126,7 @@ class ExecutorConfig(_Closed):
     # times, a short fixed delay apart, before the runner falls back to a human charge.
     guardian_retries: Annotated[int, Field(ge=0, le=10)] = 3
     guardian_retry_seconds: Annotated[int, Field(ge=0, le=30)] = 2
+    stage_watcher: StageWatcherBlock | None = None
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
 
@@ -232,8 +263,11 @@ class SaladCampaignExecutor:
         route_runner: RouteRunner = subprocess_route_runner,
         importer: Importer,
         sleep: Callable[[float], None] = time.sleep,
+        stage_watch: Any = None,
     ) -> None:
         self.sleep = sleep
+        # Optional ``SaladRouteWatch`` (descriptive reports only; None by default).
+        self.stage_watch = stage_watch
         chosen = (profile,) if isinstance(profile, SaladCampaignProfile) else tuple(profile)
         if not chosen or len({item.name for item in chosen}) != len(chosen):
             raise ValueError("The executor needs distinct profiles.")
@@ -402,7 +436,14 @@ class SaladCampaignExecutor:
         return derived, plan, profile
 
     def _write_live_config(
-        self, route_id, state, derived, plan, directory: Path, profile: SaladCampaignProfile
+        self,
+        route_id,
+        state,
+        derived,
+        plan,
+        directory: Path,
+        profile: SaladCampaignProfile,
+        watch_signals_file=None,
     ) -> Path:
         from .salad_live_check import MAX_POLLS
 
@@ -429,6 +470,8 @@ class SaladCampaignExecutor:
             max_polls=min(MAX_POLLS, max(30, -(-max_seconds // 5))),
             source_revision=self.config.source_revision,
         )
+        if watch_signals_file is not None:
+            config["watch_signals_file"] = str(watch_signals_file)
         path = directory / "live-config.json"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
@@ -464,22 +507,45 @@ class SaladCampaignExecutor:
         receipts = directory / "receipts"
         receipts.mkdir(mode=0o700)
         (directory / "outputs").mkdir(mode=0o700)
-        config_path = self._write_live_config(route_id, state, derived, plan, directory, profile)
+        watch = self.stage_watch
+        signals = None if watch is None else self._watch_begin(watch, item, derived)
+        config_path = self._write_live_config(
+            route_id, state, derived, plan, directory, profile, signals
+        )
         try:
-            receipt = self.route_runner(
-                config_path,
-                receipts,
-                derived.resources.max_seconds + SUBPROCESS_GRACE_SECONDS,
-            )
+            with watch.ticking() if signals is not None else nullcontext():
+                receipt = self.route_runner(
+                    config_path,
+                    receipts,
+                    derived.resources.max_seconds + SUBPROCESS_GRACE_SECONDS,
+                )
         except RouteTimeout:
             self._note("route_timeout", attempt)
             return
         finally:
             config_path.unlink(missing_ok=True)
+            if signals is not None:
+                watch.end(item["operation_id"])
         if receipt is None:
             self._note("no_receipt", attempt)
             return
         self._finish(item, receipt)
+
+    def _watch_begin(self, watch: Any, item: dict[str, Any], derived: Any) -> Path | None:
+        """Start the descriptive watch for this route; None (no watch) on any failure."""
+        try:
+            lease = self._lease_for(item)
+            if lease is None:
+                return None
+            return watch.begin(
+                operation_id=item["operation_id"],
+                lease_id=lease[0],
+                epoch=lease[1],
+                stage_key=item["stage_key"],
+                deadline_seconds=derived.resources.max_seconds,
+            )
+        except Exception:
+            return None
 
     def _resume(self, item: dict[str, Any]) -> None:
         """An `executing` attempt after a restart: finish only from a receipt on disk."""
@@ -862,12 +928,23 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
 
         return SaladSafetyHTTPSClient(**config.custody.model_dump(mode="json")).status(state)
 
+    stage_watch = None
+    if config.stage_watcher is not None and config.stage_watcher.enabled:
+        from .stage_watch_channel import build_salad_route_watch
+
+        stage_watch = build_salad_route_watch(
+            config.stage_watcher,
+            state_dir=state_dir,
+            worker=worker,
+            poll_seconds=config.poll_seconds,
+        )
     return SaladCampaignExecutor(
         config,
         profiles,
         StoreControl(state_dir, worker, guardian_status),
         worker_principal_id=worker["id"],
         importer=trusted_importer(config, worker, state_dir),
+        stage_watch=stage_watch,
     )
 
 

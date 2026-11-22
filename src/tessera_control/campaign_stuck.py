@@ -30,6 +30,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from . import campaign_heavy_guard_readout as heavy_readout
 from .store import Store, _parse_utc, _utc_string
 
 CODES = {
@@ -39,9 +40,13 @@ CODES = {
     "stale_execution_lease": "reconcile_or_cancel_the_grant",
     "runner_lease_stale": "check_the_campaign_runner_service",
     "no_progress": "check_provider_capacity_or_cancel",
+    # ADR 0107: the heavy-stage placement guard.
+    "heavy_stage_on_local": "check_salad_credential_or_profile",
+    "heavy_stage_refused_local": "restore_remote_capacity_or_allow_local",
 }
 ACTIVE = ("submitted", "running", "stopping", "cancel_requested")
 TERMINAL_CAMPAIGN = ("succeeded", "stopped", "failed", "cancelled")
+HEAVY_LIVE_ATTEMPT = ("reserved", "granted", "admitted", "running")
 LIVE_ATTEMPT = ("granted", "admitted", "running", "exited", "collected", "resolved", "measured")
 STATUSES = ("open", "acknowledged", "resolved")
 DEFAULT_UNCHANGED_SECONDS = 3600
@@ -73,7 +78,7 @@ def create_stuck_schema(connection: sqlite3.Connection) -> None:
         stage_key TEXT,
         code TEXT NOT NULL CHECK(code IN ('campaign_blocked','delegation_lapsed',
             'attempt_outcome_unknown','stale_execution_lease','runner_lease_stale',
-            'no_progress')),
+            'no_progress','heavy_stage_on_local','heavy_stage_refused_local')),
         subject TEXT NOT NULL,
         suggested_action TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('open','acknowledged','resolved')),
@@ -260,6 +265,65 @@ def detect(
                         },
                     )
                 )
+    # ADR 0107: a heavy stage placed on a local executor while a remote profile exists, and one
+    # the operator's refuse mode keeps waiting past the grace. Ids, codes and ages only.
+    for cid in open_ids:
+        guards = heavy_readout.stage_guards(connection, project_id, cid)
+        if not guards:
+            continue
+        warned = {
+            (e.get("stage_key"), e.get("attempt")): e
+            for e in heavy_readout._events(
+                connection, project_id, cid, heavy_readout.FALLBACK_EVENT
+            )
+            if (e.get("mode") or "warn") == "warn"
+        }
+        for a in connection.execute(
+            "SELECT id, stage_key, attempt, status FROM campaign_stage_attempts "
+            f"WHERE campaign_id=? AND status IN ({','.join('?' * len(HEAVY_LIVE_ATTEMPT))})",
+            (cid, *HEAVY_LIVE_ATTEMPT),
+        ).fetchall():
+            event = warned.get((a["stage_key"], a["attempt"]))
+            if event is None:
+                continue
+            found.append(
+                _finding(
+                    cid,
+                    "heavy_stage_on_local",
+                    a["id"],
+                    a["stage_key"],
+                    {
+                        "attempt_id": a["id"],
+                        "attempt": a["attempt"],
+                        "attempt_status": a["status"],
+                        "provider_id": event.get("provider_id"),
+                        "reasons": list(event.get("reasons") or []),
+                        "signals": list(event.get("signals") or []),
+                        "age_seconds": _age(now, event["_at"]),
+                    },
+                )
+            )
+        for key, guard in guards.items():
+            if guard["mode"] != "refuse" or not guard["waiting"]:
+                continue
+            waited = _age(now, guard["recorded_at"])
+            if waited <= grace:
+                continue
+            found.append(
+                _finding(
+                    cid,
+                    "heavy_stage_refused_local",
+                    key,
+                    key,
+                    {
+                        "stage_key": key,
+                        "attempt": guard.get("attempt"),
+                        "reasons": list(guard["reasons"]),
+                        "waiting_seconds": waited,
+                        "grace_seconds": grace,
+                    },
+                )
+            )
     # The runner service itself has stopped renewing its lease.
     runner = connection.execute(
         "SELECT expires_at FROM campaign_runner_lease WHERE singleton=1"

@@ -20,12 +20,21 @@ allowing a registered model destination for a stage with non-public input is an 
 spec-validation rule ("no egress for a non-public stage"), which this draft does not make. Closes no
 [ADR 0033](0033-freeze-over-built-planes.md) freeze: see "Freeze" below.
 
-Implementation status: the first slice (S1 contract digest + S2 observe-only watcher, library, off
-by default, not wired into the default worker service) is implemented; see
-[the stage watcher](../stage-watcher.md). No ADR 0033 amendment text is requested by this slice
-because it adds no provider call, spend or egress beyond the injected report sink; the owner still
-decides whether an amendment is needed. Everything else in this record (actions, model calls,
-Salad sidecar, escalation) remains a draft and inactive.
+Implementation status: the first slice (S1 contract digest + S2 observe-only watcher, disabled by
+default) is implemented. The worker starts it beside a local Docker stage only with the explicit
+`--stage-watcher` operator flag and a kill-switch path; see
+[the stage watcher](../stage-watcher.md). The worker wiring (supervisor hook, service attach, CLI
+flags) touches the ordinary-docker plane that ADR 0033 freezes (bug and security fixes only). It
+is additive, disabled by default, read-only, spend-neutral and cannot change execution results.
+It is treated as a narrowly scoped amendment of ADR 0033, proposed and pending owner
+confirmation: the owner has not yet confirmed it in a decision record. The second slice is
+[ADR 0111](0111-stage-watcher-decision-requests-and-remote-wiring.md): it records and limits the
+Salad-plane amendment for two disabled-by-default Salad hooks (the snapshot write and the
+executor's watcher ticker), and adds the watcher's retry and resize *requests*, recorded by
+control as advisory events that are always `not_admitted`. That record concerns the Salad plane
+only. Runner admission of a request remains open and needs its own reviewed ADR. Everything else
+in this record (admission, model calls, the Salad workload sidecar, escalation) remains a draft
+and inactive.
 
 ## Context
 
@@ -332,6 +341,16 @@ existing receipt or digest, and keeps a stage without a contract exactly as it r
    the same list as section 3.2: the outbox and grant endpoint (on Salad, the endpoint its workload
    token already reaches) and the attempt's artifact upload and custody endpoint; it needs the kill-switch delivery of open question 7 and an explicit
    ADR 0033 amendment for the Salad plane.
+   A smaller observe-only step is built beside the Salad plane: a remote watcher in the
+   provider-side driver's process owner (never in the container, no management credential) that
+   reads a non-secret signal snapshot (`salad_watch_signals.py` maps a poll to it; the runner's
+   `on_start_remote` and probe-factory registry consume it) and reports through the worker
+   credential, descriptive only. **Implemented by
+   [ADR 0111](0111-stage-watcher-decision-requests-and-remote-wiring.md), which makes the
+   amendment:** (i) one read-only, non-secret, spend-neutral snapshot write in the live-check poll
+   loop after each successful poll, and (ii) a tick of the runner by the executor process that
+   holds the worker credential while the route child process runs, both disabled by default. Request
+   records are advisory; admission by the runner is still not built.
 6. **S5, model-assisted judgement.** The control-side relay of section 5.1, the ADR 0083 call
    records on the attempt, the shared kill switch, an enrolled tier per contract. Optional per
    stage. On the local runner it needs the relay and the per-attempt rule; **on Salad it is
@@ -349,10 +368,16 @@ stack and ordinary-docker execution (bug and security fixes only, with an except
 runtime spend-safety fixes). [ADR 0082](0082-agent-loop-anthropic-destination.md) lifted the
 freeze for the agent and reasoning plane only. S1 is runner and receipt code, which the freeze
 does not name, so it is expected to need no amendment. S2 and S3 add a sidecar next to the local
-worker and are treated as touching the ordinary-docker plane, so they are proposed as a
-narrowly scoped amendment of ADR 0033; S4 touches the Salad plane and S5 opens the model path,
-each needing its own explicit amendment, raised when those slices are scheduled. This ADR does
-not itself lift any freeze.
+worker and are treated as touching the ordinary-docker plane (the S2 wiring edits the supervisor,
+service and CLI), so they are proposed as a narrowly scoped amendment of ADR 0033, additive,
+disabled by default, read-only and spend-neutral, pending owner confirmation in a decision
+record. S4 touches the Salad plane and S5 opens the model path, each needing its own explicit
+amendment, raised when those slices are scheduled. The two edits the observe-only remote watcher
+needs (a snapshot write in the live-check poll loop, and a runner tick beside the executor) are
+recorded and limited by [ADR 0111](0111-stage-watcher-decision-requests-and-remote-wiring.md),
+which the owner directed for slice 4; it names the frozen Salad files touched and the guarantees,
+and concerns the Salad plane only. Everything else in ADR 0033 stays frozen. This ADR does not
+itself lift any freeze.
 
 ## Consequences
 

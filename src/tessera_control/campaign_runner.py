@@ -29,6 +29,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import campaign_heavy_guard as heavy_guard
 from . import campaign_holdout as holdout
 from . import campaign_placement as placement
 from . import execution_frames as frames
@@ -1322,6 +1323,8 @@ class CampaignRunner:
         if not base.has_candidates or (
             not base.alternates and not placement.reroute_due(base, self._attempts(ctx, key))
         ):
+            if not self._single_provider_guard(ctx, key, base):
+                return False
             if prepare:
                 progress = self._provider(base).prepare(self, ctx, key)
                 if progress != "ready":
@@ -1353,6 +1356,46 @@ class CampaignRunner:
         if progress != "ready":
             return progress == "progress"
         return self._reserve(ctx, key)
+
+    def _single_provider_guard(self, ctx: _Ctx, key: str, base: NormalStage) -> bool:
+        """ADR 0107 for a stage that is not placed (one provider): a heavy stage on a local
+        provider while a remote profile is registered records its warning once per attempt
+        number (warn) or waits with the reason (refuse). False means wait."""
+        with self.connection() as connection:
+            guard = heavy_guard.applies(connection, ctx.campaign, base)
+        if guard is None or not guard.is_local(base.provider):
+            return True
+        number = self._stage_row(ctx, key)["attempts_used"] + 1
+        codes, detail = heavy_guard.reasons(guard, base, base.provider, (), None, None)
+        with self.store.runner_connection() as connection:
+            if guard.mode == "refuse":
+                block = heavy_guard.record(guard, codes, detail, refused=True)
+                skip = placement.Skip(base.provider, heavy_guard.REFUSED_REASON, ",".join(codes))
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    placement.WAITING_EVENT,
+                    {
+                        "stage_key": key,
+                        "attempt": number,
+                        "signature": f"{skip.provider_id}:{skip.reason}",
+                    },
+                    {"skipped": [skip.payload()], "steering": None, "heavy_guard": block},
+                )
+                return False
+            block = heavy_guard.record(guard, codes, detail)
+            self._emit_once_in(
+                connection,
+                ctx,
+                heavy_guard.EVENT,
+                {"stage_key": key, "attempt": number},
+                {
+                    k: v
+                    for k, v in heavy_guard.event_payload(key, number, base.provider, block).items()
+                    if k not in ("stage_key", "attempt")
+                },
+            )
+        return True
 
     def _decide_placement(
         self, ctx: _Ctx, key: str, base: NormalStage, stage_row: Mapping[str, Any]
@@ -1423,6 +1466,14 @@ class CampaignRunner:
             self.store.record_runner_event(
                 connection, ctx.campaign, placement.PLACED_EVENT, decision.payload(key, number)
             )
+            if decision.heavy_guard is not None and decision.chosen is not None:
+                # ADR 0107: the heavy stage's local fallback, once, with the placement.
+                self.store.record_runner_event(
+                    connection,
+                    ctx.campaign,
+                    heavy_guard.EVENT,
+                    heavy_guard.event_payload(key, number, decision.chosen, decision.heavy_guard),
+                )
         self._actions.append(f"placed:{key}:{number}:{decision.chosen}")
 
     def _placement_refused(
@@ -1433,11 +1484,14 @@ class CampaignRunner:
         payload = decision.payload(key, number)
         if decision.waiting:
             signature = ",".join(f"{s.provider_id}:{s.reason}" for s in decision.skipped)
+            waiting = {"skipped": payload["skipped"], "steering": payload["steering"]}
+            if decision.heavy_guard is not None:
+                waiting["heavy_guard"] = decision.heavy_guard  # ADR 0107 refusal
             self.emit_once(
                 ctx,
                 placement.WAITING_EVENT,
                 {"stage_key": key, "attempt": number, "signature": signature},
-                {"skipped": payload["skipped"], "steering": payload["steering"]},
+                waiting,
             )
             return False
         budget = next((s for s in decision.skipped if s.reason == "over_campaign_budget"), None)

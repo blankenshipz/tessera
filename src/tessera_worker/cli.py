@@ -29,6 +29,48 @@ _MAX_OUTPUT_HELP = (
 )
 
 
+_STAGE_WATCHER_HELP = (
+    "start the observe-and-report stage watcher beside each local Docker stage (ADR 0087; "
+    "off by default; reports go through this worker's control channel)"
+)
+_STAGE_WATCHER_KILL_SWITCH_HELP = (
+    "absolute path of the operator kill-switch marker (present means engaged); without it "
+    "no stage watcher starts"
+)
+
+
+def _stage_watcher_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--stage-watcher", action="store_true", help=_STAGE_WATCHER_HELP)
+    command.add_argument(
+        "--stage-watcher-kill-switch", default=None, help=_STAGE_WATCHER_KILL_SWITCH_HELP
+    )
+    command.add_argument(
+        "--stage-watcher-stats",
+        action="store_true",
+        help="with --stage-watcher, also sample docker stats so reports carry mem_bytes",
+    )
+
+
+def _stage_watch(arguments: argparse.Namespace):  # noqa: ANN202
+    """The StageWatchConfig for an explicit --stage-watcher, else None (nothing imported)."""
+    if not arguments.stage_watcher:
+        return None
+    from .stage_watch_config import StageWatchConfig
+
+    config = StageWatchConfig(
+        enabled=True,
+        kill_switch_path=arguments.stage_watcher_kill_switch,
+        stats=bool(getattr(arguments, "stage_watcher_stats", False)),
+    )
+    if not config.startable:
+        # Fail closed: the worker runs as usual, with no stage watcher.
+        print(
+            "stage watcher: no --stage-watcher-kill-switch given; no watcher will start",
+            file=sys.stderr,
+        )
+    return config
+
+
 class _Parser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         parsed = super().parse_args(args, namespace)
@@ -60,6 +102,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--control-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     run.add_argument("--poll-seconds", type=float, default=1.0)
     run.add_argument("--max-ticks", type=int, default=90_000)
+    _stage_watcher_arguments(run)
     poll = commands.add_parser("development-poll")
     # ADR 0038 loop contract: --config names the settings file (paths only, no secrets);
     # the flags remain for a one-off run. Runs forever unless --once or --max-cycles.
@@ -89,6 +132,7 @@ def parser() -> argparse.ArgumentParser:
     poll.add_argument("--max-cycles", type=int, default=None)
     poll.add_argument("--once", action="store_true")
     poll.add_argument("--health-file", type=Path, default=None)
+    _stage_watcher_arguments(poll)
     return command
 
 
@@ -123,6 +167,11 @@ def _poll(arguments: argparse.Namespace) -> int:
     try:
         config = _poll_config(arguments)
         poller = DevelopmentGrantPoller(config)
+        stage_watch = _stage_watch(arguments)
+        if stage_watch is not None:
+            poller.service_factory = lambda grant_config: DevelopmentWorkerService(
+                grant_config, channel=poller.channel, stage_watch=stage_watch
+            )
     except (DevelopmentWorkerError, ValueError, OSError):
         # Bounded and path-free: a refused configuration or credential is not retried.
         print(json.dumps({"status": "refused", "reason": "poller_setup_unavailable"}))
@@ -179,7 +228,12 @@ def main() -> int:
             poll_seconds=arguments.poll_seconds,
             max_ticks=arguments.max_ticks,
         )
-        result = DevelopmentWorkerService(config).run()
+        stage_watch = _stage_watch(arguments)
+        if stage_watch is None:
+            service = DevelopmentWorkerService(config)
+        else:
+            service = DevelopmentWorkerService(config, stage_watch=stage_watch)
+        result = service.run()
         print(json.dumps(result, sort_keys=True))
         # Imported here, beside its only use, so this file's import block stays unchanged.
         from .exit_codes import (

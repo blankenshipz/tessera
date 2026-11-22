@@ -19,6 +19,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import campaign_heavy_guard_readout as heavy_guard_readout
 from . import campaign_placement, program_budget, provider_trust
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
@@ -1034,6 +1035,13 @@ class CampaignStore(
                     (campaign_id,),
                 )
             ]
+            # ADR 0107: the latest heavy-stage placement warning or refusal per stage (read-only).
+            for entry in heavy_guard_readout.status_view(
+                connection, campaign["project_id"], campaign_id
+            ):
+                for stage in stages:
+                    if stage["stage_key"] == entry["stage_key"]:
+                        stage["heavy_guard"] = {k: v for k, v in entry.items() if k != "stage_key"}
             attempts = [
                 dict(row)
                 for row in connection.execute(

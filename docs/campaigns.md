@@ -222,6 +222,16 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   existing digests are unchanged) and are read only by the operator's placement preference
   ([campaign providers](campaign-providers.md#placement-preference-by-resource-class)), which may
   reorder a stage's approved `alternate_providers` candidates; they name no destination.
+- **Heavy-stage placement guard (ADR 0107).** When a heavy stage (an ADR 0088 signal, a
+  `pretraining` tag, large pinned inputs, or large declared output limits) is placed on a local or
+  self-hosted candidate while a Salad profile is registered for the project, the receipt attempt
+  and the `campaign.stage_placed` event carry a `placement.heavy_guard` warning with signals and
+  reasons, a `campaign.heavy_stage_local_fallback` event is recorded, and `tessera_get_campaign`
+  shows a per-stage `heavy_guard`. The operator may set `placement_preferences.heavy_local_fallback`
+  to `refuse`, so the stage waits (`heavy_local_refused`) instead of running locally; the default
+  `warn` changes nothing else
+  ([campaign providers](campaign-providers.md#heavy-stage-placement-guard)). Other stages and
+  projects without a Salad profile are unaffected.
 - **Grant lifetime and slots (ADR 0048).** A stage whose `grant_ttl_seconds` is shorter than
   `max_duration_seconds` plus 300 s is refused at submit and approval
   (`grant_shorter_than_stage_duration`). The runner issues a grant, and so starts its

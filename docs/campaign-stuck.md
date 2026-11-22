@@ -14,6 +14,14 @@ or retry. A person, or what existing policy and the standing agent loop already 
 | `stale_execution_lease` | an execution lease past its expiry plus the grace, for a live attempt | `reconcile_or_cancel_the_grant` |
 | `runner_lease_stale` | no live campaign runner while campaigns are active | `check_the_campaign_runner_service` |
 | `no_progress` | nothing in the campaign changed for longer than `unchanged_seconds` | `check_provider_capacity_or_cancel` |
+| `heavy_stage_on_local` | a live attempt (reserved, granted, admitted or running) has a heavy-stage warning event for the same attempt (ADR 0107) | `check_salad_credential_or_profile` |
+| `heavy_stage_refused_local` | a stage has waited on a `heavy_local_refused` refusal longer than `lease_grace_seconds` (ADR 0107); clears when placed | `restore_remote_capacity_or_allow_local` |
+
+Evidence for the two heavy-stage codes: `heavy_stage_on_local` carries `attempt_id`, `attempt`,
+`attempt_status`, `provider_id`, `reasons`, `signals` and `age_seconds`; `heavy_stage_refused_local`
+carries `stage_key`, `attempt`, `reasons`, `waiting_seconds` and `grace_seconds` (the project's
+`lease_grace_seconds`, default 300). A schema migration widens the findings code check to accept
+both codes.
 
 A finding carries a stable id, the code, the suggested action, when it was first and last seen,
 how many times it has occurred, and evidence (ids, statuses, ages in seconds). The evidence is

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (CONCLUSION_DECISION_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 78
+# Literal: must equal the highest registered constant (STUCK_HEAVY_STAGE_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 79
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1618,3 +1618,41 @@ def migrate_conclusion_decision_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(CONCLUSION_DECISION_SCHEMA_VERSION - 1, migrate_conclusion_decision_schema)
+
+
+# Heavy-stage stuck codes (schema 79). Widens the campaign_stuck_findings code CHECK to admit
+# 'heavy_stage_on_local' and 'heavy_stage_refused_local' by a table rebuild (SQLite cannot alter
+# a CHECK). Rows are preserved; the index and the append-only/identity triggers are recreated by
+# create_stuck_schema. Migrations must be contiguous (migrate_database has no gap handling), so
+# this takes the number after the conclusion decision migration (if another change takes 79
+# first, raise STUCK_HEAVY_STAGE_SCHEMA_VERSION, LATEST_SCHEMA_VERSION and the fresh-database
+# INSERT in store.py).
+STUCK_HEAVY_STAGE_SCHEMA_VERSION = 79
+
+
+def migrate_stuck_heavy_stage_schema(connection: sqlite3.Connection) -> None:
+    from .campaign_stuck import create_stuck_schema
+
+    connection.execute(
+        "CREATE TEMP TABLE campaign_stuck_findings_old AS SELECT * FROM campaign_stuck_findings"
+    )
+    # Dropping the table also drops its index and triggers; create_stuck_schema restores them.
+    connection.execute("DROP TABLE campaign_stuck_findings")
+    create_stuck_schema(connection)
+    connection.execute(
+        "INSERT INTO campaign_stuck_findings SELECT * FROM campaign_stuck_findings_old"
+    )
+    connection.execute("DROP TABLE campaign_stuck_findings_old")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (STUCK_HEAVY_STAGE_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(STUCK_HEAVY_STAGE_SCHEMA_VERSION - 1, migrate_stuck_heavy_stage_schema)

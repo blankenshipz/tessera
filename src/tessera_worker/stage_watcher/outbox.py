@@ -4,10 +4,16 @@ Every report is committed here BEFORE any delivery attempt. Delivery is redelive
 recorded body under its stable idempotency key. A report still undelivered 24 h after it was
 recorded is abandoned and counted, so the gap is explicit, never silence; a ``stuck``/``failed``
 is never abandoned while a later report is still pending. A report control permanently
-refused (a status in ``refusal_statuses(kind)``) is settled as ``refused``: counted, never
+refused (``settles``: a permanent status for its kind, or a permanent reason code for the
+status) is settled as ``refused``: counted, never
 retried, and it never blocks later reports. The database and its rollback journal are
 owner-only (0600; the journal is pre-created and kept in TRUNCATE mode so SQLite never
 recreates it under the umask) and store ids, closed report bodies and times only.
+
+Decision requests (``decisions.py``) live in a sibling ``decisions`` table of the same file,
+with their own ``decision_seq`` sequence (so their keys never repeat across restarts) and at
+most one row per kind and epoch. They follow the same record-before-act, settle and 24 h
+abandon rules, and are counted separately in ``gaps()``.
 """
 
 from __future__ import annotations
@@ -22,7 +28,8 @@ from datetime import UTC, datetime, timedelta
 
 from tessera_control.stage_watch_limits import TERMINAL_KINDS
 
-from .report import WatchReport, refusal_statuses
+from .decisions import DecisionRequest, decision_settles
+from .report import WatchReport, settles
 
 ABANDON_AFTER = timedelta(hours=24)
 JOURNAL_SUFFIX = "-journal"
@@ -33,6 +40,11 @@ _SCHEMA = (
     "recorded_at REAL NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
     "settled_at REAL, refused_status INTEGER)",
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS decisions ("
+    "decision_seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, epoch INTEGER NOT NULL, "
+    "operation_id TEXT NOT NULL, body TEXT NOT NULL, recorded_at REAL NOT NULL, "
+    "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, settled_at REAL, "
+    "refused_status INTEGER, UNIQUE (kind, epoch))",
 )
 
 
@@ -43,6 +55,11 @@ class OutboxGaps:
     last_delivered_seq: int | None
     refused: int = 0
     budget_dropped: int = 0
+    # Decision requests (a separate count: never part of the report counters).
+    decisions_pending: int = 0
+    decisions_delivered: int = 0
+    decisions_refused: int = 0
+    decisions_abandoned: int = 0
 
     @property
     def dropped(self) -> int:
@@ -189,11 +206,19 @@ class WatchOutbox:
                 (settled, seq),
             )
 
-    def mark_refused(self, seq: int, status: int, now: datetime | None = None) -> None:
+    def mark_refused(
+        self,
+        seq: int,
+        status: int,
+        now: datetime | None = None,
+        *,
+        reason: str | None = None,
+    ) -> None:
         """Settle a report control permanently refused: never retried, counted in gaps().
 
-        Only a status in ``refusal_statuses(kind)`` settles; anything else (for example a 401
-        or a 409 for ``failed``) is refused here, because the report must stay pending.
+        Only what ``settles(kind, status, reason)`` accepts settles; anything else (for
+        example a 401, or a 409 for ``failed`` without a permanent reason code for 409) is
+        refused here, because the report must stay pending.
         """
         if isinstance(status, bool) or not isinstance(status, int) or not 400 <= status < 500:
             raise ValueError("a refusal status must be a 4xx integer.")
@@ -204,7 +229,7 @@ class WatchOutbox:
                 row = conn.execute(
                     "SELECT body FROM reports WHERE seq=? AND state='pending'", (seq,)
                 ).fetchone()
-                if row is not None and status not in refusal_statuses(json.loads(row[0])["kind"]):
+                if row is not None and not settles(json.loads(row[0])["kind"], status, reason):
                     raise ValueError("this status does not settle a report of this kind.")
                 conn.execute(
                     "UPDATE reports SET state='refused', settled_at=?, refused_status=? "
@@ -264,22 +289,144 @@ class WatchOutbox:
                 0
             ]
             row = conn.execute("SELECT value FROM meta WHERE key='budget_dropped'").fetchone()
+            decisions = dict(
+                conn.execute("SELECT state, COUNT(*) FROM decisions GROUP BY state").fetchall()
+            )
         return OutboxGaps(
             undelivered=counts.get("pending", 0),
             abandoned=counts.get("abandoned", 0),
             last_delivered_seq=last,
             refused=counts.get("refused", 0),
             budget_dropped=0 if row is None else int(row[0]),
+            decisions_pending=decisions.get("pending", 0),
+            decisions_delivered=decisions.get("delivered", 0),
+            decisions_refused=decisions.get("refused", 0),
+            decisions_abandoned=decisions.get("abandoned", 0),
         )
 
     def pending_count(self) -> int:
+        """Reports AND decision requests not yet delivered, refused or abandoned."""
         with self._conn() as conn:
-            return conn.execute("SELECT COUNT(*) FROM reports WHERE state='pending'").fetchone()[0]
+            reports = conn.execute("SELECT COUNT(*) FROM reports WHERE state='pending'").fetchone()[
+                0
+            ]
+            decisions = conn.execute(
+                "SELECT COUNT(*) FROM decisions WHERE state='pending'"
+            ).fetchone()[0]
+        return reports + decisions
 
     def next_seq(self) -> int:
         with self._conn() as conn:
             value = conn.execute("SELECT MAX(seq) FROM reports").fetchone()[0]
         return 0 if value is None else value + 1
+
+    # -- decision requests (record before act) ------------------------------------------------
+
+    def record_decision(self, request: DecisionRequest) -> None:
+        """Durably persist one request before any delivery attempt.
+
+        A ``decision_seq`` is recorded once, and at most one request per kind and epoch.
+        """
+        body = json.dumps(request.to_body(), sort_keys=True, separators=(",", ":"))
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO decisions (decision_seq, kind, epoch, operation_id, body, "
+                    "recorded_at, state) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                    (
+                        request.decision_seq,
+                        request.kind,
+                        request.epoch,
+                        request.operation_id,
+                        body,
+                        request.observed_at.timestamp(),
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("this decision (seq, or kind for this epoch) is recorded.") from error
+
+    def next_decision_seq(self) -> int:
+        with self._conn() as conn:
+            value = conn.execute("SELECT MAX(decision_seq) FROM decisions").fetchone()[0]
+        return 0 if value is None else value + 1
+
+    def decision_kinds(self, epoch: int) -> frozenset[str]:
+        """The kinds already recorded for this epoch, in any state."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT kind FROM decisions WHERE epoch=?", (epoch,)).fetchall()
+        return frozenset(row[0] for row in rows)
+
+    def recorded_decisions(self) -> list[DecisionRequest]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT operation_id, body FROM decisions ORDER BY decision_seq"
+            ).fetchall()
+        return [
+            DecisionRequest.from_body(operation_id, json.loads(body)) for operation_id, body in rows
+        ]
+
+    def pending_decisions(self) -> list[DecisionRequest]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT operation_id, body FROM decisions WHERE state='pending' "
+                "ORDER BY decision_seq"
+            ).fetchall()
+        return [
+            DecisionRequest.from_body(operation_id, json.loads(body)) for operation_id, body in rows
+        ]
+
+    def decision_state(self, decision_seq: int) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT state FROM decisions WHERE decision_seq=?", (decision_seq,)
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def note_decision_attempt(self, decision_seq: int) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE decisions SET attempts=attempts+1 WHERE decision_seq=? AND state='pending'",
+                (decision_seq,),
+            )
+
+    def mark_decision_delivered(self, decision_seq: int, now: datetime | None = None) -> None:
+        settled = (now or datetime.now(UTC)).timestamp()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE decisions SET state='delivered', settled_at=? "
+                "WHERE decision_seq=? AND state='pending'",
+                (settled, decision_seq),
+            )
+
+    def mark_decision_refused(
+        self,
+        decision_seq: int,
+        status: int,
+        now: datetime | None = None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Settle a request control permanently refused (``decision_settles``): never resent."""
+        if not decision_settles(status, reason):
+            raise ValueError("this status does not settle a decision request.")
+        settled = (now or datetime.now(UTC)).timestamp()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE decisions SET state='refused', settled_at=?, refused_status=? "
+                "WHERE decision_seq=? AND state='pending'",
+                (settled, status, decision_seq),
+            )
+
+    def abandon_expired_decisions(self, now: datetime) -> int:
+        """Abandon requests pending for 24 h or more; they stay counted in ``gaps()``."""
+        cutoff = (_aware(now) - ABANDON_AFTER).timestamp()
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE decisions SET state='abandoned', settled_at=? "
+                "WHERE state='pending' AND recorded_at<=?",
+                (now.timestamp(), cutoff),
+            )
+            return cursor.rowcount
 
     # -- local markers ---------------------------------------------------------------------
 

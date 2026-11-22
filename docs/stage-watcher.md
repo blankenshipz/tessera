@@ -2,10 +2,14 @@
 
 The stage watcher is a small execution-plane agent that watches one execution attempt and reports
 what it sees. It only observes and reports. It cannot stop, cancel, retry, resize or re-route
-anything, and it makes no model call. It is **off by default** and is a **library**: it is not wired
-into the default worker service. Design background is in
-[ADR 0087](decisions/0087-execution-plane-agents.md); this page describes the first slice (the
-contract digest and the observe-only watcher).
+anything, and it makes no model call. It is **disabled by default**: the worker starts it only when the
+operator passes `--stage-watcher` (see "Wiring it") or enables the `stage_watcher` block of the
+Salad executor (see "Enabling it on the Salad executor"). It may also file closed decision
+*requests* (retry, resize) that control records as advisory events and nobody admits (see
+"Decision requests"). Design background is in
+[ADR 0087](decisions/0087-execution-plane-agents.md) and
+[ADR 0111](decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md); this page
+describes the contract digest, the watcher, the Salad wiring and the requests.
 
 Related: [ADR 0054](decisions/0054-durable-observation-delivery.md) (durable observation delivery)
 and [ADR 0034](decisions/0034-governed-sandbox-egress-and-dataset-staging.md) (governed egress).
@@ -26,11 +30,12 @@ every report carries that digest.
 - exit code, an OOM flag
 - integer `output_bytes`, `cpu_ms`, `mem_bytes`, `restarts`
 
-The shipped probe reads local Docker inspect data. Another provider (for example Salad) plugs in by
+The shipped probe reads local Docker inspect data. With `--stage-watcher-stats` it also samples
+`docker stats` for `mem_bytes` (see "Wiring it"). Another provider (for example Salad) plugs in by
 implementing the same interface; the watcher does not change. A Salad probe would run inside the
 provider plane, where egress is provider-wide and not restricted per host, so it needs the
 egress and kill-switch delivery conditions of ADR 0087 sections 3.2 and 7.4 first, and would be
-deterministic observe and report only. No Salad probe exists in this slice.
+deterministic observe and report only. No probe runs inside a Salad placement; Salad is watched from the executor through the snapshot file (see "Remote placements").
 
 ## Classification rules
 
@@ -45,7 +50,12 @@ Each tick the watcher samples and classifies:
   restart, silence is measured from the first sample after the restart, not from the original
   start, so a restart while the stage is making progress does not cause a false `stuck`.
 - **failed** on a non-zero exit, an OOM, the deadline passing while still running, or the probe
-  returning `unknown` or `absent` three ticks in a row.
+  returning `unknown` or `absent` three ticks in a row (a probe lost). For a remote provider, an
+  `unknown` sample that still carries a fresh `progress_marker` does not count toward the three:
+  the provider-side driver is alive and polling, for example while a group is allocating. Only a
+  missing or stale snapshot, which has no marker, counts.
+- For a remote provider, a sample `exited` with no exit code does not produce `failed`. The watch
+  ends with outcome `exited_unknown`, and the platform's own exit observation records the outcome.
 - A clean exit (code 0, not OOM-killed) ends the watch with outcome `exited_ok` and no report,
   because the closed set has no kind for it; the platform's own exit observation records it.
 - The local Docker probe has no cumulative CPU or output counter of its own: `cpu_ms` is always
@@ -55,13 +65,17 @@ Each tick the watcher samples and classifies:
 - Docker statuses map as: `running`, `restarting`, `paused` -> running; `exited`, `dead` ->
   exited; "no such container" -> absent; anything else, bad JSON or a label mismatch -> unknown.
   The probe never raises.
-- Delivery: each report gets up to 3 attempts per tick with short backoff. Only a permanent status
-  settles a report as refused (the watcher records it, counts it as `refused_reports`, and carries
-  on with the next report): 400, 404, 410, 413 or 422 for `stuck`/`failed`, and the same plus 409
-  for `heartbeat`/`progress`. Every other answer (a transport error, no status, 5xx, 401/403
-  whatever the message, since the control channel refreshes its credential, 408, 425, 429, 409 for
-  a closing report, any other 4xx) leaves the report pending under the same Idempotency-Key, and it
-  is retried next tick. So a `stuck` or `failed` is never lost to a refusal that could clear on
+- Delivery: each report gets up to 3 attempts per tick with short backoff. Only a permanent
+  refusal settles a report as refused (the watcher records it, counts it as `refused_reports`, and
+  carries on with the next report): 400, 404, 410, 413 or 422 for `stuck`/`failed`, and the same
+  plus 409 for `heartbeat`/`progress`; or, for any kind, a 403/404/409 whose `reason` code (see
+  Refusal reasons) is in `PERMANENT_REASONS` and is the code control pairs with exactly that
+  status in `REASON_STATUS` (for example 409 `stale_epoch` or `grant_reconciled`). The worker keeps
+  only a `reason` that is a short lowercase token (`[a-z][a-z_]{0,40}`), never the detail text.
+  Every other answer (a transport error, no status, 5xx, 401 whatever the body, 403 without such a
+  code, since the control channel refreshes its credential, 408, 425, 429, 409 for a closing
+  report with no reason, `too_early`, an unknown code or a code for another status, any other
+  4xx) leaves the report pending under the same Idempotency-Key, and it is retried next tick. So a `stuck` or `failed` is never lost to a refusal that could clear on
   retry; it is delivered, or abandoned after 24 h and counted as `dropped_reports`. Closing reports
   are flushed first, and a refused report never blocks later ones.
 - `observed_at` is monotonic: each report is dated no earlier than the previous recorded report,
@@ -128,6 +142,37 @@ database and its SQLite rollback journal are owner-only (0600).
 - Lookups read only the operation's project events (index `events_by_project_cursor`), never the
   whole events table.
 
+### Refusal reasons
+
+Every definite refusal has the body `{"detail": "<text>", "reason": "<code>"}`. The `detail` text
+is the same as before, and the codes form a closed set. `stage_watch_limits` exports them as
+`PERMANENT_REASONS`, `TRANSIENT_REASONS` and `REASON_STATUS` (code to HTTP status). A permanent
+reason means the same body can never succeed. A refusal with no `reason`, or with a code outside
+the set, must be treated as transient. Examples are 401 (bad or expired credential), 403 (control
+held after restore), 400 (missing Idempotency-Key) and 422 (schema). The worker's own retry rules
+still apply to those.
+
+| reason | status | kind | when |
+| --- | --- | --- | --- |
+| `unknown_operation` | 404 | permanent | the operation is missing or is not this worker's (no existence oracle) |
+| `wrong_worker` | 404 | permanent | the worker's credential no longer covers the grant's project |
+| `worker_fenced` | 409 | permanent | the operation is fenced pending independent recovery |
+| `lease_mismatch` | 409 | permanent | `lease_id` is not the operation's lease |
+| `stale_epoch` | 409 | permanent | `expected_epoch` is no longer current |
+| `grant_mismatch` | 409 | permanent | the grant does not match the operation, lease or worker |
+| `grant_reconciled` | 409 | permanent | the execution grant is already reconciled |
+| `before_lease` | 409 | permanent | `observed_at` is earlier than the lease's `issued_at` |
+| `out_of_order` | 409 | permanent | `seq` or `observed_at` is not after the last recorded report |
+| `routine_budget_exhausted` | 409 | permanent | a routine report once 180 reports are recorded |
+| `budget_exhausted` | 409 | permanent | a `stuck` or `failed` once 200 reports are recorded |
+| `key_conflict` | 409 | permanent | the Idempotency-Key was already used with a different body |
+| `decision_budget_exhausted` | 409 | permanent | a decision request once 16 decisions are recorded (decision route) |
+| `decision_not_allowed` | 409 | permanent | a decision `kind` and `reason` that are not an allowed pair (decision route) |
+| `too_early` | 425 | transient | `observed_at` is past the control clock plus skew; nothing is recorded |
+
+A replay of an accepted report still returns its stored 201 (or 200 for a coalesced report), even
+if a new report would now be refused.
+
 ## Campaign receipt: `stage_watch`
 
 The campaign receipt gains an additive section `stage_watch`. It is absent when there were no
@@ -139,29 +184,174 @@ self-reported `refused_reports` and `dropped_reports` are visible on the receipt
 ## Kill switch
 
 The contract names a marker file. Present means engaged. Absent under a valid parent directory
-means clear. Anything else (missing parent, unreadable, error) means engaged. In this slice the
-switch gates only future requests and model calls; since none exist yet, observing and reporting
-continue regardless. A reduce-only stop is not implemented.
+means clear. Anything else (missing parent, unreadable, error) means engaged. The
+switch gates decision requests (engaged: none is filed) and, later, model calls; observing and
+reporting continue regardless. A reduce-only stop is not implemented.
 
 ## What the watcher cannot do
 
-No stop, cancel, retry, resize or re-route. No management credential. No model call. No network
+No stop, cancel, retry, resize or re-route (it can only file a request for a retry or a resize,
+which nothing admits). No management credential. No model call. No network
 except its injected report sink.
 
 ## Wiring it
 
-Not wired by default. It is a library: an operator-run wrapper constructs a `StageContract`, a
-probe and a report sink, and calls the watcher. The default worker service does not do this, and
-nothing starts a watcher unless an operator writes that wrapper. The slice that wires it into the
-worker is still open.
+Off by default. `tessera-worker development-run` and `development-poll` start a watcher beside each
+local Docker stage only with `--stage-watcher --stage-watcher-kill-switch /abs/marker` (under the
+daemon, pass both after `--`). Without `--stage-watcher` the worker never imports the watcher
+library and runs exactly as before. With `--stage-watcher` but no kill-switch path no watcher
+starts (fail closed) and the worker runs as usual.
+
+`tessera_worker.stage_watch_runner.StageWatchRunner` is set as the CPU supervisor's optional
+`watch_runner`. Every supervisor `drive_once`/`reconcile`/`tick`/`cancel` hands it the result:
+a running operation gets a watcher (once), an ended one is marked ended, and the runner does one
+bounded tick. The contract comes from the operation and lease: provider `local-docker`, stage key
+`local-cpu`, `deadline_seconds` = the operation's `max_duration_seconds`, and `silent_seconds` 900,
+`heartbeat_seconds` 60, `max_reports` 200 by default (clamped to the deadline). The probe is
+`DockerInspectProbe` over the adapter's own Docker `run`, its container name and its ownership
+labels. The sink is `ControlSink` over the worker's existing control channel and credential. Each
+report gets one attempt per tick with no sleep and a 2 s request cap, so the supervisor never waits
+on it; a failed delivery is retried on a later tick. Any watcher exception is caught and counted
+(`errors`); it never changes an execution result. The runner has no stop, cancel, retry, resize,
+re-route or request method and receives no management credential.
+
+The outbox lives in `<workspace>/stage-watch/` (0700): `<operation_id>.sqlite3` and the
+contract it is bound to, `<operation_id>.contract.json` (both 0600). A restarted worker rebuilds a
+flush-only watcher for every outbox that still has pending reports, even with no operation
+running, and drops it once nothing is pending. A recovered running operation reuses its stored
+contract.
 
 The watcher has no run loop. The caller must keep calling `tick()`, or `flush()` (which delivers
 pending reports without sampling), after `done` becomes true, until `finished` is true (`done`
 and `pending_count == 0`). A caller that stops at `done` can leave a `failed` whose delivery
-failed transiently in the outbox until the next start.
+failed transiently in the outbox until the next start. The runner keeps an ended operation's
+watcher until it is `finished`. A one-shot `development-run` that exits first leaves the
+report in the outbox, and it is resumed only when a worker next runs over the same workspace.
+`development-poll` gives each grant its own workspace, so a finished grant's leftover report is
+not resumed. That gap is still open.
+
+`--stage-watcher-stats` (disabled by default, only with `--stage-watcher`) makes the local Docker probe
+also sample `docker stats` and fill the `mem_bytes` counter; without it `mem_bytes` stays absent.
+It is an unverified worker claim like every counter. `cpu_ms` is not sampled this way because
+`docker stats` gives a CPU percentage, not cumulative CPU time.
+
+### Tick budget
+
+Each supervisor tick spends at most a small wall-clock and post budget across all watchers
+(defaults 1.0 s and 4 posts; config fields `tick_budget_seconds` and `tick_max_posts`), rotating
+so no watcher is starved. The tick shares a thread with lease renewal, so it must stay short.
+Reports left over stay pending in the outbox and go out on later ticks. Decision posts share the
+same post budget and deadline, so they are bounded too. The per-post timeout is the smaller of
+2 s, the control channel's own timeout and the time left in the tick. The watcher's `docker
+inspect` and `docker stats` calls use a 2 s bounded runner.
+
+## Remote placements (Salad)
+
+A remote provider placement is watched from the provider-side driver, never from inside the
+container. The container stays passive and holds no watcher, no management credential and no
+control credential.
+
+- **Where it runs.** The remote watcher runs in the process owner of the provider-side driver. For
+  Salad that is next to the executor, under the worker credential. The control fences already
+  accept the executor's worker credential, because it owns the external operation, its lease and
+  its epoch. The watcher holds no management credential and adds no provider call.
+- **The signal snapshot.** The provider-side component drops a non-secret snapshot after each
+  successful poll: `tessera.stage-watch.signals.v1`, a closed JSON object
+  (`schema`, `observed_at` with an offset, `state` of `running`, `exited`, `absent` or `unknown`,
+  and optional integer `exit_code`, `output_bytes`, `cpu_ms`, `mem_bytes`, `restarts`,
+  `progress_marker`, optional boolean `oom_killed`). The file is 0600 and written atomically. A
+  snapshot older than the staleness bound is read as `unknown`.
+- **Mapping for Salad.** `tessera_control.salad_watch_signals.signals_from_poll` is a pure function
+  (no I/O, no network, no clock) over values the live-check loop already holds: `running` is
+  running; a confirmed stop, or `stopped`, `succeeded` or `failed` after the first successful
+  post-start poll, is `exited` with no `exit_code` (Salad gives none here, so the watch ends as `exited_unknown` and files no `failed`); `deleted` is `absent`;
+  anything else, including a `stopped` group seen before start, is `unknown`. It accepts no
+  identifier, group name, hostname, secret or financial value, so none can reach a snapshot.
+- **The runner.** `StageWatchRunner.on_start_remote` is given the operation id, lease id, epoch,
+  stage key, provider, deadline and plan digest. A probe-factory registry builds the probe for the
+  provider; the generic snapshot-file probe reads `signals_path(operation_id)`. The runner turns
+  the snapshots into the same heartbeat, progress, stuck and failed reports as the local watcher,
+  through the same worker credential and route. Reports join the campaign receipt `stage_watch`
+  section once the attempt row has its operation id; reports sent before that are stored but not
+  shown.
+- **What stuck means here.** For a remote route the only progress counter is `progress_marker`,
+  which is the driver's count of successful observe and evidence passes. `stuck` therefore means
+  "the provider-side driver stopped observing", not "the workload stalled". Salad gives no output,
+  CPU or memory counter on this path.
+- **Descriptive only.** The runner never consumes these reports for settlement, cancel or the
+  unknown outcome. Control's own silent-executor window stays authoritative.
+
+## Enabling it on the Salad executor
+
+Off by default; with neither key below set, the executor and live check behave exactly as before.
+[ADR 0111](decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md) makes the limited
+ADR 0033 amendment for these two hooks, which edit `salad_live_check.py` and
+`campaign_salad_executor.py` and nothing else in the frozen Salad plane. Both are read-only,
+non-secret and spend-neutral, never raise into the route, add no credential and no egress.
+
+1. **Snapshot write.** The optional live-check config key `watch_signals_file` names the path the
+   poll loop writes after each successful poll: the `tessera.stage-watch.signals.v1` snapshot,
+   atomic, mode 0600.
+2. **Executor ticker.** The optional `stage_watcher` executor config block starts a ticker thread
+   that drives `StageWatchRunner` while the route child process runs, with an in-process channel
+   (`stage_watch_channel.py`, which accepts only the watch-reports route) and `SaladRouteWatch`
+   carrying the snapshot path and operation facts. Fields: enable flag, the absolute kill-switch marker path
+   (required; with no marker the watcher does not start, fail closed), and the optional bounds
+   `silent_seconds`, `heartbeat_seconds` and `max_reports`. The block has no envelope fields.
+3. **What appears.** The snapshot file at `watch_signals_file`, and in the worker workspace
+   `stage-watch/<operation_id>.sqlite3` and `<operation_id>.contract.json` (both 0600). Reports
+   reach control through the executor's existing worker credential and route.
+4. **Kill switch.** The marker file of the contract. Present, unreadable or with a missing parent
+   directory means engaged: no decision request is filed; reports continue.
+
+A failed snapshot write is swallowed (it shows only as a stale snapshot, which the probe reads as
+`unknown`); a failed tick or ticker thread is caught and counted. None changes the route, its result
+or any spend. The Salad executor passes no envelope and its channel carries only reports, so
+**Salad files no decision requests today**; Salad also gives no exit code and no out-of-memory
+signal.
+
+## Decision requests
+
+The watcher may file a closed, receipted **request**. It never performs a retry, resize or
+re-route.
+
+- **Kinds and reasons.** `retry_request` goes with `transient_exit` or `probe_lost`;
+  `resize_request` goes with `oom_killed` or `resource_limit`. The watcher produces only
+  `transient_exit` and `oom_killed`. A pair outside this pairing is refused `decision_not_allowed`;
+  an unknown kind or reason is a 422 with no reason.
+- **Envelope.** Optional fields on the stage contract (covered by the digest: retry attempts
+  remaining, transient exit codes, current and maximum memory) state what the approved stage
+  allows the watcher to ask for. A contract without them files nothing. No shipped caller passes
+  an envelope yet.
+- **Record before send.** A request is recorded in the outbox before delivery, and only after the
+  `failed` report is recorded. A restart between those two steps files no request.
+- **Rate.** At most one request per kind per operation per epoch from the worker; at most 16
+  decisions per operation recorded by control.
+- **Kill switch.** Engaged means none is filed.
+- **Wire.** `POST /worker/operations/{operation_id}/watch-decisions`, worker audience, same lease
+  and epoch fences as `watch-reports`, `Idempotency-Key: watch-decision-<operation_id>-<n>`, sent
+  from the same durable outbox.
+- **Control records it as advisory.** Event `execution.watch_decision_recorded`,
+  `observation_proof: trusted_worker_assertion`, `admission: "not_admitted"` always in this slice,
+  and `bounds` (`within_envelope`, `blocked_by`) computed by control from the approved spec, not
+  from the worker's envelope. It writes no observation, money, custody or attempt state and starts
+  no attempt. A request outside the bounds is still recorded.
+- **Resize is always outside the envelope for now.** No spec declares a stage memory size, so every
+  resize request is recorded with `within_envelope: false` and `blocked_by: "cap_unknown"` until a
+  spec declares a memory cap.
+- **Refusals.** Two new permanent 409 reasons, `decision_budget_exhausted` (more than 16
+  decisions) and `decision_not_allowed` (a kind and reason that are not an allowed pair), listed in
+  the table above.
+- **Receipt.** Each `stage_watch` attempt entry gains a `decisions` list; each entry has `kind`,
+  `reason`, `decision_seq`, `requested_memory_bytes`, `within_envelope`, `admission` and
+  `observed_at`. It carries no counters. Unverified worker claims.
+- **Not built.** Admission by the runner (it moves spend and places work) needs its own reviewed
+  ADR. Nothing reads a decision record to act.
 
 ## Limitations and next slices
 
-- No actions of any kind (ADR 0087 S3: requests admitted by the runner, not implemented).
-- No Salad sidecar (S4) and no model relay (S5).
+- No actions of any kind. Salad files no decision requests today. Decision requests are recorded but never admitted (ADR 0087 S3 admission
+  is not implemented and needs its own ADR).
+- No Salad workload sidecar (S4 proper) and no model relay (S5). Salad is watched from the executor
+  process, not from inside the placement.
 - Reports are unverified worker assertions; a worker that stops reporting is visible only as a gap.

@@ -65,12 +65,28 @@ class ControlChannelError(ConnectionError):
 
     ``authority_gone`` is True only when control answered 403 with one of its fixed
     detail strings in ``AUTHORITY_GONE_DETAILS``; the body itself is never kept.
+    ``refusal_reason`` is control's machine-readable refusal code: set only when an error
+    response is a JSON object whose ``reason`` is a short lowercase token
+    (``REFUSAL_REASON_TOKEN``), else None. No other body field, and never the detail text, is
+    kept. It is a claim by control; callers decide which codes they trust for which status.
     """
 
-    def __init__(self, reason: str, status: int | None = None, *, authority_gone: bool = False):
+    def __init__(
+        self,
+        reason: str,
+        status: int | None = None,
+        *,
+        authority_gone: bool = False,
+        refusal_reason: str | None = None,
+    ):
         self.reason = reason
         self.status = status
         self.authority_gone = authority_gone
+        self.refusal_reason = (
+            refusal_reason
+            if isinstance(refusal_reason, str) and REFUSAL_REASON_TOKEN.fullmatch(refusal_reason)
+            else None
+        )
         detail = reason if status is None else f"{reason} (HTTP {status})"
         super().__init__(f"Control channel failed: {detail}")
 
@@ -93,19 +109,39 @@ AUTHORITY_GONE_DETAILS = frozenset(
 )
 
 
-def _authority_gone(error: HTTPError) -> bool:
-    """True when a 403 body is exactly one of control's authority-gone details."""
-    if error.code != 403:
-        return False
+# Control's machine-readable refusal code (``{"detail": ..., "reason": code}``): a short
+# lowercase token, never free text.
+REFUSAL_REASON_TOKEN = re.compile(r"[a-z][a-z_]{0,40}")
+
+
+def _error_body(error: HTTPError) -> dict[str, Any] | None:
+    """A 4xx error body read once (bounded) as a JSON object, or None.
+
+    Any failure to read or parse it yields None, so the body can only add a fact, never
+    change the sanitized error the caller gets.
+    """
+    if not 400 <= error.code < 500:
+        return None
     try:
         body = error.read(_MAX_ERROR_BODY_BYTES + 1)
         if not isinstance(body, bytes) or len(body) > _MAX_ERROR_BODY_BYTES:
-            return False
+            return None
         decoded = json.loads(body.decode("utf-8"), parse_constant=_invalid_json_constant)
-    except (OSError, ValueError, AttributeError, RecursionError):
-        return False
-    detail = decoded.get("detail") if isinstance(decoded, dict) else None
+    except Exception:
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _authority_gone(code: int, body: dict[str, Any] | None) -> bool:
+    """True when a 403 body is exactly one of control's authority-gone details."""
+    detail = body.get("detail") if code == 403 and body is not None else None
     return isinstance(detail, str) and detail in AUTHORITY_GONE_DETAILS
+
+
+def _refusal_reason(body: dict[str, Any] | None) -> str | None:
+    """Control's refusal code when the body's ``reason`` is a short token, else None."""
+    reason = body.get("reason") if body is not None else None
+    return reason if isinstance(reason, str) and REFUSAL_REASON_TOKEN.fullmatch(reason) else None
 
 
 def classify_control_failure(error: BaseException) -> str:
@@ -274,10 +310,13 @@ class HttpControlChannel:
         except ControlChannelError:
             raise
         except HTTPError as error:
-            gone = _authority_gone(error)
+            body = _error_body(error)
             _close_quietly(error)
             raise ControlChannelError(
-                "control rejected request", error.code, authority_gone=gone
+                "control rejected request",
+                error.code,
+                authority_gone=_authority_gone(error.code, body),
+                refusal_reason=_refusal_reason(body),
             ) from None
         except (OSError, URLError, ValueError):
             raise ControlChannelError("control transport unavailable") from None
