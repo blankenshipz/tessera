@@ -1,6 +1,6 @@
 # ADR 0092: code review jobs
 
-Status: proposed (schema v75). Extends the review jobs of
+Status: proposed (schema v75; the submit slice of [ADR 0108](0108-code-review-submit.md) is schema 81). Extends the review jobs of
 [ADR 0084](0084-research-review-journeys.md). Uses the registered model destination of
 [ADR 0082](0082-agent-loop-anthropic-destination.md) and the receipt fields of
 [ADR 0083](0083-model-call-receipts.md). Keeps the invariant of
@@ -114,6 +114,11 @@ outcome, reason, receipt, receipt digest, whether it passed binding). A structur
 is flagged `receipt_invalid` and not stored. The job exposes `attempt_receipts` and
 `cost_cents_total`, the sum of the stored receipts' cost, so an over-budget call still shows its
 cost. Failure and retry events carry the receipt digest when there is one.
+
+A billed call whose usage is unknown (a timeout or server error after the request was sent) is
+recorded with cost basis `reserved_worst_case`: the client's worst-case estimate, an over-estimate by
+design. Such a receipt never completes a job, is flagged not bound, and is counted in
+`cost_cents_total`.
 
 The verdict is advisory. The job stays `advisory: true` and `execution_authorized: false`. A verdict
 never merges, approves or unlocks anything. A person accepts or rejects findings with the ADR 0084

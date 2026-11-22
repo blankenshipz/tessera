@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (STUCK_HEAVY_STAGE_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 79
+# Literal: must equal the highest registered constant (CODE_REVIEW_SUBMIT_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 81
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1656,3 +1656,118 @@ def migrate_stuck_heavy_stage_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(STUCK_HEAVY_STAGE_SCHEMA_VERSION - 1, migrate_stuck_heavy_stage_schema)
+
+
+# Review/people schema parity (schema 80). While schema 73 (review jobs) was unreleased its
+# tables were edited in place, so databases that migrated through 73 earlier keep the old
+# shapes and fail backup/restore validation against a fresh database. This converges every
+# known old shape: the missing ``enrolled_people`` table, nullable review_jobs columns added
+# later, and ``review_finding_decisions.separation_basis`` (NOT NULL, which SQLite cannot add):
+# that table is rebuilt to the fresh DDL (immutability triggers included). Rows of the old shape
+# are copied back with separation_basis='legacy_unrecorded': their basis was never recorded, and
+# inventing distinct_person or single_owner_opt_in would forge separation-of-duties evidence.
+# Idempotent. If another
+# change owns this version when branches merge, raise REVIEW_PARITY_SCHEMA_VERSION (and
+# LATEST_SCHEMA_VERSION and the fresh-database INSERT in store.py).
+REVIEW_PARITY_SCHEMA_VERSION = 80
+
+_REVIEW_PARITY_NULLABLE_COLUMNS = (
+    ("review_jobs", "findings_actor_id", "TEXT"),
+    ("review_jobs", "findings_separation_basis", "TEXT"),
+    ("enrolled_people", "renewed_at", "TEXT"),
+)
+
+
+def _rebuild_review_decisions(connection: sqlite3.Connection, create_schema) -> None:
+    from .store import StoreError
+
+    guidance = (
+        "Cannot migrate review finding decisions to schema 80 safely. Nothing was changed. "
+        "File-copy the whole state directory (the database and its -wal/-shm files) first, "
+        "then report this error with that copy."
+    )
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(review_finding_decisions)")]
+    has_basis = "separation_basis" in columns
+    before = connection.execute("SELECT count(*) FROM review_finding_decisions").fetchone()[0]
+    fk_before = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+    connection.execute("DROP TABLE IF EXISTS temp._review_decisions_old")
+    connection.execute(
+        "CREATE TEMP TABLE _review_decisions_old AS SELECT * FROM review_finding_decisions"
+    )
+    connection.execute("DROP TABLE review_finding_decisions")  # its triggers go with it
+    create_schema(connection)
+    keep = [c for c in columns if c != "separation_basis"]
+    names = ",".join(keep)
+    basis = "separation_basis" if has_basis else "'legacy_unrecorded'"
+    connection.execute(
+        f"INSERT INTO review_finding_decisions ({names},separation_basis) "
+        f"SELECT {names},{basis} FROM temp._review_decisions_old"
+    )
+    after = connection.execute("SELECT count(*) FROM review_finding_decisions").fetchone()[0]
+    fk_after = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+    connection.execute("DROP TABLE temp._review_decisions_old")
+    if after != before or fk_after > fk_before:
+        raise StoreError(
+            f"{guidance} (rows {before} -> {after}, foreign key problems "
+            f"{fk_before} -> {fk_after})."
+        )
+
+
+def migrate_review_parity_schema(connection: sqlite3.Connection) -> None:
+    from .people import create_people_schema
+    from .review_jobs import create_review_jobs_schema
+
+    decision_sql = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='review_finding_decisions'"
+    ).fetchone()
+    if decision_sql is not None and "legacy_unrecorded" not in (decision_sql[0] or ""):
+        _rebuild_review_decisions(connection, create_review_jobs_schema)
+    create_review_jobs_schema(connection)
+    create_people_schema(connection)
+    for table, column, definition in _REVIEW_PARITY_NULLABLE_COLUMNS:
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (REVIEW_PARITY_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(REVIEW_PARITY_SCHEMA_VERSION - 1, migrate_review_parity_schema)
+
+
+# code-review-submit (ADR 0108)
+# Adds code_review_sources (the git source of a code review submitted from a platform branch)
+# with no-update and no-delete triggers. Idempotent; registered with setdefault. If another change
+# owns this version when branches merge, raise CODE_REVIEW_SUBMIT_SCHEMA_VERSION (and
+# LATEST_SCHEMA_VERSION and the fresh-database INSERT in store.py).
+CODE_REVIEW_SUBMIT_SCHEMA_VERSION = 81
+
+
+def migrate_code_review_submit_schema(connection: sqlite3.Connection) -> None:
+    from .code_review_jobs import create_code_review_sources_schema
+
+    preexisting = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+    create_code_review_sources_schema(connection)
+    if len(connection.execute("PRAGMA foreign_key_check").fetchall()) > preexisting:
+        raise ValueError("Migration v81 introduced foreign key violations.")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (CODE_REVIEW_SUBMIT_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(CODE_REVIEW_SUBMIT_SCHEMA_VERSION - 1, migrate_code_review_submit_schema)

@@ -38,6 +38,9 @@ def _downgrade_to_v73(db):
     db.execute("PRAGMA legacy_alter_table=ON")  # keep child FKs naming review_jobs
     sql = db.execute("SELECT sql FROM sqlite_master WHERE name='review_jobs'").fetchone()[0]
     assert ",'code_review'" in sql
+    for action in ("update", "delete"):  # schema 75 (ADR 0092)
+        db.execute(f"DROP TRIGGER code_review_sources_no_{action}")
+    db.execute("DROP TABLE code_review_sources")
     db.execute("DROP TRIGGER code_review_jobs_no_delete")
     db.execute("DROP TABLE code_review_jobs")
     db.execute("DROP TABLE code_review_runners")

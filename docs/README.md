@@ -44,6 +44,8 @@ references, not claims of a supported production deployment.
   explicit identity, policy, financial references and revocation.
 - [Provider trust](provider-trust.md): per-provider data-class setting for
   campaign stages (ADR 0040).
+- [Deploy check](deploy-check.md): one report of what a deploy still needs, with receipted fixes.
+- [Deploy upgrade](deploy-upgrade.md): the checked upgrade command, dry-run first, with a deploy receipt.
 - [Campaign providers](campaign-providers.md): the provider file, the self-hosted provider,
   the Salad provider and the service loop contract.
 - [Agent Sandbox](agent-sandbox.md): direct one-shot adapter and live prerequisites.

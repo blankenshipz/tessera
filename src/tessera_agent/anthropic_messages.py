@@ -45,7 +45,7 @@ from urllib.request import (
 )
 
 from .mcp_tool_bridge import catalog_sha256
-from .model_destinations import model_runtime_egress_allowed
+from .model_destinations import API_KEY_SHAPE, model_runtime_egress_allowed
 from .remote_reasoning_store import private_file
 
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -115,7 +115,7 @@ _TOOL_CODE = re.compile(r"tool_[a-z_]{1,48}\Z")
 _FENCE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _STOP_REASON = re.compile(r"[a-z_]{1,32}\Z")
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
-_KEY = re.compile(rb"[\x21-\x7e]{1,512}")
+_KEY = API_KEY_SHAPE
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9.\-]{0,127}\Z")
 SNAPSHOT_VERSION = 1
 SNAPSHOT_KEYS = frozenset(

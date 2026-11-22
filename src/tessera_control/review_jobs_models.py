@@ -4,6 +4,7 @@ A review job is a proposal for a reviewer, never a verdict: nothing here authori
 Prompt text is never stored, only its pinned digest; finding text is untrusted data.
 """
 
+import math
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -108,6 +109,11 @@ LimitValue = (
 # ``cost`` is in cents; these bases are money spent against the job budget, so ``cost_cents``
 # is required and bounded by it.
 BILLED_COST_BASES = ("reported_cost", "computed_from_pinned_prices")
+# A billed (or possibly billed) call whose usage is unknown (a timeout or 5xx after the request
+# was sent): ``cost`` is the client's reserved preflight worst case in cents (counted input plus
+# the output cap at pinned prices), a reservation and NOT a measured cost. It records the spend
+# honestly as an over-estimate; such a receipt can never complete a job.
+RESERVED_COST_BASIS = "reserved_worst_case"
 
 
 class ModelCallReceipt(StrictRequest):
@@ -116,6 +122,10 @@ class ModelCallReceipt(StrictRequest):
 
     Both identity bases are unverified: ``provider_response_model`` is what the provider's
     response named, not proof of the model that ran.
+
+    ``reserved_worst_case`` (see :data:`RESERVED_COST_BASIS`) is a reservation for a call whose
+    usage is unknown, not a measured cost: ``cost_cents`` is required and is ``ceil(cost)``, and
+    ``model_reported`` may be ``None`` (no response named a model).
     """
 
     model_configured: NonBlank200
@@ -129,7 +139,10 @@ class ModelCallReceipt(StrictRequest):
     ]
     cost: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
     cost_basis: Literal[
-        "included_subscription_usage", "reported_cost", "computed_from_pinned_prices"
+        "included_subscription_usage",
+        "reported_cost",
+        "computed_from_pinned_prices",
+        "reserved_worst_case",
     ]
     cost_cents: UInt | None = None
     policy_sha256: Sha256Digest
@@ -149,6 +162,14 @@ class ModelCallReceipt(StrictRequest):
         None  # cents; the producer may sum fractional cents
     )
     observed_at: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] | None = None
+
+    @model_validator(mode="after")
+    def reserved_cents(self):
+        if self.cost_basis == RESERVED_COST_BASIS and (
+            self.cost_cents is None or self.cost_cents != math.ceil(self.cost)
+        ):
+            raise ValueError("a reserved_worst_case receipt needs cost_cents = ceil(cost)")
+        return self
 
 
 class IngestFindings(StrictRequest):
@@ -173,3 +194,29 @@ class ResolveReviewFinding(StrictRequest):
     rationale: NonBlank4000
     expected_revision: StrictRevision
     expected_digest: Sha256Digest
+
+
+class SubmitCodeReview(StrictRequest):
+    """Submit a code review of a branch on the platform's own git remote (ADR 0108).
+
+    Shapes only; the store applies the focused-test, round and chain rules with stable reason
+    codes, and the git reader validates names against the operator's repository mapping.
+    """
+
+    repo: Annotated[str, Field(min_length=1, max_length=64)]
+    branch: Annotated[str, Field(min_length=1, max_length=200)]
+    head_sha: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+    base_branch: Annotated[str, Field(min_length=1, max_length=200)] = "main"
+    tier: Literal["haiku", "sonnet", "opus", "fable"]
+    destination_id: NonBlank200 = "anthropic"
+    budget_cents: Annotated[int, Field(strict=True, ge=0, le=MAX_BUDGET_CENTS)]
+    # Bounded loosely here so an over-long list is the store's stable focused_tests_invalid.
+    focused_tests: Annotated[list[Annotated[str, Field(max_length=1000)]], Field(max_length=200)]
+    previous_job_id: NonBlank200 | None = None
+    recheck_findings: (
+        Annotated[
+            list[Annotated[int, Field(strict=True, ge=-(2**31), le=2**31)]],
+            Field(max_length=MAX_FINDINGS),
+        ]
+        | None
+    ) = None

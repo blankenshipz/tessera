@@ -128,7 +128,7 @@ have isolated component tests. The adapter targets upstream **v1.0.6** one-shot,
 network-none Sandboxes (an opt-in allowlist egress-proxy profile exists, see ADR 0034); it does not replace batch Jobs. No live CRD/controller or
 Sandbox runtime acceptance is claimed. Warm pools, read-only source integration,
 input/reasoning credential delivery and a complete agent reasoning/critique loop
-are not available in this demonstrated journey.
+are not available in this demonstrated journey. A service credential such as a model API key is installed as root-owned systemd credential files read from standard input (never an argument or environment variable), with a receipt that records only the reference and a fingerprint; the service's existing start-up checks admit or refuse it ([service credentials](docs/service-credentials.md), [ADR 0093](docs/decisions/0093-service-credential-install.md)).
 
 ### Campaigns (ADR 0038)
 
@@ -319,7 +319,7 @@ credentials, so agents and sessions the owner creates all share the owner's root
 owner-enrolled agent cannot post findings for a job another owner-enrolled agent submitted. A job submitted by
 an owner-enrolled agent or the owner's own session can never receive findings in default mode. Alternatively
 the operator starts the server with `--review-single-owner` (off by default), which refuses only the identical
-principal; every decision then records `separation_basis: single_owner_opt_in` (otherwise `distinct_person`)
+principal; every decision then records `separation_basis: single_owner_opt_in` (otherwise `distinct_person`; `legacy_unrecorded` only marks a decision made before the basis was recorded)
 and the status shows `review_single_owner`.
 
 A second person can be enrolled by the owner (`POST /people`,
@@ -342,6 +342,11 @@ Tessera's built-in child, which calls the Messages API through the allowlisted c
 API-key credential held by reference, and the first run needs an operator-written policy
 ([example](docs/examples/code_review_policy.py)). A verdict never merges or approves anything, and
 with no runner configured the job stays `queued`. No live model call is part of the default tests.
+A review can be submitted for a branch of an operator-mapped local bare repository
+([ADR 0108](docs/decisions/0108-code-review-submit.md), `tessera_submit_code_review` or
+`tessera-review submit`): only changed files are snapshotted, only listed focused tests are named,
+a re-review checks only listed findings (at most 3 rounds), and the verdict and findings are written
+to the job receipt.
 
 **Credential expiry (Salad).** A Salad management credential has a fixed lifetime. Tessera reports each
 credential's state and expiry (metadata only, never the value), refuses or fails a stage that needs an
@@ -452,7 +457,11 @@ through the app's file picker; never paste its contents. Initialize only once;
 existing state needs the documented backup/migration procedure (`tessera backup`,
 `tessera migrate`, `tessera restore`; see the command index below). Backups are bounded
 at 1 GiB unless the operator passes `--max-backup-bytes`
-([recovery](docs/recovery.md)). Follow the
+([recovery](docs/recovery.md)). `tessera deploy-check` reports what a deploy still needs
+(pending migrations, the backup bound, config keys a release removed, provider profiles) and
+applies the safe fixes with a receipt ([deploy check](docs/deploy-check.md)); `tessera deploy-upgrade`
+runs the whole upgrade (preflight, capped backup, migrate, ordered restart, health, smoke, receipt) as
+one dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)). Follow the
 [screen-by-screen quickstart](docs/quickstart.md) for review/export and troubleshooting.
 Native installation and picker/save acceptance require their own checks;
 simulator evidence does not close those gates.

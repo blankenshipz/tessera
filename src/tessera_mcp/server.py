@@ -200,6 +200,17 @@ def register_provider_registration_tools(server: FastMCP, client: ControlClient)
         """
         return await client.list_campaign_providers()
 
+    @server.tool(annotations=read)
+    async def tessera_deploy_report() -> dict[str, Any]:
+        """The control plane's own deploy report: database schema and providers-file checks.
+
+        Read-only. Returns the `tessera.deploy-check.v1` document for what the running control
+        plane can see (schema pending or current, providers file valid), each check ok, warn,
+        fail or skipped with a one-line summary. Config files, the backup bound and the CPU smoke
+        are local to the operator's host: run `tessera deploy-check` there. It changes nothing.
+        """
+        return await client.deploy_check_report()
+
     @server.tool(annotations=write)
     async def tessera_register_provider(
         action: str,

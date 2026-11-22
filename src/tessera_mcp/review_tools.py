@@ -9,6 +9,7 @@ under ``--review-decision-tool``. The control API still decides: it refuses any 
 that is not a person's session, so an agent credential gets a 403 that is passed through.
 """
 
+import re
 import uuid
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
@@ -29,12 +30,124 @@ JOB_KINDS = ("plan_review", "dataset_scout", "technique_scout", "pre_gate_review
 # Scopes the agent tools need; the control API enforces them on every call.
 REVIEW_TOOL_SCOPES = {
     "tessera_submit_review_job": "review:submit",
+    "tessera_submit_code_review": "review:submit",
     "tessera_list_review_jobs": "review:read",
     "tessera_read_review_job": "review:read",
     "tessera_list_review_findings": "review:read",
     "tessera_read_review_finding": "review:read",
 }
 REVIEW_ACTIONS = frozenset(REVIEW_TOOL_SCOPES.values())
+
+
+MAX_FOCUSED_TESTS = 20
+MAX_RECHECK_FINDINGS = 1000
+_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_TEST_FILE_RE = re.compile(r"test_[A-Za-z0-9_.-]*\.py")
+_PATH_PART_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_TIERS = ("haiku", "sonnet", "opus", "fable")
+
+
+def _check_branch(name: str, value) -> str:
+    if (
+        not isinstance(value, str)
+        or not _BRANCH_RE.fullmatch(value)
+        or ".." in value
+        or "//" in value
+        or value.endswith(("/", ".", ".lock"))
+    ):
+        raise ValueError(f"{name} is not a valid branch name")
+    return value
+
+
+def _check_focused_test(path) -> str:
+    """A focused test is one test file: relative POSIX, under a ``tests`` directory segment,
+    named ``test_*.py`` (the generic Python convention). Never a directory, glob or ``..``."""
+    if not isinstance(path, str) or not path or len(path) > 300:
+        raise ValueError("each focused test must be a non-empty path")
+    if path.startswith("/") or path.endswith("/") or "\\" in path or any(c in path for c in "*?["):
+        raise ValueError("focused tests must be relative POSIX file paths without globs")
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} or not _PATH_PART_RE.fullmatch(part) for part in parts):
+        raise ValueError("focused tests must be plain relative paths without '..'")
+    if "tests" not in parts[:-1] or not _TEST_FILE_RE.fullmatch(parts[-1]):
+        raise ValueError("focused tests must be test_*.py files under a tests/ directory")
+    return path
+
+
+def build_code_review_body(
+    *,
+    repo,
+    branch,
+    head_sha,
+    tier,
+    budget_cents,
+    focused_tests,
+    base_branch="main",
+    destination_id="anthropic",
+    previous_job_id=None,
+    recheck_findings=None,
+) -> dict[str, Any]:
+    """Validate and build the POST /projects/{p}/code-reviews body (ADR 0108).
+
+    Raises ValueError before anything is sent. The server re-checks everything.
+    """
+    if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
+        raise ValueError("repo is not a valid repository name")
+    _check_branch("branch", branch)
+    _check_branch("base_branch", base_branch)
+    if not isinstance(head_sha, str) or not _SHA_RE.fullmatch(head_sha):
+        raise ValueError("head_sha must be 40 lowercase hex characters")
+    if tier not in _TIERS:
+        raise ValueError("tier must be one of: " + ", ".join(_TIERS))
+    if (
+        isinstance(budget_cents, bool)
+        or not isinstance(budget_cents, int)
+        or not 0 <= budget_cents <= BUDGET_CAP_CENTS
+    ):
+        raise ValueError(f"budget_cents must be an integer 0..{BUDGET_CAP_CENTS}")
+    if (
+        not isinstance(destination_id, str)
+        or not destination_id.strip()
+        or len(destination_id) > 200
+    ):
+        raise ValueError("destination_id must be a non-blank string")
+    if not isinstance(focused_tests, (list, tuple)) or not (
+        1 <= len(focused_tests) <= MAX_FOCUSED_TESTS
+    ):
+        raise ValueError(f"focused_tests must list 1..{MAX_FOCUSED_TESTS} test files")
+    tests = [_check_focused_test(path) for path in focused_tests]
+    if len(set(tests)) != len(tests):
+        raise ValueError("focused_tests must be unique")
+    body: dict[str, Any] = {
+        "repo": repo,
+        "branch": branch,
+        "head_sha": head_sha,
+        "base_branch": base_branch,
+        "tier": tier,
+        "destination_id": destination_id,
+        "budget_cents": budget_cents,
+        "focused_tests": tests,
+    }
+    if previous_job_id is None:
+        if recheck_findings:
+            raise ValueError("recheck_findings require previous_job_id")
+        return body
+    if not isinstance(previous_job_id, str) or not 1 <= len(previous_job_id) <= 200:
+        raise ValueError("previous_job_id must be a non-blank job id")
+    if (
+        not isinstance(recheck_findings, (list, tuple))
+        or not 1 <= len(recheck_findings) <= MAX_RECHECK_FINDINGS
+    ):
+        raise ValueError("a re-review needs a non-empty recheck_findings list")
+    if any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in recheck_findings):
+        raise ValueError("recheck_findings must be positive finding numbers")
+    if len(set(recheck_findings)) != len(recheck_findings):
+        raise ValueError("recheck_findings must be unique")
+    body["previous_job_id"] = previous_job_id
+    body["recheck_findings"] = list(recheck_findings)
+    return body
 
 
 def _skip(function):
@@ -145,6 +258,54 @@ def register_review_tools(
             project("review-jobs"),
             body=payload.model_dump(mode="json", exclude_none=True),
             key=idempotency_key,
+        )
+
+    @(server.tool(annotations=write) if allowed("tessera_submit_code_review") else _skip)
+    async def tessera_submit_code_review(
+        repo: str,
+        branch: str,
+        head_sha: str,
+        tier: Literal["haiku", "sonnet", "opus", "fable"],
+        budget_cents: int,
+        focused_tests: list[str],
+        base_branch: str = "main",
+        destination_id: str = "anthropic",
+        previous_job_id: str | None = None,
+        recheck_findings: list[int] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Request an advisory code review of a branch on the platform's own git remote.
+
+        The server reads head_sha and the merge base with base_branch from its configured
+        remote; nothing is uploaded from here. Name FOCUSED tests only: 1 to 20 individual
+        test_*.py files under a tests/ directory (relative POSIX paths, no globs, no
+        directories, not the whole suite); each must exist at head_sha.
+
+        A re-review (previous_job_id plus recheck_findings, the finding numbers of that
+        completed job) checks ONLY the listed findings and reports only those still
+        unresolved. At most 3 rounds per branch: a fourth is refused, as is a re-review of
+        a job whose verdict was MERGE. The verdict and findings are written to the job's
+        receipt (read it with the review job tool). They are advisory and untrusted: this
+        authorizes nothing, never merges or approves anything. Invalid arguments are
+        refused here before anything is sent. Reuse the key and arguments on reconnect.
+        """
+        body = build_code_review_body(
+            repo=repo,
+            branch=branch,
+            head_sha=head_sha,
+            tier=tier,
+            budget_cents=budget_cents,
+            focused_tests=focused_tests,
+            base_branch=base_branch,
+            destination_id=destination_id,
+            previous_job_id=previous_job_id,
+            recheck_findings=recheck_findings,
+        )
+        return await client._request(
+            "POST",
+            project("code-reviews"),
+            body=body,
+            key=idempotency_key or "code-review-" + uuid.uuid4().hex,
         )
 
     @(server.tool(annotations=read) if allowed("tessera_list_review_jobs") else _skip)

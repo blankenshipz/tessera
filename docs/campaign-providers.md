@@ -280,7 +280,8 @@ tessera providers audit  --file /path/to/campaign-providers.json
 The same operation is `GET` and `POST /admin/campaign-providers` (writes are human-only and
 idempotent) and, when the operator enables `provider_registration_tools`, the MCP tools
 `tessera_list_providers` and `tessera_register_provider`. Sections are `salad-profile`, `self-hosted`,
-`local-docker` and `plugin` (a vendor plugin may add its own through `config_sections()`).
+`local-docker` and `plugin` (a vendor plugin may add its own through `config_sections()`). `tessera_deploy_report`
+(same flag) is the read-only deploy report of the control plane ([deploy check](deploy-check.md)).
 
 Who may write through the API depends on the section. A `salad-profile` belongs to its organization:
 a human of that organization may add one for its own organization and project and a worker principal

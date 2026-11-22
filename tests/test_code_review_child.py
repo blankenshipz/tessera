@@ -14,9 +14,12 @@ import pytest
 from tessera_agent import code_review_child as child
 from tessera_agent.anthropic_messages import API_URL, COUNT_URL
 from tessera_agent.code_review_child import (
+    CODE_RECHECK_PROMPT,
+    CODE_RECHECK_PROMPT_SHA256,
     CODE_REVIEW_PROMPT,
     CODE_REVIEW_PROMPT_SHA256,
     MAX_REVIEW_INPUT_BYTES,
+    PINNED_PROMPT_DIGESTS,
     run_spec,
 )
 from tessera_control.review_jobs_models import ModelCallReceipt
@@ -125,12 +128,16 @@ def creds(tmp_path):
 
 
 class FakeTransport:
+    """The AllowlistedTransport interface: ``post_json(url, headers, body, *, timeout)``."""
+
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.timeouts = []
 
     def post_json(self, url, headers, body, *, timeout=None):
         self.calls.append((url, dict(headers), body))
+        self.timeouts.append(timeout)
         if not self.responses:
             raise AssertionError("unexpected model call")
         item = self.responses.pop(0)
@@ -252,18 +259,23 @@ def test_budget_preflight_over_budget_never_posts_messages(tmp_path, creds):
     assert not os.path.exists(tmp_path / "out" / "receipt.json")
 
 
-def check_receipt(result_receipt, spec):
+def check_receipt(
+    result_receipt,
+    spec,
+    model_reported=f"anthropic/{MODEL}",
+    cost_basis="computed_from_pinned_prices",
+):
     receipt = ModelCallReceipt.model_validate(result_receipt)
     assert receipt.model_configured == f"anthropic/{MODEL}"
-    assert receipt.model_reported == f"anthropic/{MODEL}"
+    assert receipt.model_reported == model_reported
     assert receipt.model_identity_basis == "provider_response_model"
-    assert receipt.cost_basis == "computed_from_pinned_prices"
+    assert receipt.cost_basis == cost_basis
     assert receipt.input_digests == {i["snapshot_id"]: i["digest"] for i in spec["inputs"]}
     assert receipt.cost_cents == math.ceil(receipt.cost)
     assert receipt.attempts == spec["attempt"]
     assert receipt.tier == spec["tier"]
     assert receipt.limits == spec["profile"]["limits"]
-    assert receipt.prompt_sha256 == CODE_REVIEW_PROMPT_SHA256
+    assert receipt.prompt_sha256 == spec["prompt_digest"]
     return receipt
 
 
@@ -352,16 +364,47 @@ def test_invalid_output_shapes_are_refused_with_receipt(tmp_path, creds, body):
     assert result["receipt"] is not None
 
 
-def test_transport_500_after_count_fails_without_receipt(tmp_path, creds):
+def check_reserved_receipt(result, spec):
+    """A billed call with unknown usage: ``model_failed`` with a reserved worst-case receipt."""
+    assert result["outcome"] == "failed" and result["reason"] == "model_failed"
+    receipt = ModelCallReceipt.model_validate(result["receipt"])
+    assert receipt.cost_basis == "reserved_worst_case"
+    # Worst case: 100 counted input at 300 + the 1000-token output cap at 1500 cents/Mtok.
+    assert receipt.cost == pytest.approx(1.53) and receipt.cost_cents == 2
+    assert receipt.tokens["input"] == 100 and receipt.tokens["output"] == 1000
+    assert receipt.model_reported is None
+    assert receipt.model_identity_basis == "harness_reported_unverified"
+    assert receipt.model_configured == f"anthropic/{MODEL}"
+    assert receipt.input_digests == {i["snapshot_id"]: i["digest"] for i in spec["inputs"]}
+    assert receipt.input_class == "private_code_approved"
+    assert receipt.prompt_sha256 == spec["prompt_digest"]
+    assert receipt.attempts == spec["attempt"] and receipt.tier == spec["tier"]
+    assert "output_sha256" not in result["receipt"]
+    check_receipt_file(spec["receipt_path"], result["receipt"])
+    return receipt
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_transport_5xx_after_send_is_receipted_at_reserved_worst_case(tmp_path, creds, status):
     transport = FakeTransport(
-        count(100), (500, {}, {"error": {"type": "api_error", "message": "upstream detail"}})
+        count(100), (status, {}, {"error": {"type": "api_error", "message": "upstream detail"}})
+    )
+    spec = make_spec(tmp_path)
+    result = run(spec, creds, transport)
+    check_reserved_receipt(result, spec)
+    assert "upstream detail" not in json.dumps(result)
+    assert_only_anthropic(transport)
+
+
+@pytest.mark.parametrize("status", [400, 529])
+def test_definite_rejection_of_billed_call_has_no_receipt(tmp_path, creds, status):
+    transport = FakeTransport(
+        count(100), (status, {}, {"error": {"type": "invalid_request_error"}})
     )
     spec = make_spec(tmp_path)
     result = run(spec, creds, transport)
     assert result == {"outcome": "failed", "reason": "model_failed", "receipt": None}
     assert not os.path.exists(spec["receipt_path"])
-    assert "upstream detail" not in json.dumps(result)
-    assert_only_anthropic(transport)
 
 
 def test_missing_credential_makes_no_call(tmp_path):
@@ -420,3 +463,195 @@ def test_main_reports_unexpected_errors_as_model_failed(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert json.loads(out) == {"outcome": "failed", "reason": "model_failed", "receipt": None}
     assert "secret detail" not in out
+
+
+# -- client failure mapping -------------------------------------------------------------------
+
+
+def test_per_call_cost_cap_is_budget_exceeded_without_post(tmp_path, creds):
+    spec = make_spec(tmp_path)
+    spec["profile"]["limits"]["max_cost_cents_per_call"] = 1  # worst case is 1.53 cents
+    transport = FakeTransport(count(100))
+    result = run(spec, creds, transport)
+    assert result == {"outcome": "failed", "reason": "budget_exceeded", "receipt": None}
+    assert [call[0] for call in transport.calls] == [COUNT_URL]
+
+
+def test_rate_limited_count_is_model_failed_without_receipt(tmp_path, creds):
+    transport = FakeTransport((429, {"retry-after": "5"}, {"error": {"type": "rate_limit_error"}}))
+    spec = make_spec(tmp_path)
+    result = run(spec, creds, transport)
+    assert result == {"outcome": "failed", "reason": "model_failed", "receipt": None}
+    assert not os.path.exists(spec["receipt_path"])
+
+
+def test_timeout_on_billed_call_is_receipted_at_reserved_worst_case(tmp_path, creds):
+    # Usage unknown: the client reserves its worst case; it is receipted as a reservation,
+    # never under a computed cost basis.
+    transport = FakeTransport(count(100), TimeoutError("read timed out"))
+    spec = make_spec(tmp_path)
+    result = run(spec, creds, transport)
+    check_reserved_receipt(result, spec)
+    assert "timed out" not in json.dumps(result)
+
+
+def test_accepted_call_without_usage_is_receipted_at_reserved_worst_case(tmp_path, creds):
+    status, headers, body = message(json.dumps(FINDINGS))
+    del body["usage"]
+    transport = FakeTransport(count(100), (status, headers, body))
+    spec = make_spec(tmp_path)
+    result = run(spec, creds, transport)
+    check_reserved_receipt(result, spec)
+    assert "x changes without a test" not in json.dumps(result)
+
+
+def test_substituted_model_is_receipted_with_actual_usage(tmp_path, creds):
+    status, headers, body = message(json.dumps(FINDINGS))
+    body["model"] = "claude-other-model"
+    transport = FakeTransport(count(100), (status, headers, body))
+    spec = make_spec(tmp_path)
+    result = run(spec, creds, transport)
+    assert result["outcome"] == "failed" and result["reason"] == "model_failed"
+    # The client cannot price a model it did not pin: the call is charged its worst case and
+    # receipted as a reservation (never a measured cost), naming the model the response reported.
+    receipt = check_receipt(
+        result["receipt"], spec, "anthropic/claude-other-model", cost_basis="reserved_worst_case"
+    )
+    assert receipt.tokens["input"] == 100 and receipt.tokens["output"] == 50
+    assert receipt.cost == pytest.approx(1.53) and receipt.cost_cents == 2
+    assert "output_sha256" not in result["receipt"]
+    check_receipt_file(spec["receipt_path"], result["receipt"])
+    assert "x changes without a test" not in json.dumps(result)
+
+
+def test_billed_call_uses_the_client_timeout(tmp_path, creds):
+    transport = FakeTransport(count(100), message(json.dumps(FINDINGS)))
+    assert run(make_spec(tmp_path), creds, transport)["outcome"] == "completed"
+    assert transport.timeouts[0] == 30.0 and transport.timeouts[1] == pytest.approx(100.0)
+
+
+# -- re-review (ADR 0108) ---------------------------------------------------------------------
+
+RECHECK_LIST = [
+    {"number": 1, "severity": "major", "category": "correctness", "claim": "x untested"},
+    {"number": 3, "severity": "minor", "category": "style", "claim": "missing docstring"},
+]
+
+
+def make_recheck_spec(tmp_path, recheck=RECHECK_LIST, **overrides):
+    spec = make_spec(tmp_path, mode="diff", prompt_digest=CODE_RECHECK_PROMPT_SHA256, **overrides)
+    files = {"rubric.md": "Check error handling.\n"}
+    if recheck is not None:
+        files["recheck.json"] = recheck if isinstance(recheck, bytes) else json.dumps(recheck)
+    spec["inputs"][0] = snapshot("snap-rubric", RUBRIC, files)
+    return spec
+
+
+def recheck_finding(category, severity="major"):
+    return {
+        "severity": severity,
+        "category": category,
+        "claim": "still unresolved",
+        "evidence": [{"source": "subject", "locator": "a.py:1"}],
+        "confidence": 0.7,
+    }
+
+
+def test_both_prompts_are_pinned_constants():
+    assert hashlib.sha256(CODE_RECHECK_PROMPT.encode()).hexdigest() == CODE_RECHECK_PROMPT_SHA256
+    assert PINNED_PROMPT_DIGESTS == {CODE_REVIEW_PROMPT_SHA256, CODE_RECHECK_PROMPT_SHA256}
+    assert isinstance(PINNED_PROMPT_DIGESTS, frozenset)
+    assert CODE_REVIEW_PROMPT_SHA256 != CODE_RECHECK_PROMPT_SHA256
+    assert "recheck.json" in CODE_RECHECK_PROMPT and "recheck:<number" in CODE_RECHECK_PROMPT
+
+
+def test_review_prompt_selected_by_digest(tmp_path, creds):
+    transport = FakeTransport(count(100), message(json.dumps(FINDINGS)))
+    spec = make_spec(tmp_path)
+    assert run(spec, creds, transport)["outcome"] == "completed"
+    sent = transport.calls[1][2]["messages"][0]["content"]
+    assert sent.startswith(CODE_REVIEW_PROMPT) and CODE_RECHECK_PROMPT not in sent
+
+
+def test_recheck_completes_with_listed_unresolved_findings(tmp_path, creds):
+    body = {"verdict": "CHANGES-REQUIRED", "findings": [recheck_finding("recheck:1")]}
+    transport = FakeTransport(count(100), message(json.dumps(body)))
+    spec = make_recheck_spec(tmp_path)
+    result = run(spec, creds, transport)
+    assert result["outcome"] == "completed"
+    assert [(f["id"], f["category"]) for f in result["output"]["findings"]] == [("1", "recheck:1")]
+    receipt = check_receipt(result["output"]["receipt"], spec)
+    assert receipt.prompt_sha256 == CODE_RECHECK_PROMPT_SHA256
+    assert receipt.input_digests == {"snap-rubric": RUBRIC, "snap-head": HEAD, "snap-base": BASE}
+    check_receipt_file(spec["receipt_path"], result["output"]["receipt"])
+    sent = transport.calls[1][2]["messages"][0]["content"]
+    assert sent.startswith(CODE_RECHECK_PROMPT) and CODE_REVIEW_PROMPT not in sent
+    assert "missing docstring" in sent and "+x = 2" in sent
+    assert_only_anthropic(transport)
+    assert_clean(result)
+
+
+def test_recheck_all_resolved_is_merge_without_findings(tmp_path, creds):
+    transport = FakeTransport(count(100), message(json.dumps({"verdict": "MERGE", "findings": []})))
+    result = run(make_recheck_spec(tmp_path), creds, transport)
+    assert result["outcome"] == "completed"
+    assert result["output"]["verdict"] == "MERGE" and result["output"]["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "categories",
+    [
+        ["correctness"],
+        ["recheck:2"],
+        ["recheck:1", "recheck:1"],
+        ["recheck:1", "style"],
+        ["recheck:01"],
+        ["recheck: 1"],
+        ["recheck:1 "],
+        ["recheck:"],
+    ],
+)
+def test_recheck_unlisted_or_repeated_findings_are_refused_with_receipt(
+    tmp_path, creds, categories
+):
+    body = {
+        "verdict": "CHANGES-REQUIRED",
+        "findings": [recheck_finding(category) for category in categories],
+    }
+    transport = FakeTransport(count(100), message(json.dumps(body)))
+    spec = make_recheck_spec(tmp_path)
+    result = run(spec, creds, transport)
+    assert result["outcome"] == "failed" and result["reason"] == "failed_output_invalid"
+    check_receipt(result["receipt"], spec)
+    check_receipt_file(spec["receipt_path"], result["receipt"])
+    assert "still unresolved" not in json.dumps(result)
+
+
+def test_review_prompt_does_not_filter_categories(tmp_path, creds):
+    body = {"verdict": "CHANGES-REQUIRED", "findings": [recheck_finding("correctness")]}
+    transport = FakeTransport(count(100), message(json.dumps(body)))
+    assert run(make_spec(tmp_path), creds, transport)["outcome"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "recheck",
+    [
+        None,
+        b"not json",
+        b"\xff\xfe",
+        {"number": 1},
+        [],
+        [{"number": 0, "severity": "major", "category": "c", "claim": "x"}],
+        [{"number": True, "severity": "major", "category": "c", "claim": "x"}],
+        [{"number": "1", "severity": "major", "category": "c", "claim": "x"}],
+        [{"number": 1, "severity": "huge", "category": "c", "claim": "x"}],
+        [{"number": 1, "severity": "major", "category": "c"}],
+        [{"number": 1, "severity": "major", "category": "c", "claim": "x", "extra": 1}],
+        RECHECK_LIST + [RECHECK_LIST[0]],
+    ],
+)
+def test_recheck_without_valid_list_makes_no_call(tmp_path, creds, recheck):
+    transport = FakeTransport()
+    result = run(make_recheck_spec(tmp_path, recheck=recheck), creds, transport)
+    assert result == {"outcome": "failed", "reason": "spec_invalid", "receipt": None}
+    assert transport.calls == []

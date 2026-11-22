@@ -93,6 +93,18 @@ memory or a defense against host root. Distinct service users and OS isolation a
 required. Provider API keys, `PYTHONPATH`, loader overrides and arbitrary parent
 environment are not forwarded. The mapper cannot run an arbitrary command.
 
+### Installing a model API key as a credential reference
+
+For a destination that needs an API key, do not write the key by hand. The base unit already loads
+`model-credential` and `anthropic-api-key` (see below); run `tessera-service-credential install --service
+tessera-reasoning --name anthropic-api-key --owner OWNER --reference REFERENCE` as root with the secret on
+standard input. It refuses a general `ANTHROPIC_API_KEY` in the environment or the unit, writes **both** the key
+file and the `reasoning-model-credential` reference file (root-owned, 0600, atomically), refuses if the
+profile's `credential_ref` is not `anthropic-api-key://OWNER/REFERENCE`, and records a receipt with the
+reference and fingerprint only. The service's start-up mapper then admits it as it admits any such files. A
+unit of your own needs the two `LoadCredential=` lines. See
+[service credentials](../../docs/service-credentials.md).
+
 ### Reasoning profile and separate harness admission
 
 Prepare `/etc/tessera/reasoning.json` from
@@ -122,10 +134,10 @@ the environment names are fixed:
   `model-credential` file content must equal `credential_ref` exactly (one line, trailing
   newline allowed). Both files must be private non-empty regular files; Tessera never reads
   them into logs, errors, argv or the child environment.
-- Create the key file root-owned, mode 0600, without exporting it or placing it in a shell
-  variable, repository or env file. Preferred: a root editor such as `sudoedit` creating the
-  0600 file `/etc/tessera/credentials/reasoning-anthropic-api-key`. If pasting on stdin, disable
-  echo first: `stty -echo; sudo install -m 0600 -o root -g root /dev/stdin
+- Create both files with the installer above (preferred): it keeps the key off the command line, the
+  environment and the shell. If you must create the key file by hand, make it root-owned, mode 0600, without
+  exporting it or placing it in a shell variable, repository or env file, and use a root editor such as
+  `sudoedit`, or disable echo first: `stty -echo; sudo install -m 0600 -o root -g root /dev/stdin
   /etc/tessera/credentials/reasoning-anthropic-api-key; stty echo` (paste, Enter, Ctrl-D). The harness password (`harness_token_env` above) is loaded only by the
   OpenAI drop-in, not by the base unit.
 - OpenAI included ChatGPT OAuth (optional alternative, OpenCode V2 harness): install

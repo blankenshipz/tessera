@@ -35,6 +35,8 @@ from .code_review_jobs import (
     code_review_record,
     create_code_review_schema,
     receipt_bound,
+    recheck_output_valid,
+    source_record,
 )
 from .data_class import snapshot_data_class
 from .review_jobs_models import (
@@ -282,7 +284,7 @@ def create_review_jobs_schema(connection):
         rationale TEXT NOT NULL, finding_digest TEXT NOT NULL,
         job_digest TEXT NOT NULL, subject_digests_json TEXT NOT NULL, created_at TEXT NOT NULL,
         separation_basis TEXT NOT NULL CHECK(separation_basis IN
-            ('distinct_person','single_owner_opt_in')))""")
+            ('distinct_person','single_owner_opt_in','legacy_unrecorded')))""")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS review_jobs_project ON review_jobs(org_id,project_id,sequence)"
     )
@@ -419,100 +421,23 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
 
     # -- submit / approve -----------------------------------------------------------------
 
+    def _submit_guard(self, connection, actor, project_id):
+        if actor["role"] == "agent":
+            self._scope(connection, actor, "review:submit")
+        elif actor["role"] != "human":
+            raise Forbidden("Only a human or an enrolled agent may submit a review job.")
+        self._project(connection, actor, project_id)
+
     def submit(self, principal, project_id, key, payload, policy):
         body = self._body(SubmitReviewJob, payload)
         subject = body.pop("code_review", None)
         if subject is not None:
-            # Other kinds keep their ADR 0084 job digest; a code review binds its subject.
+            # Other kinds keep their ADR 0084 digests (no code_review key bound).
             body["code_review"] = subject
 
-        def guard(connection, actor):
-            if actor["role"] == "agent":
-                self._scope(connection, actor, "review:submit")
-            elif actor["role"] != "human":
-                raise Forbidden("Only a human or an enrolled agent may submit a review job.")
-            self._project(connection, actor, project_id)
-
         def command(connection, actor):
-            guard(connection, actor)
-            inputs = []
-            for item in body["inputs"]:
-                found = connection.execute(
-                    "SELECT s.digest FROM source_snapshots s JOIN projects p ON p.id=s.project_id "
-                    "WHERE s.id=? AND s.project_id=? AND p.org_id=?",
-                    (item["snapshot_id"], project_id, actor["org_id"]),
-                ).fetchone()
-                if found is None:
-                    raise ReviewRefused("input_not_found")
-                if found["digest"] != item["digest"]:
-                    raise ReviewRefused("input_digest_mismatch")
-                derived = snapshot_data_class(connection, item["snapshot_id"])["data_class"]
-                inputs.append({**item, "data_class": derived})
-            sealed = _sealed_inputs(connection, project_id, [i["digest"] for i in inputs])
-            if any(item["digest"] in sealed for item in inputs):
-                raise ReviewRefused("input_sealed")
-            classes = sorted({item["data_class"] for item in inputs})
-            reason = policy.check(
-                body["destination_id"], body["tier"], classes, body["budget_cents"]
-            )
-            if reason:
-                raise ReviewRefused(
-                    reason if reason in REFUSAL_REASONS else "destination_not_enrolled"
-                )
-            ident = "review_job_" + uuid.uuid4().hex
-            state = "awaiting_approval" if body["tier"] == "fable" else "queued"
-            now = utc_now()
-            connection.execute(
-                "INSERT INTO review_jobs (id,org_id,project_id,credential_id,actor_id,kind,"
-                "title,inputs_json,prompt_digest,destination_id,tier,budget_cents,egress,state,"
-                "revision,digest,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
-                (
-                    ident,
-                    actor["org_id"],
-                    project_id,
-                    actor["credential_id"],
-                    actor["id"],
-                    body["kind"],
-                    body["title"],
-                    json.dumps(inputs),
-                    body["prompt_digest"],
-                    body["destination_id"],
-                    body["tier"],
-                    body["budget_cents"],
-                    body["egress"],
-                    state,
-                    canonical_digest({**body, "inputs": inputs}),
-                    now,
-                    now,
-                ),
-            )
-            if subject is not None:
-                connection.execute(
-                    "INSERT INTO code_review_jobs (job_id,org_id,mode,base_digest,head_digest,"
-                    "rubric_digest) VALUES (?,?,?,?,?,?)",
-                    (
-                        ident,
-                        actor["org_id"],
-                        subject["mode"],
-                        subject["base_digest"],
-                        subject["head_digest"],
-                        subject["rubric_digest"],
-                    ),
-                )
-            self._event(
-                connection,
-                actor,
-                project_id,
-                None,
-                "review_job.submitted",
-                1,
-                {"job_id": ident, "kind": body["kind"], "tier": body["tier"], "state": state},
-            )
-            return 201, self._job_record(
-                connection,
-                connection.execute("SELECT * FROM review_jobs WHERE id=?", (ident,)).fetchone(),
-            )
+            self._submit_guard(connection, actor, project_id)
+            return 201, self._submit_job(connection, actor, project_id, body, policy)
 
         return self._mutate(
             principal,
@@ -521,7 +446,127 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
             f"/projects/{project_id}/review-jobs",
             canonical_digest(body),
             command,
-            replay_guard=lambda c, a, r: guard(c, a),
+            replay_guard=lambda c, a, r: self._submit_guard(c, a, project_id),
+        )
+
+    def submit_code_review(self, principal, project_id, key, payload, policy, git):
+        """Submit a code review of a platform git branch (ADR 0108); see ``code_review_submit``."""
+        from .code_review_submit import submit_code_review
+
+        return submit_code_review(self, principal, project_id, key, payload, policy, git)
+
+    def _submit_job(self, connection, actor, project_id, body, policy, source=None):
+        """Insert a validated job (and a code review's subject and optional git ``source``) with
+        its event, inside the caller's transaction; returns the job record. The caller has
+        already authorized ``actor`` for ``project_id``."""
+        body = dict(body)
+        subject = body.pop("code_review", None)
+        if subject is not None:
+            # Other kinds keep their ADR 0084 job digest; a code review binds its subject.
+            body["code_review"] = subject
+        if source is not None and subject is None:
+            raise ValueError("a git source belongs to a code review job")
+        inputs = []
+        for item in body["inputs"]:
+            found = connection.execute(
+                "SELECT s.digest FROM source_snapshots s JOIN projects p ON p.id=s.project_id "
+                "WHERE s.id=? AND s.project_id=? AND p.org_id=?",
+                (item["snapshot_id"], project_id, actor["org_id"]),
+            ).fetchone()
+            if found is None:
+                raise ReviewRefused("input_not_found")
+            if found["digest"] != item["digest"]:
+                raise ReviewRefused("input_digest_mismatch")
+            derived = snapshot_data_class(connection, item["snapshot_id"])["data_class"]
+            inputs.append({**item, "data_class": derived})
+        sealed = _sealed_inputs(connection, project_id, [i["digest"] for i in inputs])
+        if any(item["digest"] in sealed for item in inputs):
+            raise ReviewRefused("input_sealed")
+        classes = sorted({item["data_class"] for item in inputs})
+        reason = policy.check(body["destination_id"], body["tier"], classes, body["budget_cents"])
+        if reason:
+            raise ReviewRefused(reason if reason in REFUSAL_REASONS else "destination_not_enrolled")
+        ident = "review_job_" + uuid.uuid4().hex
+        state = "awaiting_approval" if body["tier"] == "fable" else "queued"
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO review_jobs (id,org_id,project_id,credential_id,actor_id,kind,"
+            "title,inputs_json,prompt_digest,destination_id,tier,budget_cents,egress,state,"
+            "revision,digest,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+            (
+                ident,
+                actor["org_id"],
+                project_id,
+                actor["credential_id"],
+                actor["id"],
+                body["kind"],
+                body["title"],
+                json.dumps(inputs),
+                body["prompt_digest"],
+                body["destination_id"],
+                body["tier"],
+                body["budget_cents"],
+                body["egress"],
+                state,
+                # A job from a git source also binds that source (ADR 0108).
+                canonical_digest(
+                    {**body, "inputs": inputs}
+                    if source is None
+                    else {**body, "inputs": inputs, "source": source}
+                ),
+                now,
+                now,
+            ),
+        )
+        if subject is not None:
+            connection.execute(
+                "INSERT INTO code_review_jobs (job_id,org_id,mode,base_digest,head_digest,"
+                "rubric_digest) VALUES (?,?,?,?,?,?)",
+                (
+                    ident,
+                    actor["org_id"],
+                    subject["mode"],
+                    subject["base_digest"],
+                    subject["head_digest"],
+                    subject["rubric_digest"],
+                ),
+            )
+        event = {"job_id": ident, "kind": body["kind"], "tier": body["tier"], "state": state}
+        if source is not None:
+            connection.execute(
+                "INSERT INTO code_review_sources (job_id,org_id,project_id,repo,branch,"
+                "head_sha,base_branch,base_sha,focused_tests_json,round,previous_job_id,"
+                "recheck_findings_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ident,
+                    actor["org_id"],
+                    project_id,
+                    source["repo"],
+                    source["branch"],
+                    source["head_sha"],
+                    source["base_branch"],
+                    source["base_sha"],
+                    json.dumps(source["focused_tests"]),
+                    source["round"],
+                    source["previous_job_id"],
+                    json.dumps(source["recheck_findings"]),
+                    now,
+                ),
+            )
+            event["source"] = source
+        self._event(
+            connection,
+            actor,
+            project_id,
+            None,
+            "review_job.submitted",
+            1,
+            event,
+        )
+        return self._job_record(
+            connection,
+            connection.execute("SELECT * FROM review_jobs WHERE id=?", (ident,)).fetchone(),
         )
 
     def approve_tier(self, principal, job_id, key, payload):
@@ -663,7 +708,7 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
             row, basis = guard(connection, actor)
             if row["state"] not in ("queued", "running"):
                 raise Conflict("Review job is not accepting findings.")
-            body = self._validated_output(row, payload)
+            body = self._validated_output(row, payload, connection)
             if row["kind"] == "code_review":
                 connection.execute(
                     "UPDATE code_review_jobs SET lease_owner=NULL,lease_expires_at=NULL "
@@ -685,10 +730,12 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
         )
 
     @staticmethod
-    def _validated_output(row, payload):
+    def _validated_output(row, payload, connection):
         """Validate reviewer output for ``row``; the one rule set for HTTP ingest and the runner.
 
         Every violation is ``ReviewRefused("failed_output_invalid", 422)`` before any write.
+        ``connection`` is the caller's transaction (it reads a code review's git source for the
+        ADR 0108 re-review rule).
         """
 
         def refuse(detail=None):
@@ -711,6 +758,9 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
         if "blocking" in severities and verdict != "CHANGES-REQUIRED":
             raise refuse()
         if verdict == "MERGE" and severities & {"major", "blocking"}:
+            raise refuse()
+        # A re-review (round 2-3) checks only the listed previous findings (ADR 0108).
+        if not recheck_output_valid(source_record(connection, row["id"]), findings):
             raise refuse()
         if receipt["tier"] != row["tier"]:
             raise refuse()
@@ -774,6 +824,10 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
                 "rubric_digest": side["rubric_digest"],
                 "verdict": body["verdict"],
                 "findings_digest": canonical_digest({"findings": body["findings"]}),
+                # The verdict and the findings themselves are on the receipt, with the git
+                # source when the job was submitted from one (ADR 0108).
+                "findings": body["findings"],
+                "source": source_record(connection, job_id),
                 "model_call": body["receipt"],
             }
             review_digest = canonical_digest(review_receipt)

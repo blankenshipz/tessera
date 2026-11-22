@@ -51,7 +51,7 @@ NOT_START_REASONS = {
 @pytest.fixture(autouse=True)
 def _pinned_prompt(monkeypatch):
     # Unit tests pin a stand-in digest; the real child constant is checked separately.
-    monkeypatch.setattr(crr, "pinned_prompt_digest", lambda: PINNED)
+    monkeypatch.setattr(crr, "pinned_prompt_digests", lambda: frozenset({PINNED}))
 
 
 class FakeStore:
@@ -400,7 +400,7 @@ def test_policy_refusal_precedes_launch_checks():
 
 
 def test_missing_pinned_prompt_fails_closed(monkeypatch):
-    monkeypatch.setattr(crr, "pinned_prompt_digest", lambda: None)
+    monkeypatch.setattr(crr, "pinned_prompt_digests", frozenset)
     s = FakeStore()
     s.add("j1")
     m = ScriptModel()
@@ -409,12 +409,31 @@ def test_missing_pinned_prompt_fails_closed(monkeypatch):
     assert m.attempts == []
 
 
-def test_real_pinned_prompt_digest_is_the_child_constant(monkeypatch):
+def test_real_pinned_prompt_digests_are_the_child_constants(monkeypatch):
     monkeypatch.undo()  # the autouse stand-in
-    from tessera_agent.code_review_child import CODE_REVIEW_PROMPT_SHA256
+    from tessera_agent.code_review_child import (
+        CODE_RECHECK_PROMPT_SHA256,
+        CODE_REVIEW_PROMPT_SHA256,
+    )
 
-    assert crr.pinned_prompt_digest() == CODE_REVIEW_PROMPT_SHA256
-    assert len(CODE_REVIEW_PROMPT_SHA256) == 64
+    assert crr.pinned_prompt_digests() == {CODE_REVIEW_PROMPT_SHA256, CODE_RECHECK_PROMPT_SHA256}
+    assert CODE_REVIEW_PROMPT_SHA256 != CODE_RECHECK_PROMPT_SHA256
+    assert all(len(item) == 64 for item in crr.pinned_prompt_digests())
+
+
+def test_either_pinned_digest_launches(monkeypatch):
+    monkeypatch.setattr(crr, "pinned_prompt_digests", lambda: frozenset({PINNED, "c" * 64}))
+    s = FakeStore()
+    s.add("j1")
+    s.add("j2", prompt_digest="c" * 64)
+    s.add("j3", prompt_digest="d" * 64)
+    m = ScriptModel(ChildOutcome.completed(GOOD), ChildOutcome.completed(GOOD))
+    runner = make(s, m)
+    for _ in range(3):  # one launch per pass under the default concurrency
+        run_all(runner)
+    assert (s.job("j3")["state"], s.job("j3")["reason"]) == ("not_started", "prompt_not_pinned")
+    assert sorted(job_id for job_id, _ in m.attempts) == ["j1", "j2"]
+    assert s.job("j1")["state"] == s.job("j2")["state"] == "completed"
 
 
 def test_inputs_loaded_and_base64_encoded_into_spec():
@@ -686,7 +705,9 @@ def test_vanished_with_receipt_file_requeues_with_receipt():
         write_receipt(extra)
         return ChildOutcome.vanished("child_signalled")
 
-    run_all(make(s, ScriptModel(child)))
+    # One launch only: a fast child could otherwise be requeued and re-claimed in the same pass.
+    probes = iter([4096])
+    run_all(make(s, ScriptModel(child), memory_probe=lambda: next(probes, 0)))
     j = s.job("j1")
     assert j["state"] == "queued"
     assert j["attempt_receipts"] == [

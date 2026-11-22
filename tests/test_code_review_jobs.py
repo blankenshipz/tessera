@@ -233,6 +233,8 @@ def test_submit_code_review_record_shape(world, mode):  # noqa: F811
         "attempts": 0,
         "receipt": None,
         "review_receipt_digest": None,
+        "review_receipt": None,
+        "source": None,
         "attempt_receipts": [],
         "cost_cents_total": 0,
     }
@@ -400,10 +402,13 @@ def test_ingest_completes_with_verdict_and_receipts(world):  # noqa: F811
         "rubric_digest": R,
         "verdict": "MERGE-WITH-FOLLOWUPS",
         "findings_digest": canonical_digest({"findings": stored}),
+        "findings": stored,
+        "source": None,
         "model_call": receipt(),
     }
     assert [f["id"] for f in stored] == ["1", "2"] and len(stored) == len(findings)
     assert cr["review_receipt_digest"] == canonical_digest(review_receipt)
+    assert cr["review_receipt"] == review_receipt and cr["source"] is None
     fetched = world.client.get(f"/review-jobs/{j['id']}", headers=world.submitter).json()
     assert fetched["code_review"] == cr
     ((payload, _),) = events(world, "review_job.completed")

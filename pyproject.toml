@@ -44,6 +44,7 @@ tessera = "tessera_control.cli:main"
 tessera-worker = "tessera_worker.cli:main"
 tessera-worker-daemon = "tessera_worker.daemon:main"
 tessera-mcp = "tessera_mcp.server:main"
+tessera-review = "tessera_mcp.review_cli:main"
 tessera-salad-operator = "tessera_operator.salad:main"
 tessera-salad-cleanup = "tessera_control.salad_cleanup_cli:main"
 tessera-salad-executor = "tessera_control.campaign_salad_executor:main"
@@ -53,6 +54,7 @@ tessera-k8s-operator = "tessera_operator.kubernetes:main"
 tessera-reasoning = "tessera_agent.remote_reasoning_runtime:main"
 tessera-submit-runner = "tessera_agent.campaign_submit_runner:main"
 tessera-a2a-peer = "tessera_control.a2a_peer:main"
+tessera-service-credential = "tessera_agent.service_credentials:main"
 
 [tool.setuptools.data-files]
 "share/tessera/skills/tessera-research-bench" = ["skills/tessera-research-bench/SKILL.md"]

@@ -66,7 +66,7 @@ def old_db(tmp_path):
 
 def test_migration_preserves_rows_and_admits_heavy_stage_codes(old_db):
     env, path, campaign, before = old_db
-    assert migrate_state(env.state) == LATEST_SCHEMA_VERSION == STUCK_HEAVY_STAGE_SCHEMA_VERSION
+    assert migrate_state(env.state) == LATEST_SCHEMA_VERSION >= STUCK_HEAVY_STAGE_SCHEMA_VERSION
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT * FROM campaign_stuck_findings").fetchall() == before
         for i, code in enumerate(("heavy_stage_on_local", "heavy_stage_refused_local")):

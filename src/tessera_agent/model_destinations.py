@@ -35,6 +35,10 @@ _MODEL_ID = r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}"
 # Environment names that would signal an API-key fallback. A reasoning process
 # refuses to start when any of them is present (ADR 0082 §3).
 FORBIDDEN_ENVIRONMENT = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY")
+# The one shape of an API key the runtime accepts: 1-512 printable ASCII bytes, no whitespace. The
+# Messages client and the credential installer both use it, so an installed key is never one the
+# runtime would reject.
+API_KEY_SHAPE = re.compile(rb"[\x21-\x7e]{1,512}")
 
 # Policy tiers recorded on receipts. Fable needs a per-job human approval;
 # nothing in Tessera ever picks a cheaper tier on the caller's behalf.

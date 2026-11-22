@@ -470,6 +470,12 @@ def parser() -> argparse.ArgumentParser:
     from .provider_registration_cli import add_parser as add_providers_command
 
     add_providers_command(subcommands)
+    from .deploy_check_cli import add_parser as add_deploy_check_command
+
+    add_deploy_check_command(subcommands)
+    from .deploy_upgrade_cli import add_parser as add_deploy_upgrade_command
+
+    add_deploy_upgrade_command(subcommands)
     from .provider_trust_cli import add_provider_trust_commands
 
     add_provider_trust_commands(subcommands)
@@ -1024,6 +1030,14 @@ def main() -> int:
         from .provider_registration_cli import run as run_providers
 
         return run_providers(arguments)
+    if arguments.command == "deploy-upgrade":
+        from .deploy_upgrade_cli import run as run_deploy_upgrade
+
+        return run_deploy_upgrade(arguments)
+    if arguments.command == "deploy-check":
+        from .deploy_check_cli import run as run_deploy_check
+
+        return run_deploy_check(arguments)
     if arguments.command == "admin":
         from .provider_trust_cli import run_provider_trust
 

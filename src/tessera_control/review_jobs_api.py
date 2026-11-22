@@ -7,7 +7,12 @@ from fastapi.responses import JSONResponse
 
 from .external_agent_api import Actor, Key
 from .review_jobs import ReviewForbidden, ReviewRefused
-from .review_jobs_models import ApproveReviewTier, ResolveReviewFinding, SubmitReviewJob
+from .review_jobs_models import (
+    ApproveReviewTier,
+    ResolveReviewFinding,
+    SubmitCodeReview,
+    SubmitReviewJob,
+)
 
 router = APIRouter()
 
@@ -37,6 +42,23 @@ def submit(project_id: str, body: SubmitReviewJob, request: Request, actor: Acto
             key,
             body.model_dump(mode="json"),
             request.app.state.review_policy,
+        )
+    )
+
+
+@router.post("/projects/{project_id}/code-reviews")
+def submit_code_review(
+    project_id: str, body: SubmitCodeReview, request: Request, actor: Actor, key: Key
+):
+    """Submit a code review of a platform git branch (ADR 0108); 201 with the job record."""
+    return _response(
+        lambda: request.app.state.review_jobs.submit_code_review(
+            actor,
+            project_id,
+            key,
+            body.model_dump(mode="json"),
+            request.app.state.review_policy,
+            getattr(request.app.state, "code_review_git", None),
         )
     )
 

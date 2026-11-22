@@ -138,13 +138,20 @@ def load_model_profile(path: str) -> dict:
     return profile
 
 
-def pinned_prompt_digest() -> str | None:
-    """SHA-256 of the built-in child's pinned prompt; None (nothing matches) if unavailable."""
+def pinned_prompt_digests() -> frozenset[str]:
+    """SHA-256 digests of the built-in child's pinned prompts (review and re-review).
+
+    Empty (nothing matches) if the child's constants are unavailable or malformed.
+    """
     try:
-        from tessera_agent.code_review_child import CODE_REVIEW_PROMPT_SHA256
+        from tessera_agent.code_review_child import PINNED_PROMPT_DIGESTS
     except Exception:  # noqa: BLE001 - fail closed: no job is pinned to a missing prompt
-        return None
-    return CODE_REVIEW_PROMPT_SHA256 if isinstance(CODE_REVIEW_PROMPT_SHA256, str) else None
+        return frozenset()
+    if not isinstance(PINNED_PROMPT_DIGESTS, (set, frozenset)) or not all(
+        isinstance(item, str) and len(item) == 64 for item in PINNED_PROMPT_DIGESTS
+    ):
+        return frozenset()
+    return frozenset(PINNED_PROMPT_DIGESTS)
 
 
 @dataclass(frozen=True)
@@ -489,8 +496,7 @@ class CodeReviewRunner:
         except Exception:  # noqa: BLE001 - fail closed
             reason = "policy_check_failed"
         if not reason:
-            pinned = pinned_prompt_digest()
-            if pinned is None or job.get("prompt_digest") != pinned:
+            if job.get("prompt_digest") not in pinned_prompt_digests():
                 reason = "prompt_not_pinned"
             elif job.get("egress") != CODE_REVIEW_EGRESS:
                 reason = "egress_not_permitted"

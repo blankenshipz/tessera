@@ -155,6 +155,13 @@ connects, admission relies on the pinned effective harness config digest and gua
 (`openai_only`, `chatgpt_endpoint`), and network-level enforcement for the harness process is not
 implemented (host firewalling is the operator's responsibility).
 
+## Installing a service credential
+
+A model API key for the reasoning service is installed with `tessera-service-credential install` (secret on
+standard input only; it writes the root-owned 0600 key file and the `model-credential` reference file, and a
+receipt with the reference and fingerprint). The start-up checks above are the admission: the installer adds
+none of its own. See [service credentials](service-credentials.md).
+
 ## Required secure operator handoff
 
 1. An enrolled external-agent credential scoped to the exact project and

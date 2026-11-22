@@ -157,7 +157,7 @@ distinct root) does not exist yet: see open question 8.
 A deployment-level opt-in, `tessera serve --review-single-owner` (off by default), relaxes this to
 refuse only the identical principal (the submitter or the ingesting reviewer principal itself). Every
 decision is labelled: the decision row, its event, the resolve response and reads carry `separation_basis`
-(`distinct_person`, or `single_owner_opt_in` when the opt-in let the decision through); the job always carries
+(`distinct_person`, or `single_owner_opt_in` when the opt-in let the decision through; `legacy_unrecorded` marks a decision made before the basis was recorded, written only by the schema-80 upgrade of such rows, counted as neither separation, and never written for a new decision); the job always carries
 `findings_separation_basis` (`distinct_person` or `single_owner_opt_in`, always recorded when findings are ingested); and the
 control status (`GET /external-agent/status`, shown by `tessera_mcp status`) reports `review_single_owner`.
 Plainly: in a one-person deployment, where one owner enrolled the submitting agent, the reviewer and every

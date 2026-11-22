@@ -11,6 +11,9 @@ runner reported (or none), so a paid call that failed or vanished still leaves i
 A receipt is ``bound`` when it names exactly the job's inputs (by snapshot id and digest), the
 job's prompt digest, the most private input class, the job's destination as its provider, and
 (for ``anthropic``) a pinned-price cost and a provider-reported model; only a bound receipt can
+complete a job. A ``reserved_worst_case`` receipt (a billed call whose usage is unknown, costed
+at the reserved worst case) is never bound: it is recorded on failed, vanished and late entries
+with ``bound: false`` and counts in ``cost_cents_total`` (an over-estimate), but it cannot
 complete a job.
 
 A runner whose lease lapsed (expired, or already reaped) may still report the receipt of the
@@ -24,7 +27,7 @@ import json
 
 from pydantic import ValidationError
 
-from .review_jobs_models import ModelCallReceipt
+from .review_jobs_models import RESERVED_COST_BASIS, ModelCallReceipt
 from .store import Conflict, NotFound, _connect, canonical_digest
 
 RUNNER_ACTOR = "system:code-review-runner"
@@ -70,6 +73,74 @@ def create_code_review_schema(connection):
         runner_id TEXT PRIMARY KEY,
         max_running INTEGER NOT NULL CHECK(max_running BETWEEN 1 AND 8),
         seen_at REAL NOT NULL)""")
+    create_code_review_sources_schema(connection)
+
+
+def create_code_review_sources_schema(connection):
+    """Where a code review's subject came from (ADR 0108): one row per job submitted from a
+    platform git branch, written in the job's own submit transaction. Permanent and fixed."""
+    connection.execute("""CREATE TABLE IF NOT EXISTS code_review_sources (
+        job_id TEXT PRIMARY KEY REFERENCES review_jobs(id),
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        repo TEXT NOT NULL, branch TEXT NOT NULL,
+        head_sha TEXT NOT NULL CHECK(length(head_sha)=40),
+        base_branch TEXT NOT NULL,
+        base_sha TEXT NOT NULL CHECK(length(base_sha)=40),
+        focused_tests_json TEXT NOT NULL,
+        round INTEGER NOT NULL CHECK(round BETWEEN 1 AND 3),
+        previous_job_id TEXT REFERENCES review_jobs(id),
+        recheck_findings_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL)""")
+    for action in ("UPDATE", "DELETE"):
+        connection.execute(
+            f"CREATE TRIGGER IF NOT EXISTS code_review_sources_no_{action.lower()} "
+            f"BEFORE {action} ON code_review_sources BEGIN "
+            "SELECT RAISE(ABORT,'code review sources are immutable'); END"
+        )
+
+
+def source_record(connection, job_id):
+    """The job's git source as recorded at submit, or ``None`` (a job without a source)."""
+    row = connection.execute(
+        "SELECT s.* FROM code_review_sources s JOIN review_jobs j ON j.id=s.job_id "
+        "WHERE s.job_id=? AND s.org_id=j.org_id AND s.project_id=j.project_id",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "repo": row["repo"],
+        "branch": row["branch"],
+        "head_sha": row["head_sha"],
+        "base_branch": row["base_branch"],
+        "base_sha": row["base_sha"],
+        "focused_tests": json.loads(row["focused_tests_json"]),
+        "round": row["round"],
+        "previous_job_id": row["previous_job_id"],
+        "recheck_findings": json.loads(row["recheck_findings_json"]),
+    }
+
+
+def recheck_output_valid(source, findings):
+    """ADR 0108 re-review rule: for a round above 1 every finding is ``recheck:<n>`` for a listed
+    previous finding ``n``, each at most once, and nothing else. Round 1 (or no source) is
+    unrestricted here."""
+    if source is None or source["round"] <= 1:
+        return True
+    listed = set(source["recheck_findings"])
+    seen = set()
+    for item in findings:
+        prefix, separator, number = item["category"].partition(":")
+        if prefix != "recheck" or not separator or not number.isascii() or not number.isdigit():
+            return False
+        if number != str(int(number)):
+            return False  # one spelling per number: no leading zeros
+        value = int(number)
+        if value not in listed or value in seen:
+            return False
+        seen.add(value)
+    return True
 
 
 def most_private_class(inputs):
@@ -91,8 +162,11 @@ def receipt_bound(row, receipt):
     ``prompt_sha256`` is the job's prompt digest; (c) it names the most private input class;
     (d) the provider prefix of ``model_configured`` is the job's destination; (e) for
     ``anthropic``, the cost is computed from pinned prices and the model is the one the
-    provider's response named (no subscription or harness-reported route).
+    provider's response named (no subscription or harness-reported route). A reserved
+    worst-case receipt is a reservation, not a measured cost, and is never bound.
     """
+    if receipt.get("cost_basis") == RESERVED_COST_BASIS:
+        return False
     inputs = json.loads(row["inputs_json"])
     expected = {item["snapshot_id"]: item["digest"] for item in inputs}
     if len(expected) != len(inputs) or receipt["input_digests"] != expected:
@@ -163,6 +237,10 @@ def code_review_record(connection, job_id):
         "attempts": row["attempts"],
         "receipt": json.loads(row["receipt_json"]) if row["receipt_json"] else None,
         "review_receipt_digest": row["review_receipt_digest"],
+        "review_receipt": (
+            json.loads(row["review_receipt_json"]) if row["review_receipt_json"] else None
+        ),
+        "source": source_record(connection, job_id),
         "attempt_receipts": attempts,
         "cost_cents_total": sum(
             (entry["receipt"].get("cost_cents") or 0)
@@ -602,7 +680,7 @@ class CodeReviewRunStore:
             row = self._runner_attempt(
                 self._runner_job(connection, job_id, runner_id, now), attempt
             )
-            body = self._validated_output(row, output)
+            body = self._validated_output(row, output, connection)
             self._clear_lease(connection, job_id)
             # _store_output appends the completed attempt's receipt.
             return self._store_output(

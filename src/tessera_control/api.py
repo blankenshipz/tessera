@@ -115,6 +115,7 @@ def create_app(
     from .credential_leases import _FakeSecretBackend
     from .dataset_ingestion import DatasetIngestionStore
     from .dataset_ingestion_api import router as dataset_ingestion_router
+    from .deploy_check_api import router as deploy_check_router
     from .execution import ExecutionStore
     from .execution_api import router as execution_router
     from .execution_run_receipt_api import router as execution_run_receipt_router
@@ -232,6 +233,7 @@ def create_app(
     app.state.storage_retention_state_dir = state_dir
     app.include_router(storage_retention_router)
     app.include_router(credential_health_router)
+    app.include_router(deploy_check_router)
     app.state.external_agents = ExternalAgentStore(state_dir)
     app.include_router(external_agent_router)
     app.state.agent_authority = AgentAuthorityStore(state_dir)
@@ -244,6 +246,8 @@ def create_app(
     app.state.review_jobs = ReviewJobStore(state_dir)
     app.state.review_jobs.single_owner = review_single_owner
     app.state.review_policy = NoDestinationsPolicy()
+    # Operator git remotes for code review submit (ADR 0108); none: submit is refused.
+    app.state.code_review_git = None
     app.include_router(review_jobs_router)
     from .agent_loop_control import AgentLoopControlStore
     from .agent_loop_control_api import router as agent_loop_control_router

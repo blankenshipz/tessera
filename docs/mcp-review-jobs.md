@@ -89,7 +89,9 @@ findings in default mode. The operator can use `tessera serve --review-single-ow
 only the identical principal. A person's own agent path does not exist yet and is an open question in the ADR.
 
 Everything is recorded: `separation_basis` on the decision, its event, the resolve response and reads is
-`distinct_person` or `single_owner_opt_in`; the job always shows `findings_separation_basis` (the same two
+`distinct_person` or `single_owner_opt_in`, or `legacy_unrecorded` for a decision made before the basis was
+recorded (the schema-80 upgrade marks such rows this way, never by guessing; it counts as neither separation,
+and the application never writes it for a new decision); the job always shows `findings_separation_basis` (only the two real
 values); and `review_single_owner` appears in `GET /external-agent/status` and `tessera_mcp status`.
 
 ## Enrolling a person (operator opt-in)
@@ -108,7 +110,7 @@ for `diff`, absent for `snapshot`, different from the head) and `rubric_digest`.
 this kind and refused for every other. Each of those digests must also be listed in `inputs`, so
 derived data class, sealed-holdout refusal and policy apply to them. Head and base digests must be
 snapshots already in the project's custody (`input_not_found` otherwise). `tessera_list_review_jobs` takes an
-optional `kind` filter. There are no new tools or scopes.
+optional `kind` filter. Submitting from a git branch is described at the end of this section.
 
 A completed code review carries numbered findings (ids `1` to `n`), a verdict (`MERGE`,
 `MERGE-WITH-FOLLOWUPS` or `CHANGES-REQUIRED`) and a model-call receipt, and the job shows a review
@@ -125,7 +127,43 @@ client with an API-key credential held by reference (`--model-profile` and
 environment variable. Egress must be `model_runtime` and the destination `anthropic`. The receipt
 tier must equal the job tier, its input digests and class must match the job's inputs, and a billed
 cost (`cost_cents`) over the budget fails the job; the job shows `attempt_receipts` and
-`cost_cents_total` even for failed attempts. The runner needs an operator-written
+`cost_cents_total` even for failed attempts. A billed call with unknown usage (timeout or server
+error after sending) is recorded as `reserved_worst_case`, an over-estimate; it never completes a
+job, is flagged not bound and is counted in the total. The runner needs an operator-written
 `--policy module:attribute`;
 [docs/examples/code_review_policy.py](examples/code_review_policy.py) is an example to copy, not a
 default. A runner-completed job records no findings actor.
+
+### Submitting a review from a platform git branch
+
+`tessera_submit_code_review` (scope `review:submit`, [ADR 0108](decisions/0108-code-review-submit.md))
+submits a `code_review` job for a branch on the platform's own git remote, so no digests or snapshots
+are prepared by hand. The body names `repo` (an operator-mapped name), `branch`, `head_sha` (40
+lowercase hex), optional `base_branch` (default `main`), `tier`, `destination_id` (default
+`anthropic`), `budget_cents` and `focused_tests` (1 to 20 files). Control reads a local bare
+repository only (no network git), checks that the branch is at `head_sha`, finds the merge-base with
+the base branch and adopts snapshots of the changed files only (base, head and a generated rubric),
+then submits a `diff` job with the pinned prompt for the round. Refusals use stable reasons
+(`git_remote_not_configured`, `branch_not_found`, `head_mismatch`, `base_not_found`, `no_changes`,
+`change_too_large`, `unsupported_entry`, `focused_tests_invalid`, `review_chain_mismatch`,
+`review_round_limit`, `review_already_merge`, `recheck_findings_invalid`).
+
+Focused tests only: each entry is a relative POSIX path under a `tests/` directory segment, named
+`test_*.py`, a regular file at the head, with no glob characters, `..` or directory. A directory or
+the whole test tree cannot be named. To re-review, pass `previous_job_id` (a completed review of the
+same repo and branch) and `recheck_findings` (finding numbers of that job). The re-review checks only
+those findings and reports each unresolved one with category `recheck:<n>`. At most 3 rounds; a
+fourth is refused, and so is a re-review after a `MERGE` verdict. The verdict, the findings and the
+source (repo, branch, head and base SHAs, focused tests, round) are written to the job's review
+receipt; the job shows `code_review.source` and `code_review.review_receipt`. The result is advisory and authorizes nothing.
+
+The same submit is available from the command line:
+
+    tessera-review submit --repo R --branch B --head SHA --tier sonnet --budget-cents N \
+        --test tests/test_x.py [--test ...] [--previous JOB --recheck N ...]
+
+It prints the job id, round and state as JSON. The submit is atomic: the snapshots, job, source row,
+events and idempotency record commit in one transaction, so a refused submit leaves nothing, and a
+replay of the key returns the same job without reading git. Snapshots adopted this way are
+`private_derived`, recorded with a `workspace.snapshot_adopted` event (origin `code_review_submit`);
+the client supplies no bytes.
