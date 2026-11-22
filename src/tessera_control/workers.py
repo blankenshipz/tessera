@@ -255,7 +255,12 @@ class WorkerRegistryStore(Store):
     def heartbeat(
         self, actor: dict[str, Any], key: str, digest: str, payload: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
-        self._body(WorkerHeartbeat, payload)
+        body = self._body(WorkerHeartbeat, payload)
+        memory = {
+            name: body[name]
+            for name in ("memory_available_bytes", "container_memory_bytes")
+            if body.get(name) is not None
+        }
 
         def command(
             connection: sqlite3.Connection, live: dict[str, Any]
@@ -284,7 +289,7 @@ class WorkerRegistryStore(Store):
                 None,
                 "worker.heartbeat",
                 updated["revision"],
-                {"worker_id": row["id"], "approved_metadata_only": True},
+                {"worker_id": row["id"], "approved_metadata_only": True, **memory},
             )
             return 200, self._response(updated)
 

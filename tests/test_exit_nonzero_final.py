@@ -207,9 +207,19 @@ def test_an_exit_code_is_refused_without_a_confirmed_exit(fields):
 # -- composition with infrastructure retries (ADR 0058) ------------------------------------------
 
 
-def test_with_infrastructure_retries_on_a_killed_exit_without_outputs_uses_their_bound(tmp_path):
+def test_with_infrastructure_retries_on_a_killed_exit_without_outputs_uses_their_bound(
+    tmp_path, monkeypatch
+):
     """A 137 the worker reported with no receipt follows the spec's infrastructure policy:
-    retried under its own bound, never spending a scientific retry."""
+    retried under its own bound, never spending a scientific retry. (The test moves the
+    runner's clock past a heartbeat's freshness, so the worker's memory report is fixed.)"""
+    from tessera_control.campaign_provider_worker import WorkerGrantProvider
+
+    monkeypatch.setattr(
+        WorkerGrantProvider,
+        "memory_report",
+        lambda self, rt, ctx, stage: (8 * 1024**3, 256 * 1024**2),
+    )
     world, campaign = _world(
         tmp_path, retry={"max_attempts": 1, "infra_retries": 1, "transient_exit_codes": [7]}
     )

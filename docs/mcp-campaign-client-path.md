@@ -25,6 +25,8 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_campaign_retries` | `GET /campaigns/{id}/retries` | `campaign:read` |
 | `tessera_campaign_standing_status` | `GET /projects/{p}/agent-standing-status` | `campaign:read` |
 | `tessera_campaign_gate_decisions` | `GET /campaigns/{id}/gate-decisions` | `campaign:read` |
+| `tessera_campaign_holdout` | `GET /campaigns/{id}/holdout` | `campaign:read` |
+| `tessera_campaign_holdout_claims` | `GET /projects/{p}/holdout-claims[?partition_digest=]` | `campaign:read` |
 | `tessera_validate_campaign_spec` | `POST /projects/{p}/campaign-specs/validate` | `campaign:submit` |
 | `tessera_campaign_grants` | `GET /campaigns/{id}/grants` | `campaign:logs` |
 | `tessera_reduce_campaign_budget` | `POST /campaigns/{id}/budget-reduction` | `campaign:cancel` |

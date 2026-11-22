@@ -15,6 +15,7 @@ this is recorded status, exit code, failure class and bounded detail), ``budget:
 import json
 from typing import Any
 
+from .campaign_holdout import campaign_claims, project_claims
 from .campaign_infra_retry import infra_attempts
 from .campaign_models import normalize, parse_spec_json
 from .campaign_store import CampaignStore
@@ -283,6 +284,64 @@ class AgentCampaignReads(CampaignStore):
                 "status": campaign["status"],
                 "stages": stages,
                 "stop": "tessera_cancel_campaign stops the campaign and so every retry",
+                "boundary": BOUNDARY,
+            }
+        finally:
+            connection.close()
+
+    def campaign_holdout(self, principal, campaign_id) -> dict[str, Any]:
+        """One-time holdout claims of a campaign and their scored metrics (campaign:read,
+        ADR 0068). Per final evaluation stage the approved declaration, and the claim the
+        platform recorded (absent until the runner opened it)."""
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, "campaign:read")
+            campaign = self._campaign(connection, actor, campaign_id)
+            claims = {c["stage_key"]: c for c in campaign_claims(connection, campaign_id)}
+            stages = []
+            for stage in normalize(parse_spec_json(campaign["spec_json"])).stages:
+                if stage.evaluation is None:
+                    continue
+                declared = stage.holdout
+                stages.append(
+                    {
+                        "stage_key": stage.key,
+                        "final": stage.evaluation.final,
+                        "metrics": [metric.name for metric in stage.metrics],
+                        "holdout": None if declared is None else declared.model_dump(mode="json"),
+                        "claim": claims.get(stage.key),
+                    }
+                )
+            return {
+                "campaign_id": campaign_id,
+                "status": campaign["status"],
+                "evaluation_stages": stages,
+                "boundary": BOUNDARY
+                + " A scored claim records measured numbers, not a scientific verdict.",
+            }
+        finally:
+            connection.close()
+
+    def holdout_claims(self, principal, project_id, partition_digest=None) -> dict[str, Any]:
+        """Every holdout claim in the project, optionally for one partition (campaign:read).
+
+        A partition listed here is sealed for that scope: a new claim on it is refused."""
+        if partition_digest is not None and (
+            len(partition_digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in partition_digest)
+        ):
+            raise StoreError("partition_digest must be a lowercase sha256 hex digest.")
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, "campaign:read")
+            self._project(connection, actor, project_id)
+            claims = project_claims(
+                connection, actor["org_id"], project_id, partition_digest, _ROW_CAP
+            )
+            return {
+                "project_id": project_id,
+                "claims": claims,
+                "truncated": len(claims) == _ROW_CAP,
                 "boundary": BOUNDARY,
             }
         finally:

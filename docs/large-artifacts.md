@@ -75,7 +75,20 @@ future work.
 2. **Verification.** `complete` re-hashes every chunk and then the whole artifact, one
    chunk at a time and outside the write lock, then binds the quarantine row to exactly
    the chunk set it hashed. A missing, wrong or altered chunk, or a sha256 that is not
-   the declared one, refuses completion (409) and leaves nothing quarantined.
+   the declared one, refuses completion (409) and leaves nothing quarantined. Hashing several
+   gigabytes takes longer than a worker's request deadline (at most 20 s), so `complete` waits
+   only a few seconds (`VERIFY_WAIT_SECONDS`) and otherwise answers **202** `{"status":
+   "verifying", "retry_after_seconds": N}`, not recorded as the answer to the key. The
+   verification keeps running, one per upload and chunk set; the worker asks again with the same
+   key, a repeat joins that verification instead of hashing the file again, and the call that
+   finds it done gets the ordinary 201 receipt (a replay after that is the recorded answer). A
+   worker waits at most 9 minutes of elapsed time, counting the time each ask itself takes, and
+   then gives up and retries later; that is below the 10-minute stall window of the exited-attempt
+   hold (ADR 0064), so a worker never keeps waiting for a verification the hold has stopped
+   waiting for (a verification slower than that ends as an incomplete transfer, as before). At
+   most four whole-file hashes run at once on control, and a finished answer is kept for an hour.
+   A worker that does not know "verifying" rejects the 202 body (it carries no lease or epoch),
+   fails that attempt, and its next ask gets the 201 without another hash.
 3. **Quarantine.** The result is the ordinary quarantined, unclassified `artifacts` row
    (same id scheme, events and receipt shape); its `content` is empty and its bytes are
    the chunk rows. Manifests list it like any artifact. It has no project-object-store

@@ -67,6 +67,25 @@ Chunked input snapshots had a fixed 2 GiB / 8 GiB-per-project bound.
    (Idempotency-Key required) returns a recorded answer without sweeping again. Expired or
    epoch-stale uploads are restarted.
 
+### Completion is single-flight and may answer 202
+
+A live run of a 1,430-chunk (about 5.7 GB) output showed the weakness of verifying inside the
+request: `complete` re-hashed the whole file in every call, the worker's request deadline (the
+lease minus a renewal interval, at most 20 s) passed first, and each retry started another
+multi-gigabyte hash while the first was still running, so the worker never saw an answer
+and the attempt closed as an unresolved exit. `complete` now waits a bounded few seconds and
+otherwise answers 202 "verifying" (never recorded under the idempotency key); the verification
+runs once per upload and chunk set and later calls join it. The worker repeats the same request
+until the receipt arrives, for at most 9 minutes of elapsed time (measured on the clock, so the
+time each ask takes counts). That bound is deliberately below the 10-minute stall window of
+ADR 0064's exited-attempt hold, so the worker never polls for a verification the hold has
+stopped waiting for; a verification slower than that ends as an incomplete transfer, retried
+later, as before. Control runs at most four whole-file hashes at once, keeps a finished answer
+an hour (it is guarded by the chunk fingerprint, re-checked in the completing transaction) and
+drops one only if it is still the flight under its key. A worker that predates the 202 rejects
+its body and fails that attempt; its next ask gets the 201 with no second hash. The
+in-transaction check that the stored chunk set equals the verified one is unchanged.
+
 ## Consequences
 
 - Bytes remain in the control SQLite database (the honest limit of ADR 0037); a consumed

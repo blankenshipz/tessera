@@ -38,6 +38,23 @@ def retries(campaign_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.campaign_retries(actor, campaign_id)
 
 
+@router.get("/campaigns/{campaign_id}/holdout")
+def holdout(campaign_id: str, request: Request, actor: Actor):
+    return request.app.state.agent_campaign_reads.campaign_holdout(actor, campaign_id)
+
+
+@router.get("/projects/{project_id}/holdout-claims")
+def holdout_claims(
+    project_id: str,
+    request: Request,
+    actor: Actor,
+    partition_digest: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
+):
+    return request.app.state.agent_campaign_reads.holdout_claims(
+        actor, project_id, partition_digest
+    )
+
+
 @router.get("/campaigns/{campaign_id}/budget")
 def budget(campaign_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.campaign_budget(actor, campaign_id)

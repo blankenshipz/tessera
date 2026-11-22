@@ -34,6 +34,9 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_retries": "campaign:read",
     "tessera_campaign_standing_status": "campaign:read",
     "tessera_campaign_gate_decisions": "campaign:read",
+    # ADR 0068: read-only one-time holdout claims and their scored metrics.
+    "tessera_campaign_holdout": "campaign:read",
+    "tessera_campaign_holdout_claims": "campaign:read",
     # ADR 0055: steering. Validation is a dry-run submit; the others only reduce authority.
     "tessera_validate_campaign_spec": "campaign:submit",
     "tessera_prepare_stage_retry": "campaign:read",
@@ -212,6 +215,25 @@ def register_campaign_tools(
         A gate decision is a human go/no-go; an unlock evaluation is in the campaign receipt.
         """
         return await client.gate_decisions(campaign_id)
+
+    async def tessera_campaign_holdout(campaign_id: str) -> dict[str, Any]:
+        """Read a campaign's evaluation stages and holdout claims (campaign:read, read-only).
+
+        Per evaluation stage: whether it is final, the metrics it scores, the sealed partition
+        and claim scope the approved spec declared, and the claim the platform recorded
+        (opened, scored with the metric values, or spent; absent until the runner opened it).
+        A partition opens once per scope; nothing here opens, reopens or releases a claim.
+        """
+        return await client.campaign_view(campaign_id, "holdout")
+
+    async def tessera_campaign_holdout_claims(
+        partition_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """List this project's holdout claims, optionally for one partition digest
+        (campaign:read, read-only). Check here before submitting a final evaluation stage:
+        a (partition digest, claim scope) pair already listed is refused at submit.
+        """
+        return await client.holdout_claims(partition_digest)
 
     async def tessera_cancel_campaign(
         campaign_id: str, expected_revision: int, reason: str, idempotency_key: str
@@ -395,6 +417,8 @@ def register_campaign_tools(
         tessera_campaign_retries,
         tessera_campaign_standing_status,
         tessera_campaign_gate_decisions,
+        tessera_campaign_holdout,
+        tessera_campaign_holdout_claims,
         tessera_cancel_campaign,
         tessera_validate_campaign_spec,
         tessera_prepare_stage_retry,

@@ -26,4 +26,9 @@ class WorkerLifecycle(WorkerRequest):
 
 
 class WorkerHeartbeat(WorkerRequest):
-    pass
+    """A liveness beat. The memory figures are optional and, when sent, are what the worker
+    host reports about itself (ADR 0067): memory available now, and the memory limit its
+    stage containers run with. They feed placement and retry decisions and nothing else."""
+
+    memory_available_bytes: Annotated[int, Field(strict=True, ge=0, le=2**50)] | None = None
+    container_memory_bytes: Annotated[int, Field(strict=True, ge=1_048_576, le=2**50)] | None = None

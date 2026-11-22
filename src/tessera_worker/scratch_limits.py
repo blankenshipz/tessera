@@ -42,6 +42,18 @@ def host_memory_bytes(meminfo: Path = MEMINFO) -> int | None:
     return None
 
 
+def host_memory_available_bytes(meminfo: Path = MEMINFO) -> int | None:
+    """Memory the host can give a new container now (``MemAvailable``), or ``None`` where it
+    cannot be read. Reported to control only as a placement hint (ADR 0067)."""
+    try:
+        for line in meminfo.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def check_host_capacity(
     memory_bytes: int | None, max_scratch_bytes: int | None, *, meminfo: Path = MEMINFO
 ) -> None:

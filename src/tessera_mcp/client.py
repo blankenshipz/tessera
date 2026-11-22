@@ -158,9 +158,14 @@ class ControlClient:
         )
 
     async def campaign_view(self, campaign_id, view):
-        if view not in {"outputs", "logs", "budget", "grants", "retries"}:
+        if view not in {"outputs", "logs", "budget", "grants", "retries", "holdout"}:
             raise ControlError("Unknown campaign view")
         return await self._request("GET", f"/campaigns/{segment(campaign_id)}/{view}")
+
+    async def holdout_claims(self, partition_digest=None):
+        project = segment(self.config.project_id)
+        query = "" if partition_digest is None else f"?partition_digest={segment(partition_digest)}"
+        return await self._request("GET", f"/projects/{project}/holdout-claims{query}")
 
     async def standing_status(self):
         project = segment(self.config.project_id)

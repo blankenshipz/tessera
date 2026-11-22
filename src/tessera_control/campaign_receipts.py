@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from .campaign_gates import unlock_receipt_section
+from .campaign_holdout import receipt_section as holdout_receipt_section
 from .campaign_io import stage_io
 from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
 from .campaign_placement import placements as recorded_placements
@@ -359,6 +360,8 @@ def build_receipt(
             "lineage": _lineage(connection, campaign_id),
             **({"unlock": unlock} if unlock["requirements"] else {}),
             **steering_receipt_section(connection, campaign_id),
+            # ADR 0068: the one-time holdout claims and their scored values; absent otherwise.
+            **holdout_receipt_section(connection, campaign_id),
             "verdict": {"operational": operational, "scientific_verdict": scientific},
             "evidence_class": "operational",
             # Reviews resolved by delegation, citing the approval (ADR 0044); absent when

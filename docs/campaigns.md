@@ -32,6 +32,22 @@ under the campaign's approval, so a conditional unlock can run unattended
 stages do not take it. A stage with `gate_evidence` must have `retry.max_attempts` of 1: a
 retry would re-admit the same variant and a seed binds once per variant and lock.
 
+A v2 stage may be an evaluation stage (`evaluation: {final, holdout}`,
+[ADR 0068](decisions/0068-sealed-holdout-evaluation-stages.md)): it runs the spec's scorer image
+and must declare the `metrics` it scores. `final: true` means no stage may consume its outputs.
+A final stage may declare `holdout: {input, partition_digest, claim_scope}`: `input` is one of
+its `snapshot` or `artifact` inputs (not `public`) whose pinned digest is `partition_digest`, no
+other stage of the spec may read that digest, and retries are off (`retry.max_attempts` 1, no
+`infra_retries`). The runner opens one claim per project, partition digest and claim scope just
+before the stage's input is released, after its dependencies succeeded; a later claim is refused
+at submit, approval or the claim itself (`holdout_already_claimed`). Once the claim is open a
+failed attempt (even one reconciled as not started) fails the stage instead of being requeued.
+A stage that is not the holdout stage cannot receive a partition that has a claim, and no
+`artifact` input may come from a holdout stage: both are refused at submit and approval and
+again before each input release (`sealed_partition`). The claim ends `scored` (with the metric
+values) or `spent` and is on the receipt (`holdout_claims`); read it with
+`tessera_campaign_holdout` or `tessera_campaign_holdout_claims`.
+
 ```
 tessera campaign submit --owner-header FILE --project-id P --spec spec.json --idempotency-key K
 ```
@@ -178,6 +194,20 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   admitted like the stage's own provider at submit, approval and again at reservation (a
   rerouted attempt drops the stage's `provider_config`). `tessera_campaign_retries` shows the state and
   `tessera_cancel_campaign` stops it.
+- **Resource-limit stops (ADR 0067).** A stage that stopped on a resource limit is an
+  infrastructure failure: an attempt that succeeded but whose stop metric (listed in
+  `retry.resource_limit_metrics`, a metric of the stage) is above zero, a kill at the time limit,
+  or an out-of-memory kill. With `retry.infra_retries` enabled the runner retries it on the
+  next approved placement candidate (or reroute provider). A stop on the stage's own time
+  budget is never repeated on the provider where it happened (the approved spec has no raised
+  budget). A kill of a stage with no other approved place is retried in place exactly as ADR 0058
+  did; where other places exist it returns to the same provider only when the worker's fresh
+  report shows free memory above the limit the stage hit. Otherwise the stage ends as
+  `resource_limit_no_provider`. A kill at the time limit is exit 137 and repeats in place within
+  `infra_retries`, as in ADR 0058. With the bound spent, a stop metric keeps the recorded result
+  and only the `stage_infra_retries_exhausted` event names it. A `resource_limit_metrics` metric
+  may not also be in `stop_when`. The memory gate covers every `infra_exit_codes` code, and the
+  heartbeat figures are the worker's unverified claim. Every attempt and its reason are on the receipt.
 - **Confirmed exits (ADR 0053).** An `admitted`, `running` or `unknown` attempt whose worker
   confirmed the exit, with no contradicting observation, is resolved by the runner on its next tick:
   the grant and its slot are released and the cost recorded (never above the hold), the attempt becomes

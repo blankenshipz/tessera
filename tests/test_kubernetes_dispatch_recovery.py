@@ -58,7 +58,7 @@ def test_dispatch_ledger_backup_held_restore_preserves_data_and_remains_repeatab
 ) -> None:
     response, _worker, _package = _admitted_package(tmp_path, migrate_from_v35=migrated)
     state = tmp_path / "state"
-    assert LATEST_SCHEMA_VERSION == 71
+    assert LATEST_SCHEMA_VERSION == 72
     assert migrate_state(state) == LATEST_SCHEMA_VERSION
     assert migrate_state(state) == LATEST_SCHEMA_VERSION
 

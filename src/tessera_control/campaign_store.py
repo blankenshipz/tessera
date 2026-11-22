@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from . import campaign_placement, program_budget, provider_trust
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
+from .campaign_holdout import campaign_claims, check_unclaimed
 from .campaign_io import resolve_artifact
 from .campaign_models import (
     GRANT_SETTLE_MARGIN_SECONDS,
@@ -271,6 +272,7 @@ class CampaignStore(
         live: dict[str, Any],
         project_id: str,
         spec: Any,
+        campaign_id: str | None = None,
     ) -> None:
         normal = normalize(spec)
         # ADR 0060: every approved candidate passes the checks the stage's own provider does,
@@ -327,6 +329,12 @@ class CampaignStore(
                     connection, candidate, providers[stage.key, candidate.provider], digest
                 )
             self._check_reroutes(connection, project_id, stage, digest)
+        try:
+            # ADR 0068: a sealed partition opens once per scope; a claimed one is refused here
+            # as well as at the claim itself.
+            check_unclaimed(connection, project_id, spec, campaign_id)
+        except ValueError as error:
+            raise Conflict(str(error)) from None
 
     def _check_reroutes(
         self, connection: sqlite3.Connection, project_id: str, stage: Any, digest: Any
@@ -506,7 +514,9 @@ class CampaignStore(
             if forward:
                 # Cleanup re-approvals must not depend on forward-only references (a retired
                 # worker or snapshot must not strand a cancel).
-                self._check_references(connection, live, campaign["project_id"], spec)
+                self._check_references(
+                    connection, live, campaign["project_id"], spec, campaign_id=campaign["id"]
+                )
             unlock_evaluations: list[dict[str, Any]] = []
             if body.unlock and campaign["status"] != "submitted":
                 # Never accept a stated condition and then drop it (ADR 0045).
@@ -850,6 +860,8 @@ class CampaignStore(
                 # ADR 0060: where each stage with candidates was placed and why others were
                 # skipped, its steering and, while it waits, the reasons.
                 "placement": campaign_placement.status_view(connection, campaign),
+                # ADR 0068: one-time holdout claims this campaign opened, with scored values.
+                "holdout_claims": campaign_claims(connection, campaign_id),
             }
         finally:
             connection.close()

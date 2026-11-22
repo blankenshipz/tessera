@@ -22,6 +22,9 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -388,6 +391,55 @@ def reclaim_artifact_bytes(
 
 class _ChunkRejected(Conflict):
     """A refused chunk whose partial storage was removed; the removal is committed."""
+
+
+# Hashing a multi-gigabyte upload takes longer than a worker's request deadline (at most 20 s,
+# the lease minus a renewal interval). ``complete`` therefore waits only this long for the
+# verification and otherwise answers 202 "verifying"; the worker asks again with the same key
+# and a repeat joins the verification already running instead of starting another (ADR 0050).
+VERIFY_WAIT_SECONDS = 8.0
+VERIFY_RETRY_AFTER_SECONDS = 5
+# A finished answer is kept (it is guarded by the chunk fingerprint) at most this long, so an
+# upload that never completes (expired, aborted) cannot pin it for the life of the process.
+FLIGHT_KEEP_SECONDS = 3600.0
+# Whole-file hashes running at once across uploads; the rest wait for a slot (their callers
+# answer 202 meanwhile).
+MAX_CONCURRENT_VERIFICATIONS = 4
+_HASH_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_VERIFICATIONS)
+
+
+class _Flight:
+    """One whole-file verification: its future and when it started and finished."""
+
+    def __init__(self) -> None:
+        self.future: Future = Future()
+        self.started = time.monotonic()
+        self.finished: float | None = None
+
+
+_FLIGHTS: dict[tuple[str, str, str], _Flight] = {}
+_FLIGHTS_LOCK = threading.Lock()
+
+
+def _forget(key: tuple[str, str, str], flight: _Flight) -> None:
+    """Drop ``flight`` only if it is still the one under ``key`` (never a newer one)."""
+    with _FLIGHTS_LOCK:
+        if _FLIGHTS.get(key) is flight:
+            _FLIGHTS.pop(key, None)
+
+
+def _sweep_flights(now: float) -> None:
+    """Forget finished answers older than ``FLIGHT_KEEP_SECONDS`` (called under the lock)."""
+    for key in [
+        k
+        for k, flight in _FLIGHTS.items()
+        if flight.finished is not None and now - flight.finished > FLIGHT_KEEP_SECONDS
+    ]:
+        _FLIGHTS.pop(key, None)
+
+
+class _VerificationPending(Exception):  # noqa: N818 - a control-flow signal, not an error
+    """The whole-file verification is still running; the caller answers 202."""
 
 
 class LargeArtifactStore(ArtifactStore):
@@ -859,7 +911,15 @@ class LargeArtifactStore(ArtifactStore):
         path = f"/worker/leases/{lease_id}/large-artifact-uploads/{upload_id}/complete"
         # The multi-gigabyte hash runs on a read connection, outside the write lock. The
         # write transaction below then binds to exactly the chunk set that was hashed.
-        verified = self._verify_stored(worker, lease_id, upload_id)
+        try:
+            verified = self._verify_stored(worker, lease_id, upload_id)
+        except _VerificationPending:
+            # Not recorded as the answer to this key: the worker repeats the same request.
+            return 202, {
+                "id": upload_id,
+                "status": "verifying",
+                "retry_after_seconds": VERIFY_RETRY_AFTER_SECONDS,
+            }
 
         def command(connection: sqlite3.Connection, actor: dict[str, Any]):
             lease, grant = self._grant_for_upload(connection, actor, lease_id)
@@ -908,28 +968,74 @@ class LargeArtifactStore(ArtifactStore):
         )
 
     def _verify_stored(self, worker: dict[str, Any], lease_id: str, upload_id: str) -> str | None:
-        """Hash the stored chunks on a read-only pass; ``None`` when the upload is not ready."""
+        """Hash the stored chunks on a read-only pass; ``None`` when the upload is not ready.
+
+        One verification runs per upload and chunk set: a repeated ``complete`` (a worker whose
+        deadline passed asks again) waits on it instead of hashing the file again. Raises
+        ``_VerificationPending`` when it is still running after ``VERIFY_WAIT_SECONDS``."""
         connection = _connect(self.database_path)
         try:
             actor = self._live_principal(connection, worker, audience="worker")
             self._grant_for_upload(connection, actor, lease_id)
             row = self._upload_row(connection, actor, lease_id, upload_id)
             if row["status"] == "completed":
+                with _FLIGHTS_LOCK:  # nothing left to verify: forget this upload's answers
+                    for stale in [
+                        k for k in _FLIGHTS if k[:2] == (str(self.database_path), upload_id)
+                    ]:
+                        _FLIGHTS.pop(stale, None)
                 return ""  # replayed completion; the command returns the recorded artifact
             manifest = json.loads(row["manifest_json"])
-            try:
-                verify_artifact_bytes(
-                    connection,
-                    upload_id,
-                    manifest["relative_path"],
-                    manifest["size"],
-                    manifest["sha256"],
-                )
-            except Conflict:
-                return None
-            return chunk_fingerprint(connection, upload_id)
+            fingerprint = chunk_fingerprint(connection, upload_id)
         finally:
             connection.close()
+        key = (str(self.database_path), upload_id, fingerprint)
+        with _FLIGHTS_LOCK:
+            _sweep_flights(time.monotonic())
+            flight = _FLIGHTS.get(key)
+            if flight is None:
+                flight = _FLIGHTS[key] = _Flight()
+                threading.Thread(
+                    target=self._verification_job,
+                    args=(flight, upload_id, manifest, fingerprint),
+                    daemon=True,
+                ).start()
+        try:
+            result = flight.future.result(timeout=VERIFY_WAIT_SECONDS)
+        except FutureTimeout:
+            raise _VerificationPending from None
+        except BaseException:
+            _forget(key, flight)
+            raise
+        if result is None:  # not ready or mismatched: a later call hashes afresh
+            _forget(key, flight)
+        return result
+
+    def _verification_job(
+        self, flight: _Flight, upload_id: str, manifest: dict[str, Any], fingerprint: str
+    ) -> None:
+        with _HASH_SLOTS:
+            connection = _connect(self.database_path)
+            try:
+                try:
+                    verify_artifact_bytes(
+                        connection,
+                        upload_id,
+                        manifest["relative_path"],
+                        manifest["size"],
+                        manifest["sha256"],
+                    )
+                except Conflict:
+                    outcome: str | None = None
+                else:
+                    outcome = fingerprint
+                flight.finished = time.monotonic()
+                flight.future.set_result(outcome)
+            except BaseException as error:
+                flight.finished = time.monotonic()
+                flight.future.set_exception(error)
+            finally:
+                connection.close()
 
 
 __all__ = [

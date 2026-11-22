@@ -123,6 +123,10 @@ class RetryPolicy(_Strict):
         list[Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,63}$")]],
         Field(max_length=4),
     ] = []  # noqa: RUF012
+    # ADR 0067: stage metrics that report the stage stopped on a resource limit (its time
+    # budget, for example) when their recorded value is above zero. Such an attempt is an
+    # infrastructure failure, retried under ``infra_retries`` like a killed container.
+    resource_limit_metrics: Annotated[list[MetricName], Field(max_length=4)] = []  # noqa: RUF012
 
     @model_serializer(mode="wrap")
     def _omit_defaults(self, handler):
@@ -134,6 +138,8 @@ class RetryPolicy(_Strict):
             value.pop("infra_exit_codes", None)
         if not self.reroute_providers:
             value.pop("reroute_providers", None)
+        if not self.resource_limit_metrics:
+            value.pop("resource_limit_metrics", None)
         return value
 
 
@@ -386,6 +392,40 @@ class GateEvidenceSpec(_Strict):
     metrics: Annotated[list[GateMetricDeclaration], Field(min_length=1, max_length=16)]
 
 
+# ADR 0068: the purpose a sealed partition is opened for; one claim per (digest, scope).
+ClaimScope = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9._:/-]{0,127}$")]
+
+
+class HoldoutClaimSpec(_Strict):
+    """A sealed partition the stage opens once (ADR 0068).
+
+    ``input`` names one of the stage's own inputs: a ``snapshot`` or ``artifact`` input whose
+    pinned digest equals ``partition_digest``. The platform records at most one claim per
+    (project, ``partition_digest``, ``claim_scope``) and refuses every later one."""
+
+    input: Key
+    partition_digest: Sha256Digest
+    claim_scope: ClaimScope
+
+
+class EvaluationSpec(_Strict):
+    """An evaluation stage: it runs the spec's scorer image on custody inputs (ADR 0068).
+
+    ``final`` marks the stage the spec designates as final: no other stage may consume its
+    outputs, so a score on a sealed partition can never feed back into selection. Only a
+    final stage may declare ``holdout``. The scored values are the stage's ``metrics``."""
+
+    final: bool = False
+    holdout: HoldoutClaimSpec | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler):
+        value = handler(self)
+        if self.holdout is None:
+            value.pop("holdout", None)
+        return value
+
+
 # ADR 0060: a stage may name further provider candidates after its own, in order.
 MAX_ALTERNATE_PROVIDERS = 4
 
@@ -438,10 +478,14 @@ class StageV2(_Strict):
         Annotated[list[ProviderCandidate], Field(min_length=1, max_length=MAX_ALTERNATE_PROVIDERS)]
         | None
     ) = None
+    # ADR 0068: an evaluation stage and its one-time holdout claim; absent keeps the digest.
+    evaluation: EvaluationSpec | None = None
 
     @model_serializer(mode="wrap")
     def _omit_absent(self, handler):
         value = handler(self)
+        if self.evaluation is None:
+            value.pop("evaluation", None)
         if self.send_classes is None:
             value.pop("send_classes", None)
         if self.gate_evidence is None:
@@ -576,6 +620,12 @@ class NormalStage:
     scratch_bytes: int | None = None
     # ADR 0060: further provider candidates, in order, after ``provider``.
     alternates: tuple[NormalCandidate, ...] = ()
+    # ADR 0068: an evaluation stage (and its one-time holdout claim).
+    evaluation: EvaluationSpec | None = None
+
+    @property
+    def holdout(self) -> HoldoutClaimSpec | None:
+        return None if self.evaluation is None else self.evaluation.holdout
 
     @property
     def output_paths(self) -> list[str]:
@@ -804,6 +854,7 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                     )
                     for item in stage.alternate_providers or ()
                 ),
+                evaluation=stage.evaluation,
             )
         )
     return NormalSpec(
@@ -964,6 +1015,19 @@ def validate_structure(spec: NormalSpec) -> None:
         for rule in stage.stop_when:
             if rule.metric not in metric_names:
                 raise ValueError(f"Stage {stage.key} stop rule names unknown metric")
+        limits = stage.retry.resource_limit_metrics
+        if len(set(limits)) != len(limits) or not set(limits) <= set(metric_names):
+            raise ValueError(
+                f"Stage {stage.key}: resource_limit_metrics must be distinct metrics of the stage"
+            )
+        stopping = {rule.metric for rule in stage.stop_when} & set(limits)
+        if stopping:
+            raise ValueError(
+                f"Stage {stage.key}: resource_limit_metrics must not also be stop_when metrics "
+                f"({', '.join(sorted(stopping))}): one meaning per metric (ADR 0067)"
+            )
+        if stage.evaluation is not None:
+            _validate_evaluation(spec, stage)
         reroutes = stage.retry.reroute_providers
         if len(set(reroutes)) != len(reroutes) or stage.provider in reroutes:
             raise ValueError(f"Stage {stage.key}: reroute_providers must be distinct from it")
@@ -1020,6 +1084,64 @@ def validate_structure(spec: NormalSpec) -> None:
         if _PROVIDER_CHECKS.get():
             for candidate in placement_candidates(stage):
                 _validate_provider(candidate)
+
+
+def _validate_evaluation(spec: NormalSpec, stage: NormalStage) -> None:
+    """ADR 0068: the shape of an evaluation stage and its one-time holdout claim."""
+    label = f"Stage {stage.key}"
+    evaluation = stage.evaluation
+    assert evaluation is not None
+    if not stage.metrics:
+        raise ValueError(f"{label}: an evaluation stage must declare the metrics it scores")
+    if evaluation.final:
+        consumers = sorted(
+            other.key
+            for other in spec.stages
+            if any(item.kind == "stage" and item.stage == stage.key for item in other.inputs)
+        )
+        if consumers:
+            raise ValueError(
+                f"{label}: a final evaluation stage's outputs cannot feed another stage "
+                f"({consumers[0]})"
+            )
+    holdout = evaluation.holdout
+    if holdout is None:
+        return
+    if not evaluation.final:
+        raise ValueError(f"{label}: only a stage designated final may open a holdout claim")
+    source = next((item for item in stage.inputs if item.name == holdout.input), None)
+    if source is None or source.kind not in {"snapshot", "artifact"}:
+        raise ValueError(
+            f"{label}: holdout input {holdout.input!r} must name a snapshot or artifact input"
+        )
+    pinned = source.digest if source.kind == "snapshot" else source.sha256
+    if pinned != holdout.partition_digest:
+        raise ValueError(f"{label}: holdout partition_digest does not match its input's digest")
+    if source.kind == "snapshot" and source.data_class == PUBLIC:
+        raise ValueError(f"{label}: a sealed partition cannot be declared public")
+    # One-time means one scorer run: a retry, including an infrastructure retry, would let a
+    # scorer that exits on purpose see the partition again (no score shopping).
+    if stage.retry.max_attempts != 1 or stage.retry.infra_retries:
+        raise ValueError(
+            f"{label}: a holdout claim requires retry.max_attempts of 1 and no infra_retries"
+        )
+    for other in spec.stages:
+        if other.key == stage.key:
+            continue
+        for item in other.inputs:
+            digest = item.digest if item.kind == "snapshot" else item.sha256
+            if digest == holdout.partition_digest:
+                raise ValueError(
+                    f"Stage {other.key}: input {item.name!r} is the sealed partition of "
+                    f"{stage.key}; only its holdout stage may read it"
+                )
+    claims = [
+        (other.holdout.partition_digest, other.holdout.claim_scope)
+        for other in spec.stages
+        if other.holdout is not None
+    ]
+    if claims.count((holdout.partition_digest, holdout.claim_scope)) > 1:
+        raise ValueError(f"{label}: two stages claim the same sealed partition and scope")
 
 
 def _validate_provider(stage: NormalStage) -> None:
@@ -1164,7 +1286,10 @@ FAILURE_CLASSES = (
     "exposure_unknown",
     "t1_salad_unclaimed",
     "infra_container_killed",
+    "infra_resource_limit",
     "not_started",
     "exit_confirmed_unresolved",
     "cancelled",
+    "holdout_already_claimed",
+    "sealed_partition",
 )

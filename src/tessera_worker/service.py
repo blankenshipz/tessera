@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import scratch_limits
 from .control_channel import (
     DEFAULT_TIMEOUT_SECONDS,
     ControlChannelError,
@@ -293,6 +294,12 @@ class HeartbeatIntentJournal:
                 sequence INTEGER PRIMARY KEY, key TEXT NOT NULL,
                 completed INTEGER NOT NULL CHECK (completed IN (0, 1)))"""
             )
+            # The body of a pending beat is kept with its key, so a replay after a restart
+            # sends exactly what the first try did (the memory figures change between beats).
+            if "body" not in {
+                row[1] for row in connection.execute("PRAGMA table_info(heartbeat_intents)")
+            }:
+                connection.execute("ALTER TABLE heartbeat_intents ADD COLUMN body TEXT")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS heartbeat_journal (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), journal_id TEXT NOT NULL)"""
@@ -308,12 +315,17 @@ class HeartbeatIntentJournal:
         os.chmod(self.path, 0o600)
 
     def key(self) -> str:
+        return self.intent({})[0]
+
+    def intent(self, body: dict[str, int]) -> tuple[str, dict[str, int]]:
+        """The pending beat's key and body; a new beat records ``body`` with its key."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT key FROM heartbeat_intents WHERE completed=0 ORDER BY sequence DESC LIMIT 1"
+                "SELECT key, body FROM heartbeat_intents WHERE completed=0 "
+                "ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
             if row is not None:
-                return row[0]
+                return row[0], json.loads(row[1] or "{}")
             sequence = connection.execute(
                 "SELECT coalesce(max(sequence), 0) + 1 FROM heartbeat_intents"
             ).fetchone()[0]
@@ -322,10 +334,11 @@ class HeartbeatIntentJournal:
                 + hashlib.sha256(f"v2:{self.journal_id}:{sequence}".encode()).hexdigest()
             )
             connection.execute(
-                "INSERT INTO heartbeat_intents (sequence, key, completed) VALUES (?, ?, 0)",
-                (sequence, key),
+                "INSERT INTO heartbeat_intents (sequence, key, completed, body) "
+                "VALUES (?, ?, 0, ?)",
+                (sequence, key, json.dumps(body, sort_keys=True)),
             )
-            return key
+            return key, body
 
     def complete(self) -> None:
         with self._connect() as connection:
@@ -405,6 +418,7 @@ class DevelopmentWorkerService:
         self.sleep = sleep
         self.renewals = RenewalIntentJournal(self.root)
         self.heartbeats = HeartbeatIntentJournal(self.root)
+        self._memory_unsupported = False  # an older control plane refused the memory fields
         self.receipt_refusals = ReceiptRefusalJournal(self.root)
 
     def run(self) -> dict[str, Any]:
@@ -698,9 +712,32 @@ class DevelopmentWorkerService:
         runtime._refresh_lease()
 
     def _heartbeat(self) -> None:
-        key = self.heartbeats.key()  # durable before the control mutation
-        self._watch.post("/worker/heartbeat", {}, key)
+        key, body = self.heartbeats.intent(
+            {} if self._memory_unsupported else self._memory_report()
+        )  # durable before the mutation
+        try:
+            self._watch.post("/worker/heartbeat", body, key)
+        except ControlChannelError as error:
+            # An older control plane refuses the memory fields (HTTP 400/422: the beat was
+            # validated and rejected, never recorded). Liveness must not depend on them: send the
+            # plain beat under its own key and stop reporting memory until restart (ADR 0067).
+            if not body or error.status not in (400, 422):
+                raise
+            self._memory_unsupported = True
+            self._watch.post("/worker/heartbeat", {}, key + "-plain")
         self.heartbeats.complete()
+
+    def _memory_report(self) -> dict[str, int]:
+        """What this host reports about its memory (ADR 0067): available now, and the limit its
+        stage containers run with. Only figures it can read; none is a guess."""
+        report: dict[str, int] = {}
+        available = scratch_limits.host_memory_available_bytes()
+        if available is not None:
+            report["memory_available_bytes"] = available
+        report["container_memory_bytes"] = (
+            self.config.memory_bytes or scratch_limits.DEFAULT_MEMORY_BYTES
+        )
+        return report
 
     @staticmethod
     def _is_report_failure(result: DriverResult) -> bool:

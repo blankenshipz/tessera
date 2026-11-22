@@ -483,7 +483,7 @@ def report_provider_receipt(
 
 @router.post("/worker/heartbeat")
 def heartbeat(body: WorkerHeartbeat, worker: Worker, key: Key, store: Workers) -> JSONResponse:
-    payload = body.model_dump(mode="json")
+    payload = {k: v for k, v in body.model_dump(mode="json").items() if v is not None}
     return result(store.heartbeat(worker, key, canonical_digest(payload), payload))
 
 

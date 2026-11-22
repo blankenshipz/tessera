@@ -552,6 +552,7 @@ class DevelopmentCpuRuntime(CpuRuntime):
             control_manifest_digest=self._control_manifest_digest,
             sealed_manifest_digest=self._sealed_manifest_digest,
             scratch_bytes=operation.scratch_bytes,
+            memory_bytes=operation.memory_bytes,
         )
         key = idempotency_key(operation.operation_id, self.lease.id, self.lease.epoch)
         return self.channel.post(

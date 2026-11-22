@@ -50,6 +50,7 @@ PERMANENT_REASONS = frozenset(
         "over_run_cap",
         "over_campaign_budget",
         "plan_mismatch",
+        "resource_limit_last_attempt",
         # ADR 0058 limits on a candidate listed only in ``retry.reroute_providers``.
         "infra_retry_only",
         "reroute_refused",
@@ -360,6 +361,19 @@ def failure_reason(decision: Decision) -> str:
         "not_pinned",
         "infra_retry_only",
     }
+    if "resource_limit_last_attempt" in reasons:
+        # ADR 0067: budget and policy causes are reported first; the resource limit is the
+        # verdict only when it is what left no candidate (every skip stays on the record).
+        others = reasons - {"resource_limit_last_attempt"}
+        if not others & {
+            "over_campaign_budget",
+            "over_run_cap",
+            "plan_mismatch",
+            "untrusted",
+            "not_enrolled",
+        }:
+            return "resource_limit_no_provider"
+        reasons = others
     if reasons == {"untrusted"}:
         return "input_not_admitted"
     if reasons and reasons <= {"unregistered", "provider_invalid", "reroute_refused"}:

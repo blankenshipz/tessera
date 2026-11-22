@@ -111,6 +111,9 @@ def test_read_tools_hit_expected_routes(tmp_path):
     _call(server, "tessera_campaign_retries", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_standing_status", {})
     _call(server, "tessera_campaign_gate_decisions", {"campaign_id": "c1"})
+    _call(server, "tessera_campaign_holdout", {"campaign_id": "c1"})
+    _call(server, "tessera_campaign_holdout_claims", {})
+    _call(server, "tessera_campaign_holdout_claims", {"partition_digest": "a" * 64})
     assert [(m, p, q) for m, p, q, _ in seen] == [
         ("GET", "/projects/proj1/campaigns", "offset=5&limit=10"),
         ("GET", "/campaigns/c1/receipt", ""),
@@ -121,6 +124,9 @@ def test_read_tools_hit_expected_routes(tmp_path):
         ("GET", "/campaigns/c1/retries", ""),
         ("GET", "/projects/proj1/agent-standing-status", ""),
         ("GET", "/campaigns/c1/gate-decisions", ""),
+        ("GET", "/campaigns/c1/holdout", ""),
+        ("GET", "/projects/proj1/holdout-claims", ""),
+        ("GET", "/projects/proj1/holdout-claims", "partition_digest=" + "a" * 64),
     ]
 
 
@@ -146,6 +152,8 @@ def test_tools_register_only_for_enrolled_scopes(tmp_path):
         "tessera_campaign_retries",
         "tessera_campaign_standing_status",
         "tessera_campaign_gate_decisions",
+        "tessera_campaign_holdout",
+        "tessera_campaign_holdout_claims",
     }
     assert _names(_server(tmp_path, [], ["campaign:submit", "snapshot:read"])) == {
         "tessera_submit_campaign",

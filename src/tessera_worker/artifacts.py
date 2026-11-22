@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import re
+import time
 import uuid
 from typing import Any, Protocol
 
@@ -19,6 +20,13 @@ from .outputs import CollectedOutput, LargeOutput
 
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 CHUNK_BYTES = 256 * 1024
+# How long a large artifact's completion may stay "verifying" (control hashing the whole file)
+# before the transfer gives up and is retried later. Kept below the ADR 0064 stall window
+# (``UPLOAD_STALL_SECONDS``, 10 minutes of unchanged held bytes) so a worker never keeps waiting
+# for a verification the campaign's hold has already stopped waiting for.
+COMPLETE_MAX_WAIT_SECONDS = 540.0
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 
 class ArtifactChannel(Protocol):
@@ -357,7 +365,18 @@ def _stream_large(
             raise ArtifactTransferError("Artifact chunk receipt has an unexpected sequence.")
         seq += 1
     handle.assert_unchanged()
+    started = _monotonic()
     receipt = channel.post(base + "/complete", {}, _key(base + "/complete", {}))
+    while receipt.get("status") == "verifying":
+        # Control is hashing the whole file, which can outlast one request: ask again with the
+        # same key (it joins the verification that is running) instead of starting over.
+        delay = receipt.get("retry_after_seconds")
+        delay = float(min(max(delay, 1), 30)) if type(delay) is int else 5.0
+        # Measured on the clock, so the time each ask itself takes counts toward the bound.
+        if _monotonic() - started + delay > COMPLETE_MAX_WAIT_SECONDS:
+            raise ArtifactTransferError("Control is still verifying the artifact; try again later.")
+        _sleep(delay)
+        receipt = channel.post(base + "/complete", {}, _key(base + "/complete", {}))
     if (
         receipt.get("lease_id") != lease_id
         or type(receipt.get("epoch")) is not int

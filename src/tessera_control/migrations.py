@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 71
+LATEST_SCHEMA_VERSION = 72
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1405,3 +1405,27 @@ def migrate_steering_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(STEERING_SCHEMA_VERSION - 1, migrate_steering_schema)
+
+
+# One-time holdout claims of evaluation stages (ADR 0068). Additive and idempotent; registered
+# with setdefault. If another change owns this version when branches merge, raise
+# HOLDOUT_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION and the fresh-database INSERT in store.py).
+HOLDOUT_SCHEMA_VERSION = 72
+
+
+def migrate_holdout_schema(connection: sqlite3.Connection) -> None:
+    from .campaign_holdout import create_holdout_schema
+
+    create_holdout_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (HOLDOUT_SCHEMA_VERSION,)
+    )
+
+
+MIGRATIONS.setdefault(HOLDOUT_SCHEMA_VERSION - 1, migrate_holdout_schema)

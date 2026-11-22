@@ -10,6 +10,7 @@ granted here: only the provider trust setting binds a worker principal to data c
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
@@ -174,6 +175,29 @@ class WorkerGrantProvider:
             )
         )
         return max(self.descriptor.worker_slots - live, 0)
+
+    def memory_report(
+        self, rt: RunnerServices, ctx: Any, stage: NormalStage
+    ) -> tuple[int | None, int | None] | None:
+        """``(memory available now, container memory limit)`` as the worker last reported them
+        in a fresh heartbeat (ADR 0067), or ``None`` when it reported neither. Control never
+        infers a host's memory: a stale or silent worker has no report."""
+        from .workers import HEARTBEAT_MAX_AGE
+
+        worker = self.worker_for(stage)
+        row = rt.one(
+            """SELECT payload_json, created_at FROM events WHERE project_id=?
+            AND event_type='worker.heartbeat' AND actor_principal_id=?
+            ORDER BY cursor DESC LIMIT 1""",
+            (ctx.campaign["project_id"], worker),
+        )
+        if row is None:
+            return None
+        if rt.parse_utc(rt.stamp()) - rt.parse_utc(row["created_at"]) > HEARTBEAT_MAX_AGE:
+            return None
+        body = json.loads(row["payload_json"])
+        free, limit = body.get("memory_available_bytes"), body.get("container_memory_bytes")
+        return (free, limit) if free is not None or limit is not None else None
 
     def slot_free(self, rt: RunnerServices, ctx: Any, stage: NormalStage) -> bool:
         """A slot is free while the worker holds fewer live grants than ``worker_slots``."""

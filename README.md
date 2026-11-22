@@ -132,9 +132,10 @@ are not available in this demonstrated journey.
 
 A session can submit a typed [campaign spec](docs/campaigns.md): a digest-pinned DAG of
 stages with a budget cap, retries for transient failures (including an opt-in, bounded automatic
-retry when the infrastructure killed the container, counted in the approved digest and
-worst-case exposure,
-[ADR 0058](docs/decisions/0058-infrastructure-retry-of-stages.md)), data classes and stop
+retry when the infrastructure killed the container or the stage stopped on a resource limit,
+counted in the approved digest and worst-case exposure,
+[ADR 0058](docs/decisions/0058-infrastructure-retry-of-stages.md),
+[ADR 0067](docs/decisions/0067-resource-limit-stops-are-infrastructure-retries.md)), data classes and stop
 rules. One human approval of the exact digest lets the in-process runner drive every step
 (including staging one stage's outputs into the next) through the existing checks. A
 terminal campaign has an operational receipt, not a scientific verdict.
@@ -186,6 +187,20 @@ A v2 stage output of kind `evidence_rows` (per-variant, per-seed metric rows ove
 pre-registered grid and split lock) is ingested by the platform itself, so a paired gate over a
 stage that trains both arms needs no transcribed numbers
 ([ADR 0052](docs/decisions/0052-campaign-evidence-rows.md)).
+
+**Sealed holdout scoring.** A v2 stage can be a final `evaluation` stage that runs the spec's
+pinned scorer image on private labels from custody and records its metrics on the receipt. When
+it declares a sealed `holdout` (a snapshot or artifact input pinned by content digest, and a
+claim scope), the platform opens that partition at most once per project, digest and scope: the
+runner records a durable claim after every stage it depends on succeeded and before the labels
+are released to any worker, refuses every later claim (at submit, at approval and at the claim
+itself), and keeps the claim as `scored` with its metric values or `spent`. Claims cannot be
+deleted or reopened, a holdout stage is never requeued once its claim is open, and from then on
+no other stage receives the partition and no other campaign takes the holdout stage's outputs
+(re-checked before every input release). The labels stay non-public, so they reach only registered, trusted
+providers and never the public internet (ADR 0047). `tessera_campaign_holdout` and
+`tessera_campaign_holdout_claims` read the claims; nothing reopens one
+([ADR 0068](docs/decisions/0068-sealed-holdout-evaluation-stages.md)).
 
 **Providers and chaining.** A v2 spec names a compute *provider* and *runtime* per stage, up
 to 64 stages. `local-docker` is built in (`tessera-worker development-poll` supplies the

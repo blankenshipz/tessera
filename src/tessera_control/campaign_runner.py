@@ -29,6 +29,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import campaign_holdout as holdout
 from . import campaign_placement as placement
 from . import execution_frames as frames
 from . import provider_trust
@@ -49,7 +50,14 @@ from .campaign_exited_resolve import (
     uploads_arriving,
 )
 from .campaign_exited_resolve import assess as assess_exited
-from .campaign_infra_retry import INFRA_CONTAINER_KILLED, INFRA_PREFIX, infra_attempts
+from .campaign_infra_retry import (
+    INFRA_CONTAINER_KILLED,
+    INFRA_PREFIX,
+    INFRA_RESOURCE_LIMIT,
+    RESOURCE_LIMIT_CLASSES,
+    infra_attempts,
+    resource_limit_stop,
+)
 from .campaign_io import (
     IoEntry,
     output_entries,
@@ -1264,6 +1272,11 @@ class CampaignRunner:
                 return True
             return self._stage_unknown(ctx, key)
         if attempt_status == "failed_transient":
+            if spec_stage.holdout is not None and self._holdout_opened(ctx, key):
+                # ADR 0068: once the claim opened, the sealed partition was (or may have been)
+                # released to a worker. No further attempt, not even a not-started requeue
+                # (ADR 0046), may release it again: the stage fails and the claim is spent.
+                return self._stage_failed(ctx, key, f"holdout_spent:{latest['failure_class']}")
             # An attempt that never started uses an attempt number, not a scientific retry.
             # An infrastructure retry (ADR 0058) has its own bound, not a scientific one.
             scientific = (
@@ -1361,8 +1374,28 @@ class CampaignRunner:
                     mismatched[pid] = placement.Skip(
                         pid, "plan_mismatch", "differs from the stage's task plan"
                     )
+        # ADR 0067: a candidate whose attempt ended on a resource limit is not chosen again
+        # unless its free memory is shown above the limit (a time-budget stop never is).
+        attempts = self._attempts(ctx, key)
+        if attempts and attempts[-1]["failure_class"] in RESOURCE_LIMIT_CLASSES:
+            for pid in base.candidate_ids:
+                blocked = self._resource_limit_retry_blocked(ctx, key, attempts, pid)
+                if blocked is not None:
+                    mismatched.setdefault(
+                        pid,
+                        placement.Skip(
+                            pid,
+                            "resource_limit_last_attempt",
+                            "ended on a resource limit; "
+                            + (
+                                "a time-budget stop is not repeated there"
+                                if blocked["blocked_by"] == "time_budget_not_raisable"
+                                else "free memory not shown above its limit"
+                            ),
+                        ),
+                    )
         return placement.decide(
-            self, ctx, base, exposure_open, extra_skip=mismatched, attempts=self._attempts(ctx, key)
+            self, ctx, base, exposure_open, extra_skip=mismatched, attempts=attempts
         )
 
     def _record_placement(
@@ -1424,7 +1457,20 @@ class CampaignRunner:
             {"stage_key": key, "attempt": number, "signature": "refused"},
             {"skipped": payload["skipped"], "steering": payload["steering"], "final": True},
         )
-        return self._stage_failed(ctx, key, placement.failure_reason(decision))
+        reason = placement.failure_reason(decision)
+        if reason == "resource_limit_no_provider":
+            attempts = self._attempts(ctx, key)
+            self.emit_once(
+                ctx,
+                "campaign.stage_resource_limit_no_provider",
+                {"stage_key": key, "after_attempt": attempts[-1]["attempt"]},
+                {
+                    "reason": attempts[-1]["failure_class"],
+                    "blocked_by": "no_other_candidate",
+                    "skipped": payload["skipped"],
+                },
+            )
+        return self._stage_failed(ctx, key, reason)
 
     # -- reservation ----------------------------------------------------------------
 
@@ -1465,10 +1511,93 @@ class CampaignRunner:
                 return True
         return False
 
+    def _resource_limit_retry_blocked(
+        self, ctx: _Ctx, key: str, attempts: list[dict[str, Any]], provider_id: str
+    ) -> dict[str, Any] | None:
+        """Why the stage may not run again on ``provider_id`` after a resource-limit stop
+        (ADR 0067), or ``None`` when it may.
+
+        Only a provider whose own attempt ended on a resource limit is held back. A stop on the
+        stage's own time budget is never repeated there (free memory says nothing about time and
+        the approved spec has no raised budget). A kill is repeated in place when the stage has
+        no other approved place (ADR 0058), and otherwise only if that provider's free memory
+        is shown to exceed the limit it hit: the limit from the run receipt of the attempt that
+        ran there, else the worker's reported container limit; the free memory from the
+        worker's fresh report. Unknown is not enough. The memory gate covers every code in
+        ``infra_exit_codes``: control cannot tell an out-of-memory kill from another one.
+        Both figures are the worker's own claims, never verified."""
+        if not attempts or attempts[-1]["failure_class"] not in RESOURCE_LIMIT_CLASSES:
+            return None
+        base = ctx.spec.stage(key)
+        hit = next(
+            (
+                a
+                for a in reversed(attempts)
+                if (a["provider_id"] or base.provider) == provider_id
+                and a["failure_class"] in RESOURCE_LIMIT_CLASSES
+            ),
+            None,
+        )
+        if hit is None:
+            return None
+        if hit["failure_class"] == INFRA_RESOURCE_LIMIT:
+            return {"blocked_by": "time_budget_not_raisable", "provider": provider_id}
+        if not base.has_candidates:
+            return None
+        stage = self._on_candidate(base, provider_id)
+        try:
+            provider = self._provider(stage)
+        except KeyError:
+            return {"blocked_by": "provider_unregistered", "provider": provider_id}
+        report = None
+        hook = getattr(provider, "memory_report", None)
+        if hook is not None:
+            report = hook(self, ctx, stage)
+        free, container = (None, None) if report is None else report
+        limit = None
+        if hit["operation_id"] is not None:
+            receipt = self._one(
+                "SELECT receipt_payload_json FROM execution_run_receipts WHERE operation_id=?",
+                (hit["operation_id"],),
+            )
+            if receipt is not None:
+                value = json.loads(receipt["receipt_payload_json"]).get("memory_bytes")
+                limit = value if type(value) is int else None
+        if limit is None:
+            limit = container
+        if free is not None and limit is not None and free > limit:
+            return None
+        return {
+            "blocked_by": "memory_not_shown_sufficient",
+            "provider": provider_id,
+            "free_memory_bytes": free,
+            "limit_bytes": limit,
+        }
+
+    def _resource_limit_ended(self, ctx: _Ctx, key: str, attempts: list[dict[str, Any]]) -> bool:
+        """The stage's only place just stopped it on its time budget: record why and end the
+        stage (bounded, never a silent loop)."""
+        base = ctx.spec.stage(key)
+        blocked = self._resource_limit_retry_blocked(ctx, key, attempts, base.provider)
+        self.emit_once(
+            ctx,
+            "campaign.stage_resource_limit_no_provider",
+            {"stage_key": key, "after_attempt": attempts[-1]["attempt"]},
+            {"reason": attempts[-1]["failure_class"], **(blocked or {})},
+        )
+        return self._stage_failed(ctx, key, "resource_limit_no_provider")
+
     def _reserve(self, ctx: _Ctx, key: str) -> bool:
         if self._reservation_held_back(ctx, key):
             return False
         attempts = self._attempts(ctx, key)
+        if (
+            attempts
+            and not ctx.spec.stage(key).has_candidates
+            and self._resource_limit_retry_blocked(ctx, key, attempts, ctx.spec.stage(key).provider)
+            is not None
+        ):
+            return self._resource_limit_ended(ctx, key, attempts)
         # Placed already (ADR 0060; an infrastructure retry's reroute too, ADR 0058).
         spec_stage = self._spec_stage(ctx, key)
         target = spec_stage.provider
@@ -1654,6 +1783,9 @@ class CampaignRunner:
                 status="succeeded",
                 stop_results_json=json.dumps(results, sort_keys=True),
             )
+            if spec_stage.holdout is not None:
+                # ADR 0068: the claim records the scored values in the same transaction.
+                holdout.score_claim(connection, ctx.campaign["id"], key, attempt, _iso(self.now()))
             if triggered is not None:
                 connection.execute(
                     "UPDATE campaigns SET stop_reason=? WHERE id=? AND stop_reason IS NULL",
@@ -2255,8 +2387,95 @@ class CampaignRunner:
         if self._deadline_too_short(ctx, stage, spec_stage, attempt):
             return True
         if attempt["release_id"] is None:
+            if self._sealed_input_refused(ctx, spec_stage, attempt):
+                return True
+            if spec_stage.holdout is not None and not self._open_holdout(ctx, spec_stage, attempt):
+                return True
             return self._ensure_release(ctx, stage, spec_stage, attempt)
         return self._issue_grant(ctx, stage, spec_stage, attempt)
+
+    def _sealed_input_refused(
+        self, ctx: _Ctx, spec_stage: NormalStage, attempt: dict[str, Any]
+    ) -> bool:
+        """ADR 0068: re-check sealed partitions when the release is about to be created.
+
+        A campaign approved before another campaign opened its claim (or before a holdout
+        stage's outputs existed) is refused here, before anything is released."""
+        with self.store.runner_connection() as connection:
+            reason = holdout.sealed_input_refusal(
+                connection, ctx.campaign["project_id"], spec_stage
+            )
+        if reason is None:
+            return False
+        self._attempt_failed(ctx, spec_stage.key, attempt, holdout.SEALED_PARTITION, reason)
+        return True
+
+    def _holdout_opened(self, ctx: _Ctx, key: str) -> bool:
+        return (
+            self._one(
+                "SELECT 1 FROM campaign_holdout_claims WHERE campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+            )
+            is not None
+        )
+
+    def _open_holdout(self, ctx: _Ctx, spec_stage: NormalStage, attempt: dict[str, Any]) -> bool:
+        """ADR 0068: open the stage's one-time holdout claim before any input is released.
+
+        The claim and its event commit together. When another campaign or stage already holds
+        the (partition, scope) claim the attempt fails permanently and nothing is released."""
+        assert ctx.approval is not None
+        stamp = _iso(self.now())
+        with self.store.runner_connection() as connection:
+            self._hold_lease(connection)
+            existed = connection.execute(
+                "SELECT 1 FROM campaign_holdout_claims WHERE campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], spec_stage.key),
+            ).fetchone()
+            reused = (
+                existed is not None
+                and connection.execute(
+                    """SELECT 1 FROM campaign_stage_attempts WHERE campaign_id=? AND stage_key=?
+                AND attempt<>? AND release_id IS NOT NULL""",
+                    (ctx.campaign["id"], spec_stage.key, attempt["attempt"]),
+                ).fetchone()
+            )
+            if reused:
+                # Defense in depth: an earlier attempt already released the partition.
+                held = False
+                claim = next(
+                    c
+                    for c in holdout.campaign_claims(connection, ctx.campaign["id"])
+                    if c["stage_key"] == spec_stage.key
+                )
+            else:
+                held, claim = holdout.open_claim(
+                    connection, ctx.campaign, ctx.approval, spec_stage, stamp
+                )
+            if held and existed is None:
+                self.store.record_runner_event(
+                    connection,
+                    ctx.campaign,
+                    "campaign.holdout_claimed",
+                    {
+                        "stage_key": spec_stage.key,
+                        "claim_id": claim["claim_id"],
+                        "partition_digest": claim["partition_digest"],
+                        "claim_scope": claim["claim_scope"],
+                        "attempt": attempt["attempt"],
+                    },
+                )
+        if held:
+            return True
+        self._attempt_failed(
+            ctx,
+            spec_stage.key,
+            attempt,
+            holdout.HOLDOUT_ALREADY_CLAIMED,
+            f"claimed by campaign {claim['campaign_id']} stage {claim['stage_key']} "
+            f"({claim['status']})",
+        )
+        return False
 
     def _deadline_too_short(
         self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage, attempt: dict[str, Any]
@@ -3122,7 +3341,29 @@ class CampaignRunner:
     ) -> bool:
         observed = self._observation(spec_stage, attempt)
         if observed.outcome == "succeeded":
-            return self._lineage(ctx, stage, spec_stage, attempt)
+            stop = resource_limit_stop(
+                spec_stage.retry.resource_limit_metrics, attempt["measurements_json"]
+            )
+            infra = (
+                None
+                if stop is None
+                else self._infra_failure(
+                    ctx,
+                    stage["stage_key"],
+                    spec_stage,
+                    attempt,
+                    attempt["exit_code"],
+                    "succeeded",
+                    "",
+                    stop=stop,
+                )
+            )
+            if infra is None:
+                return self._lineage(ctx, stage, spec_stage, attempt)
+            self._set_attempt(
+                attempt["id"], status=infra[0], failure_class=infra[1], failure_detail=infra[2]
+            )
+            return True
         failure_class = (
             observed.failure_class if observed.failure_class in FAILURE_CLASSES else "step_refused"
         )
@@ -3159,8 +3400,10 @@ class CampaignRunner:
         status: str,
         failure_class: str,
         connection: sqlite3.Connection | None = None,
+        stop: tuple[str, float] | None = None,
     ) -> tuple[str, str, str] | None:
-        """Reclassify a confirmed exit that the infrastructure caused (ADR 0058).
+        """Reclassify a confirmed exit that the infrastructure caused (ADR 0058), or a stop on
+        a resource limit its own metric reported (``stop``, ADR 0067).
 
         Only a recorded exit code the spec names as infrastructure (default 137: the engine
         or the kernel's out-of-memory killer ended the container) on an attempt that would
@@ -3169,11 +3412,14 @@ class CampaignRunner:
         step and every budget or policy refusal keep their own class. Both the observation
         path and the confirmed-exit path (ADR 0053) come here. ``connection`` is the caller's
         open transaction, if any. Returns ``None`` when nothing changes; when the bound is
-        spent the failure stays permanent and says so, once, on the timeline."""
+        spent a kill stays a permanent failure and says so, once, on the timeline, and a stop
+        metric is accepted as the result it recorded (ADR 0067: a spent bound never turns a
+        success into a failure), with the same event naming the metric."""
         limit = spec_stage.retry.infra_retries
-        if (
-            limit < 1
-            or status != "failed_permanent"
+        if limit < 1:
+            return None
+        if stop is None and (
+            status != "failed_permanent"
             or failure_class != "undeclared_exit_code"
             or exit_code is None
             or exit_code not in spec_stage.retry.infra_exit_codes
@@ -3191,6 +3437,8 @@ class CampaignRunner:
         if used >= limit:
             exhausted = {"attempt": attempt["attempt"], "exit_code": exit_code}
             exhausted["infra_retries_max"] = limit
+            if stop is not None:
+                exhausted["resource_limit_metric"] = stop[0]
             if connection is not None:
                 self._emit_once_in(
                     connection,
@@ -3204,6 +3452,13 @@ class CampaignRunner:
                     ctx, "campaign.stage_infra_retries_exhausted", {"stage_key": key}, exhausted
                 )
             return None
+        if stop is not None:
+            return (
+                "failed_transient",
+                INFRA_RESOURCE_LIMIT,
+                f"stopped on a resource limit ({stop[0]}={stop[1]:g}); "
+                f"infrastructure failure, retry {used + 1} of {limit}"[:500],
+            )
         return (
             "failed_transient",
             INFRA_CONTAINER_KILLED,
@@ -3881,6 +4136,8 @@ class CampaignRunner:
                 "updated_at=? WHERE id=?",
                 (status, reason, stamp, campaign["id"]),
             )
+            # ADR 0068: a claim the campaign never scored stays claimed, as spent.
+            holdout.spend_open_claims(connection, campaign["id"], stamp)
             receipt, digest = build_receipt(connection, current, status)
             connection.execute(
                 "INSERT INTO campaign_receipts (campaign_id, receipt_json, receipt_digest, "

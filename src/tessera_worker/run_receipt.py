@@ -132,6 +132,7 @@ def build_run_receipt(
     control_manifest_digest: str,
     sealed_manifest_digest: str,
     scratch_bytes: int | None = None,
+    memory_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Return the ``ReportRunReceipt`` body; raises rather than guessing a fact."""
     image_match = _IMAGE_DIGEST.search(image)
@@ -170,6 +171,10 @@ def build_run_receipt(
     }
     if facts.image_id is not None:
         payload["image_id"] = facts.image_id
+    if memory_bytes is not None:
+        # ADR 0067: the memory limit the container ran with, the figure a later resource-limit
+        # retry decision compares a provider's free memory against.
+        payload["memory_bytes"] = memory_bytes
     if scratch_bytes is not None:
         # ADR 0059: the scratch the container actually ran with (granted, not requested).
         payload["scratch_bytes"] = scratch_bytes
