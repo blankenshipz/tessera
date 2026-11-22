@@ -32,7 +32,7 @@ config read/merge, message/reasoning capture or separate MCP client.
    borrow the coding server, coding credentials or any owner-token proxy.
 2. Install this local package with exactly `@opencode/plugin@2.0.18` in that
    dedicated environment; independently verify the installed version and package
-   digest. Package managers/dependency installation are not run by this lane.
+   digest. Package managers/dependency installation are not run by this plugin.
 3. Add the local plugin directory to the dedicated profile's V2 `plugins` array.
    Do not edit any global/coding configuration. Reviewed plugin options are:
 

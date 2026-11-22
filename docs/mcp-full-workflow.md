@@ -189,7 +189,7 @@ consumer integration and live discovery remain unverified.
 | `full-mcp` (source subset) | Planner/critic receives only admitted tools and curated skill | `harness_binding.py`, governed skill, isolated tests; MCP source lane | Synthetic deterministic config/pin/denial fixtures | Public operator-reviewed model/catalog/skill pins |
 | `full-mcp` (live; deferred to integration) | Real research harness discovers exact permitted catalog and selected skill, then performs typed workflow/reconnect | Dedicated OpenCode V2 harness, runtime consumer, stdio adapter | Actual catalog, loaded skill, effective config, account and principal observations before inference | Dedicated authorized included-OAuth account/runtime; installed Python+MCP extra; mapped agent credential and public CA; pinned isolated workspace/config |
 
-### Interfaces (no consumer edits in this lane)
+### Interfaces (no consumer edits here)
 
 New module: `tessera_mcp.harness_binding`.
 
@@ -318,7 +318,10 @@ remain backend authority. Registration is not disclosure, including for its auth
 Grant revocation denies new writes and replay; current human recipient disclosure
 withdrawal denies reads. No grant/disclosure/revoke MCP tools were added.
 
-The pinned catalog now has **18 tools**. `PERMITTED_TOOLS`, scope generation and the
+The pinned catalog had **18 tools** at this revision; it has since grown and the current
+`PERMITTED_TOOLS` has **22** (the experiment/program result reads and the generated-output
+family are included). Campaign, snapshot and provider-trust tools are deliberately outside it
+([campaign client path](mcp-campaign-client-path.md)). `PERMITTED_TOOLS`, scope generation and the
 curated governed skill include only these three additions. Full binding registration
 now requires the existing ninth enrollment scope `provenance:append`; a read-only
 subset still requires only `context:read`. Old 15-tool catalog pins and old skill/
@@ -333,10 +336,8 @@ generated reasoning, external stdio/host proof or ordinary live harness admissio
 The new event asserts content-free `generated_output.registered` identity without
 fabricated execution artifacts; the full notebook join remains the provenance lane.
 
-The SDK inventory assertion in `tests/test_mcp_workflow.py` is updated to 18.
-Parent-owned `scripts/check_mcp_control.py:178` still asserts 15 tools and needs an
-inventory-only update before its standalone rerun; this source assignment does not
-own that script. Existing installed/live receipts remain historical, not upgraded
+The SDK inventory assertion in `tests/test_mcp_workflow.py` and
+`scripts/check_mcp_control.py` both compare against `PERMITTED_TOOLS` (22 tools). Existing installed/live receipts remain historical, not upgraded
 to the expanded catalog or generated-output workflow by source tests.
 
 Continuation checks: the initial four-file targeted run passed **102 tests**

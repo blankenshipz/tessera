@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Supervised Tessera Salad safety guardian (placeholder paths). Install as
+  /Library/LaunchDaemons/dev.tessera.salad-guardian.plist, owned by root:wheel, mode 0644, after
+  creating the dedicated user, directories and 0600 config/credential files.
+  launchd does not expand variables, so edit the values below. No secrets here.
+  launchd has no RestartPreventExitStatus: unlike the systemd units, this restarts every 10 s
+  after exit 2 (bad config) too, so fix the config or unload the job rather than leave it.
+  Spends money only when you supply Salad profiles, credentials and an approved campaign.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.tessera.salad-guardian</string>
+  <key>UserName</key>
+  <string>tessera</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/tessera/.venv/bin/tessera-salad-guardian</string>
+    <string>--run</string>
+    <string>--config</string>
+    <string>/etc/tessera/salad-guardian.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>WorkingDirectory</key>
+  <string>/var/lib/tessera</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/tessera/salad-guardian.err.log</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/tessera/salad-guardian.out.log</string>
+</dict>
+</plist>

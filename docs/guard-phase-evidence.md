@@ -71,7 +71,7 @@ credentials or duplicate that logic, and source existence is not proof it ran no
 
 Historical first checkpoint: core dispatch paths were blocked and no producer was
 then implemented. Subsequently the same runtime owner completed the approved sparse
-checkout (local evidence ID `OBSERVER-OBSERVABILITY-V4`); this lane did not take
+checkout (local evidence ID `OBSERVER-OBSERVABILITY-V4`); this work did not take
 over, alias or modify its source. The handoff declares source artifact SHA-256
 `346bbd4629dc2acff0d8606d5d9c25f2fe2f26cf37498904c4d6665610875e64` and
 18 executor cases. This is not a full SDK typecheck or actual session dispatch.

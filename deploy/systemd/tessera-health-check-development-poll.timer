@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic Tessera health probe for development-poll
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+Unit=tessera-health-check@development-poll.service
+
+[Install]
+WantedBy=timers.target

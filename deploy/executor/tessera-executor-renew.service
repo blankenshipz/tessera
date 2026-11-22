@@ -1,0 +1,13 @@
+# Example: renew a stable executor enrollment (docs/provider-trust.md, Stable executor).
+# Replace the placeholder paths. Runs as the service user that owns the state directory,
+# the owner header and the enrollment directory; prints identifiers and times only.
+[Unit]
+Description=Tessera: renew the stable executor credential
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tessera/venv/bin/python -I /opt/tessera/scripts/executor_enrollment.py renew \
+    --state-dir /var/lib/tessera/control \
+    --owner-header /var/lib/tessera/control/owner.header \
+    --executor-dir /var/lib/tessera/executors/salad

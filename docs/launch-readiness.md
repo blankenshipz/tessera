@@ -82,14 +82,20 @@ not boolean switches to enable a provider.
 
 ## Storage limits and remaining capacity risk
 
-- New executable plans for either current profile accept **1–16 MiB total declared
-  output**, matching the existing package/quarantine ceiling. Oversized plans now
-  fail validation before approval/reservation, rather than only at package creation.
-  Historical records are not rewritten; previously oversized plans were already
-  unpackageable and need a new revision and approval. No schema migration is added.
-- Existing artifact intake enforces the lesser of the plan budget and 16 MiB across
-  retained artifacts and upload reservations for a lease; chunks are at most 256 KiB.
-  Input snapshots are separately capped at 16 MiB/1,000 files per capture.
+- New executable plans accept a total declared output up to the operator's artifact
+  limit (`TESSERA_MAX_ARTIFACT_BYTES`, default 8 GiB; see
+  [large artifacts](large-artifacts.md)). Plans above it fail validation at plan intake
+  (422), before approval or reservation. Historical records are not rewritten and a stored,
+  approved spec is re-validated against the absolute 1 TiB ceiling only, so lowering the
+  limit never turns a running lease's uploads into "invalid plan" errors. The operator limit
+  still applies when a **new package is built** for a stored plan: a plan above the current
+  limit gets no new grant package (409) until it is revised. Uploads for an existing lease
+  use the smaller of the plan's bound and the current limit. No schema migration is added.
+- Artifact intake enforces the lesser of the plan budget and the operator limit across
+  retained artifacts and unexpired upload reservations for a lease. Files up to 16 MiB use
+  the single-BLOB path (chunks of at most 256 KiB, placed in the project object store);
+  larger files use chunked large-artifact custody (4 MiB chunks). Input snapshots above
+  16 MiB/1,000 files are chunked, up to the same operator limit.
 - These limits **do not cap aggregate project/tenant/state-directory usage**. SQLite
   BLOBs, upload chunks, project-object copies, journals, exports, backups and history
   need capacity accounting; do not infer deduplication or deletion from placement.

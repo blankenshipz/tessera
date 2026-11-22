@@ -56,8 +56,10 @@ def profile():
     )
 
 
-def fixture(tmp_path, *, approve=True, capability=True, execution=None):
-    h = setup_route(tmp_path, approve=approve, salad_execution=execution or profile())
+def fixture(tmp_path, *, approve=True, capability=True, execution=None, budget=True):
+    h = setup_route(
+        tmp_path, approve=approve, salad_execution=execution or profile(), budget=budget
+    )
     if capability:
         store = CapabilityStore(h.journey.state)
         task = store.get_task(h.journey.actor, h.route["task_id"])
@@ -506,7 +508,13 @@ def test_rotation_requires_explicit_new_server_version_and_zeroizes_buffers(tmp_
 )
 def test_limits_cannot_exceed_parent_package(tmp_path, execution):
     h = fixture(tmp_path, execution=execution)
-    assert dispatch(h, "create")["receipts"][-1]["proxy_reason"] == "admission_denied"
+    if execution["max_cost_cents"] > profile()["max_cost_cents"]:
+        # The experiment reservation holds only the parent's exposure, so the
+        # budget binding refuses before any intent, resolution or transport.
+        with pytest.raises(Conflict, match="remaining liability"):
+            dispatch(h, "create")
+    else:
+        assert dispatch(h, "create")["receipts"][-1]["proxy_reason"] == "admission_denied"
     assert h.resolver.calls == h.transport.calls == []
 
 

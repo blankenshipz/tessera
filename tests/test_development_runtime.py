@@ -159,3 +159,80 @@ def test_normal_runtime_has_no_development_output_wiring() -> None:
     imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
     assert "tessera_worker.development_runtime" not in imported
     assert "DevelopmentOutputMount" not in Path("src/tessera_worker/runtime.py").read_text()
+
+
+def test_uploaded_seal_id_refuses_a_seal_belonging_to_another_operation(tmp_path: Path) -> None:
+    import sqlite3
+
+    from tessera_worker.sealed_outputs import _operation_id
+
+    operation_id = _operation_id("development-lease")  # how production derives it
+    backend = _backend(tmp_path, bytes=50, inodes=3)
+    workspace = backend.reserve(
+        operation_id=operation_id,
+        lease_id="development-lease",
+        epoch=1,
+        output_paths=("result.txt",),
+        max_output_bytes=50,
+    )
+    (workspace / "result.txt").write_bytes(b"declared")
+    seal_id = backend.seal(operation_id, _observation())
+    backend._transition(operation_id, {"sealed"}, "uploaded")
+    assert backend.uploaded_seal_id(operation_id) == seal_id
+
+    # The lease's seal is re-attributed to a different operation: it must not replay.
+    with sqlite3.connect(backend.seals.path) as connection:
+        connection.execute("UPDATE seals SET operation_id=? WHERE id=?", ("b" * 32, seal_id))
+    with pytest.raises(DevelopmentRuntimeError, match="no seal"):
+        backend.uploaded_seal_id(operation_id)
+
+
+def test_reused_runtime_never_carries_a_sealed_digest_into_the_next_operations_receipt() -> None:
+    from types import SimpleNamespace
+
+    from tessera_worker.development_runtime import ADAPTER_VERSION, DevelopmentCpuRuntime
+
+    first, second = "a" * 32, "b" * 32
+
+    class Outputs:
+        def uploaded_seal_id(self, operation_id):
+            return None
+
+        def seal(self, operation_id, observation):
+            if operation_id == second:
+                raise DevelopmentRuntimeError("second seal failed")
+            return "seal-1"
+
+        def manifest_digest(self, seal_id):
+            return "d1" * 32
+
+        def upload(self, operation_id, channel, seal_id):
+            return {"status": "quarantined"}
+
+    posts: list[str] = []
+    runtime = object.__new__(DevelopmentCpuRuntime)
+    runtime.development_outputs = Outputs()
+    runtime.channel = SimpleNamespace(post=lambda path, body, key: posts.append(path))
+    runtime.report = lambda result: {}
+    runtime._sealed_manifest_digest = None
+    runtime._sealed_operation_id = None
+    runtime.provider_dispatch = None
+    runtime.lease = SimpleNamespace(id="lease", epoch=1)
+    runtime.descriptor = {"control": {"package": {"adapter_version": ADAPTER_VERSION}}}
+    runtime.adapter = SimpleNamespace(run=lambda arguments: pytest.fail("must not inspect"))
+    observation = SimpleNamespace(
+        state="exited", termination_confirmed=True, container_id="c" * 64, exit_code=0
+    )
+    result = SimpleNamespace(phase="terminal", observation=observation)
+
+    runtime.operation = SimpleNamespace(operation_id=first)
+    runtime.collect(result)
+    assert runtime._sealed_manifest_digest == "d1" * 32
+
+    # Same runtime, next operation: its seal fails, so the first digest is stale.
+    runtime.operation = SimpleNamespace(operation_id=second)
+    with pytest.raises(DevelopmentRuntimeError):
+        runtime.collect(result)
+    with pytest.raises(DevelopmentRuntimeError, match="sealed output"):
+        runtime.post_run_receipt(result)
+    assert posts == []

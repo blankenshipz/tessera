@@ -29,6 +29,10 @@ def drop_empty_experiment_schema(connection: sqlite3.Connection) -> None:
         "research_experiment_variants",
         "research_experiment_designs",
         "research_experiments",
+        # ADR 0037: v60 chunk/ticket tables are also "future" tables.
+        "provider_input_tickets",
+        "snapshot_chunks",
+        "snapshot_chunk_uploads",
     )
     present = {row[0] for row in connection.execute("SELECT name FROM sqlite_schema")}
     for table in tables:

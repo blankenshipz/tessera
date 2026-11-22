@@ -7,7 +7,10 @@ import asyncio
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-# Enough for one base64-encoded 16 MiB artifact plus bounded JSON metadata.
+from .artifact_limits import operator_limits
+
+# Default: enough for one base64-encoded 16 MiB artifact plus bounded JSON metadata. Operators
+# lower it (never below 512 KiB) with TESSERA_MAX_REQUEST_BYTES to match a proxy in front.
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
 REQUEST_BODY_TIMEOUT_SECONDS = 30
 MAX_TOKEN_CHARS = 4096
@@ -23,11 +26,12 @@ class RequestLimitsMiddleware:
     def __init__(
         self,
         app: ASGIApp,
-        max_bytes: int = MAX_REQUEST_BYTES,
+        max_bytes: int | None = None,
         timeout_seconds: float = REQUEST_BODY_TIMEOUT_SECONDS,
     ) -> None:
         self.app = app
-        self.max_bytes = max_bytes
+        # The operator's TESSERA_MAX_REQUEST_BYTES (default 24 MiB, MAX_REQUEST_BYTES).
+        self.max_bytes = operator_limits().max_request_bytes if max_bytes is None else max_bytes
         self.timeout_seconds = timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

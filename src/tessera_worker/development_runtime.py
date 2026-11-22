@@ -25,7 +25,13 @@ from .cpu import (
     CpuOperation,
     DevelopmentOutputMount,
 )
-from .outputs import OutputCollectionError, validate_output_paths
+from .outputs import OutputCollectionError, validate_output_paths, worker_output_limit
+from .run_receipt import (
+    ADAPTER_VERSION,
+    build_run_receipt,
+    idempotency_key,
+    terminal_facts,
+)
 from .runtime import CpuRuntime
 from .sealed_outputs import OutputSealError, SealedOutputJournal
 from .supervisor import DriverResult, SupervisorError
@@ -46,6 +52,9 @@ class DevelopmentOutputProfile:
     root: Path
     capacity_bytes: int
     capacity_inodes: int
+    # Operator ceiling on one operation's declared output bytes; None means the
+    # installation default (tessera_control.artifact_limits). A plan above it is refused.
+    worker_max_output_bytes: int | None = None
     profile: Literal["development-local-cpu-v1"] = DEVELOPMENT_OUTPUT_PROFILE
     fixture_marker: Literal["development-local-fixture-v1"] = DEVELOPMENT_FIXTURE_MARKER
 
@@ -124,6 +133,14 @@ class DevelopmentOutputBackend:
             output_paths = validate_output_paths(output_paths)
         except OutputCollectionError as error:
             raise DevelopmentRuntimeError("Development output reservation is invalid.") from error
+        try:
+            ceiling = worker_output_limit(self.profile.worker_max_output_bytes)
+        except OutputCollectionError as error:
+            raise DevelopmentRuntimeError("Development output reservation is invalid.") from error
+        if max_output_bytes > ceiling:
+            raise DevelopmentRuntimeError(
+                "Planned output limit exceeds this worker's configured maximum."
+            )
         # Reserve every declared leaf plus its parents and the workspace itself.
         inode_count = (
             1
@@ -221,6 +238,7 @@ class DevelopmentOutputBackend:
                 output_paths=tuple(json.loads(row["paths_json"])),
                 max_output_bytes=row["byte_count"],
                 termination_observation=termination_observation,
+                worker_max_output_bytes=self.profile.worker_max_output_bytes,
             )
         except OutputSealError as error:
             raise DevelopmentRuntimeError(str(error)) from error
@@ -228,6 +246,32 @@ class DevelopmentOutputBackend:
             operation_id, {"reserved", "running", "unknown", "terminated", "sealed"}, "sealed"
         )
         return seal_id
+
+    def uploaded_seal_id(self, operation_id: str) -> str | None:
+        """The seal already uploaded for this operation (restart replay), if any."""
+        row = self._reservation(operation_id)
+        if row["status"] != "uploaded":
+            return None
+        # seals.lease_id is UNIQUE, so a lease has at most one seal; the operation filter
+        # additionally refuses a seal that was made for a different operation.
+        with self.seals._connect() as connection:
+            seal = connection.execute(
+                "SELECT id FROM seals WHERE lease_id=? AND epoch=? AND operation_id=?",
+                (row["lease_id"], row["epoch"], operation_id),
+            ).fetchone()
+        if seal is None:
+            raise DevelopmentRuntimeError("Uploaded development output has no seal.")
+        return seal["id"]
+
+    def manifest_digest(self, seal_id: str) -> str:
+        """The sealed manifest digest recorded when the output was sealed."""
+        with self.seals._connect() as connection:
+            row = connection.execute(
+                "SELECT manifest_digest FROM seals WHERE id=?", (seal_id,)
+            ).fetchone()
+        if row is None:
+            raise DevelopmentRuntimeError("Development output seal was not found.")
+        return row["manifest_digest"]
 
     @staticmethod
     def _assert_declared_tree(workspace: Path, paths: tuple[str, ...]) -> None:
@@ -359,6 +403,8 @@ class DevelopmentCpuRuntime(CpuRuntime):
     Collection is an explicit post-exit action, so cancellation never waits for it.
     """
 
+    _control_manifest_digest: str | None = None
+
     def __init__(
         self, *args: Any, development_profile: DevelopmentOutputProfile, **kwargs: Any
     ) -> None:
@@ -376,9 +422,18 @@ class DevelopmentCpuRuntime(CpuRuntime):
                 "Adapter is not configured for this development output root."
             )
         super().__init__(*args, **kwargs)
+        # The sealed manifest digest belongs to exactly one operation; both are reset
+        # whenever a new operation is built so a reused runtime cannot carry a stale
+        # digest into the next receipt.
+        self._sealed_manifest_digest: str | None = None
+        self._sealed_operation_id: str | None = None
+        self._control_manifest_digest: str | None = None
 
     def _operation(self, descriptor: dict[str, Any]) -> CpuOperation:
         operation = super()._operation(descriptor)
+        self._sealed_manifest_digest = None
+        self._sealed_operation_id = None
+        self._control_manifest_digest = None
         package = descriptor["control"]["package"]
         workspace = self.development_outputs.reserve(
             operation_id=operation.operation_id,
@@ -424,8 +479,84 @@ class DevelopmentCpuRuntime(CpuRuntime):
                 self.development_outputs.mark_unknown(self.operation.operation_id)
             raise DevelopmentRuntimeError("Collection requires a fresh confirmed termination.")
         observation = reported_observation or self.report(result)
-        seal_id = self.development_outputs.seal(self.operation.operation_id, observation)
-        return self.development_outputs.upload(self.operation.operation_id, self.channel, seal_id)
+        # After a restart past upload (e.g. a failed run-receipt post) the bytes are
+        # already sealed and transferred; replay that seal rather than re-sealing.
+        seal_id = self.development_outputs.uploaded_seal_id(
+            self.operation.operation_id
+        ) or self.development_outputs.seal(self.operation.operation_id, observation)
+        self._sealed_manifest_digest = None
+        self._sealed_operation_id = None
+        digest = self.development_outputs.manifest_digest(seal_id)
+        self._sealed_manifest_digest = digest
+        self._sealed_operation_id = self.operation.operation_id
+        self._control_manifest_digest = None
+        uploaded = self.development_outputs.upload(
+            self.operation.operation_id, self.channel, seal_id
+        )
+        # Control's own manifest digest, already recomputed and checked by the
+        # transfer helper; the run receipt must cite this, not the local seal digest.
+        self._control_manifest_digest = uploaded.get("manifest_digest")
+        return uploaded
+
+    def post_run_receipt(self, result: DriverResult) -> dict[str, Any] | None:
+        """Post one observed run receipt after a confirmed exit and sealed collection.
+
+        Returns ``None`` when no receipt applies (a fake provider is configured, a
+        different adapter version, or the adapter exposes no inspect seam).  Any
+        failure raises; the caller must not claim the receipt was recorded.  One
+        attempt, with a deterministic key so a restart replays the same request.
+        """
+        if (
+            self.operation is None
+            or self.lease is None
+            or self.descriptor is None
+            or self.provider_dispatch is not None
+            or self.descriptor["control"]["package"].get("adapter_version") != ADAPTER_VERSION
+            or not callable(getattr(self.adapter, "run", None))
+        ):
+            return None
+        observation = result.observation
+        if (
+            result.phase != "terminal"
+            or observation.state != "exited"
+            or not observation.termination_confirmed
+            or observation.container_id is None
+            or type(observation.exit_code) is not int
+            or self._sealed_manifest_digest is None
+            or not isinstance(self._control_manifest_digest, str)
+            or self._sealed_operation_id != self.operation.operation_id
+        ):
+            raise DevelopmentRuntimeError(
+                "Run receipt requires a confirmed exit and sealed output."
+            )
+        operation = self.operation
+        reply = self.adapter.run(["inspect", "--type", "container", operation.container_name])
+        if reply.returncode:
+            raise DevelopmentRuntimeError("Terminal inspect for the run receipt failed.")
+        facts = terminal_facts(
+            reply.stdout,
+            operation_id=operation.operation_id,
+            plan_digest=operation.plan_digest,
+            container_id=observation.container_id,
+            exit_code=observation.exit_code,
+        )
+        body = build_run_receipt(
+            lease_id=self.lease.id,
+            epoch=self.lease.epoch,
+            operation_id=operation.operation_id,
+            plan_digest=operation.plan_digest,
+            image=operation.image,
+            argv=operation.argv,
+            network_profile=operation.network_profile,
+            facts=facts,
+            control_manifest_digest=self._control_manifest_digest,
+            sealed_manifest_digest=self._sealed_manifest_digest,
+            scratch_bytes=operation.scratch_bytes,
+        )
+        key = idempotency_key(operation.operation_id, self.lease.id, self.lease.epoch)
+        return self.channel.post(
+            f"/worker/external-operations/{operation.operation_id}/run-receipt", body, key
+        )
 
 
 __all__ = [

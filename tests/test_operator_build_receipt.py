@@ -23,6 +23,117 @@ from tessera_operator import upgrade_support as target
 
 OP = "a" * 32
 
+
+@pytest.fixture
+def reviewed(tmp_path):
+    root = tmp_path.resolve() / "reviewed-source"
+    root.mkdir()
+    names = {
+        "src/tessera_control/store.py": "SCHEMA_VERSION = 56\n",
+        "deploy/kubernetes/local-persistent.Dockerfile": "FROM reviewed@sha256:fixed\n",
+        "deploy/kubernetes/local-persistent.Dockerfile.dockerignore": ".tessera\n",
+        "README.md": "reviewed baseline\n",
+    }
+    for name, content in names.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    files = producer._file_inventory(root)
+    value = {
+        "version": 1,
+        "source_root": str(root),
+        "git_commit": "d" * 40,
+        "baseline_files": files,
+        "baseline_inventory_sha256": upgrade._digest(files),
+        "candidate_files": files,
+        "overlays": {n: h for n, h in files.items() if n != "README.md"},
+    }
+    manifest = tmp_path / "reviewed.json"
+
+    def publish():
+        manifest.write_text(json.dumps(value, sort_keys=True))
+        return {
+            "manifest_path": str(manifest),
+            "expected_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        }
+
+    return SimpleNamespace(root=root, value=value, publish=publish)
+
+
+def test_reviewed_manifest_freezes_exact_bytes_without_git_or_dirty_overlay(
+    reviewed, tmp_path, monkeypatch
+):
+    source = reviewed.publish()
+    inventory = producer.reviewed_inventory(**source)
+    monkeypatch.setattr(
+        producer,
+        "_runtime",
+        lambda: {
+            "schema": 56,
+            "store_sha256": inventory["overlays"]["src/tessera_control/store.py"],
+        },
+    )
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: pytest.fail("manifest mode consulted Git/dirty source")
+    )
+    plan = producer.plan(**source)
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    context, digest = producer._freeze(attempt, inventory)
+    producer._unchanged(attempt, context, digest, plan)
+    assert producer._file_inventory(context) == reviewed.value["candidate_files"]
+    (reviewed.root / "README.md").write_text("drift")
+    with pytest.raises(target.AdmissionError, match="changed"):
+        producer._unchanged(attempt, context, digest, plan)
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "extra",
+        "missing",
+        "hash",
+        "symlink",
+        "recipe",
+        "provenance",
+        "manifest",
+        "secret",
+        "traversal",
+    ],
+)
+def test_reviewed_manifest_refuses_drift_before_any_build(reviewed, drift):
+    source = reviewed.publish()
+    if drift == "extra":
+        (reviewed.root / "extra").write_text("not reviewed")
+    elif drift == "missing":
+        (reviewed.root / "README.md").unlink()
+    elif drift == "hash":
+        (reviewed.root / "README.md").write_text("changed")
+    elif drift == "symlink":
+        (reviewed.root / "README.md").unlink()
+        (reviewed.root / "README.md").symlink_to("src/tessera_control/store.py")
+    elif drift == "recipe":
+        reviewed.value["overlays"].pop("deploy/kubernetes/local-persistent.Dockerfile")
+        source = reviewed.publish()
+    elif drift == "provenance":
+        reviewed.value["baseline_inventory_sha256"] = "0" * 64
+        source = reviewed.publish()
+    elif drift == "manifest":
+        reviewed.value["version"] = 2
+        reviewed.publish()  # Old review digest must not admit changed bytes.
+    elif drift == "secret":
+        (reviewed.root / "private.key").write_text("not a real secret")
+        reviewed.value["candidate_files"]["private.key"] = hashlib.sha256(
+            b"not a real secret"
+        ).hexdigest()
+        source = reviewed.publish()
+    else:
+        reviewed.value["candidate_files"]["../escape"] = "0" * 64
+        source = reviewed.publish()
+    with pytest.raises(target.AdmissionError):
+        producer.reviewed_inventory(**source)
+
+
 # Captured successful native v0.36.1-desktop.1 inspect output. Only runtime UUID,
 # host-gateway address and activity timestamp are sanitized; grammar is retained.
 INSTALLED_BUILDER_INSPECT = """Name:          desktop-linux
@@ -483,8 +594,8 @@ def test_rev006_local_builder_identity_and_queries_use_sanitized_env(monkeypatch
             "desktop-linux",
         ]
         env = kwargs["env"]
-        assert env["DOCKER_CONFIG"] == "/Users/zach/.docker"
-        assert env["BUILDX_CONFIG"] == "/Users/zach/.docker/buildx"
+        assert env["DOCKER_CONFIG"] == str(producer.local_paths.DOCKER_CONFIG)
+        assert env["BUILDX_CONFIG"] == str(producer.local_paths.DOCKER_CONFIG / "buildx")
         assert "BUILDX_BUILDER" not in env
         # Exact command assertion ensures the previously unsupported --format
         # path is never retried, even though a synthetic runner could accept it.

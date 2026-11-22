@@ -6,7 +6,7 @@ from pydantic import Field
 
 from .experiments_models import CreateExperiment
 from .external_agent_models import AgentProvenance
-from .models import NonBlank200, NonBlank4000, StrictRequest, StrictRevision
+from .models import NonBlank200, NonBlank4000, Sha256Digest, StrictRequest, StrictRevision
 from .research_models import CreateStudy
 
 
@@ -47,3 +47,9 @@ class AgentReviewRequest(StrictRequest):
     subject_id: NonBlank200
     expected_revision: StrictRevision
     reason: NonBlank4000
+
+
+class DeclineAgentProposal(StrictRequest):
+    expected_revision: StrictRevision
+    expected_digest: Sha256Digest
+    rationale: NonBlank4000

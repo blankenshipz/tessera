@@ -5,7 +5,7 @@ import json
 
 import pytest
 from test_execution_monitor import assignment
-from test_local_docker_fixture import CID, IMAGE_ID, plan, security_value
+from test_local_docker_fixture import CID, IMAGE_ID, plan, security_value, volume_value
 
 from tessera_monitor.docker import DockerAdapter
 from tessera_monitor.protocol import Denied, Limits, Workload, digest
@@ -17,7 +17,7 @@ from tessera_worker.local_docker_engine import LocalDockerEngine
 @pytest.fixture
 def docker(monkeypatch):
     p = plan(mode="wait")
-    value = security_value()
+    value = security_value(p)
     value.update(
         Id=CID,
         Name="/" + p.name,
@@ -44,6 +44,8 @@ def docker(monkeypatch):
         calls.append(args)
         if args[:2] == ["container", "inspect"]:
             return json.dumps([value]).encode()
+        if args[:2] == ["volume", "inspect"]:
+            return json.dumps([volume_value(p)]).encode()
         if args[:2] == ["container", "ls"]:
             return b"" if removed else CID.encode() + b"\n"
         if args[0] == "kill":

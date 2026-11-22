@@ -15,6 +15,7 @@ from tessera_control.agent_sandbox_models import API_VERSION, GATE, SandboxPlan
 from tessera_control.api import create_app
 from tessera_control.artifact_manifests import ArtifactManifestStore
 from tessera_control.artifacts import ArtifactStore
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.project_artifact_store import ProjectArtifactStore
 from tessera_control.store import Conflict, Forbidden, NotFound, Store, _connect, canonical_digest
 from tessera_worker.agent_sandbox import AgentSandboxBackend, SandboxUnsafe
@@ -778,8 +779,8 @@ def test_v56_migration_empty_binding_and_backup_freshness(tmp_path, held):
             "UPDATE operator_backup_health SET last_success_at='prior-success',"
             "last_backup_id='prior',last_failure_code='prior-failure'"
         )
-    assert migrate_state(state) == 56
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with _connect(state / "tessera.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM agent_sandbox_bindings").fetchone()[0] == 0
         health = connection.execute("SELECT * FROM operator_backup_health").fetchone()

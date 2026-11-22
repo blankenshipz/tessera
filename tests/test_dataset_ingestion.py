@@ -38,7 +38,7 @@ def _setup(tmp_path: Path) -> tuple[DatasetIngestionStore, dict[str, Any], str]:
     store = DatasetIngestionStore(state)
     token = (state / "owner.header").read_text().split("Bearer ", 1)[1].strip()
     owner = store.authenticate(token)
-    project_body = {"name": "MixFM"}
+    project_body = {"name": "program"}
     _, project = store.create_project(
         owner, "project", canonical_digest(project_body), project_body
     )
@@ -53,7 +53,7 @@ def _setup(tmp_path: Path) -> tuple[DatasetIngestionStore, dict[str, Any], str]:
         owner,
         study["id"],
         payload={
-            "uri": "https://example.invalid/mixfm-dataset",
+            "uri": "https://example.invalid/example-dataset",
             "quoted_passage": "Local source declaration for a dataset snapshot.",
             "content_digest": "c" * 64,
             "locator": "manifest",
@@ -77,7 +77,7 @@ def _snapshot_payload(source: dict[str, Any]) -> dict[str, Any]:
         "name": "Outcome 1 declared local snapshot",
         "snapshot_digest": "a" * 64,
         "schema": {
-            "profile": "mixfm-outcome-1-v1",
+            "profile": "example-program-v1",
             "columns": [
                 {
                     "name": "ingredient_id",
@@ -163,7 +163,7 @@ def test_unsupported_license_or_provenance_cannot_be_approved(
         payload={
             "snapshot_id": snapshot["id"],
             "expected_snapshot_revision": snapshot["revision"],
-            "intended_use": "Evaluate the declared MixFM Outcome 1 split.",
+            "intended_use": "Evaluate the declared Outcome 1 split.",
         },
     )
     with pytest.raises(Conflict, match="license or provenance"):
@@ -228,3 +228,14 @@ def test_complete_dataset_accounting_exports_snapshot_and_reviewable_proposal(
     assert any(
         event["event_type"] == "research.dataset_ingestion_reviewed" for event in exported["events"]
     )
+
+
+@pytest.mark.parametrize("profile", ["Upper", "1leading", "a" * 64, "has space", ""])
+def test_schema_profile_rejects_malformed_ids(profile):
+    from pydantic import ValidationError
+
+    from tessera_control.dataset_ingestion_models import DatasetSchema
+
+    column = {"name": "x", "logical_type": "number", "nullable": False, "missingness": "none"}
+    with pytest.raises(ValidationError):
+        DatasetSchema(profile=profile, columns=[column])

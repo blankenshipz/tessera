@@ -83,3 +83,12 @@ def worker_collect(
     operation_id: str, body: SandboxCommand, request: Request, actor: Worker, key: Key
 ):
     return response(store(request).collect(actor, operation_id, key, body.model_dump(mode="json")))
+
+
+@router.post("/worker/agent-sandboxes/{operation_id}/egress-journal")
+def worker_egress_journal(
+    operation_id: str, body: SandboxCommand, request: Request, actor: Worker, key: Key
+):
+    return response(
+        store(request).egress_journal(actor, operation_id, key, body.model_dump(mode="json"))
+    )

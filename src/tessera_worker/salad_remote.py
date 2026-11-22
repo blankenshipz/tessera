@@ -159,6 +159,12 @@ class SaladTrustedAdapter:
             raise ValueError("concrete trusted Salad server required")
         self._server, self._route_id, self._preflight = server, route_id, None
 
+    trusted_composition = True
+
+    @property
+    def trusted_store(self):
+        return self._server.store
+
     def preflight_for(self, action, proposal):
         from tessera_control.store import canonical_digest
 

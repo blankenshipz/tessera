@@ -53,3 +53,17 @@ def strip_empty_runtime_v55(connection: sqlite3.Connection) -> None:
             ).fetchone()
             is None
         )
+    drop_empty_chunk_schema(connection)
+
+
+# ADR 0037: v60 chunked-snapshot and provider-ticket tables.
+CHUNK_V60_TABLES = ("provider_input_tickets", "snapshot_chunks", "snapshot_chunk_uploads")
+
+
+def drop_empty_chunk_schema(connection: sqlite3.Connection) -> None:
+    """Remove the empty v60 additions, in the caller's transaction, without commit."""
+    present = {row[0] for row in connection.execute("SELECT name FROM sqlite_schema")}
+    for table in CHUNK_V60_TABLES:
+        if table in present:
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            connection.execute(f"DROP TABLE {table}")

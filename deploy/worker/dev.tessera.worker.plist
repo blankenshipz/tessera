@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Supervised Tessera development worker (placeholder paths; see README.md).
+  Install as /Library/LaunchDaemons/dev.tessera.worker.plist, owned by root:wheel
+  with mode 0644, after creating the dedicated user, its directories and the
+  0600 credential file. launchd does not expand variables, so edit the values
+  below. The plist contains no secrets.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.tessera.worker</string>
+  <key>UserName</key>
+  <string>tessera</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/tessera/venv/bin/python</string>
+    <string>-m</string>
+    <string>tessera_worker.daemon</string>
+    <string>run</string>
+    <string>--state-dir</string>
+    <string>/var/lib/tessera-worker/daemon</string>
+    <string>--grace-seconds</string>
+    <string>30</string>
+    <string>--</string>
+    <string>development-poll</string>
+    <string>--control-url</string>
+    <string>https://control.example.invalid</string>
+    <string>--credential-file</string>
+    <string>/etc/tessera/worker-credential</string>
+    <string>--workspace-root</string>
+    <string>/var/lib/tessera-worker/workspace</string>
+    <string>--development-output-root</string>
+    <string>/var/lib/tessera-worker/output</string>
+    <string>--allowed-image</string>
+    <string>registry.example.invalid/tessera-lab@sha256:0000000000000000000000000000000000000000000000000000000000000000</string>
+    <string>--poll-seconds</string>
+    <string>2</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>45</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>WorkingDirectory</key>
+  <string>/var/lib/tessera-worker</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/tessera-worker/worker.err.log</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/tessera-worker/worker.out.log</string>
+</dict>
+</plist>

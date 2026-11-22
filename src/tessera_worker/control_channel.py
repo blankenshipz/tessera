@@ -28,13 +28,78 @@ def _invalid_json_constant(_: str) -> None:
 
 
 class ControlChannelError(ConnectionError):
-    """A sanitized control transport failure, optionally with an HTTP status."""
+    """A sanitized control transport failure, optionally with an HTTP status.
 
-    def __init__(self, reason: str, status: int | None = None):
+    ``authority_gone`` is True only when control answered 403 with one of its fixed
+    detail strings in ``AUTHORITY_GONE_DETAILS``; the body itself is never kept.
+    """
+
+    def __init__(self, reason: str, status: int | None = None, *, authority_gone: bool = False):
         self.reason = reason
         self.status = status
+        self.authority_gone = authority_gone
         detail = reason if status is None else f"{reason} (HTTP {status})"
         super().__init__(f"Control channel failed: {detail}")
+
+
+_TRANSIENT_CLIENT_STATUSES = frozenset({408, 425, 429})
+_AUTH_STATUSES = frozenset({401, 403})
+_MAX_ERROR_BODY_BYTES = 2048
+
+# Control's fixed 403 ``detail`` strings (tessera_control/execution.py and
+# workers.py) that mean the worker's authority is gone and a new credential cannot
+# restore it.  Matched exactly, never by substring.  Every other 403 detail, an
+# unreadable body, or a 401 stays in the "auth" class (fail closed, no durable
+# record).  Control answers 401 ``Unauthorized`` for every invalid, unknown,
+# expired, revoked or wrong-audience worker token.
+AUTHORITY_GONE_DETAILS = frozenset(
+    {
+        "Worker is not assigned to this execution grant.",
+        "Worker is retired.",
+    }
+)
+
+
+def _authority_gone(error: HTTPError) -> bool:
+    """True when a 403 body is exactly one of control's authority-gone details."""
+    if error.code != 403:
+        return False
+    try:
+        body = error.read(_MAX_ERROR_BODY_BYTES + 1)
+        if not isinstance(body, bytes) or len(body) > _MAX_ERROR_BODY_BYTES:
+            return False
+        decoded = json.loads(body.decode("utf-8"), parse_constant=_invalid_json_constant)
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return False
+    detail = decoded.get("detail") if isinstance(decoded, dict) else None
+    return isinstance(detail, str) and detail in AUTHORITY_GONE_DETAILS
+
+
+def classify_control_failure(error: BaseException) -> str:
+    """Classify a control failure as ``"permanent"``, ``"auth"`` or ``"transient"``.
+
+    Auth: HTTP 401, or a 403 whose detail is not a known authority-gone string.
+    The worker credential or registration was refused; an operator can fix it, so
+    this is never a durable refusal, and retrying cannot help.
+    Permanent: an HTTP 4xx other than 401/403/408/425/429, i.e. control understood
+    and refused the request, or a 403 with an exact authority-gone detail (grant no
+    longer assigned to this worker, worker retired), so replaying cannot succeed.
+    Transient: everything else (no status such as connection errors/timeouts,
+    5xx, 408/425/429, and any non-error status with a protocol fault).
+    """
+    status = getattr(error, "status", None) if isinstance(error, ControlChannelError) else None
+    if (
+        type(status) is int
+        and status == 403
+        and isinstance(error, ControlChannelError)
+        and error.authority_gone
+    ):
+        return "permanent"
+    if type(status) is int and status in _AUTH_STATUSES:
+        return "auth"
+    if type(status) is int and 400 <= status < 500 and status not in _TRANSIENT_CLIENT_STATUSES:
+        return "permanent"
+    return "transient"
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -84,6 +149,9 @@ class HttpControlChannel:
     The caller supplies an idempotency key and decides whether an action is safe
     to retry.  This transport makes exactly one HTTP request for each ``post``.
     """
+
+    # The largest request body this channel sends; the uploader sizes large-artifact parts to it.
+    max_request_bytes = MAX_REQUEST_BYTES
 
     def __init__(
         self,
@@ -173,8 +241,11 @@ class HttpControlChannel:
         except ControlChannelError:
             raise
         except HTTPError as error:
+            gone = _authority_gone(error)
             _close_quietly(error)
-            raise ControlChannelError("control rejected request", error.code) from None
+            raise ControlChannelError(
+                "control rejected request", error.code, authority_gone=gone
+            ) from None
         except (OSError, URLError, ValueError):
             raise ControlChannelError("control transport unavailable") from None
         try:
@@ -230,6 +301,35 @@ class HttpControlChannel:
                 self._inflight = None
                 raise ControlChannelError("control transport unavailable") from None
             return future
+
+    def get(self, path: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        """GET one bounded JSON document without redirects, cookies, or retries."""
+        if timeout_seconds is None:
+            request_timeout = self.timeout_seconds
+        elif (
+            type(timeout_seconds) not in {int, float}
+            or not 0 < timeout_seconds <= self.timeout_seconds
+        ):
+            raise ValueError("Request timeout must be positive and no longer than channel timeout.")
+        else:
+            request_timeout = float(timeout_seconds)
+        request = Request(
+            f"{self.origin}{self._path(path)}",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.bearer_token}",
+            },
+            method="GET",
+        )
+        future = self._submit(request, request_timeout)
+        try:
+            return future.result(timeout=request_timeout)
+        except TimeoutError:
+            raise ControlChannelError("control response deadline exceeded") from None
+        except ControlChannelError:
+            raise
+        except Exception:
+            raise ControlChannelError("control transport unavailable") from None
 
     def post(
         self,

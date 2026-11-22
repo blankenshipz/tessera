@@ -71,9 +71,14 @@ authority, and uncertain cancellation remain visible. The receipt is bounded
 operational evidence only, not proof of Docker execution, cost/accounting,
 artifacts, results, or scientific success.
 
-If a receipt/observation report, heartbeat, or renewal cannot be confirmed, the
+If a receipt report, heartbeat, or renewal cannot be confirmed, the
 development worker keeps its durable intent and output reservation unresolved
-and attempts cancellation without waiting for that control-plane report. Local
+and attempts cancellation without waiting for that control-plane report.
+An observation report that cannot be delivered stays in the worker's durable outbox:
+the run ends as `report_pending` with no recorded result, and the poller redelivers the
+same observation (same idempotency key) after an exponential backoff of 2 s to 300 s that
+survives a restart, until control accepts it, permanently refuses it, or it is 24 hours old
+([ADR 0054](decisions/0054-durable-observation-delivery.md)). Local
 adapter termination and fake-provider cancellation are independent attempts;
 failure to confirm either remains unknown and is never reclaimed or reported as
 provider termination. Restart reads a fresh, durably keyed package response so

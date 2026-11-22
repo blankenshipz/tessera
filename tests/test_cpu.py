@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -328,3 +329,101 @@ def test_explicit_development_mount_is_fenced_and_normal_cpu_has_none(tmp_path: 
     workspace.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(CpuError, match="escapes"):
         adapter.create_arguments(mounted)
+
+
+def test_operator_resource_limits_override_defaults_within_bounds() -> None:
+    default = DockerCpuAdapter(frozenset({IMAGE}), FakeDocker()).create_arguments(operation())
+    assert default[default.index("--memory") + 1] == str(256 * 1024 * 1024)
+    assert f"size={16 * 1024 * 1024}" in default[default.index("--tmpfs") + 1]
+    big_adapter = DockerCpuAdapter(
+        frozenset({IMAGE}),
+        FakeDocker(),
+        memory_bytes=1024 * 1024 * 1024,
+        scratch_bytes=64 * 1024 * 1024,
+    )
+    big = big_adapter.create_arguments(
+        dataclasses.replace(operation(), **big_adapter.operation_limits())
+    )
+    assert big[big.index("--memory") + 1] == str(1024 * 1024 * 1024)
+    assert big[big.index("--memory-swap") + 1] == str(1024 * 1024 * 1024)
+    assert f"size={64 * 1024 * 1024}" in big[big.index("--tmpfs") + 1]
+    # ADR 0059 raised the ceilings from 1 GiB / 64 MiB to 64 GiB; the lower bounds stand.
+    for bad in (
+        {"memory_bytes": 64 * 1024**3 + 1},
+        {"memory_bytes": 1},
+        {"scratch_bytes": 64 * 1024**3 + 1},
+        {"scratch_bytes": 1024 * 1024 - 1},
+    ):
+        with pytest.raises(ValueError):
+            DockerCpuAdapter(frozenset({IMAGE}), FakeDocker(), **bad)
+
+
+def test_adapter_refuses_an_operation_whose_limits_differ_from_the_operator_limits() -> None:
+    adapter = DockerCpuAdapter(frozenset({IMAGE}), FakeDocker(), memory_bytes=1024 * 1024 * 1024)
+    assert adapter.operation_limits() == {"memory_bytes": 1024 * 1024 * 1024}
+    with pytest.raises(CpuError, match="limits differ"):
+        adapter.create_arguments(operation())  # built without the runtime's limits
+    assert DockerCpuAdapter(frozenset({IMAGE}), FakeDocker()).operation_limits() == {}
+
+
+def test_container_user_defaults_to_legacy_and_is_operator_owned() -> None:
+    args = DockerCpuAdapter(frozenset({IMAGE}), FakeDocker()).create_arguments(operation())
+    assert args[args.index("--user") + 1] == "65532:65532"
+    adapter = DockerCpuAdapter(frozenset({IMAGE}), FakeDocker(), container_user="1234:5678")
+    assert adapter.operation_limits() == {"container_user": "1234:5678"}
+    op = dataclasses.replace(operation(), **adapter.operation_limits())
+    args = adapter.create_arguments(op)
+    assert args[args.index("--user") + 1] == "1234:5678"
+    assert args.count("--user") == 1
+    with pytest.raises(CpuError, match="limits differ"):
+        adapter.create_arguments(operation())  # a plan-built operation cannot pick its own user
+    assert CpuSupervisor._payload(op) != CpuSupervisor._payload(operation())
+    assert '"container_user":"1234:5678"' in CpuSupervisor._payload(op)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["1234", "root", "1234:", ":5", "a:b", "1:2:3", "-1:5", "01:5", " 1:5", "1:5\n", "4294967295:1"]
+    + ["0:5", "5:0", "0:0", 1234, None],
+)
+def test_container_user_refusals(bad) -> None:
+    if bad is None:
+        assert DockerCpuAdapter(frozenset({IMAGE}), FakeDocker(), container_user=None)
+        return
+    with pytest.raises(ValueError):
+        DockerCpuAdapter(frozenset({IMAGE}), FakeDocker(), container_user=bad)
+
+
+def test_root_container_user_needs_the_explicit_override() -> None:
+    adapter = DockerCpuAdapter(
+        frozenset({IMAGE}),
+        FakeDocker(),
+        container_user="0:0",
+        allow_root_container_user=True,
+    )
+    op = dataclasses.replace(operation(), **adapter.operation_limits())
+    args = adapter.create_arguments(op)
+    assert args[args.index("--user") + 1] == "0:0"
+    # An adapter without the override refuses a root operation even if one is constructed.
+    strict = DockerCpuAdapter(frozenset({IMAGE}), FakeDocker())
+    with pytest.raises(CpuError, match="not permitted"):
+        strict.create_arguments(dataclasses.replace(operation(), container_user="0:0"))
+    assert 4294967294 == int(
+        DockerCpuAdapter(
+            frozenset({IMAGE}), FakeDocker(), container_user="4294967294:1"
+        ).container_user.split(":")[0]
+    )
+
+
+def test_default_container_user_is_the_poller_identity_on_linux(monkeypatch) -> None:
+    from tessera_worker import cpu
+
+    monkeypatch.setattr(cpu.sys, "platform", "linux")
+    monkeypatch.setattr(cpu.os, "geteuid", lambda: 1001)
+    monkeypatch.setattr(cpu.os, "getegid", lambda: 1002)
+    assert cpu.default_container_user() == "1001:1002"
+    monkeypatch.setattr(cpu.os, "geteuid", lambda: 0)
+    assert cpu.default_container_user() is None  # a root poller must choose explicitly
+    monkeypatch.setattr(cpu.sys, "platform", "darwin")
+    monkeypatch.setattr(cpu.os, "geteuid", lambda: 501)
+    assert cpu.default_container_user() is None

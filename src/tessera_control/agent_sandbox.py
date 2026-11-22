@@ -16,6 +16,83 @@ from .project_artifact_retention import require_project_artifact_reference_admis
 from .runtime_packages import RuntimePackageStore
 from .store import Conflict, Forbidden, NotFound, _connect, canonical_digest
 
+EGRESS_ORDER = ("sandbox_policy", "proxy_policy", "service", "proxy_pod")
+EGRESS_KINDS = {
+    "sandbox_policy": "policy",
+    "proxy_policy": "policy",
+    "service": "service",
+    "proxy_pod": "pod",
+}
+# Fields the API server may add to a Service it accepts.
+SERVICE_DEFAULTS = {
+    "clusterIP",
+    "clusterIPs",
+    "ipFamilies",
+    "ipFamilyPolicy",
+    "internalTrafficPolicy",
+    "sessionAffinity",
+}
+
+
+def _egress(package):
+    """The deterministic per-run egress objects, or None for network-none packages."""
+    from tessera_worker.agent_sandbox import egress_manifests, is_egress_package
+
+    try:
+        egress = is_egress_package(package)
+    except ValueError:
+        raise Conflict("Immutable Sandbox binding has inconsistent egress markers.") from None
+    return egress_manifests(package) if egress else None
+
+
+def _contains(wanted, actual):
+    if isinstance(wanted, dict):
+        return isinstance(actual, dict) and all(
+            key in actual and _contains(value, actual[key]) for key, value in wanted.items()
+        )
+    if isinstance(wanted, list):
+        return (
+            isinstance(actual, list)
+            and len(wanted) == len(actual)
+            and all(_contains(w, a) for w, a in zip(wanted, actual, strict=True))
+        )
+    return wanted == actual
+
+
+def _check_egress_object(name, wanted, value, entry):
+    metadata = value.get("metadata", {}) if isinstance(value, dict) else {}
+    uid = metadata.get("uid")
+    if (
+        not uid
+        or entry.get("uid") not in {None, uid}
+        or metadata.get("name") != wanted["metadata"]["name"]
+        or metadata.get("deletionTimestamp")
+        or value.get("kind") != wanted["kind"]
+        or not _contains(wanted["metadata"].get("labels", {}), metadata.get("labels", {}))
+    ):
+        raise SandboxUnsafe("egress object identity conflict")
+    spec = value.get("spec", {})
+    if name in {"sandbox_policy", "proxy_policy"}:
+        if spec != wanted["spec"]:
+            raise SandboxUnsafe("egress NetworkPolicy drift")
+    elif name == "service":
+        if (
+            not _contains(wanted["spec"], spec)
+            or set(spec) - set(wanted["spec"]) - SERVICE_DEFAULTS
+        ):
+            raise SandboxUnsafe("egress Service drift")
+    elif (
+        not _contains(wanted["spec"], spec)
+        or spec.get("initContainers")
+        or spec.get("ephemeralContainers")
+        or spec.get("hostNetwork")
+        or spec.get("hostPID")
+        or spec.get("hostIPC")
+        or len(spec.get("containers", [])) != 1
+    ):
+        raise SandboxUnsafe("egress proxy Pod drift")
+    return uid
+
 
 def create_agent_sandbox_schema(connection):
     connection.execute("""CREATE TABLE IF NOT EXISTS agent_sandbox_bindings (
@@ -53,10 +130,12 @@ class AgentSandboxStore(RuntimePackageStore):
             raise NotFound("Sandbox binding was not found.")
         package = json.loads(package_row["package_json"])
         expected = json.loads(row["blueprint_json"])
+        stored_egress = expected.pop("tessera_egress", None)
         if (
             canonical_digest(package) != row["package_digest"]
             or row["package_digest"] != operation["package_digest"]
             or manifest(package) != expected
+            or stored_egress != _egress(package)
         ):
             raise Conflict("Immutable Sandbox binding conflicts with operation identity.")
         return dict(operation), package, expected, json.loads(row["state_json"])
@@ -108,6 +187,39 @@ class AgentSandboxStore(RuntimePackageStore):
             "scientific_success": False,
         }
 
+    @staticmethod
+    def _preflight(provider, target, labels, package, *, probe=False):
+        """Egress bindings also bind the run's sandbox policy into the preflight.
+
+        probe=True (create only) tolerates the policy not existing yet; once it
+        exists, or for any later action, it is compared by spec.
+        """
+        objects = _egress(package)
+        if objects is None:
+            return provider.preflight(target, labels)
+        policy = objects["sandbox_policy"]
+        if probe:
+            path = provider.path(target, "policy", policy["metadata"]["name"])
+            if provider.client.request("GET", path) is None:
+                return provider.preflight(target, labels)
+        return provider.preflight(target, labels, expected_egress_policy=policy)
+
+    def _ensure_egress(self, provider, target, package, state, *, create, authority):
+        """Create (once, if claimed) or look up the four per-run objects, in order."""
+        objects = _egress(package)
+        for name in EGRESS_ORDER:
+            wanted, kind = objects[name], EGRESS_KINDS[name]
+            path = provider.path(target, kind, wanted["metadata"]["name"])
+            value = provider.client.request("GET", path)
+            if value is None and create:
+                authority()
+                provider.client.request("POST", provider.path(target, kind), wanted)
+                value = provider.client.request("GET", path)
+            if value is None:
+                raise SandboxUnsafe("egress object create outcome unknown; lookup only")
+            entry = state["egress_objects"][name]
+            entry["uid"] = _check_egress_object(name, wanted, value, entry)
+
     def _provider(self):
         if self.backend is None:
             raise SandboxUnsafe("operator-configured Sandbox backend unavailable")
@@ -129,16 +241,39 @@ class AgentSandboxStore(RuntimePackageStore):
         provider, client = discover(backend)
         provider.identity(target)
         if action in {"create", "run", "release"}:
-            provider.preflight(target, expected["metadata"]["labels"])
-        if action in {"release", "observe", "collect", "cleanup"}:
+            self._preflight(
+                provider,
+                target,
+                expected["metadata"]["labels"],
+                package,
+                probe=action == "create",
+            )
+        if action in {"release", "observe", "collect", "cleanup", "egress-journal"}:
             _, _, pods = self._capture(provider, target, expected, state)
             if action == "release" and pods:
-                provider.preflight(target, pods[0]["metadata"].get("labels", {}))
+                self._preflight(provider, target, pods[0]["metadata"].get("labels", {}), package)
         else:
             provider.sandbox(target, expected, state["sandbox_uid"])
             if action == "stop":
                 provider.pods(target, expected, state["sandbox_uid"])
-        return prepared(backend, client, target)
+        egress = _egress(package)
+        if egress is not None and action in {"create", "cleanup", "egress-journal"}:
+            # Bounded reads happen here, outside the writer; absent objects are cached
+            # as absent so the effect can only look them up or POST them once.
+            for name in EGRESS_ORDER:
+                provider.client.request(
+                    "GET",
+                    provider.path(target, EGRESS_KINDS[name], egress[name]["metadata"]["name"]),
+                )
+        log = None
+        if action == "egress-journal":
+            try:
+                log = backend.proxy_log(target, operation_id)
+            except (SandboxUnsafe, OSError, ValueError, RuntimeError):
+                log = None
+        result = prepared(backend, client, target)
+        result.egress_log = log  # raw proxy log read outside the writer, or None
+        return result
 
     def create(self, worker, lease_id, key, body):
         epoch = body["expected_epoch"]
@@ -173,12 +308,18 @@ class AgentSandboxStore(RuntimePackageStore):
                     "cleanup_attempted": False,
                     "cleanup_acknowledged": False,
                 }
+                objects = _egress(package)
+                if objects is not None:
+                    state["egress_objects"] = {
+                        name: {"attempted": False, "uid": None} for name in EGRESS_ORDER
+                    }
+                blueprint = expected | ({"tessera_egress": objects} if objects else {})
                 connection.execute(
                     "INSERT INTO agent_sandbox_bindings VALUES (?,?,?,?,?)",
                     (
                         operation_id,
                         response["package_digest"],
-                        json.dumps(expected, sort_keys=True),
+                        json.dumps(blueprint, sort_keys=True),
                         json.dumps(state, sort_keys=True),
                         self._now().isoformat(),
                     ),
@@ -216,6 +357,8 @@ class AgentSandboxStore(RuntimePackageStore):
             self._authority(connection, live, operation, package, epoch)
             if not state["create_attempted"]:
                 state["create_attempted"] = True
+                for entry in state.get("egress_objects", {}).values():
+                    entry["attempted"] = True
                 claimed = True
                 self._save(connection, live, operation, state, "sandbox.create_claimed")
             return 200, self._response(operation, state)
@@ -338,9 +481,26 @@ class AgentSandboxStore(RuntimePackageStore):
                     )
                 provider.identity(target)
                 if action in {"create", "run", "release"}:
-                    provider.preflight(target, expected["metadata"]["labels"])
+                    self._preflight(
+                        provider,
+                        target,
+                        expected["metadata"]["labels"],
+                        package,
+                        probe=action == "create",
+                    )
                 if action == "create":
                     existing = provider.sandbox(target, expected, state["sandbox_uid"])
+                    if _egress(package) is not None:
+                        self._ensure_egress(
+                            provider,
+                            target,
+                            package,
+                            state,
+                            create=existing is None and create_claimed,
+                            authority=lambda: self._authority(
+                                connection, live, operation, package, body["expected_epoch"]
+                            ),
+                        )
                     if existing is None and create_claimed:
                         # Current authority is serialized with revocation while this
                         # suspended create happens. Scheduling is still gated later.
@@ -375,7 +535,7 @@ class AgentSandboxStore(RuntimePackageStore):
                     ):
                         raise SandboxUnsafe("exact one-use Pod release identity unavailable")
                     provider.validate_pod(expected, pods[0], gated=True)
-                    provider.preflight(target, pods[0]["metadata"]["labels"])
+                    self._preflight(provider, target, pods[0]["metadata"]["labels"], package)
                     self._authority(connection, live, operation, package, body["expected_epoch"])
                     provider.release(target, pods[0])
                     state["phase"] = "release_sent"
@@ -441,7 +601,7 @@ class AgentSandboxStore(RuntimePackageStore):
                 if not state["release_attempted"]:
                     provider = release_provider
                     target = SandboxPlan.model_validate(package["sandbox"]).target
-                    provider.preflight(target, expected["metadata"]["labels"])
+                    self._preflight(provider, target, expected["metadata"]["labels"], package)
                     value, _, pods = self._capture(provider, target, expected, state)
                     if value["spec"]["operatingMode"] != "Running" or len(pods) != 1:
                         raise Conflict("Exactly one gated Pod must exist before release.")
@@ -571,6 +731,104 @@ class AgentSandboxStore(RuntimePackageStore):
             )
         return row
 
+    def _delete_egress(self, provider, target, package, state):
+        """Delete the run's egress objects by exact name and recorded UID."""
+        objects = _egress(package)
+        if objects is None:
+            return
+        for name in ("proxy_pod", "service", "proxy_policy", "sandbox_policy"):
+            wanted, kind = objects[name], EGRESS_KINDS[name]
+            entry = state["egress_objects"][name]
+            value = provider.client.request(
+                "GET", provider.path(target, kind, wanted["metadata"]["name"])
+            )
+            if value is None:
+                continue
+            if not entry.get("uid"):
+                raise SandboxUnsafe("unrecorded egress object prevents deletion")
+            _check_egress_object(name, wanted, value, entry)
+            provider.delete(target, kind, value)
+
+    def egress_journal(self, actor, operation_id, key, body):
+        """Record the proxy's stdout journal once the Sandbox is terminal/suspended."""
+        from tessera_worker.egress_proxy import journal_bytes_sha256, summarize_journal_bytes
+
+        from .egress_journal import frozen_egress, record_egress_journal
+        from .egress_models import EgressJournalSummary
+
+        if actor["kind"] != "worker":
+            raise Forbidden("Only the assigned worker may record a Sandbox egress journal.")
+        with _connect(self.database_path) as connection:
+            live = self._live_principal(connection, actor, audience="worker")
+            _, package, _, _ = self._bound(connection, live, operation_id)
+        if _egress(package) is None:
+            raise Conflict("Sandbox binding does not use the egress profile.")
+        journal_provider = self._snapshot(actor, operation_id, "egress-journal", body)
+
+        def command(connection, live):
+            operation, package, expected, state = self._bound(connection, live, operation_id)
+            self._fence_recovered_operation(connection, operation_id)
+            lease = connection.execute(
+                "SELECT * FROM execution_leases WHERE id=?", (package["lease_id"],)
+            ).fetchone()
+            if (
+                body["expected_epoch"] != operation["epoch"]
+                or lease is None
+                or lease["epoch"] != operation["epoch"]
+                or operation["lease_id"] != package["lease_id"]
+            ):
+                raise Conflict("Egress journal epoch is no longer current.")
+            objects = _egress(package)
+            target = SandboxPlan.model_validate(package["sandbox"]).target
+            provider = journal_provider
+            try:
+                provider.identity(target)
+                self._capture(provider, target, expected, state)
+                if not state["quiescent"]:
+                    raise Conflict("Fresh terminal/suspended Sandbox evidence required first.")
+                wanted = objects["proxy_pod"]
+                pod = provider.client.request(
+                    "GET", provider.path(target, "pod", wanted["metadata"]["name"])
+                )
+                entry = state["egress_objects"]["proxy_pod"]
+                if pod is None or not entry.get("uid"):
+                    raise SandboxUnsafe("proxy Pod identity unavailable")
+                _check_egress_object("proxy_pod", wanted, pod, entry)
+                data = provider.egress_log
+                if data is None:
+                    raise SandboxUnsafe("proxy log unavailable")
+            except (SandboxUnsafe, OSError, ValueError, RuntimeError) as error:
+                raise Conflict("Proxy journal unavailable; nothing was recorded.") from error
+            summary = summarize_journal_bytes(data)
+            try:
+                summary = EgressJournalSummary.model_validate(summary).model_dump(mode="json")
+            except ValueError as error:
+                raise Conflict("Proxy journal summary exceeds the recordable bound.") from error
+            profile, policy = frozen_egress(self, connection, live, operation)
+            if profile != "allowlist-proxy-v1" or policy != package.get("egress"):
+                raise Conflict("Operation package does not match the approved egress policy.")
+            event = record_egress_journal(
+                self,
+                connection,
+                live,
+                operation,
+                journal_bytes_sha256(data),
+                summary,
+                policy,
+            )
+            return 201, event | {"recorded": True}
+
+        return self._mutate(
+            actor,
+            key,
+            "POST",
+            f"/worker/agent-sandboxes/{operation_id}/egress-journal",
+            canonical_digest(body),
+            command,
+            audience="worker",
+            replay_guard=lambda c, a, _: self._bound(c, a, operation_id),
+        )
+
     def collect(self, actor, operation_id, key, body):
         """Fresh typed handoff only; no arbitrary exec or Job collector reuse."""
         collect_provider = self._snapshot(actor, operation_id, "collect", body)
@@ -628,6 +886,12 @@ class AgentSandboxStore(RuntimePackageStore):
             if not state["quiescent"]:
                 raise Conflict("Unknown or active Pods prevent collection/deletion.")
             self._custody(connection, operation, package, body)
+            if package.get("network_profile") is not None:
+                from .egress_journal import egress_journal_for_operation
+
+                # Deleting the proxy Pod discards its journal; retain it until recorded.
+                if egress_journal_for_operation(connection, operation_id) is None:
+                    raise Conflict("Record the egress journal before deleting the proxy Pod.")
             if state["cleanup_attempted"]:
                 raise Conflict("Cleanup already claimed; explicit UID reconciliation required.")
             state.update(
@@ -659,6 +923,7 @@ class AgentSandboxStore(RuntimePackageStore):
                     raise SandboxUnsafe("fresh complete quiescence required before deletion")
                 provider.delete(target, "pvc", pvc)
                 provider.delete(target, "sandbox", value)
+                self._delete_egress(provider, target, package, state)
                 state.update(phase="cleanup_delete_sent", cleanup_acknowledged=True)
             except (SandboxUnsafe, OSError, ValueError, RuntimeError):
                 state.update(phase="cleanup_uncertain", quiescent=False, cleanup_acknowledged=False)

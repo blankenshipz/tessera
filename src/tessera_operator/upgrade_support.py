@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -34,12 +35,13 @@ from tessera_control.recovery import (
     _validate_bundle_declaration,
     _validate_snapshot,
 )
+from tessera_operator import local_paths
 
-KUBECONFIG = Path("/Users/zach/.kube/config")
+KUBECONFIG = local_paths.KUBECONFIG
 CONTEXT = "docker-desktop"
 NAMESPACE = "tessera-local-persistent"
-SOURCE = Path("/Users/zach/Code/tessera/.tessera")
-REPOSITORY = Path("/Users/zach/Code/tessera")
+SOURCE = local_paths.STATE_DIR
+REPOSITORY = local_paths.REPOSITORY
 RESOURCE_RECEIPT = SOURCE / "private/local-persistent-operator.json"
 BACKUP_OUTPUT = SOURCE / "private/local-persistent-operator-backup"
 ACTIVATED_MARKER = SOURCE / "private/local-persistent-activated"
@@ -180,8 +182,9 @@ def _receipt(path: Path) -> dict:
         raise target.AdmissionError("operator receipt invalid") from error
 
 
-def _api_request(method: str, uri: str, body: dict, *, content_type: str | None = None) -> int:
-    """Private kubeconfig client-certificate request; discard all response bodies."""
+@contextmanager
+def _api_client():
+    """Private existing certificate boundary; callers do not receive auth config."""
     identity = target._kubeconfig_identity()
     config = yaml.safe_load(target.KUBECONFIG.read_text())
     context = next(item["context"] for item in config["contexts"] if item["name"] == target.CONTEXT)
@@ -213,18 +216,24 @@ def _api_request(method: str, uri: str, body: dict, *, content_type: str | None 
         with httpx.Client(
             verify=tls, trust_env=False, follow_redirects=False, timeout=10
         ) as client:
-            result = client.request(
-                method,
-                identity["server"] + uri,
-                json=body if content_type is None else None,
-                content=json.dumps(body).encode() if content_type is not None else None,
-                headers={"Content-Type": content_type} if content_type else None,
-            )
-        return result.status_code
+            yield client, identity["server"]
     except target.AdmissionError:
         raise
     except Exception as error:
         raise target.AdmissionError("private Kubernetes UID-delete unavailable") from error
+
+
+def _api_request(method: str, uri: str, body: dict, *, content_type: str | None = None) -> int:
+    """Legacy status-only interface; authentication and cleanup are unchanged."""
+    with _api_client() as (client, server):
+        result = client.request(
+            method,
+            server + uri,
+            json=body if content_type is None else None,
+            content=json.dumps(body).encode() if content_type is not None else None,
+            headers={"Content-Type": content_type} if content_type else None,
+        )
+        return result.status_code
 
 
 def _write_once(path, data: dict) -> None:

@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-from tessera_worker.local_docker_contract import PROGRAM, FixturePlan
+from tessera_worker.local_docker_contract import FixturePlan, program_for
 from tessera_worker.local_docker_namespace import bounded_text, process_identity
 
 from .protocol import Denied, Fact, Observation, digest
@@ -84,7 +84,7 @@ class DockerAdapter:
                 "-I",
                 "-B",
                 "-c",
-                PROGRAM,
+                program_for(self.plan),
                 self.plan.mode,
                 self.plan.nonce,
                 self.plan.digest,

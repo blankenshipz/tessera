@@ -2076,6 +2076,7 @@ def test_v25_through_v29_experiment_ledgers_upgrade_backup_restore_and_repeat_wi
             "created_by_principal_id": owner["id"],
             "id": measurement_id,
             "name": "original duration",
+            "source": "human_entered",
             "value": {"seconds": 12},
         }
     ]
@@ -2699,3 +2700,31 @@ def test_experiment_export_preflights_every_collection_before_materialization(
     monkeypatch.setattr("tessera_control.experiments.EXPORT_RECORD_LIMIT", 2)
     with pytest.raises(Conflict, match=f"{collection} record limit"):
         records.export_experiment(owner, experiment["id"], {"max_bytes": 4 * 1024 * 1024})
+
+
+def test_a_design_revision_can_record_why_the_plan_changed(tmp_path: Path) -> None:
+    state, owner, _worker, grant, *_ = _reconciled_manifest(tmp_path)
+    records = ExperimentStore(state)
+    created = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    plain = _command(records.revise_design, owner, created["id"], payload=_design(1, grant))
+    reasoned = _command(
+        records.revise_design,
+        owner,
+        created["id"],
+        payload={**_design(2, grant), "change_reason": "Baseline drifted; tighten the protocol."},
+    )
+    assert (plain["current_design_revision"], reasoned["current_design_revision"]) == (2, 3)
+    import sqlite3
+
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        payloads = [
+            row[0]
+            for row in connection.execute(
+                "SELECT payload_json FROM events WHERE event_type='experiment.design_revised' "
+                "ORDER BY rowid"
+            )
+        ]
+    assert "change_reason" not in payloads[0]
+    assert "Baseline drifted" in payloads[1]

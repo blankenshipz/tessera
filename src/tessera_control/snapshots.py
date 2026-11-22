@@ -10,7 +10,16 @@ import uuid
 from dataclasses import asdict
 from typing import Any
 
-from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, utc_now
+from .store import (
+    Conflict,
+    Forbidden,
+    NotFound,
+    Store,
+    StoreError,
+    _connect,
+    canonical_digest,
+    utc_now,
+)
 from .workspace import CapturedWorkspace, inventory_digest
 
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
@@ -95,8 +104,27 @@ class SnapshotStore(Store):
         capture: CapturedWorkspace,
         *,
         replay_guard: Any | None = None,
+        data_class: Any = None,
+        code_approval: Any = None,
     ) -> tuple[int, dict[str, Any]]:
-        """Commit reviewed bytes, manifest, audit and replay atomically, locally."""
+        """Commit reviewed bytes, manifest, audit and replay atomically, locally.
+
+        ``data_class`` is an optional ``DataClassDeclaration`` (or its dict); without
+        one the snapshot is ``private_derived`` (ADR 0039). ``code_approval`` is an
+        optional ``CodeApproval`` of exact paths as private code (amendment 1).
+        """
+        from .code_approval import parse_code_approval, record_code_approval
+        from .data_class import (
+            parse_declaration,
+            record_snapshot_data_class,
+            refuse_relabelled_files,
+        )
+
+        try:
+            declaration = parse_declaration(data_class)
+            approval = parse_code_approval(code_approval)
+        except ValueError as error:
+            raise StoreError(str(error)) from None
         manifest = _validate_capture(capture, expected_digest)
 
         def command(connection: sqlite3.Connection, live: dict[str, Any]):
@@ -112,23 +140,24 @@ class SnapshotStore(Store):
                 "INSERT INTO snapshot_files VALUES (?, ?, ?)",
                 ((ident, path, content) for path, content in capture.files),
             )
+            record = record_snapshot_data_class(connection, live, ident, declaration, now=now)
+            code = record_code_approval(connection, live, ident, approval, now=now)
+            refuse_relabelled_files(connection, live["org_id"], ident)
+            adopted = {
+                "snapshot_id": ident,
+                "digest": expected_digest,
+                "file_count": len(capture.files),
+                "total_bytes": capture.inventory.total_bytes,
+                "provenance": "imported_unverified",
+                "classification": "unclassified",
+                "data_class": record,
+            }
+            if code is not None:
+                adopted["code_approval"] = code
             self._event(
-                connection,
-                live,
-                project_id,
-                None,
-                "workspace.snapshot_adopted",
-                1,
-                {
-                    "snapshot_id": ident,
-                    "digest": expected_digest,
-                    "file_count": len(capture.files),
-                    "total_bytes": capture.inventory.total_bytes,
-                    "provenance": "imported_unverified",
-                    "classification": "unclassified",
-                },
+                connection, live, project_id, None, "workspace.snapshot_adopted", 1, adopted
             )
-            return 201, {
+            response = {
                 "id": ident,
                 "project_id": project_id,
                 "digest": expected_digest,
@@ -136,14 +165,28 @@ class SnapshotStore(Store):
                 "created_at": now,
                 "actor_principal_id": live["id"],
                 "transfer_authorized": False,
+                "data_class": record,
             }
+            if code is not None:
+                response["code_approval"] = code
+            return 201, response
 
         return self._mutate(
             actor,
             key,
             "POST",
             f"/projects/{project_id}/snapshots",
-            expected_digest,
+            expected_digest
+            if declaration is None and approval is None
+            else canonical_digest(
+                {"digest": expected_digest}
+                | (
+                    {}
+                    if declaration is None
+                    else {"data_class": declaration.model_dump(mode="json")}
+                )
+                | ({} if approval is None else {"code_approval": approval.model_dump(mode="json")})
+            ),
             command,
             replay_guard=replay_guard,
         )
@@ -152,7 +195,9 @@ class SnapshotStore(Store):
     def _snapshot(connection, live, snapshot_id):
         row = connection.execute(
             """SELECT s.id, s.project_id, s.digest, s.created_at, s.actor_principal_id,
-            substr(s.manifest_json, 1, 1048577) AS manifest_json
+            substr(s.manifest_json, 1, 4194305) AS manifest_json,
+            EXISTS(SELECT 1 FROM snapshot_chunk_uploads u
+                   WHERE u.id = s.id AND u.status = 'completed') AS chunked
             FROM source_snapshots s JOIN projects p ON p.id = s.project_id
             WHERE s.id = ? AND p.org_id = ?""",
             (snapshot_id, live["org_id"]),
@@ -166,8 +211,13 @@ class SnapshotStore(Store):
     def _response(row):
         response = dict(row)
         encoded = response.pop("manifest_json")
+        chunked = bool(response.pop("chunked", 0))
+        # ADR 0037: chunked snapshots carry larger manifests; legacy bounds are unchanged.
+        max_manifest = 4 * 1024 * 1024 if chunked else 1024 * 1024
+        max_files = 10_000 if chunked else MAX_SNAPSHOT_FILES
+        max_bytes = 2 * 1024**3 if chunked else MAX_SNAPSHOT_BYTES
         try:
-            if not isinstance(encoded, str) or len(encoded.encode()) > 1024 * 1024:
+            if not isinstance(encoded, str) or len(encoded.encode()) > max_manifest:
                 raise ValueError("manifest size")
             manifest = json.loads(encoded)
             if (
@@ -175,11 +225,11 @@ class SnapshotStore(Store):
                 or set(manifest) != {"root", "entries", "exclusions", "total_bytes"}
                 or not isinstance(manifest["root"], str)
                 or not isinstance(manifest["entries"], list)
-                or len(manifest["entries"]) > MAX_SNAPSHOT_FILES
+                or len(manifest["entries"]) > max_files
                 or not isinstance(manifest["exclusions"], list)
                 or len(manifest["exclusions"]) > 10000
                 or type(manifest["total_bytes"]) is not int
-                or not 0 <= manifest["total_bytes"] <= MAX_SNAPSHOT_BYTES
+                or not 0 <= manifest["total_bytes"] <= max_bytes
             ):
                 raise ValueError("manifest structure")
             paths = set()
@@ -193,7 +243,7 @@ class SnapshotStore(Store):
                     or not isinstance(entry["sha256"], str)
                     or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
                     or type(entry["size"]) is not int
-                    or not 0 <= entry["size"] <= MAX_SNAPSHOT_BYTES
+                    or not 0 <= entry["size"] <= max_bytes
                     or entry["provenance"] != "imported_unverified"
                     or entry["classification"] != "unclassified"
                 ):
@@ -222,7 +272,15 @@ class SnapshotStore(Store):
         connection = _connect(self.database_path)
         try:
             live = self._live_principal(connection, actor)
-            return self._response(self._snapshot(connection, live, snapshot_id))
+            from .code_approval import snapshot_code_approval
+            from .data_class import snapshot_data_class
+
+            response = self._response(self._snapshot(connection, live, snapshot_id))
+            response["data_class"] = snapshot_data_class(connection, snapshot_id)
+            code = snapshot_code_approval(connection, snapshot_id)
+            if code is not None:
+                response["code_approval"] = code
+            return response
         finally:
             connection.close()
 
@@ -245,17 +303,36 @@ class SnapshotStore(Store):
             connection.close()
 
     @staticmethod
-    def _authorized_snapshot(connection, actor, snapshot_id, worker_id, expected_digest):
+    def _authorized_snapshot(
+        connection,
+        actor,
+        snapshot_id,
+        worker_id,
+        expected_digest,
+        *,
+        verify_retained=True,
+        allow_private_derived=False,
+    ):
         from .snapshot_releases import authorize_snapshot
 
-        return authorize_snapshot(connection, actor, snapshot_id, worker_id, expected_digest)
+        return authorize_snapshot(
+            connection,
+            actor,
+            snapshot_id,
+            worker_id,
+            expected_digest,
+            verify_retained=verify_retained,
+            allow_private_derived=allow_private_derived,
+        )
 
     @staticmethod
-    def _verify_retained(connection, live, snapshot_id) -> dict[str, Any]:
+    def _verify_retained(connection, live, snapshot_id, *, full: bool = False) -> dict[str, Any]:
         row = SnapshotStore._snapshot(connection, live, snapshot_id)
         response = SnapshotStore._response(row)
         manifest = response["manifest"]
         entries = manifest["entries"]
+        if row["chunked"]:
+            return SnapshotStore._verify_chunked(connection, snapshot_id, row, manifest, full)
         if len(entries) > MAX_SNAPSHOT_FILES:
             raise Conflict("Snapshot file count exceeds its bound.")
         count = connection.execute(
@@ -292,12 +369,35 @@ class SnapshotStore(Store):
             "classification": "unclassified",
         }
 
+    @staticmethod
+    def _verify_chunked(connection, snapshot_id, row, manifest, full) -> dict[str, Any]:
+        """Chunked: metadata check by default (no gigabyte re-hash); ``full`` re-hashes bytes."""
+        from .snapshot_chunks import check_chunk_metadata, verify_chunk_content
+
+        entries = manifest["entries"]
+        if connection.execute(
+            "SELECT count(*) FROM snapshot_files WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()[0]:
+            raise Conflict("Snapshot file set integrity check failed.")
+        (verify_chunk_content if full else check_chunk_metadata)(connection, snapshot_id, entries)
+        return {
+            "id": snapshot_id,
+            "digest": row["digest"],
+            "integrity": "verified" if full else "metadata_verified",
+            "chunked": True,
+            "file_count": len(entries),
+            "total_bytes": manifest["total_bytes"],
+            "transfer_authorized": False,
+            "provenance": "imported_unverified",
+            "classification": "unclassified",
+        }
+
     def verify_snapshot(self, actor, snapshot_id) -> dict[str, Any]:
         """Rehash retained bytes locally; return metadata without exporting content."""
         connection = _connect(self.database_path)
         try:
             connection.execute("BEGIN")
             live = self._live_principal(connection, actor)
-            return self._verify_retained(connection, live, snapshot_id)
+            return self._verify_retained(connection, live, snapshot_id, full=True)
         finally:
             connection.close()

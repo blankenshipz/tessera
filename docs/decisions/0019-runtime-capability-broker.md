@@ -32,7 +32,7 @@ until acknowledgement. Never classify/release evidence or report scientific resu
 No control-plane subprocess/network installer, database migration, provider
 activation, signing-key provisioning or default-CI live effects are introduced.
 Local/Kubernetes backend configuration is opt-in but currently **always blocked**;
-a policy/fence object is not proof of isolation. Salad and outcome0 stay separate
+a policy/fence object is not proof of isolation. Salad and program-specific runs stay separate
 and provider-disabled. A live implementation requires a separately verified sandbox,
 pinned-IP TLS transport, quotas, watchdog and authenticated remote journal channel.
 

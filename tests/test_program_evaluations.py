@@ -1,4 +1,4 @@
-"""Synthetic caller-reported numbers test bookkeeping, not MixFM performance."""
+"""Synthetic caller-reported numbers test bookkeeping, not program performance."""
 
 from copy import deepcopy
 from typing import get_args

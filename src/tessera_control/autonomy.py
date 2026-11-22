@@ -7,6 +7,7 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from .approval_trust import decision_provenance, require_decision_actor
 from .autonomy_models import (
     ActionUpdate,
     AutonomyPlan,
@@ -44,6 +45,15 @@ def require_session_authority(store, connection, worker, operation_id):
         or state["actions"][-1]["worker_id"] != worker["id"]
     ):
         raise Conflict("Autonomy session fenced; reconciliation only.")
+
+
+# Command -> session field recording who made the decision (reduce-only ones included).
+_PROVENANCE_FIELDS = {
+    "approve": "approval_provenance",
+    "resume": "resume_provenance",
+    "reject": "stop_provenance",
+    "cancel": "stop_provenance",
+}
 
 
 class AutonomyStore(CapabilityStore):
@@ -174,6 +184,9 @@ class AutonomyStore(CapabilityStore):
         body = self._body(SessionCommand, payload)
 
         def command(db, live):
+            if body["command"] in {"approve", "resume"} and live["role"] == "human":
+                # Grant/continue authority is gated; reject/cancel only reduce it.
+                require_decision_actor(live, forbidden=Forbidden)
             state = self._load(db, live, ident)
             self._revision(state, body, safety=body["command"] in {"cancel", "unknown"})
             state["state"] = self._effective(state)
@@ -203,6 +216,7 @@ class AutonomyStore(CapabilityStore):
                     plan_digest=canonical_digest(body["plan"]),
                     state="proposed",
                     approved_by=None,
+                    approval_provenance=None,
                     checkpoint=None,
                     permitted_action=None,
                 )
@@ -250,6 +264,8 @@ class AutonomyStore(CapabilityStore):
                 elif choice == "complete":
                     state["state"] = "completed"
                     state["stop_reason"] = "criteria_reported"
+            if choice in _PROVENANCE_FIELDS:
+                state[_PROVENANCE_FIELDS[choice]] = decision_provenance(live)
             state["revision"] += 1
             return 200, self._save(db, live, state)
 

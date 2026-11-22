@@ -1,7 +1,7 @@
 # Bounded byte-verified tabular snapshots
 
 The `bounded-tabular-regression-v1` profile parses actual UTF-8 CSV bytes, not
-metadata-only MixFM records. It requires a reviewed byte hash/size, exact declared
+metadata-only program records. It requires a reviewed byte hash/size, exact declared
 schema, unique IDs, finite numeric features/target and nonempty fixed train,
 validation and test labels. Bounds: 4MiB data, 10000 rows, 32 numeric features,
 1024-byte cells, 64KiB observed manifest. It does not establish scientific validity.
@@ -24,6 +24,14 @@ string rows in original order. The manifest digest is not the ordinary source
 snapshot inventory digest; the approved execution plan must pin both layers.
 Filesystem readers use anchored no-follow descriptors and reject symlinks,
 unsafe paths, nonregular/oversized files and mutation during reading.
+
+Campaigns ([ADR 0038](decisions/0038-campaign-specs-and-platform-campaign-runner.md))
+add two things. A released snapshot may be classified `private_derived` (v62), which only a
+local-CPU run without egress may consume. `POST /projects/{p}/composed-snapshots`
+(human-only, delegable to the runner) composes named retained snapshots or custody-released
+manifests into one snapshot, each under `/inputs/<name>/`, taking the most restrictive
+source class; a `snapshot.composed` event records every source path and hash. See
+[campaigns](campaigns.md).
 
 The normal upload/read API now reuses retained source snapshot adoption. Explicit
 worker release, approved plan/grant, current lease/epoch input delivery and worker

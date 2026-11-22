@@ -14,6 +14,11 @@ references, not claims of a supported production deployment.
 - **Run a bounded attempt:** [Local API workflow](local-api-workflow.md) for the
   separate operator handoff, approval, grant, admission and execution. Recording
   a plan in the desktop does not start a job.
+- **Run a staged campaign:** [Campaigns](campaigns.md) for a submitted spec, one human
+  approval and the platform runner; Salad GPU stages are refused unless the operator
+  supplies Salad profiles.
+- **Supervise an agent:** [Supervised loop](supervised-loop.md) for propose, approve,
+  run, observe and critique with one local owner and one MCP-enrolled agent.
 - **Monitor and stop:** [Execution monitor](execution-monitor.md) and
   [desktop execution procedure](../desktop/EXECUTION.md) for attempt/output
   inspection and stop boundaries; requested cancellation is not confirmed termination.
@@ -33,8 +38,14 @@ references, not claims of a supported production deployment.
 - [Operator setup](runtime-operator-setup.md): private state, upgrades and enrollment.
 - [Storage](project-artifact-storage.md), [quarantine](artifact-quarantine.md) and
   [backup/recovery](recovery.md): custody, retention and permanently held restores.
+- [Worker deployment](worker-deployment.md): run the development worker unattended
+  under a supervisor, systemd or launchd.
 - [Runtime setup](runtime-setup.md) and [governed agents](remote-agent-platform-install.md):
   explicit identity, policy, financial references and revocation.
+- [Provider trust](provider-trust.md): per-provider data-class setting for
+  campaign stages (ADR 0040).
+- [Campaign providers](campaign-providers.md): the provider file, the self-hosted provider,
+  the Salad provider and the service loop contract.
 - [Agent Sandbox](agent-sandbox.md): direct one-shot adapter and live prerequisites.
 - [Kubernetes deployment](../deploy/kubernetes/README.md),
   [Astra operator setup](astra-operator-setup.md) and [connection tunnel](connection-tunnel.md):
@@ -49,6 +60,8 @@ references, not claims of a supported production deployment.
 - [Records API](records-api.md), [agent authority](agent-authority-interface.md),
   [provenance](agent-provenance-interface.md), [MCP workflow](mcp-full-workflow.md),
   [A2A peer](a2a-peer.md) and [runtime bindings](runtime-bindings-interface.md).
+- [Gate evidence](gate-evidence.md): split locks, leakage audits, per-seed metrics,
+  replicate aggregates, bound (version-2) gates and research-program spend.
 - [Admission](execution-admission.md), [capability policy](agent-capability-policy.md),
   [runtime admission v2](runtime-admission-v2.md) and [guard evidence](guard-phase-evidence.md).
 - [Release checklist](release-checklist.md), [packaging](release-candidate.md),

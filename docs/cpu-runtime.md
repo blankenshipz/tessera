@@ -22,7 +22,8 @@ preparation event does not claim provider submission.
 Retries preserve the package digest while returning current lease expiry.
 Expired, revoked or changed authority cannot recover a package through a cached
 response. The initial profile rejects network access, pinned skills not yet
-supported by the runtime, and output bounds above 16 MiB.
+supported by the runtime, and output bounds above the operator's artifact limit (default 8 GiB;
+see [large artifacts](large-artifacts.md)).
 
 `CpuRuntime` holds a private journal, obtains the package and released inputs,
 and persists a complete descriptor before the supervisor can submit anything.
@@ -37,7 +38,8 @@ persists its local start intent, rechecks authority, then records one fake submi
 intent before calling `submit`. A lost submit is reconciled through the stable
 operation lookup key and is never resubmitted. Its bounded receipt/report and
 ordinary observation reports retain durable idempotency identities across lost
-responses. Docker adapter behavior remains unchanged; the fake receipt does not
+responses and, when control cannot be reached, are redelivered later from a durable
+outbox with bounded backoff ([ADR 0054](decisions/0054-durable-observation-delivery.md)). Docker adapter behavior remains unchanged; the fake receipt does not
 prove Docker execution, a real provider operation, accounting, or success.
 
 The Docker adapter accepts only allowlisted digest-pinned images. The only
@@ -160,3 +162,88 @@ The separate [Minikube/OpenCode conformance contract](minikube-opencode-conforma
 is pure worker-side dictionary/callback evidence only. It neither invokes
 Minikube nor changes this CPU runtime, Docker adapter, fake provider, control
 schema/API, enrollment, storage quota, dispatch, or pilot acceptance gates.
+
+### Run-receipt refusal (operator note)
+
+After a confirmed exit and sealed upload the development worker posts one run
+receipt. Transient control failures (connection errors, timeouts, HTTP 5xx,
+408/425/429) are retried up to 3 attempts total with the same idempotency key,
+then end as `unknown`/`run_receipt_failed`; a later restart may try again. A
+permanent refusal is not retried: it is recorded durably in
+`receipt-refusals.sqlite3` under the worker workspace root and reported as
+`unknown`/`run_receipt_refused` with `"terminal": true`. A restart returns the same
+evidence without contacting control for the receipt or starting the provider again.
+The workspace and uploaded output are kept, no receipt is claimed, and
+`tessera-worker development-run` exits 2 with a one-line stderr naming the
+operation and reason. Resolving it needs an operator decision on control's side.
+
+Permanent means an HTTP 4xx other than 401, 403, 408, 425 and 429 (for example 409
+when the grant is no longer active, or the epoch or authority is no longer
+current), or a 403 whose control `detail` is one of two exact strings, described
+below.
+
+#### Exit codes
+
+| Exit | Meaning | Operator action |
+| --- | --- | --- |
+| 0 | The command finished. Non-terminal `unknown` results, including `run_receipt_failed` after exhausted retries, also exit 0. | Read the JSON on stdout; a restart may retry. |
+| 2 | Terminal failure evidence (`terminal: true`, such as `run_receipt_refused`). One stderr line names the operation and reason. | A restart cannot change it; decide on control's side. |
+| 3 | Control rejected the worker credential. One stderr line, no paths or control body; stdout JSON carries `"credential_rejected": true` and `"control_status"`. | Renew or replace the credential file, then restart. A supervisor should back off for a long time, not crash-loop. |
+| other | Unexpected failure (for example exit 1 for an invalid configuration or a transport failure before any lease). | Fix the cause; retry with backoff. |
+
+The constants live in `src/tessera_worker/exit_codes.py`.
+
+#### 401 versus 403
+
+Control answers every invalid worker token on `/worker/*` routes with HTTP 401 and
+the fixed detail `Unauthorized`: an unknown token, a revoked principal or
+credential, an expired credential, or a token of the wrong audience. Only a new or
+renewed credential fixes that. The worker treats it as the credential-rejected
+class: nothing is recorded durably, there is one attempt and no retry loop, and the
+process exits 3.
+
+HTTP 403 means control authenticated the worker but refused it, and the fixed
+`detail` text says why. A status alone cannot separate a fixable case from a lost
+authority, so the worker matches the 403 `detail` against an exact allowlist (never
+a substring, and the body is never echoed or stored):
+
+- `Worker is not assigned to this execution grant.` (the grant now belongs to
+  another worker) and `Worker is retired.` mean the authority is gone and a new
+  credential cannot restore it. These are permanent: recorded durably, terminal,
+  exit 2.
+- Any other 403 (for example `Worker is not registered.`, `Worker is not registered
+  for this project.`, `Worker is not authorized for this project.`), a body that is
+  not JSON, is too large, or has a different `detail`, is treated as the
+  credential-rejected class: not recorded, exit 3. The worker fails closed to this
+  class when unsure, because a wrong permanent record would block a restart that an
+  operator could have fixed. The operator checks the worker registration and the
+  credential, then restarts.
+
+A revoked or reconciled grant is answered by control with HTTP 409 on the run
+receipt route (`Run receipt authority is no longer current.`), which is already a
+permanent refusal.
+
+A credential rejection on any other call (heartbeat, lease, package refresh,
+observation) ends the run the same way. A running container is still cancelled
+first, the workspace is kept, and the result keeps its non-terminal shape with
+`"credential_rejected": true` added. A restart after the credential is fixed
+reconciles the existing operation and reposts the receipt with the same
+idempotency key.
+
+If the refusal record itself cannot be written (or the journal cannot be read at
+start), the result is terminal `unknown`/`run_receipt_refusal_unrecorded`, the
+CLI exits 2, workspace and output are kept, and a restart reposts once the
+journal is usable. A restart only reconciles the existing operation (it never
+issues a start), and it reads the journal before any receipt post, so a journal
+that stays unreadable cannot cause a second provider start or a repost.
+
+To deliberately reset a recorded refusal: stop the worker, delete that
+operation's row, and restart.
+
+```sh
+sqlite3 "<workspace_root>/receipt-refusals.sqlite3" \
+  "DELETE FROM receipt_refusals WHERE operation_id = '<operation_id>'"
+```
+
+The restart reposts the run receipt to control, and control may refuse it again,
+which records a new terminal refusal.

@@ -78,6 +78,18 @@ CASES = {
 }
 
 
+EGRESS_CASES = {"cni": {"egress-proxy-allow", "egress-proxy-deny"}}
+EGRESS_PROFILE = "agent-sandbox-egress-allowlist-v1"
+NONE_PROFILE = "agent-sandbox-network-none-v1"
+
+
+def required_cases(kind, target):
+    cases = set(CASES[kind])
+    if target.egress_proxy_image:
+        cases |= EGRESS_CASES.get(kind, set())
+    return cases
+
+
 def validate_native_pair(kind, item, target):
     values = []
     for label, uid in (("control", item["control_uid"]), ("isolated", item["subject_uid"])):
@@ -95,7 +107,23 @@ def validate_native_pair(kind, item, target):
             raise ValueError("native observation attribution mismatch")
         values.append(response)
     control, isolated = values
-    if kind == "cni":
+    if kind == "cni" and item["case"] == "egress-proxy-allow":
+        valid = (
+            control.get("connected") is True
+            and type(control.get("bytes_received")) is int
+            and control["bytes_received"] > 0
+        )
+    elif kind == "cni" and item["case"] == "egress-proxy-deny":
+        valid = (
+            isolated.get("connected") is False
+            and (
+                isolated.get("errno") in {"ETIMEDOUT", "EACCES", "EPERM", "ECONNREFUSED"}
+                or isolated.get("http_status") == 403
+            )
+            and type(isolated.get("elapsed_ms")) is int
+            and 1 <= isolated["elapsed_ms"] <= 5000
+        )
+    elif kind == "cni":
         valid = (
             control.get("connected") is True
             and type(control.get("bytes_received")) is int
@@ -180,7 +208,8 @@ class SignedSandboxWitnessVerifier:
                 raise ValueError("independent witness authority mismatch")
             inputs = report.request.inputs
             if (
-                inputs.get("profile") != "agent-sandbox-network-none-v1"
+                inputs.get("profile")
+                != (EGRESS_PROFILE if target.egress_proxy_image else NONE_PROFILE)
                 or inputs.get("target_scope") != scope_digest(target)
                 or inputs.get("upstream_commit") != target.upstream_commit
             ):
@@ -197,8 +226,8 @@ class SignedSandboxWitnessVerifier:
             raw = report.native.get("sandbox_observations")
             if (
                 not isinstance(raw, list)
-                or {item.get("case") for item in raw} != CASES[kind]
-                or len(raw) != len(CASES[kind])
+                or {item.get("case") for item in raw} != required_cases(kind, target)
+                or len(raw) != len(required_cases(kind, target))
             ):
                 raise ValueError("complete native Sandbox observations required")
             resource_uids = {item.uid for item in report.resources}

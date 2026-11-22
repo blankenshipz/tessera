@@ -12,6 +12,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
+from .artifact_limits import operator_limits
 from .migrations import plan_digest, plan_payload
 from .models import ExecutionSpec
 from .store import (
@@ -294,7 +295,7 @@ class ArtifactStore(Store):
         spec = plan["execution_spec"]
         if body["relative_path"] not in spec["output_paths"]:
             raise Conflict("Artifact path is not declared by the approved plan.")
-        return min(spec["max_output_bytes"], MAX_ARTIFACT_BYTES)
+        return min(spec["max_output_bytes"], operator_limits().max_artifact_bytes)
 
     @staticmethod
     def _reserved_bytes(connection: sqlite3.Connection, lease_id: str) -> int:
@@ -306,7 +307,20 @@ class ArtifactStore(Store):
             WHERE lease_id = ? AND status = 'uploading'""",
             (lease_id,),
         ).fetchone()[0]
-        return artifact_bytes + staged_bytes
+        # An expired upload no longer reserves budget (it can only be restarted).
+        now = datetime.now(UTC)
+        chunked_bytes = sum(
+            row["size"]
+            for row in connection.execute(
+                """SELECT json_extract(manifest_json, '$.size') AS size, expires_at
+                FROM snapshot_chunk_uploads WHERE status = 'uploading'
+                AND json_extract(manifest_json, '$.kind') = 'artifact'
+                AND json_extract(manifest_json, '$.lease_id') = ?""",
+                (lease_id,),
+            )
+            if _parse_utc(row["expires_at"]) > now
+        )
+        return artifact_bytes + staged_bytes + chunked_bytes
 
     def _late(self, connection: sqlite3.Connection, grant: sqlite3.Row, lease: sqlite3.Row) -> int:
         task = connection.execute(
@@ -335,7 +349,15 @@ class ArtifactStore(Store):
         grant: sqlite3.Row,
         body: dict[str, Any],
         content: bytes,
+        *,
+        size: int | None = None,
     ) -> dict[str, Any]:
+        """Insert a quarantined artifact; ``size`` is given only for chunk-stored bytes.
+
+        A chunk-stored (large) artifact keeps an empty ``content`` here and its bytes in
+        ``snapshot_chunks`` under the artifact id; ``size`` is then its real length.
+        """
+        size = len(content) if size is None else size
         limit = self._validate_declaration(connection, grant, lease, body)
         if (
             connection.execute(
@@ -345,7 +367,7 @@ class ArtifactStore(Store):
             is not None
         ):
             raise Conflict("Artifact path is immutable.")
-        if self._reserved_bytes(connection, lease["id"]) + len(content) > limit:
+        if self._reserved_bytes(connection, lease["id"]) + size > limit:
             raise Conflict("Artifact output budget is exceeded.")
         row = {
             "id": self._artifact_id(lease["id"], body["relative_path"]),
@@ -358,7 +380,7 @@ class ArtifactStore(Store):
             "operation_id": body["operation_id"],
             "relative_path": body["relative_path"],
             "sha256": body["sha256"],
-            "size": len(content),
+            "size": size,
             "content": content,
             "created_at": utc_now(),
             "status": "quarantined",

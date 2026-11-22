@@ -6,8 +6,10 @@ bytes, grants a lease, dispatches a job, or certifies scientific validity.
 
 import json
 
-from .evaluation_models import evaluate_record
-from .program_models import OUTCOME_CONDITIONS, ProgramReview
+from .evaluation_models import evaluate_bound_record, evaluate_record
+from .gate_evidence_metrics import series_accounting
+from .gate_evidence_splits import lock_audit_status
+from .program_models import ProgramReview
 from .research import ResearchStore
 from .store import Conflict, NotFound, canonical_digest
 
@@ -122,7 +124,80 @@ def _supported(sources):
         raise Conflict("Review requires currently supported, unsuperseded sources.")
 
 
-def _evaluation_report(review, history, *, current=True):
+def _resolve_groups(conn, project_id, basis, protocol, record):
+    """Resolve referenced replicate groups with tenant-scoped SQL and audit facts."""
+    gates = {g.id: g for g in protocol.gates}
+    variants = {v["id"]: v for v in basis["variants"]}
+    groups = {}
+    for observation in record.observations:
+        group_id = observation.replicate_group_id
+        if group_id is None or group_id in groups:
+            continue
+        row = conn.execute(
+            "SELECT * FROM gate_replicate_groups WHERE id=? AND project_id=?",
+            (group_id, project_id),
+        ).fetchone()
+        gate = gates.get(observation.gate_id)
+        if row is None or gate is None:
+            continue  # unknown groups are inconclusive; undeclared gates are rejected
+        facts = dict(row)
+        facts["sources"] = json.loads(facts.pop("sources_json"))
+        facts["excluded_attempts"] = json.loads(facts.pop("excluded_attempts_json"))
+
+        # Locks are immutable, so any recorded overlap stays binding, and a clean
+        # cross-set audit must cover the gate's evaluated partition.
+        facts["audit"] = lock_audit_status(
+            conn, gate.split_lock_id, gate.required_reference_lock_ids, gate.split_partition
+        )
+        # The gate's experiment variant must belong to an experiment linked from
+        # the gate's study variant (and be the experiment the group measured).
+        study_variant = variants.get(gate.variant_id)
+        linked = (
+            json.loads(study_variant["metadata_json"]).get("experiment_id")
+            if study_variant
+            else None
+        )
+        facts["variant_linked"] = any(
+            e["experiment"]["id"] == linked
+            and facts["experiment_id"] == linked
+            and gate.experiment_variant_id in {v["id"] for v in e["variants"]}
+            for e in basis["executions"]
+        )
+        facts["current"] = _group_is_current(conn, facts)
+        groups[group_id] = facts
+    return groups
+
+
+def _group_is_current(conn, group):
+    """True only if the group still equals its current series: no dispatched attempt
+    of the series is non-terminal, every succeeded attempt has a record, members are
+    exactly the succeeded attempts and recorded exclusions (including never-dispatched
+    attempts) are exactly the series' exclusions."""
+    series = series_accounting(
+        conn,
+        group["project_id"],
+        group["variant_id"],
+        group["lock_id"],
+        group["metric"],
+        group["partition"],
+    )
+    if series["blocking"] or series["missing_record"]:
+        return False
+    members = {
+        r["attempt_id"]
+        for r in conn.execute(
+            """SELECT m.attempt_id FROM gate_replicate_members g
+            JOIN gate_metric_records m ON m.id=g.metric_record_id WHERE g.group_id=?""",
+            (group["id"],),
+        )
+    }
+    excluded = {e["attempt_id"] for e in group["excluded_attempts"]}
+    return members == set(series["members"]) and excluded == {
+        e["attempt_id"] for e in series["excluded"]
+    }
+
+
+def _evaluation_report(review, history, *, current=True, ctx=None):
     record = review.evaluation
     plans = [r for r in history if r["scope"]["action"] == "plan"]
     plan_row = next((r for r in plans if r["id"] == record.plan_decision_id), None)
@@ -135,13 +210,23 @@ def _evaluation_report(review, history, *, current=True):
     protocol = ProgramReview.model_validate(plan_row["scope"]).evaluation_protocol
     if protocol is None:
         raise Conflict("Evaluation requires a declared plan protocol.")
+    if protocol.version != record.version:
+        raise Conflict(
+            f"Evaluation record version {record.version} does not match the plan's "
+            f"version-{protocol.version} protocol; caller-reported values cannot satisfy "
+            "bound gates."
+        )
     try:
+        if protocol.version == 2:
+            conn, project_id, basis = ctx
+            groups = _resolve_groups(conn, project_id, basis, protocol, record)
+            return evaluate_bound_record(protocol, record, groups)
         return evaluate_record(protocol, record)
     except ValueError as error:
         raise Conflict(str(error)) from error
 
 
-def _gate_direction(review, plan, history):
+def _gate_direction(review, plan, history, ctx=None):
     if plan.evaluation_protocol is None and review.evaluation_id is None:
         return  # Legacy prose-only plans remain explicitly unevaluated.
     evaluations = [r for r in history if r["scope"]["action"] == "evaluation"]
@@ -150,10 +235,50 @@ def _gate_direction(review, plan, history):
         raise Conflict("Go requires the current human-reviewed evaluation record.")
     if row["scope"]["basis_digest"] != review.basis_digest:
         raise Conflict("Go requires an evaluation of the current evidence basis.")
-    report = _evaluation_report(ProgramReview.model_validate(row["scope"]), history)
+    report = _evaluation_report(ProgramReview.model_validate(row["scope"]), history, ctx=ctx)
     if report["status"] != "pass":
         raise Conflict(
             "Go requires passing declared gates; failed or inconclusive results block go."
+        )
+
+
+def _verify_bound_protocol(conn, project_id, protocol):
+    """Plan-time: every bound lock exists in this project with the declared digest."""
+    for gate in protocol.gates:
+        lock = conn.execute(
+            "SELECT membership_digest,partitions_json FROM gate_split_locks "
+            "WHERE id=? AND project_id=?",
+            (gate.split_lock_id, project_id),
+        ).fetchone()
+        if lock is None:
+            raise NotFound("Gate split lock was not found in this project.")
+        if lock["membership_digest"] != gate.split_digest:
+            raise Conflict("Gate split_digest does not match the locked membership digest.")
+        if gate.split_partition not in {p["name"] for p in json.loads(lock["partitions_json"])}:
+            raise Conflict("Gate split_partition is not a partition of its split lock.")
+        for ref in gate.required_reference_lock_ids:
+            found = conn.execute(
+                "SELECT 1 FROM gate_split_locks WHERE id=? AND project_id=?", (ref, project_id)
+            ).fetchone()
+            if found is None:
+                raise NotFound("Required reference split lock was not found in this project.")
+
+
+def require_bound_plan(review):
+    """New plans must declare version-2 bound gates.
+
+    A plan proposed from now on cannot be decided by caller-reported floats
+    (version 1) or by prose alone (no protocol). Plan rows recorded before this
+    rule stay readable and keep their legacy label; nothing is rewritten, and an
+    already-pending legacy proposal may still be resolved by a human.
+    """
+    if review.action != "plan":
+        return
+    protocol = review.evaluation_protocol
+    if protocol is None or protocol.version != 2:
+        raise Conflict(
+            "New plans require a version-2 evaluation protocol with bound gates; "
+            "caller-reported (version 1) and protocol-less plans are legacy only."
         )
 
 
@@ -163,6 +288,8 @@ def validate_program_review(
     if scope.get("type") != "research_program":
         return
     review = ProgramReview.model_validate(scope)
+    if resolving_id is None and not approve:
+        require_bound_plan(review)
     if kind != ("access" if review.action == "source_use" else "direction"):
         raise Conflict("Program review kind does not match its action.")
     basis = program_basis(conn, actor, review.study_id)
@@ -193,7 +320,10 @@ def validate_program_review(
                 basis["variants"],
                 "Evaluation variant",
             )
-    report = _evaluation_report(review, outcome_history) if review.evaluation else None
+            if review.evaluation_protocol.version == 2:
+                _verify_bound_protocol(conn, project_id, review.evaluation_protocol)
+    ctx = (conn, project_id, basis)
+    report = _evaluation_report(review, outcome_history, ctx=ctx) if review.evaluation else None
     if review.evaluation_id:
         if not any(
             r["id"] == review.evaluation_id and r["scope"]["action"] == "evaluation"
@@ -222,7 +352,7 @@ def validate_program_review(
         if not plans:
             raise Conflict("Go requires a human-reviewed program plan.")
         plan = ProgramReview.model_validate(plans[-1]["scope"])
-        _gate_direction(review, plan, outcome_history)
+        _gate_direction(review, plan, outcome_history, ctx)
         if plan.brief.missing_prerequisites:
             raise Conflict("Go requires resolving the reviewed plan's missing prerequisites.")
         accounted = {v for c in plan.conditions.values() for v in c.variant_ids}
@@ -291,6 +421,12 @@ def program_context(conn, actor, study_id):
         if review.evaluation:
             plans = [r for r in outcome_history if r["scope"]["action"] == "plan"]
             row["is_effective_review"] &= plans[-1]["id"] == review.evaluation.plan_decision_id
+        if review.evaluation:
+            row["gate_evidence_binding"] = (
+                "platform_replicate_aggregate"
+                if review.evaluation.version == 2
+                else "unbound_caller_reported_legacy"
+            )
         if review.action == "go_no_go" and review.recommendation == "go":
             plans = [
                 r
@@ -298,9 +434,20 @@ def program_context(conn, actor, study_id):
                 if r["scope"]["action"] == "plan" and r["status"] == "approved"
             ]
             if plans:
+                protocol = ProgramReview.model_validate(plans[-1]["scope"]).evaluation_protocol
+                row["gate_evidence_binding"] = (
+                    "none_prose_only_legacy"
+                    if protocol is None
+                    else "platform_replicate_aggregate"
+                    if protocol.version == 2
+                    else "unbound_caller_reported_legacy"
+                )
                 try:
                     _gate_direction(
-                        review, ProgramReview.model_validate(plans[-1]["scope"]), outcome_history
+                        review,
+                        ProgramReview.model_validate(plans[-1]["scope"]),
+                        outcome_history,
+                        (conn, basis["study"]["project_id"], basis),
                     )
                 except Conflict:
                     row["is_effective_review"] = False
@@ -310,7 +457,8 @@ def program_context(conn, actor, study_id):
         "basis_digest": digest,
         "basis": basis,
         "reviews": history,
-        "condition_catalog": OUTCOME_CONDITIONS,
+        # Conditions are declared by each plan; the platform carries no catalog.
+        "condition_catalog": {},
         "execution_granted": False,
         "scientific_validity": "not_assessed",
         "evidence_boundary": "registered_study_records_and_explicit_experiment_links_only",

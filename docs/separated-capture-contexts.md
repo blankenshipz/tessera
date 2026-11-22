@@ -103,7 +103,7 @@ Source factory can consume the triple, `adapter.resolve_contexts()` input channe
 and `NormalizedPublicMetadataProducer.read_public_metadata(row)` capture channel.
 It still needs actual authenticated context/output readers, installed harness input
 readback, and a real eligible-public V2 extraction implementation with independent
-visibility/admission observations. This lane does not edit runtime/factory/agent,
+visibility/admission observations. This document does not edit runtime/factory/agent,
 backend/migration, peer/MCP or environment files. No denied environment file was
 read or replaced through another path. No host/auth discovery, inference or live
 deployment occurred. Tests use actual temporary backend contexts, registration,

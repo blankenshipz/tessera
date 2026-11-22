@@ -19,6 +19,7 @@ from test_execution import _grant_payload, _owner, _snapshot_release, _worker
 from test_goal_to_decision import _design
 
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.store import Store, canonical_digest, initialize_state, migrate_state
 from tessera_worker.ordinary_docker_contract import DockerLease, DockerPackage, DockerTarget
@@ -389,7 +390,7 @@ def test_explicit53_to54_empty_enrollment(tmp_path, held):
             is None
         )
     assert TestClient(create_app(state)).get("/health/ready").status_code == 503
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert db.execute("SELECT count(*) FROM ordinary_docker_targets").fetchone()[0] == 0
         assert_empty_runtime_v55(db)

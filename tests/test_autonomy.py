@@ -497,3 +497,29 @@ def test_caps_default_deny_and_revoked_running_projection(make_broker):
     with pytest.raises(EffectDenied):
         h.broker.run(h.package)
     assert not h.effects.calls
+
+
+def test_autonomy_gates_approve_resume_but_not_reject_or_cancel(make_broker):
+    h = make_broker("data")
+    store = AutonomyStore(h.state)
+    bare = dict(h.owner)
+    bare.pop("automation_label", None)
+    labelled = bare | {"automation_label": "desktop-owner"}
+    plan = plan_for(h)
+
+    _, rejected = store.create(bare, h.grant["task_id"], "s1", plan)
+    rejected = command(store, bare, rejected, "reject")  # reduce-only: bare owner allowed
+    assert rejected["stop_provenance"]["decision_class"] == "owner_unlabelled"
+
+    _, session = store.create(bare, h.grant["task_id"], "s2", plan)
+    with pytest.raises(Forbidden, match="X-Tessera-Automation"):
+        command(store, bare, session, "approve", plan_digest=session["plan_digest"])
+    session = command(store, labelled, session, "approve", plan_digest=session["plan_digest"])
+    assert session["approval_provenance"] == {
+        "credential_kind": "local_owner",
+        "decision_class": "owner_automation_unverified",
+        "automation": True,
+        "automation_label": "desktop-owner",
+    }
+    session = command(store, bare, session, "cancel")
+    assert session["stop_provenance"]["decision_class"] == "owner_unlabelled"

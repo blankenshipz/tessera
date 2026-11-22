@@ -41,7 +41,10 @@ upload through `POST /projects/{id}/tabular-dataset-snapshots`. Human snapshot
 release is separate from adoption and must identify the bounded worker principal,
 expiry and exact input snapshot digest.
 
-Register **all four** variants before any approval: `constant` (training target
+An experiment design holds exactly two variants, so register the four starter
+variants as study variants and link them to two-variant experiments (for example one
+experiment pairing `constant` with `linear` and another pairing `half-slope` with
+`zero-slope`) before any approval. The variants are: `constant` (training target
 mean), `linear` (training-only first numeric feature OLS), `half-slope` (same fit,
 preregistered coefficient intervention), `zero-slope` (explicit zero coefficient
 control). OLS singular variance falls back truthfully to the constant train mean.
@@ -72,7 +75,7 @@ The workload build slices actual pure verifier definitions verbatim out of the
 canonical backend module, excluding only Store/API imports and its Store class.
 This avoids shipping/importing control services in an experiment image; the image
 retains canonical/sliced source hashes and targeted parity checks exercise the same
-loader. User65532, read-only root, no
+loader. User 65532 by default (the local-docker poller may run it as the operator's `container_user`; its files are world-readable), read-only root, no
 capabilities/network, and container/Job resource limits remain mandatory. A local
 image tag or image-config digest is **not** a workload registry-manifest pin.
 Use the exact OCI manifest digest from the retained built artifact; installed target

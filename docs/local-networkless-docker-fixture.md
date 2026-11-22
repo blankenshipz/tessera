@@ -10,6 +10,25 @@ independent daemon-host namespace identity as well as namespace-local rtnetlink
 and connectivity observations. The macOS/LinuxKit boundary currently fails this
 preflight before any container creation; no prior evidence is upgraded.
 
+**Attestation classes.** The fixture has two explicit classes
+([ADR 0035](decisions/0035-docker-desktop-network-attestation.md)). The default,
+`daemon_host_independent` (profile `local-networkless-fixture-v1`), is the
+independent-reader proof above and is unchanged; its plan digests are byte-identical.
+The operator may instead select `engine_declared_workload_observed` (profile
+`local-networkless-fixture-engine-attested-v1`) with
+`scripts/check_local_docker_fixture.py --run --attestation-class
+engine_declared_workload_observed`. The flag takes the exact value, is valid only
+with `--run`, defaults to strong, and is never applied as an automatic fallback. The
+weak class keeps the same in-workload observer predicates plus engine readback of
+`NetworkMode=none`/`Networks=={"none"}`/the security profile before and after
+observation, no `container:<id>` peer, a command-digest match and a paused re-check
+before custody. It lacks the independent daemon-host binding, so it records
+`state="workload_observed"`, `observer_independence="none_engine_and_image_trusted"`,
+and its CLI summary state is `passed_weak_attestation`, never `passed`. Stop,
+cancel, deadline, broker-loss, recovery, guardian and cleanup behavior is identical
+in both classes and engine-observed. A weak result is reported separately and
+never folded into a strong PASS; it does not support any network-isolation claim.
+
 This is an **explicit opt-in, closed harmless conformance fixture**, not a general
 execution backend, capability activation, package installer, downloader, or
 scientific experiment. Kubernetes activation and provider-disabled defaults are
@@ -161,11 +180,36 @@ fixture logs, exit/status, image and container identities remain in the journal.
 Termination and cleanup are independent records. Removal requires exact ownership
 labels, image, name and immutable ID plus non-running readback. It uses `rm ID`,
 never force removal, prune, volume/image deletion, broad filters or namespace
-cleanup. A successful complete container listing then confirms the ID is absent;
+cleanup. A successful exact-ID query then confirms the ID is absent;
 an inspect error is not absence. No host workspace/input/output mount exists to
 delete. Empty private CLI configuration and SQLite/JSON evidence directories are
 retained intentionally, not silently pruned. Pipes/process handles are closed and
 the parent joins the supervisor. Uncertain operations retain evidence for recovery.
+
+### Cleanup confirmation is an exact-ID query with its own bound
+
+Absence is `container ls --all --no-trunc --filter id=<64-hex ID> --format {{.ID}}`:
+only a successful, empty reply counts. Any returned ID (the container's or another)
+is invalid evidence, and a timeout, error or non-zero exit is unknown, never absence.
+The earlier full listing cost grew with every stopped container on a shared Docker
+host and exceeded the two-second bound under load, ending runs `unknown` after a
+confirmed stop although nothing remained. Post-termination calls (stop readbacks,
+`rm`, the absence query, output-volume inspect/list/remove) now have a separate
+10-second bound (`CLEANUP_CALL_SECONDS`); every other call keeps two seconds
+(`DEFAULT_CALL_SECONDS`). The longer bound applies only after kill/exit, so it extends
+neither workload runtime nor guardian lease or heartbeat deadlines, only how long the
+confirmation may take. Fail-closed behaviour is unchanged.
+
+The calls made while the workload may still be running (the pre-stop inspection,
+`unpause` and `kill`) keep the two-second bound, so a hung daemon is reported
+unknown quickly and nothing waits ten seconds on a live workload; only the readback
+after the kill uses the long bound. A `kill` or `unpause` that fails because the
+container stopped on its own between the inspection and the call is benign only
+if a fresh short-bound inspection shows it is no longer running; the readback must
+then still confirm the exit. A container that is still running, or can no longer be
+inspected (for example removed), stays unknown. The tradeoff: on a heavily loaded
+host a `kill` that exceeds two seconds leaves the workload running and the case
+`unknown`, which is the safe outcome; the guardian's independent kill still applies.
 
 ## Checks and observed live limitations (2026-09-23 UTC)
 
@@ -341,3 +385,8 @@ lint/format and whitespace checks pass; the default CLI remains disabled with ze
 effects. These are targeted checks, not full integration acceptance or successful
 live conformance. Further runtime investigation needs a separately authorized
 bounded attempt; no remaining authority from this one-run task permits a retry.
+
+`--cases` (exact names `success,failure,cancel,timeout,broker-loss`, `--run` only)
+runs a subset and reports `partial_passed` or `partial_passed_weak_attestation`;
+only the full five-case run reports `passed` or `passed_weak_attestation`.
+

@@ -15,6 +15,7 @@ from test_goal_to_decision import _design
 from tessera_control.api import create_app
 from tessera_control.execution import ExecutionStore
 from tessera_control.experiments import ExperimentStore
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.store import Store, canonical_digest, initialize_state, migrate_state
 
@@ -506,6 +507,114 @@ def test_dispatch_target_status_cancel_and_replay(prepared):
     assert cancelled["result"]["status"] == "cancel_requested"
 
 
+def test_research_proposal_readback_reopen_pagination_and_promotion(prepared):
+    state, client, owner, agent, project, _, _ = prepared
+    path = f"/projects/{project}/agent-workflow-proposals"
+    body = {
+        "proposal": {
+            "kind": "study",
+            "study": {"purpose": "draft", "protocol": "pending", "mode": "exploratory"},
+        },
+        "provenance": {"client": "test", "model": "attested", "session_id": "readback"},
+    }
+    first = post(client, agent, path, body, key="readback")
+    assert post(client, agent, path, body, key="readback") == first
+    second = post(client, agent, path, body, key="readback-second")
+    detail = f"/agent-research-proposals/{first['id']}"
+    for active in (client, TestClient(create_app(state))):
+        result = active.get(detail, headers=agent)
+        assert result.status_code == 200
+        assert result.json() == {**first, "promotion": None}
+        assert result.json()["payload"] == body
+        assert result.json()["digest"] == canonical_digest(body)
+        assert active.get(path, headers=agent).json()["proposals"] == [
+            {**first, "promotion": None},
+            {**second, "promotion": None},
+        ]
+        assert active.get(path + "?offset=1&limit=1", headers=agent).json()["proposals"] == [
+            {**second, "promotion": None}
+        ]
+        assert active.get(f"/agent-proposals/{first['id']}", headers=agent).status_code == 404
+        assert active.get(f"/projects/{project}/agent-proposals", headers=agent).json() == {
+            "proposals": []
+        }
+    for ident in ("missing", "agent_proposal_wrong_family"):
+        assert client.get(f"/agent-research-proposals/{ident}", headers=agent).status_code == 404
+    promotion = post(
+        client,
+        owner,
+        detail + "/promote",
+        {"expected_revision": 1, "expected_digest": first["digest"]},
+    )
+    read = client.get(detail, headers=agent).json()
+    assert read["promotion"] == promotion
+    assert {k: read[k] for k in first} == first
+    from test_external_agent_authority import _plan
+
+    legacy = post(client, agent, f"/projects/{project}/agent-proposals", _plan())
+    assert client.get(f"/agent-proposals/{legacy['id']}", headers=agent).json() == legacy
+    assert client.get(f"/projects/{project}/agent-proposals", headers=agent).json() == {
+        "proposals": [legacy]
+    }
+    assert client.get(f"/agent-research-proposals/{legacy['id']}", headers=agent).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "denial", ["credential", "scope", "destination", "project", "org", "expired", "revoked"]
+)
+def test_research_read_authority_boundaries(prepared, denial, monkeypatch):
+    state, client, owner, agent, project, _, _ = prepared
+    credential = client.get("/external-agent/status", headers=agent).json()
+    path = f"/projects/{project}/agent-workflow-proposals"
+    proposal = post(
+        client,
+        agent,
+        path,
+        {
+            "proposal": {"kind": "study", "study": {"purpose": "draft", "protocol": "pending"}},
+            "provenance": {"client": "test", "model": "attested", "session_id": "readback"},
+        },
+    )
+    detail = f"/agent-research-proposals/{proposal['id']}"
+    headers = dict(agent)
+    if denial in ("credential", "scope"):
+        headers, _ = enroll(
+            client, owner, project, ["proposal:create"] if denial == "scope" else None
+        )
+    elif denial == "destination":
+        headers["X-Agent-Destination"] = "wrong"
+    elif denial in ("project", "org"):
+        # Isolated fixture corruption only: never a live runtime database operation.
+        with sqlite3.connect(Store(state).database_path) as db:
+            if denial == "project":
+                db.execute(
+                    "UPDATE credentials SET project_id=NULL WHERE id=?",
+                    (credential["credential_id"],),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO organizations VALUES ('org_foreign','foreign',?)",
+                    (datetime.now(UTC).isoformat(),),
+                )
+                db.execute("UPDATE projects SET org_id='org_foreign' WHERE id=?", (project,))
+    elif denial == "expired":
+        import tessera_control.store as store_module
+
+        class Future(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(tz) + timedelta(days=2)
+
+        monkeypatch.setattr(store_module, "datetime", Future)
+    else:
+        post(client, owner, f"/credentials/{credential['credential_id']}/revoke", {}, expected=200)
+    response = client.get(detail, headers=headers)
+    assert response.status_code in (401, 403, 404)
+    assert "pending" not in response.text
+    listing = client.get(path, headers=headers)
+    assert listing.status_code in (401, 403, 404) or listing.json() == {"proposals": []}
+
+
 def test_workflow_proposals_observations_review_notebook_and_exports(prepared):
     state, client, owner, agent, project, bounds, _ = prepared
     provenance = {"client": "mcp", "model": "model-1", "session_id": "session-1"}
@@ -628,6 +737,10 @@ def strip_runtime_v55(db):
             ).fetchone()
             is None
         )
+    # ADR 0037: historical fixtures also predate the v60 tables.
+    for table in ("provider_input_tickets", "snapshot_chunks", "snapshot_chunk_uploads"):
+        assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        db.execute(f"DROP TABLE {table}")
 
 
 def assert_empty_runtime_v55(db):
@@ -650,8 +763,8 @@ def test_upgrade_v50_does_not_infer_grants(tmp_path):
         ):
             db.execute(f"DROP TABLE {table}")
         db.execute("UPDATE schema_meta SET schema_version=50")
-    assert migrate_state(state) == 56
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert db.execute("SELECT COUNT(*) FROM agent_authority_grants").fetchone()[0] == 0
         assert_empty_runtime_v55(db)

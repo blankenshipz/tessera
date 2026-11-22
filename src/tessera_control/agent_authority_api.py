@@ -10,7 +10,12 @@ from .agent_authority_models import (
     RequestAgentAuthority,
     RevokeAgentAuthority,
 )
-from .agent_research_models import AgentObservation, AgentReviewRequest, ResearchProposal
+from .agent_research_models import (
+    AgentObservation,
+    AgentReviewRequest,
+    DeclineAgentProposal,
+    ResearchProposal,
+)
 from .external_agent_api import Actor, Key
 from .external_agent_models import PromoteAgentProposal
 
@@ -115,12 +120,28 @@ def research_proposals(
     }
 
 
+@router.get("/agent-research-proposals/{proposal_id}")
+def read_research_proposal(proposal_id: str, request: Request, actor: Actor):
+    return request.app.state.agent_research.get_proposal(actor, proposal_id)
+
+
 @router.post("/agent-research-proposals/{proposal_id}/promote")
 def promote_research(
     proposal_id: str, body: PromoteAgentProposal, request: Request, actor: Actor, key: Key
 ):
     return _response(
         request.app.state.agent_research.promote(
+            actor, proposal_id, key, body.model_dump(mode="json")
+        )
+    )
+
+
+@router.post("/agent-research-proposals/{proposal_id}/decline")
+def decline_research(
+    proposal_id: str, body: DeclineAgentProposal, request: Request, actor: Actor, key: Key
+):
+    return _response(
+        request.app.state.agent_research.decline(
             actor, proposal_id, key, body.model_dump(mode="json")
         )
     )

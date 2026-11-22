@@ -50,6 +50,9 @@ bundle or publication action.
 `POST /projects/{id}/experiments` and `POST /experiments/{id}/designs` record a
 baseline-plus-intervention design. Every design revision includes its own immutable
 `goal`, `success_criterion`, `protocol`, and baseline/intervention digest snapshots.
+A design revision (`POST /experiments/{id}/designs`) may carry an optional `change_reason`;
+it is recorded on the append-only `experiment.design_revised` event (not on the design
+snapshot or export), so a change of plan records why it changed.
 `POST /experiments/{id}/conclusions` accepts an optional `design_revision`; when
 omitted for compatibility it freezes the current design revision. A conclusion and
 its `POST /conclusions/{id}/review` response expose that `design_revision` and a

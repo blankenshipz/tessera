@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-LATEST_SCHEMA_VERSION = 56
+LATEST_SCHEMA_VERSION = 70
 LOCAL_ORG_ID = "org_local"
 
 
@@ -819,7 +820,7 @@ def migrate_v46_to_v47(connection: sqlite3.Connection) -> None:
 
 
 def migrate_v47_to_v48(connection: sqlite3.Connection) -> None:
-    """Add empty, metadata-only MixFM dataset ingestion/provenance records.
+    """Add empty, metadata-only program dataset ingestion/provenance records.
 
     The migration does not download datasets, validate prior bytes, infer licenses,
     or create ingestion approvals from existing sources or artifacts.
@@ -956,6 +957,288 @@ def migrate_v55_to_v56(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET schema_version=56 WHERE singleton=1")
 
 
+def migrate_v56_to_v57(connection: sqlite3.Connection) -> None:
+    """Install empty experiment budgets, without inferring financial authority."""
+    from .experiment_budgets import create_experiment_budget_schema
+
+    create_experiment_budget_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=57 WHERE singleton=1")
+
+
+def migrate_v57_to_v58(connection: sqlite3.Connection) -> None:
+    """Add empty lineage and non-fake run receipt records; no inferred history.
+
+    Existing fake receipts and acceptances keep their CHECK-constrained
+    development labels; nothing is relabelled or backfilled.
+    """
+    from .artifact_lineage import create_artifact_lineage_schema
+    from .external_operations import create_execution_run_receipt_schema
+    from .result_acceptances import create_observed_result_acceptance_schema
+
+    create_execution_run_receipt_schema(connection)
+    create_observed_result_acceptance_schema(connection)
+    create_artifact_lineage_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=58 WHERE singleton=1")
+
+
+def migrate_v58_to_v59(connection: sqlite3.Connection) -> None:
+    """Install empty gate-evidence records and the server-set measurement source.
+
+    Existing measurements are classified only from their durable derivation event;
+    no lock, binding, metric, aggregate, audit or program is inferred.
+    """
+    from .experiment_budgets import create_bound_resolution_schema
+    from .gate_evidence import create_gate_evidence_schema
+
+    create_gate_evidence_schema(connection)
+    # Databases that reached v57 before one-shot bound resolution existed lack this
+    # table; backup validates the exact table set, so install it here (idempotent).
+    create_bound_resolution_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=59 WHERE singleton=1")
+
+
+def migrate_v59_to_v60(connection: sqlite3.Connection) -> None:
+    """Add chunked snapshot upload/chunk tables and provider input tickets."""
+    from .snapshot_chunks import create_snapshot_chunk_schema
+
+    create_snapshot_chunk_schema(connection)
+    connection.execute("UPDATE schema_meta SET schema_version=60 WHERE singleton=1")
+
+
+def migrate_v60_to_v61(connection: sqlite3.Connection) -> None:
+    """Pre-register seeds and metric declarations on split bindings, and make program
+    outcome ids plan-declared data.
+
+    Existing bindings keep NULL seed and metric declarations; program outcome rows are
+    copied unchanged while the enumerated-outcome CHECK is dropped. Nothing is inferred.
+    """
+    from .gate_evidence import create_gate_evidence_schema
+
+    create_gate_evidence_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=61 WHERE singleton=1")
+
+
+def migrate_v61_to_v62(connection: sqlite3.Connection) -> None:
+    """Record a data class for every staged snapshot (ADR 0039).
+
+    Every existing snapshot becomes ``private_derived`` (origin ``migrated``), failing
+    closed: nothing is inferred public. A public class needs a new human staging with
+    license and source evidence. (The campaign runner track's migration, also written as v62,
+    must be renumbered: v64 since ADR 0039 amendment 1 took v63.)
+    """
+    from .data_class import create_data_class_schema, migrate_existing_snapshots
+    from .store import utc_now
+
+    create_data_class_schema(connection)
+    now = utc_now()
+    migrate_existing_snapshots(connection, now)
+    # Tickets minted before the guard existed are revoked; new ones re-check the class.
+    connection.execute(
+        "UPDATE provider_input_tickets SET revoked_at=? WHERE revoked_at IS NULL", (now,)
+    )
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=62 WHERE singleton=1")
+
+
+def migrate_v62_to_v63(connection: sqlite3.Connection) -> None:
+    """Add the immutable private-code approval record (ADR 0039, amendment 1).
+
+    Nothing is approved by migration: every existing snapshot has no approval, so the
+    third-party rule for it is unchanged (public data only). An approval needs a new
+    human staging decision. (The campaign runner track's migration must take v64.)
+    """
+    from .code_approval import create_code_approval_schema
+
+    create_code_approval_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=63 WHERE singleton=1")
+
+
+def migrate_v63_to_v64(connection: sqlite3.Connection) -> None:
+    """Campaign tables (ADR 0038) and a snapshot-release data class of private_derived.
+
+    Release rows are copied unchanged into a table whose CHECK also admits
+    ``private_derived``; nothing is reclassified. Existing grants keep their frozen
+    release ids, so referencing rows are re-validated by foreign_key_check.
+    """
+    from .campaign_schema import create_campaign_schema
+    from .code_approval import create_code_approval_schema
+    from .data_class import create_data_class_schema, migrate_existing_snapshots
+    from .snapshot_releases import create_release_schema
+    from .store import utc_now
+
+    # A development database stamped 62 or 63 by an earlier campaign build never ran
+    # the data class (v62) or code approval (v63) steps; all three calls are
+    # idempotent, and migrate_existing_snapshots only records snapshots without a row.
+    create_data_class_schema(connection)
+    migrate_existing_snapshots(connection, utc_now())
+    create_code_approval_schema(connection)
+    preexisting = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+    row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='snapshot_releases'"
+    ).fetchone()
+    if row is not None and "private_derived" not in row[0]:
+        # execution_grants references snapshot_releases. Defer the check to COMMIT and
+        # re-insert the same ids into a table of the same name before then.
+        connection.execute("PRAGMA defer_foreign_keys=ON")
+        connection.execute("CREATE TABLE snapshot_releases_v61 AS SELECT * FROM snapshot_releases")
+        connection.execute("DROP TABLE snapshot_releases")
+        create_release_schema(connection)
+        connection.execute("INSERT INTO snapshot_releases SELECT * FROM snapshot_releases_v61")
+        connection.execute("DROP TABLE snapshot_releases_v61")
+    create_campaign_schema(connection)
+    # An earlier development build may lack the Salad attempt result columns.
+    attempt_columns = {
+        r[1] for r in connection.execute("PRAGMA table_info(campaign_stage_attempts)")
+    }
+    for column in ("salad_verdict TEXT", "salad_evidence_digest TEXT"):
+        if column.split()[0] not in attempt_columns:
+            connection.execute(f"ALTER TABLE campaign_stage_attempts ADD COLUMN {column}")
+    # Databases rebuilt by older migrations may carry violations this step cannot own;
+    # it must only never add any (the release rebuild keeps every referenced id).
+    if len(connection.execute("PRAGMA foreign_key_check").fetchall()) > preexisting:
+        raise ValueError("Migration v64 introduced foreign key violations.")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=64 WHERE singleton=1")
+
+
+_V1_BACKEND_PROVIDERS = {"docker-local-cpu-v1": "local-docker", "salad-gpu-v1": "salad"}
+
+
+def migrate_v64_to_v65(connection: sqlite3.Connection) -> None:
+    """Provider trust policies, campaign stage I/O and provider ids (ADR 0040).
+
+    Additive only: no CHECK rebuild and no reclassification. provider_id is backfilled
+    from each stored v1 stage backend; the last backup is marked stale.
+    """
+    from .campaign_schema import add_v65_columns, create_campaign_schema
+    from .provider_trust import create_provider_trust_schema
+
+    create_campaign_schema(connection)
+    add_v65_columns(connection)
+    create_provider_trust_schema(connection)
+    for campaign_id, spec_json in connection.execute(
+        "SELECT id, spec_json FROM campaigns"
+    ).fetchall():
+        try:
+            stages = json.loads(spec_json).get("stages", [])
+        except (ValueError, AttributeError):
+            continue
+        for stage in stages:
+            provider = _V1_BACKEND_PROVIDERS.get(stage.get("backend"))
+            if provider is None:
+                continue
+            connection.execute(
+                "UPDATE campaign_stages SET provider_id=? "
+                "WHERE campaign_id=? AND stage_key=? AND provider_id IS NULL",
+                (provider, campaign_id, stage.get("key")),
+            )
+            connection.execute(
+                "UPDATE campaign_stage_attempts SET provider_id=? "
+                "WHERE campaign_id=? AND stage_key=? AND provider_id IS NULL",
+                (provider, campaign_id, stage.get("key")),
+            )
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=65 WHERE singleton=1")
+
+
+def migrate_v65_to_v66(connection: sqlite3.Connection) -> None:
+    """Execution frames and write-once experiment hold releases (ADR 0041 stages 1 and 3).
+
+    Additive only: existing attempts get no frame; the runner opens one when it next
+    settles such an attempt. The last backup is marked stale.
+    """
+    from .execution_frames import create_execution_frame_schema
+    from .experiment_budgets import create_budget_release_schema
+
+    create_execution_frame_schema(connection)
+    create_budget_release_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=66 WHERE singleton=1")
+
+
+def migrate_v66_to_v67(connection: sqlite3.Connection) -> None:
+    """Standing approvals and scheduled campaign starts (ADR 0042).
+
+    Additive only: three tables, an append-only guard on the starts table and the
+    ``campaign_approvals.standing_approval_id`` column (null for every existing approval).
+    The last backup is marked stale.
+    """
+    from .campaign_standing_schema import create_standing_schema
+
+    create_standing_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=67 WHERE singleton=1")
+
+
+def migrate_v67_to_v68(connection: sqlite3.Connection) -> None:
+    """Salad review pre-approvals (ADR 0044): additive, append-only tables."""
+    from .campaign_preapproval import create_preapproval_schema
+
+    create_preapproval_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=68 WHERE singleton=1")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -1012,6 +1295,18 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     53: migrate_v53_to_v54,
     54: migrate_v54_to_v55,
     55: migrate_v55_to_v56,
+    56: migrate_v56_to_v57,
+    57: migrate_v57_to_v58,
+    58: migrate_v58_to_v59,
+    59: migrate_v59_to_v60,
+    60: migrate_v60_to_v61,
+    61: migrate_v61_to_v62,
+    62: migrate_v62_to_v63,
+    63: migrate_v63_to_v64,
+    64: migrate_v64_to_v65,
+    65: migrate_v65_to_v66,
+    66: migrate_v66_to_v67,
+    67: migrate_v67_to_v68,
 }
 
 
@@ -1038,3 +1333,51 @@ def migrate_database(database_path: Path, connect: Callable[[Path], sqlite3.Conn
         raise
     finally:
         connection.close()
+
+
+def migrate_v68_to_v69(connection: sqlite3.Connection) -> None:
+    """Campaign gates (ADR 0045): human gate decisions, unlock evaluations, paired-delta
+    replicate groups and the standing approval ``unlock_json`` column.
+
+    Additive only; the last backup is marked stale.
+    """
+    from .campaign_gate_schema import create_campaign_gate_schema
+
+    create_campaign_gate_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute("UPDATE schema_meta SET schema_version=69 WHERE singleton=1")
+
+
+MIGRATIONS[68] = migrate_v68_to_v69
+
+
+# Evidence rows ingested from campaign stage outputs (ADR 0052). The step is additive and
+# idempotent (CREATE ... IF NOT EXISTS), and registered with setdefault so it can never replace
+# another feature's migration at the same version. If another change already owns this version
+# when branches merge, raise EVIDENCE_ROWS_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION and the
+# fresh-database INSERT in store.py); nothing else changes.
+EVIDENCE_ROWS_SCHEMA_VERSION = 70
+
+
+def migrate_evidence_rows_schema(connection: sqlite3.Connection) -> None:
+    from .gate_evidence_ingest import create_evidence_ingest_schema
+
+    create_evidence_ingest_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (EVIDENCE_ROWS_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(EVIDENCE_ROWS_SCHEMA_VERSION - 1, migrate_evidence_rows_schema)

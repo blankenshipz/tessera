@@ -14,18 +14,50 @@ import sqlite3
 import stat
 import tempfile
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
 from tessera_control.persistent_output_storage import validate_persistent_output_storage
 
-from .cpu import CpuOperation
+from .chunked_inputs import materialize_chunked_snapshot, verify_chunked_authority
+from .control_channel import classify_control_failure
+from .cpu import EGRESS_PROFILE, CpuOperation
 from .inputs import materialize_snapshot
 from .provider import Provider, ProviderDispatch
 from .supervisor import CpuSupervisor, DriverResult, Lease, SupervisorError
 
 MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
+EGRESS_REPORT_STATE = "egress_journal"
+
+# Observation delivery (ADR 0054): a report that cannot be delivered stays in the durable
+# ``reports`` journal and is retried with bounded exponential backoff, keyed by its fixed
+# idempotency key, until control accepts or refuses it or it is 24 hours old.
+DELIVERY_BACKOFF_BASE_SECONDS = 2.0
+DELIVERY_BACKOFF_CAP_SECONDS = 300.0
+DELIVERY_MAX_AGE = timedelta(hours=24)
+
+
+class ObservationDeliveryPending(SupervisorError):
+    """An observation is durably recorded but control did not take it; retry later."""
+
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: float,
+        *,
+        auth: bool = False,
+        status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.auth = auth
+        self.status = status  # the HTTP status of a rejected credential, when there was one
+
+
+class ObservationRefused(SupervisorError):
+    """Control permanently refused an observation, or it aged out undelivered."""
 
 
 class ControlChannel(Protocol):
@@ -71,6 +103,8 @@ class CpuRuntime:
         self.provider_dispatch = (
             ProviderDispatch(self.directory, channel, provider) if provider is not None else None
         )
+        # Injectable so retry timing is testable without sleeping.
+        self._clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self._initialize_observation_journal()
         self._initialize_package_refresh_journal()
         self.supervisor = CpuSupervisor(
@@ -203,6 +237,7 @@ class CpuRuntime:
                 raise SupervisorError(
                     "Control package experiment identity does not match its operation."
                 )
+            self._validate_network_profile(package, spec)
             capability = package.get("persistent_output_storage")
             if self.persistent_output_collection:
                 if capability is None:
@@ -224,6 +259,35 @@ class CpuRuntime:
         except (KeyError, TypeError, ValueError) as error:
             raise SupervisorError("Control package is malformed.") from error
 
+    @staticmethod
+    def _validate_network_profile(package: dict[str, Any], spec: dict[str, Any]) -> None:
+        policy = spec.get("egress")
+        profile = package.get("network_profile")
+        if profile is None:
+            # Older packages predate network_profile: network none only.
+            if policy is not None or package.get("egress") is not None:
+                raise SupervisorError("Control package egress lacks a network profile.")
+        elif profile == "none":
+            if policy is not None or package.get("egress") is not None:
+                raise SupervisorError("Control package network profile contradicts its egress.")
+        elif profile == EGRESS_PROFILE:
+            if not isinstance(policy, dict) or package.get("egress") != policy:
+                raise SupervisorError("Control package egress does not match its plan policy.")
+            try:
+                CpuOperation(
+                    "0" * 32,
+                    "x@sha256:" + "0" * 64,
+                    ("x",),
+                    "0" * 64,
+                    1,
+                    network_profile=profile,
+                    egress=policy,
+                )
+            except ValueError as error:
+                raise SupervisorError("Control package egress policy is invalid.") from error
+        else:
+            raise SupervisorError("Control package has an unknown network profile.")
+
     def _operation(self, descriptor: dict[str, Any]) -> CpuOperation:
         response = descriptor["control"]
         package = response["package"]
@@ -241,7 +305,30 @@ class CpuRuntime:
             max_duration_seconds=package["plan"]["max_duration_seconds"],
             input_directory=descriptor["input_directory"],
             input_manifest_json=descriptor["input_manifest_json"],
+            network_profile=package.get("network_profile") or "none",
+            egress=package["plan"]["execution_spec"].get("egress"),
+            # Operator container limits belong to the operation, so the supervisor's durable
+            # fence (and recovery's digest check) covers the limits the container runs with.
+            **self._operation_limits(package["plan"]["execution_spec"].get("max_scratch_bytes")),
         )
+
+    def _operation_limits(self, requested_scratch: int | None = None) -> dict[str, int]:
+        """The operator's limits, with a plan's scratch request granted or refused (ADR 0059).
+
+        A request above the operator's ceiling, or that the container's memory cannot back,
+        is refused here, at admission, before any container exists."""
+        limits = getattr(self.adapter, "operation_limits", None)
+        values = limits() if callable(limits) else {}
+        if requested_scratch is None:
+            return values
+        grant = getattr(self.adapter, "scratch_for", None)
+        if not callable(grant):
+            raise SupervisorError("This worker does not grant a plan's scratch request.")
+        try:
+            values["scratch_bytes"] = grant(requested_scratch)
+        except ValueError as error:
+            raise SupervisorError(str(error)) from None
+        return values
 
     @staticmethod
     def _lease(response: dict[str, Any]) -> Lease:
@@ -294,14 +381,32 @@ class CpuRuntime:
                 {"expected_epoch": epoch},
                 f"runtime-inputs-{lease_id}",
             )
-            staged = materialize_snapshot(
-                bundle,
-                self.input_root,
-                expected_snapshot_digest=package["snapshot_digest"],
-                expected_lease_id=lease_id,
-                expected_epoch=epoch,
-                expected_worker_id=self.worker_id,
-            )
+            if isinstance(bundle, dict) and (
+                isinstance(bundle.get("snapshot"), dict)
+                and bundle["snapshot"].get("delivery") == "chunked"
+            ):
+                verify_chunked_authority(
+                    bundle, package["snapshot_digest"], lease_id, epoch, self.worker_id
+                )
+                staged = materialize_chunked_snapshot(
+                    bundle["snapshot"],
+                    lambda seq: self.channel.post(
+                        f"/worker/leases/{lease_id}/inputs/chunks/{seq}",
+                        {"expected_epoch": epoch},
+                        f"runtime-input-chunk-{lease_id}-{seq}",
+                    ),
+                    self.input_root,
+                    expected_snapshot_digest=package["snapshot_digest"],
+                )
+            else:
+                staged = materialize_snapshot(
+                    bundle,
+                    self.input_root,
+                    expected_snapshot_digest=package["snapshot_digest"],
+                    expected_lease_id=lease_id,
+                    expected_epoch=epoch,
+                    expected_worker_id=self.worker_id,
+                )
             descriptor = {
                 "control": response,
                 "experiment_identity": package.get("experiment"),
@@ -441,15 +546,162 @@ class CpuRuntime:
             if state == "exited" and observation.termination_confirmed:
                 self.provider_dispatch.complete_stable(self.operation)
             provider_id = self.provider_dispatch.provider_id(self.operation)
+        launch_error = result.launch_error if state == "unknown" and provider_id is None else None
+        confirmed_exit = state == "exited" and observation.termination_confirmed
         payload, key, intent_id = self._observation_intent(
-            state,
-            provider_id,
-            state == "exited" and observation.termination_confirmed,
+            state, provider_id, confirmed_exit, launch_error
         )
-        response = self.channel.post("/worker/observations", payload, key)
+        self._begin_delivery(intent_id, confirmed_exit)
+        try:
+            response = self.channel.post("/worker/observations", payload, key)
+        except Exception as error:
+            self._delivery_failed(intent_id, error)
         with self._observation_connection() as connection:
             connection.execute("UPDATE reports SET completed=1 WHERE id=?", (intent_id,))
+        if (
+            state == "exited"
+            and observation.termination_confirmed
+            and self.operation is not None
+            and self.operation.network_profile == EGRESS_PROFILE
+        ):
+            self._report_egress_journal()
         return response
+
+    def _begin_delivery(self, intent_id: int, confirmed_exit: bool) -> None:
+        """Supersede stale intents, and honour the persisted backoff after a restart.
+
+        A confirmed exit makes every earlier undelivered non-exit observation of the operation
+        moot, so those are marked abandoned and never sent after it (control would otherwise
+        see an old ``running`` after the exit). A report whose ``next_attempt_at`` has not come
+        is not sent: the retry delay survives a worker restart, so a crash loop cannot hammer
+        control.
+        """
+        with self._observation_connection() as connection:
+            if confirmed_exit and self.operation is not None:
+                connection.execute(
+                    """UPDATE reports SET abandoned=1, last_error='superseded'
+                    WHERE operation_id=? AND completed=0 AND abandoned=0 AND id<>?
+                    AND observed_state NOT IN ('exited', ?)""",
+                    (self.operation.operation_id, intent_id, EGRESS_REPORT_STATE),
+                )
+            row = connection.execute(
+                "SELECT next_attempt_at, first_failed_at FROM reports WHERE id=?", (intent_id,)
+            ).fetchone()
+        now = self._clock()
+        if row is not None and row[0] is not None:
+            wait = (datetime.fromisoformat(row[0]) - now).total_seconds()
+            if wait > 0:
+                raise ObservationDeliveryPending("Observation delivery is backing off.", wait)
+
+    def _delivery_failed(self, intent_id: int, error: Exception) -> None:
+        """Record a failed delivery durably and raise pending or refused (never returns).
+
+        The record is committed before the exception leaves, so the outcome survives a
+        restart. A permanent refusal, or a report older than ``DELIVERY_MAX_AGE``, is
+        abandoned and raises ``ObservationRefused``; anything else is retried after an
+        exponential delay capped at ``DELIVERY_BACKOFF_CAP_SECONDS``.
+        """
+        kind = classify_control_failure(error)
+        now = self._clock()
+        with self._observation_connection() as connection:
+            row = connection.execute(
+                "SELECT attempts, first_failed_at FROM reports WHERE id=?", (intent_id,)
+            ).fetchone()
+            attempts = (row[0] if row else 0) + 1
+            first = datetime.fromisoformat(row[1]) if row and row[1] else now
+            detail = f"{kind}: {type(error).__name__}"[:120]
+            reason = None
+            if kind == "permanent":
+                reason = "refused"
+            elif now - first > DELIVERY_MAX_AGE:
+                reason = "aged out undelivered"
+            delay = min(
+                DELIVERY_BACKOFF_CAP_SECONDS,
+                DELIVERY_BACKOFF_BASE_SECONDS * 2 ** (attempts - 1),
+            )
+            if reason is not None:
+                connection.execute(
+                    """UPDATE reports SET abandoned=1, attempts=?, first_failed_at=?,
+                    last_error=? WHERE id=?""",
+                    (attempts, first.isoformat(), f"{reason}: {detail}", intent_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE reports SET attempts=?, first_failed_at=?, next_attempt_at=?,
+                    last_error=? WHERE id=?""",
+                    (
+                        attempts,
+                        first.isoformat(),
+                        (now + timedelta(seconds=delay)).isoformat(),
+                        detail,
+                        intent_id,
+                    ),
+                )
+        if reason is not None:
+            raise ObservationRefused(f"Observation {reason}.") from error
+        raise ObservationDeliveryPending(
+            "Observation delivery failed; it will be retried.",
+            delay,
+            auth=kind == "auth",
+            status=getattr(error, "status", None),
+        ) from error
+
+    def _report_egress_journal(self) -> None:
+        """Post the kept proxy journal's digest and summary exactly once, replayably."""
+        if self.lease is None or self.operation is None:
+            raise SupervisorError("Runtime has no bound operation.")
+        operation = self.operation
+        with self._observation_connection() as connection:
+            done = connection.execute(
+                "SELECT 1 FROM reports WHERE operation_id=? AND observed_state=? AND completed=1",
+                (operation.operation_id, EGRESS_REPORT_STATE),
+            ).fetchone()
+            pending = connection.execute(
+                """SELECT id, payload_json, idempotency_key FROM reports
+                WHERE operation_id=? AND observed_state=? AND completed=0
+                ORDER BY id DESC LIMIT 1""",
+                (operation.operation_id, EGRESS_REPORT_STATE),
+            ).fetchone()
+        if done is not None:
+            return
+        if pending is not None:
+            intent_id, payload, key = pending[0], json.loads(pending[1]), pending[2]
+        else:
+            teardown = getattr(self.adapter, "teardown_egress", None)
+            summarize = getattr(self.adapter, "egress_summary", None)
+            if summarize is None:
+                raise SupervisorError("Adapter cannot report the egress journal.")
+            if teardown is not None:
+                teardown(operation)
+            journal_sha256, summary = summarize(operation)
+            payload = {
+                "lease_id": self.lease.id,
+                "expected_epoch": self.lease.epoch,
+                "journal_sha256": journal_sha256,
+                "summary": summary,
+            }
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            key = (
+                "runtime-egress-journal-"
+                + hashlib.sha256(f"{operation.operation_id}:{encoded}".encode()).hexdigest()
+            )
+            with self._observation_connection() as connection:
+                cursor = connection.execute(
+                    """INSERT INTO reports
+                    (operation_id, observed_state, provider_id, termination_confirmed,
+                     payload_json, idempotency_key, completed) VALUES (?, ?, NULL, 1, ?, ?, 0)""",
+                    (operation.operation_id, EGRESS_REPORT_STATE, encoded, key),
+                )
+                intent_id = cursor.lastrowid
+        self._begin_delivery(intent_id, False)
+        try:
+            self.channel.post(
+                f"/worker/operations/{operation.operation_id}/egress-journal", payload, key
+            )
+        except Exception as error:
+            self._delivery_failed(intent_id, error)
+        with self._observation_connection() as connection:
+            connection.execute("UPDATE reports SET completed=1 WHERE id=?", (intent_id,))
 
     def _initialize_observation_journal(self) -> None:
         with self._observation_connection() as connection:
@@ -460,6 +712,20 @@ class CpuRuntime:
                 payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL,
                 completed INTEGER NOT NULL CHECK (completed IN (0, 1)))"""
             )
+            # A journal written before launch errors existed gains the column in place.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(reports)")}
+            if "launch_error" not in columns:
+                connection.execute("ALTER TABLE reports ADD COLUMN launch_error TEXT")
+            # The outbox state (ADR 0054) is added in place the same way.
+            for name, definition in (
+                ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("first_failed_at", "TEXT"),
+                ("next_attempt_at", "TEXT"),
+                ("last_error", "TEXT"),
+                ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE reports ADD COLUMN {name} {definition}")
 
     def _initialize_package_refresh_journal(self) -> None:
         with self._package_refresh_connection() as connection:
@@ -510,7 +776,11 @@ class CpuRuntime:
         return sqlite3.connect(self.directory / "runtime-package-refreshes.sqlite3")
 
     def _observation_intent(
-        self, state: str, provider_id: str | None, termination_confirmed: bool
+        self,
+        state: str,
+        provider_id: str | None,
+        termination_confirmed: bool,
+        launch_error: str | None = None,
     ) -> tuple[dict[str, Any], str, int]:
         if self.lease is None or self.operation is None:
             raise SupervisorError("Runtime has no bound operation.")
@@ -518,8 +788,15 @@ class CpuRuntime:
             row = connection.execute(
                 """SELECT id, payload_json, idempotency_key FROM reports
                 WHERE operation_id=? AND observed_state=? AND provider_id IS ?
-                AND termination_confirmed=? AND completed=0 ORDER BY id DESC LIMIT 1""",
-                (self.operation.operation_id, state, provider_id, int(termination_confirmed)),
+                AND termination_confirmed=? AND launch_error IS ? AND completed=0
+                AND abandoned=0 ORDER BY id DESC LIMIT 1""",
+                (
+                    self.operation.operation_id,
+                    state,
+                    provider_id,
+                    int(termination_confirmed),
+                    launch_error,
+                ),
             ).fetchone()
             if row is not None:
                 return json.loads(row[1]), row[2], row[0]
@@ -532,6 +809,8 @@ class CpuRuntime:
                 "provider_id": provider_id,
                 "termination_confirmed": termination_confirmed,
             }
+            if launch_error is not None:
+                payload["launch_error"] = launch_error
             encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
             key = (
                 "runtime-observation-"
@@ -540,7 +819,7 @@ class CpuRuntime:
             cursor = connection.execute(
                 """INSERT INTO reports
                 (operation_id, observed_state, provider_id, termination_confirmed, payload_json,
-                 idempotency_key, completed) VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                 idempotency_key, completed, launch_error) VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
                 (
                     self.operation.operation_id,
                     state,
@@ -548,6 +827,7 @@ class CpuRuntime:
                     int(termination_confirmed),
                     encoded,
                     key,
+                    launch_error,
                 ),
             )
             return payload, key, cursor.lastrowid

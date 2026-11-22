@@ -12,6 +12,7 @@ import stat
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -31,14 +32,46 @@ BACKUP_MANIFEST = "manifest.json"
 BACKUP_DATABASE = "snapshot.sqlite3"
 RESTORE_MARKER = ".restore-complete"
 BACKUP_OBJECTS_DIRECTORY = "objects"
+# Default size bound for one backup (database snapshot plus project objects). An operator
+# may raise it per command (``tessera backup|restore --max-backup-bytes``) up to the
+# configurable maximum; it is never raised silently. The time bound scales with it.
 MAX_BACKUP_BYTES = 1 << 30
+MAX_CONFIGURABLE_BACKUP_BYTES = 64 << 30
 MAX_BACKUP_SECONDS = 30
+_BYTE_LIMIT: ContextVar[int] = ContextVar("recovery_byte_limit", default=MAX_BACKUP_BYTES)
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_BACKUP_OBJECTS = 1024
 MAX_PROJECT_OBJECT_BYTES = 16 * 1024 * 1024
 LEGACY_BACKUP_FORMAT_VERSION = 1
 BACKUP_FORMAT_VERSION = 2
 _LOG = logging.getLogger(__name__)
+
+
+def backup_byte_limit(value: int | None) -> int:
+    """Validate an operator's backup size bound; None keeps the 1 GiB default."""
+    if value is None:
+        return MAX_BACKUP_BYTES
+    if type(value) is not int or not MAX_BACKUP_BYTES <= value <= MAX_CONFIGURABLE_BACKUP_BYTES:
+        raise StoreError(
+            f"--max-backup-bytes must be between {MAX_BACKUP_BYTES} and "
+            f"{MAX_CONFIGURABLE_BACKUP_BYTES}."
+        )
+    return value
+
+
+def _limit() -> int:
+    return _BYTE_LIMIT.get()
+
+
+def _seconds() -> int:
+    """The recovery deadline: 30 seconds per started GiB of the operator's size bound."""
+    return MAX_BACKUP_SECONDS * -(-_limit() // MAX_BACKUP_BYTES)
+
+
+def _size_error(message: str = "Backup exceeds its size limit") -> StoreError:
+    return StoreError(
+        f"{message} of {_limit()} bytes; an operator can raise it with --max-backup-bytes."
+    )
 
 
 def create_recovery_schema(connection: sqlite3.Connection) -> None:
@@ -68,8 +101,10 @@ def _open_regular(path: Path, limit: int):
     descriptor = os.open(path, flags)
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise StoreError("Recovery input must be a bounded regular file with one link.")
+        if info.st_size > limit:
+            raise _size_error("Recovery input exceeds the backup size limit")
         with os.fdopen(descriptor, "rb", closefd=False) as file:
             yield file
     finally:
@@ -79,18 +114,18 @@ def _open_regular(path: Path, limit: int):
 def _sha256(path: Path, start: float) -> str:
     digest = hashlib.sha256()
     size = 0
-    with _open_regular(path, MAX_BACKUP_BYTES) as file:
+    with _open_regular(path, _limit()) as file:
         while chunk := file.read(1024 * 1024):
             _deadline(start)
             size += len(chunk)
-            if size > MAX_BACKUP_BYTES:
-                raise StoreError("Backup exceeds its size limit.")
+            if size > _limit():
+                raise _size_error()
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def _deadline(start: float) -> None:
-    if time.monotonic() - start > MAX_BACKUP_SECONDS:
+    if time.monotonic() - start > _seconds():
         raise StoreError("Recovery operation exceeded its time limit.")
 
 
@@ -268,9 +303,7 @@ def _defensive(connection: sqlite3.Connection, start: float) -> None:
         connection.enable_load_extension(False)
     connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 128 * 1024)
     connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024)
-    connection.set_progress_handler(
-        lambda: int(time.monotonic() - start > MAX_BACKUP_SECONDS), 1000
-    )
+    connection.set_progress_handler(lambda: int(time.monotonic() - start > _seconds()), 1000)
 
 
 def _validate_snapshot(path: Path, start: float | None = None) -> tuple[int, int]:
@@ -571,9 +604,19 @@ def _record_backup_health(
         _LOG.warning("Backup health could not be recorded.", exc_info=True)
 
 
-def backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
-    """Copy one SQLite-consistent snapshot and record best-effort backup health."""
+def backup_state(state_dir: Path, output: Path, *, max_bytes: int | None = None) -> dict[str, Any]:
+    """Copy one SQLite-consistent snapshot and record best-effort backup health.
+
+    ``max_bytes`` is the operator's size bound (default 1 GiB; see backup_byte_limit)."""
     require_sqlite_runtime()
+    token = _BYTE_LIMIT.set(backup_byte_limit(max_bytes))
+    try:
+        return _backup_with_health(state_dir, output)
+    finally:
+        _BYTE_LIMIT.reset(token)
+
+
+def _backup_with_health(state_dir: Path, output: Path) -> dict[str, Any]:
     try:
         manifest = _backup_state(state_dir, output)
     except StoreError:
@@ -588,7 +631,7 @@ def _backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
     require_sqlite_runtime()
     if state_dir.is_symlink() or not state_dir.is_dir():
         raise StoreError("Source state directory is unsafe.")
-    with _open_regular(state_dir / DATABASE_NAME, MAX_BACKUP_BYTES):
+    with _open_regular(state_dir / DATABASE_NAME, _limit()):
         pass
     if (
         output.exists()
@@ -610,13 +653,13 @@ def _backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
         source.execute("BEGIN")
         source.execute("SELECT count(*) FROM sqlite_schema").fetchone()
         page_size = source.execute("PRAGMA page_size").fetchone()[0]
-        if source.execute("PRAGMA page_count").fetchone()[0] * page_size > MAX_BACKUP_BYTES:
-            raise StoreError("Backup exceeds its size limit.")
+        if source.execute("PRAGMA page_count").fetchone()[0] * page_size > _limit():
+            raise _size_error()
 
         def progress(_status: int, _remaining: int, total_pages: int) -> None:
             _deadline(start)
-            if total_pages * page_size > MAX_BACKUP_BYTES:
-                raise StoreError("Backup exceeds its size limit.")
+            if total_pages * page_size > _limit():
+                raise _size_error()
 
         source.backup(destination, pages=128, progress=progress, sleep=0.001)
         # A WAL source copies its journal-mode header too. Normalize only the
@@ -627,13 +670,13 @@ def _backup_state(state_dir: Path, output: Path) -> dict[str, Any]:
         destination.close()
         source.close()
     os.chmod(snapshot, 0o600)
-    if snapshot.stat().st_size > MAX_BACKUP_BYTES:
-        raise StoreError("Backup exceeds its size limit.")
+    if snapshot.stat().st_size > _limit():
+        raise _size_error()
     schema, watermark = _validate_snapshot(snapshot, start)
     entries, legacy = _bundle_entries(snapshot, start)
     object_bytes = sum(entry["size"] for entry in entries if entry["availability"] == "present")
-    if snapshot.stat().st_size + object_bytes > MAX_BACKUP_BYTES:
-        raise StoreError("Backup exceeds its total size limit.")
+    if snapshot.stat().st_size + object_bytes > _limit():
+        raise _size_error("Backup exceeds its total size limit")
     if any(entry["availability"] == "present" for entry in entries):
         source_objects = state_dir / "project-artifacts"
         destination_objects = output / BACKUP_OBJECTS_DIRECTORY
@@ -718,9 +761,11 @@ def _read_manifest(backup: Path) -> dict[str, Any]:
     for name in ("event_watermark", "format_version", "schema_version", "size"):
         if type(manifest[name]) is not int or manifest[name] < 0:
             raise StoreError("Backup manifest numbers must be nonnegative integers.")
+    if manifest["size"] > _limit():
+        raise _size_error("Backup is larger than the restore size limit")
     if (
         manifest["schema_version"] != LATEST_SCHEMA_VERSION
-        or not 1 <= manifest["size"] <= MAX_BACKUP_BYTES
+        or not 1 <= manifest["size"] <= _limit()
         or not isinstance(manifest["backup_id"], str)
         or len(manifest["backup_id"]) != 32
         or not isinstance(manifest["created_at"], str)
@@ -764,7 +809,7 @@ def _read_manifest(backup: Path) -> dict[str, Any]:
                 not isinstance(artifact_id, str) or not 1 <= len(artifact_id) <= 200
                 for artifact_id in manifest["legacy_artifact_ids"]
             )
-            or present_bytes + manifest["size"] > MAX_BACKUP_BYTES
+            or present_bytes + manifest["size"] > _limit()
         ):
             raise StoreError("Backup project artifact manifest is invalid.")
         _validate_bundle_layout(backup, manifest)
@@ -773,9 +818,21 @@ def _read_manifest(backup: Path) -> dict[str, Any]:
     return manifest
 
 
-def restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
-    """Create a new held restore with all prior authority revoked."""
+def restore_state(
+    backup: Path, state_dir: Path, *, max_bytes: int | None = None
+) -> tuple[Path, Path]:
+    """Create a new held restore with all prior authority revoked.
+
+    ``max_bytes`` must cover the backup's size (the bound it was taken with)."""
     require_sqlite_runtime()
+    token = _BYTE_LIMIT.set(backup_byte_limit(max_bytes))
+    try:
+        return _restore_state(backup, state_dir)
+    finally:
+        _BYTE_LIMIT.reset(token)
+
+
+def _restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
     start = time.monotonic()
     manifest = _read_manifest(backup)
     _deadline(start)
@@ -799,8 +856,8 @@ def restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
         while chunk := source.read(1024 * 1024):
             _deadline(start)
             copied += len(chunk)
-            if copied > MAX_BACKUP_BYTES:
-                raise StoreError("Backup exceeds recovery limits.")
+            if copied > _limit():
+                raise _size_error("Backup exceeds the restore size limit")
             digest.update(chunk)
             destination.write(chunk)
         destination.flush()

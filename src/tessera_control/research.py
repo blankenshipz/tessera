@@ -568,6 +568,18 @@ class ResearchStore(Store):
                 raise Conflict("Source revision is no longer current.")
             if source["superseded_at"] is not None:
                 raise Conflict("Superseded sources cannot be assessed.")
+            if actor.get("campaign_delegated"):
+                from .campaign_preapproval import KIND_SOURCE, authorize_delegated
+
+                # Delegated assessment only as an exact-digest pre-approval (ADR 0044).
+                authorize_delegated(
+                    connection,
+                    actor,
+                    step="assess_source",
+                    kind=KIND_SOURCE,
+                    subject_id=source_id,
+                    approve=body["verdict"] == "supported",
+                )
             study = self._study(connection, actor, source["study_id"])
             now, revision = utc_now(), source["revision"] + 1
             connection.execute(

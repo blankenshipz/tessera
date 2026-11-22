@@ -458,3 +458,16 @@ def test_cli_prints_paths_not_token_and_cannot_select_public_host(
     )
     assert main() == 0
     assert called == {"host": "127.0.0.1", "port": 8765}
+
+
+def test_cli_init_refuses_an_existing_state_dir_without_a_traceback(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    from tessera_control.cli import main
+
+    state = tmp_path / "state"
+    monkeypatch.setattr("sys.argv", ["tessera", "init", "--state-dir", str(state)])
+    assert main() == 0
+    capsys.readouterr()
+    assert main() == 1
+    assert "init failed" in capsys.readouterr().err

@@ -1,0 +1,72 @@
+# Staged only: no serving Pod before private state migration and verified TLS.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tessera-control-state
+  namespace: tessera-local-persistent
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tessera-control
+  namespace: tessera-local-persistent
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: tessera-control}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: tessera-control}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: control
+          image: docker.io/library/tessera-local-persistent@sha256:REPLACE_EXACT_NODE_DIGEST
+          imagePullPolicy: Never
+          # Pod-local only; the operator uses authenticated Kubernetes port-forward
+          # to bind a Mac loopback route. The ClusterIP is not a client route.
+          command: [tessera, serve, --state-dir, /state/control, --port, "8765", --bind-host, 127.0.0.1]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+          ports: [{name: http, containerPort: 8765}]
+          volumeMounts: [{name: state, mountPath: /state}, {name: temporary, mountPath: /tmp}]
+      volumes:
+        - name: state
+          persistentVolumeClaim: {claimName: tessera-control-state}
+        - name: temporary
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera-control
+  namespace: tessera-local-persistent
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: tessera-control}
+  ports: [{name: http, port: 8765, targetPort: http}]
+---
+# Declaration only. Before any Secret-bearing importer Pod is admitted, prove
+# actual deny behavior on this cluster; policy readback is not enforcement.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tessera-local-persistent
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]

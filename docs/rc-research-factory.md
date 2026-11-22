@@ -104,7 +104,7 @@ not supply production identity, credentials or approved authority.
    Observed actual publisher helper file SHA-256 is
    `b690e593fd0e9039e406ad8626f76b42b014b0f7e7b4e69fc9a07dac8fec5ce4`.
    The 36-target public staged bundle is documented in
-   `release/opencode-observer/README.md`; this lane makes no release/source changes.
+   `release/opencode-observer/README.md`; this document makes no release/source changes.
    Its `GUARD-PUBLISHER.md` and `AUTHORITY-BOUNDARY.md` distinguish actual public
    fixture execution from private-account proof and required explicit enrollment.
 2. The dedicated installed embedding binds genuine authenticated session/principal

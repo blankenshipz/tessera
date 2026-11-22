@@ -36,7 +36,7 @@ Python hashes, schema and fence source must match the frozen inventory.
 
 Commands use a fixed minimal environment, not inherited Docker/Buildx endpoints,
 builder selection, source-policy, proxy, Git or loader overrides. The normal
-`/Users/zach/.docker` context/registry credential-helper references remain in
+`$DOCKER_CONFIG` (default `~/.docker`) context/registry credential-helper references remain in
 place; credential/config contents are neither copied nor logged. Buildx explicitly
 selects `desktop-linux`, whose inspected identity must be a single running local
 `docker`-driver node at the verified Desktop context, with no custom driver options
@@ -73,6 +73,31 @@ new ID, preserving all prior logs. No caller can supply an attestation boolean
 or request publication of a receipt without the build/verification sequence.
 
 ## Normal bounded operation
+
+### Reviewed immutable source option
+
+The candidate inventory, build plan and build tools accept `manifest_path` and
+`expected_manifest_sha256`. Supply both, using an absolute non-symlink private
+manifest path and the SHA-256 of its explicitly reviewed bytes. This mode never
+derives inputs from Git HEAD, the remote tracking branch or dirty overlays.
+The version-1 JSON manifest has exactly `version`, `source_root`, `git_commit`,
+`baseline_files`, `baseline_inventory_sha256`, `candidate_files` and `overlays`.
+File maps contain relative paths and SHA-256 values. The baseline digest uses
+the operator's canonical compact sorted JSON hash; candidate files must equal
+the baseline map overlaid with the reviewed overlay map. This records provenance,
+not an assertion that arbitrary declared baseline bytes were published upstream.
+The review digest is the admission trust anchor; review the baseline identity and
+entire overlay before supplying it.
+
+The store fence and both Docker recipe files must be explicit overlays. The
+source root must contain exactly the declared regular files, with no symlinks,
+runtime/credential paths or private-key PEM blocks. These checks supplement
+review; they are not a universal secret detector. Keep receipts and test outputs
+outside this source root. The producer hashes before copying, after copying and
+before import, binds live parent/runtime/fence identity, and retains the source
+reference in build and candidate receipts. Reconnect reads the retained build
+status; it never retries a failed or uncertain build. A changed input requires a
+new manifest digest, plan and operation. Legacy published-tree mode is unchanged.
 
 Entry: run `python -m tessera_operator.upgrade_server` with the installed MCP
 extra in the local operator environment. This upgrade-only stdio server registers
@@ -111,7 +136,7 @@ ID. Disconnect does not delete receipts, restore authority or replay mutations.
    receipts cannot be relabeled/reused. The immutable freshness receipt starts at
    backup start. Raw SQL/private values never leave these hashing routines.
 3. `local_control_upgrade_apply(operation,expected_plan_sha256)` rechecks the
-   plan/capacity/backup and commits a global one-use apply claim **before** a JSON
+    plan/capacity/backup and commits a generation-specific one-use apply claim **before** a JSON
    Patch testing Deployment UID/resourceVersion, replicas=1, Recreate and old image.
    Only the container image is replaced. PVC/other spec fields are never edited.
    The normal Kubernetes Recreate controller owns old/new writer sequencing.
@@ -126,7 +151,8 @@ ID. Disconnect does not delete receipts, restore authority or replay mutations.
    backup or justify rollback. A recovery requiring that guarantee still needs a
    separately authorized verified quiescent snapshot/held-recovery protocol.
 4. Submitted/failed/lost responses never mean readiness. Once a claim exists,
-   neither a repeat call nor a new operation ID can resubmit another mutation.
+    neither a repeat call nor a new operation ID can resubmit another mutation
+    against that parent generation.
    `local_control_upgrade_reconcile(operation)` only inspects the new sole Ready
    owned Pod, unchanged spec/PVC, backend incarnation/schema/store hash and actual
    Pod-loopback application health. On success it appends readiness/current-image
@@ -139,8 +165,15 @@ ID. Disconnect does not delete receipts, restore authority or replay mutations.
    permanent Pod UID; normal readiness still inspects the actual live Pod.
 5. Exit/reconnect reuses the same operation and receipts. An ambiguous unapplied
    intent stays blocked for explicit recovery admission, not automatic replay.
-   This slice supports one admitted upgrade generation; subsequent upgrades need
-   a separately reviewed next-generation admission path.
+    A completed immutable parent admits a subsequent compatible forward upgrade.
+    The original `current.json` and global apply claim remain unchanged. Each
+    parent's operation directory owns create-only `successor-claim.json` and
+    `successor.json` records, serialized under the existing operator lock. Plans
+    bind the exact parent readiness publication, image, PVC identity and backend;
+    chain validation rejects cycles, changed evidence and backend drift. An
+    uncertain child apply admits no next generation: reconcile that operation
+    without resending. This is local receipt CAS plus Kubernetes resourceVersion
+    CAS, not a distributed database transaction or automatic rollback.
 
 ## Rollback is intentionally refusal, not unsafe automatic undo
 

@@ -18,8 +18,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from tessera_control import artifact_limits as limits
+
 from .artifacts import ArtifactChannel, upload_output_set
-from .outputs import CollectedOutput, OutputCollectionError, collect_outputs
+from .outputs import CollectedOutput, LargeOutput, OutputCollectionError, collect_output_set
 
 MAX_TERMINATION_OBSERVATION_AGE = timedelta(minutes=5)
 
@@ -69,6 +71,7 @@ class SealedOutputJournal:
         max_output_bytes: int,
         termination_observation: dict[str, Any],
         now: datetime | None = None,
+        worker_max_output_bytes: int | None = None,
     ) -> str:
         """Collect and atomically retain an immutable output snapshot.
 
@@ -86,7 +89,9 @@ class SealedOutputJournal:
             now or datetime.now(UTC),
         )
         try:
-            outputs = collect_outputs(Path(workspace), output_paths, max_output_bytes)
+            outputs = collect_output_set(
+                Path(workspace), output_paths, max_output_bytes, worker_max_output_bytes
+            )
         except OutputCollectionError as error:
             raise OutputSealError(str(error)) from error
         seal_id = _seal_id(lease_id, expected_epoch, operation_id)
@@ -137,18 +142,11 @@ class SealedOutputJournal:
                 ),
             )
             connection.executemany(
-                """INSERT INTO sealed_outputs (seal_id, relative_path, sha256, size, content)
-                VALUES (?, ?, ?, ?, ?)""",
-                [
-                    (
-                        seal_id,
-                        output.relative_path,
-                        output.sha256,
-                        len(output.content),
-                        output.content,
-                    )
-                    for output in outputs
-                ],
+                """INSERT INTO sealed_outputs
+                (seal_id, relative_path, sha256, size, content,
+                 large, source_root, ident_dev, ident_ino, ident_mtime_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [self._row(seal_id, output) for output in outputs],
             )
             connection.commit()
         return seal_id
@@ -173,12 +171,15 @@ class SealedOutputJournal:
                 or hashlib.sha256(manifest_json.encode()).hexdigest() != seal["manifest_digest"]
             ):
                 raise OutputSealError("Sealed output journal integrity check failed.")
-        receipt = upload_output_set(
-            channel,
-            lease_id=seal["lease_id"],
-            expected_epoch=seal["epoch"],
-            outputs=outputs,
-        )
+        try:
+            receipt = upload_output_set(
+                channel,
+                lease_id=seal["lease_id"],
+                expected_epoch=seal["epoch"],
+                outputs=outputs,
+            )
+        except OutputCollectionError as error:
+            raise OutputSealError(str(error)) from error
         encoded = self._json(receipt)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -247,7 +248,7 @@ class SealedOutputJournal:
         lease_id: str,
         epoch: int,
         operation_id: str,
-        outputs: tuple[CollectedOutput, ...],
+        outputs: tuple[CollectedOutput | LargeOutput, ...],
     ) -> dict[str, Any]:
         return {
             "version": 1,
@@ -259,7 +260,7 @@ class SealedOutputJournal:
                 {
                     "relative_path": item.relative_path,
                     "sha256": item.sha256,
-                    "size": len(item.content),
+                    "size": item.size if isinstance(item, LargeOutput) else len(item.content),
                 }
                 for item in sorted(outputs, key=lambda item: item.relative_path)
             ],
@@ -269,15 +270,70 @@ class SealedOutputJournal:
     def _json(value: Any) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
-    def _outputs(self, connection: sqlite3.Connection, seal_id: str) -> tuple[CollectedOutput, ...]:
+    @staticmethod
+    def _row(seal_id: str, output: CollectedOutput | LargeOutput) -> tuple[Any, ...]:
+        if isinstance(output, LargeOutput):
+            return (
+                seal_id,
+                output.relative_path,
+                output.sha256,
+                output.size,
+                b"",
+                1,
+                str(output.root),
+                output.dev,
+                output.ino,
+                output.mtime_ns,
+            )
+        return (
+            seal_id,
+            output.relative_path,
+            output.sha256,
+            len(output.content),
+            output.content,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    def _outputs(
+        self, connection: sqlite3.Connection, seal_id: str
+    ) -> tuple[CollectedOutput | LargeOutput, ...]:
         rows = connection.execute(
-            """SELECT relative_path, sha256, size, content FROM sealed_outputs
+            """SELECT relative_path, sha256, size, content, large, source_root,
+            ident_dev, ident_ino, ident_mtime_ns FROM sealed_outputs
             WHERE seal_id=? ORDER BY relative_path""",
             (seal_id,),
         ).fetchall()
-        outputs: list[CollectedOutput] = []
+        outputs: list[CollectedOutput | LargeOutput] = []
         for row in rows:
             content = row["content"]
+            if row["large"]:
+                if (
+                    content != b""
+                    or type(row["size"]) is not int
+                    or row["size"] <= limits.LEGACY_INLINE_BYTES
+                    or not isinstance(row["source_root"], str)
+                    or any(
+                        type(row[name]) is not int
+                        for name in ("ident_dev", "ident_ino", "ident_mtime_ns")
+                    )
+                ):
+                    raise OutputSealError("Sealed output journal integrity check failed.")
+                outputs.append(
+                    LargeOutput(
+                        relative_path=row["relative_path"],
+                        sha256=row["sha256"],
+                        size=row["size"],
+                        root=Path(row["source_root"]),
+                        dev=row["ident_dev"],
+                        ino=row["ident_ino"],
+                        mtime_ns=row["ident_mtime_ns"],
+                    )
+                )
+                continue
             if (
                 type(content) is not bytes
                 or len(content) != row["size"]
@@ -313,6 +369,20 @@ class SealedOutputJournal:
                 );
                 """
             )
+            # Backward compatible migration: large outputs are sealed by reference.
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(sealed_outputs)").fetchall()
+            }
+            for name, definition in (
+                ("large", "INTEGER NOT NULL DEFAULT 0"),
+                ("source_root", "TEXT"),
+                ("ident_dev", "INTEGER"),
+                ("ident_ino", "INTEGER"),
+                ("ident_mtime_ns", "INTEGER"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE sealed_outputs ADD COLUMN {name} {definition}")
         os.chmod(self.path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:

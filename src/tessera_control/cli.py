@@ -157,6 +157,278 @@ def _add_astra_namespace_command(subcommands: argparse._SubParsersAction) -> Non
             )
 
 
+def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
+    """Campaign client commands (ADR 0038): JSON out; approval stays a human, labelled act."""
+    command = subcommands.add_parser(
+        "campaign", help="submit, approve, read or cancel campaigns over the control API"
+    )
+    actions = command.add_subparsers(dest="campaign_action", required=True)
+
+    def common(sub: argparse.ArgumentParser, *, mutating: bool, label: bool = False) -> None:
+        sub.add_argument("--owner-header", type=Path, required=True)
+        sub.add_argument("--control-url", default="http://127.0.0.1:8765")
+        if mutating:
+            sub.add_argument("--idempotency-key", required=True)
+        if label:
+            sub.add_argument(
+                "--automation-label",
+                required=True,
+                help="marks this decision as automation (X-Tessera-Automation); never authority",
+            )
+
+    submit = actions.add_parser("submit", help="submit a campaign spec; grants nothing")
+    submit.add_argument("--project-id", required=True)
+    submit.add_argument("--spec", type=Path, required=True, help="campaign spec JSON file")
+    common(submit, mutating=True)
+    approve = actions.add_parser("approve", help="human approval of one exact spec digest")
+    approve.add_argument("--campaign-id", required=True)
+    approve.add_argument("--expected-revision", type=int, required=True)
+    approve.add_argument("--expected-spec-digest", required=True)
+    common(approve, mutating=True, label=True)
+    get = actions.add_parser("get")
+    get.add_argument("--campaign-id", required=True)
+    common(get, mutating=False)
+    listing = actions.add_parser("list")
+    listing.add_argument("--project-id", required=True)
+    listing.add_argument("--offset", type=int, default=0)
+    listing.add_argument("--limit", type=int, default=50)
+    common(listing, mutating=False)
+    cancel = actions.add_parser("cancel", help="reduce-only: stop further spend and reconcile")
+    cancel.add_argument("--campaign-id", required=True)
+    cancel.add_argument("--expected-revision", type=int, required=True)
+    cancel.add_argument("--reason", required=True)
+    common(cancel, mutating=True)
+    digests = actions.add_parser(
+        "preapproval-digests",
+        help="offline, read-only: the review digests an approve body would pre-approve",
+    )
+    digests.add_argument("--state-dir", required=True, type=Path)
+    digests.add_argument("--salad-campaign-profiles", required=True, type=Path)
+    digests.add_argument("--campaign-id", required=True)
+    digests.add_argument("--stage-key")
+    receipt = actions.add_parser("receipt", help="terminal campaign receipt")
+    receipt.add_argument("--campaign-id", required=True)
+    common(receipt, mutating=False)
+    _add_standing_commands(actions, common)
+
+
+def _add_standing_commands(actions, common) -> None:
+    """`campaign standing ...` (ADR 0042): human-created, capped, revocable templates."""
+    standing = actions.add_parser("standing", help="standing approvals for scheduled starts")
+    verbs = standing.add_subparsers(dest="standing_action", required=True)
+    create = verbs.add_parser("create", help="create a standing approval (human decision)")
+    create.add_argument("--project-id", required=True)
+    create.add_argument("--spec", type=Path, required=True)
+    create.add_argument("--expected-spec-digest", required=True)
+    create.add_argument("--per-start-budget-cents", type=int, required=True)
+    create.add_argument("--max-starts", type=int, required=True)
+    create.add_argument("--max-total-budget-cents", type=int, required=True)
+    create.add_argument("--not-after", required=True)
+    create.add_argument("--not-before")
+    create.add_argument("--min-interval-seconds", type=int)
+    create.add_argument("--max-concurrent", type=int, default=1)
+    create.add_argument("--trigger", choices=("schedule", "follow_on"), default="schedule")
+    create.add_argument("--follow-on")
+    create.add_argument("--retry-max", type=int, default=0)
+    create.add_argument("--retry-on", choices=("failed", "failed_or_stopped"), default="failed")
+    common(create, mutating=True, label=True)
+    for verb in ("list", "show"):
+        sub = verbs.add_parser(verb)
+        sub.add_argument("--project-id", required=True)
+        if verb == "show":
+            sub.add_argument("--id", required=True)
+        else:
+            sub.add_argument("--offset", type=int, default=0)
+            sub.add_argument("--limit", type=int, default=50)
+        common(sub, mutating=False)
+    revoke = verbs.add_parser("revoke", help="stop all new starts from a standing approval")
+    revoke.add_argument("--project-id", required=True)
+    revoke.add_argument("--id", required=True)
+    revoke.add_argument("--expected-revision", type=int, required=True)
+    revoke.add_argument("--reason", required=True)
+    revoke.add_argument("--cancel-running", action="store_true")
+    revoke.add_argument("--automation-label", help="X-Tessera-Automation label (owner credential)")
+    common(revoke, mutating=True)
+
+
+def _standing_call(arguments, project: str, key):
+    """Build the (method, path, body, key) call for a `campaign standing` verb."""
+    from urllib.parse import quote
+
+    from .agent_research_review import ReviewError
+    from .campaign_standing import CreateStandingApproval, RevokeStandingApproval
+
+    action = arguments.standing_action
+    base = f"/projects/{project}/standing-approvals"
+    if action == "create":
+        try:
+            spec = json.loads(arguments.spec.read_text(encoding="utf-8"))
+            body = CreateStandingApproval(
+                spec=spec,
+                expected_spec_digest=arguments.expected_spec_digest,
+                per_start_budget_cap_cents=arguments.per_start_budget_cents,
+                max_starts=arguments.max_starts,
+                max_total_budget_cents=arguments.max_total_budget_cents,
+                min_interval_seconds=arguments.min_interval_seconds,
+                max_concurrent=arguments.max_concurrent,
+                not_before=arguments.not_before,
+                not_after=arguments.not_after,
+                trigger=arguments.trigger,
+                follow_on_standing_approval_id=arguments.follow_on,
+                retry_max=arguments.retry_max,
+                retry_on=arguments.retry_on,
+            ).model_dump(mode="json")
+        except (OSError, ValueError) as error:
+            raise ReviewError(f"Invalid standing approval: {type(error).__name__}") from None
+        return ("POST", base, body, key)
+    if action == "list":
+        query = f"?offset={int(arguments.offset)}&limit={int(arguments.limit)}"
+        return ("GET", base + query, None, None)
+    standing = quote(arguments.id, safe="")
+    if action == "show":
+        return ("GET", f"{base}/{standing}", None, None)
+    body = RevokeStandingApproval(
+        expected_revision=arguments.expected_revision, reason=arguments.reason
+    ).model_dump(mode="json")
+    return ("POST", f"{base}/{standing}/revoke", body, key)
+
+
+def _cancel_running(transport, response: dict, key: str) -> list[dict]:
+    """Ordinary, separate cancels for the campaigns a revoke listed."""
+    from urllib.parse import quote
+
+    outcomes = []
+    for campaign_id in response.get("running_campaign_ids", []):
+        path = f"/campaigns/{quote(campaign_id, safe='')}"
+        status, current = transport("GET", path, None, None)
+        if not 200 <= status < 300 or not isinstance(current, dict):
+            outcomes.append({"campaign_id": campaign_id, "cancel_status": status})
+            continue
+        body = {"expected_revision": current["revision"], "reason": "standing approval revoked"}
+        status, _ = transport("POST", path + "/cancel", body, f"{key}-cancel-{campaign_id}"[:200])
+        outcomes.append({"campaign_id": campaign_id, "cancel_status": status})
+    return outcomes
+
+
+def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
+    from urllib.parse import quote
+
+    from .agent_research_review import (
+        LocalTransport,
+        ReviewError,
+        control_origin,
+        read_owner_header,
+    )
+    from .approval_trust import AUTOMATION_HEADER
+    from .campaign_models import (
+        ApproveCampaign,
+        CancelCampaign,
+        SubmitCampaign,
+        approve_payload,
+    )
+
+    if arguments.campaign_action == "preapproval-digests":
+        from .campaign_preapproval import preview_for_campaign
+
+        try:
+            found = preview_for_campaign(
+                arguments.state_dir,
+                arguments.salad_campaign_profiles,
+                arguments.campaign_id,
+                arguments.stage_key,
+            )
+        except (OSError, ValueError) as error:
+            print(json.dumps({"error": str(error)[:200]}))
+            return 1
+        print(json.dumps({"preapprovals": found}, indent=2, sort_keys=True))
+        return 0
+
+    label = getattr(arguments, "automation_label", None)
+
+    class CampaignTransport(LocalTransport):
+        """Like the proposal transport, but relays control denial bodies and the label."""
+
+        def __call__(self, method, path, body=None, key=None):
+            import urllib.error
+            import urllib.request
+
+            headers = {"Authorization": self.authorization, "Content-Type": "application/json"}
+            if key:
+                headers["Idempotency-Key"] = key
+            if label:
+                headers[AUTOMATION_HEADER] = label
+            data = json.dumps(body).encode() if body is not None else None
+            request = urllib.request.Request(
+                self.origin + path, data=data, headers=headers, method=method
+            )
+            try:
+                with self.opener.open(request, timeout=30) as response:
+                    return response.status, json.loads(response.read(8 * 1024 * 1024))
+            except urllib.error.HTTPError as error:
+                try:
+                    return error.code, json.loads(error.read(65536))
+                except ValueError:
+                    return error.code, None
+            except Exception:
+                raise ReviewError("Control service unreachable or refused") from None
+
+    try:
+        origin = control_origin(arguments.control_url)
+        transport = (transport_factory or CampaignTransport)(
+            origin, read_owner_header(arguments.owner_header)
+        )
+        action = arguments.campaign_action
+        key = getattr(arguments, "idempotency_key", None)
+        project = quote(getattr(arguments, "project_id", "") or "", safe="")
+        campaign = quote(getattr(arguments, "campaign_id", "") or "", safe="")
+        if action == "standing":
+            call = _standing_call(arguments, project, key)
+        elif action == "submit":
+            try:
+                spec = json.loads(arguments.spec.read_text(encoding="utf-8"))
+                body = SubmitCampaign(spec=spec).model_dump(mode="json")
+            except (OSError, ValueError) as error:
+                raise ReviewError(f"Invalid campaign spec: {type(error).__name__}") from None
+            call = ("POST", f"/projects/{project}/campaigns", body, key)
+        elif action == "approve":
+            body = ApproveCampaign(
+                expected_revision=arguments.expected_revision,
+                expected_spec_digest=arguments.expected_spec_digest,
+            )
+            body = approve_payload(body)
+            call = ("POST", f"/campaigns/{campaign}/approve", body, key)
+        elif action == "cancel":
+            body = CancelCampaign(
+                expected_revision=arguments.expected_revision, reason=arguments.reason
+            ).model_dump(mode="json")
+            call = ("POST", f"/campaigns/{campaign}/cancel", body, key)
+        elif action == "get":
+            call = ("GET", f"/campaigns/{campaign}", None, None)
+        elif action == "receipt":
+            call = ("GET", f"/campaigns/{campaign}/receipt", None, None)
+        else:
+            query = f"?offset={int(arguments.offset)}&limit={int(arguments.limit)}"
+            call = ("GET", f"/projects/{project}/campaigns{query}", None, None)
+        status, response = transport(*call)
+        if (
+            action == "standing"
+            and arguments.standing_action == "revoke"
+            and arguments.cancel_running
+            and 200 <= status < 300
+            and isinstance(response, dict)
+        ):
+            response = {**response, "cancelled": _cancel_running(transport, response, key)}
+    except ReviewError as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 1
+    except ValueError as error:
+        print(json.dumps({"error": f"Invalid arguments: {type(error).__name__}"}), file=sys.stderr)
+        return 2
+    ok = 200 <= status < 300
+    print(json.dumps(response if ok else {"status": status, "body": response}, sort_keys=True))
+    return 0 if ok else 1
+
+
 def parser() -> argparse.ArgumentParser:
     from .agent_sandbox_cli import add_agent_sandbox_commands
     from .connection_tunnel import add_connection_tunnel_command
@@ -165,6 +437,13 @@ def parser() -> argparse.ArgumentParser:
     subcommands = command.add_subparsers(dest="command", required=True)
     add_agent_sandbox_commands(subcommands)
     add_connection_tunnel_command(subcommands)
+    from .agent_research_review import add_agent_proposal_commands
+
+    add_agent_proposal_commands(subcommands)
+    _add_campaign_commands(subcommands)
+    from .provider_trust_cli import add_provider_trust_commands
+
+    add_provider_trust_commands(subcommands)
     add_workspace_commands(subcommands)
     _add_minikube_provisioning_command(subcommands)
     _add_astra_setup_command(subcommands)
@@ -180,6 +459,14 @@ def parser() -> argparse.ArgumentParser:
     restore = subcommands.add_parser("restore")
     restore.add_argument("--backup", required=True, type=Path)
     restore.add_argument("--state-dir", required=True, type=Path)
+    for recovery_command in (backup, restore):
+        recovery_command.add_argument(
+            "--max-backup-bytes",
+            type=int,
+            default=None,
+            help="operator size bound for the backup (default 1 GiB, at most 64 GiB); "
+            "a restore needs a bound that covers the backup",
+        )
     serve = subcommands.add_parser("serve")
     serve.add_argument("--state-dir", required=True, type=Path)
     serve.add_argument("--port", required=True, type=int, choices=range(1, 65_536))
@@ -190,6 +477,63 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--runtime-owner-sha256")
     serve.add_argument("--agent-sandbox-config", type=Path)
     serve.add_argument("--agent-sandbox-sha256")
+    serve.add_argument(
+        "--campaign-tick-seconds",
+        type=float,
+        default=2.0,
+        help="campaign runner tick interval, 0.2-60 (ADR 0038)",
+    )
+    serve.add_argument(
+        "--salad-campaign-profiles",
+        type=Path,
+        help=(
+            "alias: owner-only Salad campaign profile file, registered as the salad "
+            "provider's profiles; without it Salad stages are refused"
+        ),
+    )
+    serve.add_argument(
+        "--campaign-providers",
+        type=Path,
+        help=(
+            "owner-only campaign provider file (tessera.campaign-providers.v1): local-docker "
+            "and self-hosted worker principals and Salad profiles (ADR 0040)"
+        ),
+    )
+    serve.add_argument(
+        "--provider-trust",
+        type=Path,
+        help=(
+            "owner-only provider data-class trust file (tessera.provider-trust.v1); without "
+            "it every provider receives public data only (ADR 0040)"
+        ),
+    )
+    serve.add_argument(
+        "--program-budget",
+        type=Path,
+        help=(
+            "owner-only program budget file (tessera.program-budget.v1): caps on the money "
+            "committed across campaigns, counted at every admission and start (ADR 0045)"
+        ),
+    )
+    serve.add_argument(
+        "--accept-automation-gate-go",
+        action="store_true",
+        help=(
+            "count a gate `go` recorded by the owner credential under a self-declared "
+            "automation label as the go of an unlock (default: only a person's session); "
+            "the decision keeps its class on the receipt (ADR 0051)"
+        ),
+    )
+    serve.add_argument(
+        "--no-campaign-runner",
+        action="store_true",
+        help="serve the campaign routes without the in-process runner",
+    )
+    serve.add_argument(
+        "--no-campaign-scheduler",
+        action="store_true",
+        help="run the campaign runner without starting campaigns from standing approvals",
+    )
     return command
 
 
@@ -592,6 +936,16 @@ def main() -> int:
         from .connection_tunnel import run_connection_tunnel
 
         return run_connection_tunnel(arguments)
+    if arguments.command == "agent-proposal":
+        from .agent_research_review import run_agent_proposal
+
+        return run_agent_proposal(arguments)
+    if arguments.command == "campaign":
+        return run_campaign(arguments)
+    if arguments.command == "admin":
+        from .provider_trust_cli import run_provider_trust
+
+        return run_provider_trust(arguments)
     if arguments.command == "minikube-provision":
         return _run_minikube_provisioning(arguments)
     if arguments.command == "astra-setup":
@@ -609,7 +963,7 @@ def main() -> int:
     if arguments.command == "init":
         try:
             database_path, header_path = initialize_state(arguments.state_dir)
-        except StoreError as error:
+        except (StoreError, ValueError) as error:
             print(f"init failed: {error}", file=sys.stderr)
             return 1
         print(database_path)
@@ -624,14 +978,20 @@ def main() -> int:
         return 0
     if arguments.command == "backup":
         try:
-            print(backup_state(arguments.state_dir, arguments.output)["backup_id"])
+            print(
+                backup_state(
+                    arguments.state_dir, arguments.output, max_bytes=arguments.max_backup_bytes
+                )["backup_id"]
+            )
         except (StoreError, sqlite3.Error, OSError) as error:
             print(f"backup failed: {error}", file=sys.stderr)
             return 1
         return 0
     if arguments.command == "restore":
         try:
-            database_path, header_path = restore_state(arguments.backup, arguments.state_dir)
+            database_path, header_path = restore_state(
+                arguments.backup, arguments.state_dir, max_bytes=arguments.max_backup_bytes
+            )
         except (StoreError, sqlite3.Error, OSError) as error:
             print(f"restore failed: {error}", file=sys.stderr)
             return 1
@@ -645,9 +1005,52 @@ def main() -> int:
             print(f"serve failed: {error}", file=sys.stderr)
             return 1
         owner = None
+        if not 0.2 <= arguments.campaign_tick_seconds <= 60:
+            print("serve configuration error: --campaign-tick-seconds is 0.2-60", file=sys.stderr)
+            return 2
+        runner_interval = None if arguments.no_campaign_runner else arguments.campaign_tick_seconds
         try:
             deployment = serving_config(
                 arguments.bind_host, arguments.trusted_host, arguments.public_origin
+            )
+            from .provider_trust import builtin_policy, load_policy_file
+
+            # A symlink, foreign owner, group/world-writable or malformed file is a
+            # TrustPolicyRefused (a ValueError): serve exits 2 below.
+            trust_policy = (
+                load_policy_file(arguments.provider_trust)
+                if arguments.provider_trust is not None
+                else builtin_policy()
+            )
+            from .campaign_providers import configure_providers, load_providers_file
+
+            provider_config = (
+                load_providers_file(arguments.campaign_providers)
+                if arguments.campaign_providers is not None
+                else {}
+            )
+            if arguments.salad_campaign_profiles is not None:
+                if provider_config.get("salad_profiles") is not None:
+                    raise ValueError(
+                        "salad profiles come from either --campaign-providers or "
+                        "--salad-campaign-profiles, not both"
+                    )
+                from .salad_campaign_profiles import load_profiles
+
+                provider_config["salad_profiles"] = load_profiles(
+                    arguments.salad_campaign_profiles
+                ).model_dump(mode="json", by_alias=True)
+            configure_providers(provider_config or None)
+            from . import program_budget
+            from .campaign_gates import configure_go_authority
+
+            configure_go_authority(
+                accept_automation_labelled=bool(arguments.accept_automation_gate_go)
+            )
+            program_budget.configure(
+                program_budget.load_program_budget_file(arguments.program_budget)
+                if arguments.program_budget is not None
+                else None
             )
             sandbox_backend = None
             if arguments.agent_sandbox_config is not None or arguments.agent_sandbox_sha256:
@@ -691,12 +1094,21 @@ def main() -> int:
             return not cleanup_failed
 
         try:
+            from .provider_trust import install_policy, record_at_start
+            from .store import _database_path
+
+            install_policy(trust_policy)
             app = create_app(
                 arguments.state_dir,
                 deployment,
                 runtime_binding_adapter=adapter,
                 agent_sandbox_backend=sandbox_backend,
+                campaign_runner_interval=runner_interval,
+                campaign_scheduler=not arguments.no_campaign_scheduler,
             )
+            # The state is initialized and current (create_app checked it): audit the load.
+            record_at_start(_database_path(arguments.state_dir), trust_policy)
+            app.state.provider_trust_path = arguments.provider_trust
             if owner is not None:
                 previous_lifespan = app.router.lifespan_context
 

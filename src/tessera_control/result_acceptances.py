@@ -126,7 +126,8 @@ class ResultAcceptanceStore(Store):
         body: dict[str, Any],
         *,
         inspect_objects: bool = False,
-    ) -> None:
+    ) -> dict[str, Any]:
+        """Verify evidence; return which receipt class backs it."""
         if checkpoint["state"] != "committed_quarantined" or checkpoint[
             "operation_id"
         ] != ArtifactStore._expected_operation(checkpoint["lease_id"]):
@@ -224,7 +225,7 @@ class ResultAcceptanceStore(Store):
             (checkpoint["operation_id"],),
         ).fetchone()
         if receipt is None:
-            raise Conflict("Result acceptance receipt does not match current reconciled evidence.")
+            return self._verify_run_receipt(connection, actor, checkpoint, manifest, body)
         try:
             receipt_payload = json.loads(receipt["receipt_payload_json"])
         except (TypeError, json.JSONDecodeError) as error:
@@ -259,6 +260,77 @@ class ResultAcceptanceStore(Store):
             True,
         ):
             raise Conflict("Result acceptance receipt does not match current reconciled evidence.")
+        return {"kind": "fake"}
+
+    @staticmethod
+    def _verify_run_receipt(
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        checkpoint: sqlite3.Row,
+        manifest: sqlite3.Row,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify an observed-provider run receipt (a nonzero exit is still bookkeeping)."""
+        mismatch = "Result acceptance receipt does not match current reconciled evidence."
+        receipt = connection.execute(
+            """SELECT r.*, o.observed_state AS operation_observed_state,
+            o.org_id AS operation_org_id, o.worker_principal_id AS operation_worker_id
+            FROM execution_run_receipts r JOIN external_operations o
+            ON o.operation_id=r.operation_id WHERE r.operation_id=?""",
+            (checkpoint["operation_id"],),
+        ).fetchone()
+        if receipt is None:
+            raise Conflict(mismatch)
+        try:
+            payload = json.loads(receipt["receipt_payload_json"])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise Conflict("Result acceptance receipt is invalid.") from error
+        if canonical_digest(payload) != receipt["receipt_digest"]:
+            raise Conflict("Result acceptance receipt digest is invalid.")
+        if (
+            receipt["org_id"],
+            receipt["operation_org_id"],
+            receipt["project_id"],
+            receipt["task_id"],
+            receipt["grant_id"],
+            receipt["lease_id"],
+            receipt["worker_principal_id"],
+            receipt["operation_worker_id"],
+            receipt["epoch"],
+            receipt["operation_observed_state"],
+            receipt["receipt_digest"],
+            receipt["receipt_evidence"],
+        ) != (
+            actor["org_id"],
+            actor["org_id"],
+            checkpoint["project_id"],
+            checkpoint["task_id"],
+            checkpoint["grant_id"],
+            checkpoint["lease_id"],
+            manifest["worker_principal_id"],
+            manifest["worker_principal_id"],
+            checkpoint["epoch"],
+            "exited",
+            body["expected_receipt_digest"],
+            "observed_provider_execution",
+        ):
+            raise Conflict(mismatch)
+        return {
+            "kind": "observed",
+            "provider_kind": receipt["provider_kind"],
+            "exit_code": receipt["exit_code"],
+        }
+
+    @staticmethod
+    def _uses_observed_ledger(connection: sqlite3.Connection, checkpoint: sqlite3.Row) -> bool:
+        # An operation holds at most one receipt class (enforced by triggers).
+        return (
+            connection.execute(
+                "SELECT 1 FROM execution_run_receipts WHERE operation_id=?",
+                (checkpoint["operation_id"],),
+            ).fetchone()
+            is not None
+        )
 
     def record(
         self,
@@ -290,8 +362,14 @@ class ResultAcceptanceStore(Store):
         def command(connection: sqlite3.Connection, live: dict[str, Any]):
             self._require_human(live)
             checkpoint = self._checkpoint_for_actor(connection, live, checkpoint_id)
+            observed = self._uses_observed_ledger(connection, checkpoint)
+            table = (
+                "execution_observed_result_acceptances"
+                if observed
+                else "execution_result_acceptances"
+            )
             current = connection.execute(
-                """SELECT * FROM execution_result_acceptances
+                f"""SELECT * FROM {table}
                 WHERE checkpoint_id=? ORDER BY revision DESC LIMIT 1""",
                 (checkpoint_id,),
             ).fetchone()
@@ -326,7 +404,7 @@ class ResultAcceptanceStore(Store):
                 ):
                     raise Conflict("Result retraction does not match the current decision.")
             else:
-                self._verify_current_evidence(connection, live, checkpoint, body)
+                evidence = self._verify_current_evidence(connection, live, checkpoint, body)
             revision = current_revision + 1
             row = {
                 "id": self._record_id(checkpoint_id, revision),
@@ -350,8 +428,34 @@ class ResultAcceptanceStore(Store):
                 "evidence_label": "development_synthetic_only",
                 "receipt_evidence": "fake_provider_development_only",
             }
-            connection.execute(
-                """INSERT INTO execution_result_acceptances
+            if observed:
+                if body["action"] == "retract":
+                    provider_kind, exit_code = current["provider_kind"], current["exit_code"]
+                else:
+                    provider_kind, exit_code = evidence["provider_kind"], evidence["exit_code"]
+                row |= {
+                    "provider_kind": provider_kind,
+                    "exit_code": exit_code,
+                    "evidence_label": "provider_observed_unassessed",
+                    "receipt_evidence": "observed_provider_execution",
+                }
+                connection.execute(
+                    """INSERT INTO execution_observed_result_acceptances
+                    (id, checkpoint_id, revision, action, rationale, checkpoint_digest,
+                    manifest_digest, validation_digest, receipt_digest, grant_revision, lease_id,
+                    operation_id, epoch, actor_principal_id, created_at, provider_kind, exit_code,
+                    scientific_validity, provider_success, artifact_release, evidence_label,
+                    receipt_evidence)
+                    VALUES (:id,:checkpoint_id,:revision,:action,:rationale,:checkpoint_digest,
+                    :manifest_digest,:validation_digest,:receipt_digest,:grant_revision,:lease_id,
+                    :operation_id,:epoch,:actor_principal_id,:created_at,:provider_kind,:exit_code,
+                    :scientific_validity,:provider_success,:artifact_release,:evidence_label,
+                    :receipt_evidence)""",
+                    row,
+                )
+            else:
+                connection.execute(
+                    """INSERT INTO execution_result_acceptances
                 (id, checkpoint_id, revision, action, rationale, checkpoint_digest, manifest_digest,
                 validation_digest, receipt_digest, grant_revision, lease_id, operation_id, epoch,
                 actor_principal_id, created_at, scientific_validity, provider_success,
@@ -361,8 +465,8 @@ class ResultAcceptanceStore(Store):
                 :manifest_digest,:validation_digest,:receipt_digest,:grant_revision,:lease_id,
                 :operation_id,:epoch,:actor_principal_id,:created_at,:scientific_validity,
                 :provider_success,:artifact_release,:evidence_label,:receipt_evidence)""",
-                row,
-            )
+                    row,
+                )
             self._event(
                 connection,
                 live,
@@ -404,12 +508,60 @@ class ResultAcceptanceStore(Store):
         connection = _connect(self.database_path)
         try:
             live = self._live_principal(connection, actor)
-            self._checkpoint_for_actor(connection, live, checkpoint_id)
+            checkpoint = self._checkpoint_for_actor(connection, live, checkpoint_id)
+            table = (
+                "execution_observed_result_acceptances"
+                if self._uses_observed_ledger(connection, checkpoint)
+                else "execution_result_acceptances"
+            )
             rows = connection.execute(
-                """SELECT * FROM execution_result_acceptances WHERE checkpoint_id=?
+                f"""SELECT * FROM {table} WHERE checkpoint_id=?
                 ORDER BY revision LIMIT ? OFFSET ?""",
                 (checkpoint_id, limit, offset),
             ).fetchall()
             return [_response(row) for row in rows]
         finally:
             connection.close()
+
+
+def create_observed_result_acceptance_schema(connection: sqlite3.Connection) -> None:
+    """Install an empty ledger for checkpoints whose operation has a run receipt.
+
+    It mirrors the fake-provider ledger but carries a disjoint evidence class.
+    The fake ledger's CHECK constraints are left untouched; a checkpoint's
+    ledger lives in exactly one table because its operation has exactly one
+    receipt class.
+    """
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS execution_observed_result_acceptances (
+        id TEXT PRIMARY KEY,
+        checkpoint_id TEXT NOT NULL REFERENCES execution_result_checkpoints(id),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        action TEXT NOT NULL CHECK (action IN ('accept', 'reject', 'retract')),
+        rationale TEXT NOT NULL CHECK (length(rationale) BETWEEN 1 AND 8000),
+        checkpoint_digest TEXT NOT NULL CHECK (length(checkpoint_digest) = 64),
+        manifest_digest TEXT NOT NULL CHECK (length(manifest_digest) = 64),
+        validation_digest TEXT NOT NULL CHECK (length(validation_digest) = 64),
+        receipt_digest TEXT NOT NULL CHECK (length(receipt_digest) = 64),
+        grant_revision INTEGER NOT NULL CHECK (grant_revision >= 1),
+        lease_id TEXT NOT NULL REFERENCES execution_leases(id),
+        operation_id TEXT NOT NULL REFERENCES execution_run_receipts(operation_id),
+        epoch INTEGER NOT NULL CHECK (epoch >= 1),
+        actor_principal_id TEXT NOT NULL REFERENCES principals(id),
+        created_at TEXT NOT NULL,
+        provider_kind TEXT NOT NULL CHECK (
+            provider_kind IN ('local_docker_cpu', 'remote_kubernetes', 'remote_salad')
+        ),
+        exit_code INTEGER NOT NULL,
+        scientific_validity TEXT NOT NULL CHECK (scientific_validity = 'not_assessed'),
+        provider_success TEXT NOT NULL CHECK (provider_success = 'not_established'),
+        artifact_release TEXT NOT NULL CHECK (artifact_release = 'not_performed'),
+        evidence_label TEXT NOT NULL CHECK (evidence_label = 'provider_observed_unassessed'),
+        receipt_evidence TEXT NOT NULL CHECK (receipt_evidence = 'observed_provider_execution'),
+        UNIQUE(checkpoint_id, revision)
+        )"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS execution_observed_result_acceptances_by_checkpoint
+        ON execution_observed_result_acceptances(checkpoint_id, revision)"""
+    )

@@ -4,10 +4,9 @@
 live probes run or pilot Jobs started by this change.** This is a narrow
 constant-workload profile, not general hostile-code multi-tenancy.
 
-## Inspected target
+## Failure mode
 
-The retained `.tessera/comparison-pilot-20260921-local/target-provisioning/RUN-RECORD.md`
-reports a Job-creating account and output PVC in `tessera-local-control-20260921`.
+A Job-creating account and output PVC in the control namespace are an exposure.
 Denying GET of the control PVC does not prevent a Job mounting it: the kubelet,
 not the submitting account, attaches the claim. Namespace labels are not RBAC.
 The account also lacked GET of the two namespace UIDs used as cluster identity.
@@ -117,7 +116,7 @@ Add this **required** `target.isolation` to both probe and full pilot configs:
 
 ```json
 {
-  "control_namespace": "tessera-local-control-20260921",
+  "control_namespace": "tessera-local-control",
   "image": "REPLACE_WITH_APPROVED_DIGEST_PINNED_IMAGE"
 }
 ```

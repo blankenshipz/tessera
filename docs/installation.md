@@ -158,8 +158,10 @@ credentials expire: the enrollment script defaults to one hour (bounded to two
 hours). Before expiry, the local owner can explicitly renew the **same active
 worker credential** using `POST /credentials/{credential_id}/renew` with
 `{"expires_at":"OWNER_SELECTED_FUTURE_UTC_TIME"}` and an idempotency key. Select
-a time later than its current expiry, within the next 24 hours and no later than
-its parent credential's expiry. The API retains credential/principal/token and
+a time later than its current expiry, within the next 24 hours, no later than
+its parent credential's expiry and no later than seven days after the worker
+credential was issued (control refuses renewal past that and stops authenticating the
+credential there; enroll a new worker credential). The API retains credential/principal/token and
 worker-journal identity; renewal does not extend a grant, lease or network witness.
 
 ```sh

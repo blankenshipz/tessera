@@ -1,0 +1,16 @@
+# Egress proxy image recipe (ADR 0034). Source only: adding this file pulls or builds
+# nothing. An operator builds it, pushes it to a registry they control, and pins the
+# resulting repo@sha256 digest in worker/target configuration (docs/sandbox-egress.md).
+FROM python:3.11-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+WORKDIR /opt/tessera
+# Only the stdlib-only proxy is packaged: no Tessera control code, credentials,
+# package manager installs, shells beyond the base image, or network tools.
+COPY src/tessera_worker/egress_proxy.py /opt/tessera/tessera_worker/egress_proxy.py
+RUN touch /opt/tessera/tessera_worker/__init__.py && chmod -R a+rX /opt/tessera
+ENV PYTHONPATH=/opt/tessera PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+USER 65532:65532
+EXPOSE 3128
+ENTRYPOINT ["python", "-m", "tessera_worker.egress_proxy"]
+# Runtime read-only root, cap-drop, non-root, resource bounds, network attachment and
+# the per-run allowlist (--config-b64) are supplied by the Docker adapter or the
+# Kubernetes proxy Pod manifest, never baked into the image.

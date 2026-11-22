@@ -10,7 +10,7 @@ The existing Kubernetes control and research MCP are unchanged.
 
 ### Zero-project account setup
 
-For an organization with no project, call `salad_configure(organization="luxai",
+For an organization with no project, call `salad_configure(organization="example-org",
 credential_reference="credential-ref:salad-management", credential_version=1)`.
 Project and management host are optional at this stage. The CAS-protected private
 record survives reconnect and credential expiry. It reports
@@ -18,7 +18,7 @@ record survives reconnect and credential expiry. It reports
 `project_created:false`; **a proposed name is not an existing project**.
 
 Follow the returned [official account setup instructions](https://docs.salad.com/general/tutorials/account-setup):
-open the Salad Portal, select `luxai`, create the project (proposed name
+open the Salad Portal, select `example-org`, create the project (proposed name
 `tessera-research`), and do not create/deploy any workload or change billing.
 The documented public API/SDK has no project-create/list operation; Tessera cannot
 truthfully automate this Portal step through an invented endpoint. Resume with
@@ -64,8 +64,8 @@ Directory preparation is separate; local setup already prepared these mode-0700
 directories. From this checkout run this exact command in a local terminal:
 
 ```sh
-/Users/zach/Code/tessera/.venv/bin/python -m tessera_operator.salad_enroll \
-  --credential-directory /Users/zach/Code/tessera/.tessera/private/salad-operator/credentials \
+$REPO/.venv/bin/python -m tessera_operator.salad_enroll \
+  --credential-directory $REPO/.tessera/private/salad-operator/credentials \
   --reference credential-ref:salad-management --expires-in-hours 24
 ```
 
@@ -80,15 +80,15 @@ entries remains a separately administered resolver operation. Python/getpass cre
 immutable string copies; hidden entry and buffer wiping do not guarantee process
 memory erasure. Keep terminal/session recording, tracing and dumps disabled.
 
-### luxai scope and project selection
+### example-org scope and project selection
 
 `salad_discover_projects(credential_reference="credential-ref:salad-management",
-credential_version=1)` makes exactly one `GET /organizations/luxai/quotas` to
+credential_version=1)` makes exactly one `GET /organizations/example-org/quotas` to
 validate organization read access. Despite the tool's discoverability name,
 `project_discovery` truthfully reports `unsupported_by_public_api`: the official
 Salad public OpenAPI has **no organization/project enumeration or project-get
 operation**. Do not guess names or call undocumented `/projects` endpoints.
-Obtain the existing project name from trusted configuration or the luxai Portal;
+Obtain the existing project name from trusted configuration or the example-org Portal;
 then pass `candidate_project` to the same tool. It makes one documented container
 collection GET for that exact candidate and returns only read-access status,
 never quota/container bodies. It does not save configuration or select a host.
@@ -127,6 +127,66 @@ operator configuration's version pin; inspect metadata before retrying an uncert
 renewal. Renewal grants no control credential, delegation approval or spending.
 
 ## Normal use, exit and return
+
+### Billing declarations are not execution admission
+
+Both local configuration and authoritative Salad configuration accept optional
+`billing_policy` metadata. Omission preserves an existing policy during operator
+revision; explicitly send `{"mode":"credits_only"}` to replace it with the legacy
+mode. Legacy records with no policy retain their serialized configuration shape.
+`aggregate_capped` requires a strict integer `ceiling_cents` from 1 to 5000.
+Nullable strict integer `prior_cost_cents`, `reserved_cents`, `ancillary_cents` and
+`shutdown_cents` distinguish unknown amounts from declared zero; their known sum
+must not exceed the ceiling. An optional timezone-aware `expires_at` is projected
+as current or expired, not renewed automatically. Unknown or even fully declared
+accounting remains unverified. The proposed 1000-cent shutdown and 500-cent
+ancillary reserves are declarations, not measured liability guarantees.
+
+Readiness reports the policy and its declaration/expiry status, but always leaves
+ledger/enforcement verification and execution disabled. It does not claim a
+provider hard cap. Atomic experiment-wide reservations/settlements, native Salad
+execution grants, guardian/custody evidence and exact protocol acceptance remain
+separate prerequisites; policy metadata cannot substitute for any of them.
+
+Schema-57 source implements a separate control-DB experiment parent, not an upgrade
+of those declarations. An existing human credential can record a USD authorization
+at `POST /experiments/{id}/budget/authorization`; unknown prior costs, pending
+exposure or ancillary/shutdown bounds remain unknown and block admission. Once
+created, that authorization cannot be reset by a new design or billing policy.
+Authorization is refused while an earlier attempt is non-terminal or prior settled/pending
+costs are undeclared; terminal earlier attempts (e.g. a CPU baseline) are carried in
+those declared prior bounds. Budgeted attempt admission reserves the native grant's full exposure in the same
+transaction as its attempt, event and idempotency record, without a second project
+debit. `GET /experiments/{id}/budget` reports the retained parent accounting.
+
+Explicit human charge assertions use `POST /experiments/{id}/budget/charges` with
+current revision, delivery identity and evidence reference. Duplicate delivery is
+deduplicated, distinct real charges count separately, and late over-cap charges are
+recorded and fence further admission. References are not independently verified
+invoices. Settlement moves held amounts to settled; it does not release remaining
+liability. Cancellation, expiry, stopped status and reconnect never refund holds.
+This slice has no residual-release or authorization-renewal command.
+
+Authorization is one-shot: `POST /experiments/{id}/budget/authorization` creates the
+parent once and cannot be repeated or reset. Earlier CPU attempts must all be terminal
+(succeeded, failed or cancelled) with declared prior settled and pending costs before a
+budget can be authorized; finish them first. Any bound left unknown at authorization
+keeps admission blocked until a human resolves it with
+`POST /experiments/{id}/budget/bounds`, sending the current `expected_revision`, an
+`evidence_digest`, a `source_reference` and one or more of `prior_settled_cents`,
+`prior_pending_cents`, `ancillary_cents`, `shutdown_cents` as non-negative integers.
+Only a currently unknown bound may be set, once; a known bound is never changed or
+lowered (409). The resolution increments the revision, is recorded in the append-only
+`experiment_budget_bound_resolutions` table, and fences the parent if known exposure
+then exceeds the ceiling. Unknown costs are never inferred as zero.
+
+Salad create/start and proxy claims require a current retained reservation. The
+trusted server derives its identity and sends it on the authenticated safety-admin
+channel. The safety service stores only an immutable recovery constraint, not a
+copy of parent balances or authority to mint reservations. Stop-only operations
+survive a fenced parent. Local tests exercise isolated HTTP/TLS services and fake
+provider responses; these are OpenCode development checks, not actual research
+agents, Tessera research records, deployed schema acceptance or paid GPU execution.
 
 ### Authoritative control metadata mode
 
@@ -181,7 +241,7 @@ inspection/revocation, not silent token regeneration. Do not commit or share the
 
 Disconnect the root and Connect by explicitly choosing `operator.control-token`
 (legacy `.header` files remain supported). As this operator, propose a Salad
-configuration for `luxai` and its own delegation for the exact configuration record:
+configuration for `example-org` and its own delegation for the exact configuration record:
 choose subject role **Operator / agent (control agent credential)**, all three
 actions `configuration.read`, `configuration.propose`, `readiness.read`, and an
 expiry no later than the child credential. The server enforces subject lifetime.
@@ -201,7 +261,7 @@ delegation restricts administration only; it is not a universal action sandbox.
 Issuance neither approves research nor enables provider execution or spending.
 
 `salad_inspect()` reads `GET /admin/projects/PROJECT/records/RECORD/salad-setup`.
-`salad_configure(organization="luxai", expected_revision=REV,
+`salad_configure(organization="example-org", expected_revision=REV,
 idempotency_key=KEY, proposed_project="tessera-research", project=null)` uses the
 existing revision-checked admin `revise` command. Persist the non-secret key and
 exact arguments before calling; reuse them on retry, never silently allocate a new
@@ -264,3 +324,11 @@ real local stdio MCP handshake/configure/reconnect. They do not contact Salad or
 establish deployed/live readiness. Python HTTP libraries copy header strings;
 mutable-buffer wiping does not guarantee whole-process secret erasure. Protect
 the operator process from dumps, debugging and request tracing.
+
+Campaign Salad stages ([ADR 0038](decisions/0038-campaign-specs-and-platform-campaign-runner.md)
+amendment) additionally need an owner-only campaign profile file
+(`tessera.salad.campaign-profiles.v1`, no secrets) passed as
+`tessera serve --salad-campaign-profiles FILE`. Each profile must list
+`allowed_image_digests` (required, non-empty `sha256:` digests); a campaign stage whose
+image is not on that list is refused at submit, approval and dispatch. See
+[campaigns](campaigns.md).

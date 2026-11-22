@@ -1,0 +1,13 @@
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!MANIFEST.in
+!src/
+!src/**
+!deploy/
+!deploy/garage-control/
+!deploy/garage-control/Dockerfile
+!deploy/garage-control/Dockerfile.dockerignore
+**/__pycache__/

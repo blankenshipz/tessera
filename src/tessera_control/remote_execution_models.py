@@ -1,5 +1,6 @@
 """Remote routing declarations are additional restrictions, never execution grants."""
 
+import re
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -12,8 +13,9 @@ from pydantic import (
 )
 
 from .capability_models import Digest, Identifier, Positive, Strict
+from .execution_targets import Target
+from .salad_workload_contract import WorkloadContractV1
 
-Target = Literal["kubernetes", "salad_container", "salad_inference"]
 Action = Literal["create", "start", "stop", "delete", "observe"]
 Name = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 Image = Annotated[
@@ -40,7 +42,7 @@ class RemoteResources(Frozen):
     gpu_class: Name | None = None
     gpu_count: int = Field(ge=0, le=1)
     disk_mb: int = Field(ge=128, le=1048576)
-    max_seconds: int = Field(ge=1, le=3600)
+    max_seconds: int = Field(ge=1, le=7200)
 
     @model_validator(mode="after")
     def gpu(self):
@@ -49,22 +51,38 @@ class RemoteResources(Frozen):
         return self
 
 
+# Salad routes bill only running time; the route window may exceed the approved plan
+# duration by this unbilled provisioning (allocation + image pull) allowance. The
+# shared Kubernetes plan limit stays 3600 s.
+SALAD_PROVISIONING_ALLOWANCE_SECONDS = 3600
+
+
+def route_window_limit(target, plan_max_duration_seconds):
+    """Largest route window a plan admits for this target."""
+    if target == "salad_container":
+        return plan_max_duration_seconds + SALAD_PROVISIONING_ALLOWANCE_SECONDS
+    return plan_max_duration_seconds
+
+
 class SaladExecution(Frozen):
     """Exact human-reviewed executable profile, not evidence of provider enforcement."""
 
     platform: Literal["linux/amd64"]
     command: Literal["/tessera/bin/run"]
+    # exact/smoke_operation_v1 keep the original strict token shape (enforced below);
+    # workload_v1 carries the resolved printable argv of the reviewed contract.
     argv: Annotated[
-        list[Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,64}$")]],
-        Field(max_length=16),
+        list[Annotated[str, StringConstraints(min_length=1, max_length=256)]],
+        Field(max_length=32),
     ]
-    argv_binding: Literal["exact", "smoke_operation_v1"] = "exact"
+    argv_binding: Literal["exact", "smoke_operation_v1", "workload_v1"] = "exact"
+    workload: WorkloadContractV1 | None = None
     env: dict[str, str]
     max_output_bytes: int = Field(ge=1, le=16 * 1024 * 1024)
     max_output_files: int = Field(ge=1, le=128)
     capability_digest: Digest
     network_policy: Literal["provider_broad_egress_explicitly_accepted"]
-    data_policy: Literal["public_released_only"]
+    data_policy: Literal["public_released_only", "provider_trust_policy_v1"]
     artifact_destination: Annotated[
         str, StringConstraints(pattern=r"^artifact-ref:[a-z0-9-]{1,63}$")
     ]
@@ -87,15 +105,30 @@ class SaladExecution(Frozen):
         # The new smoke binding must remain explicit in every serialized review.
         if self.argv_binding == "exact":
             data.pop("argv_binding", None)
+        if self.workload is None:
+            data.pop("workload", None)
         return data
 
-    @field_validator("env")
-    @classmethod
-    def closed_environment(cls, value):
-        allowed = {"PYTHONUNBUFFERED": {"1"}, "OMP_NUM_THREADS": {"1", "2", "4"}}
-        if any(k not in allowed or v not in allowed[k] for k, v in value.items()):
-            raise ValueError("only explicit non-secret execution environment is supported")
-        return value
+    @model_validator(mode="after")
+    def binding_shape(self):
+        if (self.argv_binding == "workload_v1") != (self.workload is not None):
+            raise ValueError("workload contract is required for, and only for, workload_v1")
+        if self.workload is None:
+            if len(self.argv) > 16 or any(
+                not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", token) for token in self.argv
+            ):
+                raise ValueError("argv tokens must match the reviewed strict shape")
+            allowed = {"PYTHONUNBUFFERED": {"1"}, "OMP_NUM_THREADS": {"1", "2", "4"}}
+            if any(k not in allowed or v not in allowed[k] for k, v in self.env.items()):
+                raise ValueError("only explicit non-secret execution environment is supported")
+            return self
+        if (
+            self.env != self.workload.env
+            or self.max_output_files != len(self.workload.outputs)
+            or self.max_output_bytes < self.workload.output_bytes
+        ):
+            raise ValueError("workload profile env/output limits differ from the contract")
+        return self
 
 
 def derived_salad_argv(execution, approved_argv, operation_id, epoch, max_seconds):
@@ -105,6 +138,23 @@ def derived_salad_argv(execution, approved_argv, operation_id, epoch, max_second
     still covers the concrete resolved selection, and every use re-derives it.
     """
     profile = SaladExecution.model_validate(execution)
+    if profile.argv_binding == "workload_v1":
+        work = profile.workload
+        if (
+            type(approved_argv) is not list
+            or approved_argv != [profile.command, *work.argv_template]
+            or type(operation_id) is not str
+            or len(operation_id) != 32
+            or any(c not in "0123456789abcdef" for c in operation_id)
+            or type(epoch) is not int
+            or epoch < 1
+            or work.workload_seconds > max_seconds
+        ):
+            raise ValueError("unsupported Salad workload binding")
+        argv = work.derived_argv(operation_id, epoch)[1:]
+        if argv != profile.argv:
+            raise ValueError("Salad workload binding differs from approved spec")
+        return argv
     if profile.argv_binding == "exact":
         if approved_argv != [profile.command, *profile.argv]:
             raise ValueError("Salad argv differs from approved execution spec")
@@ -192,6 +242,14 @@ class ExecutionSelection(Frozen):
     def profile(self):
         if (self.target == "salad_container") != (self.salad is not None):
             raise ValueError("only Salad containers require the narrow Salad profile")
+        work = self.salad.execution.workload if self.salad and self.salad.execution else None
+        if work is not None:
+            # A declared input is the reviewed data snapshot of this route, never another.
+            if work.input is not None and work.input.snapshot_digest != self.manifests.data:
+                raise ValueError("workload input must be the route's manifests.data snapshot")
+            # Bounds that may tighten later (disk_mb, staged input checks) are admission
+            # checks (salad_workload_admission), never parse checks: stored proposals
+            # must always parse so stop and reconcile keep working.
         return self
 
 
@@ -232,6 +290,18 @@ class EvidenceLink(Frozen):
     custody: Literal["unverified", "quarantined"] = "unverified"
 
 
+class ProviderRejection(Frozen):
+    """Bounded, non-secret summary of a provider's clean 400/422 create rejection, or of a
+    create that never left the process (status 0: no HTTP exchange)."""
+
+    status: Literal[0, 400, 422]
+    title: Annotated[str, StringConstraints(max_length=200)] | None = None
+    detail: Annotated[str, StringConstraints(max_length=200)] | None = None
+    error_fields: Annotated[
+        list[Annotated[str, StringConstraints(max_length=128)]], Field(max_length=16)
+    ] = []
+
+
 class ProviderReadback(Frozen):
     provider_id: (
         Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9:/._-]{0,511}$")] | None
@@ -256,10 +326,14 @@ class ProviderReadback(Frozen):
             "reallocation_uncertain",
             "accepted_pending",
             "observed",
+            "provider_rejected_request",
+            "request_not_sent",
         ]
         | None
     ) = None
     usage_status: Literal["unknown"] = "unknown"
+    # Why a create was refused (operator diagnostics only, never absence evidence).
+    provider_rejection: ProviderRejection | None = None
 
     @model_validator(mode="after")
     def honest_termination(self):
@@ -268,6 +342,13 @@ class ProviderReadback(Frozen):
         _parse_utc(self.observed_at)
         if self.state != "unknown" and self.provider_id is None:
             raise ValueError("non-unknown provider observations require exact provider identity")
+        if self.provider_rejection is not None and (
+            self.proxy_reason not in {"provider_rejected_request", "request_not_sent"}
+            or (self.provider_rejection.status == 0) != (self.proxy_reason == "request_not_sent")
+            or self.state != "unknown"
+            or self.provider_id is not None
+        ):
+            raise ValueError("a provider rejection is only an unknown, unbound create receipt")
         if self.termination_confirmed and (
             self.provider_id is None
             or self.state not in {"stopped", "succeeded", "failed", "deleted"}

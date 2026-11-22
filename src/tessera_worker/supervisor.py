@@ -71,6 +71,11 @@ class DriverResult:
     phase: Phase
     observation: CpuObservation
     reason: str | None = None
+    # A closed class when launching was definitely refused before any container existed;
+    # reported to control so the campaign runner can reconcile it (ADR 0046).
+    launch_error: str | None = None
+    # Bounded Docker text for that refusal; a local diagnostic only, never reported.
+    detail: str | None = None
 
 
 class CpuSupervisor:
@@ -150,8 +155,13 @@ class CpuSupervisor:
 
             try:
                 observation = self._adapter.prepare(operation)
-            except CpuError:
-                return self._uncertain(operation, "prepare_unconfirmed")
+            except CpuError as error:
+                return self._uncertain(
+                    operation,
+                    "prepare_unconfirmed",
+                    launch_error=getattr(error, "launch_error", None),
+                    detail=getattr(error, "docker_error", None) or None,
+                )
             if observation.state == "exited":
                 return self._terminal(operation, observation, "observed_exited")
             if observation.state != "created":
@@ -441,11 +451,17 @@ class CpuSupervisor:
         return DriverResult("terminal", observation, reason)
 
     def _uncertain(
-        self, operation: CpuOperation, reason: str, observation: CpuObservation | None = None
+        self,
+        operation: CpuOperation,
+        reason: str,
+        observation: CpuObservation | None = None,
+        *,
+        launch_error: str | None = None,
+        detail: str | None = None,
     ) -> DriverResult:
         observation = observation or CpuObservation("unknown")
         self._set_phase(operation.operation_id, "uncertain", reason)
-        return DriverResult("uncertain", observation, reason)
+        return DriverResult("uncertain", observation, reason, launch_error, detail)
 
     def _set_phase(self, operation_id: str, phase: str, event: str) -> None:
         if phase not in _PHASES:
@@ -524,6 +540,7 @@ class CpuSupervisor:
             "argv": list(operation.argv),
             "image": operation.image,
             "max_duration_seconds": operation.max_duration_seconds,
+            "container_user": operation.container_user,
             "memory_bytes": operation.memory_bytes,
             "operation_id": operation.operation_id,
             "plan_digest": operation.plan_digest,

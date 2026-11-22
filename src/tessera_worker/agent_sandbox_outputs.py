@@ -111,7 +111,7 @@ class SandboxPVCCollector(KubernetesOutputCollector):
 
     def verify_pod(self, pod, manifest, uid):
         super().verify_pod(pod, manifest, uid)
-        # The generic collector verifies required fields; this lane additionally
+        # The generic collector verifies required fields; this collector additionally
         # rejects unknown admission mutation, sidecars, credentials and privileges.
         from copy import deepcopy
 

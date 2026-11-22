@@ -139,6 +139,9 @@ skills and inputs and starts the harness or experiment adapter. Jobs report
 operation IDs, usage, logs, checkpoints, and output manifests.
 
 An agent may propose additional work, but cannot execute beyond its grant.
+A submitted campaign spec ([ADR 0038](docs/decisions/0038-campaign-specs-and-platform-campaign-runner.md),
+[campaigns](docs/campaigns.md)) is one bounded form of this contract: stage dependencies,
+declared outputs and a reserved campaign budget, driven by one human approval of its digest.
 When enabled, child tasks need bounded objectives, dependency/output contracts,
 review owners, deadlines, narrowed permissions, and reserved parent budget.
 Opaque fan-out is disabled unless equivalent enforcement is demonstrated and
@@ -768,7 +771,14 @@ is not a remotely exposed MCP HTTP endpoint. MCP exposes typed, permission-scope
 research operations and redacted reads, not arbitrary database, shell, or
 filesystem access. Requests may propose work, request authority, consume an
 already-human-issued grant, report attributed observations, request human review,
-and read/export only authorized notebook data. Reconnect must reuse the same
+and read/export only authorized notebook data. The tool families are: status and
+curated context reads (`tessera_status`, `tessera_list_contexts`, `tessera_read_context`);
+legacy and research proposals; authority request/status/consume; observation, review and
+notebook; generated-output register/metadata/read; experiment and program result reads;
+and, opt-in by enrolled scope, campaign submit/read/list/receipt/cancel, snapshot,
+output, log and budget reads, and `tessera_get_provider_trust`. Campaign reads cover the
+credential's whole project and none of these tools approves, stages or releases anything.
+Reconnect must reuse the same
 idempotency key and exact arguments after an uncertain response. The adapter
 transport is not itself an authorization boundary.
 
@@ -847,7 +857,15 @@ and last observation. Lost responses trigger lookup/reconciliation, not a new
 submission identity. Exactly-once external execution is not promised.
 
 Retry classes: safe repeat, provider-deduplicated, compensatable, or manual
-reconciliation. Bound attempt count, backoff/jitter, elapsed time and total cost.
+reconciliation. A campaign maps an expired, never-leased grant to safe repeat and a
+confirmed declared exit code to a bounded retry; every unknown effect needs manual
+reconciliation (ADR 0038 section 4), except an attempt whose worker reported a refused
+launch with no container, zero hold and no provider or receipt evidence, which the runner
+reconciles at zero as `not_started`, never as evidence and without a scientific retry
+([ADR 0046](docs/decisions/0046-automatic-not-started-reconciliation.md)); a host reboot or
+a lost report never qualifies. An attempt whose worker confirmed the exit with no contradicting
+observation is resolved by the runner (grant and slot released, cost never above the hold, never a pass;
+[ADR 0053](docs/decisions/0053-resolve-attempts-on-confirmed-exit.md)); with no evidence it stays unknown. Bound attempt count, backoff/jitter, elapsed time and total cost.
 An intended scientific replication is new planned work, not a transport retry.
 Never blindly repeat an uncertain physical procedure or purchase.
 
@@ -996,7 +1014,7 @@ restart as a restart.
 | Failure | Required response |
 |---|---|
 | Desktop closes or loses connection; control plane stays available | Continue eligible work; persist decisions and replay state on reconnect |
-| Control-plane host sleeps, stops, or becomes unreachable | Workers follow bounded disconnect/expiry rules; preserve unknown job state and reconcile on recovery |
+| Control-plane host sleeps, stops, or becomes unreachable | Workers follow bounded disconnect/expiry rules; preserve unknown job state and reconcile on recovery (an unreported start is never inferred to be no start) |
 | Worker loses control connection | No grant expansion; obey bounded disconnect/expiry policy |
 | Agent crashes | Supervisor survives and reconciles jobs before authorized restart |
 | Submission reply is lost | Query provider using recorded operation identity; hold unsafe replacement |
@@ -1074,7 +1092,7 @@ Metadata-only Outcome 0/1 dataset snapshot declarations may retain caller-suppli
 digests, schemas, units, missingness, split/leakage, validation and source/license/
 provenance records for review, but never establish a download, content validation,
 rights verification, protected split, or execution authority.
-See [the requirements matrix and API workflow](docs/mixfm-interactions.md).
+See [the requirements matrix and API workflow](docs/program-interactions.md).
 
 Plans may additionally declare a versioned metric protocol and data/code/environment
 manifest identities. Evaluation decisions bind caller-reported observations to that
@@ -1083,7 +1101,7 @@ with the request event. Missing evidence remains explicitly inconclusive. A go
 under such a protocol requires a passing current human-reviewed evaluation, not
 just a human acknowledgment of a failed/incomplete record. Legacy prose-only plans
 remain unevaluated. These checks grant no execution authority or scientific truth.
-The [evaluation and Salad contract](docs/mixfm-evaluation-and-salad-contract.md)
+The [evaluation and Salad contract](docs/program-evaluation-and-salad-contract.md)
 also defines opt-in target validation and neutral capability/health discovery;
 default/fake Salad operations still fail closed without credential access or
 network calls, even when configuration is provided. Separate trusted-server

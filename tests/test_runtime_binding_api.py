@@ -17,6 +17,7 @@ from test_runtime_bindings import (  # noqa: F401
 )
 
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.store import Store, _connect
 
 
@@ -145,6 +146,9 @@ def test_schema54_to55_preserves_history_rollback_repeat_and_readiness(tmp_path)
     with sqlite3.connect(database) as c:
         for table in tables:
             c.execute(f"DROP TABLE {table}")
+        # ADR 0037: v60 additions postdate this fixture's version.
+        for table in ("provider_input_tickets", "snapshot_chunks", "snapshot_chunk_uploads"):
+            c.execute(f"DROP TABLE {table}")
         c.execute("UPDATE schema_meta SET schema_version=54")
         history = {
             t: c.execute(f"SELECT * FROM {t}").fetchall()
@@ -159,8 +163,8 @@ def test_schema54_to55_preserves_history_rollback_repeat_and_readiness(tmp_path)
         assert not c.execute(
             "SELECT 1 FROM sqlite_master WHERE name='runtime_native_claims'"
         ).fetchone()
-    assert migrate_state(state) == 56
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(database) as c:
         assert all(
             c.execute(f"SELECT * FROM {t}").fetchall() == rows for t, rows in history.items()

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
+from .artifact_limits import operator_limits
 from .artifact_manifests import ArtifactManifestStore
+from .large_artifacts import candidate_by_id, reclaim_artifact_bytes
+from .snapshot_chunks import check_chunk_metadata
 from .store import Conflict, Forbidden, NotFound, StoreError, _connect, utc_now
 
 ManifestDigest = Annotated[
@@ -105,6 +109,18 @@ class ArtifactDispositionStore(ArtifactManifestStore):
             if body["expected_revision"] != current_revision:
                 raise Conflict("Artifact disposition revision is no longer current.")
             revision = current_revision + 1
+            if body["disposition"] == "retain_quarantined":
+                for large in self._large_artifacts(connection, manifest_id):
+                    try:
+                        check_chunk_metadata(
+                            connection,
+                            large["id"],
+                            [{"relative_path": large["relative_path"], "size": large["size"]}],
+                        )
+                    except Conflict:
+                        raise Conflict(
+                            "A large artifact's bytes were reclaimed after rejection."
+                        ) from None
             row = {
                 "id": f"artifact_disposition_{manifest_id}_{revision}",
                 "manifest_id": manifest_id,
@@ -143,7 +159,63 @@ class ArtifactDispositionStore(ArtifactManifestStore):
                 raise Forbidden("Human artifact disposition is required.")
             self._manifest_for_actor(connection, live, manifest_id)
 
-        return self._mutate(actor, key, "POST", path, digest, command, replay_guard=replay_guard)
+        status, response = self._mutate(
+            actor, key, "POST", path, digest, command, replay_guard=replay_guard
+        )
+        if response.get("disposition") == "reject":
+            self._reclaim_large(actor, manifest_id)
+        return status, response
+
+    @staticmethod
+    def _large_artifacts(connection: sqlite3.Connection, manifest_id: str) -> list[dict[str, Any]]:
+        """Manifest members whose bytes are chunk rows (empty ``content``, non-zero size)."""
+        listed = connection.execute(
+            "SELECT artifacts_json FROM artifact_manifests WHERE id=?", (manifest_id,)
+        ).fetchone()
+        found: list[dict[str, Any]] = []
+        for entry in json.loads(listed["artifacts_json"]) if listed is not None else []:
+            row = connection.execute(
+                "SELECT id, relative_path, size FROM artifacts WHERE id=? "
+                "AND length(content)=0 AND size>0",
+                (entry["id"],),
+            ).fetchone()
+            if row is not None:
+                found.append(dict(row))
+        return found
+
+    def _reclaim_large(self, actor: dict[str, Any], manifest_id: str) -> None:
+        """Free the chunk bytes of a rejected manifest's large artifacts, in short batches.
+
+        Rejection is the human decision that the outputs are discarded; their bytes would
+        otherwise count against the project's chunk cap. The quarantine rows, the manifest and
+        the disposition history stay, each reclaim is recorded as an event, and a later
+        ``retain_quarantined`` is refused. A crash before this runs is finished by the
+        reclamation sweep (``LargeArtifactStore.reclaim_orphans``).
+        """
+        orphan_seconds = operator_limits().orphan_artifact_seconds
+        connection = _connect(self.database_path)
+        try:
+            connection.row_factory = sqlite3.Row
+            live = self._live_principal(connection, actor)
+            artifacts = [
+                found
+                for large in self._large_artifacts(connection, manifest_id)
+                if (found := candidate_by_id(connection, large["id"])) is not None
+            ]
+        finally:
+            connection.close()
+        for artifact in artifacts:
+            try:
+                reclaim_artifact_bytes(
+                    self,
+                    live,
+                    artifact,
+                    "rejected",
+                    trigger="reject",
+                    orphan_seconds=orphan_seconds,
+                )
+            except Forbidden:
+                return  # control went on hold after the decision; the sweep finishes it later
 
     def list_dispositions(
         self, actor: dict[str, Any], manifest_id: str, offset: int, limit: int

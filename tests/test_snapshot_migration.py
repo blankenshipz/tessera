@@ -56,6 +56,9 @@ def _v4_state(tmp_path: Path) -> tuple[Path, dict[str, object], dict[str, object
         from schema_fixtures import drop_empty_experiment_schema
 
         drop_empty_experiment_schema(connection)
+        from migration_fixture_helpers import drop_empty_chunk_schema
+
+        drop_empty_chunk_schema(connection)
         from migration_fixture_helpers import strip_empty_runtime_v55
 
         strip_empty_runtime_v55(connection)

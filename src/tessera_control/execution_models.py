@@ -111,6 +111,16 @@ class PrepareExecutionPackage(ExecutionRequest):
     persistent_output_storage: dict[str, Any] | None = None
 
 
+# A closed set so a worker's launch failure is a class, never free text or a host detail.
+LAUNCH_ERROR_CLASSES = (
+    "network_address_pool_exhausted",
+    "network_create_failed",
+    "image_unavailable",
+    "container_create_failed",
+    "launch_failed",
+)
+
+
 class ReportExecutionObservation(ExecutionRequest):
     lease_id: Identifier
     expected_epoch: Revision
@@ -119,6 +129,9 @@ class ReportExecutionObservation(ExecutionRequest):
     observed_at: datetime
     provider_id: Identifier | None = None
     termination_confirmed: bool = False
+    # The worker's own report that launching failed before any container existed
+    # (ADR 0046). Only an unknown observation with no provider identity can carry it.
+    launch_error: Literal[LAUNCH_ERROR_CLASSES] | None = None  # type: ignore[valid-type]
 
     @field_validator("observed_at", mode="before")
     @classmethod
@@ -139,6 +152,19 @@ class ReportExecutionObservation(ExecutionRequest):
     def confirmation_requires_exit(cls, value: bool, info) -> bool:
         if value and info.data.get("observed_state") != "exited":
             raise ValueError("termination confirmation requires an exited observation")
+        return value
+
+    @field_validator("launch_error")
+    @classmethod
+    def launch_error_means_nothing_started(cls, value: str | None, info) -> str | None:
+        if value is not None and (
+            info.data.get("observed_state") != "unknown"
+            or info.data.get("provider_id") is not None
+            or info.data.get("termination_confirmed")
+        ):
+            raise ValueError(
+                "a launch error requires an unknown observation with no provider identity"
+            )
         return value
 
 

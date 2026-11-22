@@ -1,0 +1,367 @@
+"""Compute provider plugins for campaign stages (ADR 0040).
+
+The runner core calls only this protocol. A provider never writes state outside the
+runner connection under the runner lease, and every external effect goes through a
+delegated step (``campaign_delegation.STEP_TABLE``) that the provider declares.
+This module imports no vendor module at import time.
+"""
+
+from __future__ import annotations
+
+import importlib
+import importlib.metadata
+import re
+import sqlite3
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from pydantic import BaseModel
+
+# Built-in kinds; a plugin may declare another lowercase slug (``route_*`` kinds name an
+# ``execution_targets`` target, ``worker_grant`` runs through a worker grant).
+ProviderKind = str
+KNOWN_KINDS = ("worker_grant", "salad_route")
+PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+MAX_OUTPUT_BYTES_LIMIT = 1 << 40
+TrustClass = Literal["public", "private_code_approved", "private_derived"]
+TRUST_CLASSES: tuple[TrustClass, ...] = ("public", "private_code_approved", "private_derived")
+SettlementBasis = Literal[
+    "local_zero",
+    "unclaimed_zero",
+    "human_charge",
+    "human_reconcile",
+    "guardian_bounded_hold",
+    "provider_billed",
+    "provider_absent_zero",
+]
+Outcome = Literal["running", "succeeded", "failed_transient", "failed_permanent", "unknown"]
+PrepareResult = Literal["ready", "progress", "waiting"]
+
+
+@dataclass(frozen=True)
+class OutputLimits:
+    max_files: int
+    max_total_bytes: int
+    max_file_bytes: int
+
+
+@dataclass(frozen=True)
+class ProviderDescriptor:
+    provider_id: str
+    kind: ProviderKind
+    runtimes: frozenset[str]
+    # execution_targets name for route-based providers; None for worker grants.
+    target: str | None
+    billable: bool
+    third_party: bool
+    delegable_steps: frozenset[str]
+    output_limits: OutputLimits
+    worker_principal_id: str
+    # Grants a worker principal may hold at once (ADR 0048); the operator sets it to the
+    # number of pollers sharing the principal. Only worker-grant providers read it.
+    worker_slots: int = 1
+    # The largest scratch a stage may request from this provider's worker (ADR 0059): the
+    # operator states what its worker's own ceiling grants, 64 MiB unless raised.
+    max_scratch_bytes: int = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class GrantRequest:
+    worker_principal_id: str
+    ttl_seconds: int
+    # Upper bound on grant expiry beyond release/ttl (e.g. approval expiry); None = none.
+    expires_not_after: str | None = None
+
+
+@dataclass(frozen=True)
+class Observation:
+    outcome: Outcome
+    failure_class: str | None = None
+    detail: str = ""
+    evidence_kind: Literal["run_receipt", "salad_live_receipt"] | None = None
+    evidence_digest: str | None = None
+    manifest_id: str | None = None
+    exit_code: int | None = None
+
+
+@dataclass(frozen=True)
+class Settlement:
+    cents: int
+    basis: SettlementBasis
+    final: bool
+    estimate_cents: int | None = None
+
+
+class Waiting(Exception):  # noqa: N818 - a control-flow signal, like the runner's _Waiting
+    """The provider cannot progress or settle yet; the runner retries next tick."""
+
+
+class RunnerServices(Protocol):
+    """The narrow runner facade a provider may use (implemented by CampaignRunner)."""
+
+    # Per-runner scratch space keyed by provider id; it dies with the runner.
+    provider_state: dict[str, Any]
+
+    def now(self) -> Any: ...
+    def connection(self) -> Any: ...  # context manager: runner_connection under the lease
+    def step(
+        self,
+        ctx: Any,
+        key: str,
+        attempt: int,
+        step: str,
+        ordinal: int,
+        build: Callable[[], tuple[dict[str, str], dict[str, Any]]],
+    ) -> Any: ...
+    def rows(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]: ...
+    def one(self, sql: str, params: tuple = ()) -> dict[str, Any] | None: ...
+    def set_stage(self, ctx: Any, key: str, **fields: Any) -> None: ...
+    def set_attempt(self, attempt_id: str, **fields: Any) -> None: ...
+    def emit_once(self, ctx: Any, event_type: str, match: dict, payload: dict) -> None: ...
+    def awaiting_human(self, ctx: Any, key: str, record: str, reason: str) -> None: ...
+
+
+@runtime_checkable
+class ComputeProvider(Protocol):
+    descriptor: ProviderDescriptor
+    config_model: type[BaseModel] | None  # validates StageV2.provider_config
+
+    # submit/approve
+    def validate_stage(self, stage: Any) -> None: ...  # pure; raise ValueError
+    def check_stage(
+        self, connection: sqlite3.Connection, project_id: str, stage: Any
+    ) -> None: ...  # DB-aware; raise Conflict
+    def execution_spec(self, stage: Any, input_digest: str) -> dict[str, Any]: ...
+
+    # submit
+    def prepare(self, rt: RunnerServices, ctx: Any, key: str) -> PrepareResult: ...
+    def grant_request(self, rt: RunnerServices, ctx: Any, stage: Any) -> GrantRequest: ...
+    def after_admit(self, rt: RunnerServices, ctx: Any, attempt: Mapping[str, Any]) -> None: ...
+
+    # poll: drive provider steps for an admitted attempt, then report
+    def advance(
+        self, rt: RunnerServices, ctx: Any, stage_row: Mapping, attempt: Mapping
+    ) -> bool: ...
+    def observe(self, rt: RunnerServices, attempt: Mapping[str, Any]) -> Observation: ...
+
+    # cancel (reduce-only); True once the attempt's authority is reconciled
+    def cancel(self, rt: RunnerServices, ctx: Any, key: str, attempt: Mapping) -> bool: ...
+
+    # cost/settle
+    def settle(self, rt: RunnerServices, attempt: Mapping[str, Any]) -> Settlement: ...
+    def exposure_open(self, connection: sqlite3.Connection, campaign_id: str) -> bool: ...
+    def after_tick(self, rt: RunnerServices, ctx: Any) -> None: ...
+
+    # receipts
+    def receipt_fields(
+        self, connection: sqlite3.Connection, attempt: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class ProviderHooks(Protocol):
+    """Optional runner hooks. A provider implements any it needs; the runner skips the rest.
+
+    ``sweep(rt)``: tick-level upkeep. ``on_settled(connection, attempt_id, cents, stamp)``:
+    bookkeeping that commits in the settlement transaction. ``experiment_ready(rt, ctx,
+    stage, spec_stage)``: scaffolding before a hold (False after it ran a step)."""
+
+    def sweep(self, rt: RunnerServices) -> None: ...
+    def on_settled(
+        self, connection: sqlite3.Connection, attempt_id: str, cents: int, stamp: str
+    ) -> None: ...
+    def experiment_ready(
+        self, rt: RunnerServices, ctx: Any, stage: Any, spec_stage: Any
+    ) -> bool: ...
+
+
+class DefaultHooks:
+    """Mixin with no-op optional hooks, for plugins that want none of them."""
+
+    def sweep(self, rt: RunnerServices) -> None:
+        return None
+
+    def on_settled(
+        self, connection: sqlite3.Connection, attempt_id: str, cents: int, stamp: str
+    ) -> None:
+        return None
+
+    def experiment_ready(self, rt: RunnerServices, ctx: Any, stage: Any, spec_stage: Any) -> bool:
+        return True
+
+
+_PROVIDERS: dict[str, ComputeProvider] = {}
+# Modules whose import registers the built-in providers.
+BUILTIN_MODULES = (
+    "tessera_control.campaign_provider_worker",
+    "tessera_control.campaign_provider_salad",
+)
+
+
+def validate_descriptor(d: Any) -> None:
+    """Refuse a malformed provider descriptor at registration (ValueError)."""
+    if not isinstance(d, ProviderDescriptor):
+        raise ValueError("provider descriptor required")
+    pid = d.provider_id
+    if not isinstance(pid, str) or not PROVIDER_ID_RE.match(pid):
+        raise ValueError(f"Provider id {pid!r} must match {PROVIDER_ID_RE.pattern}")
+    bad = f"Provider {pid}: invalid descriptor"
+    if not isinstance(d.kind, str) or not KIND_RE.match(d.kind):
+        raise ValueError(f"{bad} (kind)")
+    if (
+        not isinstance(d.runtimes, frozenset)
+        or not d.runtimes
+        or not all(isinstance(r, str) and r for r in d.runtimes)
+    ):
+        raise ValueError(f"{bad} (runtimes)")
+    if not isinstance(d.delegable_steps, frozenset) or not all(
+        isinstance(step, str) for step in d.delegable_steps
+    ):
+        raise ValueError(f"{bad} (delegable_steps)")
+    # A worker grant has no route target; every other kind names its execution target.
+    if (d.kind == "worker_grant") != (d.target is None) or (
+        d.target is not None and not (isinstance(d.target, str) and d.target)
+    ):
+        raise ValueError(f"{bad} (kind {d.kind!r} and target {d.target!r} do not match)")
+    if not isinstance(d.billable, bool) or not isinstance(d.third_party, bool):
+        raise ValueError(f"{bad} (billable and third_party must be booleans)")
+    if d.billable and not d.third_party:
+        raise ValueError(f"{bad} (a billable provider must declare third_party)")
+    limits = d.output_limits
+    if not isinstance(limits, OutputLimits):
+        raise ValueError(f"{bad} (output limits)")
+    for name in ("max_files", "max_total_bytes", "max_file_bytes"):
+        value = getattr(limits, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 < value <= (MAX_OUTPUT_BYTES_LIMIT)
+        ):
+            raise ValueError(f"{bad} (output limit {name} must be a positive integer)")
+    if limits.max_file_bytes > limits.max_total_bytes:
+        raise ValueError(f"{bad} (max_file_bytes exceeds max_total_bytes)")
+    if not isinstance(d.worker_principal_id, str):
+        raise ValueError(f"{bad} (worker principal)")
+
+
+def register_provider(provider: ComputeProvider) -> ComputeProvider:
+    d = getattr(provider, "descriptor", None)
+    validate_descriptor(d)
+    if d.provider_id in _PROVIDERS:
+        raise ValueError(f"Provider already registered: {d.provider_id}")
+    from .campaign_delegation import STEP_TABLE
+
+    unknown = d.delegable_steps - frozenset(STEP_TABLE)
+    if unknown:
+        raise ValueError(f"Provider {d.provider_id} declares unknown steps: {sorted(unknown)}")
+    _PROVIDERS[d.provider_id] = provider
+    return provider
+
+
+def unregister_provider(provider_id: str) -> None:
+    """Tests only."""
+    _PROVIDERS.pop(provider_id, None)
+
+
+def get_provider(provider_id: str) -> ComputeProvider:
+    try:
+        return _PROVIDERS[provider_id]
+    except (KeyError, TypeError):
+        raise KeyError(f"Unknown compute provider: {provider_id!r}") from None
+
+
+def provider_ids() -> tuple[str, ...]:
+    return tuple(_PROVIDERS)
+
+
+def load_builtin_providers(configure: Callable[[str], None] | None = None) -> None:
+    """Import built-in provider modules; each registers from the operator file it is given."""
+    for name in BUILTIN_MODULES:
+        module = importlib.import_module(name)
+        if configure is not None:
+            configure(module.__name__)
+
+
+ENTRY_POINT_GROUP = "tessera.campaign_providers"
+PLUGIN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
+_PLUGIN_MODULES: dict[str, str] = {}
+
+
+def _plugin_module(name: str) -> Any:
+    """Resolve an operator-named plugin: an installed entry point first, else a dotted module.
+
+    Nothing is loaded unless the operator file names it, so installing a package never
+    enables a vendor by itself."""
+    if not PLUGIN_NAME_RE.match(name):
+        raise ValueError(f"Invalid provider plugin name {name!r}")
+    for entry in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
+        if entry.name == name:
+            return entry.load()
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as error:
+        if error.name == name.split(".")[0] or error.name == name:
+            raise ValueError(f"Provider plugin {name!r} is not installed") from None
+        raise
+
+
+def load_plugin(name: str, section: Any) -> None:
+    """Load one plugin and let it register from its own config section.
+
+    The plugin exposes ``register_from_config(section)`` (module attribute or the loaded
+    entry-point object) and registers providers through ``register_provider``. It may not
+    replace a provider another module registered."""
+    target = _plugin_module(name)
+    register = getattr(target, "register_from_config", None)
+    if register is None and callable(target):
+        register = target
+    if register is None:
+        raise ValueError(f"Provider plugin {name!r} has no register_from_config")
+    before = set(_PROVIDERS)
+    try:
+        register(section)
+    except BaseException:
+        # A failed plugin leaves nothing half-registered behind.
+        for provider_id in set(_PROVIDERS) - before:
+            _PROVIDERS.pop(provider_id, None)
+        raise
+    added = set(_PROVIDERS) - before
+    for provider_id in added:
+        _PLUGIN_MODULES[provider_id] = name
+    if not added and not any(v == name for v in _PLUGIN_MODULES.values()):
+        raise ValueError(f"Provider plugin {name!r} registered no provider")
+
+
+def plugin_of(provider_id: str) -> str | None:
+    """The plugin name that registered the provider, or None for a built-in."""
+    return _PLUGIN_MODULES.get(provider_id)
+
+
+PROVIDERS_FILE_SCHEMA = "tessera.campaign-providers.v1"
+MAX_PROVIDERS_FILE_BYTES = 262144
+
+
+def load_providers_file(path: Any) -> dict[str, Any]:
+    """Read an owner-only (0600, single-link, no symlink) ``--campaign-providers`` file."""
+    from .salad_live_check import _private_bytes
+    from .salad_workload_jwt import strict_json
+
+    try:
+        document = strict_json(_private_bytes(path, MAX_PROVIDERS_FILE_BYTES))
+    except (OSError, ValueError):
+        document = None
+    if not isinstance(document, dict) or document.get("schema") != PROVIDERS_FILE_SCHEMA:
+        raise ValueError(
+            "Campaign providers must be an owner-only (0600) absolute JSON file holding "
+            f"a {PROVIDERS_FILE_SCHEMA} document."
+        )
+    return document
+
+
+def configure_providers(config: dict[str, Any] | None) -> None:
+    """Load the built-in provider modules and register each from the operator document."""
+    load_builtin_providers(lambda name: importlib.import_module(name).register_from_config(config))
+    for name, section in sorted(((config or {}).get("plugins") or {}).items()):
+        load_plugin(name, section)

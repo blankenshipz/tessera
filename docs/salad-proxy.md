@@ -8,6 +8,9 @@ See [decision 0031](decisions/0031-salad-single-container-gpu.md) and the preser
 [original boundary](decisions/0024-salad-server-proxy-boundary.md). Salad is not a
 provider-isolation witness or trusted autonomous sandbox.
 
+Runtime spend controls, the off-host stop switch and cost reconciliation are
+recorded in [Salad runtime spend safety](salad-spend-safety.md).
+
 ## Deployment topology and trust
 
 ```text
@@ -102,7 +105,7 @@ Before create/start, the server rechecks:
 1. Live authenticated tenant/project/worker, task/plan, human execution grant,
    program/source-use reviews and exact human route approval. Agent requests cannot
    grant authority; held recovery cannot mutate. Source data release and scientific
-   MixFM review remain separate existing controls.
+   program review remain separate existing controls.
 2. Exact server target allowlist including Salad org/project, country, CPU/memory/GPU,
    disk/runtime bounds, one replica and immutable image/manifests. Group must be
    `attempt-<operation_id>` and globally reserved in the route ledger.
@@ -153,7 +156,14 @@ Lost-create reconciliation still needs live conformance before acceptance.
 
 Stop/delete 202 is `pending`, never confirmed termination. Outage, timeout,
 redirect, identity mismatch, malformed/oversized response or echoed marker returns
-unknown with a closed reason code; raw exception text is discarded. Changed
+unknown with a closed reason code; raw exception text is discarded. A create
+answered with a clean ProblemDetails 400/422 is still unknown, with reason
+`provider_rejected_request` and a bounded non-secret summary; the guardian then
+releases the reservation early only on its own absence reads (see
+salad-spend-safety.md, "Create rejected"). The resource shape is checked against
+Salad's documented create limits at proposal, approval and create, and before the
+POST. Reads have a 2 s total client deadline; the create POST has 12 s (DNS,
+connect, TLS, send and response). Changed
 allocation marks uncertainty and blocks continuation. A later exact synthetic
 readback can confirm a fake stop but cannot establish live no-continued-writes.
 Quota/credit loss does not revoke narrowly scoped stop-only authority. Deleted
@@ -168,6 +178,183 @@ custody release and scientific acceptance use existing APIs, not provider claims
 The GPU recipe uploads bounded canonical bytes to authenticated external quarantine
 custody; independent deployment, actual byte retention and stop conformance are
 still prerequisites, not facts established by a signed receipt or local tests.
+
+## Generic workload contract (workload_v1)
+
+ADR 0036 phase 1 adds a third `execution.argv_binding`, `workload_v1`, beside
+`exact` and `smoke_operation_v1` (both unchanged). It carries a reviewed
+`workload` object (`tessera.salad.workload.v1`, strict, extra fields refused);
+that object is required for `workload_v1` and forbidden for the other bindings.
+It is reviewed profile data, never an execution grant.
+
+- **Command and argv.** The command stays the fixed `/tessera/bin/run`.
+  `argv_template` (1-32 printable tokens of 1-256 characters) holds literals or
+  exactly one of `{operation}`, `{epoch}`, `{custody_host}` per token. Nothing
+  else is substituted and a token containing braces that is not exactly a
+  placeholder is refused. The approved spec argv must equal
+  `[command, *argv_template]`; `execution.argv` must equal the derived argv on
+  every use.
+- **Environment.** `env` replaces the PYTHONUNBUFFERED/OMP_NUM_THREADS allowlist
+  for these profiles only and must equal `execution.env`. Keys match
+  `^[A-Z][A-Z0-9_]{0,63}$`, at most 32 entries, values are 0-512 printable
+  characters, and keys containing TOKEN, SECRET, PASSWORD or CREDENTIAL, or
+  ending in `_KEY`, are refused. Secrets never belong here.
+- **Runtime.** `workload_seconds` (1-3600) is the workload's own runtime. The
+  guardian's billed running window for the reservation is
+  `workload_seconds + 120` (upload grace), never longer than the route window.
+  The route window itself may now be up to 7200 s (45 min unbilled provisioning,
+  up to 60 min billed, grace); the live driver polls at most 10 s apart.
+- **Outputs.** `outputs` declares 1-16 unique files (`name`, `max_bytes` up to
+  64 MiB each). Custody holds at most 16 MiB in total per operation (the same
+  bound as `execution.max_output_bytes` and the plan's `max_output_bytes`); setup
+  and reserve refuse a larger total with `outputs_unsupported`. The approved
+  spec's `output_paths` must equal the declared names in contract order. See
+  "Declared multi-file output custody" below.
+- **Egress.** `egress.kind` is `provider_broad` with the list of `fetches`
+  (https URL, sha256, `max_bytes`) the workload will download and must verify.
+  Salad has provider-wide egress: the declaration is recorded and reviewed, not
+  enforced, and such a route never claims network-none (the base plan's
+  `network_enabled=false` is a plan-schema constant, not an isolation claim).
+  Optional `egress.redirect_hosts` (at most 16 sorted, unique, exact lowercase DNS
+  names; no wildcard, port, or all-digit or `0x` label; only with `runtime: gpu_runtime_v1`, which binds
+  and enforces it) lists the only hosts a fetch may be redirected to, for pinned
+  URLs that answer with a redirect to an expiring signed CDN URL.
+  Empty (the default) follows no redirect and is not serialized, so existing
+  contract and proposal digests are unchanged. The per-fetch sha256 and
+  `max_bytes` still bind the bytes; see workloads/gpu_runtime_v1/README.md.
+- **Capability declaration.** For `workload_v1` the approved capability's
+  `network` list must equal the sorted distinct (host, port) destinations of the
+  fetches (port 443 unless the URL names one) plus every redirect host on port
+  443; `actions` and `credential_refs` stay empty. Smoke and exact profiles still
+  require an empty `network`.
+- **Custody host.** `custody_host` is the exact reviewed lowercase hostname and
+  must equal the safety service's destination.
+- **Custody host binding is declarative.** Salad has provider-wide egress, so the
+  workload could reach another host: a literal argv token or env value may name
+  one. `custody_host` is the reviewed destination the safety service checks and
+  the one custody accepts, not a network restriction.
+- **Route window versus plan.** The plan's `max_duration_seconds` stays within
+  the shared 3600 s limit; Salad routes may exceed it by a fixed 3600 s unbilled
+  provisioning allowance (`route_window_limit`), up to 7200 s.
+- **Safety service.** `_request_for(proposal)` dispatches: smoke profiles keep
+  parsing their argv; `workload_v1` derives the same request dictionary
+  (operation, epoch, destination, watchdog, `max_seconds`, output caps) from the
+  profile and the admitted operation/epoch. Reserve, begin-once/output checks and
+  the billed running window all use it.
+- **Setup.** `scripts/salad_live_setup.py --workload-contract PATH` (a private
+  0600 JSON file holding one contract; `custody_host` must equal
+  `--custody-dns`; `--workload-seconds` is forbidden) builds a `workload_v1`
+  route and derives the capability network list from the fetches. Without it the
+  smoke route is unchanged. A contract that declares an input also needs
+  `--input-dir DIR --data-class public --license ID --source URL_OR_REF`: Salad is
+  third-party compute and admits only a staged snapshot recorded public with evidence
+  ([ADR 0039](decisions/0039-data-class-guard.md)). Setup never defaults to public.
+  Admission prefers a public staging of the same bytes in the project; bytes the org
+  already holds as derived or pre-v62 (migrated) data cannot be declared public.
+  `--approve-private-code PATH` (repeatable) approves exact code or config files of the
+  input for this remote run (ADR 0039 amendment 1): they stay private and unlicensed,
+  every other file still needs the public declaration, and with approved code the
+  manifest's input entry must be one of them. The summary lists each approved path,
+  its sha256 and the recorded decision class.
+
+
+## Declared multi-file output custody (ADR 0036 phase 3)
+
+Reserve registers a `workload_v1` operation's inventory with every declared output
+name and per-file cap (the fixed smoke keeps its single undeclared output). All
+workload calls below go through the same checks as begin-once: Salad IMDS JWT for
+the bound machine, exact binding, fresh guardian loop, armed guardian, live
+heartbeat and the stop deadline; they also require begin-once to have been
+granted and refuse fenced or unknown-rate reservations.
+
+- `POST /v1/workload/outputs` `{binding}` returns `tessera.output-plan.v1`
+  with `chunk_bytes` (1 MiB) and the declared `outputs` (`name`, `max_bytes`).
+- `POST /v1/workload/output-chunk` `{binding, name, sha256, bytes, seq,
+  chunk_sha256, content_base64}` stores one chunk. Its body may be up to about
+  1.34 MiB; every other path keeps the 128 KiB cap, checked before the body is
+  read (see "Request time budget" below). The first chunk of a name reserves its declared `bytes` and whole-file
+  `sha256`; later chunks must repeat them exactly. A chunk must be exactly the
+  declared slice (`seq * 1 MiB` onward, the last one short, an empty file is one
+  empty chunk) with a matching `chunk_sha256`. Chunks may arrive in any order;
+  an identical duplicate is a no-op and a different one at the same `seq` is
+  refused. Undeclared names, a size above the file's cap and a total above the
+  inventory cap are refused before any byte is stored. When a file's last chunk
+  lands, custody re-hashes the stored parts in order; a mismatch discards that
+  file's parts (the declaration stays fixed, so a wrong declaration can never
+  complete). Every chunk call, refused ones included, counts against a budget of
+  twice the planned chunks plus 16.
+- Only when every declared output is complete does the guardian record the stop
+  intent (`output_retained`), set the output flag and then close writers, in that
+  order; each step is idempotent, so a retried chunk repairs an interrupted
+  completion. After completion an exact replay of a stored chunk (a lost final
+  response) is acknowledged read-only until the group is confirmed stopped;
+  anything else is refused. Loop freshness for workload calls is judged when the
+  listener accepted the connection, so a slow chunk body is not refused for it.
+- The chunked endpoints also charge a per-operation request budget (twice the
+  planned chunks plus 32) after the token is verified against the bound group
+  and machine and the binding matches, but before the Salad read; an
+  unauthenticated caller cannot spend it. A partial upload never extends the heartbeat,
+  stop deadline or running window; at the deadline the guardian stops and
+  closes writers as before, and uploads after completion, after the deadline
+  or after sealing are refused.
+- The original `POST /v1/workload/output` (one canonical JSON `output.json`)
+  stays for the fixed smoke and for a contract whose only output is
+  `output.json` of at most 64 KiB; it is refused for other declarations.
+
+**Request time budget.** The listener is single-threaded, so each request gets
+one wall-clock budget from accept (TLS handshake, request line, headers, body,
+work, reply), enforced by the whole-request alarm plus a per-body deadline:
+
+| Phase | Small paths (128 KiB cap) | `output-chunk` (1,402,197 B cap) |
+| --- | --- | --- |
+| Handshake, request line, headers | 3 s from accept | 3 s from accept |
+| Body = `length / 187,500 B/s + 1 s` (floor 1.5 Mbit/s) | 1.70 s | 8.48 s |
+| Reserve: auth, provider read (2 s), custody write, reply (2 s) | 5 s | 5 s |
+| Request alarm | 10 s (3 + 1.70 + 5 = 9.7) | 20 s (3 + 8.48 + 5 = 16.5) |
+
+The floor rate is the sustained upload a 1.34 MiB chunk needs to fit; a slower
+sender is cut off and retries. Before any body byte is read, the request must
+pass a cheap pre-auth check from its headers: the admin token for `/v1/admin`,
+or for workload paths a Bearer token that parses as a Salad ES256 JWT, is
+unexpired and verifies against the cached JWKS (no network call; the tenant,
+group and machine scope check still runs after the body). Only a request that
+passes it has its alarm extended past the 3 s header phase, so an unauthenticated
+client, including one that reconnects and trickles header bytes, holds the
+guardian thread for at most 3 s per connection; the loop runs between requests.
+An authenticated chunk upload may hold it up to 20 s. `UNSEEN_RUN_GAP_SECONDS`
+(the billed time a run may hide between two guardian polls, used to backdate
+accrual and in admission budgeting) is 45 s: between two loop passes the guardian
+may handle one unix admin frame (2 s read plus the 10 s admin budget) and one
+authenticated chunk request (20 s), plus a worst-case 12 s loop pass (two 4.5 s
+provider-read retry windows, one first-attempt read at the 2 s transport deadline and
+1 s of local work), i.e. 44 s; module asserts keep these consistent. The reply resets the
+socket timeout to 2 s.
+
+`status.retained_outputs` is read-only progress for declared outputs (exact
+`binding`, sorted `declared` names, completed `files` with `sha256`/`bytes`,
+`complete`, `quarantine`); it is `null` for the smoke. `import` after confirmed
+stop seals custody as before. For the smoke, or a single `output.json` retained
+through the original endpoint, it returns `{manifest, output}` unchanged.
+Otherwise it returns `{manifest, chunk_bytes}` and control pulls each file with
+the admin action `import_chunk` `{name, seq}` (also only after confirmed stop).
+`SaladSafetyClient.import_retained` returns `{manifest, output}` (no `files`) for
+the two original-shape cases above, `{manifest, files, output}` for a single
+`output.json` uploaded in chunks (`files` is the verified `{name, sha256, bytes}`
+list; `output` is parsed strictly, rejecting NaN, Infinity and duplicate keys),
+and `{manifest, files}` for every other declaration. It verifies the signed manifest, writers closed,
+quarantine, completeness, the exact binding, the exact declared name set and the
+per-file and total caps, then recomputes every chunk's and every file's sha256
+from the streamed bytes; with `destination` (an existing 0700 directory) it
+publishes each verified file with a no-replace hard link and never overwrites;
+a retry after a partial import accepts already published files whose digest
+matches and refetches the rest. The live check does
+the same through the pinned HTTPS admin channel and its receipt carries
+`outputs: [{name, sha256, bytes}]` (a smoke receipt keeps `output_sha256`).
+
+The guardian's private custody database gains a `parts` table and additive
+columns (`inventories.outputs`, `inventories.chunk_calls`, `files.chunked`) on
+open; the control database schema is unchanged. Guardian memory stays bounded by
+one request body and one chunk at a time; its disk by the declared caps.
 
 ## Local validation (no network, opt-in file read)
 
@@ -228,10 +415,19 @@ bounded live evidence still must satisfy every requirement.
    exact peer identity and HTTPS workload destination. Review the native Salad IMDS
    JWT verification and exact operation/group/machine/image bindings. Guardian must
    survive control/proxy disconnect/death; sharing a thread is not independence.
-5. Approve the exact public-data task, package, route, account/project/image/GPU,
+5. For routes that carry approved private code (or other non-public classes), enroll
+   one stable executor before setup and list its principal in the provider trust file;
+   pass `--executor-dir` to every setup. See
+   [provider trust: stable executor](provider-trust.md#stable-executor-route-setups-that-mint-principals).
+6. Approve the exact public-data task, package, route, account/project/image/GPU,
    capability declaration and exposure ceiling through existing human authority.
    Review startup/runtime/output limits and orphan/unknown usage policy. Account
    credit is not a hard cap; unknown usage must block new work, not exact stop.
+7. Authorize the experiment budget (`POST /experiments/{id}/budget/authorization`)
+   **before** admitting the GPU attempt: Salad create/start requires the reservation
+   written at admission. Declare every bound as a known amount (`0`, not `null`);
+   an unknown bound blocks admission permanently. Earlier attempts are allowed only
+   when all are terminal and prior settled/pending costs are declared.
 
 ### Everyday operation and return
 
@@ -256,9 +452,110 @@ The workload's operation-wide begin-once claim survives startup failure/realloca
 there is no automatic GPU retry, new epoch reset, resumption or replacement group.
 Guardian must stop uncertain allocations and retain unresolved resource/cost exposure.
 After normal confirmed stop, keep quarantine and audit records according to approved
-retention; deletion of the stopped group is separately scoped cleanup, not this
-milestone's automatic fallback. Never tear down the independent service merely
-because the live-check process exits.
+retention. Deleting the stopped group is the separate, audited cleanup below, never
+an automatic fallback. Never tear down the independent service merely because the
+live-check process exits.
+
+### Cleanup of stopped groups
+
+Stopped groups still count against the project's group quota, so Tessera can delete
+the ones it created. `tessera_control.salad_group_cleanup` works **only from
+Tessera's own route records**. It never lists the provider's groups and never reads
+or deletes a group the records cannot prove Tessera created, so other groups in the
+project are untouched by construction.
+
+A route is eligible only if all of these hold; each failure is a distinct reported
+skip reason: the route targets the Salad container group; it is `stopped` with
+confirmed termination and `desired == stop`; it was not reallocated; it has a bound
+provider id **and** the recorded group name is exactly `attempt-<operation id>`
+(a group whose creation response was lost has no bound id and is never deleted);
+no delete was ever attempted and no effect is unresolved; and the stop was recorded
+at least `min_age_seconds` ago (default 3600).
+
+For each eligible route, one at a time in deterministic order (bounded by
+`max_groups`), `apply` does exactly this:
+
+1. Read that group by its bound id (read-only, through a provider port). The id,
+   `stopped` state, no pending change and zero instances must all match, otherwise
+   the route is skipped and audited; an identity mismatch or provider error stops the
+   whole run. Any future port must pin the group itself: the HTTP transport deletes by
+   name after an id-verified GET, and a port that fills the observation name from the
+   route's selection proves nothing by that name, so the port's own identity check is
+   what counts.
+2. Commit the one-shot `delete` effect on the route (`begin`). `begin` is the durable
+   intent commit. It is called with the route revision the candidate was read at and
+   fails, in the same transaction, if the route changed since. A route can never have
+   a second delete.
+3. Write the audit event `remote.group_cleanup_recorded` (phase `intent`), which
+   carries the effect id. A run that loses a race to another run writes no intent
+   event.
+4. Read the group again immediately before the delete. It must still be the same
+   stopped, idle group. On any drift (or a failed read) nothing is sent: the outcome
+   `delete_aborted_drift` is audited with no receipt and the route stays `unknown` for
+   read-only reconciliation. The one-shot delete effect is consumed; that is the safe
+   direction.
+5. Send the provider delete. `202` means pending, never confirmation.
+6. Read the group back once. Confirmed gone records state `deleted`. Anything else
+   records state `unknown` with termination not confirmed and `accepted_pending`
+   (a delete was accepted and is unreconciled), flags `needs_reconciliation` and is
+   never retried. Such a route can neither be started nor deleted again.
+7. Record the receipt on the route and write the audit event (phase `outcome`). A
+   crash after step 2 leaves the route `unknown` with a delete effect, so a later run
+   never deletes again. A crash after the receipt leaves the recorded receipt and no
+   outcome event; the route is already `deleted` or `unknown` and is never deleted
+   again either.
+
+Authorization comes before any provider read: the route list is the calling
+worker's own routes only (same organization, accessible project, and an admitted
+external operation naming that worker principal). A route failing any check never
+reaches a port. A store refusal before a delete was sent is recorded as
+`not_authorized` and stops the run without raising. A store refusal after the delete
+was sent (receipt or outcome audit refused, for example a revoked credential or a
+late-receipt conflict) stops the run and reports `delete_unrecorded` with
+`delete_status: sent` and `needs_reconciliation`; a sent delete is never reported as
+skipped. `plan(record_plan=True)` counts audit events it could not record
+(`unrecorded`) and completes. Once a delete effect has been attempted, even if it is
+later reconciled (observe, then a receipt back to `stopped`), the route stays
+`delete_already_attempted`, so such a group can only be removed in the Salad portal.
+The audit event shape is validated strictly by the store (unknown keys, a true
+`liability_released`, a `readback_source` other than `non_live_port` and malformed
+fields are refused).
+
+The receipt is `synthetic` like every receipt today, carries no cost and names no
+cost relief; its evidence link is a hash of the marker "cleanup of a stopped
+zero-instance group". Receipt evidence and audit events also carry
+`readback_source: non_live_port`. **Deleting a group does not release experiment
+liability or budget** ([spend safety](salad-spend-safety.md)).
+
+**Applying is not available against the live service in this milestone, and there is
+no production port.** Live group deletion has no activation gate (no one-use claim,
+preflight freshness, rebinding, stop or input revocation), and no adapter over the
+real HTTP transport exists. `apply` accepts only a port marked `live is False`, and
+`TrustedSaladServer.cleanup_settled(cleanup, port=...)` additionally refuses unless
+the server's own transport is marked non-live too. The real HTTP transport carries no
+such mark, so **against a real server the hook always refuses**: recording a delete
+through a fake port on a real service's routes would fake provider status. The hook
+is off by default, needs a cleanup bound to the same worker and store, and refuses to
+run inside a store transaction. Nothing calls it. The `live is False` marks guard
+against accidental live use; they are not a security boundary (a subclass or an
+instance attribute can satisfy them). The no-transaction guard sees only store-mutate
+lineage; it cannot see an arbitrary caller's own database transaction.
+
+Operator dry run (opens the state read-only, makes no provider call, changes
+nothing, exit 0; usage errors exit 64; there is no apply option). It is a local
+operator tool and reads every organization in the state directory:
+
+```sh
+tessera-salad-cleanup --state-dir /path/to/state --min-age-seconds 3600 [--json]
+```
+
+A dry run does not read the provider; every candidate is re-verified at apply time.
+
+Honest limits: the live DELETE client path has not been exercised and is unreachable
+from this code; the HTTP client cannot yet tell a 404 from an outage, so even a
+future live delete would read back as unconfirmed and stay flagged for read-only
+reconciliation; groups with a lost creation response are never deleted (an operator
+may remove them in the Salad portal).
 
 ### Opt-in live check and current service prerequisites
 
@@ -321,7 +618,7 @@ TLS CA is a referenced reviewed file, not embedded configuration bytes.
 | `guardian_socket`, `guardian_uid` | Independent Linux service's exact Unix socket and uid; peer pid must differ |
 | `custody` | Closed object: `host`, `port` (443), `token_file`, `ca_file`, `certificate_sha256` (64 hex) |
 | `approved_max_cost_cents` | Existing explicitly approved exposure ceiling, 1–10000; admitted plan/profile cap must fit and independent conservative ledger must remain within the profile cap |
-| `max_seconds`, `max_polls` | 1–300 seconds, 1–30 polls; profile runtime must fit |
+| `max_seconds`, `max_polls` | 1–900 seconds, 1–90 polls (route window incl. allocation and image pull); profile runtime must fit |
 | `source_revision` | Git source reference plus observed installed package inventory: `40hex+sha256:64hex` |
 
 After package writers are paused, obtain the inventory digest locally without
@@ -363,7 +660,10 @@ passes. Isolated metadata/driver tests are local coverage, not deployed service
 or real GPU proof. Full integrated journey and live acceptance still need the
 coordinated runtime/service test and actual deployed prerequisites.
 
-Scheduling bounds are 300 seconds, 30 polls per observation phase, one create/start/stop
+After launch, every poll first renews the exact soft execution lease and heartbeats the
+guardian (polls are spaced `max_seconds/max_polls`, at most 10s apart); the guardian
+deadline is bounded by the lease hard expiry, not the 30s renewal window. Stop
+confirmation gets its own 120s window. Scheduling bounds are up to 900 seconds and 90 polls per observation phase (the workload's own runtime argument stays <=300s), one create/start/stop
 attempt, no retries and no direct mutation bypass. On any issue the driver attempts
 exact cancel/stop/reconcile and retains sanitized inconclusive evidence; unresolved
 cleanup remains an exposure incident. Receipt directory must already be private
@@ -438,3 +738,13 @@ effects 0 and transport disabled, and printed neither references nor key values.
 No full-repository integration gate, GUI launch or live provider conformance is
 claimed. No real credentials, Salad API calls, projects, cloud resources, paid
 effects, dependency installs, commits or pushes occurred.
+
+## Workload input delivery in the campaign driver
+
+For `workload_v1` profiles the live driver (`salad_live_check`) now asks the trusted server
+to deliver the route's inputs once, after create has settled to `stopped` and before start
+(ADR 0037's delivery, a narrow ADR 0033 exception). Smoke and exact profiles, reconnects and
+reruns with prior launch effects never deliver. A delivery failure takes the existing exact
+stop path and never reports `passed`. The campaign executor
+(`tessera_control.campaign_salad_executor`, see [campaigns](campaigns.md)) is the only caller
+that starts this driver for a campaign stage.

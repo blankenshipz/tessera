@@ -1,0 +1,6 @@
+[Unit]
+Description=Tessera supervised services (example)
+Wants=tessera-development-poll.service tessera-salad-executor.service tessera-salad-guardian.service
+
+[Install]
+WantedBy=multi-user.target

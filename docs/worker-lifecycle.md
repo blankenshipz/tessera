@@ -52,3 +52,6 @@ A future Kubernetes worker/operator must attach only to an explicitly identified
 target; lifecycle registration cannot adopt an ambient kube context or authorize
 cluster bootstrap, provisioning, Secret materialization, or destructive teardown.
 Those actions remain separate planned workflows with human approvals.
+
+To run the development worker unattended under a supervisor, see
+[worker deployment](worker-deployment.md).

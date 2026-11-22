@@ -196,7 +196,7 @@ not successful completion or implicit sequence advancement.
 
 ## Exact blocked runtime callsite / next action
 
-Runtime owner integration remains outside this lane:
+Runtime owner integration remains outside this interface:
 
 1. `src/tessera_agent/remote_reasoning_runtime.py:V2Harness.status` needs an actual
    supported V2 public metadata/readback binding, distinct from usage tokens and

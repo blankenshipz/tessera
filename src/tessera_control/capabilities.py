@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 
+from .approval_trust import require_decision_actor
 from .capability_models import (
     AdmitCapability,
     ApproveCapabilities,
@@ -180,6 +181,7 @@ class CapabilityStore(ExecutionStore):
 
         def command(connection, live):
             self._human(live)
+            require_decision_actor(live, forbidden=Forbidden)
             policy = self._policy(connection, live, ident)
             task = self._task(connection, live, policy["task_id"])
             if (

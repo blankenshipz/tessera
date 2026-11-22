@@ -228,6 +228,7 @@ def test_registered_variants_admission_dispatch_restart_and_measurement_linkage(
             "artifact_id",
             "created_at",
             "created_by_principal_id",
+            "source",
         )
     }
 

@@ -4,7 +4,12 @@ import json
 import uuid
 
 from .agent_authority import AgentAuthorityStore
-from .agent_research_models import AgentObservation, AgentReviewRequest, ResearchProposal
+from .agent_research_models import (
+    AgentObservation,
+    AgentReviewRequest,
+    DeclineAgentProposal,
+    ResearchProposal,
+)
 from .external_agent_models import PromoteAgentProposal
 from .research import ResearchStore
 from .store import Conflict, Forbidden, NotFound, _connect, canonical_digest, utc_now
@@ -124,6 +129,7 @@ class AgentResearchStore(AgentAuthorityStore):
             "id": row["id"],
             "sequence": row["sequence"],
             "project_id": row["project_id"],
+            "credential_id": row["credential_id"],
             "kind": row["kind"],
             "payload": json.loads(row["payload_json"]),
             "digest": row["digest"],
@@ -230,6 +236,44 @@ class AgentResearchStore(AgentAuthorityStore):
             replay_guard=replay,
         )
 
+    def _proposal_record(self, connection, row):
+        promotion = connection.execute(
+            "SELECT result_json FROM agent_research_promotions WHERE proposal_id=?", (row["id"],)
+        ).fetchone()
+        decline = self._decline_event(connection, row["project_id"], row["id"])
+        record = {
+            **self._record(row),
+            "promotion": json.loads(promotion["result_json"]) if promotion else None,
+        }
+        # Present only once declined, so records of undecided/promoted proposals keep their shape.
+        if decline:
+            record["decline"] = {
+                "rationale": decline["rationale"],
+                "credential_kind": decline["credential_kind"],
+                "created_at": decline["created_at"],
+            }
+        return record
+
+    def get_proposal(self, principal, proposal_id):
+        connection = _connect(self.database_path)
+        try:
+            connection.execute("BEGIN")
+            actor = self._actor(connection, principal)
+            if actor["role"] != "human":
+                self._scope(connection, actor, "proposal:read")
+            row = connection.execute(
+                "SELECT * FROM agent_research_records WHERE id=? AND org_id=? AND kind='proposal'",
+                (proposal_id, actor["org_id"]),
+            ).fetchone()
+            if row is None or (
+                actor["role"] != "human" and row["credential_id"] != actor["credential_id"]
+            ):
+                raise NotFound("Research proposal was not found.")
+            self._project(connection, actor, row["project_id"])
+            return self._proposal_record(connection, row)
+        finally:
+            connection.close()
+
     def list_proposals(self, principal, project_id, offset=0, limit=100):
         connection = _connect(self.database_path)
         try:
@@ -241,11 +285,12 @@ class AgentResearchStore(AgentAuthorityStore):
                 self._scope(connection, actor, "proposal:read")
                 credential = actor["credential_id"]
             return [
-                self._record(row)
+                self._proposal_record(connection, row)
                 for row in connection.execute(
-                    "SELECT * FROM agent_research_records WHERE project_id=? AND kind='proposal' "
+                    "SELECT * FROM agent_research_records WHERE org_id=? AND project_id=? "
+                    "AND kind='proposal' "
                     "AND (? IS NULL OR credential_id=?) ORDER BY sequence LIMIT ? OFFSET ?",
-                    (project_id, credential, credential, limit, offset),
+                    (actor["org_id"], project_id, credential, credential, limit, offset),
                 )
             ]
         finally:
@@ -271,6 +316,8 @@ class AgentResearchStore(AgentAuthorityStore):
             ).fetchone()
             if existing:
                 return 200, json.loads(existing[0])
+            if self._decline_event(connection, row["project_id"], proposal_id):
+                raise Conflict("Research proposal was already declined.")
             proposal = json.loads(row["payload_json"])["proposal"]
             if proposal["kind"] == "project":
                 _, resource = self._create_project_transaction(
@@ -314,6 +361,83 @@ class AgentResearchStore(AgentAuthorityStore):
             command,
             replay_guard=lambda c, a, r: self._human(a),
         )
+
+    def decline(self, principal, proposal_id, key, payload):
+        body = self._body(DeclineAgentProposal, payload)
+
+        def command(connection, actor):
+            self._human(actor)
+            row = connection.execute(
+                "SELECT * FROM agent_research_records WHERE id=? AND org_id=? AND kind='proposal'",
+                (proposal_id, actor["org_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Research proposal was not found.")
+            self._project(connection, actor, row["project_id"])
+            if body["expected_revision"] != 1 or body["expected_digest"] != row["digest"]:
+                raise Conflict("Research proposal revision or digest changed.")
+            if connection.execute(
+                "SELECT 1 FROM agent_research_promotions WHERE proposal_id=?", (proposal_id,)
+            ).fetchone():
+                raise Conflict("Research proposal was already promoted.")
+            existing = self._decline_event(connection, row["project_id"], proposal_id)
+            if existing:
+                if existing["rationale"] != body["rationale"]:
+                    raise Conflict("Research proposal was already declined.")
+                return 200, self._decline_result(proposal_id, existing)
+            self._event(
+                connection,
+                actor,
+                row["project_id"],
+                None,
+                "agent_research.declined",
+                1,
+                {
+                    "proposal_id": proposal_id,
+                    "rationale": body["rationale"],
+                    "credential_kind": actor["kind"],
+                    "proposal_digest": row["digest"],
+                },
+            )
+            return 201, self._decline_result(
+                proposal_id, self._decline_event(connection, row["project_id"], proposal_id)
+            )
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/agent-research-proposals/{proposal_id}/decline",
+            canonical_digest(body),
+            command,
+            replay_guard=lambda c, a, r: self._human(a),
+        )
+
+    @staticmethod
+    def _decline_event(connection, project_id, proposal_id):
+        event = connection.execute(
+            "SELECT payload_json,created_at FROM events WHERE project_id=? "
+            "AND event_type='agent_research.declined' "
+            "AND json_extract(payload_json,'$.proposal_id')=? ORDER BY cursor LIMIT 1",
+            (project_id, proposal_id),
+        ).fetchone()
+        if event is None:
+            return None
+        payload = json.loads(event["payload_json"])
+        return {
+            "rationale": payload["rationale"],
+            "credential_kind": payload["credential_kind"],
+            "created_at": event["created_at"],
+        }
+
+    @staticmethod
+    def _decline_result(proposal_id, decline):
+        return {
+            "proposal_id": proposal_id,
+            "declined": True,
+            **decline,
+            "execution_authorized": False,
+        }
 
     def notebook(self, principal, project_id, **options):
         from .agent_provenance import project_external_agent_notebook

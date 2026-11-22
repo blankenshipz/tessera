@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
@@ -11,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .approval_trust import AUTOMATION_HEADER, AUTOMATION_KEY, valid_automation_label
 from .deployment import DeploymentConfig, backend_status
 from .models import (
     ApproveTask,
@@ -34,7 +36,9 @@ class RejectBrowserOriginsMiddleware(BaseHTTPMiddleware):
 
 
 def principal(
-    request: Request, authorization: Annotated[str | None, Header()] = None
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+    automation: Annotated[str | None, Header(alias=AUTOMATION_HEADER)] = None,
 ) -> dict[str, str]:
     if authorization is None or not authorization.startswith("Bearer "):
         _unauthorized()
@@ -42,9 +46,17 @@ def principal(
     if not token or token.strip() != token:
         _unauthorized()
     try:
-        return request.app.state.store.authenticate(token)
+        actor = request.app.state.store.authenticate(token)
     except Forbidden:
         _unauthorized()
+    if automation is not None:
+        # Only a label: it never grants authority, it marks decisions as automation.
+        if not valid_automation_label(automation):
+            raise StoreError(
+                "X-Tessera-Automation must be a non-empty label of at most 128 characters."
+            )
+        actor[AUTOMATION_KEY] = automation
+    return actor
 
 
 def idempotency_key(value: Annotated[str | None, Header(alias="Idempotency-Key")] = None) -> str:
@@ -74,6 +86,8 @@ def create_app(
     *,
     runtime_binding_adapter: Any = None,
     agent_sandbox_backend: Any = None,
+    campaign_runner_interval: float | None = None,
+    campaign_scheduler: bool = True,
 ) -> FastAPI:
     """Build a control API with an explicit serving profile around initialized state."""
 
@@ -86,6 +100,7 @@ def create_app(
     from .agent_research import AgentResearchStore
     from .artifact_api import router as artifact_router
     from .artifact_disposition_api import router as artifact_disposition_router
+    from .artifact_lineage_api import router as artifact_lineage_router
     from .astra import AstraStore
     from .astra_api import router as astra_router
     from .astra_status import AstraStatusStore
@@ -98,6 +113,7 @@ def create_app(
     from .dataset_ingestion_api import router as dataset_ingestion_router
     from .execution import ExecutionStore
     from .execution_api import router as execution_router
+    from .execution_run_receipt_api import router as execution_run_receipt_router
     from .experiments import ExperimentStore
     from .experiments_api import router as experiments_router
     from .external_agent_api import router as external_agent_router
@@ -107,7 +123,10 @@ def create_app(
     from .interaction import InteractionStore
     from .interaction_api import router as interaction_router
     from .interaction_api import worker_router as interaction_worker_router
+    from .large_artifact_api import router as large_artifact_router
     from .observability import OperatorObservabilityStore
+    from .provider_inputs import ProviderInputStore
+    from .provider_inputs_api import router as provider_inputs_router
     from .remote_execution import RemoteExecutionStore
     from .remote_execution_api import router as remote_execution_router
     from .research_api import router as research_router
@@ -205,6 +224,11 @@ def create_app(
     app.state.agent_authority = AgentAuthorityStore(state_dir)
     app.state.agent_research = AgentResearchStore(state_dir)
     app.include_router(agent_authority_router)
+    from .agent_research_results import AgentResultStore
+    from .agent_research_results_api import router as agent_results_router
+
+    app.state.agent_results = AgentResultStore(state_dir)
+    app.include_router(agent_results_router)
     app.state.agent_provenance = AgentProvenanceStore(state_dir)
     app.include_router(agent_provenance_router)
     app.state.observability = OperatorObservabilityStore(state_dir)
@@ -212,20 +236,65 @@ def create_app(
     # for inserting/resolving secret values.
     app.state.fake_secret_backend = _FakeSecretBackend()
     app.state.execution = ExecutionStore(state_dir)
+    from .dataset_staging import DatasetStagingStore
+    from .dataset_staging_api import router as dataset_staging_router
+    from .egress_journal import EgressJournalStore
+    from .egress_journal_api import router as egress_journal_router
+    from .snapshot_chunks import ChunkedSnapshotStore
+    from .snapshot_chunks_api import router as snapshot_chunks_router
+
+    app.state.egress_journal = EgressJournalStore(state_dir)
+    app.state.dataset_staging = DatasetStagingStore(state_dir)
+    app.state.chunked_snapshots = ChunkedSnapshotStore(state_dir)
     app.state.remote_execution = RemoteExecutionStore(state_dir)
     app.state.snapshot_releases = SnapshotReleaseStore(state_dir)
     app.state.skills = SkillStore(state_dir)
     app.state.handoffs = WorkspaceHandoffStore(state_dir)
+    app.state.provider_inputs = ProviderInputStore(state_dir)
     app.include_router(execution_router)
+    app.include_router(execution_run_receipt_router)
+    app.include_router(provider_inputs_router)
+    app.include_router(egress_journal_router)
+    app.include_router(dataset_staging_router)
+    app.include_router(snapshot_chunks_router)
     app.include_router(credential_lease_router)
     app.include_router(capability_router)
     app.include_router(autonomy_router)
     app.include_router(remote_execution_router)
     app.include_router(skill_router)
+    from .campaign_api import router as campaign_router
+    from .campaign_store import CampaignStore
+    from .snapshot_composition import SnapshotCompositionStore
+    from .snapshot_composition_api import router as snapshot_composition_router
+    from .worker_grants_api import router as worker_grants_router
+
+    app.state.campaigns = CampaignStore(state_dir)
+    app.state.snapshot_composition = SnapshotCompositionStore(state_dir)
+    app.include_router(campaign_router)
+    from .agent_campaign_reads import AgentCampaignReads
+    from .agent_campaign_reads_api import router as agent_campaign_reads_router
+
+    app.state.agent_campaign_reads = AgentCampaignReads(state_dir)
+    app.include_router(agent_campaign_reads_router)
+    app.include_router(snapshot_composition_router)
+    app.include_router(worker_grants_router)
+    from .salad_unclaimed import SaladUnclaimedStore
+    from .salad_unclaimed_api import router as salad_unclaimed_router
+
+    app.state.salad_unclaimed = SaladUnclaimedStore(state_dir)
+    app.include_router(salad_unclaimed_router)
     app.include_router(artifact_router)
+    app.include_router(large_artifact_router)
     app.include_router(artifact_disposition_router)
+    app.include_router(artifact_lineage_router)
     app.state.research = DatasetIngestionStore(state_dir)
     app.state.experiments = ExperimentStore(state_dir)
+    from .gate_evidence import GateEvidenceStore
+    from .gate_evidence_api import router as gate_evidence_router
+    from .gate_evidence_metrics_api import router as gate_evidence_metrics_router
+    from .gate_evidence_programs_api import router as gate_evidence_programs_router
+
+    app.state.gate_evidence = GateEvidenceStore(state_dir)
     app.state.interactions = InteractionStore(store)
     app.state.astra = AstraStore(store)
     app.state.astra_status = AstraStatusStore(store)
@@ -233,6 +302,9 @@ def create_app(
     app.include_router(research_router)
     app.include_router(dataset_ingestion_router)
     app.include_router(experiments_router)
+    app.include_router(gate_evidence_router)
+    app.include_router(gate_evidence_metrics_router)
+    app.include_router(gate_evidence_programs_router)
     app.include_router(interaction_router)
     app.include_router(interaction_worker_router)
     app.include_router(astra_router)
@@ -453,6 +525,26 @@ def create_app(
         snapshot_id: str, actor: Annotated[dict[str, Any], Depends(principal)]
     ) -> dict[str, Any]:
         return snapshots.get_snapshot(actor, snapshot_id)
+
+    if campaign_runner_interval is not None:
+        # In-process campaign runner: started and stopped with the ASGI lifespan, composed
+        # with (never replacing) the existing lifespan.
+        previous_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def runner_lifespan(application: FastAPI):
+            from . import campaign_runner
+
+            handle = campaign_runner.start_background(
+                state_dir, campaign_runner_interval, scheduler=campaign_scheduler
+            )
+            try:
+                async with previous_lifespan(application) as state:
+                    yield state
+            finally:
+                handle.stop()
+
+        app.router.lifespan_context = runner_lifespan
 
     return app
 

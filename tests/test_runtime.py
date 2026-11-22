@@ -385,3 +385,103 @@ def test_stalled_http_response_cannot_hold_supervisor_cancellation(tmp_path):
         if stalled_read_channel._inflight is not None:
             stalled_read_channel._inflight.result(timeout=2)
         client.close()
+
+
+class LimitedAdapter(FakeAdapter):
+    """A fake adapter carrying operator container limits, like DockerCpuAdapter."""
+
+    def __init__(self, memory_bytes: int, scratch_bytes: int) -> None:
+        super().__init__()
+        self.limits = {"memory_bytes": memory_bytes, "scratch_bytes": scratch_bytes}
+
+    def operation_limits(self) -> dict[str, int]:
+        return dict(self.limits)
+
+
+def test_durable_fence_records_the_operator_limits_the_container_runs_with(tmp_path):
+    import hashlib
+
+    from tessera_worker.supervisor import CpuSupervisor
+
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    root = tmp_path / "private-inputs"
+    root.mkdir(mode=0o700)
+    adapter = LimitedAdapter(1024 * 1024 * 1024, 64 * 1024 * 1024)
+    with CpuRuntime(
+        tmp_path / "runtime", root, ApiChannel(state), adapter, worker_id=worker["id"]
+    ) as runtime:
+        assert runtime.start(lease["id"], lease["epoch"]).phase == "running"
+        operation = runtime.operation
+        assert (operation.memory_bytes, operation.scratch_bytes) == (
+            1024 * 1024 * 1024,
+            64 * 1024 * 1024,
+        )
+        row = runtime.supervisor._lookup(operation.operation_id)
+        payload = CpuSupervisor._payload(operation)
+        assert '"memory_bytes":1073741824' in payload.replace(" ", "")
+        assert row["payload_digest"] == hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_restart_with_different_operator_limits_does_not_reuse_the_recorded_operation(tmp_path):
+    from tessera_worker.supervisor import SupervisorError
+
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    channel = ApiChannel(state)
+    root = tmp_path / "private-inputs"
+    root.mkdir(mode=0o700)
+    directory = tmp_path / "runtime"
+    adapter = LimitedAdapter(512 * 1024 * 1024, 32 * 1024 * 1024)
+    adapter.lose_start_reply = True
+    with CpuRuntime(directory, root, channel, adapter, worker_id=worker["id"]) as runtime:
+        assert runtime.start(lease["id"], lease["epoch"]).phase == "uncertain"
+    adapter.lose_start_reply = False
+    adapter.limits["memory_bytes"] = 1024 * 1024 * 1024
+    with CpuRuntime(directory, root, channel, adapter, worker_id=worker["id"]) as runtime:
+        with pytest.raises(SupervisorError, match="payload digest"):
+            runtime.start(lease["id"], lease["epoch"])
+    assert adapter.calls.count("start") == 1
+
+
+def test_durable_fence_records_the_effective_container_user(tmp_path):
+    import hashlib
+
+    from tessera_worker.supervisor import CpuSupervisor
+
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    root = tmp_path / "private-inputs"
+    root.mkdir(mode=0o700)
+    adapter = LimitedAdapter(512 * 1024 * 1024, 32 * 1024 * 1024)
+    adapter.limits["container_user"] = "1234:5678"
+    with CpuRuntime(
+        tmp_path / "runtime", root, ApiChannel(state), adapter, worker_id=worker["id"]
+    ) as runtime:
+        assert runtime.start(lease["id"], lease["epoch"]).phase == "running"
+        operation = runtime.operation
+        assert operation.container_user == "1234:5678"
+        row = runtime.supervisor._lookup(operation.operation_id)
+        payload = CpuSupervisor._payload(operation)
+        assert '"container_user":"1234:5678"' in payload.replace(" ", "")
+        assert row["payload_digest"] == hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_restart_with_a_different_container_user_does_not_reuse_the_operation(tmp_path):
+    from tessera_worker.supervisor import SupervisorError
+
+    state, _, _, worker, _, lease = _delivery(tmp_path)
+    channel = ApiChannel(state)
+    root = tmp_path / "private-inputs"
+    root.mkdir(mode=0o700)
+    adapter = LimitedAdapter(512 * 1024 * 1024, 32 * 1024 * 1024)
+    adapter.limits["container_user"] = "1234:5678"
+    adapter.lose_start_reply = True
+    with CpuRuntime(
+        tmp_path / "runtime", root, channel, adapter, worker_id=worker["id"]
+    ) as runtime:
+        assert runtime.start(lease["id"], lease["epoch"]).phase == "uncertain"
+    adapter.lose_start_reply = False
+    adapter.limits["container_user"] = "4321:8765"
+    with CpuRuntime(
+        tmp_path / "runtime", root, channel, adapter, worker_id=worker["id"]
+    ) as runtime:
+        with pytest.raises(SupervisorError, match="payload digest"):
+            runtime.start(lease["id"], lease["epoch"])

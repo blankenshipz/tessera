@@ -1,0 +1,841 @@
+"""Campaign submission, approval, cancel and reads (ADR 0038).
+
+Submission grants nothing. A human approves the exact spec digest; the runner (WP2)
+then acts through ``campaign_delegation``. Everything here is one ``_mutate``
+transaction per command, so state, events and the idempotency row commit together.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import sqlite3
+import uuid
+from collections.abc import Iterator, Mapping
+from datetime import timedelta
+from typing import Any
+
+from pydantic import ValidationError
+
+from . import program_budget, provider_trust
+from .approval_trust import decision_provenance, require_decision_actor
+from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
+from .campaign_io import resolve_artifact
+from .campaign_models import (
+    GRANT_SETTLE_MARGIN_SECONDS,
+    TERMINAL_CAMPAIGN,
+    ApproveCampaign,
+    CancelCampaign,
+    SubmitCampaign,
+    normalize,
+    parse_spec_json,
+    spec_digest,
+    stage_input_class,
+    stage_output_class,
+    stage_provider,
+    topological_order,
+)
+from .campaign_salad_commands import (  # noqa: F401
+    SALAD_ACTIVE_PHASES,
+    SaladWorkerCommands,
+    _GuardianFinal,
+)
+from .campaign_standing_store import StandingApprovalCommands
+from .campaign_steering import CampaignSteeringCommands
+from .data_class import DataClassRefused, snapshot_data_class
+from .execution import ExecutionStore
+from .external_agents import ExternalAgentStore
+from .snapshots import SnapshotStore
+from .store import (
+    Conflict,
+    Forbidden,
+    NotFound,
+    Store,
+    StoreError,
+    _connect,
+    _parse_utc,
+    _utc_string,
+    utc_now,
+)
+
+SALAD_REFUSAL = "salad-gpu-v1 stages are not enabled: no Salad profile is configured"
+RUNNABLE_STATUSES = (
+    "running",
+    "stopping",
+    "cancel_requested",
+    "blocked",
+    "paused_delegation_lapsed",
+)
+MAX_LISTED_INTENTS = 500
+# Statuses a human may re-approve. Only the first two resume forward work; in the others
+# a re-approval installs a live delegation for reduce-only cleanup and changes no status.
+REAPPROVABLE_STATUSES = ("submitted", "paused_delegation_lapsed", "cancel_requested", "blocked")
+FORWARD_APPROVAL_STATUSES = ("submitted", "paused_delegation_lapsed")
+
+
+def _invalid(error: ValidationError) -> StoreError:
+    first = error.errors()[0] if error.errors() else {}
+    location = ".".join(str(part) for part in first.get("loc", ()))[:200]
+    return StoreError(f"Invalid campaign request: {location}: {str(first.get('msg', ''))[:200]}")
+
+
+def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
+    result = {key: value for key, value in dict(row).items() if key != "spec_json"}
+    return result
+
+
+class CampaignStore(
+    CampaignGateCommands,
+    CampaignSteeringCommands,
+    StandingApprovalCommands,
+    SaladWorkerCommands,
+    ExternalAgentStore,
+):
+    def __init__(self, state_dir):
+        super().__init__(state_dir)
+
+    # -- actor classification -------------------------------------------------------
+
+    @staticmethod
+    def _external_scope(connection: sqlite3.Connection, actor: Mapping[str, Any]) -> bool:
+        return (
+            connection.execute(
+                "SELECT 1 FROM external_agent_scopes WHERE credential_id=?",
+                (actor["credential_id"],),
+            ).fetchone()
+            is not None
+        )
+
+    def _require_action(
+        self, connection: sqlite3.Connection, actor: dict[str, Any], action: str
+    ) -> None:
+        """External agents need the enrolled scope; workers never reach campaigns."""
+        if actor.get("kind") == "worker":
+            raise Forbidden("Workers cannot use campaigns.")
+        if self._external_scope(connection, actor):
+            self._scope(connection, actor, action)
+
+    @staticmethod
+    def _campaign(
+        connection: sqlite3.Connection, actor: dict[str, Any], campaign_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """SELECT c.* FROM campaigns c JOIN projects p ON p.id = c.project_id
+            WHERE c.id = ? AND p.org_id = ?""",
+            (campaign_id, actor["org_id"]),
+        ).fetchone()
+        if row is None:
+            raise NotFound("Campaign was not found.")
+        Store._project(connection, actor, row["project_id"])
+        return row
+
+    # -- spec reference checks (submit and approve) ---------------------------------
+
+    @staticmethod
+    def recorded_snapshot_class(connection: sqlite3.Connection, snapshot_id: str) -> str:
+        """The ADR 0039 recorded class of a snapshot (the one source of truth).
+
+        A thin reader over ``data_class.snapshot_data_class``: an unrecorded snapshot reads
+        as private_derived. The spec's claim is never consulted.
+        """
+        return snapshot_data_class(connection, snapshot_id)["data_class"]
+
+    @staticmethod
+    def check_grant_lifetime(provider: Any, stage: Any) -> None:
+        """Refuse a grant that expires before its stage can finish (ADR 0048).
+
+        The grant is the only authority a run has, and the worker stops at its expiry, so a
+        ``grant_ttl_seconds`` shorter than the stage's ``max_duration_seconds`` plus the
+        settle margin can never complete. It is refused at admission with the reason."""
+        from .campaign_steps import StepFailed
+
+        try:
+            # The provider decides the lifetime (a plugin may take it from its own config).
+            ttl = int(provider.grant_request(None, None, stage).ttl_seconds)
+        except StepFailed:
+            return  # the worker lookup reports this refusal with its own reason
+        except (AttributeError, TypeError):
+            # A provider whose lifetime needs a live runner cannot be checked here; its
+            # ``grant_request`` must be pure when called with ``None`` to be checked. The
+            # skip is logged so a provider bug does not pass unnoticed.
+            logging.getLogger("tessera.campaign_store").warning(
+                "grant lifetime of stage %s not checked: provider needs a runner", stage.key
+            )
+            return
+        required = int(stage.max_duration_seconds) + GRANT_SETTLE_MARGIN_SECONDS
+        if ttl < required:
+            raise Conflict(
+                f"Stage {stage.key!r}: grant_shorter_than_stage_duration: grant_ttl_seconds "
+                f"{ttl} is shorter than max_duration_seconds "
+                f"{int(stage.max_duration_seconds)} plus the {GRANT_SETTLE_MARGIN_SECONDS}s "
+                f"settle margin ({required}s), so the grant would expire before the stage "
+                "can finish; raise grant_ttl_seconds or lower max_duration_seconds."
+            )
+
+    @staticmethod
+    def stage_worker(provider: Any, stage: Any) -> str | None:
+        """The worker principal the provider would grant this stage to (a pure lookup)."""
+        from .campaign_steps import StepFailed
+
+        try:
+            return provider.grant_request(None, None, stage).worker_principal_id
+        except StepFailed as error:
+            raise Conflict(f"Stage {stage.key!r}: {error.detail}") from None
+
+    @staticmethod
+    def check_stage_inputs(
+        connection: sqlite3.Connection,
+        stage: Any,
+        provider: Any,
+        approval_digest: str | None = None,
+    ) -> None:
+        """ADR 0040 section 4: every input must be one the provider instance may receive.
+
+        A snapshot input goes through ``provider_admits`` (recorded class and code approval);
+        a stage or artifact input is always ``private_derived``. Raises Conflict (409) naming
+        the stage, input, provider and worker principal; used at submit, at approve and again
+        when the runner reserves the stage.
+        """
+        worker = CampaignStore.stage_worker(provider, stage)
+        narrowed = frozenset(stage.send_classes) if stage.send_classes else None
+        who = f"provider {stage.provider!r} with worker principal {worker!r}"
+        for source in stage.inputs:
+            if source.kind == "snapshot":
+                try:
+                    provider_trust.provider_admits(
+                        connection,
+                        stage.provider,
+                        worker,
+                        source.snapshot_id,
+                        narrowed,
+                        approval_digest,
+                    )
+                except DataClassRefused as error:
+                    raise Conflict(
+                        f"Stage {stage.key!r} input {source.name!r}: {error} ({who})."
+                    ) from None
+            elif not provider_trust.provider_admits_class(
+                stage.provider,
+                worker,
+                "private_derived",
+                narrowed,
+                approval_digest,
+                connection=connection,
+            ):
+                raise Conflict(
+                    f"Stage {stage.key!r} input {source.name!r} is derived data and {who} is "
+                    "not trusted to receive private_derived (provider trust setting)."
+                )
+
+    @staticmethod
+    def _check_worker(
+        connection: sqlite3.Connection, live: dict[str, Any], project_id: str, worker_id: str
+    ) -> None:
+        try:
+            worker = Store._live_principal(
+                connection, {"id": worker_id, "org_id": live["org_id"]}, audience="worker"
+            )
+        except Forbidden:
+            raise Conflict("Campaign worker is not registered.") from None
+        if (
+            worker["kind"] != "worker"
+            or worker["role"] != "agent"
+            or worker["project_id"] != project_id
+        ):
+            raise Conflict("Campaign worker is not authorized for this project.")
+
+    def _check_references(
+        self,
+        connection: sqlite3.Connection,
+        live: dict[str, Any],
+        project_id: str,
+        spec: Any,
+    ) -> None:
+        normal = normalize(spec)
+        providers: dict[str, Any] = {}
+        for stage in normal.stages:
+            try:
+                provider = providers[stage.key] = stage_provider(stage.provider)
+            except KeyError:
+                raise Conflict(
+                    f"Stage {stage.key!r} names unknown compute provider {stage.provider!r}."
+                ) from None
+            if stage.scratch_bytes is not None and not getattr(provider, "grants_scratch", False):
+                raise Conflict(
+                    f"Stage {stage.key!r}: provider {stage.provider!r} does not grant a "
+                    "scratch request (scratch_bytes applies to worker-grant CPU providers)."
+                )
+            provider.check_stage(connection, project_id, stage)
+            self.check_grant_lifetime(provider, stage)
+            try:
+                provider_trust.check_narrowing(
+                    stage.provider,
+                    None if stage.send_classes is None else list(stage.send_classes),
+                    self.stage_worker(provider, stage),
+                    connection=connection,
+                )
+            except ValueError as error:
+                raise Conflict(f"Stage {stage.key!r}: {error}") from None
+        if normal.worker_principal_id is not None:
+            self._check_worker(connection, live, project_id, normal.worker_principal_id)
+        digest = provider_trust.current_policy(connection).digest
+        project = {"org_id": live["org_id"], "project_id": project_id}
+        for stage in normal.stages:
+            for source in stage.inputs:
+                if source.kind == "artifact":
+                    resolve_artifact(connection, project, source)
+                if source.kind != "snapshot":
+                    continue
+                snapshot = SnapshotStore._snapshot(connection, live, source.snapshot_id)
+                if snapshot["project_id"] != project_id or snapshot["digest"] != source.digest:
+                    raise Conflict("Campaign input snapshot does not match its pinned digest.")
+                if (
+                    source.data_class == "public"
+                    and snapshot_data_class(connection, source.snapshot_id)["data_class"]
+                    != "public"
+                ):
+                    raise Conflict(
+                        "Campaign input snapshot is not recorded public (ADR 0039) "
+                        "and cannot be declared public."
+                    )
+            self.check_stage_inputs(connection, stage, providers[stage.key], digest)
+
+    # -- commands -------------------------------------------------------------------
+
+    def submit_campaign(self, principal, project_id, key, digest, payload) -> tuple[int, dict]:
+        try:
+            body = SubmitCampaign.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+        spec = body.spec
+        normal_spec = normalize(spec)
+        encoded_spec = json.dumps(spec.model_dump(mode="json"), sort_keys=True)
+        spec_hash = spec_digest(spec)
+
+        def command(connection, live):
+            self._project(connection, live, project_id)
+            self._require_action(connection, live, "campaign:submit")
+            if live["role"] not in {"human", "agent"}:
+                raise Forbidden("This credential cannot submit campaigns.")
+            self._check_references(connection, live, project_id, spec)
+            now, ident = utc_now(), "campaign_" + uuid.uuid4().hex
+            campaign = {
+                "id": ident,
+                "org_id": live["org_id"],
+                "project_id": project_id,
+                "spec_json": encoded_spec,
+                "spec_digest": spec_hash,
+                "status": "submitted",
+                "stop_reason": None,
+                "budget_cap_cents": spec.budget_cap_cents,
+                "held_cents": 0,
+                "settled_cents": 0,
+                "revision": 1,
+                "submitted_by_principal_id": live["id"],
+                "submitted_credential_id": live["credential_id"],
+                "created_at": now,
+                "updated_at": now,
+            }
+            connection.execute(
+                """INSERT INTO campaigns VALUES (:id,:org_id,:project_id,:spec_json,:spec_digest,
+                :status,:stop_reason,:budget_cap_cents,:held_cents,:settled_cents,:revision,
+                :submitted_by_principal_id,:submitted_credential_id,:created_at,:updated_at)""",
+                campaign,
+            )
+            for index, stage_key in enumerate(topological_order(spec)):
+                connection.execute(
+                    """INSERT INTO campaign_stages (campaign_id, stage_key, topo_index, status,
+                    prep_phase, input_data_class, output_data_class, revision, updated_at,
+                    provider_id) VALUES (?, ?, ?, 'pending', 'none', ?, ?, 1, ?, ?)""",
+                    (
+                        ident,
+                        stage_key,
+                        index,
+                        stage_input_class(spec, stage_key),
+                        stage_output_class(spec, stage_key),
+                        now,
+                        normal_spec.stage(stage_key).provider,
+                    ),
+                )
+            self._event(
+                connection,
+                live,
+                project_id,
+                None,
+                "campaign.submitted",
+                1,
+                {
+                    "campaign_id": ident,
+                    "spec_digest": spec_hash,
+                    "stage_keys": [stage.key for stage in spec.stages],
+                },
+            )
+            return 201, {**_summary(campaign), "spec": spec.model_dump(mode="json")}
+
+        return self._mutate(
+            principal, key, "POST", f"/projects/{project_id}/campaigns", digest, command
+        )
+
+    def approve_campaign(self, principal, campaign_id, key, digest, payload) -> tuple[int, dict]:
+        try:
+            body = ApproveCampaign.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+
+        def command(connection, live):
+            campaign = self._campaign(connection, live, campaign_id)
+            if live["role"] != "human":
+                raise Forbidden("A human must approve a campaign.")
+            require_decision_actor(live, forbidden=Forbidden)
+            if (
+                campaign["revision"] != body.expected_revision
+                or campaign["spec_digest"] != body.expected_spec_digest
+            ):
+                raise Conflict("Campaign revision or spec digest is no longer current.")
+            if campaign["status"] not in REAPPROVABLE_STATUSES:
+                raise Conflict("Campaign is not awaiting approval.")
+            forward = campaign["status"] in FORWARD_APPROVAL_STATUSES
+            try:
+                # Provider validation applies to a forward approval only; a cleanup
+                # re-approval must not depend on the provider registry.
+                spec = parse_spec_json(campaign["spec_json"], providers=forward)
+            except ValidationError:
+                raise Conflict("Stored campaign spec failed validation.") from None
+            if spec_digest(spec) != campaign["spec_digest"]:
+                raise Conflict("Stored campaign spec digest changed.")
+            if forward:
+                # Cleanup re-approvals must not depend on forward-only references (a retired
+                # worker or snapshot must not strand a cancel).
+                self._check_references(connection, live, campaign["project_id"], spec)
+            unlock_evaluations: list[dict[str, Any]] = []
+            if body.unlock and campaign["status"] != "submitted":
+                # Never accept a stated condition and then drop it (ADR 0045).
+                raise Conflict("An unlock applies to a campaign's first approval only.")
+            if campaign["status"] == "submitted":
+                # First admission (ADR 0045): the program cap and any stated unlock
+                # requirement are checked in this transaction; a refusal writes nothing.
+                refusal = program_budget.check_admission(
+                    connection, campaign["project_id"], campaign["budget_cap_cents"]
+                )
+                if refusal is None and body.unlock:
+                    refusal, unlock_evaluations = evaluate_unlock(
+                        connection, campaign["org_id"], campaign["project_id"], body.unlock
+                    )
+                if refusal is not None:
+                    raise Conflict(f"Admission refused: {refusal}")
+            now_dt = _parse_utc(utc_now())
+            now = _utc_string(now_dt)
+            superseded = connection.execute(
+                "SELECT id FROM campaign_approvals WHERE campaign_id=? AND status='active'",
+                (campaign_id,),
+            ).fetchone()
+            if superseded is not None:
+                connection.execute(
+                    "UPDATE campaign_approvals SET status='superseded', ended_at=? WHERE id=?",
+                    (now, superseded["id"]),
+                )
+                # A pending intent committed nothing; the runner re-issues it.
+                connection.execute(
+                    """UPDATE campaign_step_intents SET status='abandoned', completed_at=?
+                    WHERE approval_id=? AND status='pending'""",
+                    (now, superseded["id"]),
+                )
+            expires_dt = now_dt + timedelta(seconds=spec.deadline_seconds)
+            if forward:
+                # Re-approval never extends the campaign's wall-clock bound: it ends
+                # ``deadline_seconds`` after the first approval. Cleanup re-approvals are
+                # reduce-only and keep a full window so a cancel is never stranded.
+                first = connection.execute(
+                    "SELECT MIN(approved_at) AS at FROM campaign_approvals WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()["at"]
+                if first is not None:
+                    bound = _parse_utc(first) + timedelta(seconds=spec.deadline_seconds)
+                    if bound <= now_dt:
+                        raise Conflict("The campaign deadline has passed; submit a new campaign.")
+                    expires_dt = min(expires_dt, bound)
+            provenance = decision_provenance(live)
+            approval = {
+                "id": "approval_" + uuid.uuid4().hex,
+                "campaign_id": campaign_id,
+                "spec_digest": campaign["spec_digest"],
+                "approving_principal_id": live["id"],
+                "decision_class": provenance["decision_class"],
+                "automation_label": provenance.get("automation_label"),
+                "approved_at": now,
+                "expires_at": _utc_string(expires_dt),
+                "status": "active",
+                "ended_at": None,
+                # The setting this approval was checked against; enforcement points use the
+                # intersection of it, the current setting and the stage's send_classes.
+                "trust_policy_digest": provider_trust.current_policy(connection).digest,
+            }
+            connection.execute(
+                """INSERT INTO campaign_approvals (id, campaign_id, spec_digest,
+                approving_principal_id, decision_class, automation_label, approved_at,
+                expires_at, status, ended_at, trust_policy_digest) VALUES (:id,:campaign_id,
+                :spec_digest,:approving_principal_id,:decision_class,:automation_label,
+                :approved_at,:expires_at,:status,:ended_at,:trust_policy_digest)""",
+                approval,
+            )
+            record_evaluations(
+                connection,
+                org_id=campaign["org_id"],
+                project_id=campaign["project_id"],
+                campaign_id=campaign_id,
+                approval_id=approval["id"],
+                standing_approval_id=None,
+                evaluations=unlock_evaluations,
+                now=now,
+            )
+            declared = self._insert_preapprovals(
+                connection, campaign, spec, approval, body.preapprovals, forward
+            )
+            revision = campaign["revision"] + 1
+            # Re-approval never resumes forward work after cancel (or while blocked).
+            resulting = "running" if forward else campaign["status"]
+            connection.execute(
+                "UPDATE campaigns SET status=?, revision=?, updated_at=? WHERE id=?",
+                (resulting, revision, now, campaign_id),
+            )
+            self._event(
+                connection,
+                live,
+                campaign["project_id"],
+                None,
+                "campaign.approved",
+                revision,
+                {
+                    "campaign_id": campaign_id,
+                    "approval_id": approval["id"],
+                    "spec_digest": campaign["spec_digest"],
+                    "expires_at": approval["expires_at"],
+                    "superseded_approval_id": superseded["id"] if superseded else None,
+                    "resulting_status": resulting,
+                    "preapprovals": declared,
+                },
+            )
+            return 200, {
+                **_summary(campaign),
+                "status": resulting,
+                "revision": revision,
+                "updated_at": now,
+                "approval": approval,
+            }
+
+        return self._mutate(
+            principal, key, "POST", f"/campaigns/{campaign_id}/approve", digest, command
+        )
+
+    @staticmethod
+    def _insert_preapprovals(connection, campaign, spec, approval, entries, forward) -> list[dict]:
+        """Store the approve body's Salad review pre-approvals (ADR 0044), fail closed.
+
+        Only a forward approval may carry them; each names a distinct Salad stage of the
+        approved spec; nothing carries over from a superseded approval."""
+        if not entries:
+            return []
+        if not forward:
+            raise Conflict("A cleanup re-approval cannot carry review pre-approvals.")
+        from .campaign_models import normalize, stage_provider
+
+        normal = normalize(spec)
+        cap = approval["expires_at"]
+        declared, seen = [], set()
+        for entry in entries:
+            if entry.stage_key in seen:
+                raise Conflict("Duplicate pre-approval stage.")
+            seen.add(entry.stage_key)
+            try:
+                stage = normal.stage(entry.stage_key)
+                billable = stage_provider(stage.provider).descriptor.kind == "salad_route"
+            except (StopIteration, ValueError, KeyError):
+                raise Conflict("Pre-approval names an unknown stage.") from None
+            if not billable:
+                raise Conflict("Pre-approvals apply to Salad stages only.")
+            if entry.max_total_cents < entry.max_attempt_cents:
+                raise Conflict("max_total_cents must be at least max_attempt_cents.")
+            if entry.max_total_cents > normal.budget_cap_cents:
+                raise Conflict("max_total_cents exceeds the campaign's approved budget cap.")
+            if entry.max_attempt_cents < stage.max_exposure_cents:
+                raise Conflict("max_attempt_cents is below the stage's max_exposure_cents.")
+            expires = cap
+            if entry.expires_at is not None:
+                try:
+                    requested = _utc_string(_parse_utc(entry.expires_at))
+                except ValueError:
+                    raise Conflict("Pre-approval expires_at is not a UTC timestamp.") from None
+                expires = min(expires, requested)  # never extended past the approval
+            row = {
+                "id": "preapproval_" + uuid.uuid4().hex,
+                "campaign_id": campaign["id"],
+                "approval_id": approval["id"],
+                "stage_key": entry.stage_key,
+                "source_digest": entry.source_assessment_digest,
+                "plan_digest": entry.plan_digest,
+                "source_use_digest": entry.source_use_digest,
+                "max_attempt_cents": entry.max_attempt_cents,
+                "max_total_cents": entry.max_total_cents,
+                "expires_at": expires,
+                "created_at": approval["approved_at"],
+            }
+            connection.execute(
+                """INSERT INTO campaign_review_preapprovals (id, campaign_id, approval_id,
+                stage_key, source_digest, plan_digest, source_use_digest, max_attempt_cents,
+                max_total_cents, expires_at, created_at) VALUES (:id,:campaign_id,:approval_id,
+                :stage_key,:source_digest,:plan_digest,:source_use_digest,:max_attempt_cents,
+                :max_total_cents,:expires_at,:created_at)""",
+                row,
+            )
+            declared.append({k: v for k, v in row.items() if k != "created_at"})
+        return declared
+
+    def cancel_campaign(self, principal, campaign_id, key, digest, payload) -> tuple[int, dict]:
+        try:
+            body = CancelCampaign.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+
+        def command(connection, live):
+            campaign = self._campaign(connection, live, campaign_id)
+            if self._external_scope(connection, live):
+                self._scope(connection, live, "campaign:cancel")
+                if campaign["submitted_by_principal_id"] != live["id"]:
+                    raise Forbidden("Only the submitting agent may cancel this campaign.")
+            elif live["role"] != "human":
+                raise Forbidden("A human must cancel a campaign.")
+            if campaign["status"] in TERMINAL_CAMPAIGN:
+                raise Conflict("Campaign is already finished.")
+            if campaign["status"] == "cancel_requested":
+                return 200, _summary(campaign)
+            if campaign["revision"] != body.expected_revision:
+                raise Conflict("Campaign revision is no longer current.")
+            now, revision = utc_now(), campaign["revision"] + 1
+            # A campaign never approved has no effects to unwind, so it ends here.
+            status = "cancelled" if campaign["status"] == "submitted" else "cancel_requested"
+            reason = ("cancel: " + body.reason)[:300]
+            connection.execute(
+                "UPDATE campaigns SET status=?, stop_reason=?, revision=?, updated_at=? WHERE id=?",
+                (status, reason, revision, now, campaign_id),
+            )
+            if status == "cancelled":
+                connection.execute(
+                    """UPDATE campaign_stages SET status='cancelled', revision=revision+1,
+                    updated_at=? WHERE campaign_id=? AND status='pending'""",
+                    (now, campaign_id),
+                )
+            revoked = self._revoke_unleased_grants(connection, live, campaign_id)
+            self._event(
+                connection,
+                live,
+                campaign["project_id"],
+                None,
+                "campaign.cancel_requested",
+                revision,
+                {
+                    "campaign_id": campaign_id,
+                    "reason": body.reason,
+                    "resulting_status": status,
+                    "requested_status": campaign["status"],
+                    "revoked_grant_ids": revoked,
+                },
+            )
+            return 200, {
+                **_summary(campaign),
+                "status": status,
+                "stop_reason": reason,
+                "revision": revision,
+                "updated_at": now,
+            }
+
+        return self._mutate(
+            principal, key, "POST", f"/campaigns/{campaign_id}/cancel", digest, command
+        )
+
+    def _revoke_unleased_grants(
+        self, connection: sqlite3.Connection, live: dict[str, Any], campaign_id: str
+    ) -> list[str]:
+        """Fence this campaign's active, never-leased grants in the cancel transaction.
+
+        Same transition and events as a human revoke; a leased grant is left for the
+        runner's unwind, which needs observation before it can settle.
+        """
+        revoked: list[str] = []
+        executor = ExecutionStore(self.database_path.parent)
+        rows = connection.execute(
+            """SELECT DISTINCT g.id, g.revision FROM campaign_stage_attempts a
+            JOIN execution_grants g ON g.id = a.grant_id
+            WHERE a.campaign_id = ? AND g.status = 'active'
+            AND NOT EXISTS (SELECT 1 FROM execution_leases l WHERE l.grant_id = g.id)
+            ORDER BY g.id""",
+            (campaign_id,),
+        ).fetchall()
+        for row in rows:
+            executor._cancel_grant_transaction(connection, live, row["id"], row["revision"])
+            revoked.append(row["id"])
+        return revoked
+
+    # -- reads ----------------------------------------------------------------------
+
+    def _read_actor(self, connection, principal) -> dict[str, Any]:
+        actor = self._actor(connection, principal)
+        self._require_action(connection, actor, "campaign:read")
+        return actor
+
+    def get_campaign(self, principal, campaign_id) -> dict:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._read_actor(connection, principal)
+            campaign = self._campaign(connection, actor, campaign_id)
+            approvals = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM campaign_approvals WHERE campaign_id=? ORDER BY approved_at, id",
+                    (campaign_id,),
+                )
+            ]
+            stages = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM campaign_stages WHERE campaign_id=? ORDER BY topo_index",
+                    (campaign_id,),
+                )
+            ]
+            attempts = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM campaign_stage_attempts WHERE campaign_id=? "
+                    "ORDER BY created_at, stage_key, attempt",
+                    (campaign_id,),
+                )
+            ]
+            counts = {
+                row["status"]: row["n"]
+                for row in connection.execute(
+                    "SELECT status, count(*) AS n FROM campaign_step_intents "
+                    "WHERE campaign_id=? GROUP BY status",
+                    (campaign_id,),
+                )
+            }
+            intents = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT id, approval_id, stage_key, attempt, step, ordinal, status,
+                    idempotency_key, response_status, error_class, created_at, completed_at
+                    FROM campaign_step_intents WHERE campaign_id=? ORDER BY created_at, id
+                    LIMIT ?""",
+                    (campaign_id, MAX_LISTED_INTENTS),
+                )
+            ]
+            return {
+                **_summary(campaign),
+                "spec": json.loads(campaign["spec_json"]),
+                "approval": next((a for a in approvals if a["status"] == "active"), None),
+                "approvals": approvals,
+                "stages": stages,
+                "attempts": attempts,
+                "intents": {"counts": counts, "items": intents},
+            }
+        finally:
+            connection.close()
+
+    def list_campaigns(self, principal, project_id, offset=0, limit=50) -> dict:
+        if not 0 <= offset <= 2**63 - 1 or not 1 <= limit <= 200:
+            raise StoreError("Invalid page bounds.")
+        connection = _connect(self.database_path)
+        try:
+            actor = self._read_actor(connection, principal)
+            self._project(connection, actor, project_id)
+            rows = connection.execute(
+                """SELECT * FROM campaigns WHERE project_id=? AND org_id=?
+                ORDER BY created_at, id LIMIT ? OFFSET ?""",
+                (project_id, actor["org_id"], limit, offset),
+            ).fetchall()
+            return {"campaigns": [_summary(row) for row in rows]}
+        finally:
+            connection.close()
+
+    def get_campaign_receipt(self, principal, campaign_id) -> dict:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._read_actor(connection, principal)
+            self._campaign(connection, actor, campaign_id)
+            row = connection.execute(
+                "SELECT * FROM campaign_receipts WHERE campaign_id=?", (campaign_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("Campaign receipt was not found.")
+            return {
+                "campaign_id": campaign_id,
+                "receipt": json.loads(row["receipt_json"]),
+                "receipt_digest": row["receipt_digest"],
+                "created_at": row["created_at"],
+            }
+        finally:
+            connection.close()
+
+    # -- runner side (never exposed over HTTP) --------------------------------------
+
+    @contextlib.contextmanager
+    def runner_connection(self) -> Iterator[sqlite3.Connection]:
+        """One IMMEDIATE transaction for the runner; refuses while restore state is held."""
+        connection = _connect(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recovery = connection.execute(
+                "SELECT state FROM control_recovery WHERE singleton=1"
+            ).fetchone()
+            if recovery is None or recovery["state"] != "active":
+                raise Forbidden("Control state is held after restore; mutations are disabled.")
+            yield connection
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def runnable_campaigns(self, connection: sqlite3.Connection) -> list[dict]:
+        marks = ",".join("?" for _ in RUNNABLE_STATUSES)
+        return [
+            dict(row)
+            for row in connection.execute(
+                f"SELECT * FROM campaigns WHERE status IN ({marks}) ORDER BY created_at, id",
+                RUNNABLE_STATUSES,
+            )
+        ]
+
+    def record_runner_event(
+        self,
+        connection: sqlite3.Connection,
+        campaign: Mapping,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        task_id: str | None = None,
+    ) -> None:
+        """Append an event attributed to the active approver (else the submitter)."""
+        approval = connection.execute(
+            """SELECT approving_principal_id FROM campaign_approvals WHERE campaign_id=?
+            ORDER BY (status='active') DESC, approved_at DESC, id DESC LIMIT 1""",
+            (campaign["id"],),
+        ).fetchone()
+        actor_id = (
+            approval["approving_principal_id"]
+            if approval is not None
+            else campaign["submitted_by_principal_id"]
+        )
+        current = connection.execute(
+            "SELECT revision FROM campaigns WHERE id=?", (campaign["id"],)
+        ).fetchone()
+        self._event(
+            connection,
+            {"id": actor_id, "org_id": campaign["org_id"]},
+            campaign["project_id"],
+            task_id,
+            event_type,
+            current["revision"] if current is not None else campaign["revision"],
+            {"campaign_id": campaign["id"], **payload},
+        )

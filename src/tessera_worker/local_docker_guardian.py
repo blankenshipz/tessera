@@ -17,7 +17,13 @@ from .capability_effects import BackendBlocked
 from .capability_journal import JournalConflict
 from .local_docker_contract import authenticate, message
 from .local_docker_engine import DockerCLI, LocalDockerEngine
-from .local_docker_fixture import FixtureJournal, LocalFixtureAdapter, _child, terminate
+from .local_docker_fixture import (
+    FixtureJournal,
+    LocalFixtureAdapter,
+    _child,
+    release_volume,
+    terminate,
+)
 
 PEER_LEASE = 6.0  # exceeds the bounded five-second, pre-effect Docker discovery
 STOP_ALLOWANCE = 12.0  # absolute outer bound, never renewed by either peer
@@ -132,7 +138,7 @@ def reap_interrupted(root, config, plan, reason, *, engine=None):
             k in records for k in ("kill_pending", "stop_intent", "recovery_intent", "guard_intent")
         )
         if (
-            not journal.report()["cleanup_confirmed"]
+            not journal.report()["container_cleanup_confirmed"]
             and "create_intent" in records
             and not stop_dispatched
         ):
@@ -143,6 +149,14 @@ def reap_interrupted(root, config, plan, reason, *, engine=None):
             journal.event("guard_intent", dict(container_id=cid, image_id=image))
             engine = engine or LocalDockerEngine(DockerCLI(config, journal.root / "docker-config"))
             terminate(journal, engine, plan, image, cid, "guard")
+        if (
+            "volume_intent" in records
+            and "guard_volume_intent" not in records
+            and not journal.report()["volume_cleanup_confirmed"]
+        ):
+            # The dead supervisor may have left its exact-named output volume behind.
+            engine = engine or LocalDockerEngine(DockerCLI(config, journal.root / "docker-config"))
+            release_volume(journal, engine, plan, "guard")
         return journal.report()
     finally:
         journal.close()

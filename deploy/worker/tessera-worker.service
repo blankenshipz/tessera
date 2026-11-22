@@ -1,0 +1,70 @@
+# Supervised Tessera development worker (placeholder paths; see README.md).
+#
+# Install as /etc/systemd/system/tessera-worker.service after creating the
+# dedicated user, the credential file and /etc/tessera/worker.env. The unit
+# contains no secrets: the credential is a 0600 file referenced by path.
+#
+# The worker drives the HOST Docker daemon, which is root-equivalent. The user
+# below must be allowed to use Docker (for example through the docker group)
+# and must be dedicated to this service.
+[Unit]
+Description=Tessera development worker (supervised)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+# systemd never gives up: the daemon owns the backoff.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tessera
+Group=tessera
+SupplementaryGroups=docker
+UMask=0077
+EnvironmentFile=/etc/tessera/worker.env
+StateDirectory=tessera-worker
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/tessera-worker
+# ${VAR} expands to exactly one argument. TESSERA_WORKER_EXTRA_ARGS is split on
+# whitespace and may be empty (for example: --egress-proxy-image IMAGE).
+ExecStart=/opt/tessera/venv/bin/python -m tessera_worker.daemon run \
+    --state-dir /var/lib/tessera-worker/daemon \
+    --grace-seconds 30 \
+    -- development-poll \
+    --control-url ${TESSERA_CONTROL_URL} \
+    --credential-file ${TESSERA_CREDENTIAL_FILE} \
+    --workspace-root ${TESSERA_WORKSPACE_ROOT} \
+    --development-output-root ${TESSERA_OUTPUT_ROOT} \
+    --allowed-image ${TESSERA_ALLOWED_IMAGE} \
+    --poll-seconds ${TESSERA_POLL_SECONDS} \
+    $TESSERA_WORKER_EXTRA_ARGS
+Restart=always
+RestartSec=5
+# Configuration errors from the daemon (64 usage, 73 state directory) will not
+# fix themselves; do not loop on them.
+RestartPreventExitStatus=64 73
+# SIGTERM goes to the daemon only; it forwards it to the worker's process group
+# and escalates to SIGKILL after --grace-seconds. Leftovers are killed at the end.
+KillMode=mixed
+KillSignal=SIGTERM
+# Must exceed --grace-seconds.
+TimeoutStopSec=45
+
+# Hardening that stays compatible with driving the host Docker CLI through its
+# Unix socket. The Docker daemon, not this unit, performs bind mounts.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/tessera-worker
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

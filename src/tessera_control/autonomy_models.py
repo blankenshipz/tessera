@@ -1,6 +1,6 @@
 """Bounded plans and secret-free projections; no executable command fields."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -193,6 +193,9 @@ class AutonomySession(Strict):
     workspace_id: Digest
     state: State
     approved_by: Identifier | None = None
+    approval_provenance: dict[str, Any] | None = None
+    resume_provenance: dict[str, Any] | None = None
+    stop_provenance: dict[str, Any] | None = None
     deadline: str | None = None
     lease_until: str | None = None
     checkpoint: Checkpoint | None = None

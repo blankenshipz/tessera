@@ -16,7 +16,7 @@ not yet provide an independent live inspector or enforcing runner and does not
 change this blocked activation boundary. Signed probe claims alone cannot activate.
 
 The broker is a library boundary for a trusted supervisor, not a new HTTP/CLI agent
-endpoint or automatic integration into CPU, Kubernetes or outcome0 execution.
+endpoint or automatic integration into CPU, Kubernetes or program-specific execution.
 Existing provider-disabled responses and network guards are unchanged. Salad is
 not an activation target. Synthetic completion means the offline state machine
 verified fixtures/inventory, **not** that a package was installed or a model fetched.

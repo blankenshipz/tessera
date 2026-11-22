@@ -39,6 +39,66 @@ def configuration(**updates):
     )
 
 
+def test_billing_policy_stdio_cas_omission_expiry_and_reconnect(directories):
+    state, credentials = directories
+    policy = {
+        "mode": "aggregate_capped",
+        "ceiling_cents": 5000,
+        "ancillary_cents": 500,
+        "shutdown_cents": 1000,
+        "expires_at": "2000-01-01T00:00:00Z",
+    }
+
+    async def journey(update):
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-B",
+                "-m",
+                "tessera_operator.salad",
+                "--state-directory",
+                str(state),
+                "--credential-directory",
+                str(credentials),
+            ],
+        )
+        async with stdio_client(params) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+
+                async def call(name, args):
+                    result = await session.call_tool(name, args)
+                    assert not result.isError
+                    return json.loads(result.content[0].text)
+
+                view = await call("salad_inspect", {})
+                if update:
+                    args = {
+                        "organization": "example-org",
+                        "project": "tessera-research",
+                        "credential_reference": "credential-ref:billing-test",
+                        "credential_version": 1,
+                        "expected_revision": view["revision"],
+                        "billing_policy": policy,
+                    }
+                    saved = await call("salad_configure", args)
+                    assert saved["state"] == "configured"
+                    stale = await call("salad_configure", args)
+                    assert stale["reason"] == "stale_revision"
+                    args.pop("billing_policy")
+                    args["expected_revision"] = saved["revision"]
+                    assert (await call("salad_configure", args))["revision"] == saved["revision"]
+                ready = await call("salad_readiness", {})
+                assert ready["billing"] == "aggregate_cap_expired"
+                assert ready["billing_declaration"]["accounting"] == "unknown"
+                assert ready["execution_enabled"] is False
+                assert ready["provider"] == "unrun"
+                assert ready["control_integration"] == "not_connected"
+                return ready["revision"]
+
+    assert asyncio.run(journey(True)) == asyncio.run(journey(False))
+
+
 def test_persist_cas_restart(directories):
     state, _ = directories
     store = salad.ConfigurationStore(state)
@@ -120,7 +180,7 @@ def test_account_only_setup_real_stdio_reconnect(directories):
                     result = await session.call_tool(
                         "salad_configure",
                         {
-                            "organization": "luxai",
+                            "organization": "example-org",
                             "credential_reference": "credential-ref:salad-test",
                             "credential_version": 1,
                         },
@@ -151,7 +211,9 @@ def test_account_setup_survives_credential_expiry(directories, monkeypatch):
     state, credentials = directories
     store = salad.ConfigurationStore(state)
     config = salad.SaladConfiguration(
-        organization="luxai", credential_reference="credential-ref:salad-test", credential_version=1
+        organization="example-org",
+        credential_reference="credential-ref:salad-test",
+        credential_version=1,
     )
     result = store.configure(config, None)
     resolver = PrivateFileSecretResolver(credentials)
@@ -310,7 +372,7 @@ def test_transport_diagnostics_redacted(monkeypatch, error, reason):
 
     monkeypatch.setattr(salad.http.client, "HTTPSConnection", unavailable)
     with SecretBuffer(bytearray(b"synthetic-only-marker")) as secret:
-        result = salad._provider_get("/api/public/organizations/luxai/quotas", secret)
+        result = salad._provider_get("/api/public/organizations/example-org/quotas", secret)
     assert result == (reason, None)
     assert "sensitive" not in json.dumps(result)
 
@@ -356,7 +418,7 @@ def test_real_stdio_handshake_configure_reconnect(directories):
     asyncio.run(session_round(False))
 
 
-def test_discovery_fixed_luxai_no_invented_project_listing(directories, monkeypatch):
+def test_discovery_configured_org_no_invented_project_listing(directories, monkeypatch):
     state, credentials = directories
     resolver = PrivateFileSecretResolver(credentials)
     resolver.enroll(
@@ -374,7 +436,7 @@ def test_discovery_fixed_luxai_no_invented_project_listing(directories, monkeypa
 
     monkeypatch.setattr(salad, "_provider_get", get)
     store = salad.ConfigurationStore(state)
-    server = salad.create_server(store, credentials)
+    server = salad.create_server(store, credentials, "example-org")
     args = {"credential_reference": "credential-ref:salad-test", "credential_version": 1}
     result = asyncio.run(call(server, "salad_discover_projects", args))
     assert result["project_discovery"] == "unsupported_by_public_api"
@@ -384,8 +446,8 @@ def test_discovery_fixed_luxai_no_invented_project_listing(directories, monkeypa
     )
     assert result["provider"] == "project_readable"
     assert requests == [
-        "/api/public/organizations/luxai/quotas",
-        "/api/public/organizations/luxai/projects/existing-project/containers",
+        "/api/public/organizations/example-org/quotas",
+        "/api/public/organizations/example-org/projects/existing-project/containers",
     ]
     assert store.read() is None
     assert "synthetic-only-marker" not in json.dumps(result)
@@ -509,3 +571,21 @@ def test_real_hidden_terminal_enrollment_no_echo(directories):
             process.kill()
             process.wait()
         os.close(master)
+
+
+def test_discovery_without_any_organization_refuses_not_crashes(directories):
+    state, credentials = directories
+    server = salad.create_server(salad.ConfigurationStore(state), credentials)
+    args = {"credential_reference": "credential-ref:salad-test", "credential_version": 1}
+    try:
+        result = asyncio.run(call(server, "salad_discover_projects", args))
+    except Exception as error:  # refusal surfaces as a tool error, never a crash
+        assert "organization" in str(error)
+    else:
+        assert result.get("provider") != "organization_readable"
+
+
+def test_cli_organization_override_is_validated(directories):
+    state, credentials = directories
+    base = ["--state-directory", str(state), "--credential-directory", str(credentials)]
+    assert salad.main(base + ["--organization", "../escape"]) == 2

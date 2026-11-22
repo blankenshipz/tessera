@@ -175,11 +175,43 @@ def test_file_mutation_during_read_denied(tmp_path, monkeypatch):
         chunk = original(fd, size)
         if chunk and not changed:
             changed = True
+            before = path.stat()
             path.write_bytes(DATA.replace(b"a,1,2", b"a,1,9"))
+            # Force a distinct mtime so the timestamp check never depends on the clock tick.
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
         return chunk
 
     monkeypatch.setattr(os, "read", read)
     with pytest.raises(DatasetIntegrityError):
+        verify_dataset_file(
+            tmp_path,
+            "dataset.csv",
+            DECLARATION,
+            expected_sha256=hashlib.sha256(DATA).hexdigest(),
+            expected_size=len(DATA),
+        )
+
+
+def test_same_tick_same_size_rewrite_is_caught_by_the_content_check(tmp_path, monkeypatch):
+    """Even when every timestamp and size is identical, the bytes must read back the same."""
+    path = tmp_path / "dataset.csv"
+    path.write_bytes(DATA)
+    frozen = os.stat(path)
+    original = os.read
+    changed = False
+
+    def read(fd, size):
+        nonlocal changed
+        chunk = original(fd, size)
+        if chunk and not changed:
+            changed = True
+            path.write_bytes(DATA.replace(b"a,1,2", b"a,1,9"))
+        return chunk
+
+    monkeypatch.setattr(os, "read", read)
+    monkeypatch.setattr(os, "fstat", lambda fd: frozen)
+    monkeypatch.setattr(os, "stat", lambda *args, **kwargs: frozen)
+    with pytest.raises(DatasetIntegrityError, match="changed while reading"):
         verify_dataset_file(
             tmp_path,
             "dataset.csv",

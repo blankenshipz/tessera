@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from .admin import AdminStore
+from .admin import AdminStore, ProviderTrustStore
 from .admin_models import (
     AdminCommand,
     AdminCreate,
@@ -14,10 +14,15 @@ from .admin_models import (
     SaladSetupView,
 )
 from .execution_api import Actor, Key, result
+from .external_agent_api import Actor as ExternalActor
 from .protected_secrets import ProtectedSecretStore
 from .store import Forbidden
 
-router = APIRouter(prefix="/admin/projects/{project_id}")
+# The project routes and the deployment-wide provider trust routes share one router so the
+# application includes a single object.
+router = APIRouter()
+project_router = APIRouter(prefix="/admin/projects/{project_id}")
+trust_router = APIRouter(prefix="/admin/provider-trust")
 
 
 def admin(request: Request) -> AdminStore:
@@ -27,7 +32,7 @@ def admin(request: Request) -> AdminStore:
 Administration = Annotated[AdminStore, Depends(admin)]
 
 
-@router.get("/records/{ident}/enrollment", response_model=AdminRecord)
+@project_router.get("/records/{ident}/enrollment", response_model=AdminRecord)
 def enrollment(
     project_id: Identifier, ident: Identifier, actor: Actor, store: Administration, request: Request
 ):
@@ -43,12 +48,12 @@ def enrollment(
     return ProtectedSecretStore(store.database_path.parent).inspect(actor, project_id, ident)
 
 
-@router.get("/records/{ident}/salad-setup", response_model=SaladSetupView)
+@project_router.get("/records/{ident}/salad-setup", response_model=SaladSetupView)
 def salad_setup(project_id: Identifier, ident: Identifier, actor: Actor, store: Administration):
     return store.salad_setup(actor, project_id, ident)
 
 
-@router.get("/records", response_model=AdminWorkspace)
+@project_router.get("/records", response_model=AdminWorkspace)
 def workspace(
     project_id: Identifier,
     actor: Actor,
@@ -59,14 +64,14 @@ def workspace(
     return store.workspace(actor, project_id, offset, limit)
 
 
-@router.post("/records", response_model=AdminRecord)
+@project_router.post("/records", response_model=AdminRecord)
 def create(
     project_id: Identifier, body: AdminCreate, actor: Actor, key: Key, store: Administration
 ):
     return result(store.create(actor, project_id, key, body.model_dump(mode="json")))
 
 
-@router.post("/records/{ident}/commands", response_model=AdminRecord)
+@project_router.post("/records/{ident}/commands", response_model=AdminRecord)
 def command(
     project_id: Identifier,
     ident: Identifier,
@@ -78,7 +83,7 @@ def command(
     return result(store.command(actor, project_id, ident, key, body.model_dump(mode="json")))
 
 
-@router.get("/audit")
+@project_router.get("/audit")
 def audit(
     project_id: Identifier,
     actor: Actor,
@@ -87,3 +92,33 @@ def audit(
     limit: int = Query(default=50, ge=1, le=100),
 ):
     return store.audit(actor, project_id, after, limit)
+
+
+def provider_trust_store(request: Request) -> ProviderTrustStore:
+    state = request.app.state
+    store = getattr(state, "provider_trust", None)
+    if store is None:
+        store = ProviderTrustStore(
+            state.admin.database_path.parent, path=getattr(state, "provider_trust_path", None)
+        )
+        state.provider_trust = store
+    return store
+
+
+TrustStore = Annotated[ProviderTrustStore, Depends(provider_trust_store)]
+
+
+@trust_router.get("")
+def read_provider_trust(actor: ExternalActor, store: TrustStore):
+    """The setting, its digest and load time: a human, or an agent with provider_trust:read."""
+    return store.read(actor)
+
+
+@trust_router.post("/reload")
+def reload_provider_trust(actor: Actor, key: Key, store: TrustStore):
+    """Human only: re-read the configured file; there is no write route."""
+    return result(store.reload(actor, key))
+
+
+router.include_router(project_router)
+router.include_router(trust_router)

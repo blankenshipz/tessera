@@ -6,9 +6,12 @@ control backup/held-recovery boundary. No provider client or credential lives he
 
 import json
 import uuid
+from contextlib import closing
 from datetime import UTC, datetime
 
+from .approval_trust import decision_provenance, require_decision_actor
 from .capabilities import CapabilityStore
+from .execution_targets import get_target, require_admission_hook
 from .experiments import admitted_attempt_package_identity
 from .programs import program_context
 from .remote_execution_models import (
@@ -19,8 +22,47 @@ from .remote_execution_models import (
     RemoteProposal,
     TargetPolicy,
     derived_salad_argv,
+    route_window_limit,
 )
+from .salad_workload_contract import capability_network_matches
 from .store import Conflict, Forbidden, NotFound, _connect, _parse_utc, canonical_digest, utc_now
+
+
+def _admit_workload(db, project_id, selection, worker_principal_id=None, *, create_shape=True):
+    """Workload_v1 admission bounds (disk, staged input, input-carried manifest), and
+    the Salad create-shape limits unless ``create_shape`` is False (start).
+
+    ``worker_principal_id`` is the operation's worker: with the target's provider id it is
+    the instance the provider trust setting (ADR 0040 section 4) is checked for. Returns
+    the admission evidence, or None without a staged input.
+    """
+    from .salad_workload_admission import check_workload_admission
+
+    try:
+        return check_workload_admission(
+            db, project_id, selection, worker_principal_id, create_shape=create_shape
+        )
+    except ValueError as error:
+        raise Conflict(f"Workload route refused: {error}.") from None
+
+
+# The budget scales with the approved window so a slow pull cannot exhaust it, but stays
+# bounded: max_seconds is capped at 7200 by the model, so the effective maximum is 752.
+# Storage cost: each effect plus its receipt is ~0.7 KB of route state, and every save
+# appends the whole state as a new event row, so history grows with the square of the
+# effect count (~100 MB per route at 382 effects, ~400 MB at 752). Accepted until the
+# execution-frame model (ADR 0041) replaces route-state history; create/start/stop/delete
+# remain one attempt each and observes consume the remainder.
+MIN_OBSERVE_INTERVAL_SECONDS = 10  # The live driver never observes faster than this.
+EFFECT_BUDGET_FLOOR = 128
+EFFECT_BUDGET_CEILING = 1024
+EFFECT_BUDGET_SLACK = 32  # create/start/stop/delete plus stop-confirmation observes.
+
+
+def effect_budget(max_seconds):
+    """Route effect cap derived from the approved window, clamped to [128, 1024]."""
+    needed = -(-int(max_seconds) // MIN_OBSERVE_INTERVAL_SECONDS) + EFFECT_BUDGET_SLACK
+    return max(EFFECT_BUDGET_FLOOR, min(EFFECT_BUDGET_CEILING, needed))
 
 
 class RemoteExecutionStore(CapabilityStore):
@@ -83,7 +125,9 @@ class RemoteExecutionStore(CapabilityStore):
             or package["pinned_image"] != proposal["selection"]["manifests"]["image"]
             or package["snapshot_digest"] != proposal["selection"]["manifests"]["data"]
             or proposal["selection"]["resources"]["max_seconds"]
-            > package["plan"]["max_duration_seconds"]
+            > route_window_limit(
+                proposal["selection"]["target"], package["plan"]["max_duration_seconds"]
+            )
         ):
             raise Conflict("Remote tenant/plan/attempt/package/manifest binding mismatch.")
         return dict(op), package
@@ -274,6 +318,7 @@ class RemoteExecutionStore(CapabilityStore):
             if count >= 32:
                 raise Conflict("Task remote proposal limit reached.")
             if body["selection"]["salad"]:
+                _admit_workload(db, op["project_id"], body["selection"], op["worker_principal_id"])
                 salad = body["selection"]["salad"]
                 if db.execute(
                     "SELECT 1 FROM events WHERE event_type='remote_execution.state' "
@@ -345,6 +390,8 @@ class RemoteExecutionStore(CapabilityStore):
 
         def command(db, live):
             self._human(live)
+            if body["command"] in {"approve", "start"}:
+                require_decision_actor(live, forbidden=Forbidden)
             state = self._load(db, live, ident)
             if (
                 state["revision"] != body["expected_revision"]
@@ -354,6 +401,7 @@ class RemoteExecutionStore(CapabilityStore):
             choice = body["command"]
             if choice in {"pause", "cancel"}:
                 state.update(desired="stop", cancellation="pending", state="stop_requested")
+                state["stop_provenance"] = decision_provenance(live)
                 # Pause means stop/hold, never process suspension or automatic resume.
                 op, _ = self._operation(db, live, state["proposal"])
                 grant = self._grant(db, live, op["grant_id"])
@@ -379,11 +427,21 @@ class RemoteExecutionStore(CapabilityStore):
             else:
                 op = self._current(db, live, state)
                 if choice == "approve" and state["state"] == "proposed":
+                    admission = _admit_workload(
+                        db,
+                        state["project_id"],
+                        state["proposal"]["selection"],
+                        op["worker_principal_id"],
+                    )
+                    if admission is not None:
+                        state["input_admission"] = admission
                     state.update(approved_by=live["id"], state="reviewed")
+                    state["approval_provenance"] = decision_provenance(live)
                 elif choice == "start" and state["state"] == "reviewed":
                     if state["proposal"]["selection"]["target"] == "kubernetes":
                         self._queue_kubernetes(db, live, state, op)
                     state.update(desired="run", state="queued")
+                    state["start_provenance"] = decision_provenance(live)
                 else:
                     raise Conflict("No resumable route; reconcile and obtain fresh authority.")
             return 200, self._save(db, live, state)
@@ -398,8 +456,13 @@ class RemoteExecutionStore(CapabilityStore):
             replay_guard=lambda db, live, r: self._load(db, live, ident),
         )
 
-    def begin(self, worker, ident, action, *, preflight_digest=None):
-        """No idempotent cached effect permission: commit one intent, then call provider."""
+    def begin(self, worker, ident, action, *, preflight_digest=None, expected_revision=None):
+        """No idempotent cached effect permission: commit one intent, then call provider.
+
+        ``expected_revision`` (default None: unchecked) makes a caller that evaluated the
+        route earlier fail with Conflict if the route changed since, in the same
+        transaction that commits the effect.
+        """
         if action not in {"create", "start", "stop", "delete", "observe"}:
             raise Conflict("Unsupported remote effect.")
 
@@ -408,11 +471,15 @@ class RemoteExecutionStore(CapabilityStore):
             op, _ = self._operation(db, live, state["proposal"])
             if live["id"] != op["worker_principal_id"]:
                 raise Forbidden("Wrong dispatcher worker.")
+            if expected_revision is not None and state["revision"] != expected_revision:
+                raise Conflict("Route changed since it was evaluated.")
             if state.get("dispatch_id") is not None:
                 raise Conflict(
                     "Kubernetes route uses the claimed dispatch outbox, not route effects."
                 )
-            if len(state["effects"]) >= 128:
+            if len(state["effects"]) >= effect_budget(
+                state["proposal"]["selection"]["resources"]["max_seconds"]
+            ):
                 raise Conflict(
                     "Remote observation budget exhausted; manual reconciliation required."
                 )
@@ -420,6 +487,11 @@ class RemoteExecutionStore(CapabilityStore):
                 raise Conflict("Effect already attempted; read-only reconciliation required.")
             if action in {"create", "start"}:
                 self._current(db, live, state)
+                spec = get_target(state["proposal"]["selection"]["target"])
+                if spec.billable and spec.admission_hook is None:
+                    raise Conflict("Billable target has no admission hook; refusing.")
+                if spec.admission_hook is not None:
+                    spec.admission_hook(db, live, state["proposal"], op)
                 if action == "start" and state["proposal"]["selection"]["target"] == "kubernetes":
                     raise Conflict(
                         "Kubernetes create includes start; separate restart is forbidden."
@@ -546,6 +618,77 @@ class RemoteExecutionStore(CapabilityStore):
             audience="worker",
         )[1]
 
+    def route_snapshots(self, worker):
+        """Read-only latest states of the routes THIS worker may act on (cleanup input).
+
+        A route is returned only if its organization is the worker's, its project is
+        accessible to the worker's credential, and its admitted external operation
+        names this worker principal: the same checks ``begin`` and ``record`` apply. A
+        route failing any of them is never returned, so it never reaches a provider port.
+        """
+        from .salad_group_cleanup import open_readonly, read_route_snapshots
+
+        with closing(open_readonly(self.database_path)) as db:
+            live = self._live_principal(db, worker, audience="worker")
+
+        def admit(db, state):
+            try:
+                self._project(db, live, state["project_id"])
+                op, _ = self._operation(db, live, state["proposal"])
+            except (Forbidden, NotFound, Conflict):
+                return False
+            return op["worker_principal_id"] == live["id"]
+
+        return read_route_snapshots(self.database_path, org_id=live["org_id"], admit=admit)
+
+    def record_group_cleanup(self, worker, ident, audit):
+        """Append one cleanup audit event; route identity fields come from the record."""
+
+        from pydantic import ValidationError
+
+        from .salad_group_cleanup import CleanupAudit
+
+        try:
+            audit = CleanupAudit.model_validate(audit).model_dump(mode="json", exclude_unset=True)
+        except ValidationError:
+            raise Conflict("Cleanup audit has an unsupported shape.") from None
+
+        def command(db, live):
+            state = self._load(db, live, ident)
+            op, _ = self._operation(db, live, state["proposal"])
+            if live["id"] != op["worker_principal_id"]:
+                raise Forbidden("Wrong dispatcher worker.")
+            salad = state["proposal"]["selection"].get("salad") or {}
+            payload = dict(
+                audit,
+                route_id=ident,
+                route_digest=state["proposal_digest"],
+                operation_id=state["proposal"]["operation_id"],
+                group=salad.get("group"),
+                provider_id=state.get("provider_id"),
+                route_state=state["state"],
+            )
+            self._event(
+                db,
+                live,
+                state["project_id"],
+                state["task_id"],
+                "remote.group_cleanup_recorded",
+                state["revision"],
+                payload,
+            )
+            return 201, payload
+
+        return self._mutate(
+            worker,
+            uuid.uuid4().hex,
+            "POST",
+            f"/internal/remote/{ident}/group-cleanup",
+            canonical_digest(audit),
+            command,
+            audience="worker",
+        )[1]
+
     def _provider_receipt_allowed(self, db, worker, state, effect_id):
         # Only a separately server-composed store can accept provider evidence.
         # Neither a public payload nor adapter injection activates this boundary.
@@ -597,6 +740,12 @@ class RemoteExecutionStore(CapabilityStore):
             action = effect["action"]
             if action in {"create", "start"}:
                 self._current(db, live, state)
+                # Salad-only path: a missing hook fails closed, never skips the budget.
+                try:
+                    hook = require_admission_hook(proposal["selection"]["target"])
+                except ValueError:
+                    raise Conflict("Salad target has no admission hook; refusing.") from None
+                state["budget_binding"] = hook(db, live, proposal, op)
                 if state["desired"] != "run" or state["reallocated"]:
                     raise Conflict("Salad proxy execution is fenced.")
             elif action in {"stop", "delete"} and state["desired"] != "stop":
@@ -646,7 +795,7 @@ class RemoteExecutionStore(CapabilityStore):
                     != proposal["selection"]["manifests"]["image"].split("@")[1]
                     or declaration["actions"]
                     or declaration["credential_refs"]
-                    or declaration["network"]
+                    or not capability_network_matches(execution, declaration)
                 ):
                     raise Conflict(
                         "Salad runtime acquisition/credential/network capabilities unsupported."

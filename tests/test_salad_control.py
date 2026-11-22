@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -44,6 +45,56 @@ def target(f):
     delegation = create(f, grant(f, record), "agent")
     delegation = command(f, delegation, "approve")
     return record, delegation
+
+
+def test_billing_policy_real_http_projection_replay_omission_and_no_admission(f, target, server):
+    record, _ = target
+    origin, token = server
+    control = SaladControl(origin, token, f["project"], record["id"])
+    policy = {
+        "mode": "aggregate_capped",
+        "ceiling_cents": 5000,
+        "ancillary_cents": 500,
+        "shutdown_cents": 1000,
+    }
+    args = (
+        "example-org",
+        "tessera-research",
+        "tessera-research",
+        record["revision"],
+        "billing-policy-cas",
+    )
+    result = control.configure(*args, billing_policy=policy)
+    assert result["billing"] == "aggregate_cap_unverified"
+    assert result["billing_declaration"]["accounting"] == "unknown"
+    assert result["billing_declaration"]["enforcement_verified"] is False
+    assert result["execution_enabled"] is False
+    assert result["control_integration"] == "metadata_only_connected"
+    assert (
+        control.configure(*args, billing_policy=policy)["record"]["revision"]
+        == result["record"]["revision"]
+    )
+    omitted = control.configure(
+        "example-org",
+        "tessera-research",
+        "tessera-research",
+        result["record"]["revision"],
+        "billing-omitted",
+    )
+    assert omitted["record"]["spec"]["billing_policy"] == result["record"]["spec"]["billing_policy"]
+    assert (
+        SaladControl(origin, token, f["project"], record["id"]).inspect()["record"]["revision"]
+        == omitted["record"]["revision"]
+    )
+    with pytest.raises(ControlUnavailable, match="invalid_setup_metadata"):
+        control.configure(
+            "example-org",
+            "tessera-research",
+            "tessera-research",
+            omitted["record"]["revision"],
+            "billing-widen",
+            billing_policy={"mode": "aggregate_capped", "ceiling_cents": 5001},
+        )
 
 
 @pytest.fixture
@@ -95,7 +146,7 @@ def test_rev003_configure_pins_delegated_token_across_owner_file_swap(
     result = None
     try:
         result = control.configure(
-            "luxai", "tessera-research", None, record["revision"], "pin-race"
+            "example-org", "tessera-research", None, record["revision"], "pin-race"
         )
     except ControlUnavailable:
         pass  # Examine actual authority DB, never log credential-bearing exceptions/headers.
@@ -113,7 +164,9 @@ def test_rev003_configure_pins_delegated_token_across_owner_file_swap(
     with pytest.raises(ControlUnavailable, match="separate_delegated_operator_required"):
         control.inspect()
     with pytest.raises(ControlUnavailable, match="separate_delegated_operator_required"):
-        control.configure("luxai", "other-name", None, result["record"]["revision"], "new-owner")
+        control.configure(
+            "example-org", "other-name", None, result["record"]["revision"], "new-owner"
+        )
     with sqlite3.connect(f["state"] / "tessera.sqlite3") as db:
         assert (
             db.execute(
@@ -158,7 +211,9 @@ def test_rev003_pinned_delegate_revocation_still_denied_before_post(
     with pytest.raises(
         ControlUnavailable, match="control_authentication_required|control_scope_denied"
     ):
-        control.configure("luxai", "tessera-research", None, record["revision"], "revoked-pin")
+        control.configure(
+            "example-org", "tessera-research", None, record["revision"], "revoked-pin"
+        )
     with sqlite3.connect(f["state"] / "tessera.sqlite3") as db:
         assert (
             db.execute(
@@ -231,8 +286,31 @@ def test_real_stdio_http_authoritative_replay_cas_and_reconnect(f, target, serve
     origin, token = server
 
     async def roundtrip(write):
+        # MCP's safe default environment deliberately excludes PYTHONPATH. Bind
+        # this test child to the same source tree as its HTTP control parent,
+        # rather than an unrelated editable installation in this interpreter.
+        source = str(Path(__file__).resolve().parents[1] / "src")
+        import subprocess
+
+        identity = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                "import tessera_operator.salad_control as m; print(m.__file__)",
+            ],
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": source},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert (
+            Path(identity.stdout.strip()).resolve()
+            == (Path(source) / "tessera_operator/salad_control.py").resolve()
+        )
         params = StdioServerParameters(
             command=sys.executable,
+            env={"PYTHONPATH": source, "PYTHONDONTWRITEBYTECODE": "1"},
             args=[
                 "-B",
                 "-m",
@@ -257,7 +335,7 @@ def test_real_stdio_http_authoritative_replay_cas_and_reconnect(f, target, serve
                 }
                 if write:
                     args = {
-                        "organization": "luxai",
+                        "organization": "example-org",
                         "expected_revision": record["revision"],
                         "idempotency_key": "setup-first",
                     }
@@ -284,7 +362,7 @@ def test_real_stdio_http_authoritative_replay_cas_and_reconnect(f, target, serve
                     )
                 result = await session.call_tool("salad_readiness", {})
                 view = json.loads(result.content[0].text)
-                assert view["record"]["spec"]["salad_organization"] == "luxai"
+                assert view["record"]["spec"]["salad_organization"] == "example-org"
                 assert view["record"]["spec"]["salad_project"] is None
                 assert view["proposed_project"] == "tessera-research"
                 assert view["provider_validation"] == "not_performed_by_control"
@@ -336,7 +414,7 @@ def test_no_owner_substitution_and_no_cache_success(f, target, server, tmp_path)
         SaladControl(origin, owner, f["project"], record["id"]).inspect()
     with pytest.raises(ControlUnavailable, match="separate_delegated_operator_required"):
         SaladControl(origin, owner, f["project"], record["id"]).configure(
-            "luxai", "tessera-research", None, record["revision"], "initial-owner"
+            "example-org", "tessera-research", None, record["revision"], "initial-owner"
         )
     with sqlite3.connect(f["state"] / "tessera.sqlite3") as db:
         assert (

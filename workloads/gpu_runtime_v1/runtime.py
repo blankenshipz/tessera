@@ -1,0 +1,1412 @@
+"""Generic reviewed GPU runtime (ADR 0036 phase 5); stdlib only.
+
+Fetches only what a hash-pinned manifest lists, verifies every byte before use,
+installs verified wheels offline, runs the single verified entry under a wall
+clock, and retains every declared output with the guardian (IMDS JWT, begin-once
+before the entry, the guardian's declared output plan, then chunked upload with
+per-file sha256). With a declared input snapshot it pulls the snapshot from the
+guardian after begin-once and verifies every chunk, file and the snapshot digest
+against the reviewed argv before the entry runs. Failures are detail-free.
+
+Argv (all tokens ``[A-Za-z0-9_.:/=-]``-class, see parse_argv)::
+
+    v1 OPERATION EPOCH CUSTODY_HOST WATCHDOG WORKLOAD_SECONDS MAX_OUTPUT_BYTES
+       MAX_OUTPUT_FILES MANIFEST_SHA256 [input:SNAPSHOT_SHA256:MAX_BYTES]
+       [redirect-hosts:HOSTS_SHA256] MANIFEST_REF...
+
+With a ``redirect-hosts:`` token the manifest must carry ``redirect_hosts``
+hashing to it; a fetch may then follow at most MAX_REDIRECTS HTTPS redirects to
+exactly those hosts (port 443). Without it no redirect is followed.
+
+MANIFEST_REF is one or more ``b64:<base64url>`` tokens whose payloads are
+concatenated and decoded (unpadded base64url), or, with an input token, exactly
+one ``input-manifest:FETCHES_SHA256:PATH`` token naming the manifest file inside
+the verified input snapshot. A ``file:/abs/path`` form exists only behind
+parse_argv(allow_file=True) for tests; reviewed contracts refuse it.
+
+A manifest item may instead be served from the verified input snapshot
+(``{"kind": "entry"|"file", "source": "input", "path": RELATIVE}``): it is not
+fetched, the snapshot digest pins its bytes, and the entry then runs from the
+read-only input tree.
+"""
+
+import base64
+import binascii
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import signal
+import ssl
+import stat
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+WORK_ROOT = "/tessera/work"
+MANIFEST_SCHEMA = "tessera.gpu-runtime.manifest.v1"
+STATUS_SCHEMA = "tessera.gpu-runtime-status.v1"
+MAX_MANIFEST_BYTES = 65536  # inline (argv) manifest
+MAX_FILE_MANIFEST_BYTES = 262144  # manifest carried as a file in the input snapshot
+MAX_FETCHES = 128  # equals the contract's egress.fetches cap
+MAX_TOTAL_FETCH_BYTES = 1 << 40  # sum of per-URL caps; the RemoteResources disk ceiling
+MAX_TOTAL_OUTPUT_BYTES = 16 * 1024 * 1024  # guardian custody total per operation
+MAX_OUTPUT_FILES = 16
+OUTPUT_CHUNK_BYTES = 1 << 20  # must equal the guardian's plan
+CHUNK_ATTEMPTS = 3  # per chunk; a chunk is idempotent at the guardian
+UPLOAD_RETRY_BUDGET = 8  # extra attempts across the whole upload
+OUTPUT_JSON = "output.json"
+_OUTPUT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+MIN_CLAIM_SECONDS = 60  # never spend the single claim with less than this left
+UPLOAD_GRACE_SECONDS = 100  # inside the guardian's 120 s billed upload grace
+KINDS = ("wheel", "file", "entry")
+INPUT_SOURCE = "input"
+INPUT_ITEM_KEYS = {"kind", "source", "path"}
+INPUT_ITEM_KINDS = ("entry", "file")
+_KIND_DIR = {"wheel": "wheels", "file": "files", "entry": "entry"}
+_DEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){0,7}")
+_CHUNK = 1 << 16
+_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+_INPUT_TOKEN = re.compile(r"input:([a-f0-9]{64}):([1-9][0-9]{0,9})")
+_INPUT_MANIFEST_TOKEN = re.compile(
+    rf"input-manifest:([a-f0-9]{{64}}):({_SEGMENT}(?:/{_SEGMENT}){{0,7}})"
+)
+
+# Staged input snapshot (ADR 0036 phase 2, ADR 0037). These mirror
+# tessera_worker.chunked_inputs exactly; tests check the two agree case by case.
+INPUT_DIR = "input"  # <work>/input, read-only once verified
+INPUT_CHUNK_BYTES = 4 * 1024 * 1024
+MAX_INPUT_BYTES = 8 * 1024 * 1024 * 1024  # the default operator artifact bound
+MAX_INPUT_FILES = 10000
+MAX_INPUT_MANIFEST_BYTES = 4 * 1024 * 1024
+# Every guardian input reply (the manifest, or one range of a stored chunk) is at most
+# INPUT_REPLY_BYTES so it fits the guardian's rate-derived request budget; a stored
+# 4 MiB chunk is read in ranges of at most INPUT_RANGE_BYTES and verified whole.
+INPUT_RANGE_BYTES = 1 << 20
+INPUT_REPLY_BYTES = INPUT_RANGE_BYTES * 4 // 3 + 4096
+INPUT_CHUNK_ATTEMPTS = 3  # transport failures only; equals the guardian's per-item bound
+INPUT_RETRY_BUDGET = 8  # extra attempts across the whole pull (guardian allows 12)
+_HEX64 = re.compile(r"[a-f0-9]{64}")
+# Reviewed redirects (equal to salad_workload_contract's rules; tests assert it).
+MAX_REDIRECTS = 3
+MAX_REDIRECT_HOSTS = 16
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_REDIRECT_TOKEN = re.compile(r"redirect-hosts:([a-f0-9]{64})")
+_DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_REDIRECT_HOST = re.compile(rf"(?=.{{1,253}}$){_DNS_LABEL}(?:\.{_DNS_LABEL})+")
+_LOCATION = re.compile(r"[\x21-\x7e]{1,2048}")
+_INDEX_KEYS = {"seq", "relative_path", "offset", "size", "sha256"}
+_INPUT_RANGE_KEYS = {"schema", "snapshot_id", "seq", "offset", "length", "content_base64"}
+
+
+class Failure(Exception):
+    """Intentionally detail-free; ``code`` is a closed, non-sensitive token."""
+
+    def __init__(self, code="failed"):
+        super().__init__(code)
+        self.code = code
+
+
+def encode(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+# --------------------------------------------------------------------- argv
+
+
+def parse_argv(argv, allow_file=False):
+    if not 10 <= len(argv) <= 32 or any(
+        not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9_.:/=-]{1,256}", v) for v in argv
+    ):
+        raise Failure("argv")
+    if argv[0] != "v1":
+        raise Failure("argv")
+    operation, epoch, host, watchdog, seconds, out_bytes, out_files, manifest_sha = argv[1:9]
+    ref = argv[9:]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", operation):
+        raise Failure("argv")
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", epoch):
+        raise Failure("argv")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,62}", host) or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", p) for p in host.split(".")
+    ):
+        raise Failure("argv")
+    if not re.fullmatch(r"[a-f0-9]{64}", watchdog) or not re.fullmatch(
+        r"[a-f0-9]{64}", manifest_sha
+    ):
+        raise Failure("argv")
+    if any(not re.fullmatch(r"[1-9][0-9]{0,7}", v) for v in (seconds, out_bytes, out_files)):
+        raise Failure("argv")
+    seconds, out_bytes, out_files = int(seconds), int(out_bytes), int(out_files)
+    if not (
+        MIN_CLAIM_SECONDS <= seconds <= 3600
+        and 1 <= out_bytes <= MAX_TOTAL_OUTPUT_BYTES
+        and 1 <= out_files <= MAX_OUTPUT_FILES
+    ):
+        raise Failure("argv")
+    expected_input = None
+    if ref and ref[0].startswith("input:"):
+        match = _INPUT_TOKEN.fullmatch(ref[0])
+        if match is None or not 1 <= int(match.group(2)) <= MAX_INPUT_BYTES:
+            raise Failure("argv")
+        expected_input = {"digest": match.group(1), "max_bytes": int(match.group(2))}
+        ref = ref[1:]
+    redirect_hosts_sha256 = None
+    if ref and ref[0].startswith("redirect-hosts:"):
+        match = _REDIRECT_TOKEN.fullmatch(ref[0])
+        if match is None:
+            raise Failure("argv")
+        redirect_hosts_sha256 = match.group(1)
+        ref = ref[1:]
+    manifest_in_input = None
+    if allow_file and len(ref) == 1 and ref[0].startswith("file:"):  # test-only
+        if not re.fullmatch(r"file:/[A-Za-z0-9_./-]{1,200}", ref[0]) or ".." in ref[0]:
+            raise Failure("argv")
+    elif len(ref) == 1 and ref[0].startswith("input-manifest:"):
+        match = _INPUT_MANIFEST_TOKEN.fullmatch(ref[0])
+        if expected_input is None or match is None or ".." in match.group(2).split("/"):
+            raise Failure("argv")
+        manifest_in_input = {"fetches_sha256": match.group(1), "path": match.group(2)}
+    elif not ref or any(not re.fullmatch(r"b64:[A-Za-z0-9_-]{1,250}", t) for t in ref):
+        raise Failure("argv")
+    return {
+        "operation": operation,
+        "epoch": epoch,
+        "destination": host,
+        "watchdog": watchdog,
+        "max_seconds": seconds,
+        "max_output_bytes": out_bytes,
+        "max_output_files": out_files,
+        "manifest_sha256": manifest_sha,
+        "manifest_ref": ref,
+        "input": expected_input,
+        "manifest_in_input": manifest_in_input,
+        "redirect_hosts_sha256": redirect_hosts_sha256,
+    }
+
+
+def binding_of(request):
+    """The exact guardian binding (matches the reviewed profile's derived request)."""
+    keys = (
+        "operation",
+        "epoch",
+        "destination",
+        "watchdog",
+        "max_seconds",
+        "max_output_bytes",
+        "max_output_files",
+    )
+    return {k: request[k] for k in keys}
+
+
+# ----------------------------------------------------------------- manifest
+
+
+def load_manifest(request):
+    """Return the verified, validated argv manifest. Digest is checked BEFORE parsing."""
+    if request.get("manifest_in_input") is not None:
+        raise Failure("manifest")  # read from the verified input after begin-once instead
+    ref = request["manifest_ref"]
+    try:
+        if ref[0].startswith("file:"):
+            with open(ref[0][5:], "rb") as handle:
+                raw = handle.read(MAX_MANIFEST_BYTES + 1)
+        else:
+            text = "".join(t[4:] for t in ref)
+            raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (OSError, binascii.Error, ValueError):
+        raise Failure("manifest") from None
+    manifest = parse_manifest(raw, request["manifest_sha256"], MAX_MANIFEST_BYTES)
+    bind_redirect_hosts(manifest, request)
+    return manifest
+
+
+def parse_manifest(raw, digest, cap):
+    if not raw or len(raw) > cap:
+        raise Failure("manifest")
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise Failure("manifest_digest")
+    try:
+        manifest = json.loads(raw)
+    except ValueError:
+        raise Failure("manifest") from None
+    return validate_manifest(manifest)
+
+
+def redirect_hosts_digest(hosts):
+    """Matches salad_workload_contract.redirect_hosts_digest: canonical JSON list."""
+    return hashlib.sha256(json.dumps(list(hosts), separators=(",", ":")).encode()).hexdigest()
+
+
+def bind_redirect_hosts(manifest, request):
+    """The manifest's ``redirect_hosts`` must hash to the reviewed argv token.
+
+    No token means the manifest must not name redirect hosts (no redirects).
+    """
+    hosts = manifest.get("redirect_hosts")
+    token = request.get("redirect_hosts_sha256")
+    if token is None:
+        if hosts is not None:
+            raise Failure("manifest")
+        return
+    if hosts is None or redirect_hosts_digest(hosts) != token:
+        raise Failure("manifest_redirects")
+
+
+def redirect_hosts_of(manifest):
+    return frozenset(manifest.get("redirect_hosts", ()))
+
+
+def _redirect_host_ok(host):
+    """Exact DNS name; no label is all digits or starts with 0x (no IP-like form)."""
+    return (
+        isinstance(host, str)
+        and _REDIRECT_HOST.fullmatch(host) is not None
+        and not any(label.isdigit() or label.startswith("0x") for label in host.split("."))
+    )
+
+
+def fetches_digest(rows):
+    """Matches salad_workload_contract.fetches_digest: sorted (url, sha256, max_bytes)."""
+    return hashlib.sha256(encode(sorted([r[0], r[1], r[2]] for r in rows))).hexdigest()
+
+
+def load_input_manifest(request, input_root):
+    """The manifest file inside the verified input snapshot, bound twice by argv.
+
+    Its sha256 is checked BEFORE parsing (exactly as the inline form), and its
+    (url, sha256, max_bytes) rows must hash to the reviewed FETCHES_SHA256, which
+    contract validation derived from ``egress.fetches``.
+    """
+    spec = request["manifest_in_input"]
+    try:
+        with _open_input_file(input_root, spec["path"]) as handle:
+            raw = handle.read(MAX_FILE_MANIFEST_BYTES + 1)
+    except Failure:
+        raise Failure("manifest") from None
+    except OSError:
+        raise Failure("manifest") from None
+    manifest = parse_manifest(raw, request["manifest_sha256"], MAX_FILE_MANIFEST_BYTES)
+    rows = [(f["url"], f["sha256"], f["max_bytes"]) for f in url_items(manifest)]
+    if fetches_digest(rows) != spec["fetches_sha256"]:
+        raise Failure("manifest_fetches")
+    bind_redirect_hosts(manifest, request)
+    return manifest
+
+
+def is_input_item(item):
+    """Served from the verified input snapshot (has ``source``), not fetched."""
+    return isinstance(item, dict) and "source" in item
+
+
+def url_items(manifest):
+    return [item for item in manifest["fetches"] if not is_input_item(item)]
+
+
+def input_items(manifest):
+    return [item for item in manifest["fetches"] if is_input_item(item)]
+
+
+def _validate_input_item(item):
+    """``{kind, source: input, path}`` only: no url/sha256/max_bytes, a bounded relative path."""
+    path = item.get("path")
+    if (
+        set(item) != INPUT_ITEM_KEYS
+        or item["source"] != INPUT_SOURCE
+        or item["kind"] not in INPUT_ITEM_KINDS
+        or not isinstance(path, str)
+        or not _DEST.fullmatch(path)
+        or ".." in path.split("/")
+    ):
+        raise Failure("manifest")
+    _input_path(path)
+    return item["kind"], path
+
+
+def validate_manifest(manifest):
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) - {"redirect_hosts"} != {"schema", "fetches"}
+        or manifest["schema"] != MANIFEST_SCHEMA
+        or not isinstance(manifest["fetches"], list)
+        or not 1 <= len(manifest["fetches"]) <= MAX_FETCHES
+    ):
+        raise Failure("manifest")
+    if "redirect_hosts" in manifest:
+        hosts = manifest["redirect_hosts"]
+        if (
+            not isinstance(hosts, list)
+            or not 1 <= len(hosts) <= MAX_REDIRECT_HOSTS
+            or not all(_redirect_host_ok(h) for h in hosts)
+            or hosts != sorted(set(hosts))
+        ):
+            raise Failure("manifest")
+    seen, entries, total = set(), 0, 0
+    for item in manifest["fetches"]:
+        if is_input_item(item):
+            try:
+                kind, path = _validate_input_item(item)
+            except Failure:
+                raise Failure("manifest") from None
+            if kind == "entry":
+                entries += 1
+                if not path.endswith(".py"):
+                    raise Failure("manifest")
+            if (INPUT_SOURCE, path) in seen:
+                raise Failure("manifest")
+            seen.add((INPUT_SOURCE, path))
+            continue
+        if not isinstance(item, dict) or set(item) != {
+            "url",
+            "sha256",
+            "max_bytes",
+            "kind",
+            "dest",
+        }:
+            raise Failure("manifest")
+        url, digest, cap, kind, dest = (
+            item[k] for k in ("url", "sha256", "max_bytes", "kind", "dest")
+        )
+        if (
+            not isinstance(url, str)
+            or not re.fullmatch(
+                r"https://[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?/[\x21-\x7e]{0,500}", url
+            )
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", digest)
+            or type(cap) is not int
+            or not 1 <= cap <= 8589934592
+            or kind not in KINDS
+            or not isinstance(dest, str)
+            or not _DEST.fullmatch(dest)
+            or ".." in dest.split("/")
+        ):
+            raise Failure("manifest")
+        if kind == "wheel" and ("/" in dest or not dest.endswith(".whl")):
+            raise Failure("manifest")
+        if kind == "entry":
+            entries += 1
+            if not dest.endswith(".py"):
+                raise Failure("manifest")
+        key = (kind, dest)
+        if key in seen:
+            raise Failure("manifest")
+        seen.add(key)
+        total += cap
+    if entries != 1 or total > MAX_TOTAL_FETCH_BYTES:
+        raise Failure("manifest")
+    return manifest
+
+
+# -------------------------------------------------------------------- fetch
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def open_url(url, timeout):
+    """One HTTPS GET: never follows a redirect, no proxy, no credentials. Patched in tests.
+
+    A redirect status is returned (not raised) so open_following can check its
+    Location; every other HTTP error raises. Each call builds a fresh request
+    with no headers, so nothing (no Authorization, no cookie) crosses a hop.
+    """
+    if not url.startswith("https://"):
+        raise Failure("fetch")
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        _NoRedirect(),
+    )
+    try:
+        return opener.open(urllib.request.Request(url, method="GET"), timeout=timeout)
+    except urllib.error.HTTPError as error:
+        if error.code in REDIRECT_STATUSES:
+            return error
+        raise
+
+
+def redirect_target(current, location, allowed):
+    """The absolute URL a redirect leads to, or Failure("redirect").
+
+    ``location`` is resolved against ``current`` (so a relative Location gets the
+    same check), and must be HTTPS to a host exactly in ``allowed`` on the
+    default port, without credentials. The fragment is dropped (never sent).
+    """
+    if not isinstance(location, str) or not _LOCATION.fullmatch(location):
+        raise Failure("redirect")
+    try:
+        parts = urllib.parse.urlsplit(urllib.parse.urljoin(current, location))
+        port = parts.port
+    except ValueError:
+        raise Failure("redirect") from None
+    host = parts.hostname
+    if (
+        parts.scheme != "https"
+        or host not in allowed
+        or parts.netloc not in (host, f"{host}:443")
+        or port not in (None, 443)
+    ):
+        raise Failure("redirect")
+    return urllib.parse.urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+
+
+def _location(response):
+    headers = getattr(response, "headers", None) or {}
+    get_all = getattr(headers, "get_all", None)
+    values = get_all("Location") if get_all else [headers.get("Location")]
+    values = [v for v in values or [] if v is not None]
+    return values[0] if len(values) == 1 else None
+
+
+def open_following(url, deadline, opener, allowed):
+    """GET ``url`` through ``opener`` (one hop per call), following reviewed redirects.
+
+    At most MAX_REDIRECTS redirects, each to an HTTPS URL on a host in
+    ``allowed`` (empty: none followed). Each hop's socket timeout is at most
+    the remaining wall clock divided by the hops that may still follow, and the
+    deadline is checked again when a hop returns. Returns the final
+    non-redirect response.
+    """
+    current = url
+    for hop in range(MAX_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Failure("deadline")
+        hops_left = MAX_REDIRECTS + 1 - hop if allowed else 1
+        response = opener(current, min(30, remaining / hops_left))
+        if time.monotonic() >= deadline:
+            response.close()
+            raise Failure("deadline")
+        if getattr(response, "status", 200) not in REDIRECT_STATUSES:
+            return response
+        try:
+            location = _location(response)
+        finally:
+            response.close()
+        if hop == MAX_REDIRECTS or not allowed:
+            raise Failure("redirect")
+        current = redirect_target(current, location, allowed)
+    raise Failure("redirect")  # unreachable: the last hop returns or raises
+
+
+def fetch_one(item, dest_path, deadline, opener=None, redirect_hosts=frozenset()):
+    """Stream to a .part file with a hard size cap, verify sha256, then rename.
+
+    ``opener`` performs one request per call; redirects are followed only to
+    ``redirect_hosts`` (see open_following). The cap and sha256 apply to the
+    final response's bytes, wherever they came from.
+    """
+    opener = opener or open_url
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise Failure("deadline")
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    part = dest_path + ".part"
+    digest, total = hashlib.sha256(), 0
+    try:
+        response = open_following(item["url"], deadline, opener, redirect_hosts)
+        try:
+            if getattr(response, "status", 200) != 200:
+                raise Failure("fetch")
+            declared = response.headers.get("Content-Length") if response.headers else None
+            if declared is not None and declared.isdigit() and int(declared) > item["max_bytes"]:
+                raise Failure("size")
+            with open(part, "wb") as out:
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise Failure("deadline")
+                    chunk = response.read(min(_CHUNK, item["max_bytes"] + 1 - total))
+                    # The whole body, including its final read, ends within the run
+                    # deadline; one blocking read is bounded by the hop's socket
+                    # timeout (at most the remaining time) and the process alarm.
+                    if time.monotonic() >= deadline:
+                        raise Failure("deadline")
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > item["max_bytes"]:
+                        raise Failure("size")
+                    digest.update(chunk)
+                    out.write(chunk)
+        finally:
+            response.close()
+        if digest.hexdigest() != item["sha256"]:
+            raise Failure("sha256")
+        os.chmod(part, 0o444)
+        os.replace(part, dest_path)
+    except Failure:
+        _unlink(part)
+        raise
+    except Exception:
+        _unlink(part)
+        raise Failure("fetch") from None
+    return {"url": item["url"], "sha256": item["sha256"], "bytes": total}
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def fetch_all(manifest, work, deadline, opener=None):
+    """Download+verify every URL item. Returns (paths-by-kind, fetched record list).
+
+    Input-sourced items are not fetched; resolve_input_items checks them later.
+    """
+    paths = {k: [] for k in KINDS}
+    fetched = []
+    hosts = redirect_hosts_of(manifest)  # bound to the argv token when loaded
+    for item in url_items(manifest):
+        target = os.path.join(work, _KIND_DIR[item["kind"]], item["dest"])
+        fetched.append(fetch_one(item, target, deadline, opener, hosts))
+        paths[item["kind"]].append(target)
+    return paths, fetched
+
+
+def install_wheels(wheels, work, deadline, runner=subprocess.run):
+    """Offline install of ONLY the verified wheel files into <work>/site."""
+    site = os.path.join(work, "site")
+    if not wheels:
+        return site
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise Failure("deadline")
+    command = [
+        sys.executable,
+        "-I",
+        "-m",
+        "pip",
+        "install",
+        "--isolated",
+        "--no-index",
+        "--no-deps",
+        "--no-cache-dir",
+        "--disable-pip-version-check",
+        "--no-compile",
+        "--target",
+        site,
+        "--find-links",
+        os.path.join(work, _KIND_DIR["wheel"]),
+        *wheels,
+    ]
+    try:
+        result = runner(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=remaining,
+            check=False,
+            env=_clean_env(work),
+        )
+    except Exception:
+        raise Failure("install") from None
+    if result.returncode != 0:
+        raise Failure("install")
+    return site
+
+
+def _clean_env(work):
+    return {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": work,
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_NO_INDEX": "1",
+    }
+
+
+def _entry_env(work, site):
+    """Reviewed contract env passes through; interpreter/pip/XDG state does not."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "PIP_", "XDG_"))}
+    env.update(HOME=work, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=site, PYTHONUNBUFFERED="1")
+    return env
+
+
+def _remove_tree(path):
+    """Remove a tree that may hold read-only (0555/0444) input; never follows symlinks."""
+    if not os.path.lexists(path):
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        for root, dirs, _ in os.walk(path, followlinks=False):
+            for name in [root, *(os.path.join(root, d) for d in dirs)]:
+                try:
+                    if not os.path.islink(name):
+                        os.chmod(name, 0o700)
+                except OSError:
+                    pass
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        _unlink(path)
+
+
+def prepare_work(work):
+    """Start from an empty work dir (plus a fresh out dir); nothing survives a restart."""
+    os.makedirs(work, exist_ok=True)
+    for name in os.listdir(work):
+        _remove_tree(os.path.join(work, name))
+    out_dir = os.path.join(work, "out")
+    os.makedirs(out_dir)
+    return out_dir
+
+
+# -------------------------------------------------------------------- input
+
+
+def _input_path(value):
+    """Mirror of tessera_worker.inputs._path: a bounded relative POSIX file path."""
+    try:
+        if isinstance(value, str):
+            value.encode()  # lone surrogates are malformed, as for the worker
+    except UnicodeError:
+        raise Failure("input") from None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode()) > 4096
+        or len(value.split("/")) > 64
+        or "\\" in value
+        or "\0" in value
+        or re.match(r"^[A-Za-z]:", value)
+        or any(part in {"", ".", ".."} or len(part.encode()) > 255 for part in value.split("/"))
+    ):
+        raise Failure("input")
+    return value
+
+
+def input_chunk_plan(entries):
+    """(seq, relative_path, offset, size) per fixed INPUT_CHUNK_BYTES chunk, manifest order."""
+    plan = []
+    for entry in entries:
+        size = entry["size"]
+        for offset in range(0, size, INPUT_CHUNK_BYTES):
+            plan.append(
+                (len(plan), entry["relative_path"], offset, min(INPUT_CHUNK_BYTES, size - offset))
+            )
+    return plan
+
+
+def verify_input_manifest(snapshot, digest):
+    """Mirror of chunked_inputs._verify_manifest: re-derive the digest, bound every entry."""
+    manifest = snapshot["manifest"]
+    if not isinstance(manifest, dict):
+        raise Failure("input")
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    if (
+        len(raw) > MAX_INPUT_MANIFEST_BYTES
+        or hashlib.sha256(raw).hexdigest() != digest
+        or snapshot["digest"] != digest
+        or set(manifest) != {"root", "entries", "exclusions", "total_bytes"}
+        or not isinstance(manifest["root"], str)
+        or not isinstance(manifest["exclusions"], list)
+        or len(manifest["exclusions"]) > 10000
+        or type(manifest["total_bytes"]) is not int
+        or not 0 <= manifest["total_bytes"] <= MAX_INPUT_BYTES
+    ):
+        raise Failure("input_digest")
+    for exclusion in manifest["exclusions"]:
+        if (
+            not isinstance(exclusion, dict)
+            or set(exclusion) != {"relative_path", "reason"}
+            or not all(isinstance(v, str) for v in exclusion.values())
+        ):
+            raise Failure("input")
+    entries = manifest["entries"]
+    if not isinstance(entries, list) or len(entries) > MAX_INPUT_FILES:
+        raise Failure("input")
+    expected, total = {}, 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise Failure("input")
+        path = _input_path(entry.get("relative_path"))
+        if (
+            set(entry) != {"relative_path", "size", "sha256", "provenance", "classification"}
+            or path in expected
+            or type(entry["size"]) is not int
+            or not 0 <= entry["size"] <= MAX_INPUT_BYTES
+            or not isinstance(entry["sha256"], str)
+            or not _HEX64.fullmatch(entry["sha256"])
+            or entry["provenance"] != "imported_unverified"
+            or entry["classification"] != "unclassified"
+        ):
+            raise Failure("input")
+        expected[path] = entry
+        total += entry["size"]
+    if total != manifest["total_bytes"]:
+        raise Failure("input")
+    aliases = {}
+    for path in expected:
+        parts = path.split("/")
+        for length in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:length])
+            alias = unicodedata.normalize("NFC", prefix).casefold()
+            if alias in aliases and aliases[alias] != prefix:
+                raise Failure("input")
+            aliases[alias] = prefix
+        for length in range(1, len(parts)):
+            if "/".join(parts[:length]) in expected:
+                raise Failure("input")  # a file path collides with a directory
+    return expected
+
+
+def verify_input_index(snapshot):
+    """Mirror of chunked_inputs._verify_index: the index is exactly the manifest's plan."""
+    index = snapshot["chunks"]
+    plan = input_chunk_plan(snapshot["manifest"]["entries"])
+    if not isinstance(index, list) or len(index) != len(plan):
+        raise Failure("input")
+    for item, (seq, path, offset, size) in zip(index, plan, strict=True):
+        if (
+            not isinstance(item, dict)
+            or set(item) != _INDEX_KEYS
+            or type(item["seq"]) is not int
+            or item["seq"] != seq
+            or item["relative_path"] != path
+            or type(item["offset"]) is not int
+            or item["offset"] != offset
+            or type(item["size"]) is not int
+            or item["size"] != size
+            or not isinstance(item["sha256"], str)
+            or not _HEX64.fullmatch(item["sha256"])
+        ):
+            raise Failure("input")
+    return index
+
+
+def decode_input_range(snapshot, item, offset, length, reply):
+    """One range reply: exact fields for the requested (seq, offset, length), canonical base64."""
+    if (
+        not isinstance(reply, dict)
+        or set(reply) != _INPUT_RANGE_KEYS
+        or reply["schema"] != "tessera.input-range.v1"
+        or reply["snapshot_id"] != snapshot["id"]
+        or any(
+            type(reply[k]) is not int or reply[k] != v
+            for k, v in (("seq", item["seq"]), ("offset", offset), ("length", length))
+        )
+    ):
+        raise Failure("input_chunk")
+    encoded = reply["content_base64"]
+    if not isinstance(encoded, str) or len(encoded) != ((length + 2) // 3) * 4:
+        raise Failure("input_chunk")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise Failure("input_chunk") from None
+    if len(content) != length or base64.b64encode(content).decode("ascii") != encoded:
+        raise Failure("input_chunk")
+    return content
+
+
+def verify_input_chunk(item, content):
+    """The reassembled stored chunk must match its index entry (size and sha256)."""
+    if len(content) != item["size"] or hashlib.sha256(content).hexdigest() != item["sha256"]:
+        raise Failure("input_chunk")
+    return content
+
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _walk_dirs(root_fd, parts, create):
+    """Open (optionally creating 0700) each directory below root_fd without following links."""
+    fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            next_fd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_input_file(root, relative):
+    """Read-only regular file inside the verified input tree (no symlink anywhere)."""
+    parts = _input_path(relative).split("/")
+    root_fd = os.open(root, _DIR_FLAGS)
+    try:
+        parent = _walk_dirs(root_fd, parts[:-1], create=False)
+    finally:
+        os.close(root_fd)
+    try:
+        fd = os.open(parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent)
+    finally:
+        os.close(parent)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise Failure("input")
+    return os.fdopen(fd, "rb")
+
+
+def resolve_input_items(manifest, input_root):
+    """Every input-sourced item must be a regular file of the verified tree.
+
+    Opened without following any link (``_open_input_file``). Returns the
+    absolute path of the input-sourced entry, or None when the entry is fetched.
+    The tree was written by fetch_input from verified chunks only and is
+    read-only; the entry runs from it in place.
+    """
+    entry = None
+    for item in input_items(manifest):
+        if input_root is None:
+            raise Failure("manifest")
+        try:
+            with _open_input_file(input_root, item["path"]):
+                pass
+        except (Failure, OSError):
+            raise Failure("input_item") from None
+        if item["kind"] == "entry":
+            entry = os.path.join(input_root, *item["path"].split("/"))
+    return entry
+
+
+def fetch_input(custody, expected, work, deadline):
+    """Pull, verify and materialize the declared input snapshot read-only at <work>/input.
+
+    The expected digest and byte cap come from the reviewed argv, never from the
+    guardian. The manifest digest is re-derived and the chunk index must be exactly
+    the manifest's plan. Each stored chunk is read in ranges of at most
+    INPUT_RANGE_BYTES (exact range fields, canonical base64), reassembled and
+    checked against its index size and sha256 before it is written; then every
+    file's size and sha256 and the total. Transport failures are retried
+    within INPUT_CHUNK_ATTEMPTS per range and INPUT_RETRY_BUDGET overall; a
+    verification mismatch is never retried. Any failure removes the partial tree.
+    """
+    spare = [INPUT_RETRY_BUDGET]
+
+    def call(**body):
+        for attempt in range(INPUT_CHUNK_ATTEMPTS):
+            if time.monotonic() >= deadline:
+                raise Failure("deadline")
+            try:
+                return custody.input_request(body)
+            except Failure:
+                if attempt + 1 == INPUT_CHUNK_ATTEMPTS or spare[0] == 0:
+                    raise Failure("input_fetch") from None
+                spare[0] -= 1
+        raise Failure("input_fetch")  # pragma: no cover
+
+    reply = call(request="manifest")
+    if (
+        set(reply) != {"schema", "snapshot_id", "digest", "manifest", "delivery", "chunks"}
+        or reply["schema"] != "tessera.input-manifest.v1"
+        or reply["delivery"] != "chunked"
+        or not isinstance(reply["snapshot_id"], str)
+        or not reply["snapshot_id"]
+    ):
+        raise Failure("input")
+    if reply["digest"] != expected["digest"]:
+        raise Failure("input_digest")
+    snapshot = {k: reply[k] for k in ("digest", "manifest", "delivery", "chunks")}
+    snapshot["id"] = reply["snapshot_id"]
+    files = verify_input_manifest(snapshot, expected["digest"])
+    index = verify_input_index(snapshot)
+    if snapshot["manifest"]["total_bytes"] > expected["max_bytes"]:
+        raise Failure("input_size")
+    root = os.path.join(work, INPUT_DIR)
+    os.mkdir(root, 0o700)  # never pre-existing: prepare_work emptied <work>
+    directories = {root}
+    try:
+        root_fd = os.open(root, _DIR_FLAGS)
+        try:
+            by_path = {}
+            for item in index:
+                by_path.setdefault(item["relative_path"], []).append(item)
+            total = 0
+            for path, entry in files.items():
+                parts = path.split("/")
+                parent = _walk_dirs(root_fd, parts[:-1], create=True)
+                for length in range(1, len(parts)):
+                    directories.add(os.path.join(root, *parts[:length]))
+                try:
+                    fd = os.open(
+                        parts[-1],
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=parent,
+                    )
+                finally:
+                    os.close(parent)
+                digest, written = hashlib.sha256(), 0
+                with os.fdopen(fd, "wb") as out:
+                    for item in by_path.get(path, []):
+                        parts = []
+                        for offset in range(0, item["size"], INPUT_RANGE_BYTES):
+                            length = min(INPUT_RANGE_BYTES, item["size"] - offset)
+                            reply = call(
+                                request="chunk", seq=item["seq"], offset=offset, length=length
+                            )
+                            parts.append(decode_input_range(snapshot, item, offset, length, reply))
+                        # Nothing is written until the whole stored chunk verifies.
+                        content = verify_input_chunk(item, b"".join(parts))
+                        written += len(content)
+                        total += len(content)
+                        if written > entry["size"] or total > expected["max_bytes"]:
+                            raise Failure("input_size")
+                        digest.update(content)
+                        out.write(content)
+                    if written != entry["size"] or digest.hexdigest() != entry["sha256"]:
+                        raise Failure("input_file")
+                    out.flush()
+                    os.fchmod(out.fileno(), 0o444)
+            if total != snapshot["manifest"]["total_bytes"]:
+                raise Failure("input")
+        finally:
+            os.close(root_fd)
+        for path in sorted(directories, key=len, reverse=True):
+            os.chmod(path, 0o555)
+    except Failure:
+        _remove_tree(root)
+        raise
+    except BaseException:
+        _remove_tree(root)
+        raise
+    return root
+
+
+# ------------------------------------------------------------------- custody
+
+
+class HTTPSCustody:
+    """Guardian protocol of the reviewed smoke recipe (IMDS JWT, begin-once, output).
+
+    Mirrors workloads/salad_gpu_smoke/smoke.py: no unauthenticated fallback,
+    redirects, management key, or env lookup. Binding comes from argv.
+    """
+
+    def __init__(self, binding, deadline):
+        self.binding = binding
+        self.deadline = deadline
+        self.context = ssl.create_default_context()
+        self.token, self.token_expires = self.identity()
+
+    def identity(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise Failure("custody")
+        conn = http.client.HTTPConnection("169.254.169.254", 80, timeout=min(5, remaining))
+        try:
+            conn.request("GET", "/v1/token", headers={"Metadata": "true"})
+            response = conn.getresponse()
+            if response.status != 200:
+                raise Failure("custody")
+            raw = response.read(4097)
+            if len(raw) > 4096 or time.monotonic() >= self.deadline:
+                raise Failure("custody")
+            body = json.loads(raw)
+            token = body.get("jwt") if isinstance(body, dict) else None
+            if (
+                not isinstance(token, str)
+                or not 1 <= len(token) <= 1000
+                or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token)
+            ):
+                raise Failure("custody")
+            payload = token.split(".")[1]
+            claims = json.loads(
+                base64.b64decode(payload + "=" * (-len(payload) % 4), altchars=b"-_", validate=True)
+            )
+            expiry = claims.get("exp") if isinstance(claims, dict) else None
+            # Unverified expiry is ONLY a refresh hint. Server verifies all claims.
+            if type(expiry) is not int or expiry <= time.time():
+                raise Failure("custody")
+            return token, expiry
+        except Exception:
+            raise Failure("custody") from None
+        finally:
+            conn.close()
+
+    def post(self, path, body, cap=4096, timeout=10):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise Failure("custody")
+        conn = http.client.HTTPSConnection(
+            self.binding["destination"], 443, timeout=min(timeout, remaining), context=self.context
+        )
+        try:
+            conn.request(
+                "POST",
+                path,
+                body=encode(body),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + self.token,
+                },
+            )
+            response = conn.getresponse()
+            if response.status != 200:
+                raise Failure("custody")
+            raw = response.read(cap + 1)
+            if len(raw) > cap or time.monotonic() >= self.deadline:
+                raise Failure("custody")
+            result = json.loads(raw)
+            if not isinstance(result, dict):
+                raise Failure("custody")
+            return result
+        except Exception:
+            raise Failure("custody") from None
+        finally:
+            conn.close()
+
+    def begin_once(self):
+        result = self.post("/v1/workload/begin-once", {"binding": self.binding})
+        return result == {
+            "schema": "tessera.begin-once.v1",
+            "granted": True,
+            "operation": self.binding["operation"],
+            "epoch": self.binding["epoch"],
+        }
+
+    def retain(self, output, digest):
+        # At most one proactive refresh, solely for upload, never claim/compute retry.
+        if time.time() >= self.token_expires - 15:
+            self.token, self.token_expires = self.identity()
+        result = self.post(
+            "/v1/workload/output",
+            {"binding": self.binding, "sha256": digest, "output": json.loads(output)},
+        )
+        return result == {
+            "schema": "tessera.retained.v1",
+            "sha256": digest,
+            "operation": self.binding["operation"],
+            "epoch": self.binding["epoch"],
+            "retained": True,
+        }
+
+    def _refresh(self):
+        if time.time() >= self.token_expires - 15:
+            self.token, self.token_expires = self.identity()
+
+    def input_request(self, request):
+        """One read of the staged input from the guardian (manifest or one chunk).
+
+        Same IMDS identity and binding as begin-once; the ticket stays in the
+        guardian. Replies are bounded like tessera_worker.provider_inputs.
+        """
+        self._refresh()
+        return self.post(
+            "/v1/workload/input",
+            {"binding": self.binding, **request},
+            cap=INPUT_REPLY_BYTES,
+            timeout=30,
+        )
+
+    def output_plan(self):
+        """The guardian's declared outputs for this operation (after begin-once)."""
+        result = self.post("/v1/workload/outputs", {"binding": self.binding})
+        if (
+            set(result) != {"schema", "operation", "epoch", "chunk_bytes", "outputs"}
+            or result["schema"] != "tessera.output-plan.v1"
+            or result["operation"] != self.binding["operation"]
+            or result["epoch"] != self.binding["epoch"]
+        ):
+            raise Failure("custody")
+        return result
+
+    def put_chunk(self, name, size, digest, seq, data):
+        """One idempotent chunk; returns (file_complete, outputs_complete)."""
+        self._refresh()
+        result = self.post(
+            "/v1/workload/output-chunk",
+            {
+                "binding": self.binding,
+                "name": name,
+                "sha256": digest,
+                "bytes": size,
+                "seq": seq,
+                "chunk_sha256": hashlib.sha256(data).hexdigest(),
+                "content_base64": base64.b64encode(data).decode("ascii"),
+            },
+        )
+        if (
+            set(result)
+            != {
+                "schema",
+                "operation",
+                "epoch",
+                "name",
+                "seq",
+                "stored",
+                "file_complete",
+                "outputs_complete",
+            }  # fmt: skip
+            or result["schema"] != "tessera.output-chunk.v1"
+            or result["operation"] != self.binding["operation"]
+            or result["epoch"] != self.binding["epoch"]
+            or result["name"] != name
+            or result["seq"] != seq
+            or result["stored"] is not True
+            or type(result["file_complete"]) is not bool
+            or type(result["outputs_complete"]) is not bool
+        ):
+            raise Failure("custody")
+        return result["file_complete"], result["outputs_complete"]
+
+
+# ---------------------------------------------------------------- entry run
+
+
+def run_entry(entry, work, site, out_dir, deadline, runner=subprocess.Popen):
+    """Run the verified entry: ``python entry WORK_DIR OUT_DIR`` with a hard wall clock."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise Failure("deadline")
+    env = _entry_env(work, site)
+    try:
+        proc = runner(
+            [sys.executable, "-B", entry, work, out_dir],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            cwd=work,
+            start_new_session=True,
+        )
+    except Exception:
+        raise Failure("entry") from None
+    try:
+        code = proc.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        _kill(proc)
+        raise Failure("entry_timeout") from None
+    except BaseException:
+        _kill(proc)
+        raise
+    if code != 0:
+        raise Failure("entry")
+
+
+def _kill(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, AttributeError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def validate_plan(plan, request):
+    """The guardian's declared outputs must agree with the reviewed argv literals."""
+    outputs = plan.get("outputs")
+    if (
+        plan.get("chunk_bytes") != OUTPUT_CHUNK_BYTES
+        or not isinstance(outputs, list)
+        or len(outputs) != request["max_output_files"]
+    ):
+        raise Failure("output_plan")
+    names, total = set(), 0
+    for item in outputs:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "max_bytes"}
+            or not isinstance(item["name"], str)
+            or not _OUTPUT_NAME.fullmatch(item["name"])
+            or item["name"] in names
+            or type(item["max_bytes"]) is not int
+            or not 1 <= item["max_bytes"] <= MAX_TOTAL_OUTPUT_BYTES
+        ):
+            raise Failure("output_plan")
+        names.add(item["name"])
+        total += item["max_bytes"]
+    if total != request["max_output_bytes"]:
+        raise Failure("output_plan")
+    return [(item["name"], item["max_bytes"]) for item in outputs]
+
+
+def _open_output(out_dir, name):
+    """A declared output must be a regular file directly in out_dir (no symlinks)."""
+    try:
+        fd = os.open(os.path.join(out_dir, name), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise Failure("output") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Failure("output")
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "rb")
+
+
+def read_output(out_dir, fetched, max_bytes):
+    """output.json must be one JSON object; the runtime adds the `fetched` list."""
+    try:
+        with _open_output(out_dir, OUTPUT_JSON) as handle:
+            raw = handle.read(max_bytes + 1)
+        value = json.loads(raw)
+    except Failure:
+        raise
+    except (OSError, ValueError):
+        raise Failure("output") from None
+    if len(raw) > max_bytes or not isinstance(value, dict) or "fetched" in value:
+        raise Failure("output")
+    value["fetched"] = fetched
+    try:
+        output = encode(value)
+    except (TypeError, ValueError):
+        raise Failure("output") from None
+    if not output or len(output) > max_bytes:
+        raise Failure("output")
+    return output
+
+
+def stage_outputs(out_dir, stage_dir, plan, fetched):
+    """Snapshot every declared output into stage_dir before any byte is uploaded.
+
+    All-or-nothing: a missing, non-regular or oversize declared file fails before
+    the first chunk. Undeclared files in out_dir are never uploaded. output.json,
+    when declared, gets the runtime's ``fetched`` record. Returns
+    ``[(name, staged_path, size, sha256)]`` in plan order.
+    """
+    os.makedirs(stage_dir, mode=0o700)
+    staged = []
+    for name, cap in plan:
+        target = os.path.join(stage_dir, name)
+        digest, size = hashlib.sha256(), 0
+        with open(target, "xb") as out:
+            if name == OUTPUT_JSON:
+                data = read_output(out_dir, fetched, cap)
+                out.write(data)
+                digest.update(data)
+                size = len(data)
+            else:
+                with _open_output(out_dir, name) as source:
+                    while True:
+                        chunk = source.read(min(_CHUNK, cap + 1 - size))
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > cap:
+                            raise Failure("output")
+                        digest.update(chunk)
+                        out.write(chunk)
+        os.chmod(target, 0o400)
+        staged.append((name, target, size, digest.hexdigest()))
+    return staged
+
+
+def upload_outputs(custody, staged):
+    """Chunked, idempotent upload of every staged output, with bounded retries.
+
+    One chunk is in memory at a time. Each chunk is retried at most
+    CHUNK_ATTEMPTS times and UPLOAD_RETRY_BUDGET extra attempts in total; the
+    guardian independently bounds chunk calls. Success requires every file to be
+    reported complete and the final chunk to report all declared outputs complete.
+    """
+    spare = UPLOAD_RETRY_BUDGET
+    complete = False
+    for name, path, size, digest in staged:
+        chunks = max(1, -(-size // OUTPUT_CHUNK_BYTES))
+        file_complete = False
+        with open(path, "rb") as handle:
+            for seq in range(chunks):
+                data = handle.read(OUTPUT_CHUNK_BYTES)
+                for attempt in range(CHUNK_ATTEMPTS):
+                    try:
+                        file_complete, complete = custody.put_chunk(name, size, digest, seq, data)
+                        break
+                    except Failure:
+                        if attempt + 1 == CHUNK_ATTEMPTS or spare == 0:
+                            raise
+                        spare -= 1
+        if not file_complete:
+            raise Failure("custody")
+    if not complete:
+        raise Failure("custody")
+    return [{"name": n, "sha256": d, "bytes": z} for n, _, z, d in staged]
+
+
+def execute(
+    request,
+    deadline,
+    work=WORK_ROOT,
+    custody_factory=HTTPSCustody,
+    opener=None,
+    installer=install_wheels,
+    entry_runner=run_entry,
+):
+    from_input = request.get("manifest_in_input") is not None
+    expected_input = request.get("input")
+    if from_input and expected_input is None:
+        raise Failure("argv")
+    manifest = None if from_input else load_manifest(request)
+    if manifest is not None and input_items(manifest) and expected_input is None:
+        raise Failure("manifest")  # an input-sourced item needs a declared input
+    work = os.path.realpath(work)
+    out_dir = prepare_work(work)
+    if manifest is not None:
+        # Inline manifest: everything is fetched and verified before the claim.
+        paths, fetched = fetch_all(manifest, work, deadline, opener)
+        site = installer(paths["wheel"], work, deadline)
+    # An uncertain/lost/rejected claim is terminal. Never retry or release a claim.
+    if deadline - time.monotonic() < MIN_CLAIM_SECONDS:
+        raise Failure("deadline")
+    custody = custody_factory(binding_of(request), deadline + UPLOAD_GRACE_SECONDS)
+    if custody.begin_once() is not True:
+        raise Failure("custody")
+    plan = validate_plan(custody.output_plan(), request)
+    input_root = None
+    if expected_input is not None:
+        # Only a reviewed input declaration fetches; none declared means none fetched.
+        input_root = fetch_input(custody, expected_input, work, deadline)
+        if from_input:
+            manifest = load_input_manifest(request, input_root)
+            paths, fetched = fetch_all(manifest, work, deadline, opener)
+            site = installer(paths["wheel"], work, deadline)
+    entry = resolve_input_items(manifest, input_root) or paths["entry"][0]
+    entry_runner(entry, work, site, out_dir, deadline)
+    staged = stage_outputs(out_dir, os.path.join(work, "staged"), plan, fetched)
+    return upload_outputs(custody, staged)
+
+
+def main(argv):
+    armed = False
+    work = WORK_ROOT
+    try:
+        request = parse_argv(argv)
+
+        def expired(signum, frame):
+            raise Failure("deadline")
+
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, request["max_seconds"] + UPLOAD_GRACE_SECONDS)
+        armed = True
+        deadline = time.monotonic() + request["max_seconds"]
+        outputs = execute(request, deadline, work)
+        print(encode({"schema": STATUS_SCHEMA, "status": "retained", "outputs": outputs}).decode())
+        return 0
+    except BaseException as exc:
+        code = exc.code if isinstance(exc, Failure) else "failed"
+        print(encode({"schema": STATUS_SCHEMA, "status": "failed", "reason": code}).decode())
+        return 1
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        shutil.rmtree(os.path.join(work, "out"), ignore_errors=True)
+        shutil.rmtree(os.path.join(work, "staged"), ignore_errors=True)
+        _remove_tree(os.path.join(work, INPUT_DIR))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

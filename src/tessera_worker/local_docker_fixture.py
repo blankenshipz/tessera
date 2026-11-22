@@ -27,9 +27,20 @@ from .local_docker_contract import (
     capture_archive,
     log_records,
     message,
+    require_class_match,
 )
 from .local_docker_engine import DockerCLI, LocalDockerEngine, safe_engine_error
-from .local_docker_namespace import NamespaceUnknown, require
+from .local_docker_namespace import ATTESTATION, STRONG_CLASS, WEAK_CLASS, NamespaceUnknown, require
+
+
+def unknown_network(error):
+    """Finite gate, plus a bounded sanitized interface-name list when the verifier set one."""
+    result = dict(state="unknown", gate=str(error))
+    if error.interfaces is not None:
+        result["interfaces"] = list(error.interfaces)
+    if error.sysfs_other is not None:
+        result["sysfs_other"] = list(error.sysfs_other)
+    return result
 
 
 class FixtureJournal(CapabilityJournal):
@@ -170,8 +181,26 @@ class FixtureJournal(CapabilityJournal):
                 or canonical_digest(manifest) != records["custody"]["manifest_digest"]
             ):
                 raise JournalConflict("fixture custody integrity")
+        plan = self.plan()
+        attestation = plan.attestation
+        for key in ("network_preflight", "network"):
+            recorded = observations.get(key)
+            if recorded is None:
+                continue
+            for field, expected in attestation.items():
+                # Historical strong records predate the class fields; a weak plan
+                # never has that excuse. A present value must equal the plan's.
+                if (field in recorded or plan.attestation_class != STRONG_CLASS) and recorded.get(
+                    field
+                ) != expected:
+                    raise JournalConflict("fixture attestation class mismatch")
+        container_cleaned = any(v.get("cleanup_confirmed") is True for v in observations.values())
+        volume_cleaned = any(
+            v.get("volume_cleanup_confirmed") is True for v in observations.values()
+        )
         return dict(
             profile=self.plan().profile,
+            **attestation,
             package_digest=self.plan().digest,
             operation_id=self.plan().operation_id,
             nonce=self.plan().nonce,
@@ -183,9 +212,13 @@ class FixtureJournal(CapabilityJournal):
             termination_confirmed=any(
                 v.get("termination_confirmed") is True for v in observations.values()
             ),
-            cleanup_confirmed=any(
-                v.get("cleanup_confirmed") is True for v in observations.values()
-            ),
+            container_cleanup_confirmed=container_cleaned,
+            volume_name=self.plan().output_volume_name,
+            volume_created="volume_created" in observations,
+            volume_cleanup_confirmed=volume_cleaned,
+            # Removal is owed only once a volume create was even attempted.
+            cleanup_confirmed=container_cleaned
+            and (volume_cleaned or "volume_intent" not in observations),
             evidence_digest=canonical_digest(records),
             records=records,
         )
@@ -209,9 +242,12 @@ def supervise(
             docker_call_seconds=2,
         ),
     )
+    attest = plan.attestation
+    expected_state = ATTESTATION[plan.attestation_class]["state"]
     image_id = None
     cid = None
     possible = False
+    volume_possible = False
     deadline = clock() + plan.runtime_seconds
     heartbeat = clock()
     sequence = 1
@@ -221,9 +257,28 @@ def supervise(
         journal.event("image", dict(image_id=image_id))
         namespace_ready = engine.namespace_preflight()
         require(namespace_ready.get("state") == "available", "namespace_preflight_unknown")
-        journal.event("network_preflight", namespace_ready)
+        journal.event("network_preflight", dict(namespace_ready) | attest)
         if clock() >= deadline:
             raise BackendBlocked("preflight deadline")
+        # /output is an exact-named tmpfs-typed local volume so the daemon archive API
+        # can read it. Intent is durable before the effect; a lost reply never retries.
+        journal.event(
+            "volume_intent",
+            dict(volume=plan.output_volume_name, options=plan.output_volume_options),
+        )
+        volume_possible = True
+        volume = engine.create_volume(plan)
+        journal.event(
+            "volume_created",
+            dict(
+                volume=plan.output_volume_name,
+                driver=volume.get("Driver"),
+                options=volume.get("Options"),
+                labels_sha256=canonical_digest(volume.get("Labels") or {}),
+            ),
+        )
+        if clock() >= deadline:
+            raise BackendBlocked("volume deadline")
         journal.event("create_intent", dict(container_name=plan.name, image_id=image_id))
         possible = True  # Lost create response is not permission to create again.
         cid = engine.create(plan, image_id)
@@ -267,12 +322,23 @@ def supervise(
                 if not released:
                     try:
                         proof = engine.verify_network(plan, image_id, cid)
-                        require(proof.get("state") == "verified", "namespace_proof_unknown")
+                        # Exact equality on state and (when reported) class: a weak
+                        # proof can never satisfy the strong class, nor the reverse.
+                        require(proof.get("state") == expected_state, "namespace_proof_unknown")
+                        # Historical strong proofs carry no class field; weak always does.
+                        require(
+                            proof.get(
+                                "attestation_class",
+                                STRONG_CLASS if plan.attestation_class == STRONG_CLASS else None,
+                            )
+                            == plan.attestation_class,
+                            "namespace_proof_unknown",
+                        )
                     except NamespaceUnknown as error:
-                        journal.event("network", dict(state="unknown", gate=str(error)))
+                        journal.event("network", unknown_network(error) | attest)
                         state, reason = "blocked", "network_namespace_unknown"
                         break
-                    journal.event("network", proof)
+                    journal.event("network", dict(proof) | attest)
                     # Recheck the independent deadline after all blocking Docker reads.
                     if clock() >= deadline or clock() - heartbeat >= 3:
                         state, reason = "unknown", "deadline"
@@ -282,12 +348,15 @@ def supervise(
                     journal.event("released", dict(container_id=cid))
             if len(logs) == 2:
                 journal.event("logs", dict(records=logs))
-                # tmpfs disappears on stop. Freeze ALL writers before exact-root
+                # The volume is removed after stop. Freeze ALL writers before exact-root
                 # capture. Never call Docker cp with a host destination or extract.
                 engine.run(["pause", cid])
                 paused = engine.inspect(plan, image_id, cid)
                 if not paused["State"].get("Paused"):
                     raise BackendBlocked("writers not frozen")
+                if plan.attestation_class == WEAK_CLASS:
+                    # Weak class re-checks the engine-declared readback before custody.
+                    engine.verify_security(paused)
                 raw_archive = engine.run(["cp", cid + ":/output", "-"])
                 try:
                     content = capture_archive(raw_archive)
@@ -327,7 +396,7 @@ def supervise(
                 raise BackendBlocked("unexpected early exit")
             sleep(0.05)
     except NamespaceUnknown as error:
-        journal.event("network", dict(state="unknown", gate=str(error)))
+        journal.event("network", unknown_network(error) | attest)
         state, reason = "blocked", "network_namespace_preflight_unknown"
     except BaseException:
         state, reason = (
@@ -339,25 +408,30 @@ def supervise(
         # Unknown is committed BEFORE kill; later independent inspect may confirm
         # termination, but never rewrites an uncertain execution as success.
         try:
-            journal.event("outcome_intent", dict(state=state, reason=reason))
-        finally:
-            if possible:
-                if preclaimed:
-                    # A guardian can take over after our death. Commit the shared
-                    # stop claim before dispatch so it cannot duplicate a lost kill.
-                    # Unlike the legacy single-owner emergency path, a failed
-                    # durable claim leaves the first stop to that independent owner.
-                    journal.event(
-                        "kill_pending", dict(state="unknown", reason="awaiting_stop_readback")
-                    )
-                    terminate(journal, engine, plan, image_id, cid, "stop")
-                else:
-                    try:
+            try:
+                journal.event("outcome_intent", dict(state=state, reason=reason))
+            finally:
+                if possible:
+                    if preclaimed:
+                        # A guardian can take over after our death. Commit the shared
+                        # stop claim before dispatch so it cannot duplicate a lost kill.
+                        # Unlike the legacy single-owner emergency path, a failed
+                        # durable claim leaves the first stop to that independent owner.
                         journal.event(
                             "kill_pending", dict(state="unknown", reason="awaiting_stop_readback")
                         )
-                    finally:
                         terminate(journal, engine, plan, image_id, cid, "stop")
+                    else:
+                        try:
+                            journal.event(
+                                "kill_pending",
+                                dict(state="unknown", reason="awaiting_stop_readback"),
+                            )
+                        finally:
+                            terminate(journal, engine, plan, image_id, cid, "stop")
+        finally:
+            if volume_possible:
+                release_volume(journal, engine, plan, "stop")
         if possible and not journal.report()["termination_confirmed"]:
             state = "unknown"
         journal.event("terminal", dict(state=state, reason=reason))
@@ -393,6 +467,29 @@ def terminate(journal, engine, plan, image_id, cid, key):
             pass  # Preserve interrupted intent; a fresh owner must recover it.
 
 
+def release_volume(journal, engine, plan, key):
+    """Remove exactly the plan's output volume, after the container is gone. Never raises.
+
+    Intent is journaled first; confirmation needs an exact-name list that no longer
+    shows the volume. An in-use or unreadable volume stays recorded as unknown.
+    """
+    try:
+        journal.event(key + "_volume_intent", dict(volume=plan.output_volume_name))
+    except Exception:
+        pass  # Persistence failure must not disable the removal itself.
+    try:
+        engine.remove_volume(plan)
+        journal.event(
+            key + "_volume_removed",
+            dict(volume=plan.output_volume_name, volume_cleanup_confirmed=True),
+        )
+    except Exception:
+        try:
+            journal.event(key + "_volume_unknown", dict(volume_cleanup="unknown"))
+        except Exception:
+            pass
+
+
 def recover(root, config, *, engine=None):
     if not config.enabled:
         raise BackendBlocked("explicit local fixture opt-in required")
@@ -402,7 +499,8 @@ def recover(root, config, *, engine=None):
         records = journal.records()
         if "terminal" not in records:
             journal.event("terminal", dict(state="unknown", reason="supervisor_restart"))
-        if not journal.report()["cleanup_confirmed"] and "create_intent" in records:
+        report = journal.report()
+        if not report["container_cleanup_confirmed"] and "create_intent" in records:
             # A new process has the exclusive lock. It may stop the historical
             # operation only, never call create/start or reset its lifetime.
             engine = engine or LocalDockerEngine(DockerCLI(config, journal.root / "docker-config"))
@@ -410,6 +508,10 @@ def recover(root, config, *, engine=None):
             cid = records.get("created", {}).get("observation", {}).get("container_id")
             if "recovery_intent" not in records:
                 terminate(journal, engine, plan, image, cid, "recovery")
+        if "volume_intent" in records and not journal.report()["volume_cleanup_confirmed"]:
+            # An orphaned exact-named volume only; never any other volume.
+            engine = engine or LocalDockerEngine(DockerCLI(config, journal.root / "docker-config"))
+            release_volume(journal, engine, plan, "recovery")
         return journal.report()
     finally:
         journal.close()
@@ -418,6 +520,7 @@ def recover(root, config, *, engine=None):
 def _child(root, plan, config, connection, key, *, guard=None, preclaimed=False):
     # Detached from caller's terminal/process group; not a broker thread or daemon.
     os.setsid()
+    require_class_match(plan, config)
     journal = FixtureJournal(root)
     try:
         docker_config = journal.root / "docker-config"
@@ -426,7 +529,16 @@ def _child(root, plan, config, connection, key, *, guard=None, preclaimed=False)
 
         def run(args, **kwargs):
             # Lost guardian authority fences forward work, not historical cleanup.
-            gated = args[0] in {"info", "image", "create", "start", "logs", "exec", "pause", "cp"}
+            gated = args[0] in {
+                "info",
+                "image",
+                "create",
+                "start",
+                "logs",
+                "exec",
+                "pause",
+                "cp",
+            } or args[:2] == ["volume", "create"]
             if guard and gated:
                 guard()
             result = cli(args, **kwargs)
@@ -434,7 +546,12 @@ def _child(root, plan, config, connection, key, *, guard=None, preclaimed=False)
                 guard()
             return result
 
-        engine = LocalDockerEngine(run)
+        # Strong (default) construction is unchanged; the weak class is explicit.
+        engine = (
+            LocalDockerEngine(run)
+            if plan.attestation_class == STRONG_CLASS
+            else LocalDockerEngine(run, attestation_class=plan.attestation_class)
+        )
 
         def receive(sequence):
             if guard:
@@ -468,6 +585,7 @@ class LocalFixtureAdapter:
             raise BackendBlocked("explicit local fixture opt-in required")
         # Validate before any filesystem/process/engine effect, even for Python callers.
         plan = FixturePlan.model_validate_json(plan.model_dump_json())
+        require_class_match(plan, self.config)
         root = Path(root)
         if root.exists() or root.is_symlink() or root.absolute() != root.resolve():
             raise BackendBlocked("fresh private evidence path required; use recovery")

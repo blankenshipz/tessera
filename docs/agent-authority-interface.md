@@ -82,6 +82,69 @@ Existing proposal/create and context/read scopes do not implicitly acquire them.
 Delegate requires both enrolled consumption scope and an explicit delegated action.
 Caller model is attested, not cryptographically verified model provenance.
 
+## Approval trust and the automation label
+
+The root `local_owner` credential (the `owner.header` written by `tessera init`)
+sits on disk, so any local script can use it. It therefore cannot silently make
+human decisions. These endpoints refuse a bare `local_owner` credential with 403:
+task-plan approval (`/tasks/{id}/approve`), execution-grant issuance, agent-authority
+grant issuance, experiment attempt admission, experiment budget
+authorization/charges/bounds, remote route `approve`/`start`, autonomy session
+`approve`/`resume`, credential-access lease create/renew, snapshot release,
+capability approval, conclusion review, program/source review approval
+(`/interaction/decisions/resolve`) and dataset-ingestion approval.
+Use a separately issued interactive `human_session` credential
+(`POST /credentials`, `kind: human_session`) for these.
+
+Owner-operated automation may still use the owner credential if the request carries
+`X-Tessera-Automation: <label>` (non-empty, printable, no surrounding whitespace,
+at most 128 characters; an invalid value is rejected). The header only labels the
+caller: it never grants authority, and agent and worker credentials gain nothing
+from it (every role check still applies). The label is not a secret and is not
+proof of identity.
+
+### Gated and ungated actions
+
+Rule: actions that grant, approve, start, release or spend are gated. Actions that
+only stop, cancel, pause, reject, revoke or revise (they reduce authority) are not
+gated, so an owner can always stop things, but they still record provenance. Ungated:
+`reject` on review decisions and dataset-ingestion review; route `pause`/`cancel` (routes have no `reject` command: only `approve` and
+`start`, gated, and `pause` and `cancel`); autonomy `reject`/`cancel`/`revise`; credential-lease and snapshot-release revoke;
+agent-authority and execution-grant revoke. Bare-owner reduce-only actions are
+recorded with `decision_class: "owner_unlabelled"`.
+
+### Decision provenance and `decision_class`
+
+Each decision event (`task.approved`, `execution.grant_issued`,
+`execution.grant_cancel_requested`, `experiment.attempt_admitted`,
+`experiment.budget_*`, `experiment.conclusion_reviewed`, `capability.approved`,
+`decision_resolved`, `research.dataset_ingestion_reviewed`, `agent_authority.issued`,
+`agent_authority.revoked`, `credential_access.lease_created`/`_renewed`/`_revoked`,
+`workspace.snapshot_released`, `workspace.snapshot_release_revoked`) records
+`credential_kind` (`local_owner`, `human_session`, ...), `automation` (true when a
+label was sent), `automation_label` when present, and `decision_class`:
+
+| `decision_class` | Meaning |
+| --- | --- |
+| `human_session` | A separately issued interactive `human_session` credential. The only class that points at a person's credential. |
+| `owner_automation_unverified` | Root `local_owner` credential labelled `desktop-owner`. |
+| `owner_automation_labelled` | Root `local_owner` credential with any other label (for example `salad-live-setup`). |
+| `owner_unlabelled` | Root `local_owner` credential without a label; only possible on ungated reduce-only actions. |
+| `other_credential` | Any other credential kind. |
+
+`desktop-owner` is unverified. The desktop app sends it when connected with the
+owner credential, but any holder of the owner token can send the same string, so it
+does not show that a human clicked. Receipts must not present it as a human
+decision; `human_session` is the only class that does. Remote route state records the
+same provenance under `approval_provenance` / `start_provenance` / `stop_provenance`,
+and autonomy sessions under `approval_provenance` / `resume_provenance` /
+`stop_provenance`; the state events carry them. `scripts/salad_live_setup.py` sends
+`X-Tessera-Automation: salad-live-setup` on every owner-made request.
+
+Next: desktop `human_session` login. The desktop app should obtain and use a
+`human_session` credential instead of the labelled owner token, so its decisions
+record `decision_class: "human_session"`. Not implemented yet.
+
 ## Atomicity, execution boundary and migration
 
 Additive `create_agent_authority_schema(connection)` is installed through the
@@ -196,7 +259,7 @@ No raw research/context/artifact contents are included in metadata export.
 - Scoped Ruff check/format check and scoped `git diff --check`: passed.
 - `uv.lock` updated with optional `a2a-sdk[http-server]==1.2.1`; uv was installed
   only in an isolated private tooling directory outside the repository. Reasoning and A2A
-  console entrypoints added; installed entrypoints are not exercised by this lane.
+  console entrypoints added; installed entrypoints are not exercised here.
 - Broader combined research/experiment/Kubernetes regression runs exceeded 120- and
   300-second command limits without a reported test failure; they are incomplete,
   not passing evidence. Parent owns the final full integration gate.

@@ -38,7 +38,9 @@ class DatasetColumn(StrictResearchRequest):
 
 
 class DatasetSchema(StrictResearchRequest):
-    profile: Literal["mixfm-outcome-0-v1", "mixfm-outcome-1-v1"]
+    profile: Annotated[
+        str, Field(pattern=r"^[a-z][a-z0-9-]{0,62}$")
+    ]  # operator-chosen program profile id
     columns: Annotated[list[DatasetColumn], Field(min_length=1, max_length=128)]
 
     @field_validator("columns")
@@ -71,7 +73,14 @@ class SplitStrategy(StrictResearchRequest):
     kind: Literal["random", "grouped", "temporal", "predefined", "holdout"]
     declaration: NonBlank4000
     leakage_policy: NonBlank4000
-    leakage_status: Literal["declared", "unsupported"]
+    leakage_status: Literal["declared", "unsupported", "audited"]
+    split_lock_id: NonBlank200 | None = None
+
+    @model_validator(mode="after")
+    def audited_requires_lock(self) -> SplitStrategy:
+        if (self.leakage_status == "audited") != (self.split_lock_id is not None):
+            raise ValueError("split_lock_id is required for, and only for, audited leakage_status")
+        return self
 
 
 class RegisterDatasetSnapshot(StrictResearchRequest):

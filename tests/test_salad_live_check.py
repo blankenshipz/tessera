@@ -39,6 +39,13 @@ class LocalSession:
         self.fail = None
         self.cancelled = False
         self.corrupt_reconnect = False
+        self.keepalives = 0
+        self.settling = 0
+        self.refuse_keepalive = False
+        self.expects_input = False
+        self.deliver_error = None
+        self.revoke_error = None
+        self.input_calls = []
 
     def state(self, route):
         return json.loads(json.dumps(self.record))
@@ -48,10 +55,33 @@ class LocalSession:
         if self.fail == action:
             raise RuntimeError("SECRET must not appear")
         self.record["effects"].append({"action": action})
+        if action == "observe" and self.settling:
+            self.settling -= 1
+            return dict(self.state(route), provider_status="unknown")
         return self.state(route)
+
+    def keepalive(self, route):
+        self.keepalives += 1
+        if self.refuse_keepalive and "start" in self.actions:
+            raise RuntimeError("guardian refuses heartbeat")
 
     def cancel(self, route):
         self.cancelled = True
+        self.input_calls.append("cancel")
+
+    def input_expected(self, route):
+        return self.expects_input
+
+    def deliver_inputs(self, route):
+        self.input_calls.append("deliver")
+        if self.deliver_error:
+            raise self.deliver_error
+
+    def revoke_inputs(self, route):
+        self.input_calls.append("revoke")
+        if self.revoke_error:
+            raise self.revoke_error
+        return self.expects_input
 
     def evidence(self, route):
         return self.proof
@@ -532,3 +562,698 @@ def test_concrete_pre_stop_retention_metadata_is_exact_and_never_imports(
     assert set(calls) == {"status"}
     session.close()
     h.server.resolver.close()
+
+
+def test_launched_run_keeps_lease_and_guardian_alive_each_poll():
+    session = LocalSession()
+    session.proof["output_retained"] = False
+    receipt = drive(session, max_polls=3)
+    # Never retained output: the settle read and every post-launch observation
+    # first renew liveness (1 before start + 3 polls).
+    assert receipt["status"] == "inconclusive"
+    assert session.actions[:2] == ["create", "observe"]
+    assert session.keepalives == 4
+
+
+def test_reconnect_without_launch_never_sends_keepalive():
+    session = LocalSession(prior=True)
+    drive(session)
+    assert session.keepalives == 0
+
+
+def test_concrete_keepalive_renews_exact_lease_and_requires_create(tmp_path, monkeypatch):
+    import sqlite3
+
+    session, h, _ = concrete_session(tmp_path, monkeypatch)
+    route = h.route["id"]
+    lease = session.state(route)["proposal"]["lease_id"]
+
+    def expiry():
+        with sqlite3.connect(session.server.store.database_path) as db:
+            return db.execute(
+                "SELECT expires_at, renewed_at FROM execution_leases WHERE id=?", (lease,)
+            ).fetchone()
+
+    def last_seen():
+        with sqlite3.connect(session.server.store.database_path) as db:
+            return db.execute(
+                "SELECT last_seen_at FROM worker_registry WHERE worker_principal_id=?",
+                (session.server.worker["id"],),
+            ).fetchone()
+
+    before, seen_before = expiry(), last_seen()
+    # Renewal is real; a guardian heartbeat without an existing create intent is refused.
+    with pytest.raises(Exception, match="create intent"):
+        session.keepalive(route)
+    after = expiry()
+    assert after[1] is not None and after != before
+    assert last_seen() is not None and last_seen() != seen_before
+    assert session.state(route)["effects"] == []
+    session.close()
+    h.server.resolver.close()
+
+
+def test_create_waits_for_group_to_settle_before_start():
+    session = LocalSession()
+    session.settling = 2
+    receipt = drive(session, max_polls=5)
+    assert session.actions[:5] == ["create", "observe", "observe", "observe", "start"]
+    assert receipt["status"] == "passed"
+
+
+def test_group_that_never_settles_is_stopped_not_started():
+    session = LocalSession()
+    session.settling = 99
+    receipt = drive(session, max_polls=3)
+    assert "start" not in session.actions and "stop" in session.actions
+    assert receipt["status"] == "inconclusive"
+
+
+def test_heartbeat_refused_after_retained_output_is_completion_not_failure():
+    session = LocalSession()
+    session.refuse_keepalive = True  # guardian already stopped on retained output
+    receipt = drive(session)
+    assert receipt["status"] == "passed" and receipt["stop_confirmed"]
+
+
+def test_heartbeat_refused_without_output_still_fails():
+    session = LocalSession()
+    session.refuse_keepalive = True
+    session.proof["output_retained"] = False
+    receipt = drive(session)
+    assert receipt["status"] == "inconclusive"
+    assert "stop" in session.actions
+
+
+# --- ADR 0036 phase 3: declared multi-file outputs ------------------------------------------
+
+
+class MultiSession(LocalSession):
+    def __init__(self):
+        super().__init__()
+        self.files = [
+            dict(name="output.json", sha256="1" * 64, bytes=10),
+            dict(name="weights.bin", sha256="2" * 64, bytes=2000),
+        ]
+        self.proof = dict(self.proof, output_sha256=None, outputs=self.files)
+        self.reconnect_files = self.files
+
+    def retained_bytes(self, route):
+        raise AssertionError("multi-file custody is never read as one blob")
+
+    def retained_files(self, route):
+        return [dict(f) for f in self.files]
+
+    def reopen(self):
+        other = MultiSession()
+        other.record = self.record
+        other.files = self.reconnect_files
+        return other
+
+
+def test_multi_output_receipt_carries_every_verified_per_file_digest():
+    session = MultiSession()
+    receipt = drive(session)
+    assert receipt["status"] == "passed", receipt
+    assert receipt["outputs"] == session.files
+    assert receipt["output_bytes"] == 2010
+    assert "output_sha256" not in receipt
+
+
+@pytest.mark.parametrize("tamper", ["import", "reconnect", "cap"])
+def test_multi_output_digest_or_reconnect_mismatch_never_passes(tamper):
+    session = MultiSession()
+    changed = [dict(session.files[0]), dict(session.files[1], sha256="3" * 64)]
+    if tamper == "import":
+        session.retained_files = lambda route: changed
+    elif tamper == "reconnect":
+        session.reconnect_files = changed
+    else:
+        session.proof["output_byte_cap"] = 2009
+    receipt = drive(session)
+    assert receipt["status"] == "inconclusive"
+    assert receipt["reason"] == "custody_stop_or_reconnect_unresolved"
+
+
+@pytest.mark.parametrize("tamper", [None, "chunk", "progress", "missing"])
+def test_concrete_multi_output_evidence_and_chunked_import(tmp_path, monkeypatch, tamper):
+    import base64
+
+    import tessera_control.salad_output_import as output_import
+    from tessera_control.store import canonical_digest
+
+    session, h, _ = concrete_session(tmp_path, monkeypatch)
+    state = session.state(h.route["id"])
+    declared = {"output.json": 64, "weights.bin": 600}  # the fixture profile caps 1024 total
+    monkeypatch.setattr(session, "_multi_output", lambda state: declared)
+    monkeypatch.setattr(output_import, "declared_outputs", lambda execution: declared)
+    data = {"output.json": b'{"result":1}', "weights.bin": bytes(range(256)) * 2}
+    files = [
+        dict(name=n, sha256=hashlib.sha256(d).hexdigest(), bytes=len(d))
+        for n, d in sorted(data.items())
+    ]
+    binding = session._output_binding(state)
+    sealed = dict(writers_closed=True, complete=True, quarantine=True)
+    inventory = dict(binding=binding, files=files, **sealed)
+    inventory["digest"] = canonical_digest(inventory)
+    manifest = dict(inventories=[inventory], **sealed)
+    manifest["digest"] = canonical_digest(manifest)
+    progress = dict(
+        binding=binding, declared=sorted(declared), files=files, complete=True, quarantine=True
+    )
+    if tamper == "progress":
+        progress["files"] = [dict(files[0], bytes=65)]
+    if tamper == "missing":
+        progress["files"] = files[:1]
+    calls = []
+
+    def exchange(body, cap=131072):
+        calls.append(body["operation"])
+        if body["operation"] == "status":
+            return dict(
+                status="stopped",
+                reason="exact_terminal_and_sealed",
+                orphan=False,
+                allocation_uncertain=False,
+                manifest=manifest,
+                retained_output=None,
+                retained_outputs=progress,
+            )
+        if body["operation"] == "import":
+            return dict(manifest=manifest, chunk_bytes=1 << 20)
+        assert body["operation"] == "import_chunk" and body["seq"] == 0 and cap > 1 << 20
+        chunk = data[body["name"]]
+        if tamper == "chunk" and body["name"] == "weights.bin":
+            chunk = chunk[:-1] + b"x"
+        return dict(
+            name=body["name"],
+            seq=0,
+            sha256=hashlib.sha256(chunk).hexdigest(),
+            content_base64=base64.b64encode(chunk).decode(),
+        )
+
+    monkeypatch.setattr(session.custody, "exchange", exchange)
+    record = session.server.store.get(session.server.worker, h.route["id"])
+    monkeypatch.setattr(
+        session,
+        "state",
+        lambda route: dict(record, provider_status="stopped", termination_confirmed=True),
+    )
+    try:
+        if tamper is None:
+            proof = session.evidence(h.route["id"])
+            assert proof["output_retained"] and proof["writers_quiescent"]
+            assert proof["outputs"] == files and proof["stop_confirmed"]
+            assert session.retained_files(h.route["id"]) == files
+            # evidence imports once; retained_files re-runs evidence and imports again.
+            assert calls.count("import_chunk") == 6
+        elif tamper == "missing":
+            with pytest.raises(ValueError, match="completeness"):
+                session.evidence(h.route["id"])
+        else:
+            with pytest.raises(ValueError):
+                session.evidence(h.route["id"])
+    finally:
+        session.close()
+        h.server.resolver.close()
+
+
+def test_rejected_create_is_reported_never_started_and_still_stopped():
+    rejection = dict(
+        status=400,
+        title="One or more validation errors occurred.",
+        detail="storage_amount must be a whole number of GiB",
+        error_fields=["container.resources.storage_amount"],
+    )
+
+    class Rejecting(LocalSession):
+        def dispatch(self, route, action):
+            state = super().dispatch(route, action)
+            if action == "create":
+                state["receipts"] = [
+                    dict(proxy_reason="provider_rejected_request", provider_rejection=rejection)
+                ]
+            return state
+
+    session = Rejecting()
+    receipt = drive(session)
+    assert receipt["status"] == "inconclusive"
+    assert receipt["reason"] == "provider_rejected_request"
+    assert receipt["create_rejection"] == rejection
+    assert "start" not in session.actions and session.actions.count("create") == 1
+    assert session.cancelled and session.actions.count("stop") == 1
+    # A normal journey carries no rejection.
+    assert drive(LocalSession())["create_rejection"] is None
+
+
+def test_prestart_observes_back_off_but_heartbeats_keep_cadence_then_normal_when_running():
+    class PullSession(LocalSession):
+        def __init__(self):
+            super().__init__()
+            self.now = 0.0
+            self.observes = []
+            self.beats = []
+            self.pull_until = 3
+
+        def dispatch(self, route, action):
+            if action == "start":
+                self.record["provider_status"] = "unknown"
+            if action == "observe" and "start" in self.actions:
+                if len(self.observes) >= self.pull_until:
+                    self.record["provider_status"] = "running"
+                self.observes.append((self.now, self.record["provider_status"]))
+            if action == "observe" and "start" in self.actions and len(self.observes) > 6:
+                self.proof["output_retained"] = True
+            return super().dispatch(route, action)
+
+        def keepalive(self, route):
+            self.beats.append(self.now)
+
+    session = PullSession()
+    session.proof["output_retained"] = False
+
+    def sleep(seconds):
+        session.now += seconds
+
+    _drive(
+        session,
+        route_id="exact-route",
+        source_revision="a" * 40,
+        max_seconds=3500,
+        max_polls=350,
+        sleep=sleep,
+        clock=lambda: session.now,
+    )
+    times = [t for t, _ in session.observes]
+    gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
+    states = [s for _, s in session.observes]
+    assert gaps[:3] == [30, 30, 30]  # pre-start: backed off
+    assert states[3] == "running" and gaps[3:6] == [10, 10, 10]  # running: normal
+    start = times[0]
+    beats = [b for b in session.beats if b >= start]
+    assert max(b - a for a, b in zip(beats, beats[1:], strict=False)) <= 10
+    # 45 minutes of pre-start at 30 s is 90 observes: well under the derived budget.
+    from tessera_control.remote_execution import effect_budget
+
+    assert 2700 // 30 + 4 < effect_budget(3500)
+
+
+# --- Guardian refusal classification in the keepalive ---------------------------------------
+
+
+class RefusingSession(LocalSession):
+    """Keepalive refuses with the scripted guardian errors once the group is started."""
+
+    def __init__(self, refusals, *, retain_after=None, beat_seconds=0):
+        super().__init__()
+        self.refusals = list(refusals)
+        self.now = 0.0
+        self.beat_seconds = beat_seconds
+        self.retain_after = retain_after
+        self.proof["output_retained"] = False
+
+    def dispatch(self, route, action):
+        if action == "observe" and "start" in self.actions and self.retain_after is not None:
+            self.retain_after -= 1
+            if self.retain_after < 0:
+                self.proof["output_retained"] = True
+        return super().dispatch(route, action)
+
+    def cancel(self, route):
+        self.cancelled_at = self.now
+        super().cancel(route)
+
+    def keepalive(self, route):
+        self.keepalives += 1
+        self.now += self.beat_seconds
+        if "start" in self.actions and self.refusals:
+            error = self.refusals.pop(0)
+            if error is not None:
+                raise error
+
+
+def drive_clocked(session, *, max_polls=10, max_seconds=100):
+    def sleep(seconds):
+        session.now += seconds
+
+    return _drive(
+        session,
+        route_id="exact-route",
+        source_revision="a" * 40,
+        max_seconds=max_seconds,
+        max_polls=max_polls,
+        sleep=sleep,
+        clock=lambda: session.now,
+    )
+
+
+def test_transient_guardian_refusal_is_retried_at_next_interval():
+    from tessera_control.salad_server import GuardianRefused
+
+    session = RefusingSession(
+        [
+            GuardianRefused("guardian_loop_unready"),
+            None,
+            GuardianRefused("workload_verifier_unready"),
+            None,
+        ],
+        retain_after=5,
+    )
+    receipt = drive_clocked(session)
+    assert receipt["status"] == "passed", receipt
+    assert receipt["guardian_transient_refusals"] == 2
+    assert receipt["guardian_refusal"] is None
+    assert session.actions.count("observe") >= 6 and not session.refusals
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "stop_only",
+        "exposure_fenced",
+        "rate_unknown",
+        "budget_binding_expired",
+        "stop_credential_window_insufficient",
+        "custody_unready",
+        "guardian_unready",
+        "budget_insufficient",
+        "internal",
+        "something_new",
+    ],
+)
+def test_terminal_guardian_refusal_cancels_at_once(code):
+    from tessera_control.salad_server import GuardianRefused
+
+    session = RefusingSession([GuardianRefused(code)], retain_after=5)
+    receipt = drive_clocked(session)
+    assert receipt["status"] == "inconclusive"
+    assert receipt["guardian_refusal"] == {"code": code, "cause": "terminal_code"}
+    assert receipt["guardian_transient_refusals"] == 0
+    assert session.cancelled and "stop" in session.actions
+    # Cancelled on the first refused beat: nothing is observed before the stop path.
+    assert session.actions[session.actions.index("start") + 1] == "stop"
+
+
+def test_transient_refusals_cancel_before_guardian_silence():
+    from tessera_control.salad_live_check import (
+        GUARDIAN_SILENCE_MARGIN_SECONDS,
+        GUARDIAN_SILENCE_SECONDS,
+    )
+    from tessera_control.salad_server import GuardianRefused
+
+    session = RefusingSession([GuardianRefused("guardian_loop_unready")] * 10, retain_after=50)
+    receipt = drive_clocked(session, max_polls=20, max_seconds=200)  # 10 s interval
+    assert receipt["status"] == "inconclusive"
+    assert receipt["guardian_refusal"] == {
+        "code": "guardian_loop_unready",
+        "cause": "silence_bound",
+    }
+    assert session.cancelled and "stop" in session.actions
+    # Last good beat at t=0, 10 s interval: refusals at t=0 and t=10 are skipped (the
+    # next beat still lands by t=20 <= 30 - 5); at t=20 the next beat would be at 30 > 25,
+    # so the run is cancelled while the guardian has not yet gone silent.
+    assert receipt["guardian_transient_refusals"] == 2
+    assert session.cancelled_at < GUARDIAN_SILENCE_SECONDS
+    assert GUARDIAN_SILENCE_SECONDS - GUARDIAN_SILENCE_MARGIN_SECONDS == 25
+
+
+def test_slow_transient_refusal_is_not_tolerated_near_silence():
+    from tessera_control.salad_server import GuardianRefused
+
+    # Each beat takes 6 s: the refused beat ends 22 s after the last good one started,
+    # and the next would land at 32 > 30 - 5, so it is cancelled now.
+    session = RefusingSession(
+        [None, GuardianRefused("guardian_loop_unready")], retain_after=50, beat_seconds=6
+    )
+    receipt = drive_clocked(session, max_polls=20, max_seconds=200)
+    assert receipt["guardian_refusal"] == {
+        "code": "guardian_loop_unready",
+        "cause": "silence_bound",
+    }
+    assert receipt["guardian_transient_refusals"] == 0
+
+
+def test_unanswered_guardian_is_terminal():
+    from tessera_control.salad_server import GuardianUnavailable
+
+    # No answer may mean a dead guardian, which enforces nothing on silence.
+    session = RefusingSession([GuardianUnavailable()], retain_after=5)
+    receipt = drive_clocked(session)
+    assert receipt["guardian_refusal"] == {"code": "unavailable", "cause": "terminal_code"}
+    assert receipt["guardian_transient_refusals"] == 0
+    assert session.cancelled and session.actions[session.actions.index("start") + 1] == "stop"
+
+
+@pytest.mark.parametrize("error", ["forbidden", "conflict"])
+def test_revoked_authority_cancels_at_once(error):
+    from tessera_control.store import Conflict, Forbidden
+
+    session = RefusingSession(
+        [Forbidden("revoked") if error == "forbidden" else Conflict("revoked")], retain_after=5
+    )
+    receipt = drive_clocked(session)
+    assert receipt["guardian_refusal"] is None and receipt["guardian_transient_refusals"] == 0
+    assert session.cancelled and session.actions[session.actions.index("start") + 1] == "stop"
+
+
+def test_guardian_silence_matches_assignment_default():
+    from tessera_control.salad_guardian import GuardianAssignment
+    from tessera_control.salad_live_check import GUARDIAN_SILENCE_SECONDS
+
+    assert GuardianAssignment.__dataclass_fields__["heartbeat_seconds"].default == (
+        GUARDIAN_SILENCE_SECONDS
+    )
+
+
+@pytest.mark.parametrize("provider_stopped", [True, False])
+def test_provider_confirmed_stop_ends_the_stop_wait_without_claiming_custody(provider_stopped):
+    """A stop_only refusal: the provider stopped the group at once, but custody can never
+    seal (allocation changed). The driver must not wait out the whole window."""
+    from tessera_control.salad_server import GuardianRefused
+
+    session = RefusingSession([GuardianRefused("stop_only")])
+    session.proof.update(stop_confirmed=False, writers_quiescent=False)
+    session.proof["provider_stop_confirmed"] = provider_stopped
+    receipt = drive_clocked(session, max_polls=50, max_seconds=1000)
+    assert receipt["status"] == "inconclusive"
+    assert receipt["stop_confirmed"] is False
+    assert receipt["guardian_refusal"] == {"cause": "terminal_code", "code": "stop_only"}
+    stop_at = session.actions.index("stop")
+    if provider_stopped:
+        assert receipt["provider_stop_confirmed"] is True
+        assert receipt["reason"] == "provider_stopped_custody_unsealed"
+        assert session.actions[stop_at + 1 :] == ["observe"]
+        assert session.now < 100
+    else:
+        assert receipt["provider_stop_confirmed"] is False
+        assert receipt["reason"] != "provider_stopped_custody_unsealed"
+        assert session.actions[stop_at + 1 :].count("observe") > 5
+
+
+@pytest.mark.parametrize(
+    "status,reason,orphan,provider_status,expected",
+    [
+        ("reconciled", "provider_confirmed_exact_group_stopped", False, "stopped", True),
+        # An operator attestation is not a provider read seen by this driver.
+        ("reconciled", "operator_reconciled_exact_group_stopped", False, "stopped", False),
+        ("reconciled", "provider_confirmed_exact_group_stopped", True, "stopped", False),
+        ("reconciled", "provider_confirmed_exact_group_stopped", False, "unknown", False),
+        ("unknown", "provider_unknown", True, "stopped", False),
+    ],
+)
+def test_concrete_provider_stop_evidence_is_exact_and_never_stop_confirmed(
+    tmp_path, monkeypatch, status, reason, orphan, provider_status, expected
+):
+    session, h, _ = concrete_session(tmp_path, monkeypatch)
+    real = session.state(h.route["id"])
+    monkeypatch.setattr(session, "state", lambda route: dict(real, provider_status=provider_status))
+    monkeypatch.setattr(
+        session.custody,
+        "exchange",
+        lambda body: dict(
+            status=status,
+            reason=reason,
+            orphan=orphan,
+            allocation_uncertain=True,
+            manifest=None,
+            retained_output=None,
+        ),
+    )
+    proof = session.evidence(h.route["id"])
+    assert proof["provider_stop_confirmed"] is expected
+    assert proof["stop_confirmed"] is False and proof["writers_quiescent"] is False
+    session.close()
+    h.server.resolver.close()
+
+
+def test_create_refreshes_worker_liveness_before_use_time_authority(tmp_path, monkeypatch):
+    """A long-lived executor's last sighting can be older than the 60 s disconnect bound
+    when the route launches; create must heartbeat the registry before preflight."""
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    session, h, _ = concrete_session(tmp_path, monkeypatch)
+    stale = (datetime.now(UTC) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    with sqlite3.connect(session.server.store.database_path) as db:
+        changed = db.execute(
+            "UPDATE worker_registry SET last_seen_at=?, heartbeat_at=? WHERE worker_principal_id=?",
+            (stale, stale, session.server.worker["id"]),
+        ).rowcount
+    assert changed == 1
+    status = dict(
+        published_hourly_rate_usd="0.1",
+        estimated_exposure_cents="0",
+        actual_billed_cost_cents=None,
+        exposure_unknown=True,
+        exposure_pending=True,
+        rate_unknown=False,
+        budget_fenced=False,
+        escalation_pending=False,
+    )
+    monkeypatch.setattr(session.custody, "exchange", lambda body: status)
+    calls = []
+    monkeypatch.setattr(session.dispatcher, "dispatch", lambda *args: calls.append(args))
+    session.dispatch(h.route["id"], "create")
+    assert calls == [(h.route["id"], "create")]
+    with sqlite3.connect(session.server.store.database_path) as db:
+        seen = db.execute(
+            "SELECT last_seen_at FROM worker_registry WHERE worker_principal_id=?",
+            (session.server.worker["id"],),
+        ).fetchone()[0]
+    assert seen > stale
+    session.close()
+    h.server.resolver.close()
+
+
+def test_receipt_records_guardian_rate_read_retries():
+    session = LocalSession()
+    session.proof["rate_read_retries"] = 2
+    receipt = drive(session)
+    assert receipt["status"] == "passed"
+    assert receipt["guardian_rate_read_retries"] == 2
+
+
+@pytest.mark.parametrize("value,expected", [(3, 3), (0, 0), (-1, None), ("2", None), (True, None)])
+def test_rate_read_retry_count_is_projected_strictly(value, expected):
+    from tessera_control.salad_live_check import _count
+
+    assert _count(value) == expected
+
+
+class FlakyObserveSession(LocalSession):
+    """Observe's fresh provider read times out for the next ``failures`` calls after start."""
+
+    def __init__(self, failures, error=None):
+        super().__init__()
+        self.failures, self.error = failures, error
+
+    def dispatch(self, route, action):
+        if action == "observe" and "start" in self.actions and self.failures:
+            self.failures -= 1
+            self.actions.append(action)
+            from tessera_control.salad_server import ProviderReadUnavailable
+
+            raise self.error or ProviderReadUnavailable("Fresh provider preflight unavailable.")
+        return super().dispatch(route, action)
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_a_transient_observe_read_failure_is_skipped_not_fatal(failures):
+    session = FlakyObserveSession(failures)
+    receipt = drive(session, max_polls=10)
+    assert receipt["status"] == "passed", receipt
+    assert receipt["observe_transient_failures"] == failures
+    assert session.actions.count("stop") == 1
+
+
+def test_consecutive_observe_read_failures_past_the_bound_still_fail():
+    session = FlakyObserveSession(3)
+    receipt = drive(session, max_polls=10)
+    assert receipt["status"] == "inconclusive"
+    assert receipt["observe_transient_failures"] == 2
+    assert session.cancelled and session.actions.count("stop") == 1
+
+
+def test_other_observe_errors_stay_fatal():
+    session = FlakyObserveSession(1, error=RuntimeError("SECRET must not appear"))
+    receipt = drive(session, max_polls=10)
+    assert receipt["status"] == "inconclusive"
+    assert receipt["observe_transient_failures"] == 0
+    assert "SECRET" not in json.dumps(receipt)
+
+
+def test_receipt_records_guardian_stop_cause_and_provider_read_retries():
+    session = LocalSession()
+    session.proof.update(stop_cause="provider_unavailable", provider_read_retries=2)
+    receipt = drive(session)
+    assert receipt["guardian_stop_cause"] == "provider_unavailable"
+    assert receipt["guardian_provider_read_retries"] == 2
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("missed_poll", "missed_poll"),
+        (None, None),
+        ("Bad Cause", "invalid_code"),
+        ("x" * 80, "invalid_code"),
+        (3, "invalid_code"),
+    ],
+)
+def test_stop_cause_is_projected_strictly(value, expected):
+    from tessera_control.salad_live_check import _cause
+
+    assert _cause(value) == expected
+
+
+def test_receipt_records_the_last_guardian_workload_refusal():
+    session = LocalSession()
+    session.proof["last_workload_refusal"] = "workload_rejected"
+    receipt = drive(session)
+    assert receipt["guardian_last_workload_refusal"] == "workload_rejected"
+
+
+def test_receipt_records_the_last_rate_and_group_read_failure_reasons():
+    session = LocalSession()
+    session.proof.update(last_rate_read_failure="timeout", last_provider_read_failure="rate_stale")
+    receipt = drive(session)
+    assert receipt["guardian_last_rate_read_failure"] == "timeout"
+    assert receipt["guardian_last_provider_read_failure"] == "rate_stale"
+
+
+def test_a_create_that_was_never_sent_is_reported_as_such_and_still_stopped():
+    not_sent = dict(status=0, title="The create request was not sent", detail=None,
+                    error_fields=[])  # fmt: skip
+
+    class NotSent(LocalSession):
+        def dispatch(self, route, action):
+            state = super().dispatch(route, action)
+            if action == "create":
+                state["receipts"] = [
+                    {"proxy_reason": "request_not_sent", "provider_rejection": not_sent}
+                ]
+            return state
+
+    session = NotSent()
+    receipt = drive(session)
+    assert receipt["status"] == "inconclusive"
+    assert receipt["reason"] == "create_not_sent"
+    assert receipt["create_rejection"] == not_sent
+    assert "start" not in session.actions
+    assert session.actions[: session.actions.index("stop")] == ["create"]
+    assert session.cancelled and session.actions.count("stop") == 1
+
+
+def test_a_receipt_cannot_mix_a_status_0_rejection_with_another_reason():
+    from pydantic import ValidationError
+
+    from tessera_control.remote_execution_models import ProviderReadback
+
+    base = dict(state="unknown", observed_at="2026-11-20T00:00:00Z")
+    zero = dict(status=0, title=None, detail=None, error_fields=[])
+    ProviderReadback(proxy_reason="request_not_sent", provider_rejection=zero, **base)
+    with pytest.raises(ValidationError):
+        ProviderReadback(proxy_reason="provider_rejected_request", provider_rejection=zero, **base)
+    with pytest.raises(ValidationError):
+        ProviderReadback(proxy_reason="request_not_sent",
+                         provider_rejection=dict(zero, status=400), **base)  # fmt: skip

@@ -18,6 +18,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from .approval_trust import require_decision_actor
 from .experiments_models import (
     AdmitExperimentAttempt,
     AmendConclusion,
@@ -36,6 +37,7 @@ from .experiments_models import (
     UpdateConclusion,
 )
 from .external_operations import current_operation_reconciliation
+from .gate_evidence_ingest import EvidenceIngestMixin
 from .project_artifact_retention import (
     admit_experiment_artifact_evidence_reference,
     validate_experiment_artifact_evidence_reference,
@@ -690,7 +692,7 @@ def create_experiment_evidence_retention_schema(connection: sqlite3.Connection) 
     create_v26_experiment_evidence_retention_schema(connection)
 
 
-class ExperimentStore(Store):
+class ExperimentStore(EvidenceIngestMixin, Store):
     """Commands for one bounded design, evidence chain, and human review."""
 
     def __init__(self, state_dir, backend=None) -> None:
@@ -712,6 +714,59 @@ class ExperimentStore(Store):
     def _human(actor: dict[str, Any]) -> None:
         if actor["role"] != "human":
             raise Forbidden("Human review is required for goal-to-decision records.")
+
+    def get_budget(self, principal, experiment_id):
+        from .experiment_budgets import budget_status
+
+        connection = _connect(self.database_path)
+        try:
+            actor = self._live_principal(connection, principal)
+            self._experiment(connection, actor, experiment_id)
+            return budget_status(connection, actor, experiment_id)
+        finally:
+            connection.close()
+
+    def budget_command(self, principal, experiment_id, key, payload, *, charge=False, bounds=False):
+        from .experiment_budget_models import (
+            AuthorizeExperimentBudget,
+            RecordExperimentCharge,
+            ResolveExperimentBudgetBounds,
+        )
+        from .experiment_budgets import authorize_budget, record_charge, resolve_bounds
+        from .store import canonical_digest
+
+        model, handler, action = (
+            (ResolveExperimentBudgetBounds, resolve_bounds, "bounds")
+            if bounds
+            else (RecordExperimentCharge, record_charge, "charges")
+            if charge
+            else (AuthorizeExperimentBudget, authorize_budget, "authorization")
+        )
+        body = self._body(model, payload)
+
+        def command(connection, actor):
+            self._human(actor)
+            require_decision_actor(actor, forbidden=Forbidden)
+            experiment = self._experiment(connection, actor, experiment_id)
+            result = handler(connection, actor, experiment_id, body)
+            self._event(
+                connection,
+                actor,
+                experiment,
+                f"experiment.budget_{action}",
+                result["revision"],
+                {"experiment_id": experiment_id, "budget_revision": result["revision"]},
+            )
+            return 200, result
+
+        return self._mutate(
+            principal,
+            key,
+            "POST",
+            f"/experiments/{experiment_id}/budget/{action}",
+            canonical_digest(body),
+            command,
+        )
 
     def _experiment(
         self, connection: sqlite3.Connection, actor: dict[str, Any], ident: str
@@ -1071,7 +1126,8 @@ class ExperimentStore(Store):
                 updated,
                 "experiment.design_revised",
                 revision,
-                {"experiment_id": experiment_id, "design_revision": revision},
+                {"experiment_id": experiment_id, "design_revision": revision}
+                | ({"change_reason": body["change_reason"]} if body.get("change_reason") else {}),
             )
             return 201, self._experiment_response(connection, updated)
 
@@ -1092,6 +1148,7 @@ class ExperimentStore(Store):
 
         def command(connection, actor):
             self._human(actor)
+            require_decision_actor(actor, forbidden=Forbidden)
             return self._admit_attempt_transaction(connection, actor, variant_id, body)
 
         return self._mutate(
@@ -1182,6 +1239,15 @@ class ExperimentStore(Store):
             VALUES (?,1,'admitted',NULL,NULL,NULL,?,?)""",
             (row["id"], now, actor["id"]),
         )
+        # Existing unbudgeted non-Salad workflows retain their native task/project
+        # gates. Budgeted experiments reserve all variants in this same transaction.
+        # Salad use-time admission additionally requires this reservation (bridge).
+        if connection.execute(
+            "SELECT 1 FROM experiment_budgets WHERE experiment_id=?", (experiment["id"],)
+        ).fetchone():
+            from .experiment_budgets import reserve_attempt
+
+            reserve_attempt(connection, actor, row, grant)
         self._event(
             connection,
             actor,
@@ -1679,6 +1745,15 @@ class ExperimentStore(Store):
         """
         if outcome not in {"succeeded", "cancelled"}:
             return
+        if (
+            outcome == "cancelled"
+            and attempt["state"] == "admitted"
+            and attempt["operation_id"] is None
+            and attempt["package_digest"] is None
+        ):
+            # Withdrawn before dispatch: nothing ran, and a resolved attempt can never
+            # be packaged or dispatched afterwards. The required reason is recorded.
+            return
         if attempt["operation_id"] is None or attempt["package_digest"] is None:
             raise Conflict(
                 "Execution success or cancellation requires a bound package and operation."
@@ -1977,6 +2052,7 @@ class ExperimentStore(Store):
                 "artifact_id": body["artifact_id"],
                 "created_at": now,
                 "created_by_principal_id": actor["id"],
+                "source": "human_entered",
             }
             table = (
                 "research_admitted_attempt_measurements"
@@ -1984,7 +2060,7 @@ class ExperimentStore(Store):
                 else "research_attempt_measurements"
             )
             connection.execute(
-                f"INSERT INTO {table} (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id)",
+                f"INSERT INTO {table} (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id,source) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id,:source)",
                 row,
             )
             if body["artifact_id"] is not None:
@@ -2027,6 +2103,7 @@ class ExperimentStore(Store):
                     "experiment_id": experiment["id"],
                     "attempt_id": attempt_id,
                     "measurement_id": ident,
+                    "source": "human_entered",
                     "scientific_validity": "not_assessed",
                 },
             )
@@ -2043,6 +2120,68 @@ class ExperimentStore(Store):
             digest,
             command,
         )
+
+    def _read_retained_output(
+        self,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        attempt: dict[str, Any],
+        attempt_id: str,
+        artifact_id: str,
+    ) -> tuple[bytes, str]:
+        """Custody-checked bytes of an output linked to the attempt, and their sha256."""
+        linked_table = (
+            "research_admitted_attempt_artifacts"
+            if attempt["attempt_kind"] == "admitted"
+            else "research_attempt_artifacts"
+        )
+        if connection.execute(
+            f"SELECT 1 FROM {linked_table} WHERE attempt_id=? AND artifact_id=?",
+            (attempt_id, artifact_id),
+        ).fetchone() is None or not self._artifact_matches_attempt_provenance(
+            connection, actor, attempt, artifact_id
+        ):
+            raise Conflict("Output artifact is not linked to this attempt provenance.")
+        validate_experiment_artifact_evidence_reference(
+            connection, attempt["project_id"], artifact_id
+        )
+        row = connection.execute(
+            """SELECT a.sha256,a.size,a.status,a.classification,a.late,
+            p.tenant_namespace,p.project_namespace,p.object_key,
+            p.sha256 AS placement_sha256,p.size AS placement_size,
+            p.backend_kind,r.state AS retention_state
+            FROM artifacts a JOIN project_artifact_placements p
+            ON p.artifact_id=a.id AND p.project_id=a.project_id
+            JOIN project_artifact_retention r ON r.artifact_id=a.id AND r.project_id=a.project_id
+            WHERE a.id=? AND a.project_id=?""",
+            (artifact_id, attempt["project_id"]),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "quarantined"
+            or row["classification"] != "unclassified"
+            or row["late"]
+            or row["retention_state"] != "active"
+            or row["backend_kind"] != self.backend.kind
+            or row["sha256"] != row["placement_sha256"]
+            or row["size"] != row["placement_size"]
+            or row["size"] > 1024 * 1024
+        ):
+            raise Conflict("Output has no eligible active retained placement.")
+        placement = ProjectArtifactPlacement(
+            row["tenant_namespace"],
+            row["project_namespace"],
+            row["object_key"],
+            row["sha256"],
+            row["size"],
+        )
+        try:
+            content = self.backend.read(
+                actor["org_id"], attempt["project_id"], artifact_id, placement
+            )
+        except ProjectArtifactStorageError as error:
+            raise Conflict("Output custody integrity check failed.") from error
+        return content, row["sha256"]
 
     def derive_output_measurement(
         self,
@@ -2065,57 +2204,9 @@ class ExperimentStore(Store):
             if attempt["revision"] != body["expected_revision"]:
                 raise Conflict("Experiment attempt revision is no longer current.")
             artifact_id = body["artifact_id"]
-            linked_table = (
-                "research_admitted_attempt_artifacts"
-                if attempt["attempt_kind"] == "admitted"
-                else "research_attempt_artifacts"
+            content, artifact_sha256 = self._read_retained_output(
+                connection, actor, attempt, attempt_id, artifact_id
             )
-            if connection.execute(
-                f"SELECT 1 FROM {linked_table} WHERE attempt_id=? AND artifact_id=?",
-                (attempt_id, artifact_id),
-            ).fetchone() is None or not self._artifact_matches_attempt_provenance(
-                connection, actor, attempt, artifact_id
-            ):
-                raise Conflict("Output artifact is not linked to this attempt provenance.")
-            validate_experiment_artifact_evidence_reference(
-                connection, attempt["project_id"], artifact_id
-            )
-            row = connection.execute(
-                """SELECT a.sha256,a.size,a.status,a.classification,a.late,
-                p.tenant_namespace,p.project_namespace,p.object_key,
-                p.sha256 AS placement_sha256,p.size AS placement_size,
-                p.backend_kind,r.state AS retention_state
-                FROM artifacts a JOIN project_artifact_placements p
-                ON p.artifact_id=a.id AND p.project_id=a.project_id
-                JOIN project_artifact_retention r ON r.artifact_id=a.id AND r.project_id=a.project_id
-                WHERE a.id=? AND a.project_id=?""",
-                (artifact_id, attempt["project_id"]),
-            ).fetchone()
-            if (
-                row is None
-                or row["status"] != "quarantined"
-                or row["classification"] != "unclassified"
-                or row["late"]
-                or row["retention_state"] != "active"
-                or row["backend_kind"] != self.backend.kind
-                or row["sha256"] != row["placement_sha256"]
-                or row["size"] != row["placement_size"]
-                or row["size"] > 1024 * 1024
-            ):
-                raise Conflict("Output has no eligible active retained placement.")
-            placement = ProjectArtifactPlacement(
-                row["tenant_namespace"],
-                row["project_namespace"],
-                row["object_key"],
-                row["sha256"],
-                row["size"],
-            )
-            try:
-                content = self.backend.read(
-                    actor["org_id"], attempt["project_id"], artifact_id, placement
-                )
-            except ProjectArtifactStorageError as error:
-                raise Conflict("Output custody integrity check failed.") from error
 
             def unique_object(pairs):
                 result = {}
@@ -2161,7 +2252,7 @@ class ExperimentStore(Store):
                 "number": document,
                 "derivation": "retained-json-number-v1",
                 "json_pointer": pointer,
-                "artifact_sha256": row["sha256"],
+                "artifact_sha256": artifact_sha256,
             }
             now, revision, ident = (
                 utc_now(),
@@ -2176,6 +2267,7 @@ class ExperimentStore(Store):
                 "artifact_id": artifact_id,
                 "created_at": now,
                 "created_by_principal_id": actor["id"],
+                "source": "derived",
             }
             table = (
                 "research_admitted_attempt_measurements"
@@ -2183,7 +2275,7 @@ class ExperimentStore(Store):
                 else "research_attempt_measurements"
             )
             connection.execute(
-                f"INSERT INTO {table} (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id)",
+                f"INSERT INTO {table} (id,attempt_id,name,value_json,artifact_id,created_at,created_by_principal_id,source) VALUES (:id,:attempt_id,:name,:value_json,:artifact_id,:created_at,:created_by_principal_id,:source)",
                 measurement,
             )
             if attempt["attempt_kind"] == "admitted":
@@ -2227,6 +2319,7 @@ class ExperimentStore(Store):
                     "experiment_id": experiment["id"],
                     "attempt_id": attempt_id,
                     "measurement_id": ident,
+                    "source": "derived",
                     "artifact_id": artifact_id,
                     "scientific_validity": "not_assessed",
                 },
@@ -2484,6 +2577,7 @@ class ExperimentStore(Store):
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             self._human(actor)
+            require_decision_actor(actor, forbidden=Forbidden)
             conclusion = self._conclusion(connection, actor, conclusion_id)
             if (
                 conclusion["status"] != "draft"

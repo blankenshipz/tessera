@@ -1,15 +1,23 @@
 """Isolated API-only research reviews. No models, providers or execution effects."""
 
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
+from tessera_control import programs
 from tessera_control.api import create_app
-from tessera_control.program_models import OUTCOME_CONDITIONS
 from tessera_control.store import Store, initialize_state
+
+# Fixture catalogs only: the platform has none; real plans declare their own conditions.
+FIXTURE_CONDITIONS = {
+    "primary_outcome": tuple(f"condition_{c}" for c in "abcdefghi"),
+    "secondary_outcome": tuple(f"condition_{c}" for c in "abcdefghij"),
+}
 
 
 class ProgramJourney:
@@ -23,7 +31,7 @@ class ProgramJourney:
         self.project = (
             execution.project
             if execution
-            else self.post("/projects", {"name": "Synthetic MixFM requirements fixture"})
+            else self.post("/projects", {"name": "Synthetic program requirements fixture"})
         )
         self.study = self.post(
             f"/projects/{self.project['id']}/studies",
@@ -92,7 +100,7 @@ class ProgramJourney:
         assert response.status_code == 200, response.text
         return response.json()
 
-    def scope(self, action="plan", outcome="outcome_0", **changes):
+    def scope(self, action="plan", outcome="primary_outcome", **changes):
         context = self.context()
         prior = [
             r
@@ -140,7 +148,7 @@ class ProgramJourney:
                         "rationale": "Bound this first comparison; deferred is not tested",
                         "variant_ids": [self.variant["id"]] if index == 0 else [],
                     }
-                    for index, name in enumerate(OUTCOME_CONDITIONS[outcome])
+                    for index, name in enumerate(FIXTURE_CONDITIONS[outcome])
                 },
             )
         if action == "source_use":
@@ -152,19 +160,29 @@ class ProgramJourney:
         scope.update(changes)
         return scope
 
-    def propose(self, scope=None, **kwargs):
+    def propose(self, scope=None, *, strict=False, **kwargs):
+        """Propose a review. A non-version-2 plan is seeded as legacy history, i.e.
+        as a plan recorded before new plans required bound gates; pass strict=True
+        to exercise the current rule instead."""
         scope = scope or self.scope()
-        return self.post(
-            "/interaction/decisions",
-            {
-                "project_id": self.project["id"],
-                "kind": "access" if scope["action"] == "source_use" else "direction",
-                "scope": scope,
-                "expires_at": self.expiry(),
-                "reviewer_principal_id": self.actor["id"],
-            },
-            **kwargs,
-        )
+        protocol = scope.get("evaluation_protocol") or {}
+        legacy = scope["action"] == "plan" and protocol.get("version") != 2 and not strict
+        with (
+            mock.patch.object(programs, "require_bound_plan", lambda _review: None)
+            if legacy
+            else nullcontext()
+        ):
+            return self.post(
+                "/interaction/decisions",
+                {
+                    "project_id": self.project["id"],
+                    "kind": "access" if scope["action"] == "source_use" else "direction",
+                    "scope": scope,
+                    "expires_at": self.expiry(),
+                    "reviewer_principal_id": self.actor["id"],
+                },
+                **kwargs,
+            )
 
     def resolve(self, proposal, decision="approve", **kwargs):
         return self.post(
@@ -214,7 +232,7 @@ def journey(tmp_path):
     return ProgramJourney(tmp_path)
 
 
-@pytest.mark.parametrize("outcome", OUTCOME_CONDITIONS)
+@pytest.mark.parametrize("outcome", FIXTURE_CONDITIONS)
 def test_agent_proposal_human_version_review_and_restart(journey, outcome):
     j = journey
     assert j.context(j.agent)["execution_granted"] is False
@@ -262,7 +280,7 @@ def test_missing_source_support_and_incomplete_condition_accounting(journey):
     unsupported = j.propose(j.scope("source_use"))
     assert "supported" in j.resolve(unsupported, status=409)["detail"]
     missing_condition = j.scope()
-    del missing_condition["conditions"]["scaffold_ood"]
+    missing_condition["conditions"] = {}  # no catalog: only empty accounting is incomplete
     j.propose(missing_condition, status=422)
     missing_source = j.scope()
     missing_source["brief"]["data_source_ids"] = ["source_missing"]

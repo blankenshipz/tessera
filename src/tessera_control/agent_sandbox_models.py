@@ -3,7 +3,7 @@
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Name = Annotated[str, Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63)]
@@ -45,6 +45,18 @@ class SandboxTarget(FrozenModel):
     witness_uid: Identity
     witness_sha256: Digest
     upstream_commit: Literal["cd0761d5001baaf293460cd382ee318744d6b249"] = UPSTREAM_COMMIT
+    # ADR 0034 phase 2. Omitted from serialization when unset so the digests and
+    # witness scope of every existing target stay byte-identical.
+    egress_proxy_image: Annotated[str, Field(pattern=r"^[^\s@]+@sha256:[0-9a-f]{64}$")] | None = (
+        None
+    )
+
+    @model_serializer(mode="wrap")
+    def omit_unset_proxy(self, handler):
+        value = handler(self)
+        if value.get("egress_proxy_image") is None:
+            value.pop("egress_proxy_image", None)
+        return value
 
     @field_validator("kubeconfig")
     @classmethod

@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from test_agent_authority import assert_empty_runtime_v55, enroll, post, strip_runtime_v55
 
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.recovery import backup_state, restore_state
 from tessera_control.store import initialize_state, migrate_state
 
@@ -236,7 +237,7 @@ def test_old52_requires_explicit53_migration(output_setup, held):
         before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
         health = db.execute("SELECT * FROM operator_backup_health").fetchall()
     assert TestClient(create_app(state)).get("/health/ready").status_code == 503
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     if not held:
         assert TestClient(create_app(state)).get("/health/ready").status_code == 200
     with sqlite3.connect(state / "tessera.sqlite3") as db:

@@ -9,9 +9,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .code_approval import refuse_local_transfer
 from .execution import ExecutionStore
+from .snapshot_chunks import chunk_index, is_chunked, read_chunk
 from .snapshots import SnapshotStore
-from .store import Conflict, NotFound, StoreError, _parse_utc, utc_now
+from .store import Conflict, Forbidden, NotFound, StoreError, _connect, _parse_utc, utc_now
 
 
 class DeliverInputs(BaseModel):
@@ -20,9 +22,15 @@ class DeliverInputs(BaseModel):
 
 
 class InputDeliveryStore(ExecutionStore):
-    def _lease_bundle(
-        self, connection: sqlite3.Connection, worker: dict[str, Any], lease_id: str, epoch: int
-    ) -> dict[str, Any]:
+    def _lease_fences(
+        self,
+        connection: sqlite3.Connection,
+        worker: dict[str, Any],
+        lease_id: str,
+        epoch: int,
+        *,
+        verify_retained: bool = True,
+    ) -> tuple[Any, Any, Any]:
         lease = connection.execute(
             "SELECT * FROM execution_leases WHERE id = ?", (lease_id,)
         ).fetchone()
@@ -34,11 +42,35 @@ class InputDeliveryStore(ExecutionStore):
             raise Conflict("Execution lease expiry is invalid.") from error
         if lease["epoch"] != epoch or expiry <= self._now():
             raise Conflict("Execution lease is no longer current.")
-        grant = self._active_worker_grant(connection, worker, lease["grant_id"])
+        grant = self._active_worker_grant(
+            connection, worker, lease["grant_id"], verify_retained=verify_retained
+        )
         if grant["epoch"] != epoch:
             raise Conflict("Execution grant epoch is no longer current.")
+        return lease, grant, expiry
+
+    def _lease_bundle(
+        self, connection: sqlite3.Connection, worker: dict[str, Any], lease_id: str, epoch: int
+    ) -> dict[str, Any]:
+        lease, grant, expiry = self._lease_fences(connection, worker, lease_id, epoch)
         snapshot = SnapshotStore._snapshot(connection, worker, grant["snapshot_id"])
+        refuse_local_transfer(connection, grant["snapshot_id"])
         verified = SnapshotStore._verify_retained(connection, worker, grant["snapshot_id"])
+        if verified.get("chunked"):
+            # ADR 0037: chunked delivery carries an index; bytes come one chunk at a time.
+            if expiry <= self._now():
+                raise Conflict("Execution lease expired while preparing input delivery.")
+            return {
+                "lease": lease,
+                "grant": grant,
+                "snapshot": {
+                    "id": snapshot["id"],
+                    "digest": verified["digest"],
+                    "manifest": SnapshotStore._response(snapshot)["manifest"],
+                    "delivery": "chunked",
+                    "chunks": chunk_index(connection, snapshot["id"]),
+                },
+            }
         files = [
             {
                 "relative_path": row["relative_path"],
@@ -62,6 +94,47 @@ class InputDeliveryStore(ExecutionStore):
                 "files": files,
             },
         }
+
+    def read_input_chunk(
+        self, worker: dict[str, Any], lease_id: str, seq: int, expected_epoch: int
+    ) -> dict[str, Any]:
+        """Read one chunk under the same fences as ``_lease_bundle``; never stored or replayed."""
+        if (
+            not isinstance(lease_id, str)
+            or not lease_id.strip()
+            or len(lease_id) > 200
+            or type(seq) is not int
+            or seq < 0
+            or type(expected_epoch) is not int
+            or not 1 <= expected_epoch <= 2**63 - 1
+        ):
+            raise StoreError("Invalid input chunk request.")
+        connection = _connect(self.database_path)
+        try:
+            connection.execute("BEGIN")
+            live = self._live_principal(connection, worker, audience="worker")
+            recovery = connection.execute(
+                "SELECT state FROM control_recovery WHERE singleton=1"
+            ).fetchone()
+            if recovery is None or recovery["state"] != "active":
+                raise Forbidden("Control state is held after restore; input delivery is disabled.")
+            lease, grant, expiry = self._lease_fences(connection, live, lease_id, expected_epoch)
+            refuse_local_transfer(connection, grant["snapshot_id"])
+            if not is_chunked(connection, grant["snapshot_id"]):
+                raise NotFound("Snapshot is not delivered in chunks.")
+            SnapshotStore._verify_retained(connection, live, grant["snapshot_id"])
+            meta, content = read_chunk(connection, grant["snapshot_id"], seq)
+            if expiry <= self._now():
+                raise Conflict("Execution lease expired while preparing input delivery.")
+            return {
+                "snapshot_id": grant["snapshot_id"],
+                **meta,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        finally:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            connection.close()
 
     def deliver_inputs(
         self, worker: dict[str, Any], lease_id: str, key: str, digest: str, expected_epoch: int

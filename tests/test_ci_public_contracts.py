@@ -39,7 +39,7 @@ def test_distribution_checker_requires_the_exact_current_mcp_tool_surface():
     expected = ast.literal_eval(declarations[0])
     actual = {tool.name for tool in asyncio.run(create_server(None).list_tools())}
     assert actual == expected
-    assert len(actual) == 18
+    assert len(actual) == 22
 
 
 def test_docker_context_includes_public_test_inputs_without_runtime_state():

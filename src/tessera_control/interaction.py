@@ -12,6 +12,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .approval_trust import require_decision_actor
 from .execution import ExecutionStore, _parse_utc
 from .interaction_models import (
     AcknowledgeHarnessDelivery,
@@ -935,6 +936,8 @@ class InteractionStore:
         }
 
         def command(conn, live):
+            if live["role"] == "human" and decision != "reject":  # reject only reduces
+                require_decision_actor(live, forbidden=Forbidden)
             row = conn.execute(
                 "SELECT * FROM decision_requests WHERE id = ? AND org_id = ?",
                 (decision_id, live["org_id"]),
@@ -967,6 +970,18 @@ class InteractionStore:
                 conn, live, row["project_id"], row["kind"], scope,
                 resolving_id=decision_id, approve=decision == "approve",
             )
+            if live.get("campaign_delegated"):
+                from .campaign_preapproval import authorize_delegated
+
+                # Delegated resolution only as an exact-digest pre-approval (ADR 0044).
+                authorize_delegated(
+                    conn,
+                    live,
+                    step="resolve_decision",
+                    kind=scope.get("action", ""),
+                    subject_id=decision_id,
+                    approve=decision == "approve",
+                )
             now = utc_now()
             status = {"approve": "approved", "reject": "rejected"}[decision]
             conn.execute(

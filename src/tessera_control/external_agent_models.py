@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from .models import (
     ExecutionSpec,
@@ -13,6 +13,7 @@ from .models import (
     StrictNonNegativeInt,
     StrictRequest,
     StrictRevision,
+    within_operator_limit,
 )
 
 
@@ -22,6 +23,11 @@ class AgentPlan(StrictRequest):
     budget_cents: StrictNonNegativeInt
     max_duration_seconds: StrictDuration
     execution_spec: ExecutionSpec
+
+    @field_validator("execution_spec")
+    @classmethod
+    def _within_operator_limit(cls, spec: ExecutionSpec) -> ExecutionSpec:
+        return within_operator_limit(spec)
 
 
 class AgentProvenance(StrictRequest):

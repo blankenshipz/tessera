@@ -1,6 +1,6 @@
 # Direct Agent Sandbox adapter: operator gates and authenticated commands
 
-This is a **one-shot, network-none** integration with upstream Agent Sandbox
+This is a **one-shot, network-none by default** integration (an opt-in allowlist egress-proxy profile, ADR 0034, is detected by one shared predicate in worker and control) with upstream Agent Sandbox
 v1.0.6, commit `cd0761d5001baaf293460cd382ee318744d6b249` (Apache-2.0).
 [Decision 0030](decisions/0030-direct-agent-sandbox.md) specifies the boundary.
 Default tests use synthetic Kubernetes effects. No live Sandbox, network

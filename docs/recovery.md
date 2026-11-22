@@ -33,10 +33,13 @@ control database.
 The manifest records the backup ID, time, schema version, event watermark, snapshot
 size, and SHA-256 digest. Bundle manifests additionally declare every external
 object and every SQLite-only legacy artifact. Backup validates integrity and foreign
-keys before publishing the manifest. The 1 GiB total bundle limit, 1,024-object
-limit, 16 MiB per-object limit, and 30-second deadline are cooperative limits; an
-in-progress kernel I/O operation cannot be preempted. Failed attempts leave their
-private incomplete output directory for diagnosis.
+keys before publishing the manifest. The total bundle limit is 1 GiB by default;
+an operator raises it for one command with `--max-backup-bytes N` (at most 64 GiB) on
+`tessera backup`, and a restore needs a bound that covers the backup. The default is
+never raised implicitly, and a refusal names the setting. The deadline is 30 seconds per
+started GiB of the bound. These, the 1,024-object limit and the 16 MiB per-object limit
+are cooperative limits; an in-progress kernel I/O operation cannot be preempted. Failed
+attempts leave their private incomplete output directory for diagnosis.
 
 Restore only into an absent destination:
 
@@ -139,7 +142,7 @@ then complete these steps before declaring recovery verification complete:
    Keep private backup outputs outside the source state/PVC. Quiesce application
    writes for an exact before/after comparison, or declare an explicit event
    cutoff and record IDs rather than comparing to a subsequently changing source.
-2. After the MixFM records to be protected have committed, retain private baseline
+2. After the program records to be protected have committed, retain private baseline
    responses for `GET /studies/{id}/export`,
    `GET /studies/{id}/dataset-snapshots`, and
    `GET /interaction/studies/{id}/program-context`. Record their IDs, revisions,
@@ -180,16 +183,16 @@ then complete these steps before declaring recovery verification complete:
 ### Bounded disposable developer drill
 
 This single test invokes the real backup/restore CLI handlers against generated
-temporary state with populated MixFM metadata, evaluation reviews and v48 dataset
+temporary state with populated program metadata, evaluation reviews and v48 dataset
 records. It compares retained rows/API exports, checks SQLite integrity, rejects
 old credentials, tests held writes/replays/restarts, and backs up/restores the held
 copy again without writable promotion. It uses no network providers or PVCs:
 
 ```sh
-.venv/bin/pytest -q tests/test_recovery_mixfm.py::test_v48_mixfm_cli_backup_restore_drill
+.venv/bin/pytest -q tests/test_recovery_program_records.py::test_v48_program_cli_backup_restore_drill
 ```
 
-The full `tests/test_recovery_mixfm.py` additionally checks migration freshness,
+The full `tests/test_recovery_program_records.py` additionally checks migration freshness,
 held migration, altered dataset bytes/schema/foreign keys, and incompatible
 schema/watermark manifests. All inputs and credentials are disposable synthetic
 fixtures; these checks do not attest to the contents of a live backup.

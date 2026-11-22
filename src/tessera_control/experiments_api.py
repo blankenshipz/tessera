@@ -6,6 +6,11 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from .api import idempotency_key, principal, worker_principal
+from .experiment_budget_models import (
+    AuthorizeExperimentBudget,
+    RecordExperimentCharge,
+    ResolveExperimentBudgetBounds,
+)
 from .experiments import EXPORT_DEFAULT_BYTES, EXPORT_MAX_BYTES, ExperimentStore
 from .experiments_models import (
     AdmitExperimentAttempt,
@@ -39,6 +44,40 @@ Experiments = Annotated[ExperimentStore, Depends(store)]
 
 def response(value: tuple[int, dict[str, Any]]) -> JSONResponse:
     return JSONResponse(status_code=value[0], content=value[1])
+
+
+@router.get("/experiments/{experiment_id}/budget")
+def budget(experiment_id: str, actor: Actor, records: Experiments) -> dict[str, Any]:
+    return records.get_budget(actor, experiment_id)
+
+
+@router.post("/experiments/{experiment_id}/budget/authorization")
+def authorize_budget(
+    experiment_id: str,
+    body: AuthorizeExperimentBudget,
+    actor: Actor,
+    key: Key,
+    records: Experiments,
+) -> JSONResponse:
+    return response(records.budget_command(actor, experiment_id, key, body))
+
+
+@router.post("/experiments/{experiment_id}/budget/charges")
+def record_budget_charge(
+    experiment_id: str, body: RecordExperimentCharge, actor: Actor, key: Key, records: Experiments
+) -> JSONResponse:
+    return response(records.budget_command(actor, experiment_id, key, body, charge=True))
+
+
+@router.post("/experiments/{experiment_id}/budget/bounds")
+def resolve_budget_bounds(
+    experiment_id: str,
+    body: ResolveExperimentBudgetBounds,
+    actor: Actor,
+    key: Key,
+    records: Experiments,
+) -> JSONResponse:
+    return response(records.budget_command(actor, experiment_id, key, body, bounds=True))
 
 
 @router.get("/projects/{project_id}/experiments")

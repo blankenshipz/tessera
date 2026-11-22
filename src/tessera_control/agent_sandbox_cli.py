@@ -11,7 +11,17 @@ from tessera_worker.service import DevelopmentWorkerError, read_private_credenti
 def add_agent_sandbox_commands(subcommands):
     parser = subcommands.add_parser("agent-sandbox", help="authenticated direct Sandbox lifecycle")
     actions = parser.add_subparsers(dest="sandbox_action", required=True)
-    for name in ("create", "run", "release", "status", "stop", "collect", "deliver", "cleanup"):
+    for name in (
+        "create",
+        "run",
+        "release",
+        "status",
+        "stop",
+        "collect",
+        "deliver",
+        "cleanup",
+        "egress-journal",
+    ):
         command = actions.add_parser(name)
         command.add_argument("--control-url", required=True)
         command.add_argument("--credential-file", required=True, type=Path)
@@ -64,7 +74,7 @@ def run_agent_sandbox(arguments):
         if name == "create":
             path = f"/worker/agent-sandbox/leases/{arguments.lease_id}"
         else:
-            prefix = "/worker" if name in {"run", "release"} else ""
+            prefix = "/worker" if name in {"run", "release", "egress-journal"} else ""
             action = {"status": "observe", "collect": "collection-handoff"}.get(name, name)
             path = f"{prefix}/agent-sandboxes/{arguments.operation_id}/{action}"
         body = (

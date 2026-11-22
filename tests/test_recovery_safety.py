@@ -135,9 +135,12 @@ def test_hash_limit_and_deadline_are_checked_while_reading(tmp_path: Path, monke
     path.write_bytes(b"bounded bytes")
     with pytest.raises(StoreError, match="time limit"):
         recovery._sha256(path, time.monotonic() - recovery.MAX_BACKUP_SECONDS - 1)
-    monkeypatch.setattr(recovery, "MAX_BACKUP_BYTES", 1)
-    with pytest.raises(StoreError, match="bounded"):
-        recovery._sha256(path, time.monotonic())
+    token = recovery._BYTE_LIMIT.set(1)  # the per-call operator bound
+    try:
+        with pytest.raises(StoreError, match="size limit.*--max-backup-bytes"):
+            recovery._sha256(path, time.monotonic())
+    finally:
+        recovery._BYTE_LIMIT.reset(token)
 
 
 def test_exclusive_writes_handle_short_writes(tmp_path: Path, monkeypatch):

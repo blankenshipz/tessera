@@ -164,8 +164,12 @@ def test_inventory_detects_queued_directory_replacement(
             nonlocal swapped
             self.scanned.close()
             if not swapped:
+                before = tmp_path.stat()
                 child.rmdir()
                 child.symlink_to(outside, target_is_directory=True)
+                # Force a distinct directory mtime so the timestamp check never depends on the
+                # clock tick; the listing check is exercised on its own in the next test.
+                os.utime(tmp_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
                 swapped = True
 
     def scandir_and_swap(directory_fd: int):
@@ -325,3 +329,62 @@ def test_literal_dot_components_are_rejected_before_path_normalization(tmp_path:
         inventory_workspace(path_with_parent)
     with pytest.raises(WorkspaceError, match="unsafe path component"):
         snapshot_skill(path_with_parent)
+
+
+def test_same_tick_directory_replacement_is_caught_by_the_listing_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """With the directory's timestamps frozen, a swapped entry is still seen (kind or inode)."""
+    child = tmp_path / "child"
+    child.mkdir()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    real_identity = workspace._directory_identity
+    frozen = real_identity(os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY))
+    monkeypatch.setattr(workspace, "_directory_identity", lambda fd: frozen)
+    original_scandir = workspace.os.scandir
+    swapped = False
+
+    class Swap:
+        def __init__(self, scanned):
+            self.scanned = scanned
+
+        def __enter__(self):
+            return self.scanned
+
+        def __exit__(self, *args):
+            nonlocal swapped
+            self.scanned.close()
+            if not swapped:
+                child.rmdir()
+                child.symlink_to(outside, target_is_directory=True)
+                swapped = True
+
+    monkeypatch.setattr(workspace.os, "scandir", lambda fd: Swap(original_scandir(fd)))
+    with pytest.raises(WorkspaceError, match="directory changed"):
+        inventory_workspace(tmp_path.absolute())
+
+
+def test_same_tick_same_size_file_rewrite_is_caught_by_the_content_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "data.txt"
+    path.write_bytes(b"aaaa")
+    frozen = os.stat(path)
+    original = os.read
+    changed = False
+
+    def read(fd, size):
+        nonlocal changed
+        chunk = original(fd, size)
+        if chunk and not changed:
+            changed = True
+            path.write_bytes(b"aaab")
+        return chunk
+
+    monkeypatch.setattr(os, "read", read)
+    monkeypatch.setattr(workspace.os, "fstat", lambda fd: frozen)
+    with pytest.raises(WorkspaceError, match="file changed during read"):
+        workspace._read_bytes_at(
+            os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY), "data.txt", 100, "data.txt"
+        )

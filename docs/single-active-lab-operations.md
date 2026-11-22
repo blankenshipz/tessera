@@ -72,7 +72,7 @@ fixture namespace and must never be pointed at an existing lab namespace.
 
 After migration, follow [post-migration verification](recovery.md#post-migration-verification)
 as well. A pre-upgrade backup or a recent backup-health timestamp cannot prove
-that new MixFM records are protected; require a post-upgrade snapshot and compare
+that new program records are protected; require a post-upgrade snapshot and compare
 the metadata, evaluation and dataset projections on a disposable held restore.
 Already-migrated labs need this gate too. Never use the production PVC as a
 restore-drill destination or interpret this check as writable promotion.

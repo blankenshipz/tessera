@@ -58,7 +58,7 @@ authorized paid spend, no retries. Billing remains unknown, not zero accounting.
 
 Receipts distinguish synthetic completion, quarantined artifacts, observed stop,
 missing stdout/stderr capture and scientific validity `not_assessed`. Source/license
-review, dataset metadata validation, MixFM evaluation and scientific acceptance
+review, dataset metadata validation, program evaluation and scientific acceptance
 remain separate. Session approval never performs those decisions automatically.
 
 Control backups include session event history without a schema migration. Preserve

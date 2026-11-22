@@ -4,6 +4,10 @@ Lifecycle definitions follow Kubernetes SIGs Agent Sandbox v1.0.6 (Apache-2.0),
 commit cd0761d5001baaf293460cd382ee318744d6b249. Tessera owns authority/fences.
 """
 
+import base64
+import json
+import time
+import urllib.request
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +23,20 @@ from .execution_contracts import (
     TargetBinding,
 )
 
+EGRESS_PROFILE_VERSION = "agent-sandbox-egress-allowlist-v1"
+EGRESS_PROXY_PORT = 3128
+NETWORK_NONE_PROFILE_VERSION = "agent-sandbox-network-none-v1"
+_PRIVATE_V4 = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+    "127.0.0.0/8",
+    "0.0.0.0/8",
+]
+_PRIVATE_V6 = ["fc00::/7", "fe80::/10", "::1/128"]
+
 
 class SandboxUnsafe(RuntimeError):
     """Identity, drift, prerequisites or termination cannot be established."""
@@ -31,7 +49,9 @@ def envelope(package):
         operation_id=package["operation_id"],
         package_digest=canonical_digest(package),
         target=TargetBinding(
-            "agent-sandbox", "agent-sandbox-network-none-v1", canonical_digest(target.model_dump())
+            "agent-sandbox",
+            package.get("profile_version", NETWORK_NONE_PROFILE_VERSION),
+            canonical_digest(target.model_dump()),
         ),
         lease_id=package["lease_id"],
         epoch=package["epoch"],
@@ -66,7 +86,7 @@ def authenticated_backend(target, ca_reference, token_reference, verify_witness)
     ipaddress.ip_address(urlsplit(target.server).hostname)
 
     class ReferencePinnedClient(NamespacedKubernetesClient):
-        def request(self, *args, **kwargs):
+        def _check_reference(self):
             reference = Path(target.kubeconfig)
             if not reference.is_file() or reference.stat().st_size > 1024 * 1024:
                 raise SandboxUnsafe("explicit kubeconfig reference unavailable")
@@ -74,10 +94,41 @@ def authenticated_backend(target, ca_reference, token_reference, verify_witness)
 
             if hashlib.sha256(reference.read_bytes()).hexdigest() != target.kubeconfig_sha256:
                 raise SandboxUnsafe("explicit kubeconfig reference digest changed")
+
+        def request(self, *args, **kwargs):
+            self._check_reference()
             return super().request(*args, **kwargs)
+
+        def request_raw(self, path, max_bytes):
+            self._check_reference()
+            return _raw_get(self, path, max_bytes)
 
     client = ReferencePinnedClient(target, Path(ca_reference), Path(token_reference))
     return AgentSandboxBackend(client, verify_witness)
+
+
+EGRESS_NETWORK_PROFILE = "allowlist-proxy-v1"
+
+
+def is_egress_package(package):
+    """The one egress-mode predicate shared by worker and control.
+
+    An allowlist-proxy package sets both ``profile_version`` and ``network_profile``. A package
+    that sets only one is ambiguous, so it is refused rather than treated as network-none.
+    """
+    versioned = package.get("profile_version") == EGRESS_PROFILE_VERSION
+    profiled = package.get("network_profile") == EGRESS_NETWORK_PROFILE
+    if versioned != profiled:
+        raise ValueError("Sandbox package has inconsistent egress profile markers.")
+    return versioned
+
+
+def _is_egress(package):
+    return is_egress_package(package)
+
+
+def _proxy_url(package):
+    return f"http://tessera-egress-{package['operation_id']}:{EGRESS_PROXY_PORT}"
 
 
 def manifest(package):
@@ -124,6 +175,13 @@ def manifest(package):
         ],
         "volumes": [{"name": "outputs", "persistentVolumeClaim": {"claimName": "outputs-" + name}}],
     }
+    if _is_egress(package):
+        proxy = _proxy_url(package)
+        pod["containers"][0]["env"] = [
+            {"name": "HTTPS_PROXY", "value": proxy},
+            {"name": "HTTP_PROXY", "value": proxy},
+            {"name": "NO_PROXY", "value": ""},
+        ]
     return {
         "apiVersion": API_VERSION,
         "kind": "Sandbox",
@@ -152,6 +210,175 @@ def manifest(package):
             ],
         },
     }
+
+
+def _dns_rule():
+    return {
+        "to": [
+            {
+                "namespaceSelector": {
+                    "matchLabels": {"kubernetes.io/metadata.name": "kube-system"}
+                },
+                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+            }
+        ],
+        "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
+    }
+
+
+def egress_manifests(package):
+    """Deterministic per-run proxy Pod, Service and the two NetworkPolicies."""
+    envelope(package)
+    if not _is_egress(package):
+        raise SandboxUnsafe("package has no egress profile")
+    op = package["operation_id"]
+    egress = package["egress"]
+    target = package["sandbox"]["target"]
+    namespace = target["namespace"]
+    destinations = [{"host": d["host"], "port": d["port"]} for d in egress["destinations"]]
+    ports = sorted({int(d["port"]) for d in destinations})
+    config = {"destinations": destinations, "max_egress_bytes": egress["max_egress_bytes"]}
+    config_b64 = base64.b64encode(
+        json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    ).decode()
+    sandbox_labels = {"tessera.dev/operation": op}
+    proxy_labels = {"tessera.dev/egress-proxy": op}
+
+    def meta(name, labels=None):
+        return {
+            "name": name,
+            "namespace": namespace,
+            "labels": {"tessera.dev/egress-operation": op} | (labels or {}),
+            "annotations": {"tessera.dev/package": canonical_digest(package)},
+        }
+
+    proxy_port = [{"protocol": "TCP", "port": EGRESS_PROXY_PORT}]
+    sandbox_policy = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": meta("tessera-egress-" + op),
+        "spec": {
+            "podSelector": {"matchLabels": dict(sandbox_labels)},
+            "policyTypes": ["Egress"],
+            "egress": [
+                {"to": [{"podSelector": {"matchLabels": dict(proxy_labels)}}], "ports": proxy_port},
+                _dns_rule(),
+            ],
+        },
+    }
+    proxy_policy = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": meta("tessera-egress-proxy-" + op),
+        "spec": {
+            "podSelector": {"matchLabels": dict(proxy_labels)},
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [
+                {
+                    "from": [{"podSelector": {"matchLabels": dict(sandbox_labels)}}],
+                    "ports": deepcopy(proxy_port),
+                }
+            ],
+            "egress": [
+                {
+                    "to": [
+                        {"ipBlock": {"cidr": "0.0.0.0/0", "except": list(_PRIVATE_V4)}},
+                        {"ipBlock": {"cidr": "::/0", "except": list(_PRIVATE_V6)}},
+                    ],
+                    "ports": [{"protocol": "TCP", "port": port} for port in ports],
+                },
+                _dns_rule(),
+            ],
+        },
+    }
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": meta("tessera-egress-" + op),
+        "spec": {
+            "type": "ClusterIP",
+            "selector": dict(proxy_labels),
+            "ports": [
+                {"protocol": "TCP", "port": EGRESS_PROXY_PORT, "targetPort": EGRESS_PROXY_PORT}
+            ],
+        },
+    }
+    resource = {"cpu": "100m", "memory": "128Mi"}
+    proxy_pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": meta("tessera-egress-proxy-" + op, proxy_labels),
+        "spec": {
+            "runtimeClassName": target["runtime_class"],
+            "automountServiceAccountToken": False,
+            "enableServiceLinks": False,
+            "hostNetwork": False,
+            "hostPID": False,
+            "hostIPC": False,
+            "restartPolicy": "Never",
+            "priority": 0,
+            "preemptionPolicy": "PreemptLowerPriority",
+            "activeDeadlineSeconds": package["plan"]["max_duration_seconds"],
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": 65532,
+                "runAsGroup": 65532,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": "proxy",
+                    "image": target["egress_proxy_image"],
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": [
+                        "python",
+                        "-m",
+                        "tessera_worker.egress_proxy",
+                        "--config-b64",
+                        config_b64,
+                        "--journal",
+                        "-",
+                        "--listen",
+                        f"0.0.0.0:{EGRESS_PROXY_PORT}",  # noqa: S104
+                    ],
+                    "ports": [{"containerPort": EGRESS_PROXY_PORT}],
+                    "resources": {"requests": dict(resource), "limits": dict(resource)},
+                    "securityContext": {
+                        "readOnlyRootFilesystem": True,
+                        "allowPrivilegeEscalation": False,
+                        "privileged": False,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                }
+            ],
+        },
+    }
+    return {
+        "sandbox_policy": sandbox_policy,
+        "proxy_policy": proxy_policy,
+        "service": service,
+        "proxy_pod": proxy_pod,
+    }
+
+
+def _raw_get(client, path, max_bytes):
+    """Bounded raw GET through the client's pinned opener, token and CA."""
+    if not path.startswith("/api/"):
+        raise SandboxUnsafe("raw read path outside fixed API")
+    token = client.token.read_bytes()
+    if not token or len(token) > 8192 or any(ch in token for ch in (b"\n", b"\r")):
+        raise SandboxUnsafe("invalid projected Kubernetes token")
+    request = urllib.request.Request(
+        client.cluster.server.rstrip("/") + path,
+        method="GET",
+        headers={"Authorization": "Bearer " + token.decode("ascii"), "Accept": "text/plain"},
+    )
+    deadline = time.monotonic() + 5.0
+    try:
+        with client.opener.open(request, timeout=5.0) as response:
+            return client._read_response(response, max_bytes, deadline)
+    except (OSError, ValueError):
+        raise SandboxUnsafe("proxy log read unavailable") from None
 
 
 def _identity(value, kind, *, uid=None, name=None, namespace=None):
@@ -209,6 +436,7 @@ class AgentSandboxBackend:
         base = {
             "sandbox": f"/apis/{API_VERSION}/namespaces/{ns}/sandboxes",
             "pod": f"/api/v1/namespaces/{ns}/pods",
+            "service": f"/api/v1/namespaces/{ns}/services",
             "pvc": f"/api/v1/namespaces/{ns}/persistentvolumeclaims",
             "policy": f"/apis/networking.k8s.io/v1/namespaces/{ns}/networkpolicies",
         }[kind]
@@ -272,7 +500,24 @@ class AgentSandboxBackend:
             value = self.client.request("GET", "/api/v1/namespaces/" + quote(name, safe=""))
             _identity(value, "Namespace", uid=uid, name=name)
 
-    def preflight(self, target, labels):
+    def proxy_log(self, target, operation_id, max_bytes=2 * 1024 * 1024):
+        """Raw proxy container log, bounded; never truncated silently."""
+        path = (
+            self.path(target, "pod", "tessera-egress-proxy-" + operation_id)
+            + f"/log?container=proxy&limitBytes={int(max_bytes)}"
+        )
+        reader = getattr(self.client, "request_raw", None) or (
+            lambda p, n: _raw_get(self.client, p, n)
+        )
+        data = reader(path, max_bytes)
+        if not isinstance(data, bytes):
+            raise SandboxUnsafe("proxy log unavailable")
+        if len(data) >= max_bytes:
+            # limitBytes cannot reveal truncation, so a full buffer is refused.
+            raise SandboxUnsafe("proxy log exceeds bound")
+        return data
+
+    def preflight(self, target, labels, expected_egress_policy=None):
         self.identity(target)
         crd = self.client.request(
             "GET",
@@ -331,10 +576,20 @@ class AgentSandboxBackend:
         }
         if any(witness.get(key) != value for key, value in expected.items()):
             raise SandboxUnsafe("witness does not cover required isolation/authority boundaries")
-        denied = set()
+        denied, matched = set(), 0
         for policy in self.list(target, "policy", "NetworkPolicyList"):
             spec = policy.get("spec", {})
             if not _selected(spec.get("podSelector"), labels):
+                continue
+            if expected_egress_policy is not None and (
+                policy.get("metadata", {}).get("name") == expected_egress_policy["metadata"]["name"]
+            ):
+                actual = deepcopy(spec)
+                actual.setdefault("policyTypes", ["Ingress"])
+                if actual != expected_egress_policy["spec"]:
+                    raise SandboxUnsafe("egress NetworkPolicy drift")
+                matched += 1
+                denied.update(actual["policyTypes"])
                 continue
             if spec.get("ingress") or spec.get("egress"):
                 raise SandboxUnsafe("additive NetworkPolicy permits traffic")
@@ -342,6 +597,8 @@ class AgentSandboxBackend:
             if not isinstance(types, list) or set(types) - {"Ingress", "Egress"}:
                 raise SandboxUnsafe("unknown NetworkPolicy types")
             denied.update(types)
+        if expected_egress_policy is not None and matched != 1:
+            raise SandboxUnsafe("expected egress NetworkPolicy missing or duplicated")
         if denied != {"Ingress", "Egress"}:
             raise SandboxUnsafe("default-deny ingress and egress required before creation")
 

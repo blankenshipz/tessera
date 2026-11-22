@@ -13,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from .gate_evidence_models import RESERVED_MEASUREMENT_KEYS
 from .research_models import _bounded_json
 
 
@@ -63,6 +64,9 @@ class CreateExperiment(ExperimentRequest):
 
 class ReviseExperimentDesign(CreateExperiment):
     expected_revision: Revision
+    # Why the plan changed. Recorded on the append-only design-revision event so a change of
+    # plan is never a silent replacement; optional so existing clients keep working.
+    change_reason: NonBlank4000 | None = None
 
 
 class RecordAttempt(ExperimentRequest):
@@ -143,6 +147,14 @@ class RecordMeasurement(ExperimentRequest):
     artifact_id: Identifier | None = None
 
     _value_is_bounded = field_validator("value")(_bounded_json)
+
+    @field_validator("value")
+    @classmethod
+    def _value_has_no_server_keys(cls, value: dict[str, Any]) -> dict[str, Any]:
+        reserved = sorted(RESERVED_MEASUREMENT_KEYS.intersection(value))
+        if reserved:
+            raise ValueError(f"Measurement value uses server-reserved keys: {reserved}")
+        return value
 
 
 class DeriveOutputMeasurement(ExperimentRequest):

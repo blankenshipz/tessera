@@ -1,0 +1,251 @@
+"""Scoped, read-only campaign evidence for enrolled external agents.
+
+Lets an agent that submits campaigns discover the snapshots it may cite, then read stage
+outputs (metadata only), attempt diagnostics and campaign budget without a human relaying
+them.  Every read needs its own enrolled action, stays inside the credential's project and
+organization, selects explicit column allowlists, and grants no approval, spend, release or
+staging authority.  Staging stays a human step; artifact bytes stay behind the release path.
+
+Actions: ``snapshot:read`` (project snapshot catalog), ``artifact:read`` (stage output
+metadata), ``campaign:logs`` (attempt diagnostics; Tessera keeps no raw stdout/stderr, so
+this is recorded status, exit code, failure class and bounded detail), ``budget:read``
+(campaign cap, holds and settlements).  Humans (unscoped, tenant-checked) read the same.
+"""
+
+import json
+from typing import Any
+
+from .campaign_store import CampaignStore
+from .data_class import snapshot_data_class
+from .store import StoreError, _connect
+
+SNAPSHOT_SCOPE = "snapshot:read"
+ARTIFACT_SCOPE = "artifact:read"
+LOGS_SCOPE = "campaign:logs"
+BUDGET_SCOPE = "budget:read"
+
+BOUNDARY = (
+    "Recorded Tessera records only. Absent records are not evidence of absence and nothing "
+    "here is approval, release or evidence of scientific validity."
+)
+_ROW_CAP = 1000
+
+
+class AgentCampaignReads(CampaignStore):
+    def _reader(self, connection, principal, action):
+        actor = self._actor(connection, principal)
+        self._require_action(connection, actor, action)
+        return actor
+
+    def list_snapshots(self, principal, project_id, offset=0, limit=50) -> dict[str, Any]:
+        if not 0 <= offset <= 2**63 - 1 or not 1 <= limit <= 200:
+            raise StoreError("Invalid page bounds.")
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, SNAPSHOT_SCOPE)
+            self._project(connection, actor, project_id)
+            rows = connection.execute(
+                """SELECT s.id, s.digest, s.created_at,
+                json_extract(s.manifest_json, '$.total_bytes') AS total_bytes,
+                json_array_length(s.manifest_json, '$.entries') AS file_count
+                FROM source_snapshots s JOIN projects p ON p.id = s.project_id
+                WHERE s.project_id = ? AND p.org_id = ?
+                ORDER BY s.created_at, s.id LIMIT ? OFFSET ?""",
+                (project_id, actor["org_id"], limit, offset),
+            ).fetchall()
+            snapshots = []
+            for row in rows:
+                item = dict(row)
+                item["data_class"] = snapshot_data_class(connection, item["id"])
+                snapshots.append(item)
+            return {"snapshots": snapshots, "boundary": BOUNDARY}
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _custody_released(connection, manifest_id) -> bool:
+        """The condition a later campaign's artifact pin needs (campaign_io.resolve_artifact)."""
+        if manifest_id is None:
+            return False
+        manifest = connection.execute(
+            "SELECT manifest_digest FROM artifact_manifests WHERE id=?", (manifest_id,)
+        ).fetchone()
+        disposition = connection.execute(
+            "SELECT disposition FROM artifact_dispositions WHERE manifest_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (manifest_id,),
+        ).fetchone()
+        release = connection.execute(
+            "SELECT state, manifest_digest FROM artifact_custody_releases WHERE manifest_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (manifest_id,),
+        ).fetchone()
+        return bool(
+            manifest is not None
+            and disposition is not None
+            and disposition["disposition"] == "retain_quarantined"
+            and release is not None
+            and release["state"] == "released"
+            and release["manifest_digest"] == manifest["manifest_digest"]
+        )
+
+    def campaign_outputs(self, principal, campaign_id) -> dict[str, Any]:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, ARTIFACT_SCOPE)
+            self._campaign(connection, actor, campaign_id)
+            rows = connection.execute(
+                """SELECT stage_key, attempt_id, name, kind, media_type, sha256, size_bytes,
+                snapshot_id, manifest_id, data_class, created_at FROM campaign_stage_io
+                WHERE campaign_id = ? AND direction = 'output'
+                ORDER BY created_at, stage_key, name LIMIT ?""",
+                (campaign_id, _ROW_CAP),
+            ).fetchall()
+            outputs = []
+            for row in rows:
+                item = dict(row)
+                item["custody_released"] = self._custody_released(connection, row["manifest_id"])
+                outputs.append(item)
+            return {
+                "campaign_id": campaign_id,
+                "outputs": outputs,
+                "truncated": len(rows) == _ROW_CAP,
+                "boundary": BOUNDARY + " Metadata only; bytes need a human-released snapshot.",
+            }
+        finally:
+            connection.close()
+
+    def campaign_logs(self, principal, campaign_id) -> dict[str, Any]:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, LOGS_SCOPE)
+            campaign = self._campaign(connection, actor, campaign_id)
+            stages = connection.execute(
+                """SELECT stage_key, status, attempts_used, provider_id, updated_at
+                FROM campaign_stages WHERE campaign_id = ? ORDER BY topo_index""",
+                (campaign_id,),
+            ).fetchall()
+            attempts = connection.execute(
+                """SELECT stage_key, attempt, status, exit_code, failure_class, failure_detail,
+                provider_id, created_at, updated_at FROM campaign_stage_attempts
+                WHERE campaign_id = ? ORDER BY stage_key, attempt LIMIT ?""",
+                (campaign_id, _ROW_CAP),
+            ).fetchall()
+            return {
+                "campaign_id": campaign_id,
+                "status": campaign["status"],
+                "stages": [dict(row) for row in stages],
+                "attempts": [dict(row) for row in attempts],
+                "truncated": len(attempts) == _ROW_CAP,
+                "boundary": BOUNDARY + " Raw stdout/stderr is not retained by Tessera.",
+            }
+        finally:
+            connection.close()
+
+    def campaign_grants(self, principal, campaign_id) -> dict[str, Any]:
+        """Why a slot or release may still be held: each attempt's grant and data release.
+
+        Recorded status only, from explicit column allowlists (campaign:logs). Reconciling a
+        grant is human-only evidence work (ADR 0053 resolves a confirmed exit on its own);
+        nothing here changes a grant.
+        """
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, LOGS_SCOPE)
+            self._campaign(connection, actor, campaign_id)
+            rows = connection.execute(
+                """SELECT a.stage_key, a.attempt, a.status AS attempt_status, a.failure_class,
+                a.hold_cents, a.settled_cents, a.settlement_basis,
+                g.id AS grant_id, g.status AS grant_status, g.max_exposure_cents,
+                g.expires_at AS grant_expires_at, g.settlement_cents AS grant_settlement_cents,
+                g.revision AS grant_revision,
+                r.id AS release_id, r.status AS release_status, r.revision AS release_revision,
+                r.expires_at AS release_expires_at
+                FROM campaign_stage_attempts a
+                LEFT JOIN execution_grants g ON g.id = a.grant_id
+                LEFT JOIN snapshot_releases r ON r.id = a.release_id
+                WHERE a.campaign_id = ? ORDER BY a.stage_key, a.attempt LIMIT ?""",
+                (campaign_id, _ROW_CAP),
+            ).fetchall()
+            return {
+                "campaign_id": campaign_id,
+                "grants": [dict(row) for row in rows],
+                "truncated": len(rows) == _ROW_CAP,
+                "boundary": BOUNDARY + " An unresolved grant keeps holding its worker slot.",
+            }
+        finally:
+            connection.close()
+
+    def standing_status(self, principal, project_id) -> dict[str, Any]:
+        """Why a scheduled or follow-on start did or did not happen (campaign:read).
+
+        Standing approvals are created, revoked and shown in full only to a human. An agent
+        sees recorded schedule status and the starts and pending triggers, from explicit
+        column allowlists, never the template spec or any principal or credential id.
+        """
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, "campaign:read")
+            self._project(connection, actor, project_id)
+            approvals = connection.execute(
+                """SELECT id, status, "trigger", not_before, not_after, min_interval_seconds,
+                max_starts, max_concurrent, per_start_budget_cap_cents, max_total_budget_cents,
+                retry_max, retry_on, follow_on_standing_approval_id, spec_digest, created_at
+                FROM campaign_standing_approvals WHERE project_id=? AND org_id=?
+                ORDER BY created_at, id LIMIT ?""",
+                (project_id, actor["org_id"], _ROW_CAP),
+            ).fetchall()
+            items = []
+            for row in approvals:
+                item = dict(row)
+                item["starts"] = [
+                    dict(r)
+                    for r in connection.execute(
+                        """SELECT start_index, campaign_id, kind, trigger_campaign_id,
+                        retry_number, budget_cap_cents, created_at
+                        FROM campaign_standing_starts WHERE standing_approval_id=?
+                        ORDER BY start_index""",
+                        (row["id"],),
+                    )
+                ]
+                item["triggers"] = [
+                    dict(r)
+                    for r in connection.execute(
+                        """SELECT trigger_campaign_id, kind, retry_number, status, start_index,
+                        reason, created_at, resolved_at FROM campaign_standing_triggers
+                        WHERE target_standing_approval_id=? ORDER BY created_at""",
+                        (row["id"],),
+                    )
+                ]
+                items.append(item)
+            return {
+                "project_id": project_id,
+                "standing_approvals": items,
+                "truncated": len(approvals) == _ROW_CAP,
+                "boundary": BOUNDARY + " Agents cannot create, edit or revoke standing approvals.",
+            }
+        finally:
+            connection.close()
+
+    def campaign_budget(self, principal, campaign_id) -> dict[str, Any]:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, BUDGET_SCOPE)
+            campaign = self._campaign(connection, actor, campaign_id)
+            spec = json.loads(campaign["spec_json"])
+            cap, held, settled = (
+                campaign["budget_cap_cents"],
+                campaign["held_cents"],
+                campaign["settled_cents"],
+            )
+            return {
+                "campaign_id": campaign_id,
+                "budget_cap_cents": cap,
+                "held_cents": held,
+                "settled_cents": settled,
+                "remaining_cents": cap - held - settled,
+                "currency": spec.get("currency", "USD"),
+                "boundary": BOUNDARY,
+            }
+        finally:
+            connection.close()

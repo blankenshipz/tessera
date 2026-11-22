@@ -144,31 +144,62 @@ def _directory_identity(directory_fd: int) -> tuple[int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
 
 
-def _directory_names(
+def _entry_fingerprint(item: os.DirEntry) -> tuple[str, int, bool, bool]:
+    """Name, inode and kind: a replacement is visible even when the clock did not tick."""
+    return (
+        item.name,
+        item.inode(),
+        item.is_symlink(),
+        item.is_dir(follow_symlinks=False),
+    )
+
+
+def _scan_directory(
     directory_fd: int, relative_path: str, remaining_nodes: int, limit_message: str
-) -> tuple[tuple[int, int, int, int], list[str]]:
-    before = _directory_identity(directory_fd)
+) -> list[tuple[str, int, bool, bool]]:
     try:
         with os.scandir(directory_fd) as scanned:
-            names = []
+            entries = []
             for item in scanned:
-                names.append(item.name)
-                if len(names) > remaining_nodes:
+                entries.append(_entry_fingerprint(item))
+                if len(entries) > remaining_nodes:
                     raise WorkspaceError(limit_message)
     except OSError as exc:
         raise WorkspaceError(f"cannot read directory {relative_path}: {exc.strerror}") from exc
-    return before, sorted(names)
+    return sorted(entries)
+
+
+def _directory_names(
+    directory_fd: int, relative_path: str, remaining_nodes: int, limit_message: str
+) -> tuple[tuple[Any, ...], list[str]]:
+    identity = _directory_identity(directory_fd)
+    entries = _scan_directory(directory_fd, relative_path, remaining_nodes, limit_message)
+    return (identity, tuple(entries)), [entry[0] for entry in entries]
 
 
 def _check_directory_unchanged(
-    directory_fd: int, before: tuple[int, int, int, int], relative_path: str
+    directory_fd: int, before: tuple[Any, ...], relative_path: str
 ) -> None:
-    if _directory_identity(directory_fd) != before:
+    """Timestamps alone can miss a same-tick swap, so the listing is compared as well."""
+    identity, entries = before
+    if _directory_identity(directory_fd) != identity:
+        raise WorkspaceError(f"directory changed during snapshot: {relative_path}")
+    if tuple(_scan_directory(directory_fd, relative_path, 2**31, "unbounded")) != entries:
         raise WorkspaceError(f"directory changed during snapshot: {relative_path}")
 
 
 def _relative(parent: str, name: str) -> str:
     return name if parent == "." else f"{parent}/{name}"
+
+
+def _same_bytes(fd: int, expected: bytes | bytearray) -> bool:
+    offset = 0
+    while offset < len(expected):
+        chunk = os.pread(fd, min(1024 * 1024, len(expected) - offset), offset)
+        if not chunk or chunk != bytes(expected[offset : offset + len(chunk)]):
+            return False
+        offset += len(chunk)
+    return not os.pread(fd, 1, offset)
 
 
 def _read_open_file(fd: int, limit: int, relative_path: str) -> bytes:
@@ -184,6 +215,10 @@ def _read_open_file(fd: int, limit: int, relative_path: str) -> bytes:
         if len(result) > limit:
             raise WorkspaceError(f"file exceeds byte limit: {relative_path}")
     after = os.fstat(fd)
+    # A same-size rewrite inside one clock tick leaves the timestamps equal, so confirm that the
+    # bytes still read back identically (pread does not move the offset).
+    if not _same_bytes(fd, result):
+        raise WorkspaceError(f"file changed during read: {relative_path}")
     if (before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
         after.st_ino,
         after.st_dev,

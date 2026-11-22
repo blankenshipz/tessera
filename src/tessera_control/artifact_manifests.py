@@ -9,7 +9,8 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
-from .artifacts import MAX_ARTIFACT_BYTES, ArtifactStore
+from .artifact_limits import ABSOLUTE_MAX_ARTIFACT_BYTES, operator_limits
+from .artifacts import ArtifactStore
 from .project_artifact_retention import require_project_artifact_reference_admissible
 from .project_artifacts import (
     FilesystemProjectArtifactBackend,
@@ -18,6 +19,7 @@ from .project_artifacts import (
     ProjectArtifactStorageError,
     verify_project_artifact_placement,
 )
+from .snapshot_chunks import check_chunk_metadata
 from .store import Conflict, NotFound, StoreError, _connect, canonical_digest, utc_now
 
 MAX_MANIFEST_ENTRIES = 128
@@ -61,7 +63,7 @@ class ManifestArtifact(BaseModel):
     id: ArtifactId
     relative_path: PortablePath
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$", min_length=64, max_length=64)
-    size: int = Field(strict=True, ge=0, le=MAX_ARTIFACT_BYTES)
+    size: int = Field(strict=True, ge=0, le=ABSOLUTE_MAX_ARTIFACT_BYTES)
 
 
 class CreateArtifactManifest(BaseModel):
@@ -196,11 +198,12 @@ class ArtifactManifestStore(ArtifactStore):
                 raise Conflict("Artifact manifest does not match declared output paths.")
             entries = sorted(body["artifacts"], key=lambda entry: entry["relative_path"])
             total = sum(entry["size"] for entry in entries)
-            limit = min(spec["max_output_bytes"], MAX_ARTIFACT_BYTES)
+            limit = min(spec["max_output_bytes"], operator_limits().max_artifact_bytes)
             if total > limit:
                 raise Conflict("Artifact manifest output budget is exceeded.")
 
             verified: list[dict[str, Any]] = []
+            large_ids: set[str] = set()
             any_late = False
             remaining = limit
             for entry in entries:
@@ -213,26 +216,38 @@ class ArtifactManifestStore(ArtifactStore):
                 ).fetchone()
                 if row is None:
                     raise NotFound("Quarantined artifact was not found.")
+                # A large artifact keeps an empty ``content``; its bytes are chunk rows that
+                # complete verified end to end. Like chunked snapshots (ADR 0037) this path
+                # checks chunk metadata, not gigabytes of content.
+                large = row["content_length"] == 0 and row["size"] > 0
                 if (
                     row["operation_id"] != body["operation_id"]
                     or row["epoch"] != lease["epoch"]
                     or row["sha256"] != entry["sha256"]
                     or row["size"] != entry["size"]
                     or row["content_type"] != "blob"
-                    or row["content_length"] != row["size"]
+                    or not (large or row["content_length"] == row["size"])
                     or row["size"] > remaining
                 ):
                     raise Conflict("Artifact manifest entry does not match quarantined artifact.")
-                content = connection.execute(
-                    """SELECT content FROM artifacts WHERE id=? AND lease_id=?
-                    AND worker_principal_id=? AND relative_path=?""",
-                    (entry["id"], lease_id, actor["id"], entry["relative_path"]),
-                ).fetchone()["content"]
-                if (
-                    len(content) != row["size"]
-                    or hashlib.sha256(content).hexdigest() != row["sha256"]
-                ):
-                    raise Conflict("Quarantined artifact integrity check failed.")
+                if large:
+                    check_chunk_metadata(
+                        connection,
+                        row["id"],
+                        [{"relative_path": row["relative_path"], "size": row["size"]}],
+                    )
+                    large_ids.add(row["id"])
+                else:
+                    content = connection.execute(
+                        """SELECT content FROM artifacts WHERE id=? AND lease_id=?
+                        AND worker_principal_id=? AND relative_path=?""",
+                        (entry["id"], lease_id, actor["id"], entry["relative_path"]),
+                    ).fetchone()["content"]
+                    if (
+                        len(content) != row["size"]
+                        or hashlib.sha256(content).hexdigest() != row["sha256"]
+                    ):
+                        raise Conflict("Quarantined artifact integrity check failed.")
                 remaining -= row["size"]
                 any_late = any_late or bool(row["late"])
                 verified.append(
@@ -249,7 +264,10 @@ class ArtifactManifestStore(ArtifactStore):
                 "SELECT 1 FROM project_storage_bindings WHERE project_id=?", (grant["project_id"],)
             ).fetchone()
             if binding is not None:
-                for entry in verified:
+                # Large artifacts live in the control chunk store, not the project object
+                # store, so they carry no placement or retention record (like legacy
+                # unplaced SQLite artifacts).
+                for entry in (item for item in verified if item["id"] not in large_ids):
                     self._verify_placement(
                         connection, grant, entry["id"], entry["sha256"], entry["size"]
                     )

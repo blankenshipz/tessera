@@ -1,0 +1,42 @@
+# Example unit; every path is a generic placeholder (see README.md).
+# Contains no secrets: configuration and credentials are owner-only files
+# referenced by path from /etc/tessera/salad-executor.json.
+[Unit]
+Description=Tessera Salad campaign executor (supervised example)
+PartOf=tessera.target
+After=network-online.target tessera-salad-guardian.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tessera
+Group=tessera
+UMask=0077
+EnvironmentFile=-/etc/tessera/salad-executor.env
+StateDirectory=tessera tessera/health
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/tessera
+ExecStart=/opt/tessera/.venv/bin/python -m tessera_control.campaign_salad_executor --config /etc/tessera/salad-executor.json --health-file /var/lib/tessera/health/salad-executor.json
+Restart=on-failure
+RestartSec=10
+# Exit 2 means configuration or prerequisites were refused; it will not fix itself.
+RestartPreventExitStatus=2
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/tessera
+
+[Install]
+WantedBy=tessera.target

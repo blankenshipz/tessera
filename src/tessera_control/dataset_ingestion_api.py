@@ -1,4 +1,4 @@
-"""Authenticated metadata-only MixFM dataset-ingestion routes."""
+"""Authenticated metadata-only program dataset-ingestion routes."""
 
 from typing import Annotated, Any
 

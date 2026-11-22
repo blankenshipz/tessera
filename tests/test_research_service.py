@@ -788,6 +788,8 @@ def test_serve_retains_existing_lifespan_and_closes_owner_once(
         asyncio.run(cycle())
 
     monkeypatch.setattr(cli, "create_app", make_app)
+    # The stubbed app has no database; serve records the provider trust setting there.
+    monkeypatch.setattr("tessera_control.provider_trust.record_at_start", lambda *a, **k: None)
     monkeypatch.setattr(cli.uvicorn, "run", run)
     monkeypatch.setattr(
         sys,

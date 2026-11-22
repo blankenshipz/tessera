@@ -31,6 +31,8 @@ PERMITTED_TOOLS = (
     "tessera_authority_status",
     "tessera_consume_grant",
     "tessera_propose_research",
+    "tessera_list_research_proposals",
+    "tessera_read_research_proposal",
     "tessera_record_observation",
     "tessera_request_review",
     "tessera_notebook",
@@ -38,6 +40,8 @@ PERMITTED_TOOLS = (
     "tessera_register_generated_output",
     "tessera_generated_output_metadata",
     "tessera_read_generated_output",
+    "tessera_experiment_results",
+    "tessera_program_results",
 )
 
 _SCOPES = {
@@ -47,6 +51,8 @@ _SCOPES = {
     "tessera_read_proposal": "proposal:read",
     "tessera_propose_task_plan": "proposal:create",
     "tessera_propose_research": "proposal:create",
+    "tessera_list_research_proposals": "proposal:read",
+    "tessera_read_research_proposal": "proposal:read",
     "tessera_request_authority": "authority:request",
     "tessera_list_authority_requests": "authority:request",
     "tessera_authority_status": "authority:consume",
@@ -58,6 +64,8 @@ _SCOPES = {
     "tessera_register_generated_output": ("context:read", "provenance:append"),
     "tessera_generated_output_metadata": "context:read",
     "tessera_read_generated_output": "context:read",
+    "tessera_experiment_results": "results:read",
+    "tessera_program_results": "results:read",
 }
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")

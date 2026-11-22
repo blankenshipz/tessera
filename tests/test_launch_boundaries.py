@@ -169,7 +169,13 @@ def test_remote_origin_rejects_even_empty_userinfo_and_accepts_explicit_tls_port
 
 @pytest.mark.parametrize("profile", ["local-cpu", "kubernetes-opencode"])
 def test_output_plan_limit_matches_runtime_and_quarantine(profile):
-    from tessera_control.artifacts import MAX_ARTIFACT_BYTES, MAX_BASE64_CHARS
+    from tessera_control.artifact_limits import ABSOLUTE_MAX_ARTIFACT_BYTES, operator_limits
+    from tessera_control.artifacts import MAX_BASE64_CHARS
+    from tessera_control.models import within_operator_limit
+
+    # The spec model enforces the absolute ceiling; the operator's limit (default 8 GiB, was
+    # the legacy 16 MiB quarantine bound) applies at plan intake only.
+    MAX_ARTIFACT_BYTES = operator_limits().max_artifact_bytes
 
     spec = {
         "argv": ["python", "analysis.py"],
@@ -179,8 +185,13 @@ def test_output_plan_limit_matches_runtime_and_quarantine(profile):
         "profile": profile,
         "max_output_bytes": MAX_ARTIFACT_BYTES,
     }
-    assert ExecutionSpec.model_validate(spec).max_output_bytes == MAX_ARTIFACT_BYTES
-    for invalid in (MAX_ARTIFACT_BYTES + 1, 0, True, "1024"):
+    assert within_operator_limit(ExecutionSpec.model_validate(spec)).max_output_bytes == (
+        MAX_ARTIFACT_BYTES
+    )
+    over = ExecutionSpec.model_validate(spec | {"max_output_bytes": MAX_ARTIFACT_BYTES + 1})
+    with pytest.raises(ValueError):
+        within_operator_limit(over)
+    for invalid in (ABSOLUTE_MAX_ARTIFACT_BYTES + 1, 0, True, "1024"):
         with pytest.raises(ValidationError):
             ExecutionSpec.model_validate(spec | {"max_output_bytes": invalid})
     assert MAX_BASE64_CHARS + 1024 * 1024 < MAX_REQUEST_BYTES
@@ -203,6 +214,8 @@ def test_credential_issuance_bound_matches_auth_intake_without_echoing_secret():
 def test_oversized_output_plan_is_rejected_before_revision_or_approval(tmp_path):
     from test_plans import _headers, _project, _spec, _task
 
+    from tessera_control.artifact_limits import operator_limits
+
     state = tmp_path / "state"
     initialize_state(state)
     with TestClient(create_app(state)) as client:
@@ -214,14 +227,15 @@ def test_oversized_output_plan_is_rejected_before_revision_or_approval(tmp_path)
             "purpose": "Reject unsupported output before approval",
             "budget_cents": 0,
             "max_duration_seconds": 60,
-            "execution_spec": _spec() | {"max_output_bytes": 16 * 1024 * 1024 + 1},
+            "execution_spec": _spec()
+            | {"max_output_bytes": operator_limits().max_artifact_bytes + 1},
         }
         headers = _headers(state, "output-plan")
         denied = client.put(f"/tasks/{task['id']}/plan", headers=headers, json=body)
         assert denied.status_code == 422
         unchanged = client.get(f"/tasks/{task['id']}", headers=headers).json()
         assert unchanged == task
-        body["execution_spec"]["max_output_bytes"] = 16 * 1024 * 1024
+        body["execution_spec"]["max_output_bytes"] = operator_limits().max_artifact_bytes
         accepted = client.put(f"/tasks/{task['id']}/plan", headers=headers, json=body)
         assert accepted.status_code == 200
         assert accepted.json()["revision"] == task["revision"] + 1

@@ -1,4 +1,4 @@
-"""Metadata-only, reviewable dataset provenance for MixFM Outcome 0/1.
+"""Metadata-only, reviewable dataset provenance for research programs (Outcome 0/1 style).
 
 This service records caller-supplied snapshot claims.  It never fetches bytes,
 contacts a source, checks a license, or validates a dataset's contents.
@@ -13,13 +13,14 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .approval_trust import require_decision_actor
 from .dataset_ingestion_models import (
     CreateIngestionProposal,
     RegisterDatasetSnapshot,
     ReviewIngestionProposal,
 )
 from .research import ResearchStore
-from .store import Conflict, NotFound, StoreError, canonical_digest, utc_now
+from .store import Conflict, Forbidden, NotFound, StoreError, canonical_digest, utc_now
 
 DATASET_RECORD_LIMIT = 1_000
 
@@ -86,7 +87,10 @@ class DatasetIngestionStore(ResearchStore):
             )
         except ValidationError as error:
             raise StoreError("Invalid research request.") from error
-        return value.model_dump(mode="json", by_alias=True)
+        result = value.model_dump(mode="json", by_alias=True)
+        if result["split_strategy"].get("split_lock_id") is None:
+            result["split_strategy"].pop("split_lock_id", None)  # keep stored JSON unchanged
+        return result
 
     @staticmethod
     def _snapshot(
@@ -164,6 +168,22 @@ class DatasetIngestionStore(ResearchStore):
                     or source["content_digest"] != source_record["expected_content_digest"]
                 ):
                     raise Conflict("Dataset source digest or revision no longer matches.")
+            lock_id = body["split_strategy"].get("split_lock_id")
+            if lock_id is not None:
+                locked = connection.execute(
+                    "SELECT 1 FROM gate_split_locks WHERE id=? AND project_id=?",
+                    (lock_id, study["project_id"]),
+                ).fetchone()
+                audit = connection.execute(
+                    """SELECT status FROM gate_leakage_audits WHERE lock_id=?
+                    AND kind='within_lock' ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                    (lock_id,),
+                ).fetchone()
+                if locked is None or audit is None or audit["status"] != "clean":
+                    raise Conflict(
+                        "Audited leakage status requires a split lock in this project "
+                        "with a clean within-lock audit."
+                    )
             schema_json = json.dumps(body["schema"], sort_keys=True, separators=(",", ":"))
             now, snapshot_id = utc_now(), "dataset_" + uuid.uuid4().hex
             try:
@@ -346,6 +366,8 @@ class DatasetIngestionStore(ResearchStore):
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             self._human(actor, "review a dataset ingestion proposal")
+            if body["decision"] != "reject":  # reject only reduces authority
+                require_decision_actor(actor, forbidden=Forbidden)
             proposal = self._proposal(connection, actor, proposal_id)
             if (
                 proposal["status"] != "proposed"

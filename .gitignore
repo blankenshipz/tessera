@@ -23,3 +23,12 @@ desktop/release/
 
 # Local immutable verification bundles; never commit dirty-tree snapshots.
 .evidence/
+
+# Local research data/payloads (licensed data, private receipts) and agent client config
+experiments/
+opencode.jsonc
+opencode.jsonc.backup-*
+
+# In-repo pytest basetemp (disk-tight runs); delete after use
+.pytest-tmp*/
+.private-denylist

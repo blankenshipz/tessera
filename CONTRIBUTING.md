@@ -65,7 +65,12 @@ credentials and `.venv/` must stay out of Git and image contexts.
 
 ## Verification gates
 
-- **Task acceptance:** derive targeted tests/lint from the requested behavior.
+- **Task acceptance:** derive targeted tests/lint from the requested behavior. While
+  working, run only the tests of the modules you changed and their direct dependents,
+  stopping at the first failure: `.venv/bin/python dev/focused_tests.py` selects them from
+  your changes (`--list` shows the selection, extra arguments go to pytest), or run
+  specific files with `pytest -x`. Run the whole suite once per branch, right before
+  merge, in the background.
   Docs-only changes require scoped diff, references/anchors, source consistency
   and affected package checks, not unrelated runtime traces. Run
   `.venv/bin/python dev/check_docs.py` for local Markdown links/assets/anchors.
@@ -79,6 +84,10 @@ credentials and `.venv/` must stay out of Git and image contexts.
     .venv/bin/python dev/pytest_shard.py --index "$shard" --count 4 -q || exit
   done
   ```
+
+  `make test-parallel` (or `.venv/bin/python dev/pytest_parallel.py --jobs N`) runs the
+  same file shards concurrently with separate basetemps and logs, without pytest-xdist.
+  While working, run only the affected files: `make test TESTS="tests/test_a.py"` (`-x`).
 
   Every `tests/**/test_*.py` file belongs to exactly one shard. Report concurrent
   changes, failures, skipped and unrun checks explicitly.

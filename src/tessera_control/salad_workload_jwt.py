@@ -109,53 +109,80 @@ class SaladWorkloadJWT:
             raise ValueError("stale_jwks")
         self.keys, self.refreshed = keys, observed_at
 
+    def _signed_claims(self, token):
+        """Cached-JWKS signature and time checks; never any network call."""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec, utils
+
+        now = self.clock()
+        if self.refreshed is None or not 0 <= now - self.refreshed <= 3600:
+            raise ValueError("stale_jwks")
+        if not isinstance(token, str) or not 1 <= len(token) <= 1000:
+            raise ValueError("invalid_token")
+        header_part, claims_part, signature_part = token.split(".")
+        header = strict_json(decode64(header_part))
+        if (
+            type(header) is not dict
+            or set(header) - {"alg", "kid", "typ"}
+            or header.get("alg") != "ES256"
+            or header.get("typ", "JWT") != "JWT"
+            or header.get("kid") not in self.keys
+        ):
+            raise ValueError("invalid_header")
+        signature = decode64(signature_part)
+        if len(signature) != 64:
+            raise ValueError("invalid_signature")
+        self.keys[header["kid"]].verify(
+            utils.encode_dss_signature(
+                int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:], "big")
+            ),
+            (header_part + "." + claims_part).encode(),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        claims = strict_json(decode64(claims_part))
+        if type(claims) is not dict:
+            raise ValueError("invalid_claims")
+        if any(type(claims.get(k)) is not int for k in ("iat", "nbf", "exp")):
+            raise ValueError("invalid_time")
+        if not (
+            claims["iat"] <= claims["nbf"] <= now < claims["exp"]
+            and 0 < claims["exp"] - claims["iat"] <= 300
+            and now - claims["iat"] <= 300
+        ):
+            raise ValueError("invalid_time")
+        return claims
+
+    def precheck(self, token):
+        """Cheap pre-auth: a parsed, unexpired token signed by a cached key.
+
+        Scope (organization, group, machine) is not checked here; ``verify`` still
+        does that once the request is routed to its reservation.
+        """
+        try:
+            self._signed_claims(token)
+            return True
+        except Exception:
+            raise ValueError("workload_identity_rejected") from None
+
     def verify(
-        self, token, *, organization_id, organization_name, group_id, group_name, machine_id
+        self,
+        token,
+        *,
+        organization_id,
+        organization_name,
+        project_name,
+        group_id,
+        group_name,
+        machine_id,
     ):
         try:
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.asymmetric import ec, utils
-
-            now = self.clock()
-            if self.refreshed is None or not 0 <= now - self.refreshed <= 3600:
-                raise ValueError("stale_jwks")
-            if not isinstance(token, str) or not 1 <= len(token) <= 1000:
-                raise ValueError("invalid_token")
-            header_part, claims_part, signature_part = token.split(".")
-            header = strict_json(decode64(header_part))
-            if (
-                type(header) is not dict
-                or set(header) - {"alg", "kid", "typ"}
-                or header.get("alg") != "ES256"
-                or header.get("typ", "JWT") != "JWT"
-                or header.get("kid") not in self.keys
-            ):
-                raise ValueError("invalid_header")
-            signature = decode64(signature_part)
-            if len(signature) != 64:
-                raise ValueError("invalid_signature")
-            self.keys[header["kid"]].verify(
-                utils.encode_dss_signature(
-                    int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:], "big")
-                ),
-                (header_part + "." + claims_part).encode(),
-                ec.ECDSA(hashes.SHA256()),
-            )
-            claims = strict_json(decode64(claims_part))
-            if type(claims) is not dict:
-                raise ValueError("invalid_claims")
-            if any(type(claims.get(k)) is not int for k in ("iat", "nbf", "exp")):
-                raise ValueError("invalid_time")
-            if not (
-                claims["iat"] <= claims["nbf"] <= now < claims["exp"]
-                and 0 < claims["exp"] - claims["iat"] <= 300
-                and now - claims["iat"] <= 300
-            ):
-                raise ValueError("invalid_time")
+            claims = self._signed_claims(token)
             expected = {
                 "iss": ISSUER,
                 "salad_organization_name": organization_name,
-                "salad_workload_name": group_name,
+                # Salad qualifies the workload name as
+                # "{organization}-{project}-{container group}", not the bare group.
+                "salad_workload_name": f"{organization_name}-{project_name}-{group_name}",
             }
             if any(claims.get(k) != v for k, v in expected.items()):
                 raise ValueError("invalid_scope")

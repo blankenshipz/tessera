@@ -48,12 +48,14 @@ idempotency key. The strict JSON body contains `expected_epoch`, `operation_id`,
 `relative_path`, `sha256` and `content_base64`. The operation ID must match the
 lease's deterministic CPU operation identity. The path must be explicitly
 declared in the historically approved plan and the supplied checksum must match
-the decoded bytes. File content is limited to 16 MiB; cumulative stored bytes for
-the lease cannot exceed the smaller of 16 MiB and the plan's output limit,
-including bytes reserved for incomplete uploads.
+the decoded bytes. File content on this path is limited to 16 MiB; cumulative stored
+bytes for the lease cannot exceed the smaller of the operator's artifact limit (default
+8 GiB) and the plan's output limit, including bytes reserved for incomplete uploads.
+Outputs above 16 MiB use the chunked path described in
+[large artifacts](large-artifacts.md), with the same fences and receipts.
 
-For larger files, use the resumable worker endpoints with an idempotency key on
-each request:
+For files up to 16 MiB that need chunking, use the resumable worker endpoints with an
+idempotency key on each request (files above 16 MiB use the large-artifact routes above):
 
 1. `POST /worker/leases/{lease_id}/artifact-uploads` begins an immutable upload
    with `expected_epoch`, `operation_id`, `relative_path`, `sha256` and `size`.

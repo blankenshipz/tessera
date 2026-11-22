@@ -1,37 +1,15 @@
 """Versioned research review scopes, not execution permissions or model outputs."""
 
+import re
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
 from .evaluation_models import EvaluationProtocol, EvaluationRecord
+from .gate_evidence_models import OutcomeId
 from .research_models import Digest, NonBlank200, NonBlank4000, StrictResearchRequest
 
-OUTCOME_CONDITIONS = {
-    "outcome_0": (
-        "direct_property_language",
-        "uncertainty_distribution",
-        "pairwise_ranking",
-        "counterfactual_intervention",
-        "attribution_assisted",
-        "representation_ablations",
-        "observable_scratchpad",
-        "scaffold_ood",
-        "capability_retention",
-    ),
-    "outcome_1": (
-        "unified_mixture_schema",
-        "ingredient_concentration_context",
-        "permutation_aware_model",
-        "baseline_vs_pretrained",
-        "few_shot_curves",
-        "ingredient_holdout",
-        "family_holdout",
-        "domain_holdout",
-        "calibration",
-        "leakage_controls",
-    ),
-}
+CONDITION_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 Ids = Annotated[list[NonBlank200], Field(max_length=100)]
 Notes = Annotated[list[NonBlank4000], Field(max_length=20)]
 
@@ -85,7 +63,7 @@ class ProgramReview(StrictResearchRequest):
     type: Literal["research_program"]
     version: Literal[1]
     study_id: NonBlank200
-    outcome: Literal["outcome_0", "outcome_1"]
+    outcome: OutcomeId
     action: Literal["plan", "source_use", "evaluation", "go_no_go"]
     basis_digest: Digest
     supersedes_id: NonBlank200 | None = None
@@ -112,10 +90,12 @@ class ProgramReview(StrictResearchRequest):
             if len(set(values)) != len(values):
                 raise ValueError("reference IDs must be unique")
         if self.action == "plan":
-            if self.brief is None or set(self.conditions) != set(OUTCOME_CONDITIONS[self.outcome]):
+            if self.brief is None or not self.conditions:
                 raise ValueError(
                     "plan needs a brief and complete selected/deferred condition accounting"
                 )
+            if not all(CONDITION_KEY.match(k) for k in self.conditions):
+                raise ValueError("plan condition keys must be snake_case identifiers")
             if not any(c.disposition == "selected" for c in self.conditions.values()):
                 raise ValueError("plan needs at least one selected condition")
         elif self.brief is not None or self.conditions:

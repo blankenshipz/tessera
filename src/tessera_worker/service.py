@@ -7,9 +7,12 @@ creates human authority or interprets an exit as a research result.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
+import secrets
 import sqlite3
 import stat
 import time
@@ -17,16 +20,88 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .control_channel import HttpControlChannel
-from .cpu import DEVELOPMENT_OUTPUT_PROFILE, DockerCpuAdapter
+from .control_channel import ControlChannelError, HttpControlChannel, classify_control_failure
+from .cpu import (
+    DEVELOPMENT_OUTPUT_PROFILE,
+    DockerCpuAdapter,
+    default_container_user,
+    validate_container_user,
+)
 from .development_runtime import DevelopmentCpuRuntime, DevelopmentOutputProfile
+from .docker_network_pool import DEFAULT_PREFIX_LENGTH, DockerNetworkPool
+from .outputs import OutputCollectionError, worker_output_limit
 from .provider import Provider
-from .runtime import MAX_DESCRIPTOR_BYTES
+from .runtime import MAX_DESCRIPTOR_BYTES, ObservationDeliveryPending, ObservationRefused
 from .supervisor import DriverResult, SupervisorError
+
+_ABSOLUTE_PATH = re.compile(r"(?<![\w.])/[^\s'\"<>:;,)\]]+")
+_DETAIL_LIMIT = 200
+RUN_RECEIPT_ATTEMPTS = 3
+_RUN_RECEIPT_RETRY_SECONDS = 1.0
+
+
+def safe_error_detail(error: BaseException, *private_paths: Path | str) -> str:
+    """Bounded operator diagnostic: class name plus message, never host paths."""
+    text = str(error)
+    for private in private_paths:
+        if str(private) not in {"", "/"}:
+            text = text.replace(str(private), "<path>")
+    text = _ABSOLUTE_PATH.sub("<path>", text)
+    text = " ".join(text.split())
+    detail = f"{type(error).__name__}: {text}" if text else type(error).__name__
+    return detail[:_DETAIL_LIMIT]
+
+
+class _CredentialWatch:
+    """Channel proxy that remembers the first credential rejection, then re-raises.
+
+    The runtime and supervisor deliberately swallow some control failures (for
+    example a package refresh) and cancel instead.  Remembering the rejection here
+    lets the service mark the final result without changing that fail-closed path.
+    """
+
+    def __init__(self, channel: Any) -> None:
+        self._channel = channel
+        self.rejected_status: int | None = None
+
+    @property
+    def max_request_bytes(self) -> int | None:
+        """The wrapped channel's request bound: large-artifact uploads size their parts to it."""
+        return getattr(self._channel, "max_request_bytes", None)
+
+    def post(self, *arguments: Any, **keywords: Any) -> Any:
+        try:
+            return self._channel.post(*arguments, **keywords)
+        except ControlChannelError as error:
+            if self.rejected_status is None and classify_control_failure(error) == "auth":
+                self.rejected_status = error.status
+            raise
 
 
 class DevelopmentWorkerError(SupervisorError):
     """The opt-in development worker cannot safely advance its one operation."""
+
+
+def _check_container_user(user: object, allow_root: object) -> None:
+    """Shared config validation for the operator-owned container user."""
+    if type(allow_root) is not bool:
+        raise DevelopmentWorkerError("Container user override must be a boolean.")
+    if user is None:
+        return
+    try:
+        validate_container_user(user, allow_root=allow_root)
+    except ValueError as error:
+        raise DevelopmentWorkerError("Container user configuration is invalid.") from error
+
+
+def network_pool_from_config(cidr: Any, prefix_length: Any) -> DockerNetworkPool | None:
+    """The operator's Docker network pool, or None when unset; invalid values are refused."""
+    if cidr is None:
+        return None
+    try:
+        return DockerNetworkPool(cidr, prefix_length)
+    except ValueError as error:
+        raise DevelopmentWorkerError("Docker network pool configuration is invalid.") from error
 
 
 @dataclass(frozen=True)
@@ -39,11 +114,29 @@ class DevelopmentWorkerConfig:
     workspace_root: Path
     development_output_root: Path
     allowed_image: str
-    output_capacity_bytes: int = 16 * 1024 * 1024
+    egress_proxy_image: str | None = None
+    memory_bytes: int | None = None
+    scratch_bytes: int | None = None
+    max_scratch_bytes: int | None = None
+    container_user: str | None = None
+    allow_root_container_user: bool = False
+    # Operator-owned IPv4 block (and per-network prefix length) for the Docker networks
+    # Tessera creates; None keeps Docker's default address pools.
+    docker_network_pool: str | None = None
+    docker_network_prefix_length: int = DEFAULT_PREFIX_LENGTH
+    # Disk reservation capacity; None means the worker output ceiling below.
+    output_capacity_bytes: int | None = None
+    # Operator ceiling on one operation's output bytes (16 MiB .. 1 TiB); None keeps the
+    # installation default (tessera_control.artifact_limits).
+    max_output_bytes: int | None = None
     output_capacity_inodes: int = 256
     poll_seconds: float = 1.0
     max_ticks: int = 90_000
     renew_every_ticks: int = 15
+    # Control leases last 30 s (tessera_control.execution.LEASE_SECONDS) and only a renewal
+    # extends them. Renew on elapsed time as well as tick count, so a longer poll interval or
+    # slow control round trips can never let a running operation's lease lapse.
+    renew_after_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         if (
@@ -53,10 +146,20 @@ class DevelopmentWorkerConfig:
             or self.poll_seconds <= 0
             or self.max_ticks < 0
             or self.renew_every_ticks < 1
-            or self.output_capacity_bytes < 1
+            or not 0 < self.renew_after_seconds <= 20
+            or (self.output_capacity_bytes is not None and self.output_capacity_bytes < 1)
+            or (
+                self.max_output_bytes is not None
+                and (
+                    type(self.max_output_bytes) is not int
+                    or not 16 * 1024 * 1024 <= self.max_output_bytes <= 1024**4
+                )
+            )
             or self.output_capacity_inodes < 1
         ):
             raise DevelopmentWorkerError("Development worker configuration is invalid.")
+        _check_container_user(self.container_user, self.allow_root_container_user)
+        network_pool_from_config(self.docker_network_pool, self.docker_network_prefix_length)
 
 
 def read_private_credential(path: Path) -> str:
@@ -161,7 +264,13 @@ class RenewalIntentJournal:
 
 
 class HeartbeatIntentJournal:
-    """Persist heartbeat keys so retries are safe and successful beats are distinct."""
+    """Persist heartbeat keys so retries are safe and successful beats are distinct.
+
+    Keys are unique to this journal, not only to its sequence: the grant poller gives each
+    grant a fresh workspace, and keys derived from the sequence alone repeated across grants
+    under one worker credential, so control answered them as idempotent replays and the
+    worker's liveness was never refreshed (new leases were then refused as disconnected).
+    """
 
     def __init__(self, root: Path) -> None:
         self.path = root / "heartbeats.sqlite3"
@@ -171,6 +280,18 @@ class HeartbeatIntentJournal:
                 sequence INTEGER PRIMARY KEY, key TEXT NOT NULL,
                 completed INTEGER NOT NULL CHECK (completed IN (0, 1)))"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS heartbeat_journal (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), journal_id TEXT NOT NULL)"""
+            )
+            # Created once per journal file and kept, so a restart replays a pending key.
+            connection.execute(
+                "INSERT OR IGNORE INTO heartbeat_journal (singleton, journal_id) VALUES (1, ?)",
+                (secrets.token_hex(16),),
+            )
+            self.journal_id = connection.execute(
+                "SELECT journal_id FROM heartbeat_journal WHERE singleton = 1"
+            ).fetchone()[0]
         os.chmod(self.path, 0o600)
 
     def key(self) -> str:
@@ -183,7 +304,10 @@ class HeartbeatIntentJournal:
             sequence = connection.execute(
                 "SELECT coalesce(max(sequence), 0) + 1 FROM heartbeat_intents"
             ).fetchone()[0]
-            key = "development-heartbeat-" + hashlib.sha256(f"v1:{sequence}".encode()).hexdigest()
+            key = (
+                "development-heartbeat-"
+                + hashlib.sha256(f"v2:{self.journal_id}:{sequence}".encode()).hexdigest()
+            )
             connection.execute(
                 "INSERT INTO heartbeat_intents (sequence, key, completed) VALUES (?, ?, 0)",
                 (sequence, key),
@@ -198,6 +322,49 @@ class HeartbeatIntentJournal:
         return sqlite3.connect(self.path)
 
 
+class ReceiptRefusalJournal:
+    """Durable record that control permanently refused an operation's run receipt.
+
+    A restart consults it before any receipt post, so a refusal is never replayed.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.path = root / "receipt-refusals.sqlite3"
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS receipt_refusals (
+                    operation_id TEXT PRIMARY KEY, http_status INTEGER NOT NULL,
+                    detail TEXT NOT NULL)"""
+                )
+        except sqlite3.Error:
+            # An unreadable journal fails closed when it is read (detail()).
+            pass
+        else:
+            os.chmod(self.path, 0o600)
+
+    def record(self, operation_id: str, http_status: int, detail: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO receipt_refusals (operation_id, http_status, detail) "
+                "VALUES (?, ?, ?)",
+                (operation_id, http_status, detail[:_DETAIL_LIMIT]),
+            )
+
+    def detail(self, operation_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT detail FROM receipt_refusals WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+        return None if row is None else row[0]
+
+    @contextlib.contextmanager
+    def _connect(self):  # noqa: ANN202
+        """Yield a connection inside a transaction; always closed afterwards."""
+        with contextlib.closing(sqlite3.connect(self.path)) as connection, connection:
+            yield connection
+
+
 class DevelopmentWorkerService:
     """Run exactly one existing grant with development-only output custody."""
 
@@ -209,21 +376,48 @@ class DevelopmentWorkerService:
         adapter: Any | None = None,
         provider: Provider | None = None,
         sleep: Any = time.sleep,
+        clock: Any = time.monotonic,
     ) -> None:
         self.config = config
+        self.clock = clock
         self.root = _private_directory(config.workspace_root)
         self.output_root = _private_directory(config.development_output_root)
         self.token = read_private_credential(config.credential_file)
         self.channel = channel or HttpControlChannel(config.control_url, self.token)
+        self._watch = _CredentialWatch(self.channel)
         self.adapter = adapter
         self.provider = provider
         self.sleep = sleep
         self.renewals = RenewalIntentJournal(self.root)
         self.heartbeats = HeartbeatIntentJournal(self.root)
+        self.receipt_refusals = ReceiptRefusalJournal(self.root)
 
     def run(self) -> dict[str, Any]:
-        """Heartbeat, lease, execute, and quarantine only a single grant attempt."""
+        """Heartbeat, lease, execute, and quarantine only a single grant attempt.
 
+        A control credential rejection (HTTP 401, or an unclassified 403) ends the
+        run after the usual bounded cancellation and adds ``credential_rejected``
+        and ``control_status`` to the non-terminal result; it never retries.
+        """
+
+        try:
+            result = self._run()
+        except ControlChannelError as error:
+            if classify_control_failure(error) != "auth":
+                raise
+            return {
+                "state": "unknown",
+                "quarantined": False,
+                "reason": "credential_rejected",
+                "credential_rejected": True,
+                "control_status": error.status,
+            }
+        status = self._watch.rejected_status
+        if result.get("state") == "unknown" and result.get("terminal") is not True and status:
+            result = {**result, "credential_rejected": True, "control_status": status}
+        return result
+
+    def _run(self) -> dict[str, Any]:
         inputs = self.root / "inputs"
         runtime_dir = self.root / "runtime"
         inputs.mkdir(mode=0o700, exist_ok=True)
@@ -239,9 +433,25 @@ class DevelopmentWorkerService:
             frozenset({self.config.allowed_image}),
             input_root=inputs,
             development_output_root=output_workspace_root,
+            egress_proxy_image=self.config.egress_proxy_image,
+            memory_bytes=self.config.memory_bytes,
+            scratch_bytes=self.config.scratch_bytes,
+            max_scratch_bytes=self.config.max_scratch_bytes,
+            container_user=self.config.container_user or default_container_user(),
+            allow_root_container_user=self.config.allow_root_container_user,
+            network_pool=network_pool_from_config(
+                self.config.docker_network_pool, self.config.docker_network_prefix_length
+            ),
         )
+        try:
+            worker_limit = worker_output_limit(self.config.max_output_bytes)
+        except OutputCollectionError as error:
+            raise DevelopmentWorkerError("Development worker configuration is invalid.") from error
         profile = DevelopmentOutputProfile(
-            self.output_root, self.config.output_capacity_bytes, self.config.output_capacity_inodes
+            self.output_root,
+            self.config.output_capacity_bytes or worker_limit,
+            self.config.output_capacity_inodes,
+            worker_max_output_bytes=self.config.max_output_bytes,
         )
         if recovered is not None:
             # A persisted runtime descriptor represents an admitted operation.
@@ -251,7 +461,7 @@ class DevelopmentWorkerService:
             with DevelopmentCpuRuntime(
                 runtime_dir,
                 inputs,
-                self.channel,
+                self._watch,
                 adapter,
                 worker_id=worker_id,
                 development_profile=profile,
@@ -263,14 +473,14 @@ class DevelopmentWorkerService:
         # Registration is an owner-only, prior human command.  A heartbeat is the
         # first worker mutation and deliberately precedes a new lease acquisition.
         self._heartbeat()
-        lease = self.channel.post(
+        lease = self._watch.post(
             "/worker/leases", {"grant_id": self.config.grant_id}, self._key("lease")
         )
         lease_id, epoch, worker_id = self._lease_identity(lease)
         with DevelopmentCpuRuntime(
             runtime_dir,
             inputs,
-            self.channel,
+            self._watch,
             adapter,
             worker_id=worker_id,
             development_profile=profile,
@@ -280,22 +490,44 @@ class DevelopmentWorkerService:
             return self._drive(runtime, result)
 
     def _drive(self, runtime: DevelopmentCpuRuntime, result: DriverResult) -> dict[str, Any]:
+        # None: renew on the first pass. start() leases afresh, but recover() resumes a lease
+        # that may have only seconds left, and neither renews it.
+        renewed_at: float | None = None
         for tick in range(self.config.max_ticks + 1):
             if result.phase == "terminal" and result.observation.termination_confirmed:
+                if runtime.operation is not None:
+                    refused = self._refusal_outcome(runtime.operation.operation_id)
+                    if refused is not None:
+                        # A permanent refusal is already durable: never repost.
+                        return refused
                 # collect reports a fresh confirmed exit before touching outputs.
                 try:
                     observation = runtime.report(result)
-                except Exception:
-                    return self._cancel_unresolved(runtime, "observation_report_failure")
+                except Exception as error:
+                    return self._report_failed(runtime, error)
                 try:
                     receipt = runtime.collect(result, reported_observation=observation)
-                except SupervisorError:
+                except SupervisorError as error:
                     # A confirmed provider exit does not make missing, unsafe, or
                     # untransferable output safe to reclaim.  Keep its workspace.
                     runtime.development_outputs.mark_unknown(runtime.operation.operation_id)  # type: ignore[union-attr]
-                    return {"state": "unknown", "quarantined": False, "reason": "quarantine_failed"}
+                    return {
+                        "state": "unknown",
+                        "quarantined": False,
+                        "reason": "quarantine_failed",
+                        "detail": safe_error_detail(error, self.root),
+                    }
+                run_receipt, failure = self._post_run_receipt(runtime, result)
+                if failure is not None:
+                    return failure
                 runtime.development_outputs.cleanup(runtime.operation.operation_id)  # type: ignore[union-attr]
-                return {"state": "exited", "quarantined": True, "receipt": receipt}
+                outcome = {"state": "exited", "quarantined": True, "receipt": receipt}
+                if run_receipt is not None:
+                    outcome["run_receipt"] = {
+                        "status": "recorded",
+                        "receipt_digest": run_receipt.get("receipt_digest"),
+                    }
+                return outcome
             if result.phase in {"terminal", "denied", "uncertain"}:
                 if runtime.operation is not None:
                     runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
@@ -303,15 +535,20 @@ class DevelopmentWorkerService:
                     return self._cancel_unresolved(runtime, "receipt_report_failure")
                 try:
                     self._report(runtime, result)
-                except Exception:
-                    return self._cancel_unresolved(runtime, "observation_report_failure")
-                return {"state": "unknown", "quarantined": False, "reason": result.reason}
+                except Exception as error:
+                    return self._report_failed(runtime, error)
+                outcome = {"state": "unknown", "quarantined": False, "reason": result.reason}
+                if result.detail is not None:
+                    # Failed before any container existed: not started, no run cost.
+                    outcome["detail"] = result.detail
+                    outcome["container_created"] = False
+                return outcome
             if self._is_report_failure(result):
                 return self._cancel_unresolved(runtime, "receipt_report_failure")
             try:
                 self._report(runtime, result)
-            except Exception:
-                return self._cancel_unresolved(runtime, "observation_report_failure")
+            except Exception as error:
+                return self._report_failed(runtime, error)
             if tick == self.config.max_ticks:
                 # Do not abandon Docker merely because this foreground loop has
                 # exhausted its own budget. Request cancellation and retain the
@@ -330,22 +567,109 @@ class DevelopmentWorkerService:
                     "quarantined": False,
                     "reason": "tick_limit_cancellation_requested",
                 }
-            if tick and tick % self.config.renew_every_ticks == 0:
+            now = self.clock()
+            due = renewed_at is None or now - renewed_at >= self.config.renew_after_seconds
+            if due or (tick and tick % self.config.renew_every_ticks == 0):
                 try:
                     self._heartbeat()
                     self._renew(runtime)
                 except Exception:
                     return self._cancel_unresolved(runtime, "heartbeat_or_renewal_failure")
-            self.sleep(self.config.poll_seconds)
+                renewed_at = now  # measured before the request, so the interval never stretches
+            # Never sleep past the next renewal: a long poll interval cannot outlast the lease.
+            assert renewed_at is not None  # the first pass always renews
+            until_due = renewed_at + self.config.renew_after_seconds - self.clock()
+            self.sleep(max(0.0, min(self.config.poll_seconds, until_due)))
             result = runtime.tick()
         raise AssertionError("bounded worker loop did not return")
+
+    def _refusal_outcome(self, operation_id: str) -> dict[str, Any] | None:
+        try:
+            detail = self.receipt_refusals.detail(operation_id)
+        except (sqlite3.Error, OSError):
+            return self._refusal_unrecorded(
+                operation_id,
+                "the receipt refusal journal could not be read; the run receipt was not reposted",
+            )
+        if detail is None:
+            return None
+        return {
+            "state": "unknown",
+            "quarantined": False,
+            "reason": "run_receipt_refused",
+            "detail": detail,
+            "terminal": True,
+            "operation_id": operation_id,
+        }
+
+    @staticmethod
+    def _refusal_unrecorded(operation_id: str, detail: str) -> dict[str, Any]:
+        return {
+            "state": "unknown",
+            "quarantined": False,
+            "reason": "run_receipt_refusal_unrecorded",
+            "detail": detail,
+            "terminal": True,
+            "operation_id": operation_id,
+        }
+
+    def _post_run_receipt(
+        self, runtime: DevelopmentCpuRuntime, result: DriverResult
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Post the run receipt with bounded retry; return (receipt, failure outcome).
+
+        Transient control failures retry with the same deterministic key.  A
+        permanent refusal is recorded durably and is terminal.  Custody (workspace
+        and uploaded output) is kept on every failure; nothing is claimed recorded.
+        """
+        for attempt in range(1, RUN_RECEIPT_ATTEMPTS + 1):
+            try:
+                return runtime.post_run_receipt(result), None
+            except Exception as error:
+                if not isinstance(error, OSError):  # ControlChannelError is a ConnectionError
+                    return None, self._receipt_failed(safe_error_detail(error, self.root))
+                kind = classify_control_failure(error)
+                if isinstance(error, ControlChannelError) and kind == "auth":
+                    # Fixable by the operator: no durable record, one attempt only.
+                    return None, self._receipt_failed(
+                        f"control rejected the worker credential (HTTP {error.status}); "
+                        "renew or replace the credential, then restart to repost"
+                    )
+                if isinstance(error, ControlChannelError) and kind == "permanent":
+                    operation_id = runtime.operation.operation_id  # type: ignore[union-attr]
+                    detail = f"control refused the run receipt (HTTP {error.status})"
+                    try:
+                        self.receipt_refusals.record(operation_id, error.status, detail)  # type: ignore[arg-type]
+                    except (sqlite3.Error, OSError):
+                        return None, self._refusal_unrecorded(
+                            operation_id,
+                            f"control refused the run receipt (HTTP {error.status}); "
+                            "the refusal could not be recorded durably, so a restart will repost",
+                        )
+                    return None, self._refusal_outcome(operation_id)
+                if attempt == RUN_RECEIPT_ATTEMPTS:
+                    detail = safe_error_detail(error, self.root)
+                    return None, self._receipt_failed(
+                        f"retries exhausted after {attempt} attempts: {detail}"[:_DETAIL_LIMIT]
+                    )
+                self.sleep(_RUN_RECEIPT_RETRY_SECONDS)
+        raise AssertionError("bounded receipt retry did not return")
+
+    @staticmethod
+    def _receipt_failed(detail: str) -> dict[str, Any]:
+        return {
+            "state": "unknown",
+            "quarantined": False,
+            "reason": "run_receipt_failed",
+            "detail": detail,
+        }
 
     def _renew(self, runtime: DevelopmentCpuRuntime) -> None:
         if runtime.lease is None:
             raise DevelopmentWorkerError("Development runtime has no lease to renew.")
         lease = runtime.lease
         key = self.renewals.key(lease.id, lease.epoch)  # durable before the HTTP mutation
-        self.channel.post(
+        self._watch.post(
             "/worker/leases/renew",
             {"lease_id": lease.id, "expected_epoch": lease.epoch},
             key,
@@ -356,7 +680,7 @@ class DevelopmentWorkerService:
 
     def _heartbeat(self) -> None:
         key = self.heartbeats.key()  # durable before the control mutation
-        self.channel.post("/worker/heartbeat", {}, key)
+        self._watch.post("/worker/heartbeat", {}, key)
         self.heartbeats.complete()
 
     @staticmethod
@@ -376,6 +700,39 @@ class DevelopmentWorkerService:
         if runtime.operation is not None:
             runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
         return {"state": "unknown", "quarantined": False, "reason": reason}
+
+    def _report_failed(self, runtime: DevelopmentCpuRuntime, error: Exception) -> dict[str, Any]:
+        """An observation was not delivered (ADR 0054).
+
+        The container is cancelled either way (a run that cannot be observed must not go on),
+        but the observation stays in the durable outbox. A retryable failure ends this run
+        as ``report_pending`` WITHOUT a recorded result, so the poller recovers the grant after
+        the backoff and delivers the same observation, whatever state the container reached
+        meanwhile. Only a permanent refusal, or a report that aged out undelivered, is a
+        recorded unknown outcome.
+        """
+        outcome = self._cancel_unresolved(
+            runtime,
+            "observation_refused"
+            if isinstance(error, ObservationRefused)
+            else "observation_report_failure",
+        )
+        if isinstance(error, ObservationDeliveryPending):
+            pending: dict[str, Any] = {
+                "state": "report_pending",
+                "quarantined": False,
+                "reason": "observation_delivery_pending",
+                "delivery_pending": True,
+                "retry_after_seconds": round(error.retry_after_seconds, 3),
+            }
+            if error.auth:
+                # A rejected credential: the operator must renew it; the observation waits in
+                # the outbox and is delivered after the restart (exit code 3, as before).
+                pending["credential_rejected"] = True
+                if type(error.status) is int:
+                    pending["control_status"] = error.status
+            return pending
+        return outcome
 
     @staticmethod
     def _report(runtime: DevelopmentCpuRuntime, result: DriverResult) -> None:
@@ -460,6 +817,8 @@ __all__ = [
     "DevelopmentWorkerError",
     "DevelopmentWorkerService",
     "HeartbeatIntentJournal",
+    "ReceiptRefusalJournal",
     "RenewalIntentJournal",
+    "RUN_RECEIPT_ATTEMPTS",
     "read_private_credential",
 ]

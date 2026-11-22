@@ -179,6 +179,15 @@ def _read_file(root: Path, relative_path: str, limit: int):
             if size > limit:
                 raise DatasetIntegrityError("Dataset file grew beyond bounds")
         after = os.fstat(file_fd)
+        # Timestamps can be equal after a same-size rewrite within one clock tick, so confirm
+        # the bytes read back identically (pread leaves the offset alone).
+        offset = 0
+        for chunk in chunks:
+            if os.pread(file_fd, len(chunk), offset) != chunk:
+                raise DatasetIntegrityError("Dataset file changed while reading")
+            offset += len(chunk)
+        if os.pread(file_fd, 1, offset):
+            raise DatasetIntegrityError("Dataset file changed while reading")
 
         def identity(s):
             return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
@@ -281,8 +290,11 @@ class DatasetSnapshotStore(SnapshotStore):
             )
         except (ValueError, KeyError, TypeError) as error:
             raise Conflict("Retained dataset profile integrity check failed") from error
+        from .data_class import snapshot_data_class
+
         return {
             **snapshot,
+            "data_class": snapshot_data_class(c, snapshot_id),
             "dataset_manifest_digest": manifest_digest,
             "dataset_manifest": observed.model_dump(mode="json"),
         }

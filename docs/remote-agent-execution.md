@@ -11,7 +11,7 @@ have an empty target allowlist and no dispatch loop. See [decision 0023](decisio
 1. Treat this as a proposal, not authorization to call Salad or provision resources.
    A Tessera project contains research; a Salad project is separately provisioned
    by an authorized operator.
-2. Use [program interactions](mixfm-interactions.md) for the objective, variants,
+2. Use [program interactions](program-interactions.md) for the objective, variants,
    manifests, data/source use, evaluation protocol, budget and stop conditions.
    Set compute target to `salad_container` or `kubernetes`. Historical `local_cpu`,
    `configured_remote` and `salad_gpu_future` reviews remain readable but do not
@@ -100,7 +100,7 @@ and route digest, timestamps/status and typed evidence references. Exceptions ar
 reduced to unknown, never retained as potentially secret-bearing text. Only
 references matching an existing same-project operation/epoch/plan artifact manifest
 can claim quarantine custody. Byte transfer, custody release, result checkpoints,
-human result acceptance and MixFM scientific go/no-go remain separate workflows.
+human result acceptance and program scientific go/no-go remain separate workflows.
 Routing go/no-go always reports live activation blocked; it is not a scientific
 verdict. Unknown cost stays null, not zero or settled exposure.
 

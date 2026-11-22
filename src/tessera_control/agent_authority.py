@@ -17,6 +17,7 @@ from .agent_authority_models import (
     RevokeAgentAuthority,
 )
 from .agent_provenance import record_agent_provenance
+from .approval_trust import require_decision_actor
 from .execution import ExecutionStore
 from .experiments import ExperimentStore
 from .external_agents import ExternalAgentStore
@@ -365,6 +366,7 @@ class AgentAuthorityStore(ExternalAgentStore):
 
         def command(connection, actor):
             self._human(actor)
+            require_decision_actor(actor, forbidden=Forbidden)
             bounds = body["bounds"]
             self._recipient_bounds(connection, actor, project_id, bounds)
             for binding in bounds["bindings"]:

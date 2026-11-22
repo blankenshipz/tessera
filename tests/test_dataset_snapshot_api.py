@@ -20,6 +20,7 @@ from tessera_control.dataset_snapshots import (
     manifest_bytes,
     verify_dataset_bytes,
 )
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.store import _connect
 from tessera_control.workspace import inventory_digest
 from tessera_worker.inputs import materialize_snapshot
@@ -214,7 +215,10 @@ def test_normal_api_human_adopt_release_worker_lease_deliver_same_verified_bytes
                 "SELECT response_json FROM idempotency WHERE path=?", (path,)
             ).fetchone()[0]
         )
-        assert c.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == 56
+        assert (
+            c.execute("SELECT schema_version FROM schema_meta").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
     finally:
         c.close()
 

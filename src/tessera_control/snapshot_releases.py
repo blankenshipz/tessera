@@ -16,6 +16,8 @@ from pydantic import (
     field_validator,
 )
 
+from .approval_trust import require_decision_actor
+from .data_class import snapshot_data_class
 from .snapshots import SnapshotStore
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, _parse_utc, utc_now
 
@@ -24,7 +26,7 @@ class ReleaseSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_digest: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
     worker_principal_id: Annotated[str, StringConstraints(min_length=1, max_length=200)]
-    classification: Literal["public"]
+    classification: Literal["public", "private_derived"]
     permits_worker_transfer: Literal[True]
     rationale: Annotated[
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)
@@ -64,7 +66,8 @@ def create_release_schema(connection: sqlite3.Connection) -> None:
         id TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id),
         worker_principal_id TEXT NOT NULL REFERENCES principals(id),
         actor_principal_id TEXT NOT NULL REFERENCES principals(id),
-        digest TEXT NOT NULL, classification TEXT NOT NULL CHECK(classification='public'),
+        digest TEXT NOT NULL, classification TEXT NOT NULL
+            CHECK(classification IN ('public','private_derived')),
         rationale TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('active','revoked')),
         revision INTEGER NOT NULL, revoked_at TEXT)"""
@@ -81,8 +84,21 @@ def _principal(connection, principal_id, org_id, audience):
     )
 
 
-def authorize_snapshot(connection, actor, snapshot_id, worker_id, expected_digest):
-    """Check data, human review and destination identity within the admission transaction."""
+def authorize_snapshot(
+    connection,
+    actor,
+    snapshot_id,
+    worker_id,
+    expected_digest,
+    *,
+    verify_retained=True,
+    allow_private_derived=False,
+):
+    """Check data, human review and destination identity within the admission transaction.
+
+    Fails closed: a private_derived release is eligible only when the caller opts in.
+    """
+    eligible = {"public", "private_derived"} if allow_private_derived else {"public"}
     snapshot = SnapshotStore._snapshot(connection, actor, snapshot_id)
     if snapshot["digest"] != expected_digest:
         raise Conflict("Input snapshot digest does not match the approved plan.")
@@ -93,7 +109,7 @@ def authorize_snapshot(connection, actor, snapshot_id, worker_id, expected_diges
     ).fetchone()
     if row is None or _parse_utc(row["expires_at"]) <= datetime.now(UTC):
         raise Forbidden("Snapshot has no live release for this worker.")
-    if row["digest"] != expected_digest or row["classification"] != "public":
+    if row["digest"] != expected_digest or row["classification"] not in eligible:
         raise Forbidden("Snapshot release is not eligible.")
     issuer = _principal(connection, row["actor_principal_id"], actor["org_id"], "control")
     worker = _principal(connection, worker_id, actor["org_id"], "worker")
@@ -101,8 +117,21 @@ def authorize_snapshot(connection, actor, snapshot_id, worker_id, expected_diges
         raise Forbidden("Snapshot release identities are not eligible.")
     Store._project(connection, issuer, snapshot["project_id"])
     Store._project(connection, worker, snapshot["project_id"])
-    SnapshotStore._verify_retained(connection, actor, snapshot_id)
+    if verify_retained:
+        SnapshotStore._verify_retained(connection, actor, snapshot_id)
     return dict(row)
+
+
+def public_release_refused(connection: sqlite3.Connection, snapshot_id: str) -> bool:
+    """ADR 0039: a snapshot recorded private_derived by derivation is never released public.
+
+    Narrowed to origin ``derived`` (composed or built from run outputs). A snapshot merely
+    staged without a declaration (origin ``default``) or migrated keeps the pre-0039
+    human-release behaviour for non-third-party targets: ADR 0039 keeps the release
+    classification separate from the staging class there, and Salad never consults the
+    release (admission and tickets read the recorded class).
+    """
+    return snapshot_data_class(connection, snapshot_id)["origin"] == "derived"
 
 
 class SnapshotReleaseStore(SnapshotStore):
@@ -115,10 +144,16 @@ class SnapshotReleaseStore(SnapshotStore):
         def command(connection, live):
             if live["role"] != "human":
                 raise Forbidden("A human must classify and release source data.")
+            require_decision_actor(live, forbidden=Forbidden)
             snapshot = self._snapshot(connection, live, snapshot_id)
             if snapshot["digest"] != body.expected_digest:
                 raise Conflict("Snapshot digest changed from the reviewed basis.")
             self._verify_retained(connection, live, snapshot_id)
+            if body.classification == "public" and public_release_refused(connection, snapshot_id):
+                raise Conflict(
+                    "A snapshot built from run outputs (recorded private_derived, ADR 0039) "
+                    "cannot be released as public."
+                )
             worker = _principal(connection, body.worker_principal_id, live["org_id"], "worker")
             self._project(connection, worker, snapshot["project_id"])
             now = datetime.now(UTC)
@@ -135,6 +170,12 @@ class SnapshotReleaseStore(SnapshotStore):
             ).fetchone():
                 raise Conflict("Revoke the previous release before replacing it.")
             ident, timestamp = "release_" + uuid.uuid4().hex, utc_now()
+            # Derived, not stored: the classification says how the data may be used; a
+            # "public" release of a snapshot that also carries owner-approved private code
+            # is labelled so no consumer mistakes that code for public data.
+            from .code_approval import snapshot_code_approval
+
+            carries_code = snapshot_code_approval(connection, snapshot_id) is not None
             result = {
                 "id": ident,
                 "snapshot_id": snapshot_id,
@@ -148,6 +189,7 @@ class SnapshotReleaseStore(SnapshotStore):
                 "status": "active",
                 "revision": 1,
                 "revoked_at": None,
+                "contains_approved_code": carries_code,
             }
             connection.execute(
                 """INSERT INTO snapshot_releases VALUES
@@ -168,6 +210,7 @@ class SnapshotReleaseStore(SnapshotStore):
                     "worker_principal_id": worker["id"],
                     "digest": body.expected_digest,
                     "classification": body.classification,
+                    "contains_approved_code": carries_code,
                     "expires_at": expiry.isoformat(),
                 },
             )

@@ -169,6 +169,55 @@ def prepared():
     return plan
 
 
+def test_completed_parent_admits_one_successor_preserving_history(case, monkeypatch):
+    first = prepared()
+    upgrade.apply(OP, first["plan_sha256"])
+    upgrade.reconcile(OP)
+    retained = {p: p.read_bytes() for p in upgrade.ROOT.rglob("*.json")}
+    third = NEW.replace("b" * 64, "9" * 64)
+    candidate = private_import._receipt(upgrade.ROOT / "candidates" / ("b" * 64 + ".json"))
+    activation._write_once(
+        upgrade.ROOT / "candidates" / ("9" * 64 + ".json"), candidate | {"image": third}
+    )
+    monkeypatch.setattr(target, "_docker", lambda *args: OLD + "\n" + NEW + "\n" + third)
+
+    def patch(method, uri, body, **kwargs):
+        assert (upgrade.ROOT / OP / "successor-claim.json").exists()
+        case.state["patches"].append(body)
+        case.deployment["spec"]["template"]["spec"]["containers"][0]["image"] = third
+        case.deployment["metadata"]["resourceVersion"] = "rv-3"
+        return 200
+
+    monkeypatch.setattr(private_import, "_api_request", patch)
+    second_op, competitor = "2" * 32, "3" * 32
+    second = upgrade.plan(second_op, third)
+    upgrade.prepare(second_op, third, second["plan_sha256"])
+    rival = upgrade.plan(competitor, third)
+    upgrade.prepare(competitor, third, rival["plan_sha256"])
+    upgrade.apply(second_op, second["plan_sha256"])
+    with pytest.raises(target.AdmissionError, match="reconcile only"):
+        upgrade.apply(competitor, rival["plan_sha256"])
+    with pytest.raises(target.AdmissionError):
+        upgrade.plan("4" * 32, NEW)  # Applied but not reconciled is not a parent.
+    upgrade.reconcile(second_op)
+    upgrade.reconcile(second_op)
+    assert activation.ready_pod()["pod_uid"] == "new-pod"
+    assert upgrade.admitted_activation(case.base)["image"] == third
+    assert len(case.state["patches"]) == 2
+    assert all(p.read_bytes() == data for p, data in retained.items())
+
+
+def test_parent_backend_drift_never_prepares_successor(case):
+    saved = prepared()
+    upgrade.apply(OP, saved["plan_sha256"])
+    upgrade.reconcile(OP)
+    case.backend["incarnation"] = "changed"
+    # Even before a child image is registered, the active parent binding must
+    # remain strict; reconcile must not rewrite historical backend evidence.
+    with pytest.raises(target.AdmissionError, match="backend identity"):
+        upgrade.reconcile(OP)
+
+
 def test_valid_occupied_target_update_readiness_and_reconnect(case):
     saved = prepared()
     assert case.state["backups"][0][0] == "upgrade-" + OP

@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .approval_trust import require_decision_actor
 from .credential_lease_models import (
     CreateCredentialAccessLease,
     RenewCredentialAccessLease,
@@ -213,6 +214,7 @@ class CredentialAccessLeaseStore(ExecutionStore):
             connection: sqlite3.Connection, live: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             self._require_human(live)
+            require_decision_actor(live, forbidden=Forbidden)
             grant = self._grant(connection, live, grant_id)
             parent = connection.execute(
                 "SELECT * FROM execution_leases WHERE id=? AND grant_id=?",
@@ -325,6 +327,7 @@ class CredentialAccessLeaseStore(ExecutionStore):
             connection: sqlite3.Connection, live: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             self._require_human(live)
+            require_decision_actor(live, forbidden=Forbidden)
             row = self._record(connection, live, lease_id)
             if row["revision"] != payload["expected_revision"]:
                 raise Conflict("Credential access lease revision is no longer current.")

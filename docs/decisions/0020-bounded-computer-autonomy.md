@@ -94,7 +94,7 @@ blocked reasons, checkpoint question, state/revision/deadline, action identities
 and receipts. Desktop is a narrow task-card projection, not a GUI redesign or a
 privileged terminal. Main-process credentials never enter the renderer/workload.
 Held restores are permanently read-only. Control backup retains session events;
-worker journals and their bytes must be retained separately. MixFM source/license,
+worker journals and their bytes must be retained separately. Program source/license,
 dataset-ingestion, evaluation, result acceptance and publication decisions remain
 separate existing workflows. Salad stays deferred.
 

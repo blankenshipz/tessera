@@ -453,6 +453,9 @@ def report_observation(
     body: ReportExecutionObservation, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
+    if payload.get("launch_error") is None:
+        # Absent stays absent so an older client's replayed request keeps its digest.
+        payload.pop("launch_error", None)
     return result(
         store.report_execution_observation(
             worker, body.lease_id, key, canonical_digest(payload), payload
@@ -531,6 +534,14 @@ def deliver_inputs(
     return result(
         store.deliver_inputs(worker, lease_id, key, canonical_digest(payload), body.expected_epoch)
     )
+
+
+@router.post("/worker/leases/{lease_id}/inputs/chunks/{seq}")
+def deliver_input_chunk(
+    lease_id: str, seq: int, body: DeliverInputs, worker: Worker, store: Delivery
+) -> dict[str, Any]:
+    """Read-only chunk fetch (ADR 0037); an Idempotency-Key header is accepted and ignored."""
+    return store.read_input_chunk(worker, lease_id, seq, body.expected_epoch)
 
 
 @router.post("/worker/leases/{lease_id}/package")

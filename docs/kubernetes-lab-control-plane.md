@@ -1,6 +1,6 @@
 # Kubernetes lab control plane
 
-## Local composition safety checkpoint (2026-09-29)
+## Local composition safety checkpoint
 
 The control, coordinator and dispatch-worker examples are **not** a deployable
 composition on an empty Docker Desktop cluster. Check a candidate pair of
@@ -194,31 +194,3 @@ inspection. It never deletes the namespace, uses a registry, reads a Secret, or
 falls back to the current context. A pass is operational evidence only: private
 custody release preserves quarantine/unclassified status and neither accepts an
 artifact as a result nor establishes scientific validity.
-
-## Retained image-load fixture record (2026-09-17)
-
-Read-only inspection was performed against the explicitly selected Docker
-Desktop `docker-desktop` context before cleanup. No container logs, Secret
-objects, ConfigMap data, PVC contents, or control-plane state were read. The
-only ConfigMap in each namespace was the cluster-provided `kube-root-ca.crt`;
-only its name, metadata, and data-key name were inspected. No harness final JSON
-or other per-run metadata was retained in these namespaces.
-
-All four namespaces below had the required
-`tessera.io/control-restart-fixture` label, a single `control` Deployment,
-`state` PVC, and `control` Service. Every `state` PVC was `Bound` (64 MiB,
-`ReadWriteOnce`, `standard`); the Services were ClusterIP on port 8765. Their
-fixture-owned labels establish only cleanup ownership, not a successful fixture
-verdict.
-
-| Attempt / namespace | Fixture label | Observed result before cleanup | Exact recorded cause / qualification |
-| --- | --- | --- | --- |
-| `imageload` | `63412d88abdf` | Deployment `0/1` available; Pod `control-df97d74b9-t4plj` Pending, init container waiting with `ErrImageNeverPull`. | The node did not contain `docker.io/library/tessera-control-restart:63412d88abdf` while `imagePullPolicy: Never` was required. The Deployment recorded `ProgressDeadlineExceeded` and `MinimumReplicasUnavailable`. This is the failed image-visibility attempt. |
-| `imageload-v2` | `67facdbdf4f3` | Deployment `1/1` available; Pod `control-76cff9f88-qtx8b` Running/Ready, no restarts. | The node reported the image already present. One startup readiness probe saw `connect: connection refused` at 02:37:19Z, before the Deployment became available at 02:37:29Z. No retained final harness verdict establishes whether the complete restart/persistence checks passed. |
-| `imageload-v3` | `44cdfa49f9e8` | Deployment `1/1` available; Pod `control-6c7f5855-w64f4` Running/Ready, no restarts. | The node reported the image already present. One startup readiness probe saw `connect: connection refused` at 02:39:27Z, before availability at 02:39:37Z. No retained final harness verdict establishes whether the complete restart/persistence checks passed. |
-| `imageload-v4` | `1217812fe190` | Deployment `1/1` available; replacement Pod `control-d8d9b864f-s5v7b` Running/Ready, no restarts. | The first Pod (`control-d8d9b864f-x7s8d`) was stopped and replaced; both startup instances recorded a transient readiness `connect: connection refused` event before the replacement became available at 02:41:52Z. No retained final harness verdict establishes whether the complete restart/persistence checks passed. |
-
-This record does not replace, reinterpret, or delete the separately retained
-successful v6 result. In particular, this cleanup is limited to the four exact
-`imageload` namespaces listed above; the other labelled retained namespace
-(`tessera-control-e2e-20260917final` at inspection time) is out of scope.

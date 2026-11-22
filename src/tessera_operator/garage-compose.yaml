@@ -1,0 +1,76 @@
+# Separate, single-writer garage control deployment. TLS termination is an
+# externally admitted host-side reverse proxy; no unauthenticated LAN HTTP.
+name: tessera-garage-control
+services:
+  control:
+    image: tessera-garage-control:reviewed
+    pull_policy: never
+    build:
+      context: ../..
+      dockerfile: deploy/garage-control/Dockerfile
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    pids_limit: 128
+    cpus: 0.5
+    mem_limit: 512m
+    restart: unless-stopped
+    stop_grace_period: 40s
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1770,uid=65532,gid=65532"]
+    command:
+      - tessera
+      - serve
+      - --state-dir
+      - /state/control
+      - --port
+      - "8765"
+      - --bind-host
+      - 0.0.0.0
+      - --trusted-host
+      - ${TESSERA_TRUSTED_HOST:?Set the exact TLS proxy hostname}
+      - --public-origin
+      - ${TESSERA_PUBLIC_ORIGIN:?Set a verified HTTPS origin}
+    # The proxy MUST live on this Docker host and connect through loopback.
+    # Never change this binding to 0.0.0.0 without a new security review.
+    ports: ["127.0.0.1:18766:8765"]
+    volumes:
+      - type: bind
+        source: /srv/tessera-garage/control
+        target: /state/control
+        bind: {create_host_path: false}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8765/health', headers={'Host':'${TESSERA_TRUSTED_HOST:?Set the exact TLS proxy hostname}'}), timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    labels: {com.tessera.scope: garage-control}
+  backup:
+    profiles: [maintenance]
+    image: tessera-garage-control:reviewed
+    pull_policy: never
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    cpus: 0.25
+    mem_limit: 384m
+    restart: "no"
+    network_mode: none
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1770,uid=65532,gid=65532"]
+    # Writable source is required for the CLI's backup-health record; no owner
+    # credential is mounted separately and the backup CLI never copies it.
+    volumes:
+      - type: bind
+        source: /srv/tessera-garage/control
+        target: /state/control
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/tessera-garage/backups
+        target: /backups
+        bind: {create_host_path: false}
+    command: [tessera, backup, --state-dir, /state/control, --output, /backups/manual-new-directory]
+    labels: {com.tessera.scope: garage-control}

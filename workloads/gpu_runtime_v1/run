@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fixed entrypoint: no shell expansion of arguments, no environment lookups.
+exec /usr/bin/python3 -I /tessera/lib/runtime.py "$@"

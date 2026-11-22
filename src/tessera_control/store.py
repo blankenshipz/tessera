@@ -16,6 +16,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .approval_trust import (
+    AUTOMATION_KEY,
+    CAMPAIGN_DELEGATION_KEY,
+    DECISION_EVENT_TYPES,
+    decision_provenance,
+    require_decision_actor,
+)
 from .migrations import LATEST_SCHEMA_VERSION, migrate_database, plan_digest
 
 SCHEMA_VERSION = LATEST_SCHEMA_VERSION
@@ -36,6 +43,10 @@ class NotFound(StoreError):
 
 class Conflict(StoreError):
     pass
+
+
+# Hard bound on a worker credential's total life, enforced at renewal (issue is <=24 h).
+MAX_WORKER_CREDENTIAL_LIFETIME = timedelta(days=7)
 
 
 class Forbidden(StoreError):
@@ -125,7 +136,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 56);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 70);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -302,6 +313,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_experiment_schema(connection)
     create_experiment_evidence_retention_schema(connection)
     create_experiment_admission_schema(connection)
+    from .experiment_budgets import create_experiment_budget_schema
+
+    create_experiment_budget_schema(connection)
     create_admitted_attempt_resolution_schema(connection)
     create_admitted_attempt_observation_projection_schema(connection)
     create_admitted_attempt_evidence_schema(connection)
@@ -325,9 +339,56 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .agent_sandbox import create_agent_sandbox_schema
 
     create_agent_sandbox_schema(connection)
+    from .artifact_lineage import create_artifact_lineage_schema
+    from .external_operations import create_execution_run_receipt_schema
+    from .result_acceptances import create_observed_result_acceptance_schema
+
+    create_execution_run_receipt_schema(connection)
+    create_observed_result_acceptance_schema(connection)
+    create_artifact_lineage_schema(connection)
+    from .gate_evidence import create_gate_evidence_schema
+
+    create_gate_evidence_schema(connection)
+    from .snapshot_chunks import create_snapshot_chunk_schema
+
+    create_snapshot_chunk_schema(connection)
+    from .data_class import create_data_class_schema
+
+    create_data_class_schema(connection)
+    from .code_approval import create_code_approval_schema
+
+    create_code_approval_schema(connection)
+    from .campaign_schema import create_campaign_schema
+
+    create_campaign_schema(connection)
+    from .campaign_preapproval import create_preapproval_schema
+
+    create_preapproval_schema(connection)
+    from .provider_trust import create_provider_trust_schema
+
+    create_provider_trust_schema(connection)
+    from .execution_frames import create_execution_frame_schema
+
+    create_execution_frame_schema(connection)
+    from .campaign_standing_schema import create_standing_schema
+
+    create_standing_schema(connection)
+    from .campaign_gate_schema import create_campaign_gate_schema
+
+    create_campaign_gate_schema(connection)
+    from .gate_evidence_ingest import create_evidence_ingest_schema
+
+    create_evidence_ingest_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
+    # A local operator may have fenced this old home for an explicit active
+    # transfer. Old binaries are blocked by absence of the moved database;
+    # current binaries also refuse a mistakenly restored copy at this path.
+    if (database_path.parent / ".authority-moved").exists() or (
+        database_path.parent / ".authority-moved"
+    ).is_symlink():
+        raise ValueError("Control-plane authority was moved from this state directory.")
     if _lstat_is_symlink(database_path) or not database_path.is_file():
         raise ValueError("Control-plane database is not a regular file.")
     connection = _connect(database_path)
@@ -364,6 +425,8 @@ def validate_database(database_path: Path) -> None:
 def migrate_state(state_dir: Path) -> int:
     """Explicitly migrate an existing state database and return its schema version."""
     database_path = _database_path(state_dir)
+    if (state_dir / ".authority-moved").exists() or (state_dir / ".authority-moved").is_symlink():
+        raise ValueError("Control-plane authority was moved from this state directory.")
     if _lstat_is_symlink(database_path) or not database_path.is_file():
         raise ValueError("Control-plane database is not a regular file.")
     return migrate_database(database_path, _connect)
@@ -464,7 +527,10 @@ class Store:
                 WHERE p.token_hash = ? AND p.revoked_at IS NULL""",
                 (_token_hash(token),),
             ).fetchone()
-            return self._credential_principal(connection, row, audience)
+            actor = self._credential_principal(connection, row, audience)
+            # The campaign delegation marker may only be attached in-process by the runner.
+            actor.pop(CAMPAIGN_DELEGATION_KEY, None)
+            return actor
         finally:
             connection.close()
 
@@ -507,6 +573,15 @@ class Store:
                 created_at = _parse_utc(credential["created_at"])
             except ValueError as error:
                 raise Forbidden("Unauthorized") from error
+            if credential["kind"] == "worker":
+                # Use-time total lifetime, independent of how expires_at was written:
+                # a worker credential never authenticates past issue + seven days.
+                issued_bound = created_at + MAX_WORKER_CREDENTIAL_LIFETIME
+                if datetime.now(UTC) > issued_bound or (
+                    credential["expires_at"] is not None
+                    and _parse_utc(credential["expires_at"]) > issued_bound
+                ):
+                    raise Forbidden("Unauthorized")
             expires_at = credential["expires_at"]
             if expires_at is not None:
                 try:
@@ -962,6 +1037,16 @@ class Store:
             ).fetchone()
             if parent["expires_at"] is not None and expiry > _parse_utc(parent["expires_at"]):
                 raise Forbidden("Renewal cannot outlive its parent credential.")
+            # Total lifetime is fail-closed at control, whoever renews: a worker token
+            # never lives past issue + MAX_WORKER_CREDENTIAL_LIFETIME; then re-enroll.
+            issued = connection.execute(
+                "SELECT created_at FROM credentials WHERE id=?", (credential_id,)
+            ).fetchone()
+            if expiry > _parse_utc(issued["created_at"]) + MAX_WORKER_CREDENTIAL_LIFETIME:
+                raise Conflict(
+                    "Worker credential renewal cannot pass seven days after issue; "
+                    "enroll a new worker credential."
+                )
             connection.execute(
                 "UPDATE credentials SET expires_at=? WHERE id=?",
                 (_utc_string(expiry), credential_id),
@@ -1144,6 +1229,7 @@ class Store:
             task = self._task(connection, actor, task_id)
             if actor["role"] != "human":
                 raise Forbidden("Human approval is required.")
+            require_decision_actor(actor, forbidden=Forbidden)
             if task["revision"] != expected_revision or task["status"] != "draft":
                 raise Conflict("Task revision is no longer approvable.")
             if (
@@ -1308,6 +1394,12 @@ class Store:
             recovery_state = recovery["state"] if recovery is not None else None
             if recovery is None or recovery["state"] != "active":
                 raise Forbidden("Control state is held after restore; mutations are disabled.")
+            marker = principal.get(CAMPAIGN_DELEGATION_KEY)
+            intent = None
+            if marker is not None:
+                from .campaign_delegation import admit
+
+                intent = admit(connection, live_principal, marker, method, path, digest, key)
             existing = connection.execute(
                 """SELECT request_digest, response_status, response_json FROM idempotency
                 WHERE principal_id = ? AND org_id = ? AND idempotency_key = ?
@@ -1325,6 +1417,10 @@ class Store:
             command_id = "command_" + uuid.uuid4().hex
             lineage_token = _EVENT_LINEAGE.set((command_id, command_id))
             status, response = command(connection, live_principal)
+            if intent is not None:
+                from .campaign_delegation import complete
+
+                complete(connection, intent, status, response)
             connection.execute(
                 """INSERT INTO idempotency
                 (principal_id, org_id, idempotency_key, method, path, request_digest,
@@ -1396,6 +1492,8 @@ class Store:
             (principal["id"], principal["org_id"]),
         ).fetchone()
         actor = Store._credential_principal(connection, row, audience)
+        if principal.get(AUTOMATION_KEY):
+            actor[AUTOMATION_KEY] = principal[AUTOMATION_KEY]
         if (
             not external_allowed
             and connection.execute(
@@ -1484,6 +1582,8 @@ class Store:
         payload: dict[str, Any],
     ) -> None:
         lineage = _EVENT_LINEAGE.get()
+        if event_type in DECISION_EVENT_TYPES and "kind" in principal:
+            payload = {**payload, **decision_provenance(principal)}
         connection.execute(
             """INSERT INTO events
             (org_id, project_id, task_id, event_type, resource_revision,

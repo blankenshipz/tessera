@@ -3,11 +3,16 @@
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from pydantic import ValidationError
 
+from . import provider_trust
 from .admin_models import AdminCommand, AdminCreate, AdminRecord
 from .admin_secrets import FakeAdminSecretBackend, UnavailableSecretBackend
+from .approval_trust import require_decision_actor
+from .external_agents import ExternalAgentStore
+from .salad_billing import BillingPolicy, billing_projection
 from .store import (
     Conflict,
     Forbidden,
@@ -237,6 +242,11 @@ class AdminStore(Store):
                 or "tessera-research",
                 "project_created": None if selected else False,
                 "portal_url": "https://docs.salad.com/general/tutorials/account-setup",
+                **billing_projection(
+                    BillingPolicy.model_validate(state["spec"]["billing_policy"])
+                    if state["spec"].get("billing_policy") is not None
+                    else None
+                ),
             }
 
     def create(self, actor, project_id, key, payload):
@@ -524,3 +534,65 @@ class AdminStore(Store):
             }
         finally:
             db.close()
+
+
+class ProviderTrustStore(ExternalAgentStore):
+    """Reads and the human-only reload of the provider trust setting (ADR 0040 section 4).
+
+    There is no write path: the setting is a host file, and only its reload is exposed.
+    """
+
+    def __init__(self, state_dir, *, path: Path | None = None):
+        super().__init__(state_dir)
+        self.path = path
+
+    def read(self, principal) -> dict:
+        connection = _connect(self.database_path)
+        try:
+            actor = self._actor(connection, principal)
+            if actor["kind"] == "worker":
+                raise Forbidden("Workers cannot read the provider trust setting.")
+            if actor["role"] == "agent":
+                self._scope(connection, actor, "provider_trust:read")
+            elif actor["role"] != "human":
+                raise Forbidden("A human or a provider_trust:read agent is required.")
+            return {**provider_trust.show(), "reload_configured": self.path is not None}
+        finally:
+            connection.close()
+
+    def reload(self, principal, key: str) -> tuple[int, dict]:
+        """Re-read the configured file. A refusal keeps the last good setting and is audited."""
+        loaded: dict = {}
+
+        def command(connection, live):
+            if live["role"] != "human":
+                raise Forbidden("Only a human may reload the provider trust setting.")
+            require_decision_actor(live, forbidden=Forbidden)
+            if self.path is None:
+                raise Conflict("No provider trust file is configured for this service.")
+            now = utc_now()
+            try:
+                policy = provider_trust.load_policy_file(self.path)
+            except provider_trust.TrustPolicyRefused as error:
+                provider_trust.record_reload_refused(connection, live["id"], now, str(error))
+                return 409, {
+                    "status": "refused",
+                    "reason": str(error),
+                    "kept_digest": provider_trust.current_policy(connection).digest,
+                }
+            before = provider_trust.current_policy(connection).digest
+            changed = provider_trust.record_policy(connection, policy, live["id"], now)
+            loaded["policy"], loaded["now"] = policy, now
+            return 200, {
+                "status": "loaded",
+                "changed": policy.digest != before,
+                "event_recorded": changed,
+                **provider_trust.show(policy),
+                "loaded_at": now,
+            }
+
+        path = "/admin/provider-trust/reload"
+        status, body = self._mutate(principal, key, "POST", path, canonical_digest({}), command)
+        if "policy" in loaded:
+            provider_trust.install_policy(loaded["policy"], loaded["now"])
+        return status, body

@@ -120,12 +120,33 @@ tests remain passing. No default test contacts Docker/network/providers.
 
 ## Remaining prerequisite, not a permission workaround
 
-To obtain live proof, an independently trusted observer must be available on the
-LinuxKit **daemon host**, or an equivalently authenticated native observation
-transport must be implemented and deployed. No such transport is currently
-configured. Do not use a privileged helper, host bind mount, workload self-report
-alone, weaker predicate, or newly installed workload tools to evade this gate.
+To obtain the **strong** proof (`daemon_host_independent`), an independently
+trusted observer must be available on the LinuxKit **daemon host**, or an
+equivalently authenticated native observation transport must be implemented and
+deployed. No such transport is currently configured. Do not use a privileged helper,
+host bind mount, workload self-report alone, a weaker predicate under the strong
+class, or newly installed workload tools to evade this gate. The strong predicate
+and the default behavior are unchanged; a strong-preflight failure still blocks
+with its gate and never retries as another class.
+
+[ADR 0035](decisions/0035-docker-desktop-network-attestation.md) (Accepted) adds
+one **separate and weaker** class, `engine_declared_workload_observed`, which an
+operator must select explicitly (`--attestation-class`, `--run` only). It keeps
+every in-workload predicate above but has **no independent daemon-host reader**:
+it trusts the engine, kernel and pinned image interpreter, and cannot show that
+the enumerated namespace is the workload's or that it is not the VM host's. It
+records `attestation_class` and `observer_independence` on every network event and
+report, emits `state="workload_observed"` and never `verified`, and can never be
+relabelled as, combined into, or upgraded to `daemon_host_independent`. It is a
+configuration attestation, not an adversarial isolation proof, and network-isolation
+claims remain a gap under the strong class.
 The new native reader/exec path is offline-tested, **not live-validated** here.
 Actual namespace cause, downstream limits, independent watchdog termination and
 artifact behavior remain live acceptance gaps. Even a future passing fixture
 cannot activate autonomy, downloads, installs, providers or Kubernetes.
+
+The weak class additionally tolerates the kernel's fallback tunnel devices (`tunl0`,
+`gre0`, `gretap0`, `erspan0`, `ip_vti0`, `ip6_vti0`, `sit0`, `ip6tnl0`, `ip6gre0`) that
+appear in every new namespace, but only when DOWN, unaddressed and unrouted
+([ADR 0035](decisions/0035-docker-desktop-network-attestation.md), "Kernel fallback
+tunnel devices"). The strong class keeps the strict loopback-only rule.

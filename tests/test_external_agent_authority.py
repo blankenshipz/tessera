@@ -11,6 +11,7 @@ from test_agent_authority import assert_empty_runtime_v55, strip_runtime_v55
 from test_artifact_custody import _released_manifest
 
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.models import CreateCredential
 from tessera_control.store import Store, canonical_digest, initialize_state, migrate_state
 
@@ -466,8 +467,8 @@ def test_v49_migration_creates_empty_authority_without_inference(tmp_path):
         ):
             db.execute(f"DROP TABLE {table}")
         db.execute("UPDATE schema_meta SET schema_version=49")
-    assert migrate_state(state) == 56
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert_empty_runtime_v55(db)
         for table in (

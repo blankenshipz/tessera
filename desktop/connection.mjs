@@ -2,6 +2,8 @@
 import { randomUUID } from 'node:crypto';
 import { validControlToken } from './control-credential.mjs';
 
+export const OWNER_AUTOMATION_LABEL = 'desktop-owner';
+
 export class ConnectionError extends Error {}
 
 export function normalizeEndpoint(value) {
@@ -196,7 +198,12 @@ export class ControlConnection {
       const response = await this.#fetch(connection.origin + path, {
         method,
         headers: { Authorization: `Bearer ${connection.token}`,
-          ...(body === undefined ? {} : { 'Content-Type': 'application/json', 'Idempotency-Key': key }) },
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json', 'Idempotency-Key': key }),
+          // The control plane refuses bare root-owner decisions; a desktop connected
+          // with the owner credential labels them as owner-operated. A label only:
+          // it grants nothing and is recorded on the decision. Other identities never send it.
+          ...(body !== undefined && connection.identity?.kind === 'local_owner'
+            ? { 'X-Tessera-Automation': OWNER_AUTOMATION_LABEL } : {}) },
         body: body === undefined ? undefined : JSON.stringify(body),
         redirect: 'error', signal: controller.signal,
       });

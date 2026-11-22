@@ -17,6 +17,7 @@ from test_goal_to_decision import _command, _design
 
 from tessera_control.execution import ExecutionStore
 from tessera_control.experiments import ExperimentStore
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.runtime_packages import RuntimePackageStore
 from tessera_control.store import Store, canonical_digest, initialize_state, migrate_state
 from tessera_worker.kubernetes_contracts import (
@@ -106,7 +107,7 @@ def _admitted_package(
     before = None
     if migrate_from_v35:
         before = _old_v35_state(state)
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         assert_empty_runtime_v55(connection)
         if before is not None:

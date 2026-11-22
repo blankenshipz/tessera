@@ -234,3 +234,108 @@ os._exit(19)
         assert stops == [a]
     finally:
         recovered.close()
+
+
+def _running_window_assignment(case, operation, running_seconds=40, deadline=1000):
+    g, _, c, clock, state, stops, _, _ = case
+    b = CustodyBinding("tenant", "project", operation, 1, "artifact")
+    c.register(b, byte_cap=10, file_cap=1)
+    a = GuardianAssignment(
+        b,
+        "org",
+        "provider-project",
+        "group-id",
+        "attempt-operation",
+        "allocation",
+        "sha256:image",
+        deadline,
+        running_seconds=running_seconds,
+    )
+    g.arm(a)
+    return a
+
+
+def _advance(g, a, clock, seconds):
+    for _ in range(int(seconds // 5)):
+        clock[0] += 5
+        g.heartbeat(a.binding.operation)
+        status = g.tick(a.binding.operation)
+        if status["status"] != "armed" or status["reason"] != "armed":
+            return status
+    return g.status(a.binding.operation)
+
+
+def test_stops_at_first_running_plus_running_seconds_before_longer_route_window(case):
+    g, _, _, clock, state, stops, _, _ = case
+    a = _running_window_assignment(case, "op-running-window")
+    state[0] = "pending"
+    status = _advance(g, a, clock, 60)  # provisioning longer than running window: unbilled
+    assert status["reason"] == "armed" and not stops
+    state[0] = "running"
+    clock[0] += 5
+    g.heartbeat(a.binding.operation)
+    g.tick(a.binding.operation)
+    started = clock[0]
+    status = _advance(g, a, clock, 35)
+    assert status["reason"] == "armed" and not stops
+    status = _advance(g, a, clock, 10)
+    assert status["reason"] == "deadline" and clock[0] <= started + 45
+    assert stops and stops[-1].binding == a.binding
+
+
+def test_never_running_instance_stops_at_provisioning_deadline(case):
+    g, _, _, clock, state, stops, _, _ = case
+    a = _running_window_assignment(case, "op-never-running", deadline=160)
+    state[0] = "pending"
+    status = _advance(g, a, clock, 50)
+    assert status["reason"] == "armed" and not stops
+    status = _advance(g, a, clock, 20)
+    assert status["reason"] == "deadline" and stops
+
+
+def test_running_window_never_extends_route_deadline(case):
+    g, _, _, clock, state, stops, _, _ = case
+    a = _running_window_assignment(case, "op-capped", running_seconds=500, deadline=140)
+    state[0] = "running"
+    status = _advance(g, a, clock, 60)
+    assert status["reason"] == "deadline" and stops
+
+
+@pytest.mark.parametrize(
+    "reason", ["provider_confirmed_exact_group_stopped", "operator_reconciled_exact_group_stopped"]
+)
+def test_restart_keeps_reconciled_reason(case, reason):
+    g, a, _, clock, states, _, kw, tmp = case
+    clock[0] += 30  # control disconnect: stopping
+    g.tick(a.binding.operation)
+    g.reconcile(a.binding.operation, reason=reason)
+    g.close()
+    g2 = SaladGuardian(tmp / "guardian.db", **kw)
+    try:
+        s = g2.status(a.binding.operation)
+        assert s["status"] == "reconciled" and s["reason"] == reason
+    finally:
+        g2.close()
+
+
+def test_reconcile_reason_is_closed(case):
+    g, a, _, clock, _, _, _, _ = case
+    clock[0] += 30
+    g.tick(a.binding.operation)
+    with pytest.raises(ValueError, match="reconcile_reason"):
+        g.reconcile(a.binding.operation, reason="anything_else")
+    assert g.status(a.binding.operation)["status"] == "unknown"
+
+
+def test_stop_cause_is_recorded_once_and_survives_terminal(case):
+    g, a, _, clock, states, _, _, _ = case
+    assert g.status(a.binding.operation)["stop_cause"] is None
+    clock[0] += 30  # control disconnect
+    g.tick(a.binding.operation)
+    assert g.status(a.binding.operation)["stop_cause"] == "control_disconnect"
+    clock[0] += 70  # now past the deadline too: the first cause is kept
+    g.tick(a.binding.operation)
+    states[0] = "stopped"
+    final = g.tick(a.binding.operation)
+    assert final["status"] == "stopped" and final["reason"] == "exact_terminal_and_sealed"
+    assert final["stop_cause"] == "control_disconnect"

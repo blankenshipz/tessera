@@ -30,6 +30,8 @@ class SaladProxy:
 class FakeSaladTransport:
     """Closed simulator, not an injectable live HTTP adapter or provider witness."""
 
+    live = False  # never a real provider; group cleanup accepts only non-live transports
+
     def __init__(self):
         self.calls = []
         self.responses = []

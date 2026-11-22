@@ -124,6 +124,91 @@ class ControlClient:
             key=idempotency_key,
         )
 
+    async def submit_campaign(self, spec, idempotency_key):
+        return await self._request(
+            "POST",
+            f"/projects/{segment(self.config.project_id)}/campaigns",
+            body={"spec": spec},
+            key=idempotency_key,
+        )
+
+    async def provider_trust(self):
+        return await self._request("GET", "/admin/provider-trust")
+
+    async def campaign(self, campaign_id):
+        return await self._request("GET", "/campaigns/" + segment(campaign_id))
+
+    async def list_campaigns(self, offset=0, limit=50):
+        if not 0 <= offset or not 1 <= limit <= 200:
+            raise ControlError("Pagination requires offset >= 0 and limit 1–200")
+        project = segment(self.config.project_id)
+        return await self._request(
+            "GET", f"/projects/{project}/campaigns?offset={offset}&limit={limit}"
+        )
+
+    async def campaign_receipt(self, campaign_id):
+        return await self._request("GET", f"/campaigns/{segment(campaign_id)}/receipt")
+
+    async def list_snapshots(self, offset=0, limit=50):
+        if not 0 <= offset or not 1 <= limit <= 200:
+            raise ControlError("Pagination requires offset >= 0 and limit 1–200")
+        project = segment(self.config.project_id)
+        return await self._request(
+            "GET", f"/projects/{project}/agent-snapshots?offset={offset}&limit={limit}"
+        )
+
+    async def campaign_view(self, campaign_id, view):
+        if view not in {"outputs", "logs", "budget", "grants"}:
+            raise ControlError("Unknown campaign view")
+        return await self._request("GET", f"/campaigns/{segment(campaign_id)}/{view}")
+
+    async def standing_status(self):
+        project = segment(self.config.project_id)
+        return await self._request("GET", f"/projects/{project}/agent-standing-status")
+
+    async def gate_decisions(self, campaign_id):
+        return await self._request("GET", f"/campaigns/{segment(campaign_id)}/gate-decisions")
+
+    async def cancel_campaign(self, campaign_id, expected_revision, reason, idempotency_key):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/cancel",
+            body={"expected_revision": expected_revision, "reason": reason},
+            key=idempotency_key,
+        )
+
+    async def validate_campaign_spec(self, spec):
+        """Dry-run of submit on the control plane: same checks, nothing stored."""
+        return await self._request(
+            "POST",
+            f"/projects/{segment(self.config.project_id)}/campaign-specs/validate",
+            body={"spec": spec},
+        )
+
+    async def reduce_campaign_budget(
+        self, campaign_id, expected_revision, budget_cap_cents, reason, idempotency_key
+    ):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/budget-reduction",
+            body={
+                "expected_revision": expected_revision,
+                "budget_cap_cents": budget_cap_cents,
+                "reason": reason,
+            },
+            key=idempotency_key,
+        )
+
+    async def revoke_campaign_release(
+        self, campaign_id, release_id, expected_revision, reason, idempotency_key
+    ):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/releases/{segment(release_id)}/revoke",
+            body={"expected_revision": expected_revision, "reason": reason},
+            key=idempotency_key,
+        )
+
     def _collection(self, name, offset, limit):
         if not 0 <= offset or not 1 <= limit <= 100:
             raise ControlError("Pagination requires offset >= 0 and limit 1–100")

@@ -32,6 +32,11 @@ class RoutePreflight:
 class RemoteAdapter(Protocol):
     def preflight(self, proposal: RemoteProposal) -> RoutePreflight: ...
 
+    # Optional: adapters that need the action define
+    #   def preflight_for(self, action: str, proposal: RemoteProposal) -> RoutePreflight
+    # and the dispatcher prefers it over preflight(). Trusted-server composition is
+    # declared with ``trusted_composition = True`` plus ``trusted_store`` (the store).
+
     def perform(self, action: str, proposal: RemoteProposal, state: dict) -> ProviderReadback: ...
 
 
@@ -54,11 +59,17 @@ class RemoteDispatcher:
         adapter = self.adapters.get(proposal.selection.target_digest)
         if adapter is None:
             raise Conflict("Remote provider disabled or target adapter unavailable.")
-        from .salad_remote import SaladTrustedAdapter
-
-        trusted = type(adapter) is SaladTrustedAdapter and adapter._server.store is self.store
+        # Trusted-server mode is an explicit adapter declaration bound to THIS store;
+        # an adapter cannot claim it without naming the store it was composed against.
+        trusted = (
+            getattr(adapter, "trusted_composition", False) is True
+            and getattr(adapter, "trusted_store", None) is self.store
+        )
+        preflight_for = getattr(adapter, "preflight_for", None)
         preflight = (
-            adapter.preflight_for(action, proposal) if trusted else adapter.preflight(proposal)
+            preflight_for(action, proposal)
+            if callable(preflight_for)
+            else adapter.preflight(proposal)
         )
         if (
             not preflight.admissible

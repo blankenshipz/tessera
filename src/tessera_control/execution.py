@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .approval_trust import require_decision_actor
 from .execution_models import (
     AcquireExecutionLease,
     AttestKubernetesNeverSubmitted,
@@ -26,6 +27,7 @@ from .execution_models import (
     RevokeExecutionGrant,
 )
 from .external_operations import current_operation_reconciliation
+from .provider_trust import receipt_trust_fields, worker_admits_class
 from .store import (
     Conflict,
     Forbidden,
@@ -164,6 +166,48 @@ def create_execution_schema(connection: sqlite3.Connection) -> None:
         """CREATE INDEX execution_observations_by_grant
         ON execution_observations(grant_id, recorded_at, id)"""
     )
+
+
+def reconcile_grant_row(
+    connection: sqlite3.Connection,
+    grant: sqlite3.Row | dict[str, Any],
+    *,
+    settlement_cents: int,
+    principal_id: str,
+    now: str,
+) -> int | None:
+    """Reconcile one unresolved grant and move its hold to settled; the new revision.
+
+    The one accounting step shared by the human reconcile route and the automatic release
+    of an expired grant with a confirmed exit (ADR 0048). ``None`` when the reservation
+    ledger cannot cover the grant's hold (nothing is written then). The caller proves the
+    evidence and records the event."""
+    released = connection.execute(
+        """UPDATE execution_project_limits SET held_cents = held_cents - ?,
+        settled_cents = settled_cents + ?, updated_at = ? WHERE project_id = ?
+        AND held_cents >= ?""",
+        (
+            grant["max_exposure_cents"],
+            settlement_cents,
+            now,
+            grant["project_id"],
+            grant["max_exposure_cents"],
+        ),
+    ).rowcount
+    if released != 1:
+        return None
+    revision = grant["revision"] + 1
+    changed = connection.execute(
+        """UPDATE execution_grants SET status = 'reconciled', revision = ?, updated_at = ?,
+        reconciled_at = ?, reconciled_by_principal_id = ?, settlement_cents = ?
+        WHERE id = ? AND revision = ? AND status IN ('active', 'cancel_requested')""",
+        (revision, now, now, principal_id, settlement_cents, grant["id"], grant["revision"]),
+    ).rowcount
+    if changed != 1:
+        # The caller holds the write transaction and read the grant in it, so this is a
+        # logic error; failing loudly rolls the whole transaction back.
+        raise Conflict("Execution authority is no longer unresolved.")
+    return revision
 
 
 class ExecutionStore(Store):
@@ -526,14 +570,25 @@ class ExecutionStore(Store):
         worker_principal_id: str,
         expected_digest: str,
         frozen_release_id: str | None = None,
+        *,
+        verify_retained: bool = True,
+        allow_private_derived: bool = False,
     ) -> dict[str, Any]:
         # Keep this import local: snapshots layers its operations on Store too.
         from .snapshots import SnapshotStore
 
         release = SnapshotStore._authorized_snapshot(
-            connection, principal, snapshot_id, worker_principal_id, expected_digest
+            connection,
+            principal,
+            snapshot_id,
+            worker_principal_id,
+            expected_digest,
+            verify_retained=verify_retained,
+            allow_private_derived=allow_private_derived,
         )
-        if release["classification"] != "public":
+        if release["classification"] != "public" and not (
+            allow_private_derived and release["classification"] == "private_derived"
+        ):
             raise Forbidden("The snapshot release is not approved for this local CPU authority.")
         if frozen_release_id is not None and release["id"] != frozen_release_id:
             raise Forbidden("The snapshot release no longer matches this grant.")
@@ -654,6 +709,7 @@ class ExecutionStore(Store):
             connection: sqlite3.Connection, actor: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             self._require_human(actor)
+            require_decision_actor(actor, forbidden=Forbidden)
             limits = self._limit(connection, actor, project_id)
             if payload["currency"] != limits["currency"]:
                 raise Conflict("Grant currency must match the project execution currency.")
@@ -724,7 +780,15 @@ class ExecutionStore(Store):
                 for skill_digest in spec["pinned_skill_digests"]
             ]
             release = self._authorize_snapshot(
-                connection, actor, payload["snapshot_id"], worker["id"], expected_digest
+                connection,
+                actor,
+                payload["snapshot_id"],
+                worker["id"],
+                expected_digest,
+                allow_private_derived=(
+                    spec.get("egress") is None
+                    and worker_admits_class(worker["id"], "private_derived", connection)
+                ),
             )
             expiry = self._parse_future(payload["expires_at"], MAX_GRANT_LIFETIME, "Grant expiry")
             if docker_target_bounds is not None and expiry > _parse_utc(
@@ -1163,7 +1227,12 @@ class ExecutionStore(Store):
         return command(connection, actor)
 
     def _active_worker_grant(
-        self, connection: sqlite3.Connection, worker: dict[str, Any], grant_id: str
+        self,
+        connection: sqlite3.Connection,
+        worker: dict[str, Any],
+        grant_id: str,
+        *,
+        verify_retained: bool = True,
     ) -> sqlite3.Row:
         grant = self._grant(connection, worker, grant_id)
         if grant["worker_principal_id"] != worker["id"] or worker["kind"] != "worker":
@@ -1227,6 +1296,14 @@ class ExecutionStore(Store):
         ).fetchone()[0]
         if unresolved > limits["max_concurrency"]:
             raise Conflict("Project execution concurrency is exceeded pending reconciliation.")
+        # ADR 0040 section 4: private_derived data reaches only a plan without egress
+        # whose worker principal is bound to a provider the setting trusts with it.
+        frozen_spec = (
+            json.loads(spec_row[0]) if spec_row is not None and spec_row[0] is not None else {}
+        )
+        private_derived_ok = frozen_spec.get("egress") is None and worker_admits_class(
+            worker["id"], "private_derived", connection
+        )
         release = self._authorize_snapshot(
             connection,
             worker,
@@ -1234,6 +1311,8 @@ class ExecutionStore(Store):
             worker["id"],
             grant["snapshot_digest"],
             grant["snapshot_release_id"],
+            verify_retained=verify_retained,
+            allow_private_derived=private_derived_ok,
         )
         try:
             release_expiry = _parse_utc(release["expires_at"])
@@ -1320,6 +1399,14 @@ class ExecutionStore(Store):
             connection: sqlite3.Connection, worker: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
             grant = self._active_worker_grant(connection, worker, grant_id)
+            if connection.execute(
+                """SELECT 1 FROM campaign_stage_attempts a JOIN campaigns c
+                ON c.id = a.campaign_id WHERE a.grant_id = ? AND (c.status <> 'running'
+                OR EXISTS (SELECT 1 FROM campaign_salad_attempts sa
+                           WHERE sa.attempt_id = a.id AND sa.phase <> 'awaiting_lease'))""",
+                (grant_id,),
+            ).fetchone():
+                raise Conflict("The grant's campaign is not running; no new lease is issued.")
             now_datetime = self._now()
             prior = connection.execute(
                 "SELECT 1 FROM execution_leases WHERE grant_id = ? LIMIT 1",
@@ -1374,6 +1461,9 @@ class ExecutionStore(Store):
                     "lease_id": lease["id"],
                     "epoch": epoch,
                     "operational_only": True,
+                    # ADR 0040 section 4: the setting in force when authority was issued;
+                    # the run receipt returns these rather than recomputing them.
+                    **receipt_trust_fields(connection, worker["id"], grant["snapshot_id"]),
                 },
             )
             return 201, self._lease_response(lease)
@@ -1416,6 +1506,16 @@ class ExecutionStore(Store):
             grant = self._active_worker_grant(connection, worker, lease["grant_id"])
             if grant["epoch"] != expected_epoch:
                 raise Conflict("Execution grant epoch is no longer current.")
+            if connection.execute(
+                """SELECT 1 FROM events WHERE project_id=?
+                AND event_type='execution.observation_reported'
+                AND json_extract(payload_json,'$.grant_id')=?
+                AND json_extract(payload_json,'$.launch_error') IS NOT NULL LIMIT 1""",
+                (grant["project_id"], grant["id"]),
+            ).fetchone():
+                # ADR 0046: a reported launch error is final for this operation, so its
+                # lease is never extended (the worker must not start after reporting it).
+                raise Conflict("A launch error was reported for this operation.")
             now_datetime = self._now()
             expires_at = min(
                 now_datetime + timedelta(seconds=LEASE_SECONDS),
@@ -1525,6 +1625,15 @@ class ExecutionStore(Store):
             # and any replacement authority.
             if payload["termination_confirmed"] and payload["observed_state"] != "exited":
                 raise Conflict("Termination confirmation requires an exited observation.")
+            launch_error = payload.get("launch_error")
+            if launch_error is not None:
+                seen_container = connection.execute(
+                    """SELECT 1 FROM execution_observations WHERE grant_id=?
+                    AND (provider_id IS NOT NULL OR observed_state!='unknown') LIMIT 1""",
+                    (grant["id"],),
+                ).fetchone()
+                if seen_container or (operation is not None and operation["provider_id"]):
+                    raise Conflict("A launch error cannot follow evidence that a container exists.")
             if payload["termination_confirmed"] and payload.get("provider_id") is None:
                 raise Conflict("Termination confirmation requires a provider identity.")
             observed_at = _parse_utc(payload["observed_at"])
@@ -1621,7 +1730,7 @@ class ExecutionStore(Store):
                 )
             else:
                 semantic_transition = True
-            if semantic_transition:
+            if semantic_transition or launch_error is not None:
                 self._event(
                     connection,
                     worker,
@@ -1640,6 +1749,7 @@ class ExecutionStore(Store):
                         "cancellation": self._cancellation_payload(connection, grant),
                         "observation_proof": "trusted_worker_assertion",
                         "operational_only": True,
+                        **({"launch_error": launch_error} if launch_error is not None else {}),
                     },
                 )
             return 201, {
@@ -1875,33 +1985,17 @@ class ExecutionStore(Store):
             if payload["settlement_cents"] > MAX_CENTS - limits["settled_cents"]:
                 raise Conflict("Settlement exceeds the supported durable ledger range.")
             now = utc_now()
-            next_revision = grant["revision"] + 1
-            connection.execute(
-                """UPDATE execution_grants SET status = 'reconciled', revision = ?, updated_at = ?,
-                reconciled_at = ?, reconciled_by_principal_id = ?, settlement_cents = ?
-                WHERE id = ? AND revision = ? AND status IN ('active', 'cancel_requested')""",
-                (
-                    next_revision,
-                    now,
-                    now,
-                    actor["id"],
-                    payload["settlement_cents"],
-                    grant_id,
-                    grant["revision"],
-                ),
+            next_revision = reconcile_grant_row(
+                connection,
+                grant,
+                settlement_cents=payload["settlement_cents"],
+                principal_id=actor["id"],
+                now=now,
             )
-            connection.execute(
-                """UPDATE execution_project_limits SET held_cents = held_cents - ?,
-                settled_cents = settled_cents + ?, updated_at = ? WHERE project_id = ?
-                AND held_cents >= ?""",
-                (
-                    grant["max_exposure_cents"],
-                    payload["settlement_cents"],
-                    now,
-                    grant["project_id"],
-                    grant["max_exposure_cents"],
-                ),
-            )
+            if next_revision is None:
+                raise Conflict(
+                    "Execution reservation ledger is inconsistent; authority remains held."
+                )
             updated = dict(grant)
             updated.update(
                 status="reconciled",

@@ -17,6 +17,8 @@ from pydantic import (
 )
 
 from .agent_sandbox_models import SandboxPlan
+from .artifact_limits import ABSOLUTE_MAX_ARTIFACT_BYTES, operator_limits
+from .egress_models import EgressPolicy
 from .request_limits import MAX_TOKEN_CHARS
 from .token_purpose import provider_key_shaped
 
@@ -69,20 +71,37 @@ class ExecutionSpec(StrictRequest):
     profile: Literal["local-cpu", "kubernetes-opencode", "ordinary-docker", "agent-sandbox"]
     docker: DockerPlan | None = None
     sandbox: SandboxPlan | None = None
+    egress: EgressPolicy | None = None
     network_enabled: Literal[False] = False
-    # Both currently supported runtime packages and quarantine cap total output
-    # at 16 MiB. Reject impossible new plans before approval/reservation.
-    max_output_bytes: Annotated[int, Field(strict=True, ge=1, le=16 * 1024 * 1024)]
+    # Outputs above 16 MiB use chunked large-artifact custody; the operator's
+    # ArtifactLimits (default 8 GiB) bound what a package may actually request.
+    max_output_bytes: Annotated[int, Field(strict=True, ge=1, le=ABSOLUTE_MAX_ARTIFACT_BYTES)]
+    # The scratch a local-cpu run asks for (ADR 0059): within the worker operator's ceiling
+    # it is granted, above it the run is refused before any container starts. Part of the
+    # approved plan; absent keeps the operator's default and every existing plan digest.
+    max_scratch_bytes: (
+        Annotated[int, Field(strict=True, ge=1024 * 1024, le=64 * 1024**3)] | None
+    ) = None
 
     @model_serializer(mode="wrap")
     def preserve_legacy_profile_shape(self, handler):
         value = handler(self)
+        if self.max_scratch_bytes is None:
+            value.pop("max_scratch_bytes", None)
         if self.sandbox is None:
             value.pop("sandbox", None)
+        if self.egress is None:
+            value.pop("egress", None)
         return value
 
     @model_validator(mode="after")
     def docker_is_explicit(self):
+        if self.max_scratch_bytes is not None and self.profile != "local-cpu":
+            raise ValueError("max_scratch_bytes is supported only for the local-cpu profile")
+        if self.egress is not None and self.profile not in {"local-cpu", "agent-sandbox"}:
+            raise ValueError(
+                "Egress is supported only for the local-cpu and agent-sandbox profiles (ADR 0034)"
+            )
         if (self.profile == "ordinary-docker") != (self.docker is not None):
             raise ValueError("Docker profile requires its explicit approved target/resource pins")
         if (self.profile == "agent-sandbox") != (self.sandbox is not None):
@@ -118,6 +137,18 @@ class ExecutionSpec(StrictRequest):
         return digests
 
 
+def within_operator_limit(spec: ExecutionSpec) -> ExecutionSpec:
+    """Refuse a NEW plan whose output bound exceeds the operator's artifact limit.
+
+    Only plan intake applies the operator limit. A stored, approved spec is validated against
+    the absolute ceiling alone, so lowering the limit later never makes a running lease's
+    uploads fail as an "invalid plan".
+    """
+    if spec.max_output_bytes > operator_limits().max_artifact_bytes:
+        raise ValueError("max_output_bytes exceeds the operator's artifact size limit")
+    return spec
+
+
 class ReviseTaskPlan(StrictRequest):
     expected_revision: StrictRevision
     title: NonBlank200
@@ -125,6 +156,11 @@ class ReviseTaskPlan(StrictRequest):
     budget_cents: StrictNonNegativeInt
     max_duration_seconds: StrictDuration
     execution_spec: ExecutionSpec
+
+    @field_validator("execution_spec")
+    @classmethod
+    def _within_operator_limit(cls, spec: ExecutionSpec) -> ExecutionSpec:
+        return within_operator_limit(spec)
 
 
 class ApproveTask(StrictRequest):
@@ -145,9 +181,18 @@ class ExternalAgentScope(StrictRequest):
                 "review:request",
                 "notebook:read",
                 "provenance:append",
+                "results:read",
+                "budget:read",
+                "campaign:submit",
+                "campaign:read",
+                "campaign:cancel",
+                "provider_trust:read",
+                "snapshot:read",
+                "artifact:read",
+                "campaign:logs",
             ]
         ],
-        Field(min_length=1, max_length=9),
+        Field(min_length=1, max_length=18),
     ]
     destination: NonBlank200
 

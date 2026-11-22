@@ -23,6 +23,7 @@ from .project_artifacts import (
     ProjectArtifactPlacement,
     ProjectArtifactStorageError,
 )
+from .snapshot_chunks import check_chunk_metadata
 from .store import (
     Conflict,
     Forbidden,
@@ -242,6 +243,47 @@ class ArtifactCustodyStore(Store):
         finally:
             connection.close()
 
+    @staticmethod
+    def large_artifact(
+        connection: sqlite3.Connection,
+        live: dict[str, Any],
+        manifest: sqlite3.Row,
+        artifact_id: str,
+    ) -> dict[str, Any] | None:
+        """A manifest member whose bytes are chunk-stored (see ``large_artifacts``), else None.
+
+        The caller has already checked the active custody release. This verifies the same
+        identity the small path does (project, quarantine status, manifest sha256 and size)
+        and the chunk set's metadata; the streaming consumer re-hashes the bytes it copies.
+        """
+        row = connection.execute(
+            """SELECT a.id,a.project_id,a.relative_path,a.sha256,a.size,a.status,a.classification,
+            length(a.content) AS content_length
+            FROM artifacts a JOIN projects project ON project.id=a.project_id
+            WHERE a.id=? AND a.project_id=? AND project.org_id=?""",
+            (artifact_id, manifest["project_id"], live["org_id"]),
+        ).fetchone()
+        if row is None or row["content_length"] != 0 or row["size"] <= 0:
+            return None
+        listed = next(
+            entry
+            for entry in json.loads(manifest["artifacts_json"])
+            if entry.get("id") == artifact_id
+        )
+        if (
+            row["status"] != "quarantined"
+            or row["classification"] != "unclassified"
+            or row["sha256"] != listed["sha256"]
+            or row["size"] != listed["size"]
+        ):
+            raise Conflict("Released large artifact no longer matches the manifest.")
+        check_chunk_metadata(
+            connection,
+            artifact_id,
+            [{"relative_path": row["relative_path"], "size": row["size"]}],
+        )
+        return dict(row)
+
     def _artifact_for_read(
         self,
         connection: sqlite3.Connection,
@@ -253,6 +295,10 @@ class ArtifactCustodyStore(Store):
         entries = json.loads(manifest["artifacts_json"])
         if not any(entry.get("id") == artifact_id for entry in entries):
             raise NotFound("Released artifact was not found in this manifest.")
+        if self.large_artifact(connection, live, manifest, artifact_id) is not None:
+            raise Conflict(
+                "A large artifact is not retrievable inline; compose it into an input snapshot."
+            )
         row = connection.execute(
             """SELECT a.id,a.project_id,a.relative_path,a.sha256,a.size,a.status,a.classification,
             r.state AS retention_state,p.tenant_namespace,p.project_namespace,p.object_key,

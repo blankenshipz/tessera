@@ -249,12 +249,17 @@ def _locked():
         os.close(fd)
 
 
-def candidate_inventory() -> dict:
+def candidate_inventory(manifest_path: str = "", expected_manifest_sha256: str = "") -> dict:
     """Published tree plus explicit existing active store fence/build-recipe overlays.
 
     Untracked migration/operator files and dirty pyproject are NOT image inputs.
     A future builder must materialize this inventory, not build the dirty checkout.
     """
+
+    if manifest_path or expected_manifest_sha256:
+        from .build_receipt import reviewed_inventory
+
+        return reviewed_inventory(manifest_path, expected_manifest_sha256)
 
     def git(*args):
         r = subprocess.run(["git", *args], cwd=target.REPOSITORY, capture_output=True, timeout=10)
@@ -293,7 +298,9 @@ def _candidate(image):
     if not re.fullmatch(IMAGE, image):
         raise target.AdmissionError("immutable local control image required")
     receipt = admission._receipt(ROOT / "candidates" / (image.rsplit(":", 1)[1] + ".json"))
-    inventory = candidate_inventory()
+    inventory = (
+        candidate_inventory(**receipt["source"]) if receipt.get("source") else candidate_inventory()
+    )
     if (
         receipt.get("image") != image
         or receipt.get("inventory_sha256") != inventory["inventory_sha256"]
@@ -369,11 +376,7 @@ def _deployment():
 
 
 def _snapshot():
-    base = admission._receipt(activation.INTENT)
-    if (ROOT / "current.json").exists():
-        raise target.AdmissionError(
-            "one upgrade already admitted; separate next-generation admission required"
-        )
+    base, _ = _admission_tip(admission._receipt(activation.INTENT))
     pod = activation.ready_pod()
     deploy = _deployment()
     spec = deploy["spec"]
@@ -395,6 +398,9 @@ def plan(operation: str, image: str) -> dict:
     base, pod, deploy = _snapshot()
     candidate, inventory = _candidate(image)
     backend = _backend(pod)
+    parent = _admission_tip(admission._receipt(activation.INTENT))[1]
+    if parent and backend != _saved(parent["operation"])["backend"]:
+        raise target.AdmissionError("upgrade parent backend identity changed")
     if (
         backend["recovery_state"] != "active"
         or backend.get("application_http") != 200
@@ -415,6 +421,7 @@ def plan(operation: str, image: str) -> dict:
         raise target.AdmissionError("new and retained rollback image references required")
     value = {
         "operation": operation,
+        "parent": parent,
         "fingerprint_version": HEAD_VERSION,
         **{k: base[k] for k in IDENTITY},
         "old_image": base["image"],
@@ -430,7 +437,8 @@ def plan(operation: str, image: str) -> dict:
 
 def prepare(operation: str, image: str, expected_plan_sha256: str) -> dict:
     with _locked():
-        if (ROOT / "apply-claim.json").exists():
+        parent = _admission_tip(admission._receipt(activation.INTENT))[1]
+        if _claim_path({"parent": parent}).exists():
             raise target.AdmissionError("prior apply intent; reconcile only")
         current = plan(operation, image)
         if current["plan_sha256"] != expected_plan_sha256:
@@ -444,7 +452,7 @@ def prepare(operation: str, image: str, expected_plan_sha256: str) -> dict:
                 "prior upgrade preparation retained; no overwrite"
             ) from None
         activation._write_once(directory / "plan.json", current)
-        inventory = candidate_inventory()
+        _, inventory = _candidate(image)
         activation._write_once(directory / "inventory.json", inventory)
         started = _now()
         before = _control_head(current["pod"])
@@ -489,7 +497,7 @@ def apply(operation: str, expected_plan_sha256: str) -> dict:
     with _locked():
         directory = _operation(operation)
         saved = _saved(operation)
-        if (ROOT / "apply-claim.json").exists():
+        if _claim_path(saved).exists():
             raise target.AdmissionError("prior apply intent; reconcile only")
         if (
             saved["plan_sha256"] != expected_plan_sha256
@@ -507,7 +515,7 @@ def apply(operation: str, expected_plan_sha256: str) -> dict:
             raise target.AdmissionError("fresh upgrade backup binding changed")
         _backup_admission(directory, saved, backup)
         activation._write_once(
-            ROOT / "apply-claim.json", {"operation": operation, "plan_sha256": expected_plan_sha256}
+            _claim_path(saved), {"operation": operation, "plan_sha256": expected_plan_sha256}
         )
         patch = [
             {"op": "test", "path": path, "value": value}
@@ -539,36 +547,79 @@ def apply(operation: str, expected_plan_sha256: str) -> dict:
         return {"state": "image_patch_submitted_readiness_unproven", "operation": operation}
 
 
-def admitted_activation(base):
+def _claim_path(saved):
+    parent = saved.get("parent")
+    return (
+        _operation(parent["operation"]) / "successor-claim.json"
+        if parent
+        else ROOT / "apply-claim.json"
+    )
+
+
+def _admission_tip(base):
+    """Follow create-only publications; never replace the legacy anchor/history."""
     pointer = ROOT / "current.json"
-    if not pointer.exists():
-        return base
-    publication = admission._receipt(pointer)
-    operation = publication["operation"]
-    saved = _saved(operation)
-    ready_name = publication.get("ready_receipt", "")
-    if not re.fullmatch(r"ready-[a-f0-9]{64}\.json", ready_name):
-        raise target.AdmissionError("upgrade readiness reference invalid")
-    ready = admission._receipt(_operation(operation) / ready_name)
-    claim = admission._receipt(ROOT / "apply-claim.json")
-    if (
-        any(saved[k] != base[k] for k in IDENTITY)
-        or saved["old_image"] != base["image"]
-        or ready.get("plan_sha256") != saved["plan_sha256"]
-        or ready_name != "ready-" + _digest(ready) + ".json"
-        or claim != {"operation": operation, "plan_sha256": saved["plan_sha256"]}
-    ):
-        raise target.AdmissionError("upgrade admission chain changed")
-    return base | {"image": saved["new_image"]}
+    parent = None
+    seen = set()
+    previous_backend = None
+    while pointer.exists():
+        publication = admission._receipt(pointer)
+        operation = publication["operation"]
+        if operation in seen:
+            raise target.AdmissionError("upgrade admission cycle")
+        seen.add(operation)
+        saved = _saved(operation)
+        ready_name = publication.get("ready_receipt", "")
+        if not re.fullmatch(r"ready-[a-f0-9]{64}\.json", ready_name):
+            raise target.AdmissionError("upgrade readiness reference invalid")
+        ready = admission._receipt(_operation(operation) / ready_name)
+        claim = admission._receipt(_claim_path(saved))
+        if (
+            saved.get("parent") != parent
+            or any(saved[k] != base[k] for k in IDENTITY)
+            or saved["old_image"] != base["image"]
+            or (previous_backend is not None and saved["backend"] != previous_backend)
+            or ready.get("plan_sha256") != saved["plan_sha256"]
+            or ready_name != "ready-" + _digest(ready) + ".json"
+            or claim != {"operation": operation, "plan_sha256": saved["plan_sha256"]}
+        ):
+            raise target.AdmissionError("upgrade admission chain changed")
+        base = base | {"image": saved["new_image"]}
+        previous_backend = saved["backend"]
+        parent = publication
+        pointer = _operation(operation) / "successor.json"
+    return base, parent
+
+
+def admitted_activation(base):
+    return _admission_tip(base)[0]
 
 
 def reconcile(operation: str) -> dict:
     with _locked():
         saved = _saved(operation)
-        claim = admission._receipt(ROOT / "apply-claim.json")
+        claim = admission._receipt(_claim_path(saved))
         if claim != {"operation": operation, "plan_sha256": saved["plan_sha256"]}:
             raise target.AdmissionError("upgrade claim mismatch")
         base = admission._receipt(activation.INTENT)
+        parent = saved.get("parent")
+        if parent:
+            # Validate the entire retained chain, including the exact parent proof.
+            _, tip = _admission_tip(base)
+            if tip != parent and (not tip or tip["operation"] != operation):
+                raise target.AdmissionError("upgrade parent is not the admitted generation")
+            parent_plan = _saved(parent["operation"])
+            parent_ready = parent.get("ready_receipt", "")
+            if not re.fullmatch(r"ready-[a-f0-9]{64}\.json", parent_ready):
+                raise target.AdmissionError("upgrade parent proof invalid")
+            proof = admission._receipt(_operation(parent["operation"]) / parent_ready)
+            if (
+                parent_ready != "ready-" + _digest(proof) + ".json"
+                or proof.get("plan_sha256") != parent_plan["plan_sha256"]
+                or saved["backend"] != parent_plan["backend"]
+            ):
+                raise target.AdmissionError("upgrade parent proof changed")
+            base = base | {"image": parent_plan["new_image"]}
         if any(saved[k] != base[k] for k in IDENTITY) or saved["old_image"] != base["image"]:
             raise target.AdmissionError("upgrade original authority identity changed")
         pod = activation._ready_pod_for(base | {"image": saved["new_image"]})
@@ -588,11 +639,13 @@ def reconcile(operation: str) -> dict:
                 raise target.AdmissionError("upgrade readiness receipt changed")
         else:
             activation._write_once(receipt, value)
-        pointer = ROOT / "current.json"
+        pointer = (
+            _operation(parent["operation"]) / "successor.json" if parent else ROOT / "current.json"
+        )
         if pointer.exists():
             if admission._receipt(pointer).get("operation") != operation:
                 raise target.AdmissionError("another upgrade generation admitted")
-            admitted_activation(base)  # Validate retained publication; it is historical proof.
+            admitted_activation(admission._receipt(activation.INTENT))
         else:
             activation._write_once(pointer, {"operation": operation, "ready_receipt": receipt.name})
         return {

@@ -12,7 +12,7 @@ real writer identity and an independently human-issued output disclosure. Absent
 stay off the wire; legacy worker references/digests/replay remain unchanged. The older
 manifest-specific generated-output guidance below applies only to worker-manifest
 output, not human-admitted public planner/critic research output. Actual V2 source
-capture/consumer binding remains outside this lane and unverified.
+capture/consumer binding remains outside this interface and unverified.
 
 ## Revision 3: public harness metadata contract (source-only acceptance)
 
@@ -57,7 +57,7 @@ through an attested watermark is not a complete raw transcript, scientific proof
 or evidence about uninstrumented/off-platform work. Optional absent harness fields
 must stay off the wire to preserve pre-revision-3 request digests and acknowledgements.
 
-Future runtime/A2A consumer contract (implementation outside this lane):
+Future runtime/A2A consumer contract (implementation outside this interface):
 
 1. A separately authenticated human creates the ordinary agent context whose
    `body` is `PublicHarnessDisclosure` JSON. No new enrollment action is required;

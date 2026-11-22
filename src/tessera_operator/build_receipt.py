@@ -14,7 +14,7 @@ from pathlib import Path
 
 from mcp.types import ToolAnnotations
 
-from . import upgrade
+from . import local_paths, upgrade
 from . import upgrade_support as activation
 from . import upgrade_support as admission
 from . import upgrade_support as target
@@ -27,9 +27,9 @@ def _execution_env():
     # credential values. Do not inherit client endpoint, builder, source-policy,
     # proxy/build-argument, Git, Python or loader overrides from the caller.
     return {
-        "HOME": "/Users/zach",
-        "DOCKER_CONFIG": "/Users/zach/.docker",
-        "BUILDX_CONFIG": "/Users/zach/.docker/buildx",
+        "HOME": str(local_paths.HOME),
+        "DOCKER_CONFIG": str(local_paths.DOCKER_CONFIG),
+        "BUILDX_CONFIG": str(local_paths.DOCKER_CONFIG / "buildx"),
         "DOCKER_CONTEXT": "desktop-linux",
         "DOCKER_BUILDKIT": "1",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -191,7 +191,7 @@ def _runtime():
     endpoint = _query(
         "context", "inspect", "desktop-linux", "--format", "{{json .Endpoints.docker.Host}}"
     )
-    if endpoint != '"unix:///Users/zach/.docker/run/docker.sock"':
+    if endpoint != f'"unix://{local_paths.DOCKER_DESKTOP_SOCKET}"':
         raise target.AdmissionError("Docker Desktop endpoint changed")
     return {
         "kubernetes": target._kubeconfig_identity(),
@@ -201,26 +201,118 @@ def _runtime():
         "execution_policy": "desktop-sanitized-v1",
         **{key: base[key] for key in upgrade.IDENTITY},
         "old_image": base["image"],
+        "parent": upgrade._admission_tip(admission._receipt(activation.INTENT))[1],
         "schema": backend["schema"],
         "incarnation": backend["incarnation"],
         "store_sha256": backend["store_sha256"],
     }
 
 
-def plan() -> dict:
-    inventory = upgrade.candidate_inventory()
-    published = subprocess.run(
-        ["git", "-C", str(target.REPOSITORY), "rev-parse", "refs/remotes/origin/main"],
-        capture_output=True,
-        env=_execution_env(),
-        timeout=10,
+def reviewed_inventory(manifest_path, expected_manifest_sha256):
+    """Explicit review digest binds all source bytes, provenance and build recipes."""
+    manifest = Path(manifest_path)
+    if (
+        not manifest.is_absolute()
+        or manifest.resolve() != manifest
+        or not re.fullmatch(r"[a-f0-9]{64}", expected_manifest_sha256)
+    ):
+        raise target.AdmissionError("reviewed manifest reference required")
+    raw = manifest.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_manifest_sha256:
+        raise target.AdmissionError("reviewed manifest changed")
+    value = json.loads(raw)
+    if (
+        set(value)
+        != {
+            "version",
+            "source_root",
+            "git_commit",
+            "baseline_files",
+            "baseline_inventory_sha256",
+            "candidate_files",
+            "overlays",
+        }
+        or value["version"] != 1
+    ):
+        raise target.AdmissionError("unsupported reviewed manifest")
+    root = Path(value["source_root"])
+    files, baseline, overlays = value["candidate_files"], value["baseline_files"], value["overlays"]
+    if (
+        not root.is_absolute()
+        or root.resolve() != root
+        or not root.is_dir()
+        or not re.fullmatch(r"[a-f0-9]{40}", value["git_commit"])
+        or upgrade._digest(baseline) != value["baseline_inventory_sha256"]
+        or files != baseline | overlays
+    ):
+        raise target.AdmissionError("reviewed baseline or overlay provenance invalid")
+    for name, digest in files.items():
+        path = Path(name)
+        if (
+            not name
+            or path.is_absolute()
+            or path.as_posix() != name
+            or any(p in {"..", ".", ".git", ".tessera", "__pycache__", ".venv"} for p in path.parts)
+            or path.name.startswith(".env")
+            or path.suffix.lower() in {".key", ".pem", ".sqlite3", ".pyc"}
+            or not re.fullmatch(r"[a-f0-9]{64}", digest)
+        ):
+            raise target.AdmissionError("unsafe reviewed source entry")
+    required = {
+        "src/tessera_control/store.py",
+        "deploy/kubernetes/local-persistent.Dockerfile",
+        "deploy/kubernetes/local-persistent.Dockerfile.dockerignore",
+    }
+    if not required <= overlays.keys() or _file_inventory(root) != files:
+        raise target.AdmissionError("reviewed source files or build recipe changed")
+    for name in files:
+        data = (root / name).read_bytes()
+        if any(
+            line.startswith(
+                (b"-----BEGIN PRIVATE KEY-----", b"-----BEGIN OPENSSH PRIVATE KEY-----")
+            )
+            for line in data.splitlines()
+        ):
+            raise target.AdmissionError("private key material forbidden in reviewed source")
+    return {
+        "git_commit": value["git_commit"],
+        "overlays": overlays,
+        "candidate_files": files,
+        "source_root": str(root),
+        "source": {
+            "manifest_path": str(manifest),
+            "expected_manifest_sha256": expected_manifest_sha256,
+        },
+        "inventory_sha256": upgrade._digest(value),
+    }
+
+
+def _source(manifest_path, expected_manifest_sha256):
+    return (
+        {"manifest_path": manifest_path, "expected_manifest_sha256": expected_manifest_sha256}
+        if manifest_path or expected_manifest_sha256
+        else {}
     )
-    if published.returncode or published.stdout.decode().strip() != inventory["git_commit"]:
-        raise target.AdmissionError("candidate must match locally recorded published main")
+
+
+def plan(manifest_path: str = "", expected_manifest_sha256: str = "") -> dict:
+    source = _source(manifest_path, expected_manifest_sha256)
+    inventory = upgrade.candidate_inventory(**source) if source else upgrade.candidate_inventory()
+    if not source:
+        published = subprocess.run(
+            ["git", "-C", str(target.REPOSITORY), "rev-parse", "refs/remotes/origin/main"],
+            capture_output=True,
+            env=_execution_env(),
+            timeout=10,
+        )
+        if published.returncode or published.stdout.decode().strip() != inventory["git_commit"]:
+            raise target.AdmissionError("candidate must match locally recorded published main")
     runtime = _runtime()
     if runtime["store_sha256"] != inventory["overlays"]["src/tessera_control/store.py"]:
         raise target.AdmissionError("build fence overlay differs from active store")
     value = {"inventory_sha256": inventory["inventory_sha256"], "runtime": runtime}
+    if source:
+        value["source"] = source
     return value | {"build_plan_sha256": upgrade._digest(value)}
 
 
@@ -462,6 +554,24 @@ def _verify_node_identity(directory, label, root_digest, identity):
 def _freeze(directory, inventory):
     context = directory / "context"
     context.mkdir(mode=0o700)
+    if inventory.get("source"):
+        if reviewed_inventory(**inventory["source"]) != inventory:
+            raise target.AdmissionError("reviewed source changed before freeze")
+        root = Path(inventory["source_root"])
+        for name in inventory["candidate_files"]:
+            destination = context / name
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with destination.open("xb") as stream:
+                stream.write((root / name).read_bytes())
+            destination.chmod(0o444)
+        if _file_inventory(context) != inventory["candidate_files"]:
+            raise target.AdmissionError("reviewed source changed during freeze")
+        activation._write_once(directory / "frozen-inventory.json", inventory)
+        for path in sorted(context.rglob("*"), reverse=True):
+            if path.is_dir():
+                path.chmod(0o555)
+        context.chmod(0o555)
+        return context, upgrade._digest(inventory["candidate_files"])
     archive = directory / "source.tar"
     _run(
         directory,
@@ -531,13 +641,20 @@ def _freeze(directory, inventory):
 
 
 def _unchanged(directory, context, digest, expected):
-    if upgrade._digest(_file_inventory(context)) != digest or plan() != expected:
+    current = plan(**expected["source"]) if expected.get("source") else plan()
+    if upgrade._digest(_file_inventory(context)) != digest or current != expected:
         raise target.AdmissionError("frozen inputs or target changed; do not import/deploy")
 
 
-def build(operation: str, expected_build_plan_sha256: str) -> dict:
+def build(
+    operation: str,
+    expected_build_plan_sha256: str,
+    manifest_path: str = "",
+    expected_manifest_sha256: str = "",
+) -> dict:
     with upgrade._locked():
-        current = plan()
+        source = _source(manifest_path, expected_manifest_sha256)
+        current = plan(**source) if source else plan()
         if current["build_plan_sha256"] != expected_build_plan_sha256:
             raise target.AdmissionError("build plan stale")
         _capacity()  # Before context/archive/build growth on either volume.
@@ -551,7 +668,9 @@ def build(operation: str, expected_build_plan_sha256: str) -> dict:
         directory.mkdir(mode=0o700)
         activation._write_once(directory / "intent.json", current)
         try:
-            inventory = upgrade.candidate_inventory()
+            inventory = (
+                upgrade.candidate_inventory(**source) if source else upgrade.candidate_inventory()
+            )
             if inventory["inventory_sha256"] != current["inventory_sha256"]:
                 raise target.AdmissionError("source changed before freeze")
             context, context_digest = _freeze(directory, inventory)
@@ -716,6 +835,8 @@ print(json.dumps({'store_sha256':hashlib.sha256(pathlib.Path(s.__file__).read_by
                 "image_identity": identity,
                 "producer": "frozen-build-v1",
             }
+            if source:
+                receipt["source"] = source
             activation._write_once(directory / "verified.json", receipt)
             candidates = upgrade.ROOT / "candidates"
             candidates.mkdir(mode=0o700, exist_ok=True)

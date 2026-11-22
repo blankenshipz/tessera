@@ -3,7 +3,17 @@
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_serializer,
+    model_validator,
+)
+
+from .salad_billing import BillingDeclaration, BillingPolicy
 
 Identifier = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_-]{1,128}$")]
 MetadataId = Annotated[str, StringConstraints(pattern=r"^admin_[a-f0-9]{32}$")]
@@ -17,6 +27,15 @@ class Closed(BaseModel):
 
 
 class Configuration(Closed):
+    billing_policy: BillingPolicy | None = None
+
+    @model_serializer(mode="wrap")
+    def legacy_billing_shape(self, handler):
+        data = handler(self)
+        if self.billing_policy is None:
+            data.pop("billing_policy", None)
+        return data
+
     kind: Literal["configuration"] = "configuration"
     component: Literal[
         "control_plane", "execution_target", "artifact_store", "monitor", "model_gateway"
@@ -48,7 +67,9 @@ class Configuration(Closed):
         "networkless"
     )
     custody_policy: Literal["quarantine_only"] = "quarantine_only"
-    data_policy: Literal["public_released_only"] = "public_released_only"
+    data_policy: Literal["public_released_only", "provider_trust_policy_v1"] = (
+        "public_released_only"
+    )
     max_seconds: Annotated[int, Field(strict=True, ge=1, le=86400)] = 60
     max_cpu: Annotated[int, Field(strict=True, ge=1, le=64)] = 1
     max_gpu: Annotated[int, Field(strict=True, ge=0, le=8)] = 0
@@ -57,6 +78,8 @@ class Configuration(Closed):
 
     @model_validator(mode="after")
     def bindings(self):
+        if self.billing_policy is not None and self.provider != "salad":
+            raise ValueError("Billing policy requires Salad.")
         providers = {
             "control_plane": {"none", "kubernetes"},
             "execution_target": {"kubernetes", "local_fixture", "salad"},
@@ -213,7 +236,10 @@ class SaladSetupView(Closed):
     provider_validation: Literal["not_performed_by_control"] = "not_performed_by_control"
     deployment: Literal["unverified"] = "unverified"
     guardian_custody: Literal["unverified"] = "unverified"
-    billing: Literal["no_cash_hard_cap_unverified"] = "no_cash_hard_cap_unverified"
+    billing: Literal[
+        "no_cash_hard_cap_unverified", "aggregate_cap_unverified", "aggregate_cap_expired"
+    ] = "no_cash_hard_cap_unverified"
+    billing_declaration: BillingDeclaration | None = None
     control_integration: Literal["metadata_only_connected"] = "metadata_only_connected"
     execution_enabled: Literal[False] = False
 

@@ -1,0 +1,16 @@
+# Oneshot health probe, instance = service name (development-poll or salad-executor).
+# It only reports: a failed run is visible in `systemctl --failed`. It never
+# restarts anything, because a long step legitimately delays the health file.
+[Unit]
+Description=Tessera health probe for %i
+
+[Service]
+Type=oneshot
+User=tessera
+Group=tessera
+ExecStart=/opt/tessera/.venv/bin/python /opt/tessera/deploy/systemd/tessera-health-check /var/lib/tessera/health/%i.json 3600
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=

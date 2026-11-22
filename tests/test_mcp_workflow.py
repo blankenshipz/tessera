@@ -257,8 +257,10 @@ def test_tool_schema_and_denial_redaction(tmp_path):
         )
     )
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert len(tools) == 18
-    assert not any("approve" in name or "issue" in name or "promote" in name for name in tools)
+    assert len(tools) == 22
+    assert not any(
+        word in name for word in ("approve", "issue", "promote", "decline") for name in tools
+    )
     command = tools["tessera_consume_grant"].inputSchema["$defs"]["Consume"]["properties"][
         "command"
     ]
@@ -268,3 +270,31 @@ def test_tool_schema_and_denial_redaction(tmp_path):
         asyncio.run(server.call_tool("tessera_authority_status", {"grant_id": "grant"}))
     assert "protected-marker" not in str(error.value)
     assert len(calls) == 1
+
+
+def test_research_reads_use_distinct_family_and_readonly_annotations(tmp_path):
+    token = tmp_path / "agent"
+    token.write_text("synthetic-agent-only")
+    token.chmod(0o600)
+    calls = []
+
+    def receive(request):
+        calls.append(request)
+        return httpx.Response(200, json={"proposals": []})
+
+    config = Config("http://127.0.0.1:1234", token, "project", "test:destination")
+    for _ in range(2):
+        server = create_server(ControlClient(config, httpx.MockTransport(receive)))
+        tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+        for name, args in [
+            ("tessera_list_research_proposals", {"offset": 1, "limit": 2}),
+            ("tessera_read_research_proposal", {"proposal_id": "agent_research_1"}),
+        ]:
+            assert tools[name].annotations.readOnlyHint is True
+            asyncio.run(server.call_tool(name, args))
+    assert [r.url.path for r in calls] == [
+        "/projects/project/agent-workflow-proposals",
+        "/agent-research-proposals/agent_research_1",
+    ] * 2
+    assert str(calls[0].url.query, "ascii") == "offset=1&limit=2"
+    assert all(r.method == "GET" for r in calls)

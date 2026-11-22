@@ -20,6 +20,7 @@ the organizing workflow, not a promise of one-click execution.
 | Artifacts | Bounded intake, retained project objects, quarantine, explicit retrieval release and exact-byte access | Release does not classify data, approve publication or accept science; retention is not automatic deletion |
 | Recovery | Consistent SQLite/object backups and verified restore to permanently held history | Restore does not fence the original writer/jobs and cannot promote a copy to active failover |
 | Agents | Scoped identities, authority requests/grants, MCP stdio, A2A reference exchange, provenance and runtime binding checks | A catalog entry, peer response or signed binding is not proof of integrated planner/critic reasoning |
+| Campaigns | Digest-pinned campaign specs, one human approval, platform runner for staged DAGs across providers (local Docker, self-hosted, opt-in Salad, plugin providers) with budget holds, standing and follow-on approvals, gates, program budget, MCP client reads, retries, data classes, cancel, restart and operational receipts ([campaigns](campaigns.md)) | Salad GPU stages are refused unless the operator supplies Salad profiles; a receipt is operational evidence, not a scientific verdict |
 | Agent Sandbox | Opt-in direct adapter targeting upstream v1.0.6 one-shot network-none Sandboxes | Component-tested; live controller/CRD/isolation acceptance, warm pools and reasoning/input credential delivery are not established |
 
 Read these components by the work you need to do:

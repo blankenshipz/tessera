@@ -14,6 +14,7 @@ from test_agent_authority import (  # noqa: F401
 )
 
 from tessera_control.api import create_app
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.store import initialize_state, migrate_state
 
 
@@ -142,7 +143,7 @@ def test_collector_schema51_readiness_and_existing50_explicit_migration(tmp_path
         db.execute("UPDATE schema_meta SET schema_version=50")
     old = TestClient(create_app(state))
     assert old.get("/health/ready").status_code == 503
-    assert migrate_state(state) == 56
+    assert migrate_state(state) == LATEST_SCHEMA_VERSION
     with sqlite3.connect(state / "tessera.sqlite3") as db:
         assert_empty_runtime_v55(db)
     assert TestClient(create_app(state)).get("/health/ready").status_code == 200

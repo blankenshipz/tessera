@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ControlConnection, normalizeEndpoint } from '../connection.mjs';
+import { ControlConnection, OWNER_AUTOMATION_LABEL, normalizeEndpoint } from '../connection.mjs';
 
 const tokenA = 'a'.repeat(43);
 const tokenB = 'b'.repeat(43);
@@ -615,4 +615,23 @@ test('recovery status is an authenticated read on the selected control connectio
   assert.equal(calls[1].options.method, 'GET');
   assert.equal(calls[1].options.body, undefined);
   assert.equal(calls[1].options.headers.Authorization, `Bearer ${tokenA}`);
+});
+
+test('owner-connected decisions carry the automation label; other identities never do', async () => {
+  for (const [kind, labelled] of [['local_owner', true], ['human_session', false], [undefined, false]]) {
+    const seen = [];
+    const connection = new ControlConnection(async (url, init) => {
+      seen.push({ url, method: init.method, label: init.headers['X-Tessera-Automation'] });
+      return url.endsWith('/me')
+        ? json({ principal_id: 'human', org_id: 'org', role: 'human', kind })
+        : json({ id: 'task' });
+    });
+    await connection.connect(config());
+    await connection.approve('task_1', { expected_revision: 1 }, 'key-1');
+    await connection.projects();
+    const post = seen.find(call => call.method === 'POST');
+    const get = seen.find(call => call.method === 'GET' && !call.url.endsWith('/me'));
+    assert.equal(post.label, labelled ? OWNER_AUTOMATION_LABEL : undefined);
+    assert.equal(get.label, undefined);
+  }
 });

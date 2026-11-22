@@ -18,14 +18,24 @@ from typing import Annotated, Literal
 import certifi
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
 
+from tessera_control.salad_billing import BillingPolicy, billing_projection
 from tessera_control.salad_secret_files import PrivateFileSecretResolver
 
 Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$")]
 
 
 class SaladConfiguration(BaseModel):
+    billing_policy: BillingPolicy | None = None
+
+    @model_serializer(mode="wrap")
+    def legacy_billing_shape(self, handler):
+        data = handler(self)
+        if self.billing_policy is None:
+            data.pop("billing_policy", None)
+        return data
+
     model_config = ConfigDict(extra="forbid", strict=True)
 
     schema_version: Literal[1] = 1
@@ -240,7 +250,8 @@ class ScopeReference(BaseModel):
     candidate_project: Name | None = None
 
 
-def create_server(store, credential_directory):
+def create_server(store, credential_directory, organization=None):
+    """`organization` scopes discovery; it defaults to the stored configuration's."""
     server = FastMCP("Tessera Salad human operator", log_level="CRITICAL")
     read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 
@@ -279,14 +290,24 @@ def create_server(store, credential_directory):
         management_host: str | None = None,
         proposed_project: str = "tessera-research",
         expected_revision: str | None = None,
+        billing_policy: BillingPolicy | None = None,
     ) -> dict:
         """Persist operator metadata with compare-and-swap; no enrollment/deploy/provider effects.
 
         Pass only an existing opaque credential-ref, NEVER a credential value.
         management_host is selected deployment metadata, not an SSH or network target.
         """
-        return guarded(
-            lambda: store.configure(
+
+        def configure():
+            previous = store.read()
+            policy = (
+                billing_policy
+                if billing_policy is not None
+                else previous.billing_policy
+                if previous
+                else None
+            )
+            return store.configure(
                 SaladConfiguration(
                     organization=organization,
                     project=project,
@@ -294,10 +315,12 @@ def create_server(store, credential_directory):
                     management_host=management_host,
                     credential_reference=credential_reference,
                     credential_version=credential_version,
+                    billing_policy=policy,
                 ),
                 expected_revision,
             )
-        )
+
+        return guarded(configure)
 
     @server.tool(
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
@@ -319,7 +342,7 @@ def create_server(store, credential_directory):
                 "execution_enabled": False,
                 "account": "unrun",
                 "project": "requires_portal" if config and config.project is None else "unverified",
-                "billing": "no_cash_hard_cap_unverified",
+                **billing_projection(config.billing_policy if config else None),
                 "control_integration": "not_connected",
                 "next_action": _portal_action(config),
             }
@@ -361,9 +384,9 @@ def create_server(store, credential_directory):
     def salad_discover_projects(
         credential_reference: str, credential_version: int, candidate_project: str | None = None
     ) -> dict:
-        """Validate luxai scope; the public API CANNOT enumerate projects.
+        """Validate the configured organization scope; the public API CANNOT enumerate projects.
 
-        No candidate: one GET of luxai quotas. Candidate: one GET of its container
+        No candidate: one GET of the organization quotas. Candidate: one GET of its container
         collection. No raw quota/container data is returned. No key values accepted.
         """
 
@@ -373,8 +396,13 @@ def create_server(store, credential_directory):
                 credential_version=credential_version,
                 candidate_project=candidate_project,
             )
+            config_now = store.read()
+            org = organization or (config_now.organization if config_now else None)
+            if org is None:
+                raise ValueError("organization not configured")
+            TypeAdapter(Name).validate_python(org)
             result = {
-                "organization": "luxai",
+                "organization": org,
                 "project_discovery": "unsupported_by_public_api",
                 "candidate_project": reference.candidate_project,
                 "provider": "credential_unavailable",
@@ -393,14 +421,12 @@ def create_server(store, credential_directory):
                     reference.credential_reference, reference.credential_version
                 ) as secret:
                     if reference.candidate_project is None:
-                        reason, _ = _provider_get("/api/public/organizations/luxai/quotas", secret)
+                        reason, _ = _provider_get(f"/api/public/organizations/{org}/quotas", secret)
                         result["provider"] = (
                             "organization_readable" if reason == "readable" else reason
                         )
                     else:
-                        config = ProjectRead(
-                            organization="luxai", project=reference.candidate_project
-                        )
+                        config = ProjectRead(organization=org, project=reference.candidate_project)
                         result["provider"] = provider_project(config, secret)
             finally:
                 resolver.close()
@@ -415,6 +441,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Separate human-only Salad operator stdio MCP")
     parser.add_argument("--state-directory")
     parser.add_argument("--credential-directory")
+    parser.add_argument("--organization")
     parser.add_argument("--control-url")
     parser.add_argument("--control-project-id")
     parser.add_argument("--control-record-id")
@@ -423,6 +450,8 @@ def main(argv=None):
     logging.disable(logging.CRITICAL)
     store = None
     try:
+        if args.organization is not None:
+            TypeAdapter(Name).validate_python(args.organization)
         control_options = (
             args.control_url,
             args.control_project_id,
@@ -446,7 +475,7 @@ def main(argv=None):
         if not args.state_directory or not args.credential_directory:
             return 2
         store = ConfigurationStore(args.state_directory)
-        create_server(store, args.credential_directory).run(transport="stdio")
+        create_server(store, args.credential_directory, args.organization).run(transport="stdio")
     except Exception:
         return 2
     finally:

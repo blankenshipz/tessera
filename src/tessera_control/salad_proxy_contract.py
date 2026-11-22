@@ -95,6 +95,11 @@ class ProxyResult(Frozen):
         "reallocation_uncertain",
         "accepted_pending",
         "observed",
+        # A create answered with a clean ProblemDetails 400/422 (status stays
+        # "unknown"); the observation carries only a bounded provider_rejection.
+        "provider_rejected_request",
+        # A create that provably never left the process (status 0 in its rejection).
+        "request_not_sent",
     ]
     observation: dict | None = None
 

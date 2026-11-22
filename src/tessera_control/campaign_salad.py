@@ -1,0 +1,1748 @@
+"""Salad GPU stage driver for the campaign runner (ADR 0038 amendment).
+
+The runner keeps every generic phase (prepare, compose, reserve, release, grant, admit,
+collect, resolve, lineage). For a ``salad-gpu-v1`` stage this driver adds what is
+specific: a stage-level study scaffold, the per-attempt reviews, capability and route
+steps, verification of the executor's recorded outcome, and the unwind of an attempt that
+claimed no provider effect. It never calls a provider, never resolves a human decision,
+never records a charge and never settles without a charge or an unclaimed proof; the
+operator-run executor (``campaign_salad_executor``) owns every provider-facing effect.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import sqlite3
+from datetime import timedelta
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any
+
+from . import campaign_preapproval, provider_trust
+from . import execution_frames as frames
+from .campaign_models import SALAD_TARGET, TERMINAL_CAMPAIGN, SaladStageSpec, StageSpec
+from .campaign_settlement import apply_late_charge, confirm_settlement
+from .campaign_steps import StepFailed
+from .campaign_store import _GuardianFinal
+from .external_operations import current_operation_reconciliation
+from .programs import program_context
+from .remote_execution_models import ExecutionSelection, TargetPolicy
+from .salad_campaign_profiles import (
+    DATA_POLICY_PUBLIC,
+    DATA_POLICY_TRUST,
+    SaladCampaignProfile,
+    capability_declaration,
+    derive_selection,
+    derived_digests,
+    stage_data_policy,
+    target_policy,
+)
+from .store import _parse_utc, canonical_digest
+
+if TYPE_CHECKING:
+    from .campaign_runner import CampaignRunner, _Ctx
+
+# Attempt phases in which provider exposure may exist or is unresolved: a new reservation
+# with a positive hold waits while any attempt of the campaign is in one of them.
+EXPOSURE_PHASES = (
+    "leased",
+    "awaiting_review",
+    "reviewed",
+    "capability_ready",
+    "route_proposed",
+    "route_started",
+    "executing",
+    "outcome_recorded",
+    "awaiting_charge",
+    "unknown",
+)
+PRE_ROUTE_PHASES = ("leased", "awaiting_review", "reviewed", "capability_ready", "route_proposed")
+DECISION_HOURS = 23
+CAPABILITY_HOURS = 23
+SILENT_EXECUTOR_GRACE_SECONDS = 600
+PARTITION = "operational"
+CONDITION = "operational_run"
+REVIEW_REASON = (
+    "remote_execution._reviews requires current human program and source-use reviews "
+    "bound to this admitted attempt (ADR 0032, not delegated)"
+)
+
+
+def salad_config(spec_stage: Any) -> SaladStageSpec:
+    """The stage's Salad fields: ``.salad`` (spec v1) or ``provider_config`` (normal form)."""
+    found = getattr(spec_stage, "salad", None)
+    if found is None:
+        found = getattr(spec_stage, "provider_config", None)
+    if isinstance(found, SaladStageSpec):
+        return found
+    if not found:
+        raise StepFailed("salad", "step_refused", "salad_config_missing")
+    return SaladStageSpec.model_validate(found)
+
+
+def _waiting() -> type[Exception]:
+    from .campaign_runner import _Waiting
+
+    return _Waiting
+
+
+def _resolve_build(decision_id: str, revision: int, kind: str, digest: str, pre_id: str):
+    def build() -> tuple[dict[str, str], dict[str, Any]]:
+        return (
+            {"decision_id": decision_id, "preapproval_id": pre_id},
+            {
+                "decision_id": decision_id,
+                "expected_revision": revision,
+                "decision": "approve",
+                "rationale": (
+                    f"Delegated under review pre-approval {pre_id} (exact {kind} digest {digest})"
+                ),
+            },
+        )
+
+    return build
+
+
+class SaladStageDriver:
+    def __init__(self, runner: CampaignRunner, profiles: Any = None) -> None:
+        # ``runner`` is the ``RunnerServices`` object the provider was handed; the driver
+        # also uses the runner's step/attempt helpers (ADR 0040 §2).
+        self.runner = runner
+        self._profiles = profiles
+
+    # -- small helpers --------------------------------------------------------------
+
+    def profile(self, spec_stage: StageSpec) -> SaladCampaignProfile:
+        profiles = (
+            self._profiles
+            if self._profiles is not None
+            else getattr(self.runner, "salad_profiles", None)
+        )
+        found = None if profiles is None else profiles.get(salad_config(spec_stage).profile)
+        if (
+            found is None
+            or found.worker_principal_id != salad_config(spec_stage).worker_principal_id
+        ):
+            raise StepFailed("salad", "step_refused", "salad_profile_unavailable")
+        if not found.image_allowed(spec_stage.image):
+            raise StepFailed("salad", "step_refused", "salad_image_not_allowlisted")
+        return found
+
+    def _stage_row(self, ctx: _Ctx, key: str) -> dict[str, Any]:
+        profile = salad_config(self._spec(ctx, key)).profile
+        with self.runner.store.runner_connection() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO campaign_salad_stages
+                (campaign_id, stage_key, profile, revision, updated_at) VALUES (?,?,?,1,?)""",
+                (ctx.campaign["id"], key, profile, self._stamp()),
+            )
+            row = connection.execute(
+                "SELECT * FROM campaign_salad_stages WHERE campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+            ).fetchone()
+        return dict(row)
+
+    def _spec(self, ctx: _Ctx, key: str) -> StageSpec:
+        return self.runner._spec_stage(ctx, key)
+
+    def _stamp(self) -> str:
+        from .campaign_runner import _iso
+
+        return _iso(self.runner.now())
+
+    def _set_stage_row(self, ctx: _Ctx, key: str, **fields: Any) -> None:
+        with self.runner.store.runner_connection() as connection:
+            self.runner._touch(
+                connection,
+                "campaign_salad_stages",
+                "campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+                **fields,
+            )
+
+    def row(self, attempt_id: str) -> dict[str, Any]:
+        with self.runner.store.runner_connection() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO campaign_salad_attempts
+                (attempt_id, phase, revision, updated_at) VALUES (?, 'awaiting_lease', 1, ?)""",
+                (attempt_id, self._stamp()),
+            )
+            return dict(
+                connection.execute(
+                    "SELECT * FROM campaign_salad_attempts WHERE attempt_id=?", (attempt_id,)
+                ).fetchone()
+            )
+
+    def _move(self, attempt_id: str, **fields: Any) -> None:
+        with self.runner.store.runner_connection() as connection:
+            self.runner._touch(
+                connection, "campaign_salad_attempts", "attempt_id=?", (attempt_id,), **fields
+            )
+
+    def _emit_once(self, ctx: _Ctx, event_type: str, match: dict[str, Any], payload: dict) -> None:
+        """One event per (type, match); the runner re-derives state every tick."""
+        clauses = " AND ".join(f"json_extract(payload_json, '$.{name}') IS ?" for name in match)
+        with self.runner.store.runner_connection() as connection:
+            seen = connection.execute(
+                f"""SELECT 1 FROM events WHERE project_id=? AND event_type=?
+                AND json_extract(payload_json, '$.campaign_id') = ? AND {clauses} LIMIT 1""",
+                (ctx.campaign["project_id"], event_type, ctx.campaign["id"], *match.values()),
+            ).fetchone()
+            if seen is None:
+                self.runner.store.record_runner_event(
+                    connection, ctx.campaign, event_type, {**match, **payload}
+                )
+
+    def _awaiting_human(
+        self, ctx: _Ctx, key: str, attempt: int | None, records: list[str], reason: str
+    ) -> None:
+        self._emit_once(
+            ctx,
+            "campaign.stage_awaiting_human",
+            {"stage_key": key, "attempt": attempt, "reason": reason},
+            {"records": records},
+        )
+
+    def _task(self, task_id: str) -> dict[str, Any]:
+        row = self.runner._one(
+            "SELECT id, revision, status, current_plan_digest FROM tasks WHERE id=?", (task_id,)
+        )
+        assert row is not None
+        return row
+
+    def _grant(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        row = self.runner._one("SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],))
+        assert row is not None
+        return row
+
+    def route_state(self, route_id: str | None) -> dict[str, Any] | None:
+        if route_id is None:
+            return None
+        row = self.runner._one(
+            """SELECT payload_json FROM events WHERE event_type='remote_execution.state'
+            AND json_extract(payload_json,'$.id')=? ORDER BY cursor DESC LIMIT 1""",
+            (route_id,),
+        )
+        return None if row is None else json.loads(row["payload_json"])
+
+    def claimed(self, ctx: _Ctx, operation_id: str | None) -> bool:
+        """True when control holds a provider create or start claim for the operation."""
+        return self._claimed(ctx.campaign["org_id"], operation_id)
+
+    def _claimed(self, org_id: str, operation_id: str | None) -> bool:
+        if operation_id is None:
+            return False
+        row = self.runner._one(
+            """SELECT 1 AS n FROM events WHERE org_id=? AND event_type='salad_proxy.claim'
+            AND json_extract(payload_json,'$.operation_id')=?
+            AND json_extract(payload_json,'$.action') IN ('create','start') LIMIT 1""",
+            (org_id, operation_id),
+        )
+        return row is not None
+
+    def reconciled_settlement(self, attempt: dict[str, Any], grant: dict[str, Any]) -> int | None:
+        """Cents for a grant someone else reconciled; None means wait for a human charge."""
+        found = self.reconciled(attempt, grant)
+        return None if found is None else found[0]
+
+    def reconciled(self, attempt: dict[str, Any], grant: dict[str, Any]) -> tuple[int, str] | None:
+        """``(cents, basis)`` for a grant someone else reconciled, or None to wait.
+
+        Billed work is never settled at 0 by default. Unclaimed (no create/start claim on any
+        operation of the grant) settles at the recorded settlement, else 0. Claimed settles
+        at the larger of the recorded settlement and the recorded compute charges; a
+        settlement of 0 or NULL with no charge waits, unless the guardian bounds the hold.
+        """
+        recorded = grant["settlement_cents"]
+        campaign = self.runner._campaign(attempt["campaign_id"])
+        row = self.runner._one(
+            "SELECT * FROM campaign_salad_attempts WHERE attempt_id=?", (attempt["id"],)
+        )
+        if row is None:
+            return None  # no Salad bookkeeping to judge claims by: wait, never raise
+        operations = [
+            r["operation_id"]
+            for r in self.runner._rows(
+                "SELECT operation_id FROM external_operations WHERE grant_id=?", (grant["id"],)
+            )
+        ]
+        claimed = any(
+            self._claimed(campaign["org_id"], operation)
+            for operation in (row["operation_id"], *operations)
+        )
+        if not claimed:
+            if recorded is not None and int(recorded) > 0:
+                return int(recorded), "human_reconcile"
+            return 0, "unclaimed_zero"
+        count, total = self.charges(attempt)
+        if count and total >= int(recorded or 0):
+            return total, "human_charge"
+        if recorded is not None and int(recorded) > 0:
+            return int(recorded), "human_reconcile"
+        bounded = self.bounded_hold(attempt, row)
+        if bounded is not None:
+            self._read_verdict(attempt, row)
+            return bounded, "guardian_bounded_hold"
+        if self._guardian_overrun(attempt, row):
+            self._block_overrun(attempt)
+            return None
+        self._await_charge(attempt)
+        return None
+
+    def _selection(
+        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec, row: dict[str, Any]
+    ) -> ExecutionSelection:
+        return derive_selection(
+            self.profile(spec_stage),
+            salad_config(spec_stage).workload,
+            operation_id=row["operation_id"],
+            epoch=row["epoch"],
+            snapshot_digest=stage["input_snapshot_digest"],
+            image=spec_stage.image,
+            max_cost_cents=spec_stage.max_exposure_cents,
+            plan_max_seconds=spec_stage.max_duration_seconds,
+            data_policy=self._data_policy(stage, spec_stage),
+        )
+
+    def _data_policy(self, stage: dict[str, Any], spec_stage: StageSpec) -> str:
+        """The route literal: public only when the declared classes and the admitted input
+        (recorded public, no code approval) are public (ADR 0040 section 4)."""
+        policy = stage_data_policy(spec_stage)
+        snapshot_id = stage.get("input_snapshot_id")
+        if policy == DATA_POLICY_PUBLIC and snapshot_id:
+            with self.runner.store.runner_connection() as connection:
+                if provider_trust.admission_basis(connection, snapshot_id) != "public_only":
+                    return DATA_POLICY_TRUST
+        return policy
+
+    # -- stage scaffold (before the first reservation) ------------------------------
+
+    def scaffold(self, ctx: _Ctx, key: str) -> str:
+        """``ready``, ``progress`` (a step ran) or ``waiting`` (a human must act)."""
+        spec_stage = self._spec(ctx, key)
+        salad = salad_config(spec_stage)
+        row = self._stage_row(ctx, key)
+        project = ctx.campaign["project_id"]
+        if row["study_id"] is None:
+            result = self.runner._step(
+                ctx,
+                key,
+                None,
+                "create_study",
+                0,
+                lambda: (
+                    {"project_id": project},
+                    {
+                        "purpose": (
+                            f"Operational Salad GPU stage {key} of campaign "
+                            f"{ctx.campaign['id']}, outcome {salad.program.outcome}; "
+                            "not a scientific study"
+                        )[:4000],
+                        "protocol": (
+                            "Admitted attempts of one pre-approved stage with quarantined output; "
+                            "route approval is not a scientific result."
+                        ),
+                    },
+                ),
+            )
+            self._set_stage_row(ctx, key, study_id=result.response["id"])
+            return "progress"
+        if row["source_id"] is None:
+            template = salad.program.source
+            result = self.runner._step(
+                ctx,
+                key,
+                None,
+                "create_study_source",
+                0,
+                lambda: (
+                    {"study_id": row["study_id"]},
+                    template.model_dump(mode="json", exclude_none=True),
+                ),
+            )
+            self._set_stage_row(ctx, key, source_id=result.response["id"])
+            return "progress"
+        source = self.runner._one(
+            "SELECT verdict FROM research_sources WHERE id=?", (row["source_id"],)
+        )
+        if source is None or source["verdict"] == "unverified":
+            if source is not None and self._delegate_source(ctx, key, row):
+                return "progress"
+            self._awaiting_human(
+                ctx,
+                key,
+                None,
+                [row["source_id"]],
+                "the source assessment verdict is a human review; assess source "
+                f"{row['source_id']} as supported (ADR 0038 amendment, not delegated)",
+            )
+            return "waiting"
+        if source["verdict"] != "supported":
+            self.runner._stage_failed(ctx, key, "source_not_supported")
+            return "waiting"
+        return "ready"
+
+    def experiment_ready(self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec) -> bool:
+        """Study variant and split lock for the stage experiment; False after a step ran."""
+        key = stage["stage_key"]
+        row = self._stage_row(ctx, key)
+        contract = salad_config(spec_stage).workload
+        if row["study_variant_id"] is None:
+            code = derived_digests(self.profile(spec_stage), contract, spec_stage.image)
+            result = self.runner._step(
+                ctx,
+                key,
+                None,
+                "register_study_variant",
+                0,
+                lambda: (
+                    {"study_id": row["study_id"]},
+                    {
+                        "name": f"{key} baseline"[:200],
+                        "method_digest": code["code_digest"],
+                        "input_digest": stage["input_snapshot_digest"],
+                        "metadata": {"experiment_id": stage["experiment_id"]},
+                    },
+                ),
+            )
+            self._set_stage_row(ctx, key, study_variant_id=result.response["id"])
+            return False
+        if row["split_lock_id"] is None:
+            member = f"{ctx.campaign['id']}/{key}/{stage['input_snapshot_digest']}"[:200]
+            result = self.runner._step(
+                ctx,
+                key,
+                None,
+                "create_split_lock",
+                0,
+                lambda: (
+                    {"project_id": ctx.campaign["project_id"]},
+                    {
+                        "name": f"{key} operational"[:200],
+                        "partitions": {PARTITION: {"keys": [member]}},
+                    },
+                ),
+            )
+            self._set_stage_row(ctx, key, split_lock_id=result.response["id"])
+            return False
+        return True
+
+    # -- attempt lifecycle ------------------------------------------------------------
+
+    def admitted(self, attempt_id: str) -> None:
+        """Called when admission completes: the executor may now lease this grant."""
+        self.row(attempt_id)
+
+    def advance(
+        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec, attempt: dict[str, Any]
+    ) -> bool:
+        attempt = self.adopt_started(ctx, stage["stage_key"], attempt)
+        row = self.row(attempt["id"])
+        phase = row["phase"]
+        grant = self._grant(attempt)
+        expired = self.runner.now() >= _parse_utc(grant["expires_at"])
+        if phase == "awaiting_lease":
+            if expired:
+                return self.runner._do_observe(ctx, stage, spec_stage, attempt)
+            raise _waiting()()
+        if phase in PRE_ROUTE_PHASES and (expired or grant["status"] != "active"):
+            return self._abandon(ctx, stage, spec_stage, attempt, "grant_expired_before_route")
+        handler = {
+            "leased": self._propose_decisions,
+            "awaiting_review": self._await_review,
+            "reviewed": self._capability,
+            "capability_ready": self._propose_route,
+            "route_proposed": self._approve_and_start,
+            "route_started": self._await_outcome,
+            "executing": self._await_outcome,
+            "outcome_recorded": self._verify,
+        }.get(phase)
+        if handler is None:
+            raise _waiting()()
+        return handler(ctx, stage, spec_stage, attempt, row)
+
+    # decisions ----------------------------------------------------------------------
+
+    def _plan_scope(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        row: dict[str, Any],
+        context: dict[str, Any],
+        salad_row: dict[str, Any],
+        preview: bool = False,
+    ) -> dict[str, Any]:
+        salad = salad_config(spec_stage)
+        profile = self.profile(spec_stage)
+        template = salad.program
+        selection = self._selection(ctx, stage, spec_stage, row)
+        digests = derived_digests(profile, salad.workload, spec_stage.image)
+        max_seconds = selection.resources.max_seconds
+        gate = template.gate
+        return {
+            "type": "research_program",
+            "version": 1,
+            "study_id": salad_row["study_id"],
+            "outcome": template.outcome,
+            "action": "plan",
+            "basis_digest": context["basis_digest"],
+            "supersedes_id": self._head(context, template.outcome, "plan"),
+            "reason": f"Campaign {ctx.campaign['id']} stage {stage['stage_key']} Salad GPU run",
+            "brief": {
+                **template.brief.model_dump(mode="json"),
+                "data_source_ids": [salad_row["source_id"]],
+                "compute": {
+                    "budget_cents": spec_stage.max_exposure_cents,
+                    "max_wall_seconds": max_seconds,
+                    "max_gpu_hours": round(max_seconds / 3600, 6),
+                    "target": SALAD_TARGET,
+                    "resources": "One Salad GPU container, exact reviewed class",
+                },
+                "missing_prerequisites": [],
+            },
+            "conditions": {
+                CONDITION: {
+                    "disposition": "selected",
+                    "rationale": "The declared stage run is the only condition in scope",
+                    "variant_ids": [salad_row["study_variant_id"]],
+                }
+            },
+            "evaluation_protocol": {
+                "version": 2,
+                "identity": {
+                    "data_digest": stage["input_snapshot_digest"],
+                    "code_digest": digests["code_digest"],
+                    "environment_digest": digests["environment_digest"],
+                },
+                "gates": [
+                    {
+                        "id": f"{template.outcome}_gate"[:200],
+                        "category": gate.category,
+                        "variant_id": salad_row["study_variant_id"],
+                        "experiment_variant_id": stage["variant_id"],
+                        "metric": gate.metric,
+                        "unit": gate.unit,
+                        "split_lock_id": salad_row["split_lock_id"],
+                        "split_partition": PARTITION,
+                        "split_digest": (
+                            "0" * 64 if preview else self._lock_digest(salad_row["split_lock_id"])
+                        ),
+                        "procedure": gate.procedure,
+                        "comparison": gate.comparison,
+                        "threshold": gate.threshold,
+                        "statistic": gate.statistic,
+                        "minimum_replicates": gate.minimum_replicates,
+                        "minimum_samples": gate.minimum_samples,
+                        "allowed_sources": list(gate.allowed_sources),
+                    }
+                ],
+            },
+        }
+
+    def _source_use_scope(
+        self, ctx: _Ctx, spec_stage: StageSpec, salad_row: dict[str, Any], context: dict[str, Any]
+    ) -> dict[str, Any]:
+        outcome = salad_config(spec_stage).program.outcome
+        return {
+            "type": "research_program",
+            "version": 1,
+            "study_id": salad_row["study_id"],
+            "outcome": outcome,
+            "action": "source_use",
+            "basis_digest": context["basis_digest"],
+            "supersedes_id": self._head(context, outcome, "source_use"),
+            "reason": f"Campaign {ctx.campaign['id']} stage {spec_stage.key} Salad GPU run",
+            "source_ids": [salad_row["source_id"]],
+            "intended_use": "Workload provenance for one operational stage run only",
+        }
+
+    def preview_review_digests(self, ctx: _Ctx, key: str) -> dict[str, str]:
+        """The three digests a human binds in ``preapprovals`` for this stage (ADR 0044).
+
+        Read-only: builds the scopes with placeholder run-minted ids through the same code
+        the runner uses to propose them, then digests the cores."""
+        spec_stage = self._spec(ctx, key)
+        salad = salad_config(spec_stage)
+        snapshot = next(i for i in spec_stage.inputs if i.kind == "snapshot")
+        placeholder = {
+            "study_id": "study_preview",
+            "source_id": "source_preview",
+            "study_variant_id": "variant_preview",
+            "split_lock_id": "lock_preview",
+        }
+        context = {"basis_digest": "0" * 64, "reviews": []}
+        row = {"operation_id": "operation-preview", "epoch": 1}
+        stage = {
+            "stage_key": key,
+            "input_snapshot_digest": snapshot.digest,
+            "variant_id": "variant_preview",
+        }
+        plan = self._plan_scope(ctx, stage, spec_stage, row, context, placeholder, preview=True)
+        use = self._source_use_scope(ctx, spec_stage, placeholder, context)
+        template = salad.program.source.model_dump(mode="json")
+        return {
+            "stage_key": key,
+            "source_assessment_digest": campaign_preapproval.source_core_digest(
+                {
+                    "uri": template["uri"],
+                    "quoted_passage": template["quoted_passage"],
+                    "content_digest": template["content_digest"],
+                    "locator": template.get("locator"),
+                }
+            ),
+            "plan_digest": campaign_preapproval.review_core_digest(plan),
+            "source_use_digest": campaign_preapproval.review_core_digest(use),
+        }
+
+    def _lock_digest(self, lock_id: str) -> str:
+        row = self.runner._one(
+            "SELECT membership_digest FROM gate_split_locks WHERE id=?", (lock_id,)
+        )
+        assert row is not None
+        return row["membership_digest"]
+
+    @staticmethod
+    def _head(context: dict[str, Any], outcome: str, action: str) -> str | None:
+        heads = [
+            r["id"]
+            for r in context["reviews"]
+            if r["scope"]["outcome"] == outcome and r["scope"]["action"] == action
+        ]
+        return heads[-1] if heads else None
+
+    def _context(self, ctx: _Ctx, study_id: str) -> dict[str, Any]:
+        with self.runner.store.runner_connection() as connection:
+            return program_context(
+                connection, {"org_id": ctx.campaign["org_id"], "project_id": None}, study_id
+            )
+
+    def _propose_decisions(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        key = stage["stage_key"]
+        assert ctx.approval is not None
+        salad_row = self._stage_row(ctx, key)
+        grant = self._grant(attempt)
+        approver = ctx.approval["approving_principal_id"]
+        expires = min(
+            _parse_utc(grant["expires_at"]), self.runner.now() + timedelta(hours=DECISION_HOURS)
+        )
+        from .campaign_runner import _iso
+
+        def build(action: str):
+            def make() -> tuple[dict[str, str], dict[str, Any]]:
+                context = self._context(ctx, salad_row["study_id"])
+                if action == "plan":
+                    scope = self._plan_scope(ctx, stage, spec_stage, row, context, salad_row)
+                    kind = "direction"
+                else:
+                    scope = self._source_use_scope(ctx, spec_stage, salad_row, context)
+                    kind = "access"
+                return {}, {
+                    "project_id": ctx.campaign["project_id"],
+                    "kind": kind,
+                    "scope": scope,
+                    "expires_at": _iso(expires),
+                    "reviewer_principal_id": approver,
+                }
+
+            return make
+
+        if row["plan_decision_id"] is None:
+            result = self.runner._step(
+                ctx, key, attempt["attempt"], "propose_decision", 0, build("plan")
+            )
+            self._move(attempt["id"], plan_decision_id=result.response["id"])
+            return True
+        if row["source_decision_id"] is None:
+            result = self.runner._step(
+                ctx, key, attempt["attempt"], "propose_decision", 1, build("source_use")
+            )
+            self._move(attempt["id"], source_decision_id=result.response["id"])
+            return True
+        self._move(attempt["id"], phase="awaiting_review")
+        if self._preapproval(ctx, key) is None:
+            self._awaiting_human(
+                ctx,
+                key,
+                attempt["attempt"],
+                [row["plan_decision_id"], row["source_decision_id"]],
+                REVIEW_REASON,
+            )
+        return True
+
+    # review pre-approval (ADR 0044) -----------------------------------------------------
+
+    def _preapproval(self, ctx: _Ctx, key: str) -> dict[str, Any] | None:
+        """The stage's explicit approve-body pre-approval (ADR 0044), if any. A bare approval
+        never implies one, and an operator profile can only narrow: ``preapprove_reviews:
+        false`` ignores the entry and restores the human stop."""
+        if ctx.approval is None:
+            return None
+        with self.runner.store.runner_connection() as connection:
+            found = campaign_preapproval.stage_preapproval(connection, ctx.approval["id"], key)
+        if found is None:
+            return None
+        try:
+            if not self.profile(self._spec(ctx, key)).preapprove_reviews:
+                return None
+        except StepFailed:
+            return None
+        return found
+
+    def _declined(
+        self, ctx: _Ctx, key: str, attempt: int | None, kind: str, subject: str, reason: str
+    ) -> None:
+        self._emit_once(
+            ctx,
+            "campaign.preapproval_declined",
+            {"stage_key": key, "attempt": attempt, "kind": kind, "subject_id": subject},
+            {"reason": reason},
+        )
+
+    def _delegate_source(self, ctx: _Ctx, key: str, row: dict[str, Any]) -> bool:
+        """Resolve the source assessment under an exact-digest pre-approval, else False."""
+        pre = self._preapproval(ctx, key)
+        if pre is None:
+            return False
+        source_id = row["source_id"]
+        assert ctx.approval is not None
+        with self.runner.store.runner_connection() as connection:
+            verdict = campaign_preapproval.evaluate(
+                connection,
+                campaign_id=ctx.campaign["id"],
+                approval_id=ctx.approval["id"],
+                stage_key=key,
+                kind=campaign_preapproval.KIND_SOURCE,
+                subject_id=source_id,
+            )
+            revision = connection.execute(
+                "SELECT revision FROM research_sources WHERE id=?", (source_id,)
+            ).fetchone()["revision"]
+        if verdict.reason is not None:
+            self._declined(ctx, key, None, "source_assessment", source_id, verdict.reason)
+            return False
+        try:
+            self.runner._step(
+                ctx,
+                key,
+                None,
+                "assess_source",
+                0,
+                lambda: (
+                    {"source_id": source_id, "preapproval_id": pre["id"]},
+                    {
+                        "expected_revision": revision,
+                        "verdict": "supported",
+                        "reason": (
+                            "Delegated under review pre-approval "
+                            f"{pre['id']} (exact source digest {verdict.digest})"
+                        )[:4000],
+                    },
+                ),
+            )
+        except StepFailed as error:
+            self._declined(
+                ctx, key, None, "source_assessment", source_id, f"step_{error.error_class}"
+            )
+            return False
+        return True
+
+    def _delegate_reviews(
+        self, ctx: _Ctx, key: str, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> None:
+        """Approve this attempt's plan and source-use reviews under a pre-approval; any
+        decline leaves the review pending for a human."""
+        pre = self._preapproval(ctx, key)
+        if pre is None:
+            return
+        assert ctx.approval is not None
+        for ordinal, (kind, column) in enumerate(
+            (
+                (campaign_preapproval.KIND_PLAN, "plan_decision_id"),
+                (campaign_preapproval.KIND_SOURCE_USE, "source_decision_id"),
+            )
+        ):
+            decision_id = row[column]
+            with self.runner.store.runner_connection() as connection:
+                current = connection.execute(
+                    "SELECT status, revision FROM decision_requests WHERE id=?", (decision_id,)
+                ).fetchone()
+                if current is None or current["status"] != "pending":
+                    continue
+                verdict = campaign_preapproval.evaluate(
+                    connection,
+                    campaign_id=ctx.campaign["id"],
+                    approval_id=ctx.approval["id"],
+                    stage_key=key,
+                    kind=kind,
+                    subject_id=decision_id,
+                )
+            if verdict.reason is not None:
+                self._declined(ctx, key, attempt["attempt"], kind, decision_id, verdict.reason)
+                continue
+            try:
+                self.runner._step(
+                    ctx,
+                    key,
+                    attempt["attempt"],
+                    "resolve_decision",
+                    ordinal,
+                    _resolve_build(
+                        decision_id, current["revision"], kind, verdict.digest, pre["id"]
+                    ),
+                )
+            except StepFailed as error:
+                self._declined(
+                    ctx, key, attempt["attempt"], kind, decision_id, f"step_{error.error_class}"
+                )
+
+    def _await_review(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        salad_row = self._stage_row(ctx, stage["stage_key"])
+        self._delegate_reviews(ctx, stage["stage_key"], attempt, row)
+        context = self._context(ctx, salad_row["study_id"])
+        reviews = {r["id"]: r for r in context["reviews"]}
+        now = self.runner.now()
+        states = []
+        for decision_id in (row["plan_decision_id"], row["source_decision_id"]):
+            review = reviews.get(decision_id)
+            decision = self.runner._one(
+                "SELECT status, expires_at FROM decision_requests WHERE id=?", (decision_id,)
+            )
+            if review is None or decision is None:
+                return self._abandon(ctx, stage, spec_stage, attempt, "decision_missing")
+            if decision["status"] in {"rejected", "expired"} or (
+                decision["status"] == "pending" and now >= _parse_utc(decision["expires_at"])
+            ):
+                return self._abandon(ctx, stage, spec_stage, attempt, "decision_not_approved")
+            if decision["status"] == "approved" and not review["basis_current"]:
+                return self._abandon(ctx, stage, spec_stage, attempt, "review_basis_stale")
+            states.append(decision["status"] == "approved" and review["is_effective_review"])
+        if not all(states):
+            if self._preapproval(ctx, stage["stage_key"]) is not None:
+                self._awaiting_human(
+                    ctx,
+                    stage["stage_key"],
+                    attempt["attempt"],
+                    [row["plan_decision_id"], row["source_decision_id"]],
+                    REVIEW_REASON,
+                )
+            raise _waiting()()
+        self._move(attempt["id"], phase="reviewed")
+        return True
+
+    # capability and route -------------------------------------------------------------
+
+    def _capability(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        key = stage["stage_key"]
+        salad_row = self._stage_row(ctx, key)
+        profile = self.profile(spec_stage)
+        declaration = capability_declaration(
+            profile, salad_config(spec_stage).workload, spec_stage.image
+        )
+        digest = canonical_digest(declaration)
+        existing = (
+            self.runner._one(
+                "SELECT * FROM capability_policies WHERE id=?", (salad_row["capability_id"],)
+            )
+            if salad_row["capability_id"]
+            else None
+        )
+        if existing is not None and existing["status"] == "approved":
+            if _parse_utc(existing["expires_at"]) <= self.runner.now() + timedelta(minutes=5):
+                raise StepFailed(
+                    "request_capability",
+                    "step_refused",
+                    "capability authority expired; a plan revision is required",
+                )
+            self._move(attempt["id"], phase="capability_ready")
+            return True
+        if existing is None:
+            task = self._task(stage["task_id"])
+            result = self.runner._step(
+                ctx,
+                key,
+                None,
+                "request_capability",
+                0,
+                lambda: (
+                    {"task_id": stage["task_id"]},
+                    {
+                        "expected_plan_revision": task["revision"]
+                        - (1 if task["status"] == "approved" else 0),
+                        "expected_plan_digest": task["current_plan_digest"],
+                        "declaration": declaration,
+                    },
+                ),
+            )
+            self._set_stage_row(ctx, key, capability_id=result.response["id"])
+            return True
+        from .campaign_runner import _iso
+
+        expires = _iso(self.runner.now() + timedelta(hours=CAPABILITY_HOURS))
+        self.runner._step(
+            ctx,
+            key,
+            None,
+            "approve_capability",
+            0,
+            lambda: (
+                {"capability_id": existing["id"]},
+                {
+                    "expected_revision": existing["revision"],
+                    "declaration_digest": digest,
+                    "expires_at": expires,
+                },
+            ),
+        )
+        return True
+
+    def _propose_route(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        key = stage["stage_key"]
+        salad_row = self._stage_row(ctx, key)
+        selection = self._selection(ctx, stage, spec_stage, row)
+        policy = target_policy(selection)
+        task = self._task(stage["task_id"])
+        result = self.runner._step(
+            ctx,
+            key,
+            attempt["attempt"],
+            "propose_route",
+            0,
+            lambda: (
+                {"task_id": stage["task_id"]},
+                {
+                    "operation_id": row["operation_id"],
+                    "package_digest": row["package_digest"],
+                    "attempt_id": attempt["admitted_attempt_id"],
+                    "plan_digest": task["current_plan_digest"],
+                    "lease_id": row["lease_id"],
+                    "epoch": row["epoch"],
+                    "selection": selection.model_dump(mode="json"),
+                    "study_id": salad_row["study_id"],
+                    "program_review_id": row["plan_decision_id"],
+                    "source_review_id": row["source_decision_id"],
+                },
+            ),
+            route_policy=policy,
+        )
+        self._move(
+            attempt["id"],
+            phase="route_proposed",
+            route_id=result.response["id"],
+            proposal_digest=result.response["proposal_digest"],
+        )
+        return True
+
+    def _command(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+        step: str,
+        command: str,
+        selection: ExecutionSelection | None,
+        policy: TargetPolicy | None = None,
+    ) -> None:
+        if selection is not None:
+            policy = target_policy(selection)
+
+        def build() -> tuple[dict[str, str], dict[str, Any]]:
+            state = self.route_state(row["route_id"])
+            assert state is not None
+            return {"route_id": row["route_id"]}, {
+                "expected_revision": state["revision"],
+                "command": command,
+                "proposal_digest": row["proposal_digest"],
+            }
+
+        self.runner._step(
+            ctx, stage["stage_key"], attempt["attempt"], step, 0, build, route_policy=policy
+        )
+
+    def _approve_and_start(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        selection = self._selection(ctx, stage, spec_stage, row)
+        self._command(ctx, stage, attempt, row, "approve_route", "approve", selection)
+        self._command(ctx, stage, attempt, row, "start_route", "start", selection)
+        self._record_started(attempt["id"], row["operation_id"])
+        return True
+
+    def _record_started(self, attempt_id: str, operation_id: str) -> None:
+        """Phase and operation id move together: a crash cannot leave only one of them."""
+        with self.runner.store.runner_connection() as connection:
+            self.runner._touch(
+                connection,
+                "campaign_salad_attempts",
+                "attempt_id=?",
+                (attempt_id,),
+                phase="route_started",
+            )
+            self.runner._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt_id,),
+                status="running",
+                operation_id=operation_id,
+            )
+
+    def adopt_started(self, ctx: _Ctx, key: str, attempt: dict[str, Any]) -> dict[str, Any]:
+        """Resume after a crash between a completed start_route and its bookkeeping."""
+        if attempt["operation_id"] is not None:
+            return attempt
+        with self.runner.store.runner_connection() as connection:
+            done = self.runner.steps.completed(
+                connection, ctx.campaign["id"], key, attempt["attempt"], "start_route", 0
+            )
+        if done is None:
+            return attempt
+        row = self.row(attempt["id"])
+        if row["phase"] == "route_proposed":
+            self._record_started(attempt["id"], row["operation_id"])
+        else:
+            self.runner._set_attempt(attempt["id"], operation_id=row["operation_id"])
+        return self.runner._attempt(attempt["id"])
+
+    def _cancel_route(
+        self, ctx: _Ctx, stage: dict[str, Any], attempt: dict[str, Any], row: dict[str, Any]
+    ) -> None:
+        state = self.route_state(row["route_id"])
+        assert state is not None
+        policy = TargetPolicy(
+            selection=ExecutionSelection.model_validate(state["proposal"]["selection"])
+        )
+        self._command(ctx, stage, attempt, row, "cancel_route", "cancel", None, policy)
+
+    # waiting for the executor -----------------------------------------------------------
+
+    def _await_outcome(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        state = self.route_state(row["route_id"])
+        window = (
+            state["proposal"]["selection"]["resources"]["max_seconds"]
+            if state
+            else self.profile(spec_stage).route_max_seconds
+        )
+        deadline = _parse_utc(row["updated_at"]) + timedelta(
+            seconds=window + SILENT_EXECUTOR_GRACE_SECONDS
+        )
+        if self.runner.now() > deadline:
+            self._unknown(attempt, "executor silent past the route window")
+            return True
+        raise _waiting()()
+
+    def _unknown(self, attempt: dict[str, Any], detail: str) -> None:
+        self._move(attempt["id"], phase="unknown", waiting_reason=detail[:300])
+        self.runner._set_attempt(
+            attempt["id"],
+            status="unknown",
+            failure_class="observed_unknown",
+            failure_detail=detail[:500],
+        )
+
+    # verification ---------------------------------------------------------------------
+
+    def _verify(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        verdict, detail, evidence = self.verify_outcome(ctx, attempt, row)
+        if verdict == "unknown":
+            self._unknown(attempt, detail)
+            return True
+        manifest = self.runner._one(
+            "SELECT id, manifest_digest FROM artifact_manifests WHERE id=?", (row["manifest_id"],)
+        )
+        self._move(attempt["id"], salad_evidence_digest=evidence)
+        fields: dict[str, Any] = {
+            "status": "exited",
+            "operation_id": row["operation_id"],
+            # No exit code or run receipt exists for a Salad attempt: the verdict and the
+            # Salad evidence digest are recorded in their own fields.
+            "salad_verdict": verdict,
+            "salad_evidence_digest": evidence,
+            "manifest_id": manifest["id"] if manifest else None,
+            "manifest_digest": manifest["manifest_digest"] if manifest else None,
+        }
+        if verdict != "ok":
+            fields["failure_detail"] = detail[:500]
+        self.runner._set_attempt(attempt["id"], **fields)
+        return True
+
+    def verify_outcome(
+        self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> tuple[str, str, str | None]:
+        """Read-only: ``("ok"|"failed"|"unknown", detail, salad_evidence_digest)``.
+
+        ``failed`` means termination is confirmed but the run did not pass; ``unknown``
+        means the evidence is missing, contradictory or does not match.
+        """
+        state = self.route_state(row["route_id"])
+        if state is None or row["live_receipt_json"] is None:
+            return "unknown", "route state or live receipt is missing", None
+        provider = [r for r in state["receipts"] if r.get("provenance") == "provider"]
+        if (
+            not state["termination_confirmed"]
+            or state["reallocated"]
+            or state["provider_status"] != "stopped"
+            or not provider
+        ):
+            return "unknown", "route termination is not confirmed by provider receipts", None
+        with self.runner.store.runner_connection() as connection:
+            reconciliation = current_operation_reconciliation(connection, row["operation_id"])
+        if (
+            reconciliation is None
+            or reconciliation["observed_state"] != "exited"
+            or not reconciliation["termination_confirmed"]
+        ):
+            return "unknown", "no confirmed exited worker observation", None
+        receipt = json.loads(row["live_receipt_json"])
+        manifest = (
+            None
+            if row["manifest_id"] is None
+            else self.runner._one(
+                """SELECT * FROM artifact_manifests WHERE id=? AND grant_id=? AND lease_id=?
+                AND operation_id=? AND epoch=?""",
+                (
+                    row["manifest_id"],
+                    attempt["grant_id"],
+                    row["lease_id"],
+                    row["operation_id"],
+                    row["epoch"],
+                ),
+            )
+        )
+        passed = (
+            receipt.get("status") == "passed"
+            and receipt.get("reason") == "verified_journey"
+            and receipt.get("stop_confirmed") is True
+        )
+        if not passed:
+            digest = self._evidence(row, state, provider, manifest)
+            reason = str(receipt.get("reason", "not_passed"))[:80]
+            return "failed", f"live receipt not passed: {reason}", digest
+        if manifest is None or not self._outputs_match(receipt, manifest):
+            return "unknown", "manifest does not match the imported output hashes", None
+        return "ok", "verified_journey", self._evidence(row, state, provider, manifest)
+
+    @staticmethod
+    def _outputs_match(receipt: dict[str, Any], manifest: dict[str, Any]) -> bool:
+        listed = {
+            item["relative_path"]: (item["sha256"], item["size"])
+            for item in json.loads(manifest["artifacts_json"])
+        }
+        outputs = receipt.get("outputs")
+        if outputs is not None:
+            expected = {item["name"]: (item["sha256"], item["bytes"]) for item in outputs}
+        elif receipt.get("output_sha256") is not None:
+            expected = {"output.json": (receipt["output_sha256"], receipt.get("output_bytes"))}
+        else:
+            return False
+        return bool(expected) and listed == expected
+
+    @staticmethod
+    def _evidence(
+        row: dict[str, Any],
+        state: dict[str, Any],
+        provider: list[dict[str, Any]],
+        manifest: dict[str, Any] | None,
+    ) -> str:
+        return canonical_digest(
+            {
+                "route_id": row["route_id"],
+                "proposal_digest": row["proposal_digest"],
+                "receipts": [canonical_digest(r) for r in provider],
+                "live_receipt_digest": row["live_receipt_digest"],
+                "manifest_digest": None if manifest is None else manifest["manifest_digest"],
+            }
+        )
+
+    # unclaimed and unwinding --------------------------------------------------------
+
+    def _abandon(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        """A pre-route failure: cancel authority, prove no claim, retry within the budget."""
+        key = stage["stage_key"]
+        done = self.unwind(ctx, key, attempt)
+        if done:
+            self.runner._set_attempt(
+                attempt["id"],
+                status="failed_transient",
+                failure_class="t1_salad_unclaimed",
+                failure_detail=reason,
+            )
+        return done
+
+    def unwind(self, ctx: _Ctx, key: str, attempt: dict[str, Any]) -> bool:
+        """Drive a packaged Salad attempt to settled; True when nothing is outstanding."""
+        runner = self.runner
+        attempt = self.adopt_started(ctx, key, attempt)
+        row = self.row(attempt["id"])
+        spec_stage = self._spec(ctx, key)
+        seen = runner._observe(attempt)
+        grant = seen["grant"]
+        if grant["status"] == "reconciled":
+            with runner.store.runner_connection() as connection:
+                ours = runner.steps.completed(
+                    connection,
+                    ctx.campaign["id"],
+                    key,
+                    attempt["attempt"],
+                    "reconcile_unclaimed_salad",
+                    0,
+                )
+            if ours is not None:
+                amount = int(grant["settlement_cents"] or 0)
+                found: tuple[int, str] | None = (
+                    amount,
+                    "unclaimed_zero" if amount == 0 else "human_reconcile",
+                )
+            else:
+                found = self.reconciled(attempt, grant)
+            if found is None:
+                return False  # claimed, no recorded charge: waiting for a human
+            settled, basis = found
+            with runner.store.runner_connection() as connection:
+                if ours is not None:
+                    connection.execute(
+                        """UPDATE campaign_salad_attempts SET phase='unclaimed',
+                        revision=revision+1, updated_at=? WHERE attempt_id=?""",
+                        (self._stamp(), attempt["id"]),
+                    )
+                runner._settle(connection, attempt["id"], settled, basis)
+            return True
+        stage = runner._stage_row(ctx, key)
+        route = self.route_state(row["route_id"])
+        if route is not None and route["desired"] != "stop":
+            self._cancel_route(ctx, stage, attempt, row)
+            return False
+        if grant["status"] == "active":
+            runner._revoke(ctx, key, attempt, grant)
+            return False
+        if self.claimed(ctx, seen["operation_id"] or row["operation_id"]):
+            return self._unwind_claimed(ctx, key, spec_stage, attempt, row, seen, route)
+        try:
+            result = runner._step(
+                ctx,
+                key,
+                attempt["attempt"],
+                "reconcile_unclaimed_salad",
+                0,
+                lambda: (
+                    {"grant_id": grant["id"]},
+                    {"expected_revision": grant["revision"]},
+                ),
+            )
+        except StepFailed as error:
+            self._unknown(attempt, f"unclaimed reconcile refused: {error.error_class}")
+            return False
+        with runner.store.runner_connection() as connection:
+            connection.execute(
+                """UPDATE campaign_salad_attempts SET phase='unclaimed', revision=revision+1,
+                updated_at=? WHERE attempt_id=?""",
+                (self._stamp(), attempt["id"]),
+            )
+            amount = int(result.response.get("settlement_cents") or 0)
+            # Only a zero is an unclaimed proof; any recorded amount keeps its own label.
+            runner._settle(
+                connection,
+                attempt["id"],
+                amount,
+                "unclaimed_zero" if amount == 0 else "human_reconcile",
+            )
+        return True
+
+    def _unwind_claimed(
+        self,
+        ctx: _Ctx,
+        key: str,
+        spec_stage: StageSpec,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+        seen: dict[str, Any],
+        route: dict[str, Any] | None,
+    ) -> bool:
+        """A provider effect was claimed: only confirmed termination plus a charge settles."""
+        runner = self.runner
+        reconciliation = seen["reconciliation"]
+        if (
+            reconciliation
+            and reconciliation["observed_state"] == "exited"
+            and reconciliation["termination_confirmed"]
+        ):
+            settlement, basis = runner._settlement_for(spec_stage, attempt)
+            result = runner._step(
+                ctx,
+                key,
+                attempt["attempt"],
+                "reconcile_grant",
+                1,
+                lambda: (
+                    {"grant_id": attempt["grant_id"]},
+                    {
+                        "expected_revision": runner._one(
+                            "SELECT revision FROM execution_grants WHERE id=?",
+                            (attempt["grant_id"],),
+                        )["revision"],
+                        "settlement_cents": settlement,
+                        "provider_terminated": True,
+                    },
+                ),
+            )
+            amount = int(result.response.get("settlement_cents") or 0)
+            if amount != settlement:
+                # A replayed step answers with what it recorded earlier; no basis can honestly
+                # describe that amount now, so settle nothing and block (the runner's policy).
+                self._move(attempt["id"], phase="unknown", waiting_reason="settlement_mismatch")
+                runner.block_settlement_mismatch(attempt)
+                return True
+            with runner.store.runner_connection() as connection:
+                runner._settle(connection, attempt["id"], amount, basis)
+            return True
+        window = (
+            route["proposal"]["selection"]["resources"]["max_seconds"]
+            if route
+            else self.profile(spec_stage).route_max_seconds
+        )
+        deadline = _parse_utc(row["updated_at"]) + timedelta(
+            seconds=window + SILENT_EXECUTOR_GRACE_SECONDS
+        )
+        if runner.now() > deadline and row["phase"] != "unknown":
+            self._unknown(attempt, "claimed provider effect without confirmed termination")
+        return False
+
+    # settlement -------------------------------------------------------------------------
+
+    def charges(self, attempt: dict[str, Any]) -> tuple[int, int]:
+        """(entry count, total cents) of recorded compute charges for the admitted attempt."""
+        stage = self.runner._one(
+            "SELECT experiment_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
+            (attempt["campaign_id"], attempt["stage_key"]),
+        )
+        row = self.runner._one(
+            """SELECT count(*) AS n, COALESCE(SUM(amount_cents), 0) AS total
+            FROM experiment_budget_entries WHERE experiment_id=? AND admitted_attempt_id=?
+            AND category='compute'""",
+            (stage["experiment_id"], attempt["admitted_attempt_id"]),
+        )
+        assert row is not None
+        return int(row["n"]), int(row["total"])
+
+    def settlement_for(self, stage: StageSpec, attempt: dict[str, Any]) -> tuple[int, str]:
+        """``(cents, basis)``. Never 0 without an unclaimed proof.
+
+        Order: unclaimed proof, human-reconciled grant, human-recorded charge, the
+        guardian-bounded hold; otherwise wait for a human charge.
+        """
+        runner = self.runner
+        row = self.row(attempt["id"])
+        if row["phase"] == "unclaimed":
+            return 0, "unclaimed_zero"
+        grant = runner._one("SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],))
+        ours = runner._one(
+            """SELECT 1 AS n FROM campaign_step_intents WHERE campaign_id=? AND stage_key=?
+            AND attempt=? AND step IN ('reconcile_grant','reconcile_unclaimed_salad')
+            AND status='done'""",
+            (attempt["campaign_id"], attempt["stage_key"], attempt["attempt"]),
+        )
+        if grant is not None and grant["status"] == "reconciled" and ours is None:
+            found = self.reconciled(attempt, grant)
+            if found is None:
+                raise _waiting()()
+            return found
+        count, total = self.charges(attempt)
+        if count:
+            return total, "human_charge"
+        if self._guardian_overrun(attempt, row):
+            self._block_overrun(attempt)
+            raise _waiting()()
+        bounded = self.bounded_hold(attempt, row)
+        if bounded is not None:
+            self._read_verdict(attempt, row)
+            return bounded, "guardian_bounded_hold"
+        self._await_charge(attempt)
+        raise _waiting()()
+
+    def _clean_guardian(self, attempt: dict[str, Any], row: dict[str, Any]) -> Decimal | None:
+        """The estimate (cents) when the guardian final is clean and the verdict is
+        ``ok``/``failed``; None for anything missing, malformed or not clean."""
+        if attempt.get("salad_verdict") not in ("ok", "failed"):
+            return None
+        if row.get("guardian_final_json") is None:
+            return None
+        try:
+            final = _GuardianFinal.model_validate_json(row["guardian_final_json"])
+            rate = Decimal(final.published_hourly_rate_usd or "")
+            estimate = Decimal(final.estimated_exposure_cents or "")
+        except (ValueError, InvalidOperation):
+            return None
+        flags = (
+            final.orphan,
+            final.allocation_uncertain,
+            final.escalation_pending,
+            final.budget_fenced,
+            final.rate_unknown,
+        )
+        if (
+            final.status != "stopped"
+            or any(flags)
+            or not rate.is_finite()
+            or rate <= 0
+            or final.actual_billed_cost_cents is not None
+            or not estimate.is_finite()
+            or estimate < 0
+        ):
+            return None
+        return estimate
+
+    def bounded_hold(self, attempt: dict[str, Any], row: dict[str, Any]) -> int | None:
+        """The attempt's hold when guardian evidence bounds it (ADR 0038); pure read."""
+        estimate = self._clean_guardian(attempt, row)
+        hold = int(attempt["hold_cents"])
+        if estimate is None or hold < 1 or math.ceil(estimate) > hold:
+            return None
+        return hold
+
+    def _read_verdict(self, attempt: dict[str, Any], row: dict[str, Any]) -> None:
+        """Record on the attempt's frame that control read the clean guardian verdict (the
+        recorded final, as ``_clean_guardian`` reads it). ``settle_frame`` refuses a
+        bounded-hold settlement of an ambiguous billable frame without it. A frame that does
+        not exist yet is opened at settlement; nothing is recorded and that settlement
+        fails closed if the frame is ambiguous."""
+        if self._clean_guardian(attempt, row) is None:
+            return
+        campaign = self.runner._campaign(attempt["campaign_id"])
+        tenant = frames.Tenant(campaign["org_id"], campaign["project_id"])
+        with self.runner.store.runner_connection() as connection:
+            self.runner._hold_lease(connection)
+            frame = frames.frame_for_attempt(connection, attempt["id"], tenant)
+            if frame is None or frame["state"] in {"settling", "closed"}:
+                return
+            frames.record_guardian_verdict(
+                connection,
+                frame["frame_id"],
+                tenant,
+                verdict_digest=canonical_digest(row["guardian_final_json"]),
+                actor=frames.Actor(
+                    "guardian_verdict",
+                    self.runner._actor_principal(connection, attempt["campaign_id"]),
+                ),
+                now=self._stamp(),
+            )
+
+    def _guardian_overrun(self, attempt: dict[str, Any], row: dict[str, Any]) -> bool:
+        estimate = self._clean_guardian(attempt, row)
+        return (
+            estimate is not None
+            and row["phase"] != "unknown"
+            and math.ceil(estimate) > int(attempt["hold_cents"])
+        )
+
+    def _block_overrun(self, attempt: dict[str, Any]) -> None:
+        """The guardian's estimate exceeds the hold: unknown attempt, blocked campaign."""
+        detail = "estimated_overrun"
+        with self.runner.store.runner_connection() as connection:
+            self.runner._hold_lease(connection)
+            # One transaction: an attempt marked unknown always comes with its block.
+            self.runner._touch(
+                connection,
+                "campaign_salad_attempts",
+                "attempt_id=?",
+                (attempt["id"],),
+                phase="unknown",
+                waiting_reason=detail,
+            )
+            self.runner._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                status="unknown",
+                failure_class="observed_unknown",
+                failure_detail=detail,
+            )
+            campaign = dict(
+                connection.execute(
+                    "SELECT * FROM campaigns WHERE id=?", (attempt["campaign_id"],)
+                ).fetchone()
+            )
+            blocked = connection.execute(
+                """UPDATE campaigns SET status='blocked', stop_reason=COALESCE(stop_reason,
+                'estimated_overrun'), updated_at=? WHERE id=? AND status='running'""",
+                (self._stamp(), attempt["campaign_id"]),
+            ).rowcount
+            if blocked:
+                self.runner.store.record_runner_event(
+                    connection, campaign, "campaign.blocked", {"reason": "estimated_overrun"}
+                )
+
+    def _await_charge(self, attempt: dict[str, Any]) -> None:
+        row = self.row(attempt["id"])
+        reason = (
+            "record the compute charge for admitted attempt "
+            f"{attempt['admitted_attempt_id']} at /experiments/<id>/budget/charges"
+        )
+        if row["phase"] not in {"awaiting_charge", "settled", "unclaimed", "unknown"}:
+            self._move(attempt["id"], phase="awaiting_charge", waiting_reason=reason[:300])
+        campaign = self.runner._campaign(attempt["campaign_id"])
+        stage = self.runner._one(
+            "SELECT experiment_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
+            (attempt["campaign_id"], attempt["stage_key"]),
+        )
+        with self.runner.store.runner_connection() as connection:
+            seen = connection.execute(
+                """SELECT 1 FROM events WHERE project_id=? AND event_type=?
+                AND json_extract(payload_json,'$.campaign_id')=?
+                AND json_extract(payload_json,'$.attempt_id')=? LIMIT 1""",
+                (
+                    campaign["project_id"],
+                    "campaign.stage_awaiting_human",
+                    campaign["id"],
+                    attempt["id"],
+                ),
+            ).fetchone()
+            if seen is None:
+                self.runner.store.record_runner_event(
+                    connection,
+                    campaign,
+                    "campaign.stage_awaiting_human",
+                    {
+                        "stage_key": attempt["stage_key"],
+                        "attempt": attempt["attempt"],
+                        "attempt_id": attempt["id"],
+                        "records": [attempt["admitted_attempt_id"]],
+                        "experiment_id": stage["experiment_id"],
+                        "reason": reason,
+                    },
+                )
+
+    # exposure, late charges ----------------------------------------------------------
+
+    def exposure_open(self, connection: sqlite3.Connection, campaign_id: str) -> bool:
+        marks = ",".join("?" for _ in EXPOSURE_PHASES)
+        return (
+            connection.execute(
+                f"""SELECT 1 FROM campaign_salad_attempts sa JOIN campaign_stage_attempts a
+                ON a.id = sa.attempt_id WHERE a.campaign_id=? AND sa.phase IN ({marks}) LIMIT 1""",
+                (campaign_id, *EXPOSURE_PHASES),
+            ).fetchone()
+            is not None
+        )
+
+    def late_charges(self, ctx: _Ctx) -> None:
+        """Charges recorded after settlement are added once, by CAS, as late charges.
+
+        A provisional ``guardian_bounded_hold`` settlement is confirmed by the first human
+        charge: X <= hold only confirms (amounts unchanged); X > hold adds the excess.
+        """
+        self._late_charges_for(ctx.campaign["id"])
+
+    def sweep_unconfirmed(self, limit: int = 50) -> None:
+        """Apply charges recorded after a terminal campaign settled (events only).
+
+        Only attempts with a charge the settlement has not absorbed are picked, so a
+        campaign waiting for its first charge never occupies a slot."""
+        marks = ",".join("?" for _ in TERMINAL_CAMPAIGN)
+        rows = self.runner._rows(
+            f"""SELECT DISTINCT c.id FROM campaign_salad_attempts sa
+            JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
+            JOIN campaigns c ON c.id = a.campaign_id
+            JOIN campaign_stages st ON st.campaign_id = a.campaign_id
+              AND st.stage_key = a.stage_key
+            WHERE c.status IN ({marks}) AND sa.phase='settled' AND (
+              SELECT COUNT(*) FROM experiment_budget_entries e
+              WHERE e.experiment_id = st.experiment_id
+              AND e.admitted_attempt_id = a.admitted_attempt_id AND e.category='compute') > 0
+            AND ((a.settlement_basis='guardian_bounded_hold' AND sa.settlement_confirmed_at IS NULL)
+              OR (SELECT COALESCE(SUM(e.amount_cents), 0) FROM experiment_budget_entries e
+              WHERE e.experiment_id = st.experiment_id
+              AND e.admitted_attempt_id = a.admitted_attempt_id AND e.category='compute')
+              > COALESCE(sa.charged_cents, a.settled_cents, 0)
+              OR (a.settlement_basis='guardian_bounded_hold'
+              AND sa.settlement_confirmed_at IS NOT NULL
+              AND (SELECT COALESCE(SUM(e.amount_cents), 0)
+              FROM experiment_budget_entries e WHERE e.experiment_id = st.experiment_id
+              AND e.admitted_attempt_id = a.admitted_attempt_id AND e.category='compute')
+              = a.settled_cents))
+            ORDER BY c.id LIMIT ?""",
+            (*sorted(TERMINAL_CAMPAIGN), limit),
+        )
+        for entry in rows:
+            self._late_charges_for(entry["id"])
+
+    def _late_charges_for(self, campaign_id: str) -> None:
+        """Absorb recorded compute charges into settled attempts, each once, by CAS.
+
+        ``charged_cents`` is the amount the settlement already covers: a provisional
+        bounded-hold settlement covers its whole hold, so charges below the hold (however
+        many entries an invoice is split into) change nothing, and only the total beyond
+        the settled amount is added. The campaign and attempt totals follow the charges even
+        after the campaign is terminal; the stored receipt is never rewritten, and a cap
+        overrun of a terminal campaign is the event ``campaign.late_overrun`` (a running
+        one is blocked).
+        """
+        rows = self.runner._rows(
+            """SELECT sa.attempt_id, sa.charged_cents, sa.revision, sa.settlement_confirmed_at,
+            a.settlement_basis, a.settled_cents AS covered FROM campaign_salad_attempts sa
+            JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
+            WHERE a.campaign_id=? AND sa.phase='settled'
+            ORDER BY sa.attempt_id""",
+            (campaign_id,),
+        )
+        for entry in rows:
+            provisional = (
+                entry["settlement_basis"] == "guardian_bounded_hold"
+                and entry["settlement_confirmed_at"] is None
+            )
+            attempt = self.runner._attempt(entry["attempt_id"])
+            count, total = self.charges(attempt)
+            # A settled attempt whose charge was never initialised is covered by its settled
+            # amount, never by zero (no re-adding of already settled money).
+            charged = entry["charged_cents"]
+            if charged is None:
+                charged = entry["covered"] or 0
+            if provisional and count == 0:
+                continue
+            delta = total - charged
+            settled = attempt["settled_cents"]
+            if delta <= 0 and not provisional:
+                if (
+                    entry["settlement_basis"] == "guardian_bounded_hold"
+                    and count
+                    and total == settled
+                ):
+                    # The charges now equal the settled amount: only then is it a human charge.
+                    with self.runner.store.runner_connection() as connection:
+                        self.runner._hold_lease(connection)
+                        confirm_settlement(
+                            connection, entry["attempt_id"], charged_total=total, now=self._stamp()
+                        )
+                continue
+            with self.runner.store.runner_connection() as connection:
+                self.runner._hold_lease(connection)
+                fields = "charged_cents=?, revision=revision+1, updated_at=?"
+                # Never lower the covered amount: a partial charge keeps the hold.
+                params: list[Any] = [max(charged, total), self._stamp()]
+                if provisional:
+                    fields += ", settlement_confirmed_at=?"
+                    params.append(self._stamp())
+                claimed = connection.execute(
+                    f"UPDATE campaign_salad_attempts SET {fields} "
+                    "WHERE attempt_id=? AND revision=?",
+                    (*params, entry["attempt_id"], entry["revision"]),
+                ).rowcount
+                if claimed != 1:
+                    continue
+                campaign = dict(
+                    connection.execute(
+                        "SELECT * FROM campaigns WHERE id=?", (campaign_id,)
+                    ).fetchone()
+                )
+                terminal = campaign["status"] in TERMINAL_CAMPAIGN
+                if provisional:
+                    # A partial charge below the hold confirms the hold but keeps its basis
+                    # (the settled amount is still the hold); the label follows the amount.
+                    if delta > 0 or total == settled:
+                        confirm_settlement(
+                            connection, entry["attempt_id"], charged_total=total, now=self._stamp()
+                        )
+                    if delta <= 0:
+                        self.runner.store.record_runner_event(
+                            connection,
+                            campaign,
+                            "campaign.settlement_confirmed",
+                            {
+                                "attempt_id": entry["attempt_id"],
+                                "provisional_cents": charged,
+                                "charged_cents": total,
+                            },
+                        )
+                        continue
+                apply_late_charge(
+                    connection,
+                    entry["attempt_id"],
+                    delta_cents=delta,
+                    charged_total=total,
+                    now=self._stamp(),
+                )
+                campaign["settled_cents"] += delta
+                self.runner.store.record_runner_event(
+                    connection,
+                    campaign,
+                    "campaign.late_charge",
+                    {
+                        "attempt_id": entry["attempt_id"],
+                        "delta_cents": delta,
+                        "charged_cents": total,
+                        "campaign_terminal": terminal,
+                    },
+                )
+                if (
+                    campaign["held_cents"] + campaign["settled_cents"]
+                    > campaign["budget_cap_cents"]
+                ):
+                    if terminal:
+                        self.runner.store.record_runner_event(
+                            connection, campaign, "campaign.late_overrun", {"delta_cents": delta}
+                        )
+                        continue
+                    blocked = connection.execute(
+                        """UPDATE campaigns SET status='blocked', stop_reason=COALESCE(stop_reason,
+                        'budget_overrun'), updated_at=? WHERE id=? AND status='running'""",
+                        (self._stamp(), campaign_id),
+                    ).rowcount
+                    if blocked:
+                        self.runner.store.record_runner_event(
+                            connection, campaign, "campaign.blocked", {"reason": "budget_overrun"}
+                        )

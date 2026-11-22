@@ -1,0 +1,13 @@
+# Control issues worker credentials at most 24 hours ahead and never revives an expired
+# one, so renew well inside that window. Renewal stops at the enrollment's not_after
+# (at most seven days); then rotate (docs/provider-trust.md).
+[Unit]
+Description=Tessera: renew the stable executor credential twice a day
+
+[Timer]
+OnCalendar=*-*-* 01,13:30:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

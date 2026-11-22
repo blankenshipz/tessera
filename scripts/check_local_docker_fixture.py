@@ -10,12 +10,22 @@ from pathlib import Path
 
 from tessera_worker.local_docker_contract import FixturePlan, LocalFixtureConfig
 from tessera_worker.local_docker_fixture import FixtureJournal, LocalFixtureAdapter, recover
+from tessera_worker.local_docker_namespace import ATTESTATION, STRONG_CLASS, WEAK_CLASS
+
+PROFILES = {
+    STRONG_CLASS: "local-networkless-fixture-v1",
+    WEAK_CLASS: "local-networkless-fixture-engine-attested-v1",
+}
 
 
-def run_case(root, image, case):
-    config = LocalFixtureConfig(enabled=True)
+CASES = ("success", "failure", "cancel", "timeout", "broker-loss")
+
+
+def run_case(root, image, case, attestation_class=STRONG_CLASS):
+    config = LocalFixtureConfig(enabled=True, attestation_class=attestation_class)
     mode = case if case in {"success", "failure"} else "wait"
     plan = FixturePlan(
+        profile=PROFILES[attestation_class],
         operation_id=secrets.token_hex(32),
         nonce=secrets.token_hex(32),
         image=image,
@@ -66,7 +76,27 @@ def main(argv=None):
     parser.add_argument("--image")
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--recover", type=Path)
+    # Exact value, --run only, never an automatic fallback from the strong class.
+    parser.add_argument("--attestation-class", choices=sorted(PROFILES), default=None)
+    # Exact case names, --run only. A subset can only ever report a partial state.
+    parser.add_argument(
+        "--cases", default=None, help="comma-separated subset of: " + ", ".join(CASES)
+    )
     args = parser.parse_args(argv)
+    selected = list(CASES)
+    if args.cases is not None:
+        selected = args.cases.split(",")
+        if (
+            not args.run
+            or args.recover
+            or not selected
+            or len(set(selected)) != len(selected)
+            or any(case not in CASES for case in selected)
+        ):
+            parser.error("--cases needs --run and distinct names from: " + ", ".join(CASES))
+    if args.attestation_class is not None and (not args.run or args.recover):
+        parser.error("--attestation-class is valid only with --run (and not --recover)")
+    attestation_class = args.attestation_class or STRONG_CLASS
     if not args.run:
         print(json.dumps(dict(state="disabled", effects=0, activation="blocked")))
         return 0
@@ -78,7 +108,13 @@ def main(argv=None):
         if not args.image or not args.evidence_dir:
             parser.error("--run requires --image and a fresh --evidence-dir")
         # Reject malformed/mutable image and unsafe destination before any effects.
-        FixturePlan(operation_id="0" * 64, nonce="0" * 64, image=args.image, mode="success")
+        FixturePlan(
+            profile=PROFILES[attestation_class],
+            operation_id="0" * 64,
+            nonce="0" * 64,
+            image=args.image,
+            mode="success",
+        )
         root = args.evidence_dir
         if not root.is_absolute() or root.resolve() != root or not root.parent.is_dir():
             raise ValueError("invalid evidence parent")
@@ -92,23 +128,34 @@ def main(argv=None):
             **{"broker-loss": "unknown"},
         )
         for case, state in expected.items():
-            report = run_case(root / case, args.image, case)
+            if case not in selected:
+                continue
+            report = run_case(root / case, args.image, case, attestation_class)
             reports[case] = report
             # Refuse further work on missing prerequisites or uncertain cleanup.
             if (
-                report["state"] != state
+                report.get("attestation_class") != attestation_class
+                or report["state"] != state
                 or not report["termination_confirmed"]
                 or not report["cleanup_confirmed"]
             ):
                 break
+        ok = len(reports) == len(selected) and all(
+            r["state"] == expected[c]
+            and r["cleanup_confirmed"]
+            and r["termination_confirmed"]
+            and r.get("attestation_class") == attestation_class
+            for c, r in reports.items()
+        )
+        # A weak-class result is never reported as plain "passed".
+        passed = "passed" if attestation_class == STRONG_CLASS else "passed_weak_attestation"
+        if len(selected) != len(CASES):
+            passed = "partial_" + passed
         result = dict(
-            state="passed"
-            if len(reports) == 5
-            and all(
-                r["state"] == expected[c] and r["cleanup_confirmed"] and r["termination_confirmed"]
-                for c, r in reports.items()
-            )
-            else "blocked",
+            state=passed if ok else "blocked",
+            cases_selected=selected,
+            attestation_class=attestation_class,
+            observer_independence=ATTESTATION[attestation_class]["observer_independence"],
             activation="blocked",
             evidence_directory=str(root),
             cases=reports,
@@ -123,7 +170,7 @@ def main(argv=None):
             }
         }
         print(json.dumps(concise, sort_keys=True))
-        return 0 if result["state"] == "passed" else 1
+        return 0 if ok else 1
     except Exception:
         # Never print exception input/command/provider stderr or credential values.
         print(

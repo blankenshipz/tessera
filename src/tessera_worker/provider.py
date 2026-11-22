@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from .cpu import CpuOperation
+from .provider_inputs import Opener, fetch_snapshot
 from .supervisor import Lease, SupervisorError
 
 ProviderState = Literal["unknown", "running", "exited"]
@@ -76,6 +78,23 @@ class Provider(Protocol):
     ) -> ProviderAccountingObservation: ...
 
 
+@runtime_checkable
+class InputStagingProvider(Protocol):
+    """Optional: a provider that pulls its own inputs with a ticket (ADR 0037 s3).
+
+    ``token`` is a secret: implementations must not log, persist or return it.
+    """
+
+    def stage_inputs(
+        self,
+        operation_id: str,
+        lookup_key: str,
+        origin: str,
+        token: str,
+        expected_snapshot_digest: str,
+    ) -> dict[str, Any]: ...
+
+
 class FakeProvider:
     """Deterministic injected provider with controllable lost replies.
 
@@ -87,7 +106,12 @@ class FakeProvider:
     kind = "fake"
     version = "fake-provider-v1"
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, input_opener: Opener | None = None, staging_parent: Path | None = None
+    ) -> None:
+        self.input_opener = input_opener
+        self.staging_parent = Path(staging_parent) if staging_parent is not None else None
+        self.staged: dict[str, dict[str, Any]] = {}
         self.operations: dict[str, ProviderReceipt] = {}
         self.states: dict[str, ProviderState] = {}
         self.submit_calls: list[str] = []
@@ -99,6 +123,36 @@ class FakeProvider:
         self.lose_cancel_reply = False
         self.cancel_delayed = False
         self.accounting_unknown = True
+
+    def stage_inputs(
+        self,
+        operation_id: str,
+        lookup_key: str,
+        origin: str,
+        token: str,
+        expected_snapshot_digest: str,
+    ) -> dict[str, Any]:
+        """Fake workload pulling its inputs; the result is still fake-labelled evidence."""
+        if self.staging_parent is None:
+            raise ProviderError("Fake provider has no private input staging parent.")
+        try:
+            snapshot = fetch_snapshot(
+                origin,
+                token,
+                self.staging_parent,
+                expected_snapshot_digest=expected_snapshot_digest,
+                opener=self.input_opener,
+            )
+        except ValueError as error:
+            raise ProviderError("Fake provider input staging failed.") from error
+        staged = {
+            "provider_kind": self.kind,
+            "snapshot_digest": snapshot.snapshot_digest,
+            "file_count": snapshot.file_count,
+            "total_bytes": snapshot.total_bytes,
+        }
+        self.staged[lookup_key] = {**staged, "directory": str(snapshot.directory)}
+        return staged
 
     def submit(self, operation_id: str, lookup_key: str, idempotency_key: str) -> ProviderReceipt:
         self.submit_calls.append(operation_id)
@@ -112,6 +166,10 @@ class FakeProvider:
                 "provider_kind": self.kind,
                 "provider_version": self.version,
             }
+            if lookup_key in self.staged:
+                payload["staged_inputs"] = {
+                    key: self.staged[lookup_key][key] for key in ("snapshot_digest", "file_count")
+                }
             receipt = ProviderReceipt(
                 self.kind,
                 self.version,
@@ -171,10 +229,19 @@ class FakeProvider:
 class ProviderDispatch:
     """Persist fake submit intent/receipt before and after the provider side effect."""
 
-    def __init__(self, directory: Path, channel: Any, provider: Provider) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        channel: Any,
+        provider: Provider,
+        *,
+        input_origin: str | None = None,
+    ) -> None:
         self.path = Path(directory) / "provider-dispatch.sqlite3"
         self.channel = channel
         self.provider = provider
+        # Provider-visible control origin; input staging is off unless it is configured.
+        self.input_origin = input_origin
         with self._connect() as connection:
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS dispatches (
@@ -197,6 +264,7 @@ class ProviderDispatch:
                     raise ProviderError("Fake provider submit remains unresolved.")
                 receipt = observation.receipt
             else:
+                self._stage_inputs(operation, row)
                 self._mark_submit_intent(operation.operation_id)
                 receipt = self.provider.submit(
                     operation.operation_id,
@@ -205,6 +273,52 @@ class ProviderDispatch:
                 )
             self._store_receipt(operation.operation_id, receipt)
         self._deliver(operation.operation_id, receipt, "running", False)
+
+    def _stage_inputs(self, operation: CpuOperation, row: sqlite3.Row) -> None:
+        """Ticket then stage before submit.  The token lives only in this frame's memory.
+
+        A lost ticket response just re-requests; control revokes the older token.  The
+        journal records only the milestone and the pinned digest, never the token.
+        """
+        if (
+            self.input_origin is None
+            or operation.input_manifest_json is None
+            or not isinstance(self.provider, InputStagingProvider)
+        ):
+            return
+        digest = hashlib.sha256(operation.input_manifest_json.encode()).hexdigest()
+        self._journal(operation.operation_id, "provider_input_ticket_requested", digest)
+        try:
+            issued = self.channel.post(
+                f"/worker/external-operations/{operation.operation_id}/input-tickets",
+                {"lease_id": row["lease_id"], "expected_epoch": row["epoch"]},
+                # Issuance is not idempotent; control ignores this and mints a fresh token.
+                "provider-input-ticket-" + uuid.uuid4().hex,
+            )
+            token = issued["token"]
+            if issued.get("snapshot_digest") != digest:
+                raise ProviderError("Input ticket is bound to a different snapshot digest.")
+            self.provider.stage_inputs(
+                operation.operation_id, row["lookup_key"], self.input_origin, token, digest
+            )
+        except ProviderError:
+            raise
+        except Exception as error:
+            raise ProviderError("Provider input staging is unresolved.") from error
+        self._journal(operation.operation_id, "provider_inputs_staged", digest)
+
+    def _journal(self, operation_id: str, event: str, digest: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS input_staging_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL,
+                event TEXT NOT NULL, snapshot_digest TEXT NOT NULL, at TEXT NOT NULL)"""
+            )
+            connection.execute(
+                "INSERT INTO input_staging_journal (operation_id, event, snapshot_digest, at) "
+                "VALUES (?, ?, ?, ?)",
+                (operation_id, event, digest, datetime.now(UTC).isoformat()),
+            )
 
     def cancel(self, operation: CpuOperation, lease: Lease) -> None:
         """Dispatch cancellation only from the worker; control revocation is inert."""
@@ -434,6 +548,7 @@ class ProviderDispatch:
 
 __all__ = [
     "FakeProvider",
+    "InputStagingProvider",
     "Provider",
     "ProviderAccountingObservation",
     "ProviderDispatch",

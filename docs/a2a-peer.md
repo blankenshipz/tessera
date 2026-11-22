@@ -143,7 +143,7 @@ its processes. Do not point it at ports already owned by running services.
 - The optional reasoning bridge below now connects approved curated context to
   the real remote runtime seam; live dedicated-harness admission is still missing.
 - Parent: verify installed wheel/service packaging, full integration gate and
-  planner/MCP–critic/A2A journey. This lane tested the source module, not a wheel.
+  planner/MCP–critic/A2A journey. This review tested the source module, not a wheel.
 - No official interoperability test kit, another-language SDK, legacy 0.3,
   streaming or broad A2A conformance claim is made.
 

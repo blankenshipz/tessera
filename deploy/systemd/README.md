@@ -1,0 +1,70 @@
+# Example systemd units
+
+Example units for the long-running Tessera services. Every path here is a
+generic placeholder: `/etc/tessera` (configuration), `/var/lib/tessera` (state),
+`/opt/tessera/.venv` (virtualenv with Tessera installed) and a dedicated
+`tessera` user. Adjust them for your host. Nothing here contains a secret.
+
+| Unit | Runs |
+| --- | --- |
+| `tessera-development-poll.service` | `python -m tessera_worker.cli development-poll` (same as `tessera-worker development-poll`) |
+| `tessera-salad-executor.service` | `python -m tessera_control.campaign_salad_executor` |
+| `tessera-salad-guardian.service` | `python -m tessera_control.salad_safety_service --run` |
+| `tessera.target` | groups the three services |
+| `tessera-health-check@.service` + `tessera-health-check-*.timer` | optional freshness probes |
+
+The executor and guardian are also installed as the console scripts
+`tessera-salad-executor` and `tessera-salad-guardian` (the guardian still needs
+`--run`); the units use `python -m` so they pin the virtualenv interpreter. macOS
+hosts can use the launchd templates in `deploy/launchd/` (the poller has
+`deploy/worker/dev.tessera.worker.plist`). The services do not read these paths themselves: each
+`--config` file is a JSON settings file that you write (see
+`docs/campaign-providers.md`, `docs/salad-safety-service.md` and
+`docs/worker-deployment.md` for the fields), and credentials are separate
+owner-only files that the config names by path.
+
+## Spending money
+
+The Salad units spend money only when you supply Salad profiles, credentials
+and an approved campaign. Without them the executor refuses setup (exit 2) and
+the guardian prints an `unavailable` state; neither is restarted on that exit
+code. Review the spend-safety documents before enabling them. The guardian
+(`--run` is required; without it the program prints `disabled` and exits 0)
+should be running before the executor.
+
+## Install
+
+1. Create a dedicated user: `useradd --system --home-dir /var/lib/tessera tessera`.
+   The poller drives the host Docker daemon (root-equivalent); the unit adds the
+   `docker` group, so keep the user dedicated.
+2. Install Tessera into `/opt/tessera/.venv` and copy `tessera-health-check`
+   to `/opt/tessera/deploy/systemd/` if you use the probes.
+3. Create `/etc/tessera/*.json` configs and credential files, owner `tessera`,
+   mode `0600` (the services refuse group/world-readable private files).
+   Optional `/etc/tessera/<name>.env` files (`development-poll`,
+   `salad-executor`, `salad-guardian`; also `0600`) may hold non-secret
+   environment; the leading `-` in `EnvironmentFile=-` makes them optional.
+   Prefer `LoadCredential=` over environment variables for anything sensitive.
+4. Copy the `.service`, `.timer` and `.target` files to `/etc/systemd/system/`,
+   then `systemctl daemon-reload`.
+5. `systemctl enable --now tessera.target`. To run only part of it, start the
+   individual services instead.
+
+## Health and restarts
+
+`development-poll` and the executor accept `--health-file`; the units write it
+to `/var/lib/tessera/health/<name>.json` (schema `tessera.service-health.v1`,
+fields `state`, `last_loop_at`, `loops`, `consecutive_errors`). The file is
+written between steps, never during one, so a long Salad route step leaves it
+stale. The probe is therefore report-only: `tessera-health-check FILE MAX_AGE`
+exits 1 when the state is not `running` or the file is older than `MAX_AGE`
+(the unit uses 3600 seconds; set it above your longest step plus one poll
+interval). A failed probe appears in `systemctl --failed`; it never restarts a
+service. Enable with
+`systemctl enable --now tessera-health-check-development-poll.timer
+tessera-health-check-salad-executor.timer`.
+
+The guardian has no health file. Check it through its own authenticated
+endpoint as described in `docs/salad-safety-service.md`; `Restart=on-failure`
+covers crashes. Exit code 2 (configuration or prerequisite refused) is not
+retried (`RestartPreventExitStatus=2`).

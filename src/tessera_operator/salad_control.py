@@ -90,13 +90,17 @@ class SaladControl:
         except Exception:
             raise ControlUnavailable("control_projection_invalid") from None
 
-    def configure(self, organization, proposed_project, project, expected_revision, key):
+    def configure(
+        self, organization, proposed_project, project, expected_revision, key, billing_policy=None
+    ):
         # One operation, one identity. Never reload the file after verifying its
         # delegated authority: replacement with an owner token must not widen POST.
         # Pin locally, not on self, so independent/concurrent operations can reload.
         credential = self._credential()
         view = self._inspect(credential)
         spec = dict(view["record"]["spec"])
+        if billing_policy is not None:
+            spec["billing_policy"] = billing_policy
         spec.update(
             salad_organization=organization,
             salad_proposed_project=proposed_project,
@@ -162,6 +166,7 @@ def create_server(control):
         idempotency_key: str,
         proposed_project: str = "tessera-research",
         project: str | None = None,
+        billing_policy: dict | None = None,
     ) -> dict:
         """Revise metadata only. Persist key/exact arguments before calling; reuse on retry.
 
@@ -170,7 +175,12 @@ def create_server(control):
         """
         return guarded(
             lambda: control.configure(
-                organization, proposed_project, project, expected_revision, idempotency_key
+                organization,
+                proposed_project,
+                project,
+                expected_revision,
+                idempotency_key,
+                billing_policy,
             )
         )
 

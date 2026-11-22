@@ -52,6 +52,37 @@ def resolver(tmp_path):
 
 
 def fixture(tmp_path, monkeypatch, *, capability=True, safety=None, smoke=False):
+    from tessera_control.experiment_budgets import authorize_budget
+    from tessera_control.experiments import ExperimentStore
+
+    # Synthetic fixture authorizes a parent BEFORE native admitted-attempt creation;
+    # no post-hoc reservation fabrication or production authority issuance.
+    original_admit = ExperimentStore._admit_attempt_transaction
+
+    def budgeted_admit(store, db, actor, variant_id, body):
+        experiment_id = store._variant(db, actor, variant_id)["experiment_id"]
+        if not db.execute(
+            "SELECT 1 FROM experiment_budgets WHERE experiment_id=?", (experiment_id,)
+        ).fetchone():
+            authorize_budget(
+                db,
+                actor,
+                experiment_id,
+                dict(
+                    expected_revision=0,
+                    ceiling_cents=5000,
+                    expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                    evidence_digest="f" * 64,
+                    source_reference="synthetic-parent",
+                    prior_settled_cents=0,
+                    prior_pending_cents=0,
+                    ancillary_cents=500,
+                    shutdown_cents=1000,
+                ),
+            )
+        return original_admit(store, db, actor, variant_id, body)
+
+    monkeypatch.setattr(ExperimentStore, "_admit_attempt_transaction", budgeted_admit)
     execution = profile()
     if smoke:
         execution["argv_binding"] = "smoke_operation_v1"
@@ -303,6 +334,46 @@ def test_real_wire_composition_one_shot_pending_stop_and_reconnect(tmp_path, mon
     assert reconnect["receipts"] == stopped["receipts"]
     with pytest.raises(Conflict):
         restarted.dispatcher(h.route["id"]).dispatch(h.route["id"], "create")
+
+
+def test_created_group_still_pending_binds_identity_then_requires_stopped_read(
+    tmp_path, monkeypatch
+):
+    h = fixture(tmp_path, monkeypatch)
+    pending = copy.deepcopy(h.provider_group)
+    pending["current_state"]["status"] = "pending"
+    pending["pending_change"] = True
+    wire(h, *preflight(h, absent=True), (201, pending))
+    created = dispatch(h, "create")
+    assert created["provider_id"] == ID
+    assert created["provider_status"] == "unknown" and not created["termination_confirmed"]
+    assert created["receipts"][-1]["proxy_reason"] == "accepted_pending"
+    assert [b["operation"] for b in h.safety_calls] == ["reserve", "ready", "bind"]
+    wire(h, (200, h.provider_group), (200, h.provider_group), (200, {"instances": []}))
+    settled = dispatch(h, "observe")
+    assert settled["provider_status"] == "stopped" and settled["termination_confirmed"]
+    wire(h, *preflight(h, absent=False), (200, h.provider_group), (202, b""))
+    assert dispatch(h, "start")["receipts"][-1]["response_status"] == 202
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("pending_change", False),
+        ("status", "running"),
+    ],
+)
+def test_created_group_unsettled_otherwise_is_still_denied(tmp_path, monkeypatch, field, value):
+    h = fixture(tmp_path, monkeypatch)
+    pending = copy.deepcopy(h.provider_group)
+    pending["current_state"]["status"] = "pending"
+    pending["pending_change"] = True
+    if field == "status":
+        pending["current_state"]["status"] = value
+    else:
+        pending[field] = value
+    wire(h, *preflight(h, absent=True), (201, pending))
+    assert dispatch(h, "create")["receipts"][-1]["proxy_reason"] == "admission_denied"
 
 
 @pytest.mark.parametrize(
@@ -789,6 +860,7 @@ def test_real_independent_tls_service_custody_stop_reconnect(tmp_path, monkeypat
                     proposal=copy.deepcopy(admission["proposal"]),
                     routing_package=copy.deepcopy(admission["routing_package"]),
                     runtime_package=copy.deepcopy(admission["runtime_package"]),
+                    budget_binding=copy.deepcopy(admission["budget_binding"]),
                     deadline=admission["guardian_deadline"],
                 )
                 runtime = bad["runtime_package"]
@@ -812,13 +884,21 @@ def test_real_independent_tls_service_custody_stop_reconnect(tmp_path, monkeypat
                 assert database.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] == 0
             state = dispatch(h, "create")
             assert state["provider_id"] == ID and state["termination_confirmed"]
+            with sqlite3.connect(root / "custody" / "service.db") as database:
+                retained = json.loads(
+                    database.execute(
+                        "SELECT budget_binding FROM reservations WHERE operation=?",
+                        (h.body["operation_id"],),
+                    ).fetchone()[0]
+                )
+            assert retained == admission["budget_binding"]
+            assert "remaining_cents" not in retained  # recovery constraint, not parent ledger
             time.sleep(0.25)  # The real loop must not seal custody on stopped creation.
             assert safety.status(h.store.get(h.worker, state["id"]))["status"] == "armed"
             assert dispatch(h, "start")["receipts"][-1]["response_status"] == 202
             first = dispatch(h, "observe")
-            assert first["allocation_id"] == canonical_digest(
-                {"instance_id": "d" * 32, "machine_id": "c" * 32}
-            )
+            # Still creating: Salad may yet place it elsewhere, so nothing is bound.
+            assert first["allocation_id"] is None
             connection = http.client.HTTPConnection("127.0.0.1", provider_port, timeout=2)
             connection.request(
                 "POST",
@@ -828,7 +908,11 @@ def test_real_independent_tls_service_custody_stop_reconnect(tmp_path, monkeypat
             )
             assert connection.getresponse().status == 200
             connection.close()
-            assert not dispatch(h, "observe")["reallocated"]
+            running = dispatch(h, "observe")
+            assert not running["reallocated"]
+            assert running["allocation_id"] == canonical_digest(
+                {"instance_id": "d" * 32, "machine_id": "c" * 32}
+            )
             h.server.heartbeat(state["id"])
             signing = serialization.load_pem_private_key(
                 (root / "key.pem").read_bytes(), password=None
@@ -837,7 +921,10 @@ def test_real_independent_tls_service_custody_stop_reconnect(tmp_path, monkeypat
             payload.update(
                 salad_organization_name="fixture-org",
                 salad_workload_id=ID,
-                salad_workload_name=h.server.policy.target.selection.salad.group,
+                salad_workload_name="-".join(
+                    getattr(h.server.policy.target.selection.salad, field)
+                    for field in ("organization", "project", "group")
+                ),
             )
             token = signed(signing, payload)
             request = SaladSafetyService._request(
@@ -1020,7 +1107,7 @@ def test_exact_profile_serializes_pre_binding_shape_and_smoke_stays_explicit():
         SaladExecution.model_validate(legacy | {"argv_binding": "template"})
 
 
-def test_retained_legacy_exact_route_reopens_and_fake_dispatches_without_rehash(tmp_path):
+def test_retained_legacy_exact_route_reopens_without_rehash_but_spend_requires_budget(tmp_path):
     from test_salad_proxy import fixture as fake_fixture
 
     from tessera_control.remote_execution_models import RemoteExecutionPackage
@@ -1030,7 +1117,7 @@ def test_retained_legacy_exact_route_reopens_and_fake_dispatches_without_rehash(
 
     # At original admission (before human reviews), the exact serializer writes
     # precisely the old shape. No late DB edits, digest replacement or grants.
-    h = fake_fixture(tmp_path)
+    h = fake_fixture(tmp_path, budget=False)
     with sqlite3.connect(h.store.database_path) as database:
         original = json.loads(
             database.execute(
@@ -1066,10 +1153,311 @@ def test_retained_legacy_exact_route_reopens_and_fake_dispatches_without_rehash(
             h.policy.selection.target_digest: SaladProxyFakeAdapter(proxy, h.route["id"]),
         },
     )
-    assert dispatch(h, "create")["state"] == "stopped"
-    assert dispatch(h, "start")["state"] == "running"
+    with pytest.raises(Conflict, match="authoritative experiment reservation"):
+        dispatch(h, "create")
     state = h.store.get(h.worker, h.route["id"])
     assert state["proposal"] == original_proposal
     assert state["routing_package"] == original_package
     assert state["proposal_digest"] == original_digest
-    assert all(receipt["provenance"] == "synthetic" for receipt in state["receipts"])
+    assert not state["effects"] and not state["receipts"]
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("state", "fenced"),
+        ("prior_pending_cents", None),
+        ("expires_at", "2000-01-01T00:00:00Z"),
+        ("authorization_revision", 2),
+    ],
+)
+def test_parent_budget_fences_before_preflight_and_retains_hold(
+    tmp_path, monkeypatch, column, value
+):
+    from tessera_control.remote_execution_models import RemoteProposal
+
+    h = fixture(tmp_path, monkeypatch)
+    with sqlite3.connect(h.store.database_path) as db:
+        before = db.execute("SELECT held_cents FROM experiment_budget_reservations").fetchall()
+        db.execute(f"UPDATE experiment_budgets SET {column}=?", (value,))
+    with pytest.raises(Conflict):
+        h.store.preflight_authority(
+            h.worker, h.route["id"], RemoteProposal.model_validate(h.route["proposal"]), "create"
+        )
+    assert not h.safety_calls
+    with sqlite3.connect(h.store.database_path) as db:
+        assert (
+            db.execute("SELECT held_cents FROM experiment_budget_reservations").fetchall() == before
+        )
+
+
+def test_parent_budget_fenced_after_preflight_denies_claim_without_paid_effect(
+    tmp_path, monkeypatch
+):
+    h = fixture(tmp_path, monkeypatch)
+    resolve = h.server.resolver.resolve
+    count = 0
+
+    def resolve_then_fence(reference, version):
+        nonlocal count
+        count += 1
+        secret = resolve(reference, version)
+        if count == 2:
+            with sqlite3.connect(h.store.database_path) as db:
+                db.execute("UPDATE experiment_budgets SET state='fenced'")
+        return secret
+
+    monkeypatch.setattr(h.server.resolver, "resolve", resolve_then_fence)
+    factory = wire(h, *preflight(h, absent=True))
+    state = dispatch(h, "create")
+    assert state["receipts"][-1]["proxy_reason"] == "admission_denied"
+    assert len(factory.calls) == 4
+    assert not any(
+        method == "POST" and path.endswith("/containers") for method, path, _, _ in factory.calls
+    )
+
+
+def test_parent_fence_denies_start_but_cancel_stop_and_reconnect_preserve_hold(
+    tmp_path, monkeypatch
+):
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    dispatch(h, "create")
+    with sqlite3.connect(h.store.database_path) as db:
+        before = db.execute("SELECT held_cents FROM experiment_budget_reservations").fetchall()
+        db.execute("UPDATE experiment_budgets SET state='fenced'")
+    with pytest.raises(Conflict):
+        dispatch(h, "start")
+    command(h, "cancel")
+    wire(h, (200, h.provider_group), (200, h.provider_group), (202, b""))
+    assert dispatch(h, "stop")["cancellation"] == "pending"
+    restarted = RemoteExecutionStore(h.journey.state, policies=[h.server.policy.target])
+    assert restarted.get(h.worker, h.route["id"])["desired"] == "stop"
+    with sqlite3.connect(h.store.database_path) as db:
+        assert (
+            db.execute("SELECT held_cents FROM experiment_budget_reservations").fetchall() == before
+        )
+
+
+def test_readback_binds_allocation_only_once_instance_started():
+    from tessera_control.salad_proxy_contract import ProxyResult
+
+    def result(state, machine):
+        return ProxyResult(
+            status="observed",
+            reason="observed",
+            observation=dict(
+                provider_id=ID,
+                state="unknown",
+                observed_at="2026-11-18T00:00:00Z",
+                instances=[dict(instance_id="d" * 32, machine_id=machine, state=state)],
+            ),
+        )
+
+    fresh = dict(allocation_id=None)
+    # Salad trying a node while allocating is not an allocation (observed live).
+    assert TrustedSaladServer.readback(result("allocating", "e" * 32), fresh).allocation_id is None
+    running = TrustedSaladServer.readback(result("running", "f" * 32), fresh)
+    assert running.allocation_id and running.state == "unknown"
+    bound = dict(allocation_id=running.allocation_id)
+    # After binding, a different node in any state is a reallocation.
+    moved = TrustedSaladServer.readback(result("allocating", "e" * 32), bound)
+    assert moved.state == "unknown" and moved.allocation_id != running.allocation_id
+
+
+def test_clean_create_rejection_is_reported_and_kept_on_the_receipt(tmp_path, monkeypatch):
+    h = fixture(tmp_path, monkeypatch)
+    reported = []
+
+    def call(body, cap=16384):
+        reported.append(body)
+        return dict(status="reserved")
+
+    monkeypatch.setattr(h.server.safety, "_call", call)
+    problem = {
+        "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+        "title": "One or more validation errors occurred.",
+        "status": 400,
+        "detail": "storage_amount must be a whole number of GiB",
+        "errors": {"container.resources.storage_amount": ["value echoed"]},
+    }
+    headers = {"Content-Type": "application/problem+json"}
+    wire(h, *preflight(h, absent=True), (400, problem, headers))
+    state = dispatch(h, "create")
+    assert state["state"] == "unknown" and state["provider_id"] is None
+    receipt = state["receipts"][-1]
+    assert receipt["proxy_reason"] == "provider_rejected_request"
+    summary = dict(
+        status=400,
+        title=problem["title"],
+        detail=problem["detail"],
+        error_fields=["container.resources.storage_amount"],
+    )
+    assert receipt["provider_rejection"] == summary
+    assert "value echoed" not in json.dumps(state)
+    assert [b["operation"] for b in reported] == ["create_rejected"]
+    assert reported[0]["rejection"] == summary
+
+
+@pytest.mark.parametrize("reply", [(409, {"title": "Conflict", "status": 409}), (500, {})])
+def test_other_create_failures_are_not_reported_as_rejections(tmp_path, monkeypatch, reply):
+    h = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(h.server.safety, "_call", lambda *a, **k: pytest.fail("reported"))
+    wire(h, *preflight(h, absent=True), reply)
+    receipt = dispatch(h, "create")["receipts"][-1]
+    assert receipt["proxy_reason"] == "provider_unavailable"
+    assert receipt["provider_rejection"] is None
+
+
+def test_create_shape_limits_gate_create_but_never_strand_start(tmp_path, monkeypatch):
+    import tessera_control.salad_resources as resources
+
+    def refuse(**shape):
+        return "disk_mb", "storage outside a (tightened) documented limit"
+
+    # The create is refused before any reservation, credential or provider call.
+    for name in ("create", "start"):
+        (tmp_path / name).mkdir(mode=0o700)
+    h = fixture(tmp_path / "create", monkeypatch)
+    factory = wire(h)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(resources, "salad_resource_refusal", refuse)
+        with pytest.raises(Conflict, match="Salad resources refused"):
+            dispatch(h, "create")
+    assert not h.safety_calls and not factory.calls
+
+    # A group created under the old limits still starts after they tighten.
+    h = fixture(tmp_path / "start", monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    assert dispatch(h, "create")["provider_id"] == ID
+    monkeypatch.setattr(resources, "salad_resource_refusal", refuse)
+    wire(h, *preflight(h, absent=False), (200, h.provider_group), (202, b""))
+    assert dispatch(h, "start")["receipts"][-1]["response_status"] == 202
+
+
+# --- Guardian refusal codes on the trusted unix admin socket ------------------------------
+
+
+def _client_at_socket():
+    import socket
+    import tempfile
+
+    from tessera_control.salad_server import SaladSafetyClient
+
+    short = Path(tempfile.mkdtemp(prefix="gc", dir="/tmp"))  # AF_UNIX path length limit
+    short.chmod(0o700)
+    path = short / "g.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    path.chmod(0o600)
+    return SaladSafetyClient(path, service_uid=os.getuid()), listener, short
+
+
+@pytest.mark.parametrize(
+    ("reply", "code"),
+    [
+        ({"error": "request_rejected", "code": "guardian_loop_unready"}, "guardian_loop_unready"),
+        ({"error": "request_rejected", "code": "budget_binding_expired"}, "budget_binding_expired"),
+        ({"error": "request_rejected"}, "internal"),  # an older guardian sends no code
+        ({"error": "request_rejected", "code": "Free text /path 12"}, "internal"),
+        ({"error": "request_rejected", "code": 7}, "internal"),
+        ({"error": "request_rejected", "code": "a", "detail": "x"}, "internal"),
+        # "unavailable" is reserved for "no answer"; a guardian cannot claim it.
+        ({"error": "request_rejected", "code": "unavailable"}, "internal"),
+    ],
+)
+def test_client_raises_guardian_refused_with_bounded_code(reply, code):
+    from tessera_control.salad_server import (
+        GuardianRefused,
+        GuardianUnavailable,
+        guardian_refusal_code,
+    )
+
+    client, listener, short = _client_at_socket()
+    try:
+        client._socket_call = lambda body, before, cap: reply
+        with pytest.raises(GuardianRefused) as refused:
+            client.heartbeat(dict(id="route", proposal_digest="digest"))
+        assert refused.value.code == code and isinstance(refused.value, ValueError)
+        assert str(refused.value) == "independent service refused: " + code
+        assert guardian_refusal_code(refused.value) == code
+        assert not isinstance(refused.value, GuardianUnavailable)
+    finally:
+        listener.close()
+        (short / "g.sock").unlink()
+        short.rmdir()
+
+
+def test_client_transport_failures_stay_unavailable():
+    from tessera_control.salad_server import (
+        GuardianUnavailable,
+        SaladSafetyClient,
+        guardian_refusal_code,
+    )
+
+    client, listener, short = _client_at_socket()
+    try:
+        # Bound but not listening: connect is refused (OSError), not a refusal.
+        with pytest.raises(GuardianUnavailable, match="^independent service unavailable$") as gone:
+            client.heartbeat(dict(id="route", proposal_digest="digest"))
+        assert guardian_refusal_code(gone.value) == "unavailable"
+    finally:
+        listener.close()
+        (short / "g.sock").unlink()
+    missing = SaladSafetyClient(short / "g.sock", service_uid=os.getuid())
+    with pytest.raises(GuardianUnavailable):
+        missing.heartbeat(dict(id="route", proposal_digest="digest"))
+    short.rmdir()
+    assert guardian_refusal_code(ValueError("independent service not ready")) is None
+
+
+def test_control_heartbeat_records_guardian_refusal_code(tmp_path, monkeypatch):
+    from tessera_control.salad_server import GuardianRefused
+
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    state = dispatch(h, "create")
+
+    def refuse(body):
+        raise GuardianRefused("guardian_loop_unready")
+
+    monkeypatch.setattr(h.server.safety, "_exchange", refuse)
+    with pytest.raises(GuardianRefused):
+        h.server.heartbeat(state["id"])
+    record = h.server.input_log[-1]
+    assert record["event"] == "heartbeat_refused" and record["code"] == "guardian_loop_unready"
+    assert set(record) == {"route_id", "event", "code", "at"}
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "refused", "timeout"])
+def test_revoked_authority_stays_terminal_when_guardian_cancel_fails(
+    tmp_path, monkeypatch, failure
+):
+    from tessera_control.salad_server import (
+        GuardianRefused,
+        GuardianUnavailable,
+        guardian_refusal_code,
+    )
+
+    h = fixture(tmp_path, monkeypatch)
+    wire(h, *preflight(h, absent=True), (201, h.provider_group))
+    state = dispatch(h, "create")
+    command(h, "cancel")  # control authority revoked
+    attempts = []
+
+    def broken(body):
+        attempts.append(body["operation"])
+        if failure == "unavailable":
+            raise GuardianUnavailable()
+        if failure == "refused":
+            raise GuardianRefused("workload_verifier_unready")
+        raise TimeoutError("bounded live operation expired")
+
+    monkeypatch.setattr(h.server.safety, "_exchange", broken)
+    with pytest.raises((Conflict, Forbidden)) as revoked:
+        h.server.heartbeat(state["id"])
+    # The original authority failure survives; the driver sees no guardian code.
+    assert guardian_refusal_code(revoked.value) is None
+    assert attempts[0] == "cancel" and "heartbeat" not in attempts
+    events = [record["event"] for record in h.server.input_log]
+    assert "authority_cancel_failed" in events

@@ -89,6 +89,7 @@ class FakeEngine:
         self.running = True
         self.paused = False
         self.released = False
+        self.volumes = set()
 
     def preflight(self, p):
         self.calls.append("preflight")
@@ -101,6 +102,24 @@ class FakeEngine:
         if self.fault == "create":
             raise DockerReplyUnknown("SECRET_CANARY")
         return CID
+
+    def create_volume(self, p):
+        self.calls.append("create_volume")
+        if self.fault == "create_volume":
+            raise DockerReplyUnknown("SECRET_CANARY")
+        self.volumes.add(p.output_volume_name)
+        return dict(
+            Name=p.output_volume_name,
+            Driver="local",
+            Options=p.output_volume_options,
+            Labels=p.labels,
+        )
+
+    def remove_volume(self, p):
+        self.calls.append("remove_volume")
+        if self.fault == "remove_volume":
+            raise DockerReplyUnknown("SECRET_CANARY")
+        self.volumes.discard(p.output_volume_name)
 
     def namespace_preflight(self):
         self.calls.append("namespace_preflight")
@@ -259,8 +278,15 @@ def test_exact_security_arguments():
     ]:
         assert args[args.index(flag) + 1] == value
     assert "--read-only" in args
-    assert not set(args) & {"--mount", "--volume", "-v", "--env", "-e", "--privileged"}
-    assert args.count("--tmpfs") == 2
+    assert not set(args) & {"--volume", "-v", "--env", "-e", "--privileged"}
+    # /output is a volume, not a container tmpfs the daemon archive API cannot see.
+    assert args.count("--tmpfs") == 1 and set(tmpfs()) == {"/scratch"}
+    assert [a for a in args if a.startswith("--tmpfs")] == ["--tmpfs"]
+    assert args[args.index("--tmpfs") + 1].startswith("/scratch:")
+    assert args.count("--mount") == 1
+    assert args[args.index("--mount") + 1] == (
+        f"type=volume,src=tessera-local-out-{'2' * 64},dst=/output"
+    )
     assert all("nr_inodes=32" in value and "size=1048576" in value for value in tmpfs().values())
     assert args[args.index("--log-driver") + 1] == "local"
     assert [args[i + 1] for i, arg in enumerate(args) if arg == "--log-opt"] == [
@@ -270,7 +296,19 @@ def test_exact_security_arguments():
     ]
 
 
-def security_value():
+def volume_value(p=None):
+    p = p or plan()
+    return dict(
+        Name=p.output_volume_name,
+        Driver="local",
+        Scope="local",
+        Options=dict(p.output_volume_options),
+        Labels=dict(p.labels),
+    )
+
+
+def security_value(p=None):
+    p = p or plan()
     return dict(
         HostConfig=dict(
             NetworkMode="none",
@@ -292,11 +330,36 @@ def security_value():
                 Config={"max-size": "32k", "max-file": "1", "compress": "false"},
             ),
             SecurityOpt=["no-new-privileges=true"],
+            Mounts=[dict(Type="volume", Source=p.output_volume_name, Target="/output")],
         ),
-        Config=dict(User="65532:65532", Entrypoint=["/usr/local/bin/python"]),
-        Mounts=[],
+        Config=dict(
+            User="65532:65532", Entrypoint=["/usr/local/bin/python"], Labels=dict(p.labels)
+        ),
+        Mounts=[
+            dict(Type="tmpfs", Destination="/scratch"),
+            dict(
+                Type="volume",
+                Name=p.output_volume_name,
+                Destination="/output",
+                Driver="local",
+                RW=True,
+            ),
+        ],
         NetworkSettings=dict(Networks={"none": {}}),
     )
+
+
+def volume_engine(volume=None, calls=None):
+    """Engine whose only Docker reply is `volume inspect` (a plain dict, or None for error)."""
+    volume = volume_value() if volume is None else volume
+
+    def run(args, **kwargs):
+        if calls is not None:
+            calls.append(args)
+        assert args[:2] == ["volume", "inspect"], args
+        return json.dumps([volume]).encode()
+
+    return LocalDockerEngine(run)
 
 
 @pytest.mark.parametrize(
@@ -331,7 +394,7 @@ def security_value():
     ],
 )
 def test_readback_security_mutation_blocks(key, value):
-    engine = LocalDockerEngine(None)
+    engine = volume_engine()
     original = security_value()
     engine.verify_security(original)
     changed = copy.deepcopy(original)
@@ -341,7 +404,7 @@ def test_readback_security_mutation_blocks(key, value):
 
 
 def test_host_mount_or_root_user_readback_blocks():
-    engine = LocalDockerEngine(None)
+    engine = volume_engine()
     for change in [
         dict(Mounts=[dict(Type="bind", Destination="/inputs")]),
         dict(Config=dict(User="0", Entrypoint=["/usr/local/bin/python"])),
@@ -782,7 +845,7 @@ def test_real_supervisor_process_loss_recovery_has_no_resubmit(tmp_path):
         assert "created" in result["records"] and "start_intent" in result["records"]
         assert result["state"] == "unknown" and result["termination_confirmed"]
         assert result["records"]["terminal"]["observation"]["reason"] == "supervisor_restart"
-        assert engine.calls == ["kill", "inspect", "cleanup"]
+        assert engine.calls == ["kill", "inspect", "cleanup", "remove_volume"]
         assert result["cleanup_confirmed"]
     finally:
         parent.close()
@@ -817,3 +880,326 @@ def test_journal_failure_cannot_disable_independent_kill(tmp_path, failed_key):
         assert "SECRET_CANARY" not in json.dumps(journal.records())
     finally:
         journal.close()
+
+
+# ---------------------------------------------------------------- /output volume
+
+
+def test_volume_create_arguments_exact_options_and_labels():
+    from tessera_worker.local_docker_engine import output_volume_arguments
+
+    p = plan()
+    args = output_volume_arguments(p)
+    assert args[:4] == ["volume", "create", "--driver", "local"]
+    assert args[-1] == "tessera-local-out-" + "2" * 64 == p.output_volume_name
+    opts = [args[i + 1] for i, a in enumerate(args) if a == "--opt"]
+    assert opts == [
+        "type=tmpfs",
+        "device=tmpfs",
+        "o=size=1048576,nr_inodes=32,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev",
+    ]
+    labels = {
+        a.split("=", 1)[0]: a.split("=", 1)[1]
+        for a in (args[i + 1] for i, a in enumerate(args) if a == "--label")
+    }
+    assert labels == p.labels
+    assert labels["tessera.operation"] == p.operation_id
+    assert labels["tessera.output_volume"] == p.output_volume_name
+
+
+def test_volume_is_in_plan_digest_and_labels():
+    base = plan()
+    other = plan(nonce="3" * 64)
+    assert base.output_volume_name != other.output_volume_name
+    assert base.labels["tessera.output_volume"] == base.output_volume_name
+
+
+def test_volume_created_before_container_and_removed_after_cleanup(tmp_path):
+    report, engine, p = execute(tmp_path)
+    calls = engine.calls
+    assert calls.index("create_volume") < calls.index("create")
+    assert calls.index("cleanup") < calls.index("remove_volume")
+    assert calls.index("cp") < calls.index("remove_volume")
+    assert engine.volumes == set()
+    records = report["records"]
+    assert list(records).index("volume_intent") < list(records).index("volume_created")
+    assert list(records).index("volume_created") < list(records).index("create_intent")
+    created = records["volume_created"]["observation"]
+    assert created["volume"] == p.output_volume_name and created["driver"] == "local"
+    assert created["options"] == p.output_volume_options
+    assert records["stop_volume_removed"]["observation"]["volume_cleanup_confirmed"]
+    assert report["volume_created"] and report["volume_cleanup_confirmed"]
+    assert report["container_cleanup_confirmed"] and report["cleanup_confirmed"]
+    assert report["volume_name"] == p.output_volume_name
+    assert report["state"] == "completed"
+
+
+def test_failure_mode_still_reads_output_and_removes_volume(tmp_path):
+    report, engine, _ = execute(tmp_path, mode="failure")
+    assert "custody" in report["records"] and engine.volumes == set()
+    assert report["state"] == "failed" and report["cleanup_confirmed"]
+
+
+def test_volume_create_failure_blocks_before_container_and_attempts_removal(tmp_path):
+    report, engine, _ = execute(tmp_path, fault="create_volume")
+    assert "create" not in engine.calls and "start" not in engine.calls
+    assert "remove_volume" in engine.calls  # lost reply: exact-name removal, no retry
+    assert engine.calls.count("create_volume") == 1
+    assert report["state"] == "blocked" and report["volume_cleanup_confirmed"]
+
+
+def test_volume_remove_failure_is_unknown_not_cleanup(tmp_path):
+    report, _, _ = execute(tmp_path, fault="remove_volume")
+    assert "stop_volume_unknown" in report["records"]
+    assert report["container_cleanup_confirmed"] and not report["volume_cleanup_confirmed"]
+    assert not report["cleanup_confirmed"]
+    assert "SECRET_CANARY" not in json.dumps(report)
+
+
+def test_engine_create_volume_reads_back_and_rejects_wrong_name_or_options():
+    p = plan()
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["volume", "create"]:
+            return (p.output_volume_name + "\n").encode()
+        return json.dumps([volume_value(p)]).encode()
+
+    assert LocalDockerEngine(run).create_volume(p)["Name"] == p.output_volume_name
+    assert [c[:2] for c in calls] == [["volume", "create"], ["volume", "inspect"]]
+    assert not any("rm" in c or "prune" in c for c in calls)
+    with pytest.raises(DockerReplyUnknown):
+        LocalDockerEngine(lambda a, **k: b"someone-else\n").create_volume(p)
+    bad = volume_value(p)
+    bad["Options"]["o"] += ",exec"
+    with pytest.raises(BackendBlocked):
+        LocalDockerEngine(
+            lambda a, **k: (
+                p.output_volume_name.encode() if a[1] == "create" else json.dumps([bad]).encode()
+            )
+        ).create_volume(p)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda v: v["Options"].update(o="size=1073741824"),
+        lambda v: v["Options"].update(type="nfs"),
+        lambda v: v["Options"].update(device="/etc"),
+        lambda v: v["Options"].update(extra="x"),
+        lambda v: v.update(Driver="other"),
+        lambda v: v.update(Name="tessera-local-out-" + "9" * 64),
+        lambda v: v["Labels"].update({"tessera.operation": "foreign"}),
+        lambda v: v["Labels"].pop("tessera.nonce"),
+    ],
+)
+def test_verify_security_rejects_wrong_volume_readback(mutate):
+    bad = volume_value()
+    mutate(bad)
+    with pytest.raises(BackendBlocked):
+        volume_engine(bad).verify_security(security_value())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # extra mounts of any type
+        lambda v: v["Mounts"].append(dict(Type="bind", Destination="/host", Source="/")),
+        lambda v: v["Mounts"].append(
+            dict(Type="volume", Name="other", Destination="/x", Driver="local", RW=True)
+        ),
+        lambda v: v["Mounts"].append(dict(Type="tmpfs", Destination="/output")),
+        lambda v: v["Mounts"].append(dict(Type="tmpfs", Destination="/scratch")),
+        # the volume mount itself altered
+        lambda v: v["Mounts"][1].update(Name="other"),
+        lambda v: v["Mounts"][1].update(Destination="/scratch"),
+        lambda v: v["Mounts"][1].update(Driver="nfs"),
+        lambda v: v["Mounts"][1].update(RW=False),
+        lambda v: v["Mounts"].pop(1),
+        lambda v: v["HostConfig"].update(Mounts=[]),
+        lambda v: v["HostConfig"]["Mounts"][0].update(Source="other"),
+        lambda v: v["HostConfig"]["Mounts"][0].update(Target="/scratch"),
+        lambda v: v["HostConfig"]["Mounts"][0].update(ReadOnly=True),
+        lambda v: v["HostConfig"]["Mounts"][0].update(BindOptions=dict(Propagation="shared")),
+        lambda v: v["HostConfig"]["Mounts"][0].update(VolumeOptions=dict(Subpath="x")),
+        lambda v: v["HostConfig"]["Mounts"].append(dict(Type="bind", Source="/", Target="/host")),
+        lambda v: v["Config"]["Labels"].update({"tessera.output_volume": "evil"}),
+    ],
+)
+def test_verify_security_accepts_only_the_exact_output_volume(mutate):
+    engine = volume_engine()
+    good = security_value()
+    engine.verify_security(good)  # the exact volume + /scratch tmpfs is accepted
+    bad = copy.deepcopy(good)
+    mutate(bad)
+    with pytest.raises(BackendBlocked):
+        engine.verify_security(bad)
+
+
+def test_verify_security_reads_volume_via_inspect():
+    calls = []
+    volume_engine(calls=calls).verify_security(security_value())
+    assert calls == [["volume", "inspect", plan().output_volume_name]]
+    # A failed volume read is never treated as a pass.
+    engine = LocalDockerEngine(lambda a, **k: (_ for _ in ()).throw(DockerReplyUnknown()))
+    with pytest.raises(BackendBlocked):
+        engine.verify_security(security_value())
+
+
+def test_cp_out_reads_volume_content_not_container_tmpfs(tmp_path):
+    # The fake daemon serves /output only from a volume that exists at copy time.
+    p = plan()
+
+    class VolumeEngine(FakeEngine):
+        def run(self, args, **kwargs):
+            if args[0] == "cp":
+                assert args[1] == CID + ":/output" and p.output_volume_name in self.volumes
+                return archive()
+            return super().run(args, **kwargs)
+
+    engine = VolumeEngine(p)
+    journal = FixtureJournal(tmp_path / "journal")
+    clock = [0.0]
+    try:
+        report = supervise(
+            p,
+            journal,
+            engine,
+            lambda n: "heartbeat",
+            clock=lambda: clock[0],
+            sleep=lambda v: clock.__setitem__(0, clock[0] + v),
+        )
+    finally:
+        journal.close()
+    assert report["state"] == "completed"
+    assert report["records"]["custody"]["manifest_digest"]
+
+
+def engine_with_volumes(p, present):
+    """Real LocalDockerEngine over a fake daemon holding `present` volumes."""
+    calls = []
+    volumes = dict(present)
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["volume", "ls"]:
+            fragment = args[args.index("--filter") + 1].split("=", 1)[1]
+            # name= is a substring filter: other volumes may match and must not be removed.
+            return "".join(n + "\n" for n in volumes if fragment in n).encode()
+        if args[:2] == ["volume", "inspect"]:
+            return json.dumps([volumes[args[2]]]).encode()
+        if args[:2] == ["volume", "rm"]:
+            del volumes[args[2]]
+            return b""
+        pytest.fail("unexpected Docker command")
+
+    return LocalDockerEngine(run), volumes, calls
+
+
+def test_remove_volume_only_removes_exact_owned_volume():
+    p = plan()
+    lookalike = p.output_volume_name + "-suffix"
+    foreign = dict(volume_value(p), Name=lookalike)
+    engine, volumes, calls = engine_with_volumes(
+        p, {p.output_volume_name: volume_value(p), lookalike: foreign, "user-data": {}}
+    )
+    engine.remove_volume(p)
+    assert set(volumes) == {lookalike, "user-data"}
+    assert [c for c in calls if c[:2] == ["volume", "rm"]] == [
+        ["volume", "rm", p.output_volume_name]
+    ]
+    assert not any("--force" in c or "prune" in c or "-f" in c for c in calls)
+    # Absent after a successful list is confirmed without a destructive call.
+    before = len(calls)
+    engine.remove_volume(p)
+    assert all(c[:2] == ["volume", "ls"] for c in calls[before:])
+
+
+def test_remove_volume_refuses_foreign_labelled_same_name():
+    p = plan()
+    foreign = volume_value(p)
+    foreign["Labels"]["tessera.operation"] = "someone-else"
+    engine, volumes, calls = engine_with_volumes(p, {p.output_volume_name: foreign})
+    with pytest.raises(BackendBlocked):
+        engine.remove_volume(p)
+    assert p.output_volume_name in volumes
+    assert not any(c[:2] == ["volume", "rm"] for c in calls)
+
+
+def test_remove_volume_failed_listing_is_not_absence():
+    p = plan()
+
+    def run(args, **kwargs):
+        raise DockerReplyUnknown()
+
+    with pytest.raises(DockerReplyUnknown):
+        LocalDockerEngine(run).remove_volume(p)
+
+
+def test_recovery_removes_orphaned_exact_volume_and_leaves_others(tmp_path):
+    p = plan()
+    journal = FixtureJournal(tmp_path / "journal")
+    journal.claim(p)
+    journal.event("image", dict(image_id=IMAGE_ID))
+    # Supervisor died after creating the volume, before any create_intent.
+    journal.event("volume_intent", dict(volume=p.output_volume_name, options={}))
+    journal.close()
+    engine, volumes, calls = engine_with_volumes(
+        p,
+        {
+            p.output_volume_name: volume_value(p),
+            "tessera-local-out-" + "9" * 64: {},
+            "unrelated": {},
+        },
+    )
+    result = recover(tmp_path / "journal", LocalFixtureConfig(enabled=True), engine=engine)
+    assert set(volumes) == {"tessera-local-out-" + "9" * 64, "unrelated"}
+    assert result["volume_cleanup_confirmed"]
+    assert result["records"]["recovery_volume_removed"]["observation"]["volume_cleanup_confirmed"]
+    assert [c for c in calls if c[:2] == ["volume", "rm"]] == [
+        ["volume", "rm", p.output_volume_name]
+    ]
+
+
+def test_recovery_without_volume_intent_touches_no_volume(tmp_path):
+    p = plan()
+    journal = FixtureJournal(tmp_path / "journal")
+    journal.claim(p)
+    journal.close()
+    engine, volumes, calls = engine_with_volumes(p, {p.output_volume_name: volume_value(p)})
+    recover(tmp_path / "journal", LocalFixtureConfig(enabled=True), engine=engine)
+    assert calls == [] and p.output_volume_name in volumes
+
+
+def test_recovery_after_container_gone_still_removes_volume(tmp_path):
+    p = plan()
+    engine = FakeEngine(p)
+    journal = FixtureJournal(tmp_path / "journal")
+    try:
+        journal.claim(p)
+        journal.event("image", dict(image_id=IMAGE_ID))
+        journal.event("volume_intent", dict(volume=p.output_volume_name, options={}))
+        journal.event("create_intent", dict(container_name=p.name, image_id=IMAGE_ID))
+        journal.event("stop_cleanup", dict(container_id=CID, cleanup_confirmed=True))
+    finally:
+        journal.close()
+    result = recover(tmp_path / "journal", LocalFixtureConfig(enabled=True), engine=engine)
+    assert engine.calls == ["remove_volume"]  # no second container stop
+    assert result["cleanup_confirmed"] and result["volume_cleanup_confirmed"]
+    # Repeat recovery is idempotent.
+    again = recover(tmp_path / "journal", LocalFixtureConfig(enabled=True), engine=engine)
+    assert again["cleanup_confirmed"] and engine.calls == ["remove_volume"]
+
+
+def test_journal_records_volume_intent_and_removal_durably(tmp_path):
+    report, _, p = execute(tmp_path)
+    journal = FixtureJournal(tmp_path / "journal")
+    try:
+        records = journal.records()
+    finally:
+        journal.close()
+    assert records["volume_intent"]["observation"]["volume"] == p.output_volume_name
+    assert records["volume_created"]["observation"]["volume"] == p.output_volume_name
+    assert "stop_volume_intent" in records and "stop_volume_removed" in records
+    assert report["evidence_digest"]

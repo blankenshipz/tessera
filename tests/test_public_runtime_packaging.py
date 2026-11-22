@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import sys
@@ -20,9 +21,32 @@ from run_release_candidate_gates import GateInputError, source_inventory, source
 
 @pytest.fixture
 def bundle(tmp_path):
+    source = ROOT / "release/opencode-observer/runtime-v8"
+
+    def original_snapshot():
+        paths = [source, *sorted(source.rglob("*"))]
+        assert not any(path.is_symlink() for path in paths)
+        return [
+            (
+                path.relative_to(source).as_posix(),
+                path.stat().st_mode,
+                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
+            )
+            for path in paths
+        ]
+
+    before = original_snapshot()
     destination = tmp_path / "runtime-v8"
-    shutil.copytree(ROOT / "release/opencode-observer/runtime-v8", destination)
-    return destination
+    shutil.copytree(source, destination, symlinks=True)
+    # Entry addition/removal needs writable parent directories, not writable
+    # originals or every copied file. These are the only existing directories
+    # intentionally mutated by the inventory/symlink adversarial tests below.
+    for directory in (destination, destination / "runtime-deps"):
+        assert not directory.is_symlink()
+        assert directory.resolve().is_relative_to(tmp_path.resolve())
+        directory.chmod(directory.stat().st_mode | 0o300)
+    yield destination
+    assert original_snapshot() == before
 
 
 def test_actual_closed_bundle_schema_and_pins():
@@ -92,12 +116,15 @@ def test_schema_or_reviewed_identity_drift(bundle, field, value):
     path = bundle / "baseline.json"
     manifest = json.loads(path.read_text())
     manifest[field] = value
+    path.chmod(path.stat().st_mode | 0o200)
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError):
         validate(bundle)
 
 
 def test_dependency_byte_drift_denied(bundle):
+    path = bundle / "runtime-deps/bun.lock"
+    path.chmod(path.stat().st_mode | 0o200)
     (bundle / "runtime-deps/bun.lock").write_text("not approved lock")
     with pytest.raises(ValueError, match="pin"):
         validate(bundle)

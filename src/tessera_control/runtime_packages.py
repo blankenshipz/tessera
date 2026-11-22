@@ -6,6 +6,8 @@ import hashlib
 import json
 from typing import Any
 
+from .artifact_limits import operator_limits
+from .egress_models import EgressPolicy
 from .execution import ExecutionStore
 from .experiments import admitted_attempt_package_identity, bind_admitted_attempt_package
 from .migrations import plan_payload
@@ -57,7 +59,7 @@ class RuntimePackageStore(ExecutionStore):
             spec["network_enabled"] is not False
             or spec["pinned_skill_digests"]
             or spec["input_snapshot_digest"] != grant["snapshot_digest"]
-            or spec["max_output_bytes"] > 16 * 1024 * 1024
+            or spec["max_output_bytes"] > operator_limits().max_artifact_bytes
         ):
             raise Conflict("Execution plan exceeds the supported package capabilities.")
         if spec["profile"] == "local-cpu":
@@ -85,6 +87,10 @@ class RuntimePackageStore(ExecutionStore):
                 raise Conflict("Sandbox workload exceeds the fixed profile bounds.")
             adapter_version = "agent-sandbox-v1"
             profile_version = "agent-sandbox-network-none-v1"
+            if spec.get("egress") is not None:
+                if not spec["sandbox"]["target"].get("egress_proxy_image"):
+                    raise Conflict("Sandbox target does not pin an egress proxy image (ADR 0034).")
+                profile_version = "agent-sandbox-egress-allowlist-v1"
             operation_seed = "tessera-agent-sandbox-v1"
         else:
             raise Conflict("Execution profile is not supported by the package contract.")
@@ -109,6 +115,20 @@ class RuntimePackageStore(ExecutionStore):
             "pinned_image": grant["pinned_image"],
             "hard_expires_at": lease["hard_expires_at"],
         }
+        if spec["profile"] == "local-cpu":
+            # Explicit on every local-cpu package: absent egress is network-none.
+            if spec.get("egress") is None:
+                package["network_profile"] = "none"
+            else:
+                package["network_profile"] = "allowlist-proxy-v1"
+                package["egress"] = EgressPolicy.model_validate(spec["egress"]).model_dump(
+                    mode="json"
+                )
+        elif spec["profile"] == "agent-sandbox" and spec.get("egress") is not None:
+            package["network_profile"] = "allowlist-proxy-v1"
+            package["egress"] = EgressPolicy.model_validate(spec["egress"]).model_dump(mode="json")
+        elif spec.get("egress") is not None:
+            raise Conflict("Egress is supported only for local-cpu and agent-sandbox (ADR 0034).")
         if spec["profile"] == "kubernetes-opencode":
             try:
                 issued_at = _parse_utc(lease["issued_at"])

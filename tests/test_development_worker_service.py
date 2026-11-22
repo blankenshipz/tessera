@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from tessera_worker.service import (
     DevelopmentWorkerService,
     read_private_credential,
 )
+from tessera_worker.supervisor import SupervisorError
 
 
 class ApiChannel:
@@ -277,10 +279,17 @@ def test_disconnect_while_reporting_attempts_cancellation_and_retains_the_report
         max_ticks=1,
     )
 
-    assert service.run()["reason"] == "observation_report_failure"
+    result = service.run()
+    # Not a verdict: the observation stays in the durable outbox for the poller to redeliver.
+    assert (result["state"], result["reason"]) == (
+        "report_pending",
+        "observation_delivery_pending",
+    )
     assert adapter.calls.count("cancel") == 1
     with _connect(tmp_path / "worker" / "runtime" / "runtime-observations.sqlite3") as connection:
-        assert connection.execute("SELECT completed FROM reports").fetchone()[0] == 0
+        assert tuple(
+            connection.execute("SELECT completed, attempts, abandoned FROM reports").fetchone()
+        ) == (0, 1, 0)
     assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
 
 
@@ -312,7 +321,11 @@ def test_terminal_report_failure_still_attempts_cancellation_before_collection(t
         sleep=exit_operation,
     )
 
-    assert service.run()["reason"] == "observation_report_failure"
+    result = service.run()
+    assert (result["state"], result["reason"]) == (
+        "report_pending",
+        "observation_delivery_pending",
+    )
     assert adapter.calls.count("cancel") == 1
     assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
 
@@ -504,9 +517,11 @@ def test_restart_control_outage_cancels_boundedly_without_new_authority(tmp_path
     result = _service(tmp_path, state, grant, channel=channel, adapter=adapter).run()
 
     assert result == {
-        "state": "unknown",
+        "state": "report_pending",
         "quarantined": False,
-        "reason": "observation_report_failure",
+        "reason": "observation_delivery_pending",
+        "delivery_pending": True,
+        "retry_after_seconds": 2.0,
     }
     assert "/worker/leases" not in channel.paths
     assert adapter.calls.count("start") == 1
@@ -535,11 +550,485 @@ def test_revocation_or_disconnect_cancels_and_never_reclaims_uncertain_output(tm
         # is retained, while the undeclared/missing output stays unreclaimed.
         assert result["state"] == "unknown"
     else:
-        assert result == {
-            "state": "unknown",
-            "quarantined": False,
-            "reason": "observation_report_failure",
-        }
+        assert result["state"] == "report_pending"
+        assert result["reason"] == "observation_delivery_pending"
     assert adapter.calls.count("cancel") >= 1
     if failure == "disconnect":
         assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
+@pytest.mark.parametrize("with_path", [False, True])
+def test_collect_supervisor_error_reports_bounded_pathless_detail(tmp_path, monkeypatch, with_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    leaked = str(tmp_path / "outputs" / "secret-dir" / "out.bin")
+    message = f"cannot seal {leaked}\nsecond line " + "x" * 400 if with_path else "unsafe output"
+
+    def failing_collect(self, result, **kwargs):
+        raise SupervisorError(message)
+
+    monkeypatch.setattr(DevelopmentCpuRuntime, "collect", failing_collect)
+    adapter = FakeAdapter()
+
+    def exit_provider(_):
+        adapter.state = "exited"
+
+    service = _service(tmp_path, state, grant, adapter=adapter, max_ticks=5, sleep=exit_provider)
+    result = service.run()
+    assert result["reason"] == "quarantine_failed", result
+    assert result["state"] == "unknown"
+    assert result["quarantined"] is False
+    detail = result["detail"]
+    assert detail.startswith("SupervisorError: ")
+    assert len(detail) <= 200
+    assert "\n" not in detail
+    assert str(tmp_path) not in detail
+    assert "secret-dir" not in detail
+    assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
+def test_cli_surfaces_supervisor_error_as_bounded_diagnostic(tmp_path, monkeypatch, capsys):
+    from tessera_worker import cli
+
+    class Boom:
+        def __init__(self, config):
+            pass
+
+        def run(self):
+            raise SupervisorError(f"failed at {tmp_path}/x\nmore")
+
+    monkeypatch.setattr(cli, "DevelopmentWorkerService", Boom)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "tessera-worker", "development-run", "--control-url", "http://127.0.0.1:1",
+            "--grant-id", "g", "--credential-file", str(tmp_path / "c"),
+            "--workspace-root", str(tmp_path / "w"),
+            "--development-output-root", str(tmp_path / "o"), "--allowed-image", "img",
+        ],
+    )  # fmt: skip
+    assert cli.main() == 1
+    err = capsys.readouterr().err
+    assert err.startswith("development worker failed: SupervisorError: ")
+    assert str(tmp_path) not in err
+    assert "Traceback" not in err
+
+
+class _InspectingAdapter(FakeAdapter):
+    """FakeAdapter plus the docker-inspect seam the run receipt reads."""
+
+    def __init__(self):
+        super().__init__()
+        self.operation = None
+
+    def observe(self, operation):
+        self.operation = operation
+        return super().observe(operation)
+
+    def start(self, operation):
+        Path(operation.development_output.directory, "result.txt").write_text("synthetic output")
+        return super().start(operation)
+
+    def run(self, arguments):
+        from datetime import UTC, datetime, timedelta
+
+        self.now = getattr(self, "now", None) or datetime.now(UTC)  # stable, like Docker
+        now = self.now
+        stamp = lambda moment: moment.strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"  # noqa: E731
+        info = [
+            {
+                "Id": "container",
+                "Image": "sha256:" + "e" * 64,
+                "Config": {
+                    "Labels": {
+                        "tessera.operation": self.operation.operation_id,
+                        "tessera.plan": self.operation.plan_digest,
+                    }
+                },
+                "State": {
+                    "Status": "exited",
+                    "Running": False,
+                    "ExitCode": 0,
+                    "StartedAt": stamp(now - timedelta(milliseconds=2)),
+                    "FinishedAt": stamp(now - timedelta(milliseconds=1)),
+                },
+            }
+        ]
+        return SimpleNamespace(returncode=0, stdout=__import__("json").dumps(info), stderr="")
+
+
+class _ReceiptChannel(ApiChannel):
+    def __init__(self, state, fail=None):
+        super().__init__(state)
+        self.fail = fail
+        self.receipts: list[tuple[str, dict, str]] = []
+
+    def post(self, path, body, key):
+        if path.endswith("/run-receipt"):
+            self.receipts.append((path, body, key))
+            if self.fail is not None:
+                raise self.fail
+        return super().post(path, body, key)
+
+
+def _exit_after_start(adapter):
+    def provider(_):
+        adapter.state = "exited"
+
+    return provider
+
+
+def test_confirmed_exit_posts_one_observed_receipt_that_control_accepts(tmp_path):
+    from tessera_control.execution_run_receipts import ReportRunReceipt
+    from tessera_worker.run_receipt import canonical_json
+
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter, channel = _InspectingAdapter(), None
+    channel = _ReceiptChannel(state)
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=5,
+        sleep=_exit_after_start(adapter),
+    )
+    result = service.run()
+    assert result["state"] == "exited" and result["quarantined"] is True
+    assert result["run_receipt"]["status"] == "recorded"
+    assert len(channel.receipts) == 1
+    path, body, key = channel.receipts[0]
+    assert path.endswith("/run-receipt") and path.startswith("/worker/external-operations/")
+    ReportRunReceipt(**body)
+    import hashlib
+
+    canonical = canonical_json(body["receipt_payload"])
+    assert hashlib.sha256(canonical.encode()).hexdigest() == body["receipt_digest"]
+    assert str(tmp_path) not in canonical
+    assert body["provider_id"] == "container" and body["exit_code"] == 0
+    # Control verified this receipt against its own records (the post was a 201 and
+    # the run reported `recorded`); the cited output digest is control's manifest digest,
+    # not the worker's local seal digest.
+    import sqlite3 as _sqlite3
+
+    with _sqlite3.connect(state / "tessera.sqlite3") as connection:
+        (control_digest,) = connection.execute(
+            "SELECT manifest_digest FROM artifact_manifests"
+        ).fetchone()
+        (stored,) = connection.execute(
+            "SELECT output_digest FROM execution_run_receipts"
+        ).fetchone()
+    assert body["output_digest"] == control_digest == stored
+    assert body["receipt_payload"]["sealed_manifest_digest"] != control_digest
+    assert "output_manifest_digest" not in body["receipt_payload"]
+    # The receipt is posted after the exit observation and the sealed upload.
+    assert channel.paths.index("/worker/observations") < channel.paths.index(path)
+    assert channel.paths[-1] == path
+
+
+def test_receipt_key_is_stable_across_a_restart_after_a_lost_reply(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = _InspectingAdapter()
+    first_channel = _ReceiptChannel(state, fail=ConnectionError("lost reply"))
+    first = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=first_channel,
+        adapter=adapter,
+        max_ticks=5,
+        sleep=_exit_after_start(adapter),
+    )
+    assert first.run()["reason"] == "run_receipt_failed"
+    second_channel = _ReceiptChannel(state)
+    second = _service(tmp_path, state, grant, channel=second_channel, adapter=adapter)
+    result = second.run()
+    assert result["state"] == "exited" and result["run_receipt"]["status"] == "recorded"
+    # A lost reply is transient: the worker retries a bounded number of times with the SAME
+    # key and body, and the restart reuses that key, so control sees one logical request.
+    assert len(first_channel.receipts) == 3
+    assert {item[2] for item in first_channel.receipts} == {second_channel.receipts[0][2]}
+    assert {json.dumps(item[1], sort_keys=True) for item in first_channel.receipts} == {
+        json.dumps(second_channel.receipts[0][1], sort_keys=True)
+    }
+    assert adapter.calls.count("start") == 1
+
+
+@pytest.mark.parametrize("status", [409, 422, None])
+def test_control_refusal_keeps_custody_and_claims_nothing(tmp_path, status):
+    from tessera_worker.control_channel import ControlChannelError
+
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = _InspectingAdapter()
+    failure = (
+        ControlChannelError("control rejected " + str(tmp_path) + "x" * 400, status)
+        if status
+        else RuntimeError(f"boom {tmp_path}")
+    )
+    channel = _ReceiptChannel(state, fail=failure)
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=5,
+        sleep=_exit_after_start(adapter),
+    )
+    result = service.run()
+    assert result["state"] == "unknown" and result["quarantined"] is False
+    # A permanent control refusal (4xx) is terminal evidence; any other failure here is a
+    # non-retryable local fault that keeps the generic reason. Neither retries.
+    if status:
+        assert result["reason"] == "run_receipt_refused" and result["terminal"] is True
+    else:
+        assert result["reason"] == "run_receipt_failed" and "terminal" not in result
+    assert len(result["detail"]) <= 200 and str(tmp_path) not in result["detail"]
+    assert "receipt" not in result and "run_receipt" not in result
+    assert len(channel.receipts) == 1  # one attempt, no retry loop
+    assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
+
+
+def test_no_receipt_when_collection_fails_or_exit_is_unconfirmed(tmp_path, monkeypatch):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = _InspectingAdapter()
+    channel = _ReceiptChannel(state)
+    # Unconfirmed: the container never exits within the tick budget.
+    service = _service(tmp_path, state, grant, channel=channel, adapter=adapter, max_ticks=1)
+    assert service.run()["state"] == "unknown"
+    assert channel.receipts == []
+
+    def failing_collect(self, result, **kwargs):
+        raise SupervisorError("unsafe output")
+
+    monkeypatch.setattr(DevelopmentCpuRuntime, "collect", failing_collect)
+    (tmp_path / "second").mkdir()
+    state2, _, _, _, grant2 = _unleased_delivery(tmp_path / "second")
+    adapter2 = _InspectingAdapter()
+    channel2 = _ReceiptChannel(state2)
+    service2 = _service(
+        tmp_path / "second",
+        state2,
+        grant2,
+        channel=channel2,
+        adapter=adapter2,
+        max_ticks=5,
+        sleep=_exit_after_start(adapter2),
+    )
+    assert service2.run()["reason"] == "quarantine_failed"
+    assert channel2.receipts == []
+
+
+def test_adapter_without_an_inspect_seam_posts_no_receipt(tmp_path):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+
+    class OutputOnly(FakeAdapter):
+        def start(self, operation):
+            Path(operation.development_output.directory, "result.txt").write_text("x")
+            return super().start(operation)
+
+    adapter = OutputOnly()
+    channel = _ReceiptChannel(state)
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=5,
+        sleep=_exit_after_start(adapter),
+    )
+    result = service.run()
+    assert result["state"] == "exited" and "run_receipt" not in result
+    assert channel.receipts == []
+
+
+def test_stale_sealed_digest_from_another_operation_is_never_posted(tmp_path, monkeypatch):
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = _InspectingAdapter()
+    channel = _ReceiptChannel(state)
+    real_collect = DevelopmentCpuRuntime.collect
+
+    def collect_then_go_stale(self, result, **kwargs):
+        receipt = real_collect(self, result, **kwargs)
+        # A reused runtime would still hold the previous operation's digest.
+        self._sealed_operation_id = "operation_from_a_previous_run"
+        return receipt
+
+    monkeypatch.setattr(DevelopmentCpuRuntime, "collect", collect_then_go_stale)
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=5,
+        sleep=_exit_after_start(adapter),
+    )
+    result = service.run()
+    assert result["state"] == "unknown" and result["reason"] == "run_receipt_failed"
+    assert result["quarantined"] is False
+    assert channel.receipts == []
+
+
+class RenewalTimes(ApiChannel):
+    """Records the fake-clock time of every renewal request."""
+
+    def __init__(self, state, now):
+        super().__init__(state)
+        self.now = now
+        self.renewals: list[float] = []
+
+    def post(self, path, body, key):
+        if path == "/worker/leases/renew":
+            self.renewals.append(self.now[0])
+        return super().post(path, body, key)
+
+
+def _timed_service(tmp_path, state, grant, *, poll_seconds, max_ticks=12):
+    import dataclasses
+
+    now = [0.0]
+    sleeps: list[float] = []
+    channel = RenewalTimes(state, now)
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds + 0.5  # the requested sleep plus a control round trip
+
+    service = _service(tmp_path, state, grant, channel=channel, max_ticks=max_ticks, sleep=sleep)
+    service.config = dataclasses.replace(
+        service.config, renew_every_ticks=15, poll_seconds=poll_seconds
+    )
+    service.clock = lambda: now[0]
+    return service, channel, sleeps
+
+
+@pytest.mark.parametrize("poll_seconds", [2.0, 25.0])
+def test_running_operation_renews_on_elapsed_time_inside_the_lease(tmp_path, poll_seconds):
+    """Neither a 2 s poll with round trips nor a 25 s poll may let the 30 s lease lapse."""
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    service, channel, sleeps = _timed_service(tmp_path, state, grant, poll_seconds=poll_seconds)
+    assert service.run()["reason"] == "tick_limit_cancellation_requested"
+    times = channel.renewals
+    assert times[0] == 0.0 and len(times) >= 2
+    # Each renewal follows the previous one by at most the interval plus one round trip,
+    # far inside the 30 s lease; counting 15 ticks alone took 37.5 s at a 2 s poll.
+    assert max(b - a for a, b in zip(times, times[1:], strict=False)) <= 10.5
+    assert max(sleeps) <= 10.0
+
+
+def test_recovered_lease_is_renewed_before_the_first_sleep(tmp_path):
+    """recover() resumes a lease that may have seconds left; it is renewed at once."""
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    adapter = FakeAdapter()
+    _crashed_running_service(tmp_path, state, grant, adapter)
+    now = [0.0]
+    channel = RenewalTimes(state, now)
+    renewals_seen_at_sleep: list[int] = []
+    service = _service(
+        tmp_path,
+        state,
+        grant,
+        channel=channel,
+        adapter=adapter,
+        max_ticks=2,
+        sleep=lambda _seconds: renewals_seen_at_sleep.append(len(channel.renewals)),
+    )
+    service.clock = lambda: now[0]
+    service.run()
+    assert "/worker/leases" not in channel.paths  # recovered, never re-leased
+    assert renewals_seen_at_sleep and renewals_seen_at_sleep[0] >= 1
+
+
+def test_renewal_interval_must_stay_inside_the_lease(tmp_path):
+    import dataclasses
+
+    from tessera_worker.service import DevelopmentWorkerError
+
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    service = _service(tmp_path, state, grant)
+
+    for bad in (0, 25):
+        with pytest.raises((DevelopmentWorkerError, ValueError)):
+            dataclasses.replace(service.config, renew_after_seconds=bad)
+
+
+@pytest.mark.parametrize(
+    ("configured", "default", "expected"),
+    [(None, "1001:1002", "1001:1002"), (None, None, None), ("2000:2001", "1001:1002", "2000:2001")],
+)
+def test_service_builds_the_adapter_with_the_operator_or_platform_container_user(
+    tmp_path, monkeypatch, configured, default, expected
+):
+    import dataclasses
+
+    from tessera_worker import service as service_module
+
+    state, _, _, _, grant, _ = _delivery(tmp_path)
+    built = {}
+
+    class Capture:
+        def __init__(self, *args, **kwargs):
+            built.update(kwargs)
+            raise RuntimeError("stop after adapter construction")
+
+    monkeypatch.setattr(service_module, "DockerCpuAdapter", Capture)
+    monkeypatch.setattr(service_module, "default_container_user", lambda: default)
+    service = _service(tmp_path, state, grant)
+    service.config = dataclasses.replace(service.config, container_user=configured)
+    service.adapter = None
+    with pytest.raises(RuntimeError, match="stop after"):
+        service.run()
+    assert built["container_user"] == expected
+    assert built["allow_root_container_user"] is False
+
+
+def test_a_fresh_grant_workspace_heartbeats_with_new_keys_and_refreshes_liveness(tmp_path):
+    """The poller gives each grant a new workspace under one credential: no key replays."""
+    import shutil
+
+    state, _, _, _, grant = _unleased_delivery(tmp_path)
+    channel = ApiChannel(state)
+    first = _service(tmp_path, state, grant, channel=channel)
+    first._heartbeat()
+    shutil.rmtree(tmp_path / "worker")  # the next grant starts in a fresh workspace
+    with _connect(state / "tessera.sqlite3") as connection:
+        connection.execute("UPDATE worker_registry SET last_seen_at='2000-01-01T00:00:00Z'")
+
+    second = _service(tmp_path, state, grant, channel=channel)
+    second._heartbeat()
+
+    heartbeat_keys = [key for path, key in channel.keys if path == "/worker/heartbeat"]
+    assert len(heartbeat_keys) == 2 and heartbeat_keys[0] != heartbeat_keys[1]
+    with _connect(state / "tessera.sqlite3") as connection:
+        seen = connection.execute("SELECT last_seen_at FROM worker_registry").fetchone()[0]
+    assert seen > "2026"  # a real beat, not a replay of the earlier stored response
+
+
+def test_same_workspace_replays_a_pending_heartbeat_key_across_journal_instances(tmp_path):
+    from tessera_worker.service import HeartbeatIntentJournal
+
+    root = tmp_path / "journal"
+    root.mkdir(mode=0o700)
+    first = HeartbeatIntentJournal(root).key()
+    assert HeartbeatIntentJournal(root).key() == first  # restart before complete(): replay
+    HeartbeatIntentJournal(root).complete()
+    assert HeartbeatIntentJournal(root).key() != first  # after complete(): a new beat
+
+
+def test_a_missing_journal_id_row_is_recreated_without_reusing_old_keys(tmp_path):
+    import sqlite3
+
+    from tessera_worker.service import HeartbeatIntentJournal
+
+    root = tmp_path / "journal"
+    root.mkdir(mode=0o700)
+    journal = HeartbeatIntentJournal(root)
+    first = journal.key()
+    journal.complete()
+    with sqlite3.connect(root / "heartbeats.sqlite3") as connection:
+        connection.execute("DELETE FROM heartbeat_journal")
+    reopened = HeartbeatIntentJournal(root)
+    assert reopened.journal_id and reopened.journal_id != journal.journal_id
+    assert reopened.key() != first

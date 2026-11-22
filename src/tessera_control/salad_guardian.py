@@ -20,6 +20,16 @@ from pathlib import Path
 
 from .salad_custody import CustodyBinding, SaladCustody, private_database
 
+# Guardian event kind prefix recording why a tick first decided to stop.
+STOP_CAUSE_PREFIX = "stop_cause:"
+RECONCILE_OPERATOR = "operator_reconciled_exact_group_stopped"
+RECONCILE_PROVIDER = "provider_confirmed_exact_group_stopped"
+# reason -> guardian event kind
+RECONCILE_REASONS = {
+    RECONCILE_OPERATOR: "operator_reconciled",
+    RECONCILE_PROVIDER: "provider_confirmed_stop",
+}
+
 
 @dataclass(frozen=True)
 class GuardianAssignment:
@@ -34,6 +44,16 @@ class GuardianAssignment:
     heartbeat_seconds: float = 30
     poll_seconds: float = 5
     stop_retry_seconds: float = 30
+    # Billed-time bound: Salad bills only while an instance runs. When set, the
+    # run is also stopped at first-seen-running + running_seconds; ``deadline``
+    # stays the outer (provisioning/route) bound and is the only bound while
+    # the instance has never been seen running.
+    running_seconds: float | None = None
+
+    def effective_deadline(self, first_running):
+        if self.running_seconds is None or first_running is None:
+            return self.deadline
+        return min(self.deadline, first_running + self.running_seconds)
 
     def serialized(self):
         self.binding.key()
@@ -59,7 +79,16 @@ class GuardianAssignment:
             )
         ):
             raise ValueError("invalid_deadline")
-        return json.dumps(asdict(self), sort_keys=True)
+        if self.running_seconds is not None and (
+            type(self.running_seconds) not in {int, float}
+            or not math.isfinite(self.running_seconds)
+            or self.running_seconds <= 0
+        ):
+            raise ValueError("invalid_deadline")
+        data = asdict(self)
+        if self.running_seconds is None:
+            del data["running_seconds"]  # keep pre-existing stored assignments stable
+        return json.dumps(data, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -107,12 +136,14 @@ class SaladGuardian:
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(assignments)")}
         if "assigned_allocation" not in columns:
             self.db.execute("ALTER TABLE assignments ADD COLUMN assigned_allocation TEXT")
+        if "first_running" not in columns:
+            self.db.execute("ALTER TABLE assignments ADD COLUMN first_running REAL")
         # Every process recovery is stop-only, even if a prior owner died before
         # recording an effect. Never renew running authority from saved state.
         with self.db:
             self.db.execute(
                 "UPDATE assignments SET stopping=1,reason='guardian_restart' "
-                "WHERE status!='stopped'"
+                "WHERE status NOT IN ('stopped','reconciled')"
             )
 
     def close(self):
@@ -164,6 +195,49 @@ class SaladGuardian:
                 (operation,),
             )
 
+    def complete(self, operation: str):
+        """Stop as soon as the single approved output is retained.
+
+        A one-shot workload exits after upload; Salad then keeps the replica
+        count by scheduling a replacement instance,
+        which would be a second, unapproved allocation. Stopping on retention
+        closes that window. Like cancel, this can only start a stop.
+        """
+        with self.db:
+            self.db.execute(
+                "UPDATE assignments SET stopping=1,reason='output_retained' "
+                "WHERE operation=? AND stopping=0 AND status!='stopped'",
+                (operation,),
+            )
+
+    def reconcile(self, operation: str, *, reason: str = RECONCILE_OPERATOR):
+        """Close the orphan exposure of an uncertain operation the provider reports stopped.
+
+        The guardian never self-confirms termination after an allocation change
+        (a provider readback cannot prove node-local writer death), so it never
+        seals custody here. The provider's own read IS authoritative for what it
+        runs and bills: once the service has freshly observed the exact group
+        stopped with zero instances, the spend exposure is closed. The service does
+        that automatically (RECONCILE_PROVIDER) or an operator does it with an
+        attestation (RECONCILE_OPERATOR). The result is "reconciled", never
+        "stopped": allocation uncertainty stays recorded, custody is not sealed or
+        released, and no acceptance follows from it.
+        """
+        if reason not in RECONCILE_REASONS:
+            raise ValueError("reconcile_reason")
+        with self.db:
+            changed = self.db.execute(
+                "UPDATE assignments SET status='reconciled',orphan=0,reason=? "
+                "WHERE operation=? AND stopping=1 AND status NOT IN ('stopped','reconciled')",
+                (reason, operation),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("reconcile_not_applicable")
+            self.db.execute(
+                "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                (operation, self.clock(), RECONCILE_REASONS[reason]),
+            )
+
     def status(self, operation: str) -> dict:
         row = self.db.execute(
             "SELECT status,reason,orphan,allocation_uncertain,manifest "
@@ -172,9 +246,15 @@ class SaladGuardian:
         ).fetchone()
         if not row:
             raise ValueError("assignment_missing")
+        cause = self.db.execute(
+            "SELECT kind FROM events WHERE operation=? AND substr(kind,1,?)=? "
+            "ORDER BY sequence LIMIT 1",
+            (operation, len(STOP_CAUSE_PREFIX), STOP_CAUSE_PREFIX),
+        ).fetchone()
         return dict(
             status=row[0],
             reason=row[1],
+            stop_cause=cause[0][len(STOP_CAUSE_PREFIX) :] if cause else None,
             orphan=bool(row[2]),
             allocation_uncertain=bool(row[3]),
             manifest=json.loads(row[4]) if row[4] else None,
@@ -187,7 +267,7 @@ class SaladGuardian:
     def tick(self, operation: str) -> dict:
         row = self.db.execute(
             "SELECT assignment,heartbeat,last_poll,next_stop,stopping,status,allocation_uncertain,"
-            "assigned_allocation "
+            "assigned_allocation,first_running "
             "FROM assignments WHERE operation=?",
             (operation,),
         ).fetchone()
@@ -197,12 +277,13 @@ class SaladGuardian:
         data["binding"] = CustodyBinding(**data["binding"])
         a = GuardianAssignment(**data)
         now = self.clock()
-        if row[5] == "stopped":
+        first_running = row[8]
+        if row[5] in {"stopped", "reconciled"}:
             return self.status(operation)
         reason = None
         if now < row[2] or now < row[1]:
             reason = "clock_uncertain"
-        elif now >= a.deadline:
+        elif now >= a.effective_deadline(first_running):
             reason = "deadline"
         elif now - row[1] >= a.heartbeat_seconds:
             reason = "control_disconnect"
@@ -219,7 +300,19 @@ class SaladGuardian:
             # Real callbacks finish after poll entry. Compare their receipt to
             # the completion clock, not the earlier frozen poll-start time.
             now = self.clock()
-            if now >= a.deadline:
+            if (
+                first_running is None
+                and isinstance(o, ProviderObservation)
+                and o.state == "running"
+            ):
+                first_running = now
+                with self.db:
+                    self.db.execute(
+                        "UPDATE assignments SET first_running=? "
+                        "WHERE operation=? AND first_running IS NULL",
+                        (now, operation),
+                    )
+            if now >= a.effective_deadline(first_running):
                 reason, stopping = "deadline", True
             elif now - row[1] >= a.heartbeat_seconds:
                 reason, stopping = "control_disconnect", True
@@ -263,6 +356,13 @@ class SaladGuardian:
                 "WHERE operation=?",
                 (now, int(stopping), int(uncertain), operation),
             )
+            if stopping and not row[4] and reason:
+                # Durable cause of this guardian's own stop decision: the reason column
+                # is overwritten later (e.g. exact_terminal_and_sealed), this is not.
+                self.db.execute(
+                    "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                    (operation, now, STOP_CAUSE_PREFIX + reason),
+                )
             if reason:
                 self.db.execute(
                     "UPDATE assignments SET reason=? WHERE operation=?", (reason, operation)

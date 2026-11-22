@@ -5,11 +5,13 @@ import json
 import socket
 import sqlite3
 import subprocess
+from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+from salad_budget_fixture import budgeted_admission
 from test_kubernetes_dispatch import _service
 from test_kubernetes_execution import _admitted_package, _cluster, _FakeKubernetes
 from test_program_interactions import ProgramJourney
@@ -39,11 +41,15 @@ def setup_route(
     start=True,
     agent_proposal=False,
     salad_execution=None,
+    budget=True,
 ):
-    response, worker, package = _admitted_package(
-        tmp_path,
-        argv=[salad_execution["command"], *salad_execution["argv"]] if salad_execution else None,
-    )
+    with budgeted_admission() if budget and target.startswith("salad") else nullcontext():
+        response, worker, package = _admitted_package(
+            tmp_path,
+            argv=(
+                [salad_execution["command"], *salad_execution["argv"]] if salad_execution else None
+            ),
+        )
     base = response["package"]
     journey = ProgramJourney(
         tmp_path,
@@ -553,3 +559,30 @@ def test_held_restore_retains_route_history_but_cannot_mutate_or_replay(tmp_path
                 proposal_digest=state["proposal_digest"],
             ),
         )
+
+
+def test_effect_budget_scales_with_window_and_is_clamped():
+    from tessera_control.remote_execution import effect_budget
+
+    assert effect_budget(60) == 128
+    assert effect_budget(3500) == 382  # 350 observes at 10 s + 32 slack
+    # A 45-minute pre-start at the driver's backed-off 30 s interval fits with room to spare.
+    assert effect_budget(3500) >= 2700 // 30 + 4 + 32
+    assert effect_budget(10**6) == 1024
+
+
+def test_observe_budget_enforced_at_derived_bound_and_one_shot_effects_stay_single(tmp_path):
+    from tessera_control.remote_execution import effect_budget
+
+    h = setup_route(tmp_path)
+    bound = effect_budget(h.route["proposal"]["selection"]["resources"]["max_seconds"])
+    dispatch(h, "create")
+    dispatch(h, "start")
+    for _ in range(bound - 2):
+        dispatch(h, "observe")
+    assert len(h.store.get(h.journey.actor, h.route["id"])["effects"]) == bound
+    with pytest.raises(Conflict, match="budget exhausted"):
+        dispatch(h, "observe")
+    for action in ("create", "start"):
+        with pytest.raises(Conflict):
+            dispatch(h, action)

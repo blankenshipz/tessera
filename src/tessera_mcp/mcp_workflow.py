@@ -20,6 +20,7 @@ from tessera_control.models import (
 )
 from tessera_control.research_models import CreateStudy
 from tessera_mcp.client import ControlClient, segment
+from tessera_mcp.dispatch_profiles import DispatchProfile
 
 
 def notebook_path(
@@ -126,7 +127,7 @@ class Dispatch(StrictRequest):
     attempt_id: NonBlank200
     expected_revision: StrictRevision
     target_digest: Sha256Digest
-    profile_version: Literal["development-minikube-opencode-v1"]
+    profile_version: DispatchProfile
 
 
 class AttemptStatus(StrictRequest):
@@ -249,6 +250,18 @@ def register_workflow(server, client: ControlClient):
     ) -> dict[str, Any]:
         """Propose project, study or experiment for human review, not canonical creation."""
         return await submit("agent-workflow-proposals", payload, idempotency_key)
+
+    @server.tool(annotations=read)
+    async def tessera_list_research_proposals(offset: int = 0, limit: int = 20) -> dict[str, Any]:
+        """List own study/project/experiment proposals, not legacy task-plan proposals."""
+        return await client._request(
+            "GET", client._collection("agent-workflow-proposals", offset, limit)
+        )
+
+    @server.tool(annotations=read)
+    async def tessera_read_research_proposal(proposal_id: str) -> dict[str, Any]:
+        """Read own immutable research proposal and promotion state; never approve or execute."""
+        return await client._request("GET", f"/agent-research-proposals/{segment(proposal_id)}")
 
     @server.tool(annotations=write)
     async def tessera_record_observation(

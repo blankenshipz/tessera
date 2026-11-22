@@ -5,10 +5,19 @@ bound request bodies before materializing bytes. Tickets are bearer secrets: nev
 log them. SQLite stores bytes atomically, not workload-selected filesystem paths.
 Sealing revokes every writer before checking inventory; it is NOT proof that a
 provider's node-local writers died, nor permission for scientific release.
+
+Two writer shapes share one inventory. The original single-object path issues a
+bearer ticket and stores one blob. Chunked output custody (ADR 0036 phase 3)
+binds each upload to an inventory's declared outputs: the first chunk of a name
+reserves its declared size and sha256 against the per-file and total caps, every
+chunk has a fixed offset, length and sha256, and a file is complete only when its
+streamed whole-file sha256 matches. Chunks are stored as parts; nothing is ever
+assembled in memory.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -18,6 +27,11 @@ import stat
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
+
+from .salad_workload_contract import OUTPUT_CHUNK_BYTES, OUTPUT_NAME_RE, output_chunk_count
+
+# Chunk calls an inventory accepts: twice its planned chunks plus a fixed slack.
+CHUNK_RETRY_SLACK = 16
 
 
 def private_database(path: Path) -> sqlite3.Connection:
@@ -47,6 +61,9 @@ def private_database(path: Path) -> sqlite3.Connection:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA journal_mode=DELETE")
     return db
+
+
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 @dataclass(frozen=True)
@@ -88,12 +105,35 @@ class SaladCustody:
                 binding TEXT, name TEXT, checksum TEXT, size INTEGER, data BLOB,
                 PRIMARY KEY(binding, name));
             CREATE TABLE IF NOT EXISTS closed_scopes (scope TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS parts (
+                binding TEXT, name TEXT, seq INTEGER, checksum TEXT, data BLOB,
+                PRIMARY KEY(binding, name, seq));
         """)
+        # Additive, idempotent upgrades of an existing private store.
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(inventories)")}
         if "expected_files" not in columns:
             self.db.execute("ALTER TABLE inventories ADD COLUMN expected_files INTEGER DEFAULT 0")
+        if "outputs" not in columns:
+            self.db.execute("ALTER TABLE inventories ADD COLUMN outputs TEXT")
+        if "chunk_calls" not in columns:
+            self.db.execute("ALTER TABLE inventories ADD COLUMN chunk_calls INTEGER DEFAULT 0")
+        if "chunked" not in {r[1] for r in self.db.execute("PRAGMA table_info(files)")}:
+            self.db.execute("ALTER TABLE files ADD COLUMN chunked INTEGER NOT NULL DEFAULT 0")
 
-    def register(self, binding: CustodyBinding, *, byte_cap: int, file_cap: int, expected_files=0):
+    def register(
+        self,
+        binding: CustodyBinding,
+        *,
+        byte_cap: int,
+        file_cap: int,
+        expected_files=0,
+        outputs=None,
+    ):
+        """Create the inventory once. ``outputs`` declares exact names and per-file caps.
+
+        With declared outputs every file must be one of them, within its own cap,
+        and the inventory is complete only when all of them are retained.
+        """
         key = binding.key()
         if type(byte_cap) is not int or not 0 <= byte_cap <= 64 * 1024 * 1024:
             raise ValueError("invalid_byte_cap")
@@ -101,13 +141,24 @@ class SaladCustody:
             raise ValueError("invalid_file_cap")
         if type(expected_files) is not int or not 0 <= expected_files <= file_cap:
             raise ValueError("invalid_expected_files")
+        declared = None
+        if outputs is not None:
+            declared = self._declared(outputs)
+            if (
+                expected_files != len(declared)
+                or file_cap != len(declared)
+                or sum(declared.values()) > byte_cap
+            ):
+                raise ValueError("invalid_declared_outputs")
+            declared = json.dumps(sorted(declared.items()), separators=(",", ":"))
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             existing = self.db.execute(
-                "SELECT byte_cap,file_cap,expected_files FROM inventories WHERE binding=?", (key,)
+                "SELECT byte_cap,file_cap,expected_files,outputs FROM inventories WHERE binding=?",
+                (key,),
             ).fetchone()
             if existing:
-                if existing != (byte_cap, file_cap, expected_files):
+                if existing != (byte_cap, file_cap, expected_files, declared):
                     raise ValueError("inventory_mismatch")
                 return
             if self.db.execute(
@@ -115,9 +166,9 @@ class SaladCustody:
             ).fetchone():
                 raise ValueError("operation_closed")
             self.db.execute(
-                "INSERT OR IGNORE INTO inventories(binding,byte_cap,file_cap,expected_files) "
-                "VALUES(?,?,?,?)",
-                (key, byte_cap, file_cap, expected_files),
+                "INSERT OR IGNORE INTO inventories(binding,byte_cap,file_cap,expected_files,"
+                "outputs) VALUES(?,?,?,?,?)",
+                (key, byte_cap, file_cap, expected_files, declared),
             )
             if self.db.execute(
                 "SELECT byte_cap,file_cap FROM inventories WHERE binding=?", (key,)
@@ -147,10 +198,14 @@ class SaladCustody:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT byte_cap,file_cap,closed FROM inventories WHERE binding=?", (key,)
+                "SELECT byte_cap,file_cap,closed,outputs FROM inventories WHERE binding=?", (key,)
             ).fetchone()
             if not row or row[2]:
                 raise ValueError("inventory_closed_or_missing")
+            if row[3] is not None:
+                declared = dict(json.loads(row[3]))
+                if name not in declared or size > declared[name]:
+                    raise ValueError("output_undeclared_or_oversize")
             reserved = self.db.execute(
                 "SELECT COALESCE(SUM(size),0),COUNT(*) FROM tickets WHERE binding=?", (key,)
             ).fetchone()
@@ -180,12 +235,236 @@ class SaladCustody:
             if len(data) != row[2] or hashlib.sha256(data).hexdigest() != row[1]:
                 raise ValueError("integrity_mismatch")
             self.db.execute(
-                "INSERT INTO files VALUES(?,?,?,?,?)", (key, row[0], row[1], row[2], data)
+                "INSERT INTO files(binding,name,checksum,size,data) VALUES(?,?,?,?,?)",
+                (key, row[0], row[1], row[2], data),
             )
             self.db.execute(
                 "UPDATE tickets SET consumed=1 WHERE digest=?",
                 (hashlib.sha256(token.encode()).hexdigest(),),
             )
+
+    @staticmethod
+    def _declared(outputs) -> dict:
+        declared = {}
+        if not isinstance(outputs, list) or not 1 <= len(outputs) <= 16:
+            raise ValueError("invalid_declared_outputs")
+        for item in outputs:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"name", "max_bytes"}
+                or not isinstance(item["name"], str)
+                or not OUTPUT_NAME_RE.fullmatch(item["name"])
+                or type(item["max_bytes"]) is not int
+                or not 1 <= item["max_bytes"] <= 64 * 1024 * 1024
+                or item["name"] in declared
+            ):
+                raise ValueError("invalid_declared_outputs")
+            declared[item["name"]] = item["max_bytes"]
+        return declared
+
+    @staticmethod
+    def _upload_digest(key: str, name: str) -> str:
+        """Ticket-table key of a chunked reservation. No bearer token exists for it."""
+        return hashlib.sha256(f"chunked\0{key}\0{name}".encode()).hexdigest()
+
+    def put_chunk(
+        self,
+        binding: CustodyBinding,
+        *,
+        name: str,
+        checksum: str,
+        size: int,
+        seq: int,
+        chunk_sha256: str,
+        data: bytes,
+        expires: float,
+    ) -> dict:
+        """Store one chunk of a declared output; idempotent per (name, seq).
+
+        The caller has already authenticated the bound workload and checked its
+        deadline. The first chunk of a name reserves its declared size and sha256
+        against the per-file and total caps; later chunks must repeat them exactly.
+        A chunk is exactly the declared slice length with a matching sha256, so no
+        byte beyond the declared caps is ever stored. When the last chunk lands, the
+        whole file is re-hashed from its parts; a mismatch discards that file's parts
+        (the reservation stays, so the same declaration can be retried within the
+        chunk budget). Returns completion of the file and of all declared outputs.
+        """
+        key = binding.key()
+        if (
+            not isinstance(name, str)
+            or not isinstance(checksum, str)
+            or not _hex64(checksum)
+            or not isinstance(chunk_sha256, str)
+            or not _hex64(chunk_sha256)
+            or type(size) is not int
+            or size < 0
+            or (size == 0 and checksum != _EMPTY_SHA256)  # impossible: fail fast
+            or type(seq) is not int
+            or type(data) is not bytes
+            or len(data) > OUTPUT_CHUNK_BYTES
+            or type(expires) not in {int, float}
+        ):
+            raise ValueError("invalid_chunk")
+        upload = self._upload_digest(key, name)
+        # The retry budget is charged in its own committed transaction, before any
+        # validation, so refused calls (conflicts, replays) still consume it.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT closed,outputs,chunk_calls FROM inventories WHERE binding=?", (key,)
+            ).fetchone()
+            if not row or row[0] or row[1] is None:
+                raise ValueError("inventory_closed_or_missing")
+            declared = dict(json.loads(row[1]))
+            budget = 2 * sum(output_chunk_count(cap) for cap in declared.values())
+            if row[2] >= budget + CHUNK_RETRY_SLACK:
+                raise ValueError("chunk_budget_exhausted")
+            self.db.execute(
+                "UPDATE inventories SET chunk_calls=chunk_calls+1 WHERE binding=?", (key,)
+            )
+        failed = False
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT byte_cap,file_cap,closed,outputs FROM inventories WHERE binding=?", (key,)
+            ).fetchone()
+            if not row or row[2] or row[3] is None:
+                raise ValueError("inventory_closed_or_missing")
+            declared = dict(json.loads(row[3]))
+            if name not in declared or size > declared[name]:
+                raise ValueError("output_undeclared_or_oversize")
+            ticket = self.db.execute(
+                "SELECT digest,checksum,size,consumed FROM tickets WHERE binding=? AND name=?",
+                (key, name),
+            ).fetchone()
+            if ticket is None:
+                reserved = self.db.execute(
+                    "SELECT COALESCE(SUM(size),0),COUNT(*) FROM tickets WHERE binding=?", (key,)
+                ).fetchone()
+                if reserved[0] + size > row[0] or reserved[1] + 1 > row[1]:
+                    raise ValueError("output_cap")
+                self.db.execute(
+                    "INSERT INTO tickets(digest,binding,name,checksum,size,expires) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (upload, key, name, checksum, size, float(expires)),
+                )
+                ticket = (upload, checksum, size, 0)
+            if ticket[:3] != (upload, checksum, size):
+                raise ValueError("upload_mismatch")
+            chunks = output_chunk_count(size)
+            if not 0 <= seq < chunks:
+                raise ValueError("chunk_out_of_range")
+            offset = seq * OUTPUT_CHUNK_BYTES
+            if (
+                len(data) != min(OUTPUT_CHUNK_BYTES, size - offset)
+                or hashlib.sha256(data).hexdigest() != chunk_sha256
+            ):
+                raise ValueError("chunk_integrity_mismatch")
+            stored = self.db.execute(
+                "SELECT checksum FROM parts WHERE binding=? AND name=? AND seq=?",
+                (key, name, seq),
+            ).fetchone()
+            if stored is not None and stored[0] != chunk_sha256:
+                raise ValueError("chunk_conflict")
+            if stored is None and not ticket[3]:
+                self.db.execute(
+                    "INSERT INTO parts(binding,name,seq,checksum,data) VALUES(?,?,?,?,?)",
+                    (key, name, seq, chunk_sha256, data),
+                )
+                have = self.db.execute(
+                    "SELECT COUNT(*) FROM parts WHERE binding=? AND name=?", (key, name)
+                ).fetchone()[0]
+                if have == chunks:
+                    if self._parts_digest(key, name, size) == checksum:
+                        self.db.execute(
+                            "INSERT INTO files(binding,name,checksum,size,data,chunked) "
+                            "VALUES(?,?,?,?,?,1)",
+                            (key, name, checksum, size, b""),
+                        )
+                        self.db.execute("UPDATE tickets SET consumed=1 WHERE digest=?", (upload,))
+                    else:
+                        self.db.execute("DELETE FROM parts WHERE binding=? AND name=?", (key, name))
+                        failed = True
+            done = self.db.execute("SELECT COUNT(*) FROM files WHERE binding=?", (key,))
+            done = done.fetchone()[0]
+            file_done = self.db.execute(
+                "SELECT 1 FROM files WHERE binding=? AND name=?", (key, name)
+            ).fetchone()
+        if failed:
+            raise ValueError("integrity_mismatch")
+        return dict(file_complete=bool(file_done), outputs_complete=done == len(declared))
+
+    def chunk_ack(
+        self,
+        binding: CustodyBinding,
+        *,
+        name: str,
+        checksum: str,
+        size: int,
+        seq: int,
+        chunk_sha256: str,
+        data: bytes,
+    ) -> dict:
+        """Read-only acknowledgement of an exact replay of an already stored chunk.
+
+        For a lost final response only: the file must be complete under the same
+        declaration and the replayed bytes must equal the stored part. Nothing is
+        written, reopened or charged here; works on a closed inventory.
+        """
+        key = binding.key()
+        if (
+            not isinstance(name, str)
+            or not isinstance(checksum, str)
+            or not isinstance(chunk_sha256, str)
+            or type(size) is not int
+            or type(seq) is not int
+            or type(data) is not bytes
+            or not 0 <= seq < output_chunk_count(max(size, 0))
+            or len(data) != min(OUTPUT_CHUNK_BYTES, size - seq * OUTPUT_CHUNK_BYTES)
+            or hashlib.sha256(data).hexdigest() != chunk_sha256
+        ):
+            raise ValueError("chunk_unavailable")
+        row = self.db.execute("SELECT outputs FROM inventories WHERE binding=?", (key,)).fetchone()
+        ticket = self.db.execute(
+            "SELECT digest,checksum,size,consumed FROM tickets WHERE binding=? AND name=?",
+            (key, name),
+        ).fetchone()
+        part = self.db.execute(
+            "SELECT checksum FROM parts WHERE binding=? AND name=? AND seq=?", (key, name, seq)
+        ).fetchone()
+        if (
+            not row
+            or row[0] is None
+            or ticket != (self._upload_digest(key, name), checksum, size, 1)
+            or part != (chunk_sha256,)
+        ):
+            raise ValueError("chunk_unavailable")
+        done = self.db.execute("SELECT COUNT(*) FROM files WHERE binding=?", (key,)).fetchone()[0]
+        return dict(file_complete=True, outputs_complete=done == len(json.loads(row[0])))
+
+    def _parts_digest(self, key: str, name: str, size: int):
+        """Stream a chunked file's parts in order; None unless every part is intact."""
+        digest, total, expected_seq = hashlib.sha256(), 0, 0
+        for seq, checksum, data in self.db.execute(
+            "SELECT seq,checksum,data FROM parts WHERE binding=? AND name=? ORDER BY seq",
+            (key, name),
+        ):
+            data = bytes(data)
+            if seq != expected_seq or hashlib.sha256(data).hexdigest() != checksum:
+                return None
+            expected_seq += 1
+            total += len(data)
+            digest.update(data)
+        if expected_seq != output_chunk_count(size) or total != size:
+            return None
+        return digest.hexdigest()
+
+    def _file_intact(self, key: str, name: str, checksum: str, size: int, data, chunked: int):
+        if chunked:
+            return self._parts_digest(key, name, size) == checksum
+        data = bytes(data)
+        return len(data) == size and hashlib.sha256(data).hexdigest() == checksum
 
     def close_writers(self, binding: CustodyBinding):
         """Close every output/checkpoint writer in the exact operation epoch."""
@@ -232,26 +511,38 @@ class SaladCustody:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT manifest,expected_files FROM inventories WHERE binding=?", (key,)
+                "SELECT manifest,expected_files,outputs FROM inventories WHERE binding=?", (key,)
             ).fetchone()
             if not row:
                 raise ValueError("inventory_missing")
             if row[0]:
                 return json.loads(row[0])
             entries = []
-            for name, checksum, size, data in self.db.execute(
-                "SELECT name,checksum,size,data FROM files WHERE binding=? ORDER BY name", (key,)
-            ):
-                if len(data) != size or hashlib.sha256(data).hexdigest() != checksum:
+            rows = self.db.execute(
+                "SELECT name,checksum,size,chunked FROM files WHERE binding=? ORDER BY name", (key,)
+            ).fetchall()
+            for name, checksum, size, chunked in rows:
+                data = None
+                if not chunked:
+                    data = self.db.execute(
+                        "SELECT data FROM files WHERE binding=? AND name=?", (key, name)
+                    ).fetchone()[0]
+                if not self._file_intact(key, name, checksum, size, data, chunked):
                     raise ValueError("stored_integrity_mismatch")
                 entries.append(dict(name=name, sha256=checksum, bytes=size))
             pending = self.db.execute(
                 "SELECT COUNT(*) FROM tickets WHERE binding=? AND consumed=0", (key,)
             ).fetchone()[0]
+            complete = pending == 0 and len(entries) >= row[1]
+            if row[2] is not None:
+                # Declared outputs: complete only with exactly the declared set.
+                complete = complete and [e["name"] for e in entries] == sorted(
+                    dict(json.loads(row[2]))
+                )
             manifest = dict(
                 binding=asdict(binding),
                 files=entries,
-                complete=pending == 0 and len(entries) >= row[1],
+                complete=complete,
                 writers_closed=True,
                 quarantine=True,
             )
@@ -268,7 +559,7 @@ class SaladCustody:
         """Read-only verified quarantine metadata; does not close any writer."""
         key = binding.key()
         row = self.db.execute(
-            "SELECT f.data,f.checksum,f.size,i.byte_cap,i.file_cap FROM files f "
+            "SELECT f.data,f.checksum,f.size,i.byte_cap,i.file_cap,f.chunked FROM files f "
             "JOIN inventories i ON i.binding=f.binding WHERE f.binding=? AND f.name=?",
             (key, name),
         ).fetchone()
@@ -285,10 +576,8 @@ class SaladCustody:
         totals = self.db.execute(
             "SELECT COALESCE(SUM(size),0),COUNT(*) FROM files WHERE binding=?", (key,)
         ).fetchone()
-        data = bytes(row[0])
         if (
-            len(data) != row[2]
-            or hashlib.sha256(data).hexdigest() != row[1]
+            not self._file_intact(key, name, row[1], row[2], row[0], row[5])
             or totals[0] > row[3]
             or totals[1] > row[4]
         ):
@@ -296,15 +585,89 @@ class SaladCustody:
         result.update(retained=True, sha256=row[1], bytes=row[2])
         return result
 
+    def retained_outputs(self, binding: CustodyBinding):
+        """Read-only per-declared-output progress; None for an undeclared inventory.
+
+        Reports completed files (name, sha256, bytes) and the declared names. It
+        does not rehash: seal and import verify the bytes. No writer is closed.
+        """
+        key = binding.key()
+        row = self.db.execute("SELECT outputs FROM inventories WHERE binding=?", (key,)).fetchone()
+        if not row or row[0] is None:
+            return None
+        declared = sorted(dict(json.loads(row[0])))
+        files = [
+            dict(name=name, sha256=checksum, bytes=size)
+            for name, checksum, size in self.db.execute(
+                "SELECT name,checksum,size FROM files WHERE binding=? ORDER BY name", (key,)
+            )
+        ]
+        return dict(
+            binding=asdict(binding),
+            declared=declared,
+            files=files,
+            complete=[f["name"] for f in files] == declared,
+            quarantine=True,
+        )
+
+    def uploaded_chunked(self, binding: CustodyBinding) -> bool:
+        """Whether any retained file arrived through chunked upload."""
+        return bool(
+            self.db.execute(
+                "SELECT 1 FROM files WHERE binding=? AND chunked=1", (binding.key(),)
+            ).fetchone()
+        )
+
+    def read_chunk(self, binding: CustodyBinding, name: str, seq: int) -> dict:
+        """Server-authenticated chunked import of one sealed file; never a release.
+
+        Serves only a file listed in the sealed manifest, one OUTPUT_CHUNK_BYTES
+        slice at a time, with its sha256. The importer verifies the whole file.
+        """
+        key = binding.key()
+        row = self.db.execute(
+            "SELECT f.data,f.chunked,f.size,f.checksum,i.manifest FROM files f "
+            "JOIN inventories i ON i.binding=f.binding WHERE f.binding=? AND f.name=?",
+            (key, name),
+        ).fetchone()
+        if not row or not row[4] or type(seq) is not int:
+            raise ValueError("retained_file_unavailable")
+        entry = next((e for e in json.loads(row[4])["files"] if e["name"] == name), None)
+        if entry is None or (entry["sha256"], entry["bytes"]) != (row[3], row[2]):
+            raise ValueError("stored_integrity_mismatch")
+        if not 0 <= seq < output_chunk_count(row[2]):
+            raise ValueError("retained_file_unavailable")
+        if row[1]:
+            part = self.db.execute(
+                "SELECT checksum,data FROM parts WHERE binding=? AND name=? AND seq=?",
+                (key, name, seq),
+            ).fetchone()
+            if not part:
+                raise ValueError("stored_integrity_mismatch")
+            data = bytes(part[1])
+            if hashlib.sha256(data).hexdigest() != part[0]:
+                raise ValueError("stored_integrity_mismatch")
+        else:
+            offset = seq * OUTPUT_CHUNK_BYTES
+            data = bytes(row[0])[offset : offset + OUTPUT_CHUNK_BYTES]
+        if len(data) != min(OUTPUT_CHUNK_BYTES, row[2] - seq * OUTPUT_CHUNK_BYTES):
+            raise ValueError("stored_integrity_mismatch")
+        return dict(
+            name=name,
+            seq=seq,
+            sha256=hashlib.sha256(data).hexdigest(),
+            content_base64=base64.b64encode(data).decode("ascii"),
+        )
+
     def read_retained(self, binding: CustodyBinding, name: str) -> bytes:
         """Server-authenticated import seam; no ticket grants read/release authority."""
         key = binding.key()
         row = self.db.execute(
-            "SELECT f.data,i.manifest FROM files f JOIN inventories i ON i.binding=f.binding "
-            "WHERE f.binding=? AND f.name=?",
+            "SELECT f.data,i.manifest,f.chunked FROM files f "
+            "JOIN inventories i ON i.binding=f.binding WHERE f.binding=? AND f.name=?",
             (key, name),
         ).fetchone()
-        if not row or not row[1]:
+        if not row or not row[1] or row[2]:
             raise ValueError("retained_file_unavailable")
         data = bytes(row[0])
         manifest = json.loads(row[1])
@@ -312,3 +675,7 @@ class SaladCustody:
         if len(data) != entry["bytes"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
             raise ValueError("stored_integrity_mismatch")
         return data
+
+
+def _hex64(value: str) -> bool:
+    return len(value) == 64 and all(c in "0123456789abcdef" for c in value)
