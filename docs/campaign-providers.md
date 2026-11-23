@@ -259,6 +259,39 @@ event: `source: default_policy`, `class`, `signals`, `kinds`, `spec_order`, `ord
 `default_policy` block under `placement_preference` (enabled, thresholds, and per stage the
 class, signals, order and whether it applies).
 
+### Image pull-size preflight
+
+A node on interruptible capacity can be rescheduled while a very large image is still being pulled,
+and the attempt is lost with it. An operator may state a ceiling on a stage image's compressed pull
+size per provider:
+
+- `max_image_pull_bytes`: an integer from 1 up to 2^50, or `null` for no ceiling. It defaults to
+  `null` (off) for `local-docker` and every `self_hosted` provider, and to 4 GiB (4294967296) for a
+  Salad campaign profile (set it to `null` there to turn the check off).
+- `strict_image_pull`: a boolean, `false` by default; it needs a ceiling. When true, an image known
+  to be over the ceiling is refused at placement instead of warned about.
+- Salad profiles may also record `image_pull_sizes`, a map from an allowed image digest to its
+  compressed size in bytes. Other sources register through `campaign_image_pull.register_size_resolver`
+  or a provider's optional `image_pull_bytes(stage)` hook. Nothing contacts a registry.
+
+Each placed or started attempt on a provider with a ceiling records an `image_pull_preflight`
+section (a `campaign.image_pull_preflight` event, the campaign status stage entry, and each
+attempt in the receipt): `status` (`within_limit`, `over_limit`, `refused`, `unknown`), `reason`,
+`size_bytes`, `limit_bytes` (integers; `size_bytes` is null when unknown) and `strict`. The reasons
+are closed: `image_pull_over_limit` (a warning, or the refusal when strict) and
+`image_size_unknown` (recorded only; an unknown size is never refused or warned about). A strict
+refusal is the permanent placement reason `image_pull_refused`, checked after the licence and trust
+refusals and before any wait; a stage with one provider ends as `image_pull_refused`, unless its
+inputs are refused for trust or licence labels, which it then reports instead
+(`input_not_admitted`).
+
+Before dispatch, the spec dry run (`POST /projects/{p}/campaign-specs/validate`,
+`tessera_validate_campaign_spec`) shows the same check as a plan: each stage entry carries an
+`image_pull_preflight` list with one section per candidate provider that has a ceiling, in
+candidate order, each naming its `provider_id`. A `refused` entry there means placement would
+refuse that candidate. The list is absent when no candidate has a ceiling, and the dry run records
+nothing.
+
 ### Heavy-stage placement guard
 
 Contract: [ADR 0107](decisions/0107-heavy-stage-placement-guard.md). When a heavy stage is placed
@@ -802,3 +835,13 @@ Frames already in flight across an upgrade keep the verdict digest the earlier e
 recorded. A later `stopped` read still settles them, but that frame's verdict digest then differs
 from the `record_digest` on the receipt's `guardian_record`; the receipt still names the read that
 was made. New frames take the read's digest as their verdict digest.
+
+## Optional hook: image pull size
+
+A provider may implement `image_pull_size_bytes(stage) -> int | None`, the total compressed layer size
+of the stage image from its registry manifest. It is read once when an attempt is granted, outside the
+database transaction, and waited on for at most 10 seconds; a read still running then is abandoned
+(a reader that calls a registry should still set its own network timeout). Its absence, a timeout, a
+`None` result, a non-positive or implausible value, or any exception is recorded on the attempt
+receipt as a null size with a closed reason (see
+[campaigns.md](campaigns.md#runtime-image-provenance)). The result is never used for admission.

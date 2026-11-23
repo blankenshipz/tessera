@@ -32,6 +32,7 @@ from pydantic import ValidationError
 from . import campaign_heavy_guard as heavy_guard
 from . import campaign_hold, provider_trust
 from . import campaign_holdout as holdout
+from . import campaign_image_pull as image_pull
 from . import campaign_placement as placement
 from . import execution_frames as frames
 from . import late_bound_inputs as late_bound
@@ -130,6 +131,7 @@ from .execution import reconcile_grant_row
 from .experiment_budgets import budget_status
 from .external_operations import current_operation_reconciliation
 from .grant_release import campaign_actor, release_expired_terminal_grants
+from .image_provenance import IMAGE_PROVENANCE_EVENT, image_provenance
 from .provider_fetch_record import OUTPUT_NAME as PROVIDER_FETCH_OUTPUT
 from .remote_execution_models import TargetPolicy
 from .snapshot_composition import composed_inventory
@@ -1606,6 +1608,9 @@ class CampaignRunner:
         if not base.has_candidates or (
             not base.alternates and not placement.reroute_due(base, self._attempts(ctx, key))
         ):
+            refused = self._image_pull_preflight(ctx, key, base)
+            if refused is not None:
+                return refused
             verdict = self._single_provider_guard(ctx, key, base)
             if verdict != "go":
                 return verdict == "failed"
@@ -1640,6 +1645,41 @@ class CampaignRunner:
         if progress != "ready":
             return progress == "progress"
         return self._reserve(ctx, key)
+
+    def _image_pull_preflight(self, ctx: _Ctx, key: str, base: NormalStage) -> bool | None:
+        """The image pull-size preflight for a stage that is not placed: the recorded section,
+        once per attempt number. None means go on; a strict provider's over-limit image ends
+        the stage (True: the tick made progress), after the trust and licence checks."""
+        try:
+            section = image_pull.evaluate(self._provider(base), base)
+        except KeyError:
+            return None
+        if section is None:
+            return None
+        if section["status"] == "refused":
+            # Trust and licence refusals come first, as at placement: a stage whose inputs may
+            # not go to the provider reports that, never an image-size refusal.
+            refused = self._inputs_refused(ctx, key, record=False)
+            if refused is not None:
+                return refused
+        number = self._stage_row(ctx, key)["attempts_used"] + 1
+        with self.store.runner_connection() as connection:
+            self._emit_once_in(
+                connection,
+                ctx,
+                image_pull.EVENT,
+                {"stage_key": key, "attempt": number},
+                {
+                    k: v
+                    for k, v in image_pull.event_payload(
+                        key, number, base.provider, section
+                    ).items()
+                    if k not in ("stage_key", "attempt")
+                },
+            )
+        if section["status"] == "refused":
+            return self._stage_failed(ctx, key, image_pull.REFUSED_REASON)
+        return None
 
     def _single_provider_guard(self, ctx: _Ctx, key: str, base: NormalStage) -> str:
         """ADR 0107 for a stage that is not placed (one provider): a heavy stage on a local
@@ -1794,6 +1834,25 @@ class CampaignRunner:
                     ctx.campaign,
                     heavy_guard.EVENT,
                     heavy_guard.event_payload(key, number, decision.chosen, decision.heavy_guard),
+                )
+            try:
+                chosen = self._on_candidate(ctx.spec.stage(key), decision.chosen)
+                section = image_pull.evaluate(self._provider(chosen), chosen)
+            except KeyError:
+                section = None
+            if section is not None:
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    image_pull.EVENT,
+                    {"stage_key": key, "attempt": number},
+                    {
+                        k: v
+                        for k, v in image_pull.event_payload(
+                            key, number, decision.chosen, section
+                        ).items()
+                        if k not in ("stage_key", "attempt")
+                    },
                 )
         self._actions.append(f"placed:{key}:{number}:{decision.chosen}")
 
@@ -1991,43 +2050,9 @@ class CampaignRunner:
         # Placed already (ADR 0060; an infrastructure retry's reroute too, ADR 0058).
         spec_stage = self._spec_stage(ctx, key)
         target = spec_stage.provider
-        # ADR 0040 at reservation: nothing is held for a stage whose inputs the provider
-        # instance is not trusted to receive (a 409-class refusal naming provider and worker).
-        try:
-            with self.store.runner_connection() as connection:
-                checked = CampaignStore.check_stage_inputs(
-                    connection,
-                    spec_stage,
-                    self._provider(spec_stage),
-                    approval_digest=(ctx.approval or {}).get("trust_policy_digest"),
-                    spec=ctx.spec,
-                    scope=(ctx.campaign["org_id"], ctx.campaign["project_id"]),
-                )
-                if checked is not None and (
-                    checked != {"unlabelled"}
-                    or provider_trust.current_policy(connection).lists_license_labels(target)
-                ):
-                    # The labels as checked at dispatch, for the receipt (a later label add
-                    # never rewrites what this stage was admitted with).
-                    self._emit_once_in(
-                        connection,
-                        ctx,
-                        "campaign.stage_license_checked",
-                        {"stage_key": key, "provider": target},
-                        {"labels": sorted(checked)},
-                    )
-        except LicenseRefused as error:
-            # ADR 0113: a provider's licence-label restriction (tightened after approval, or a
-            # label added since) refuses the inputs; on the record, nothing held.
-            self.emit_once(
-                ctx,
-                "campaign.stage_license_refused",
-                {"stage_key": key},
-                {"provider": target, "labels": list(error.labels), "reason": str(error)[:300]},
-            )
-            return self._stage_failed(ctx, key, "input_not_admitted")
-        except Conflict:
-            return self._stage_failed(ctx, key, "input_not_admitted")
+        refused = self._inputs_refused(ctx, key)
+        if refused is not None:
+            return refused
         hold = spec_stage.max_exposure_cents
         if attempts and str(attempts[-1]["failure_class"] or "").startswith(INFRA_PREFIX):
             self.emit_once(
@@ -2053,6 +2078,54 @@ class CampaignRunner:
                 {"hold_cents": hold},
             )
             return False
+
+    def _inputs_refused(self, ctx: _Ctx, key: str, *, record: bool = True) -> bool | None:
+        """ADR 0040 at reservation: nothing is held for a stage whose inputs the provider
+        instance is not trusted to receive (a 409-class refusal naming provider and worker),
+        nor (ADR 0113) for labels it may not receive. None means admitted; otherwise the stage
+        failed as ``input_not_admitted`` (True). ``record`` records the labels as checked."""
+        spec_stage = self._spec_stage(ctx, key)
+        target = spec_stage.provider
+        try:
+            with self.store.runner_connection() as connection:
+                checked = CampaignStore.check_stage_inputs(
+                    connection,
+                    spec_stage,
+                    self._provider(spec_stage),
+                    approval_digest=(ctx.approval or {}).get("trust_policy_digest"),
+                    spec=ctx.spec,
+                    scope=(ctx.campaign["org_id"], ctx.campaign["project_id"]),
+                )
+                if (
+                    record
+                    and checked is not None
+                    and (
+                        checked != {"unlabelled"}
+                        or provider_trust.current_policy(connection).lists_license_labels(target)
+                    )
+                ):
+                    # The labels as checked at dispatch, for the receipt (a later label add
+                    # never rewrites what this stage was admitted with).
+                    self._emit_once_in(
+                        connection,
+                        ctx,
+                        "campaign.stage_license_checked",
+                        {"stage_key": key, "provider": target},
+                        {"labels": sorted(checked)},
+                    )
+        except LicenseRefused as error:
+            # ADR 0113: a provider's licence-label restriction (tightened after approval, or a
+            # label added since) refuses the inputs; on the record, nothing held.
+            self.emit_once(
+                ctx,
+                "campaign.stage_license_refused",
+                {"stage_key": key},
+                {"provider": target, "labels": list(error.labels), "reason": str(error)[:300]},
+            )
+            return self._stage_failed(ctx, key, "input_not_admitted")
+        except Conflict:
+            return self._stage_failed(ctx, key, "input_not_admitted")
+        return None
 
     def _reserve_hold(self, ctx: _Ctx, key: str, hold: int, provider_id: str | None = None) -> bool:
         provider_id = provider_id or ctx.spec.stage(key).provider
@@ -3343,6 +3416,9 @@ class CampaignRunner:
                 },
             ),
         )
+        # Read before the transaction: an adapter's manifest read may be slow and is never
+        # allowed to hold the database.
+        provenance = image_provenance(spec_stage, self._provider(spec_stage))
         with self.store.runner_connection() as connection:
             # The grant and its code record are one write (AGENTS.md): a crash leaves both or
             # neither, so a receipt never shows a grant whose code record is missing.
@@ -3356,6 +3432,13 @@ class CampaignRunner:
             )
             self._record_code_grant_in(
                 connection, ctx, stage, spec_stage, attempt, request.worker_principal_id
+            )
+            self._emit_once_in(
+                connection,
+                ctx,
+                IMAGE_PROVENANCE_EVENT,
+                {"stage_key": stage["stage_key"], "attempt": attempt["attempt"]},
+                provenance,
             )
         return True
 

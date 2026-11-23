@@ -32,6 +32,8 @@ from .campaign_gates import (
 )
 from .campaign_hold import not_before_reaches
 from .campaign_holdout import campaign_claims, check_unclaimed
+from .campaign_image_pull import SECTION as image_pull_section
+from .campaign_image_pull import latest_by_stage as image_pull_latest
 from .campaign_io import (
     refuse_submitted_lineage,
     resolve_artifact,
@@ -1290,6 +1292,11 @@ class CampaignStore(
                 for stage in stages:
                     if stage["stage_key"] == entry["stage_key"]:
                         stage["heavy_guard"] = {k: v for k, v in entry.items() if k != "stage_key"}
+            # The image pull-size preflight recorded for each stage's newest attempt (read-only).
+            pulls = image_pull_latest(connection, campaign)
+            for stage in stages:
+                if stage["stage_key"] in pulls:
+                    stage[image_pull_section] = pulls[stage["stage_key"]]
             attempts = [
                 dict(row)
                 for row in connection.execute(

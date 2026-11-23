@@ -13,6 +13,8 @@ from .campaign_heavy_guard import recorded as recorded_heavy_guards
 from .campaign_heavy_guard import refusals as recorded_heavy_refusals
 from .campaign_heavy_remote import records as heavy_remote_records
 from .campaign_holdout import receipt_section as holdout_receipt_section
+from .campaign_image_pull import SECTION as IMAGE_PULL_SECTION
+from .campaign_image_pull import recorded as recorded_image_pulls
 from .campaign_io import stage_io
 from .campaign_models import (
     normalize,
@@ -26,6 +28,8 @@ from .campaign_rerun import lineage_of
 from .campaign_submissions import submission_receipt_section
 from .code_approval import input_classes, snapshot_code_approval
 from .delegation_receipts import delegation_receipt_section
+from .image_provenance import IMAGE_PROVENANCE_EVENT
+from .image_provenance import closed as image_provenance_closed
 from .stage_watch import watch_receipt_section
 from .store import _parse_utc, _utc_string, canonical_digest
 
@@ -458,6 +462,26 @@ def _code_grant(connection: sqlite3.Connection, attempt: sqlite3.Row) -> dict[st
     return None if row is None else json.loads(row["payload_json"])
 
 
+def _image_provenance(
+    connection: sqlite3.Connection, attempt: sqlite3.Row
+) -> dict[str, Any] | None:
+    """The image record written when the attempt was dispatched, reduced to its closed fields;
+    ``None`` for an attempt dispatched before the record existed (receipts keep their shape)."""
+    row = connection.execute(
+        """SELECT payload_json FROM events WHERE event_type=?
+        AND json_extract(payload_json, '$.campaign_id') = ?
+        AND json_extract(payload_json, '$.stage_key') = ?
+        AND json_extract(payload_json, '$.attempt') = ? ORDER BY cursor LIMIT 1""",
+        (
+            IMAGE_PROVENANCE_EVENT,
+            attempt["campaign_id"],
+            attempt["stage_key"],
+            attempt["attempt"],
+        ),
+    ).fetchone()
+    return None if row is None else image_provenance_closed(json.loads(row["payload_json"]))
+
+
 def _attempt_entry(
     connection: sqlite3.Connection,
     attempt: sqlite3.Row,
@@ -469,6 +493,7 @@ def _attempt_entry(
     placed: dict[tuple[str, int], dict[str, Any]] | None = None,
     code_info: dict[str, Any] | None = None,
     guards: dict[tuple[str, int], dict[str, Any]] | None = None,
+    pulls: dict[tuple[str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     kind, digest = _evidence(attempt)
     provider_id = attempt["provider_id"] or stage["provider_id"] or spec_stage.provider
@@ -536,6 +561,9 @@ def _attempt_entry(
     )
     if public is not None:
         entry["public_fetch"] = public
+    seen_image = _image_provenance(connection, attempt)
+    if seen_image is not None:
+        entry["image_provenance"] = seen_image
     built = image_build_entry(connection, attempt, spec_stage)
     if built is not None:
         entry["build"] = built
@@ -566,6 +594,11 @@ def _attempt_entry(
     )
     if guard is not None:
         entry.setdefault("placement", {})["heavy_guard"] = guard
+    pull = (pulls or {}).get((attempt["stage_key"], attempt["attempt"]))
+    if pull is not None:
+        # The image pull-size preflight recorded for this attempt (own section; sizes and
+        # limits are integers, the reason a closed code).
+        entry[IMAGE_PULL_SECTION] = pull
     try:
         extra = stage_provider(provider_id).receipt_fields(connection, dict(attempt))
     except KeyError:
@@ -768,6 +801,7 @@ def build_receipt(
     refusals = recorded_heavy_refusals(
         connection, current, stages, {attempt["stage_key"] for attempt in attempts}
     )
+    pulls = recorded_image_pulls(connection, current)
     grants = {
         row["id"]: row["worker_principal_id"]
         for row in connection.execute(
@@ -822,6 +856,7 @@ def build_receipt(
                         placed,
                         code_info,
                         guards,
+                        pulls,
                     )
                     for attempt in attempts
                     if attempt["stage_key"] == stage["stage_key"]

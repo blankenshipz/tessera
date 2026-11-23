@@ -15,7 +15,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from .artifact_limits import ABSOLUTE_MAX_ARTIFACT_BYTES, operator_limits
 from .campaign_models import (
@@ -466,6 +466,15 @@ class SelfHostedInstance(_Strict):
     max_scratch_bytes: ScratchCeiling = 64 * 1024 * 1024
     # ADR 0123: registries (``host[/path]``) a build stage on this instance may push to.
     build_repositories: Annotated[list[RegisteredRepository], Field(max_length=32)] = []  # noqa: RUF012
+    # Optional ceiling on a stage image's compressed pull size; absent means none (the default).
+    max_image_pull_bytes: Annotated[int | None, Field(strict=True, ge=1, le=1 << 50)] = None
+    strict_image_pull: bool = False
+
+    @model_validator(mode="after")
+    def _strict_needs_limit(self):
+        if self.strict_image_pull and self.max_image_pull_bytes is None:
+            raise ValueError("strict_image_pull needs max_image_pull_bytes")
+        return self
 
 
 class LocalDockerConfig(_Strict):
@@ -473,6 +482,15 @@ class LocalDockerConfig(_Strict):
     worker_slots: Annotated[int, Field(strict=True, ge=1, le=MAX_WORKER_SLOTS)] = 1
     max_scratch_bytes: ScratchCeiling = 64 * 1024 * 1024
     build_repositories: Annotated[list[RegisteredRepository], Field(max_length=32)] = []  # noqa: RUF012
+    # Optional ceiling on a stage image's compressed pull size; absent means none (the default).
+    max_image_pull_bytes: Annotated[int | None, Field(strict=True, ge=1, le=1 << 50)] = None
+    strict_image_pull: bool = False
+
+    @model_validator(mode="after")
+    def _strict_needs_limit(self):
+        if self.strict_image_pull and self.max_image_pull_bytes is None:
+            raise ValueError("strict_image_pull needs max_image_pull_bytes")
+        return self
 
 
 class ProvidersFile(_Strict):
@@ -560,6 +578,8 @@ def _descriptor(
     max_scratch_bytes: int = 64 * 1024 * 1024,
     runtimes: frozenset[str] = frozenset({DOCKER_CPU_RUNTIME, BUILD_RUNTIME}),
     build_repositories: tuple[str, ...] = (),
+    max_image_pull_bytes: int | None = None,
+    strict_image_pull: bool = False,
 ) -> ProviderDescriptor:
     limits = limits or OutputLimitsConfig()
     return ProviderDescriptor(
@@ -575,6 +595,8 @@ def _descriptor(
         worker_slots=worker_slots,
         max_scratch_bytes=max_scratch_bytes,
         build_repositories=build_repositories,
+        max_image_pull_bytes=max_image_pull_bytes,
+        strict_image_pull=strict_image_pull,
     )
 
 
@@ -628,6 +650,16 @@ def register_from_config(config: dict | None) -> None:
                     local_slots,
                     local_scratch,
                     build_repositories=local_builds,
+                    max_image_pull_bytes=(
+                        None
+                        if parsed.local_docker is None
+                        else parsed.local_docker.max_image_pull_bytes
+                    ),
+                    strict_image_pull=(
+                        False
+                        if parsed.local_docker is None
+                        else parsed.local_docker.strict_image_pull
+                    ),
                 )
             ),
         )
@@ -645,6 +677,8 @@ def register_from_config(config: dict | None) -> None:
                         item.max_scratch_bytes,
                         frozenset(item.runtimes),
                         tuple(item.build_repositories),
+                        item.max_image_pull_bytes,
+                        item.strict_image_pull,
                     )
                 ),
             )

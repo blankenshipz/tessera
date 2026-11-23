@@ -19,6 +19,10 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from .campaign_image_pull import (
+    DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES,
+    MAX_IMAGE_PULL_BYTES,
+)
 from .campaign_models import SaladProgramTemplate
 from .remote_execution_models import CpuRate, ExecutionSelection, TargetPolicy, route_window_limit
 from .salad_proxy_contract import ManagementCredential, ProxyPolicy
@@ -117,6 +121,18 @@ class SaladCampaignProfile(_Closed):
     # Present only on a profile the operator opened to adapted local-docker stages (ADR 0076); on
     # a GPU profile it also carries the operator's GPU price (ADR 0141 amendment 2026-11-23).
     stage_adapter: StageAdapterConfig | None = None
+    # Ceiling on a stage image's compressed pull size: a node can be rescheduled while a large
+    # image is still being pulled. 4 GiB unless changed; null turns the check off. An image over
+    # it is a recorded warning, or a refusal at placement with ``strict_image_pull``.
+    max_image_pull_bytes: int | None = Field(
+        default=DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES, ge=1, le=MAX_IMAGE_PULL_BYTES
+    )
+    strict_image_pull: bool = False
+    # Operator-recorded compressed pull sizes by allowed image digest (bytes); an image with
+    # no entry has an unknown size.
+    image_pull_sizes: dict[_ImageDigest, Annotated[int, Field(ge=0, le=MAX_IMAGE_PULL_BYTES)]] = (
+        Field(default_factory=dict, max_length=32)
+    )
 
     @model_validator(mode="after")
     def consistent(self):
@@ -140,6 +156,10 @@ class SaladCampaignProfile(_Closed):
         if adapter is not None and adapter.gpu_hour_usd is not None:
             if Decimal(adapter.gpu_hour_usd) <= 0:
                 raise ValueError("stage_adapter.gpu_hour_usd must be positive")
+        if self.strict_image_pull and self.max_image_pull_bytes is None:
+            raise ValueError("strict_image_pull needs max_image_pull_bytes")
+        if not set(self.image_pull_sizes) <= set(self.allowed_image_digests):
+            raise ValueError("image_pull_sizes names a digest that is not allowed")
         return self
 
     @property

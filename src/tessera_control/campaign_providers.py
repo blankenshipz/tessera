@@ -72,6 +72,11 @@ class ProviderDescriptor:
     # ADR 0123: registry destinations (``host[/path]`` prefixes) an image-build stage on this
     # provider may push to. Operator-owned; empty means no pushing build is accepted.
     build_repositories: tuple[str, ...] = ()
+    # Optional ceiling on a stage image's compressed pull size (bytes); None means no ceiling
+    # (the default). With ``strict_image_pull`` an image over it is refused at placement;
+    # otherwise it is a recorded warning (see ``campaign_image_pull``).
+    max_image_pull_bytes: int | None = None
+    strict_image_pull: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,7 +210,12 @@ class ProviderHooks(Protocol):
 
     ``sweep(rt)``: tick-level upkeep. ``on_settled(connection, attempt_id, cents, stamp)``:
     bookkeeping that commits in the settlement transaction. ``experiment_ready(rt, ctx,
-    stage, spec_stage)``: scaffolding before a hold (False after it ran a step)."""
+    stage, spec_stage)``: scaffolding before a hold (False after it ran a step).
+    ``image_pull_size_bytes(spec_stage)``: total compressed layer bytes of the stage image, or
+    None; read outside the grant transaction under a time bound, for the receipt only.
+    ``image_pull_limits(stage)``: the stage's ceiling on the image's compressed pull size and
+    whether it is strict (else the descriptor's fields). ``image_pull_bytes(stage)``: the
+    recorded compressed pull size of the stage image, or None (see ``campaign_image_pull``)."""
 
     def sweep(self, rt: RunnerServices) -> None: ...
     def on_settled(
@@ -214,6 +224,9 @@ class ProviderHooks(Protocol):
     def experiment_ready(
         self, rt: RunnerServices, ctx: Any, stage: Any, spec_stage: Any
     ) -> bool: ...
+    def image_pull_size_bytes(self, spec_stage: Any) -> int | None: ...
+    def image_pull_limits(self, stage: Any) -> tuple[int | None, bool]: ...
+    def image_pull_bytes(self, stage: Any) -> int | None: ...
 
 
 class DefaultHooks:
@@ -295,6 +308,9 @@ def validate_descriptor(d: Any) -> None:
     scratch = d.max_scratch_bytes
     if type(scratch) is not int or not 0 < scratch <= MAX_SCRATCH_BYTES:
         raise ValueError(f"{bad} (max_scratch_bytes must be an integer in 1..{MAX_SCRATCH_BYTES})")
+    from .campaign_image_pull import validate_limits
+
+    validate_limits(d.max_image_pull_bytes, d.strict_image_pull, bad)
 
 
 # Every method a provider must implement; tests keep this in step with ComputeProvider.
@@ -314,7 +330,15 @@ REQUIRED_PROVIDER_METHODS = (
     "receipt_fields",
 )
 # Hooks the runner reads with getattr; each must be callable when present.
-OPTIONAL_PROVIDER_HOOKS = ("sweep", "on_settled", "experiment_ready", "placement_capability")
+OPTIONAL_PROVIDER_HOOKS = (
+    "sweep",
+    "on_settled",
+    "experiment_ready",
+    "placement_capability",
+    "image_pull_size_bytes",
+    "image_pull_limits",
+    "image_pull_bytes",
+)
 
 
 def validate_provider_object(provider: Any) -> None:

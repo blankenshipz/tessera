@@ -494,6 +494,25 @@ grant, with ids and digests only; a grant does not prove the worker fetched the 
 human still does, and a composed snapshot loses an approval), it builds no image, and a stage without
 `code_input` is unchanged.
 
+### Runtime image provenance
+
+When an attempt is granted, the runner writes one `campaign.image_provenance` event (in the grant's
+transaction) and each attempt's receipt entry gains an `image_provenance` block with a closed set of
+fields: `image_ref` (the image name without its digest), `image_digest` (`sha256:...`, the immutable
+reference the stage was pinned to), `base_images` (a list of `{ref, digest}` taken from an image-build
+stage's approved plan; empty for any other stage), `compressed_size_bytes` (the total compressed layer
+size read from the registry manifest) and `size_reason`. When the size cannot be read,
+`compressed_size_bytes` is `null` and `size_reason` is one of `adapter_cannot_read_manifest` (the
+provider has no manifest reader) or `size_unavailable` (the reader returned nothing usable or failed);
+it is `null` when a size is recorded. Reasons are a closed list, never free text, and a reference with a
+scheme, user information or whitespace is recorded as `null`: a reference containing `@` is accepted
+only when exactly one `@` is followed by a well-formed `sha256:` digest, so `user:pw@host/img` records
+neither a name nor a digest. Digest pinning is unchanged: a tag-only
+reference is still refused wherever the grant or spec requires a digest. A provider may offer an optional
+`image_pull_size_bytes(stage)` hook; the Salad provider takes an operator-supplied manifest reader and
+reports no size without one. The runner waits at most 10 seconds for that read, outside the database
+transaction; a read still running then is abandoned and recorded as `size_unavailable`. Attempts dispatched before this record existed have no block.
+
 ## Standing approvals and scheduled starts
 
 A human can create a standing approval (ADR 0042): it binds one spec digest to explicit

@@ -19,7 +19,7 @@ from typing import Annotated, Any
 from pydantic import Field, StringConstraints, ValidationError
 
 from . import campaign_heavy_remote as heavy_remote
-from . import smoke_credentials
+from . import campaign_image_pull, smoke_credentials
 from .campaign_models import (
     TERMINAL_CAMPAIGN,
     SubmitCampaign,
@@ -95,6 +95,12 @@ def _invalid(error: ValidationError) -> StoreError:
     return StoreError(f"Invalid campaign request: {location}: {str(first.get('msg', ''))[:200]}")
 
 
+def _image_pull_plan(stage: Any) -> dict[str, Any]:
+    """The stage's ``image_pull_preflight`` plan, absent when no candidate has a ceiling."""
+    sections = campaign_image_pull.plan(stage)
+    return {campaign_image_pull.SECTION: sections} if sections else {}
+
+
 class CampaignSteeringCommands:
     """Mixed into ``CampaignStore``; relies on its actor, scope, campaign and mutate helpers."""
 
@@ -159,6 +165,8 @@ class CampaignSteeringCommands:
                         "input_data_class": stage_input_class(spec, key),
                         "output_data_class": stage_output_class(spec, key),
                         "max_exposure_cents": normal.stage(key).max_exposure_cents,
+                        # The image pull-size preflight per candidate provider, before dispatch.
+                        **_image_pull_plan(normal.stage(key)),
                     }
                     for key in order
                 ],

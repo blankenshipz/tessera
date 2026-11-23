@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from . import provider_trust
 from .campaign_delegation import STEP_TABLE
+from .campaign_image_pull import DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES
 from .campaign_models import SALAD_BACKEND, SALAD_RUNTIME, SALAD_TARGET, SaladStageSpec
 from .campaign_providers import (
     ComputeProvider,
@@ -199,6 +200,8 @@ class SaladRouteProvider:
         delegable_steps=DELEGABLE_STEPS,
         output_limits=OUTPUT_LIMITS,
         worker_principal_id="",
+        # Interruptible capacity: a conservative default; a campaign profile may change it.
+        max_image_pull_bytes=DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES,
     )
     config_model = SaladStageSpec
 
@@ -207,12 +210,24 @@ class SaladRouteProvider:
         profiles: SaladCampaignProfiles | None = None,
         credential_directory: str | None = None,
         guardian_reader: Any = None,
+        manifest_size_reader: Callable[[str], int | None] | None = None,
     ) -> None:
         self.profiles = profiles
         self.credential_directory = credential_directory
+        # Reads the image's total compressed layer size from its registry manifest. None until
+        # the operator wires one; the receipt then records ``size_unavailable``. The runner waits
+        # at most ``image_provenance.SIZE_READ_TIMEOUT_SECONDS`` for it and then records
+        # ``size_unavailable``; a reader that calls a registry should also set its own timeout.
+        self.manifest_size_reader = manifest_size_reader
         # Control's own read of the guardian's per-frame record (ADR 0041); None means no
         # Salad frame can settle on a guardian verdict.
         self.guardian_reader = guardian_reader
+
+    def image_pull_size_bytes(self, stage: Any) -> int | None:
+        """Total compressed layer bytes of the stage image, or None when not readable."""
+        if self.manifest_size_reader is None:
+            return None
+        return self.manifest_size_reader(stage.image)
 
     # -- credential expiry (metadata only; never a value) -------------------------------
 
@@ -255,6 +270,27 @@ class SaladRouteProvider:
             "reference": profile.credential_reference,
             **state,
         }
+
+    def _profile_of(self, stage: Any) -> Any:
+        config = _salad_config(stage)
+        if config is None or self.profiles is None:
+            return None
+        return self.profiles.get(config.profile)
+
+    def image_pull_limits(self, stage: Any) -> tuple[int | None, bool]:
+        """The stage's profile ceiling on the image's compressed pull size (default 4 GiB)."""
+        profile = self._profile_of(stage)
+        if profile is None:
+            return self.descriptor.max_image_pull_bytes, False
+        return profile.max_image_pull_bytes, profile.strict_image_pull
+
+    def image_pull_bytes(self, stage: Any) -> int | None:
+        """The operator-recorded pull size of the stage image's digest, if any."""
+        profile = self._profile_of(stage)
+        image = getattr(stage, "image", None)
+        if profile is None or not isinstance(image, str) or "@" not in image:
+            return None
+        return profile.image_pull_sizes.get(image.split("@", 1)[1])
 
     def credential_health(self, now: float | None = None) -> list[dict[str, Any]]:
         profiles = self.profiles.profiles if self.profiles is not None else []
@@ -771,6 +807,8 @@ def config_sections() -> tuple[ConfigSection, ...]:
             "max_run_cents": profile.max_run_cents,
             "max_task_cents": profile.max_task_cents,
             "allowed_image_digests": list(profile.allowed_image_digests),
+            "max_image_pull_bytes": profile.max_image_pull_bytes,
+            "strict_image_pull": profile.strict_image_pull,
             "credential_reference": profile.credential_reference,
             "custody_host": profile.custody_host,
             "stage_adapter": getattr(profile, "stage_adapter", None) is not None,

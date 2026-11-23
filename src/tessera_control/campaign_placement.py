@@ -27,6 +27,7 @@ from typing import Any
 
 from . import (
     campaign_heavy_guard,
+    campaign_image_pull,
     campaign_placement_preference,
     campaign_slot_reclaim,
     program_budget,
@@ -76,6 +77,8 @@ PERMANENT_REASONS = frozenset(
         # ADR 0107 amendment 2026-11-23b: a heavy stage's local candidate with no explicit
         # fallback reason; an approved spec never gains one, so the stage does not wait for it.
         campaign_heavy_guard.UNEXPLAINED_REASON,
+        # A strict provider's ceiling on the image's compressed pull size is exceeded.
+        campaign_image_pull.REFUSED_REASON,
     }
 )
 
@@ -284,6 +287,10 @@ def _check(
             return Skip(pid, "license_label", str(error)[:300])
         except Conflict as error:
             return Skip(pid, "untrusted", str(error)[:300])
+        pull = campaign_image_pull.refusal_detail(campaign_image_pull.evaluate(provider, stage))
+        if pull is not None:
+            # Permanent, so before every wait below; after the licence and trust refusals above.
+            return Skip(pid, campaign_image_pull.REFUSED_REASON, pull)
         if hold > base.max_exposure_cents:
             return Skip(pid, "over_run_cap", f"{hold} > {base.max_exposure_cents}")
         current = connection.execute(
