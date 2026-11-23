@@ -6,14 +6,16 @@ control backup/held-recovery boundary. No provider client or credential lives he
 
 import json
 import uuid
+import warnings
 from contextlib import closing
 from datetime import UTC, datetime
 
 from .approval_trust import decision_provenance, require_decision_actor
 from .capabilities import CapabilityStore
-from .execution_targets import get_target, require_admission_hook
+from .execution_targets import get_target
 from .experiments import admitted_attempt_package_identity
 from .programs import program_context
+from .remote_execution_hooks import cleanup_hooks, hooks_for
 from .remote_execution_models import (
     ExecutionSelection,
     ProviderReadback,
@@ -21,10 +23,8 @@ from .remote_execution_models import (
     RemoteExecutionPackage,
     RemoteProposal,
     TargetPolicy,
-    derived_salad_argv,
     route_window_limit,
 )
-from .salad_workload_contract import capability_network_matches
 from .store import Conflict, Forbidden, NotFound, _connect, _parse_utc, canonical_digest, utc_now
 
 
@@ -36,10 +36,8 @@ def _admit_workload(db, project_id, selection, worker_principal_id=None, *, crea
     the instance the provider trust setting (ADR 0040 section 4) is checked for. Returns
     the admission evidence, or None without a staged input.
     """
-    from .salad_workload_admission import check_workload_admission
-
     try:
-        return check_workload_admission(
+        return hooks_for(selection["target"]).admit_workload(
             db, project_id, selection, worker_principal_id, create_shape=create_shape
         )
     except ValueError as error:
@@ -178,8 +176,7 @@ class RemoteExecutionStore(CapabilityStore):
                 raise Conflict("Program evaluation manifests mismatch.")
 
     def _policy(self, proposal):
-        if proposal["selection"]["target"] == "salad_inference":
-            raise Conflict("Salad inference is reserved, not executable.")
+        hooks_for(proposal["selection"]["target"]).refuse(proposal)
         if not any(
             p.selection == ExecutionSelection.model_validate(proposal["selection"])
             for p in self.policies
@@ -317,17 +314,9 @@ class RemoteExecutionStore(CapabilityStore):
             ).fetchone()[0]
             if count >= 32:
                 raise Conflict("Task remote proposal limit reached.")
-            if body["selection"]["salad"]:
-                _admit_workload(db, op["project_id"], body["selection"], op["worker_principal_id"])
-                salad = body["selection"]["salad"]
-                if db.execute(
-                    "SELECT 1 FROM events WHERE event_type='remote_execution.state' "
-                    "AND json_extract(payload_json,'$.proposal.selection.salad.organization')=? "
-                    "AND json_extract(payload_json,'$.proposal.selection.salad.project')=? "
-                    "AND json_extract(payload_json,'$.proposal.selection.salad.group')=?",
-                    (salad["organization"], salad["project"], salad["group"]),
-                ).fetchone():
-                    raise Conflict("Salad group already reserved; one immutable group per attempt.")
+            hooks_for(body["selection"]["target"]).on_propose(
+                db, op, body["selection"], _admit_workload
+            )
             if (
                 db.execute(
                     "SELECT 1 FROM kubernetes_dispatches WHERE operation_id=?",
@@ -667,9 +656,8 @@ class RemoteExecutionStore(CapabilityStore):
         names this worker principal: the same checks ``begin`` and ``record`` apply. A
         route failing any of them is never returned, so it never reaches a provider port.
         """
-        from .salad_group_cleanup import open_readonly, read_route_snapshots
-
-        with closing(open_readonly(self.database_path)) as db:
+        hooks = cleanup_hooks()
+        with closing(hooks.open_readonly(self.database_path)) as db:
             live = self._live_principal(db, worker, audience="worker")
 
         def admit(db, state):
@@ -680,18 +668,15 @@ class RemoteExecutionStore(CapabilityStore):
                 return False
             return op["worker_principal_id"] == live["id"]
 
-        return read_route_snapshots(self.database_path, org_id=live["org_id"], admit=admit)
+        return hooks.read_route_snapshots(self.database_path, org_id=live["org_id"], admit=admit)
 
     def record_group_cleanup(self, worker, ident, audit):
         """Append one cleanup audit event; route identity fields come from the record."""
 
-        from pydantic import ValidationError
-
-        from .salad_group_cleanup import CleanupAudit
-
+        cleanup = cleanup_hooks()
         try:
-            audit = CleanupAudit.model_validate(audit).model_dump(mode="json", exclude_unset=True)
-        except ValidationError:
+            audit = cleanup.parse_cleanup_audit(audit)
+        except ValueError:
             raise Conflict("Cleanup audit has an unsupported shape.") from None
 
         def command(db, live):
@@ -699,13 +684,14 @@ class RemoteExecutionStore(CapabilityStore):
             op, _ = self._operation(db, live, state["proposal"])
             if live["id"] != op["worker_principal_id"]:
                 raise Forbidden("Wrong dispatcher worker.")
-            salad = state["proposal"]["selection"].get("salad") or {}
             payload = dict(
                 audit,
                 route_id=ident,
                 route_digest=state["proposal_digest"],
                 operation_id=state["proposal"]["operation_id"],
-                group=salad.get("group"),
+                group=hooks_for(state["proposal"]["selection"]["target"]).cleanup_group(
+                    state["proposal"]["selection"]
+                ),
                 provider_id=state.get("provider_id"),
                 route_state=state["state"],
             )
@@ -742,10 +728,7 @@ class RemoteExecutionStore(CapabilityStore):
             # Connection presence never renews a lease, cancels or grants execution.
             state["control_surface"] = "desktop_control_only"
             state["go_no_go"] = "no_go_live_activation_blocked"
-            if state["proposal"]["selection"]["target"] == "salad_container":
-                from .salad_proxy_contract import safety_projection
-
-                state["proxy_safety"] = safety_projection()
+            hooks_for(state["proposal"]["selection"]["target"]).project_state(state)
             state["authority_status"] = "unreviewed"
             if state["approved_by"]:
                 try:
@@ -756,149 +739,36 @@ class RemoteExecutionStore(CapabilityStore):
                     state["authority_status"] = "current_offline_only"
             return state
 
-    def claim_salad_proxy(self, worker, ident, effect_id, policy, preflight, *, recheck=False):
+    def claim_proxy(self, worker, ident, effect_id, policy, preflight, *, recheck=False):
         """Server-only use-time admission and durable one-use nonce. No public API.
 
-        A claim is not a new grant and cannot be replayed even after proxy restart.
-        Policy is trusted composition, never supplied by an HTTP request.
+        The target's hooks supply the admission checks, event and idempotency path;
+        they run inside this ``_mutate`` transaction.
         """
+        hooks = hooks_for(policy.target.selection.target)
+        path = hooks.claim_path(ident)
 
         def command(db, live):
-            state = self._load(db, live, ident)
-            proposal = state["proposal"]
-            op, package = self._operation(db, live, proposal)
-            if (
-                live["id"] != op["worker_principal_id"]
-                or (live["org_id"], state["project_id"]) != (policy.org_id, policy.project_id)
-                or proposal["selection"] != policy.target.selection.model_dump(mode="json")
-                or not state["approved_by"]
-                or not state["effects"]
-                or state["effects"][-1]["id"] != effect_id
-                or any(r["effect_id"] == effect_id for r in state["receipts"])
-            ):
-                raise Forbidden("Salad proxy authority binding mismatch.")
-            effect = state["effects"][-1]
-            action = effect["action"]
-            if action in {"create", "start"}:
-                self._current(db, live, state)
-                # Salad-only path: a missing hook fails closed, never skips the budget.
-                try:
-                    hook = require_admission_hook(proposal["selection"]["target"])
-                except ValueError:
-                    raise Conflict("Salad target has no admission hook; refusing.") from None
-                state["budget_binding"] = hook(db, live, proposal, op)
-                if state["desired"] != "run" or state["reallocated"]:
-                    raise Conflict("Salad proxy execution is fenced.")
-            elif action in {"stop", "delete"} and state["desired"] != "stop":
-                raise Conflict("Salad stop-only authority required.")
-            if action in {"start", "stop", "delete"} and not state["provider_id"]:
-                raise Conflict("Exact Salad provider identity required; reconcile by name first.")
-            if action == "observe" and not any(e["action"] == "create" for e in state["effects"]):
-                raise Conflict("Salad observation requires an existing create intent.")
-            profile = proposal["selection"]["salad"]
-            if profile["group"] != "attempt-" + proposal["operation_id"]:
-                raise Conflict("Salad group must bind the unique operation.")
-            execution = profile.get("execution")
-            spec = package["plan"]["execution_spec"]
-            if (
-                execution is None
-                or execution["max_output_bytes"] > spec["max_output_bytes"]
-                or execution["max_cost_cents"] > package["plan"]["budget_cents"]
-            ):
-                raise Conflict("Salad output limits exceed admitted package.")
-            try:
-                derived_salad_argv(
-                    execution,
-                    spec["argv"],
-                    proposal["operation_id"],
-                    proposal["epoch"],
-                    proposal["selection"]["resources"]["max_seconds"],
-                )
-            except ValueError:
-                raise Conflict("Salad argv differs from admitted package.") from None
-            if action in {"create", "start"}:
-                capability = db.execute(
-                    "SELECT * FROM capability_policies WHERE org_id=? AND project_id=? "
-                    "AND task_id=? AND declaration_digest=? AND status='approved'",
-                    (
-                        live["org_id"],
-                        state["project_id"],
-                        state["task_id"],
-                        execution["capability_digest"],
-                    ),
-                ).fetchone()
-                if capability is None:
-                    raise Conflict("Approved Salad capability policy required.")
-                self._current_policy(db, live, capability)
-                declaration = json.loads(capability["declaration_json"])
-                if (
-                    declaration["image_digest"]
-                    != proposal["selection"]["manifests"]["image"].split("@")[1]
-                    or declaration["actions"]
-                    or declaration["credential_refs"]
-                    or not capability_network_matches(execution, declaration)
-                ):
-                    raise Conflict(
-                        "Salad runtime acquisition/credential/network capabilities unsupported."
-                    )
-            # The current base package is deliberately a rejecting Kubernetes contract.
-            # This overlay cannot reinterpret its network-none claim as Salad isolation.
-            age = (datetime.now(UTC) - _parse_utc(preflight["observed_at"])).total_seconds()
-            if (
-                not 0 <= age <= 5
-                or preflight["selection_digest"] != canonical_digest(proposal["selection"])
-                or preflight["route_digest"] != state["proposal_digest"]
-                or (
-                    action in {"create", "start"}
-                    and (preflight["available"] is not True or preflight["quota_ok"] is not True)
-                )
-                or (action == "create" and preflight["group_absent"] is not True)
-                or (
-                    action == "start"
-                    and (
-                        preflight["state"] != "stopped"
-                        or preflight["provider_id"] != state["provider_id"]
-                    )
-                )
-            ):
-                raise Conflict("Fresh exact Salad target preflight required.")
-            claimed = db.execute(
-                "SELECT 1 FROM events WHERE event_type='salad_proxy.claim' "
-                "AND json_extract(payload_json,'$.nonce')=?",
-                (effect_id,),
-            ).fetchone()
-            if recheck:
-                if not claimed:
-                    raise Conflict("Salad proxy has no committed claim.")
-                return 200, state
-            if claimed:
-                raise Conflict("Salad proxy nonce consumed; reconcile without retry.")
-            claim = dict(
-                nonce=effect_id,
-                route_id=ident,
-                route_digest=state["proposal_digest"],
-                operation_id=proposal["operation_id"],
-                attempt_id=proposal["attempt_id"],
-                lease_id=proposal["lease_id"],
-                epoch=proposal["epoch"],
-                package_digest=proposal["package_digest"],
-                action=action,
-                preflight_digest=canonical_digest(preflight),
-            )
-            self._event(
-                db, live, state["project_id"], state["task_id"], "salad_proxy.claim", 1, claim
-            )
-            return 201, state
+            return hooks.claim_proxy(self, db, live, ident, effect_id, policy, preflight, recheck)
 
         return self._mutate(
             worker,
             uuid.uuid4().hex,
             "POST",
-            f"/internal/salad/{ident}/claim",
+            path,
             canonical_digest([ident, effect_id]),
             command,
             audience="worker",
         )[1]
+
+    def claim_salad_proxy(self, worker, ident, effect_id, policy, preflight, *, recheck=False):
+        """Deprecated alias of ``claim_proxy`` (identical behaviour)."""
+        warnings.warn(
+            "claim_salad_proxy is deprecated; use claim_proxy",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.claim_proxy(worker, ident, effect_id, policy, preflight, recheck=recheck)
 
     def list(self, actor, task_id):
         with _connect(self.database_path) as db:

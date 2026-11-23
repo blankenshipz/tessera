@@ -668,7 +668,7 @@ class TrustedSaladServer:
             state = self.store.get(self.worker, request.route_id)
             if ACTION.get(request.operation, "observe") != state["effects"][-1]["action"]:
                 raise ValueError("operation mismatch")
-            state = self.store.claim_salad_proxy(
+            state = self.store.claim_proxy(
                 self.worker, request.route_id, request.effect_id, self.policy, preflight
             )
         except Exception:
@@ -680,7 +680,7 @@ class TrustedSaladServer:
                 self.policy.management.reference, self.policy.management.version
             ) as secret:
                 failure_reason = "admission_denied"
-                state = self.store.claim_salad_proxy(
+                state = self.store.claim_proxy(
                     self.worker,
                     request.route_id,
                     request.effect_id,
@@ -703,7 +703,7 @@ class TrustedSaladServer:
                 # IPC can stall just like secret resolution. It cannot extend
                 # target freshness, credential expiry or current execution authority.
                 failure_reason = "admission_denied"
-                state = self.store.claim_salad_proxy(
+                state = self.store.claim_proxy(
                     self.worker,
                     request.route_id,
                     request.effect_id,

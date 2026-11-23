@@ -113,7 +113,7 @@ class FakeSaladProxy(SaladProxy):
                 or ACTION.get(request.operation, "observe") != state["effects"][-1]["action"]
             ):
                 raise ValueError("operation mismatch")
-            state = self._store.claim_salad_proxy(
+            state = self._store.claim_proxy(
                 self._worker,
                 request.route_id,
                 request.effect_id,
@@ -133,7 +133,7 @@ class FakeSaladProxy(SaladProxy):
             # Resolution is a separate trust boundary and may stall. Recheck
             # authority and freshness after it, without minting/replaying a claim.
             try:
-                state = self._store.claim_salad_proxy(
+                state = self._store.claim_proxy(
                     self._worker,
                     request.route_id,
                     request.effect_id,

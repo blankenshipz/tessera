@@ -31,6 +31,9 @@ class TargetSpec:
     # The provider id the operator's trust setting (ADR 0040 section 4) knows this target
     # by. Defaults to the target name; both Salad targets use ``salad``.
     provider_id: str | None = None
+    # Zero-argument factory for the target's ``RouteHooks`` (see ``remote_execution_hooks``);
+    # None means the default hooks. Keep vendor imports lazy inside the factory.
+    route_hooks: Callable[[], object] | None = None
 
     def __post_init__(self) -> None:
         if self.provider_id is None:
@@ -78,6 +81,12 @@ def _salad_container_admission(db, live, proposal, operation):
     return salad_budget_binding(db, live, proposal, operation)
 
 
+def _salad_route_hooks():
+    from .remote_execution_salad import salad_route_hooks
+
+    return salad_route_hooks()
+
+
 register_target(TargetSpec("kubernetes"))
 register_target(
     TargetSpec(
@@ -86,6 +95,7 @@ register_target(
         billable=True,
         third_party_compute=True,
         provider_id="salad",
+        route_hooks=_salad_route_hooks,
     )
 )
 register_target(
@@ -95,6 +105,7 @@ register_target(
         billable=True,
         third_party_compute=True,
         provider_id="salad",
+        route_hooks=_salad_route_hooks,
     )
 )
 
