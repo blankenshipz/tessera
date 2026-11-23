@@ -606,7 +606,36 @@ class SaladRouteProvider:
             if rebinds:
                 # Recorded by the guardian: an allocation change before anything ran, re-bound.
                 fields["guardian_prestart_rebinds"] = rebinds
+        termination = self._termination(connection, attempt, row)
+        if termination is not None:
+            # ADR 0149: only on a reallocated route, so every other receipt keeps its shape.
+            fields["salad_termination"] = termination
         return fields
+
+    @staticmethod
+    def _termination(
+        connection: sqlite3.Connection, attempt: Mapping[str, Any], row: Any
+    ) -> dict[str, Any] | None:
+        """Control's own reading of the route's provider readbacks, tenant-scoped."""
+        from .salad_termination import provider_termination
+
+        if row is None or row["route_id"] is None:
+            return None
+        found = connection.execute(
+            """SELECT e.payload_json FROM events e JOIN campaigns c ON c.id=?
+            WHERE e.event_type='remote_execution.state' AND e.org_id=c.org_id
+            AND e.project_id=c.project_id AND json_extract(e.payload_json,'$.id')=?
+            ORDER BY e.cursor DESC LIMIT 1""",
+            (attempt.get("campaign_id"), row["route_id"]),
+        ).fetchone()
+        if found is None:
+            return None
+        reading = provider_termination(json.loads(found["payload_json"]))
+        if reading.status == "not_applicable":
+            return None
+        view = reading.as_dict()
+        view["hold_released"] = attempt.get("settled_cents") is not None
+        return view
 
     @staticmethod
     def _translate(call):

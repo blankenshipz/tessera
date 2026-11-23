@@ -44,6 +44,12 @@ from .salad_campaign_profiles import (
     stage_data_policy,
     target_policy,
 )
+from .salad_termination import (
+    UNCONFIRMED_CODE,
+    UNCONFIRMED_EVENT,
+    UNCONFIRMED_NEW_ALLOCATION_CODE,
+    provider_termination,
+)
 from .store import Conflict, _parse_utc, canonical_digest
 
 if TYPE_CHECKING:
@@ -1218,6 +1224,9 @@ class SaladStageDriver:
         row: dict[str, Any],
     ) -> bool:
         verdict, detail, evidence = self.verify_outcome(ctx, attempt, row)
+        if verdict == "unknown" and detail in (UNCONFIRMED_CODE, UNCONFIRMED_NEW_ALLOCATION_CODE):
+            self._termination_unconfirmed(ctx, attempt, row)
+            return True
         if verdict == "unknown":
             self._unknown(attempt, detail)
             return True
@@ -1252,6 +1261,8 @@ class SaladStageDriver:
         if state is None or row["live_receipt_json"] is None:
             return "unknown", "route state or live receipt is missing", None
         provider = [r for r in state["receipts"] if r.get("provenance") == "provider"]
+        if state["reallocated"]:
+            return self._verify_reallocated(ctx.campaign, row)
         if (
             not state["termination_confirmed"]
             or state["reallocated"]
@@ -1295,6 +1306,98 @@ class SaladStageDriver:
         if manifest is None or not self._outputs_match(receipt, manifest):
             return "unknown", "manifest does not match the imported output hashes", None
         return "ok", "verified_journey", self._evidence(row, state, provider, manifest)
+
+    def scoped_route(self, campaign: dict[str, Any], route_id: str | None) -> dict[str, Any] | None:
+        """The route's latest state, read only within the campaign's own org and project."""
+        if route_id is None:
+            return None
+        row = self.runner._one(
+            """SELECT payload_json FROM events WHERE event_type='remote_execution.state'
+            AND org_id=? AND project_id=? AND json_extract(payload_json,'$.id')=?
+            ORDER BY cursor DESC LIMIT 1""",
+            (campaign["org_id"], campaign["project_id"], route_id),
+        )
+        return None if row is None else json.loads(row["payload_json"])
+
+    def _verify_reallocated(
+        self, campaign: dict[str, Any], row: dict[str, Any]
+    ) -> tuple[str, str, str | None]:
+        """ADR 0149: a reallocated route ends ``failed`` only on the provider's own confirmed
+        read of the stopped group plus a matching confirmed exit; otherwise it stays held.
+
+        Its outputs are never accepted (custody could not be sealed after the change), so the
+        verdict is never ``ok``; the route's own termination fence is left as it is."""
+        state = self.scoped_route(campaign, row["route_id"])
+        if state is None:
+            return "unknown", "route state is missing", None
+        reading = provider_termination(state)
+        if not reading.confirmed:
+            return "unknown", reading.code, None
+        with self.runner.store.runner_connection() as connection:
+            reconciliation = current_operation_reconciliation(connection, row["operation_id"])
+        if (
+            reconciliation is None
+            or reconciliation["observed_state"] != "exited"
+            or not reconciliation["termination_confirmed"]
+        ):
+            return "unknown", "no confirmed exited worker observation", None
+        provider = [r for r in state["receipts"] if r.get("provenance") == "provider"]
+        return (
+            "failed",
+            "allocation changed; termination confirmed by provider read",
+            self._evidence(row, state, provider, None),
+        )
+
+    def _termination_unconfirmed(
+        self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> None:
+        """The provider never confirmed a reallocated group stopped: the attempt is unknown and
+        held, with a short code on the Salad row and one event, in one transaction. Nothing is
+        released or settled; the human reconcile path is the way out (ADR 0149)."""
+        reading = provider_termination(self.scoped_route(ctx.campaign, row["route_id"]))
+        code = reading.code
+        runner = self.runner
+        with runner.store.runner_connection() as connection:
+            runner._touch(
+                connection,
+                "campaign_salad_attempts",
+                "attempt_id=?",
+                (attempt["id"],),
+                phase="unknown",
+                waiting_reason=code,
+            )
+            runner._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                status="unknown",
+                failure_class="observed_unknown",
+                failure_detail=f"{code}: provider has not confirmed the stopped group",
+            )
+            seen = connection.execute(
+                """SELECT 1 FROM events WHERE project_id=? AND event_type=?
+                AND json_extract(payload_json,'$.campaign_id')=?
+                AND json_extract(payload_json,'$.attempt_id')=? LIMIT 1""",
+                (ctx.campaign["project_id"], UNCONFIRMED_EVENT, ctx.campaign["id"], attempt["id"]),
+            ).fetchone()
+            if seen is None:
+                runner.store.record_runner_event(
+                    connection,
+                    ctx.campaign,
+                    UNCONFIRMED_EVENT,
+                    {
+                        "stage_key": attempt["stage_key"],
+                        "attempt": attempt["attempt"],
+                        "attempt_id": attempt["id"],
+                        "route_id": row["route_id"],
+                        "reason": code,
+                        "new_allocation_unconfirmed": reading.new_allocation_unconfirmed,
+                        "provider_reads_after_stop": reading.provider_reads,
+                        "hold_cents": attempt["hold_cents"],
+                        "hold_released": False,
+                    },
+                )
 
     @staticmethod
     def _outputs_match(receipt: dict[str, Any], manifest: dict[str, Any]) -> bool:

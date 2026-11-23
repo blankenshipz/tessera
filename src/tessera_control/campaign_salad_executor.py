@@ -52,6 +52,7 @@ from .salad_campaign_profiles import (
     load_profiles,
     proxy_policy,
 )
+from .salad_termination import provider_termination
 from .salad_workload_contract import WorkloadContractV1
 from .store import canonical_digest
 
@@ -171,6 +172,11 @@ class ExecutorConfig(_Closed):
     # times, a short fixed delay apart, before the runner falls back to a human charge.
     guardian_retries: Annotated[int, Field(ge=0, le=10)] = 3
     guardian_retry_seconds: Annotated[int, Field(ge=0, le=30)] = 2
+    # ADR 0149: after a reallocated route stops, read the provider again (one route observe per
+    # poll) until it confirms the group terminated, for at most this long. 0 disables the wait;
+    # the attempt is then left held as termination-unconfirmed at once.
+    termination_confirm_seconds: Annotated[int, Field(ge=0, le=3600)] = 600
+    termination_poll_seconds: Annotated[int, Field(ge=5, le=60)] = 15
     stage_watcher: StageWatcherBlock | None = None
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
@@ -302,6 +308,10 @@ LEASE_HELD_PHASES = frozenset(
 )
 
 
+# Consecutive failed provider reads after which the termination wait gives up (ADR 0149).
+MAX_TERMINATION_OBSERVE_FAILURES = 3
+
+
 def _key(step: str, attempt_id: str) -> str:
     return f"salad-exec-{step}-{hashlib.sha256(attempt_id.encode()).hexdigest()[:40]}"
 
@@ -318,8 +328,14 @@ class SaladCampaignExecutor:
         importer: Importer,
         sleep: Callable[[float], None] = time.sleep,
         stage_watch: Any = None,
+        clock: Callable[[], float] = time.monotonic,
+        observer: Callable[[str, SaladCampaignProfile], None] | None = None,
     ) -> None:
         self.sleep = sleep
+        self.clock = clock
+        # ADR 0149: one provider read of a route's group (the trusted composition in
+        # ``build_executor``); without it the control port's ``observe_termination`` is used.
+        self.observer = observer
         # Optional ``SaladRouteWatch`` (descriptive reports only; None by default).
         self.stage_watch = stage_watch
         chosen = (profile,) if isinstance(profile, SaladCampaignProfile) else tuple(profile)
@@ -658,6 +674,9 @@ class SaladCampaignExecutor:
         state = self.control.route(route_id)
         provider_id = state.get("provider_id")
         lease = self._lease_for(item)
+        waiting = provider_termination(state)
+        if waiting.status == "unconfirmed" and waiting.reason != "no_stop_requested":
+            state = self._confirm_termination(attempt, route_id, self._profile_for(item))
         if receipt.get("stop_confirmed") is True and lease is not None:
             try:
                 manifest_id = self._import_and_upload(item, state, lease)
@@ -677,6 +696,20 @@ class SaladCampaignExecutor:
                     )
                 except Exception as error:
                     self._note("observation_failed", attempt, type(error).__name__)
+        reading = provider_termination(state)
+        if lease is not None and provider_id and reading.confirmed and reading.observed_at:
+            # ADR 0149: the provider's own read confirmed the reallocated group stopped. The
+            # exited observation is reported once (fixed key) at that read's time; control
+            # re-checks the route's provider readbacks itself before it settles anything.
+            try:
+                self.control.report_exited(
+                    lease[0], lease[1], item["operation_id"], provider_id, reading.observed_at
+                )
+                self._note("termination_confirmed_reported", attempt)
+            except Exception as error:
+                self._note("observation_failed", attempt, type(error).__name__)
+        elif reading.status == "unconfirmed":
+            self._note("termination_unconfirmed", attempt, reading.code)
         financial = receipt.get("financial")
         guardian_final = self._read_guardian_final(attempt, route_id)
         self.control.record_outcome(
@@ -691,6 +724,49 @@ class SaladCampaignExecutor:
             ),
         )
         self._note("outcome_recorded", attempt, "manifest" if manifest_id else "no_manifest")
+
+    def _confirm_termination(
+        self, attempt: str, route_id: str, profile: SaladCampaignProfile | None
+    ) -> dict[str, Any]:
+        """Poll the provider (one route observe per poll) until it confirms the reallocated
+        group terminated or ``termination_confirm_seconds`` pass; return the latest route.
+
+        Only the provider readbacks recorded on the route count (``provider_termination``); the
+        guardian's status is never read here. A refused observe (for example the route's effect
+        budget is spent) ends the wait at once: nothing is retried past a refusal."""
+        deadline = self.clock() + self.config.termination_confirm_seconds
+        polls = 0
+        state = self.control.route(route_id)
+        observe = self.observer or getattr(self.control, "observe_termination", None)
+        if profile is None or observe is None:
+            self._note("termination_wait_refused", attempt, "observer_unavailable")
+            return state
+        failures = 0
+        while self.clock() < deadline:
+            polls += 1
+            try:
+                observe(route_id, profile)
+                failures = 0
+            except Exception as error:
+                failures += 1
+                self._note("termination_observe_failed", attempt, type(error).__name__)
+                # A refusal (fenced route, spent effect budget) is final; a failed provider
+                # read is retried at most MAX_TERMINATION_OBSERVE_FAILURES times in a row.
+                if (
+                    type(error).__name__ in {"Conflict", "Forbidden", "NotFound", "LookupError"}
+                    or failures >= MAX_TERMINATION_OBSERVE_FAILURES
+                ):
+                    break
+            state = self.control.route(route_id)
+            if provider_termination(state).confirmed:
+                self._note("termination_confirmed", attempt, f"polls={polls}")
+                return state
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                break
+            self.sleep(min(self.config.termination_poll_seconds, remaining))
+        self._note("termination_wait_ended", attempt, f"polls={polls}")
+        return state
 
     def _read_guardian_final(self, attempt: str, route_id: str) -> dict[str, Any] | None:
         """The guardian's final status, re-read while it is missing or not yet ``stopped``.
@@ -1030,6 +1106,46 @@ def trusted_importer(config: ExecutorConfig, worker, state_dir):
     return import_route
 
 
+def trusted_observer(config: ExecutorConfig, worker, state_dir):
+    """One provider read of a route's group through the trusted server (ADR 0149).
+
+    The same composition as the live driver's ``observe``: a route effect is begun, the
+    credentialed transport reads the exact group and the readback is recorded on the route by
+    the claim-checked intake. No create, start, stop or delete is ever sent from here."""
+
+    def observe(route_id: str, profile: SaladCampaignProfile) -> None:
+        from tessera_worker.remote_dispatch import RemoteDispatcher
+        from tessera_worker.salad_remote import SaladTrustedAdapter
+
+        from .remote_execution import RemoteExecutionStore
+        from .remote_execution_models import ExecutionSelection
+        from .salad_live_check import _private_bytes
+        from .salad_secret_files import PrivateFileSecretResolver
+        from .salad_server import SaladSafetyHTTPSClient, TrustedSaladServer
+
+        route = RemoteExecutionStore(state_dir).get(worker, route_id)
+        selection = ExecutionSelection.model_validate(route["proposal"]["selection"])
+        policy = proxy_policy(profile, selection)
+        _private_bytes(config.worker_credential_file, 4096)
+        resolver = PrivateFileSecretResolver(config.credential_directory)
+        try:
+            server = TrustedSaladServer(
+                state_dir=state_dir,
+                worker=worker,
+                policy=policy,
+                resolver=resolver,
+                safety=SaladSafetyHTTPSClient(**config.custody.client_fields()),
+            )
+            adapter = SaladTrustedAdapter(server, route_id)
+            RemoteDispatcher(
+                server.store, worker, {policy.target.selection.target_digest: adapter}
+            ).dispatch(route_id, "observe")
+        finally:
+            resolver.close()
+
+    return observe
+
+
 def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
     from .salad_live_check import _private_bytes
     from .store import Store
@@ -1073,6 +1189,7 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
         worker_principal_id=worker["id"],
         importer=trusted_importer(config, worker, state_dir),
         stage_watch=stage_watch,
+        observer=trusted_observer(config, worker, state_dir),
     )
 
 

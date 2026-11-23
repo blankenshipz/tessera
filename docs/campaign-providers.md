@@ -637,6 +637,26 @@ and the executor re-derives the same value from the stage. Two refusals apply ev
 - Provider trust is checked again at ticket issue and at each pull, so narrowing the setting
   stops later pulls.
 
+## Termination after a Salad reallocation (ADR 0149)
+
+When Salad moves a running instance (the route records `reallocated`), the guardian stops the
+group but never confirms that stop itself. The executor then reads the group through the route
+(one `observe` every `termination_poll_seconds`, default 15) until the provider's own read shows
+the group stopped with no instance, for at most `termination_confirm_seconds` (executor config,
+default 600, at most 3600, 0 disables the wait). Only that recorded provider read confirms; the
+guardian's status or a worker report never does.
+
+- Confirmed: the executor reports the exit once, control checks the route itself, and the attempt
+  ends `failed` (outputs are never accepted after a reallocation) and settles through the usual
+  path (a recorded charge or a human reconcile). The campaign's input release is revoked when the
+  campaign finishes, as usual.
+- Not confirmed by the bound: the attempt is `unknown` with waiting reason
+  `termination_unconfirmed` (or `termination_unconfirmed_new_allocation` when another allocation
+  was still present), one `campaign.salad_termination_unconfirmed` event is recorded, the campaign
+  blocks, and the hold and the input release stay until a person reconciles the grant.
+
+Stage status shows the code; the campaign receipt carries `salad_termination` for such attempts.
+
 ## Guardian read for Salad settlement (ADR 0041)
 
 `tessera serve --salad-guardian-read FILE` (or `"salad_guardian_read": "/abs/path"` in the
