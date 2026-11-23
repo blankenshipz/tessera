@@ -108,14 +108,31 @@ def _hash_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
+class _CopyWriteError(OSError):
+    """Writing the destination of a copy failed (full disk, read-only directory)."""
+
+
 def _copy_private(source: Path, destination: Path) -> str:
-    """Copy a file owner-only in bounded chunks and return its SHA-256."""
+    """Copy a file owner-only in bounded chunks and return its SHA-256.
+
+    A failure on the destination side raises ``_CopyWriteError``; a source failure stays a plain
+    ``OSError``."""
     digest = hashlib.sha256()
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError:
+        raise _CopyWriteError("the destination cannot be written") from None
     with open(source, "rb") as reader, os.fdopen(fd, "wb") as writer:
         while chunk := reader.read(_CHUNK):
             digest.update(chunk)
-            writer.write(chunk)
+            try:
+                writer.write(chunk)
+            except OSError:
+                raise _CopyWriteError("the destination cannot be written") from None
+        try:
+            writer.flush()
+        except OSError:
+            raise _CopyWriteError("the destination cannot be written") from None
     return digest.hexdigest()
 
 
@@ -853,6 +870,11 @@ def rollback(
         # verified, even if the snapshot file changed between the check and the copy.
         if _copy_private(snapshot, staged) != digest:
             raise RollbackRefused("the snapshot digest does not match the receipt")
+    except _CopyWriteError:
+        staged.unlink(missing_ok=True)
+        raise RollbackRefused(
+            "the snapshot could not be copied back; check free space and permissions"
+        ) from None
     except OSError:
         staged.unlink(missing_ok=True)
         raise RollbackRefused("the snapshot or its manifest cannot be read") from None
@@ -868,6 +890,7 @@ def rollback(
     os.replace(staged, database)
 
     restored_configs = []
+    not_restored = []
     paths = _config_paths(plan)
     copies = Path(plan.backup_dir) / (name + "-configs")
     for row in backup.get("config_backups") or []:
@@ -880,9 +903,11 @@ def rollback(
             copied = _copy_private(copies / f"config-{index}.json", tmp)
         except OSError:
             tmp.unlink(missing_ok=True)
+            not_restored.append(index)
             continue
         if copied != row.get("sha256"):
             tmp.unlink(missing_ok=True)
+            not_restored.append(index)
             continue
         os.replace(tmp, paths[index])
         restored_configs.append(index)
@@ -893,6 +918,7 @@ def rollback(
         "deploy_receipt_sha256": document["receipt_sha256"],
         "backup": {"name": name, "sha256": digest, "schema_version": backup.get("schema_version")},
         "configs_restored": restored_configs,
+        "configs_not_restored": not_restored,
         "replaced_database_kept_as": DATABASE_NAME + PRE_ROLLBACK_SUFFIX,
         "started_at": _stamp(datetime.now(UTC)),
         "note": "services were not started; start the release that wrote the snapshot",

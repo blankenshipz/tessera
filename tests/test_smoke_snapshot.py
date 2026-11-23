@@ -149,3 +149,23 @@ def test_an_agent_credential_still_cannot_adopt_or_declare_public(env):
             capture,
             data_class=dict(smoke_snapshot.DATA_CLASS),
         )
+
+
+def test_the_licence_guard_does_not_refuse_the_cc0_unlabelled_smoke_snapshot(env):
+    from tessera_control import license_labels, provider_trust
+
+    grant = smoke_credentials.issue(env.state, env.project["id"], DEST)
+    unlisted = provider_trust.policy_from_document(
+        {"schema": "tessera.provider-trust.v1", "providers": {}}, "file"
+    )
+    connection = _connect(env.state / "tessera.sqlite3")
+    try:
+        labels = license_labels.snapshot_labels(connection, grant["snapshot_id"])
+        policy = provider_trust.current_policy(connection)
+    finally:
+        connection.close()
+    assert labels == {license_labels.UNLABELLED}  # declared CC0-1.0, but no label
+    # Fail closed for an unlisted provider still admits unlabelled data.
+    assert unlisted.allowed_license_labels("local-docker") == {license_labels.UNLABELLED}
+    assert license_labels.license_refusal("local-docker", labels, unlisted) is None
+    assert license_labels.license_refusal("local-docker", labels, policy) is None

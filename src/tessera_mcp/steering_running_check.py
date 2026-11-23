@@ -136,11 +136,16 @@ def run_running_check(
     wait_seconds: float = 180.0,
     held_polls: int = 6,
     clock: Callable[[], float] = time.monotonic,
+    progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the steps. ``gate(campaign_id)`` performs the human acts of a gate (owner-signed
     standing approval and go) and may return the id of the campaign it started; without it the
-    gate step only reads and records that this campaign has none."""
+    gate step only reads and records that this campaign has none. ``progress``, when given, is
+    filled with ``campaign_id`` (once submitted) and ``steps`` (the records so far), so a caller
+    can say what a failed run left behind."""
     report = smoke.Report(grant_id=grant_id)
+    if progress is not None:
+        progress["steps"] = report.steps
     deadline = clock() + wait_seconds
 
     status = agent("tessera_status")
@@ -157,6 +162,8 @@ def run_running_check(
 
     submitted = agent("tessera_submit_campaign", spec=spec, idempotency_key=smoke._key("submit"))
     campaign_id = submitted["id"]
+    if progress is not None:
+        progress["campaign_id"] = campaign_id
     _need(submitted.get("status") == "submitted", "a new campaign must start as submitted")
     report.record("submit", "tessera_submit_campaign", campaign_id=campaign_id)
 
@@ -389,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     agent_approve = smoke._build_caller(arguments, agent_file, approval_tool=True)
     person = smoke._build_caller(arguments, person_file, approval_tool=True)
     spec_holder: dict[str, Any] = {}
+    progress: dict[str, Any] = {}
 
     def sleeper(_phase: str) -> None:
         time.sleep(2.0)
@@ -409,9 +417,16 @@ def main(argv: list[str] | None = None) -> int:
             advance=sleeper,
             wait_seconds=arguments.wait_seconds,
             held_polls=arguments.held_polls,
+            progress=progress,
         )
     except SmokeFailure as failure:
-        print(json.dumps({"ok": False, "failed": str(failure)}, indent=2), file=sys.stderr)
+        failed = {
+            "ok": False,
+            "failed": str(failure),
+            "campaign_id": progress.get("campaign_id"),
+            "completed_steps": [step["step"] for step in progress.get("steps", [])],
+        }
+        print(json.dumps(failed, indent=2), file=sys.stderr)
         return 1
     text = json.dumps(document, indent=2, sort_keys=True)
     if arguments.receipt_file:

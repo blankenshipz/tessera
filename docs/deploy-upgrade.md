@@ -78,6 +78,11 @@ verifies the digests, keeps the replaced database as `tessera.sqlite3.pre-rollba
 configs the upgrade rewrote, writes a receipt and starts nothing), then start the release that
 wrote the snapshot. `tessera restore` does not take it.
 
+**Memory.** The snapshot's digest, the rollback's copy of it and the config-file copies are streamed
+in fixed-size chunks, so they do not hold a whole file in memory. Migrations are not covered: they
+still load whole tables, and peak memory is not measured end to end. If a config's saved copy cannot
+be written back, the rollback receipt lists it under `configs_not_restored` and still succeeds.
+
 **Who migrated.** The receipt records the stored schema version at each boundary (`schema_trace`: at
 preflight, after the services stop, in the backup snapshot, just before the migrate step and after
 it). The migrate step says what it did: "migrated schema vN to vM in this step", or "nothing to

@@ -41,6 +41,7 @@ from .cpu import (
 from .development_runtime import DevelopmentCpuRuntime, DevelopmentOutputProfile
 from .docker_network_pool import DEFAULT_PREFIX_LENGTH, DockerNetworkPool
 from .outputs import OutputCollectionError, worker_output_limit
+from .private_auth_file import AuthFileRefused, check_private_auth_file
 from .provider import Provider
 from .runtime import MAX_DESCRIPTOR_BYTES, ObservationDeliveryPending, ObservationRefused
 from .supervisor import DriverResult, SupervisorError
@@ -223,23 +224,13 @@ def private_registry_auth_file(path: Path) -> Path:
 
     A regular file (no symlink) owned by the worker user with no group or world access; the
     mode is never repaired silently. Its content is never read, logged or reported here."""
-    path = Path(path)
     try:
-        info = path.lstat()
-    except OSError as error:
-        raise DevelopmentWorkerError("Registry auth file is unavailable.") from error
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) & 0o077
-    ):
+        return check_private_auth_file(path)
+    except AuthFileRefused as error:
         raise DevelopmentWorkerError(
             "Registry auth file must be a private regular file (no symlink, no group or world "
-            "access) owned by the worker user."
-        )
-    return path
+            f"access) owned by the worker user ({error.code})."
+        ) from error
 
 
 def read_private_credential(path: Path) -> str:

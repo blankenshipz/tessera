@@ -26,6 +26,7 @@ from tessera_control import artifact_limits as artifact_limits_module
 
 from . import scratch_limits as limits
 from .egress_proxy import journal_sha256, summarize_journal
+from .private_auth_file import AuthFileRefused, check_private_auth_file
 
 if TYPE_CHECKING:
     from .docker_network_pool import DockerNetworkPool
@@ -750,17 +751,15 @@ class DockerCpuAdapter:
             mounts = ["--mount", f"type=bind,src={directory},dst=/outputs"]
             if operation.registry_auth_file is not None:
                 auth = Path(operation.registry_auth_file)
-                auth_info = auth.lstat()
-                if (
-                    not auth.is_absolute()
-                    or not stat.S_ISREG(auth_info.st_mode)
-                    or auth_info.st_mode & 0o022
-                ):
+                if not auth.is_absolute():
                     raise ValueError
+                check_private_auth_file(auth)
                 mounts += [
                     "--mount",
                     f"type=bind,src={auth},dst=/run/registry-auth/auth.json,readonly",
                 ]
+        except AuthFileRefused as error:
+            raise CpuError(f"Registry auth is not private custody ({error.code}).") from error
         except (OSError, ValueError) as error:
             raise CpuError("Image build output or registry auth is not private custody.") from error
         return mounts

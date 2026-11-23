@@ -570,6 +570,31 @@ def test_an_unreadable_version_does_not_change_the_outcome_or_other_receipt_fiel
     assert document["backup"]["schema_version"] == baseline["backup"]["schema_version"]
 
 
+def test_an_unreadable_boundary_version_keeps_the_generic_wording_and_never_raises(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    # The backup boundary is unknown, so the move between after_stop and before_migrate has no
+    # named window: the wording stays generic.
+    old, new = LATEST_SCHEMA_VERSION - 1, LATEST_SCHEMA_VERSION
+    holder = SimpleNamespace(document={})
+    trace = {"preflight": old, "after_stop": old, "backup_snapshot": None, "before_migrate": new}
+    after = SimpleNamespace(detail={"current": new})
+    detail = deploy_upgrade._migrate_detail(holder, trace, None, after)
+    assert "between two steps" in detail
+    assert holder.document["early_migration"]["changed"] == "between two steps"
+
+    # End to end: when the stored version cannot be read at any boundary the run still completes.
+    monkeypatch.setattr(deploy_upgrade, "_observed_version", lambda plan: None)
+    plan, _path, _state = make_plan(tmp_path, with_config=False)
+    document = run(plan, Fakes(), execute=True)
+    assert document["result"] == "ok", document["steps"]
+    assert document["schema_trace"]["after_stop"] is None
+    assert document["schema_trace"]["before_migrate"] is None
+    assert "early_migration" not in document
+
+
 def test_a_database_already_current_is_reported_as_nothing_to_migrate(tmp_path):
     plan, _path, _state = make_plan(tmp_path, behind=False, with_config=False)
     document = run(plan, Fakes(), execute=True)

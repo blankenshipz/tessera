@@ -94,7 +94,10 @@ end within the pin's `max_bytes` and its sha256 differs from the pin. Every othe
 that call and the entry stays: an I/O error (EMFILE, EACCES, EIO, a vanished file), a size above this
 pin's `max_bytes` (a rerun with a smaller bound does not delete a good entry), a non-regular, symlinked
 or hard-linked entry (not trusted, not deleted; `store()` replaces entries by rename), and a size that
-changed under the reader. The mismatch delete is skipped if the entry was replaced since it was opened.
+changed under the reader. A failure while copying a local hit (for example a full disk) also falls
+through to a network refetch rather than raising `io_error`; the row then reports `cached: false`, and
+nothing records that a hit degraded to a miss, because that would need a new receipt field.
+The mismatch delete is skipped if the entry was replaced since it was opened.
 The `.part` file is removed on every failure path of the process that wrote it, and unverified bytes
 are never served; a part file left by a process that died is reclaimed by a later `store()` (decision 7).
 

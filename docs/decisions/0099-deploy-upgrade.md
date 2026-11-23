@@ -65,6 +65,14 @@ smoke, and note what happened. Each step could be done out of order or forgotten
    (digest-checked), writes a `tessera.deploy-rollback-receipt.v1`, and starts nothing; start the
    release that wrote the snapshot afterwards. A validated backup is restored with `tessera restore`. Exit status: 0 done (or planned), 1
    a step failed, 2 a bad plan or usage.
+9. **What is bounded in memory.** The pre-migration snapshot's digest, the rollback's copy of that
+   snapshot back into place and the config-file copies are read and written in fixed-size chunks,
+   so their memory does not grow with the file; the bundle's object declaration is read one row past
+   its cap, never the whole table. Not covered: the migrations themselves still load whole tables,
+   and nothing measures peak memory end to end. A rollback result also lists `configs_not_restored`
+   (config numbers whose copy could not be written back or did not match); it does not change the
+   result or exit status. A failed copy-back of the snapshot is refused with its own message, apart
+   from an unreadable snapshot.
 
 ## Consequences
 

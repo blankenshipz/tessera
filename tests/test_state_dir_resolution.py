@@ -89,6 +89,28 @@ def test_a_loose_or_bad_plan_is_refused_without_echoing_it(tmp_path, state):
         sdr.resolve_state_dir(plan=plan, environ={})
 
 
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda p: None,  # missing file
+        lambda p: p.write_text("{not json /secret/value"),
+        lambda p: p.write_text('{"a": 1, "a": 2}'),  # duplicate keys
+        lambda p: p.write_text('["/secret/value"]'),  # wrong shape
+        lambda p: p.write_text('{"schema": "/secret/value", "state_dir": "/secret/value"}'),
+        lambda p: p.write_text(json.dumps({"schema": PLAN_SCHEMA, "/secret/value": 1})),
+    ],
+)
+def test_a_refused_plan_never_echoes_its_path_or_value(tmp_path, write):
+    plan = tmp_path / "secret-plan-name.json"
+    write(plan)
+    if plan.exists():
+        plan.chmod(0o600)
+    with pytest.raises(sdr.StateDirRefused, match="--plan is unusable") as caught:
+        sdr.resolve_state_dir(plan=plan, environ={})
+    text = str(caught.value)
+    assert "secret" not in text and str(tmp_path) not in text
+
+
 def test_the_database_name_matches_the_store():
     from tessera_control.store import DATABASE_NAME
 

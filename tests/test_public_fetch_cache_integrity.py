@@ -221,3 +221,38 @@ def test_whole_flow_cache_hit_row(tmp_path):
     )
     assert rows[0]["cached"] is True and rows[0]["bytes"] == len(GOOD)
     assert hashlib.sha256(final.read_bytes()).hexdigest() == SHA
+
+
+def test_hard_linked_entry_is_miss_and_kept(tmp_path):
+    cache, dest, pin, final = _setup(tmp_path)
+    os.link(cache / SHA, tmp_path / "other")
+    assert pf._from_cache(cache, pin, final) is None
+    assert (cache / SHA).read_bytes() == GOOD
+    assert list(dest.iterdir()) == []
+
+
+def test_hard_linked_entry_is_refetched(tmp_path):
+    cache, dest, pin, final = _setup(tmp_path)
+    os.link(cache / SHA, tmp_path / "other")
+    rows = pf.fetch_public_files(
+        [pin], dest=dest, cache_dir=cache, opener=lambda url: (200, {}, iter([GOOD]))
+    )
+    assert rows[0]["cached"] is False
+    assert final.read_bytes() == GOOD
+
+
+def test_copy_failure_on_hit_refetches_and_reports_miss(tmp_path, monkeypatch):
+    cache, dest, pin, final = _setup(tmp_path)
+    real = pf.os.replace
+
+    def boom(src, dst, *a, **k):
+        if str(src).endswith(".cachetmp"):
+            raise OSError(errno.ENOSPC, "full")
+        return real(src, dst, *a, **k)
+
+    monkeypatch.setattr(pf.os, "replace", boom)
+    rows = pf.fetch_public_files(
+        [pin], dest=dest, cache_dir=cache, opener=lambda url: (200, {}, iter([GOOD]))
+    )
+    assert rows[0]["cached"] is False
+    assert final.read_bytes() == GOOD

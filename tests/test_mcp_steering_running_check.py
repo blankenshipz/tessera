@@ -9,6 +9,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -459,3 +460,84 @@ def test_dry_run_builds_no_caller_and_reads_no_credential(tmp_path, capsys, monk
     missing = str(tmp_path / "does-not-exist.token")
     assert check.main(["--agent-token-file", missing, "--person-token-file", missing]) == 0
     assert json.loads(capsys.readouterr().out)["mode"] == "dry-run"
+
+
+def _execute_argv(tmp_path, env, *extra):
+    tokens = []
+    for name in ("agent", "person"):
+        path = tmp_path / f"{name}.token"
+        path.write_text("synthetic-token-" + "x" * 30)
+        path.chmod(0o600)
+        tokens.append(str(path))
+    return [
+        "--execute",
+        "--confirm",
+        check.CONFIRM_PHRASE,
+        "--control-url",
+        "http://127.0.0.1:8765",
+        "--project-id",
+        env.project["id"],
+        "--destination",
+        "planner.local",
+        "--agent-token-file",
+        tokens[0],
+        "--person-token-file",
+        tokens[1],
+        "--image",
+        IMAGE,
+        "--snapshot-id",
+        env.snapshot_id,
+        "--held-polls",
+        "2",
+        *extra,
+    ]
+
+
+def _wire_main(monkeypatch, rig, *, expire_when_held=False):
+    """Point main()'s MCP callers at the in-process rig; nothing live is contacted."""
+    sched, agent, person, agent_approve = rig
+    env = sched.env
+    spec = _spec("running-check", _stage(env, "one"), _stage(env, "two", upstream="one"))
+    callers = iter([agent, agent_approve, person])
+    monkeypatch.setattr(smoke, "_build_caller", lambda *a, **k: next(callers))
+    advance = _advance(sched.world)
+    expired = [False]
+
+    def fast_forward(phase):
+        advance(phase)
+        expired[0] = expired[0] or (expire_when_held and phase == "held")
+
+    real = check.run_running_check
+
+    def run(*args, **kwargs):
+        kwargs.update(
+            spec=spec,
+            advance=fast_forward,
+            wait_seconds=3600.0,
+            clock=lambda: time.monotonic() + (1e7 if expired[0] else 0.0),
+        )
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(check, "run_running_check", run)
+
+
+def test_main_execute_runs_the_check_and_prints_the_report(tmp_path, monkeypatch, capsys):
+    rig = _rig(tmp_path)
+    _wire_main(monkeypatch, rig)
+    receipt = tmp_path / "report.json"
+    assert check.main(_execute_argv(tmp_path, rig[0].env, "--receipt-file", str(receipt))) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["ok"] is True and document["schema"] == check.REPORT_SCHEMA
+    assert [s["step"] for s in document["steps"]] == [name for name, _ in check.STEPS]
+    assert json.loads(receipt.read_text()) == document
+
+
+def test_a_failed_run_names_its_campaign_and_the_steps_completed(tmp_path, monkeypatch, capsys):
+    rig = _rig(tmp_path)
+    _wire_main(monkeypatch, rig, expire_when_held=True)  # times out after the pause step
+    assert check.main(_execute_argv(tmp_path, rig[0].env)) == 1
+    failed = json.loads(capsys.readouterr().err)
+    assert failed["ok"] is False and "did not finish while paused" in failed["failed"]
+    assert failed["campaign_id"]
+    steps = [name for name, _ in check.STEPS]
+    assert failed["completed_steps"] == steps[: steps.index("pause_while_running") + 1]

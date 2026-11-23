@@ -1,4 +1,4 @@
-"""``tessera deploy-upgrade`` must not hold a whole database or config in memory (ADR 0099).
+"""``tessera deploy-upgrade`` must not hold a whole database or config in memory (ADR 0099, item 9).
 
 The snapshot digest, the snapshot restore and the config copies stream through a fixed-size chunk.
 These tests shrink the chunk, pad the database well past it, and fail on any whole-file read."""
@@ -153,3 +153,50 @@ def test_the_object_declaration_reads_one_row_past_its_cap_not_the_table(tmp_pat
         recovery._bundle_entries(path, time.monotonic())
     selects = [s for s in statements if "FROM project_artifact_placements" in s]
     assert selects and all("LIMIT 4" in s for s in selects)
+
+
+def _rolled_back_plan(tmp_path):
+    plan, _path, state = make_plan(tmp_path)
+    document = run(plan, Fakes(), execute=True)
+    assert document["result"] == "ok"
+    return plan, state, deploy_upgrade.write_receipt(plan, document)
+
+
+def test_rollback_records_a_config_it_could_not_write_back(tmp_path):
+    import os
+
+    plan, state, receipt = _rolled_back_plan(tmp_path)
+    config_dir = Path(plan.live_configs[0]).parent
+    assert config_dir != state  # only the config directory is made read-only
+    config_dir.chmod(0o500)
+    try:
+        if os.access(config_dir, os.W_OK):
+            pytest.skip("directory permissions are not enforced for this user")
+        result = deploy_upgrade.rollback(plan, receipt, probe=lambda _h, **_: (False, "down"))
+    finally:
+        config_dir.chmod(0o700)
+    assert result["result"] == "ok"
+    assert result["configs_restored"] == [] and result["configs_not_restored"] == [0]
+    assert str(tmp_path) not in json.dumps(result)
+
+
+def test_rollback_names_a_write_failure_and_keeps_the_read_failure_message(tmp_path, monkeypatch):
+    plan, state, receipt = _rolled_back_plan(tmp_path)
+    probe = lambda _h, **_: (False, "down")  # noqa: E731
+    real = deploy_upgrade._copy_private
+
+    def full_disk(source, destination):
+        raise deploy_upgrade._CopyWriteError("no space")
+
+    monkeypatch.setattr(deploy_upgrade, "_copy_private", full_disk)
+    with pytest.raises(deploy_upgrade.RollbackRefused, match="check free space and permissions"):
+        deploy_upgrade.rollback(plan, receipt, probe=probe)
+    assert not (state / (DATABASE_NAME + ".rollback-new")).exists()
+
+    def unreadable(source, destination):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(deploy_upgrade, "_copy_private", unreadable)
+    with pytest.raises(deploy_upgrade.RollbackRefused, match="cannot be read"):
+        deploy_upgrade.rollback(plan, receipt, probe=probe)
+    monkeypatch.setattr(deploy_upgrade, "_copy_private", real)

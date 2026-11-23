@@ -128,8 +128,8 @@ def _from_cache(cache: Path, pin: dict[str, Any], final: Path) -> int | None:
 
     The entry is read once: the same bytes are hashed and written to a temp file, which only
     replaces ``final`` after the digest equals the pin. The entry is deleted only when the whole
-    file was read and its sha256 differs; an I/O error, a non-regular or symlinked entry or a
-    size above this pin's cap is a miss that leaves the entry in place.
+    file was read and its sha256 differs; an I/O error, a non-regular, symlinked or hard-linked
+    entry or a size above this pin's cap is a miss that leaves the entry in place.
     """
     entry, tmp = cache / pin["sha256"], final.with_name(final.name + ".cachetmp")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -141,7 +141,11 @@ def _from_cache(cache: Path, pin: dict[str, Any], final: Path) -> int | None:
     try:
         with os.fdopen(fd, "rb") as src:
             opened = os.fstat(src.fileno())
-            if not stat.S_ISREG(opened.st_mode) or opened.st_size > pin["max_bytes"]:
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1  # a hard-linked entry is not trusted
+                or opened.st_size > pin["max_bytes"]
+            ):
                 return None
             tmp.unlink(missing_ok=True)
             out_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
