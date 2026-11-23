@@ -23,6 +23,7 @@ from .campaign_models import (
     stage_on_candidate,
     stage_provider,
 )
+from .campaign_placement import final_refusal
 from .campaign_placement import placements as recorded_placements
 from .campaign_rerun import lineage_of
 from .campaign_submissions import submission_receipt_section
@@ -768,6 +769,18 @@ def _wall_clock(connection: sqlite3.Connection, campaign_id: str, spec: Any) -> 
     }
 
 
+def _placement_refused(
+    connection: sqlite3.Connection, campaign: sqlite3.Row, stage: sqlite3.Row
+) -> dict[str, Any]:
+    """ADR 0060: a stage no candidate could ever serve (over the per-run cap, untrusted, ...)
+    failed before any attempt; the refusal and each candidate's reason are on the receipt.
+    Absent otherwise, so other receipts keep their shape."""
+    if stage["status"] != "failed":
+        return {}
+    refused = final_refusal(connection, campaign, stage["stage_key"])
+    return {} if refused is None else {"placement_refused": refused}
+
+
 def build_receipt(
     connection: sqlite3.Connection, campaign: sqlite3.Row | dict[str, Any], status: str
 ) -> tuple[dict[str, Any], str]:
@@ -872,6 +885,7 @@ def build_receipt(
                     if stage["stage_key"] in refusals
                     else {}
                 ),
+                **_placement_refused(connection, current, stage),
             }
         )
     reason = current["stop_reason"]

@@ -1899,7 +1899,12 @@ class CampaignRunner:
             ctx,
             placement.WAITING_EVENT,
             {"stage_key": key, "attempt": number, "signature": "refused"},
-            {"skipped": payload["skipped"], "steering": payload["steering"], "final": True},
+            {
+                "candidates": payload["candidates"],
+                "skipped": payload["skipped"],
+                "steering": payload["steering"],
+                "final": True,
+            },
         )
         reason = placement.failure_reason(decision)
         if reason == heavy_guard.UNEXPLAINED_REASON and decision.heavy_guard is not None:

@@ -85,7 +85,9 @@ empty output paths and a one-byte output limit.
    Job UID, attributed running/exit observations, termination and automatic output
    provenance. `interrupted` can be the control mapping of a reported exit, not
    evidence that compute failed. Inspect provider completion, lateness and human
-   outcome separately; leave scientific validity unassessed.
+   outcome separately; leave scientific validity unassessed. **Record human outcome** on an
+   admitted attempt is the desktop's resolve form: a human accounting record (unknown, failed,
+   cancelled or succeeded, with a reason unless succeeded), not a scientific conclusion.
 7. **Review/export → disconnect/reconnect.** Quarantined bytes are not readable
    merely because compute completed. A human must review and explicitly release
    exact artifact custody before native preview/save or reproduction-bundle export.

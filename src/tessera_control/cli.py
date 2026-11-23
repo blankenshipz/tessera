@@ -1184,6 +1184,29 @@ def main(argv: list[str] | None = None) -> int:
         except (StoreError, ValueError) as error:
             print(f"init failed: {error}", file=sys.stderr)
             return 1
+        except (OSError, sqlite3.Error) as error:
+            # An unwritable parent, a path the filesystem rejects, a full disk or a database that
+            # cannot be opened: a short message naming only the kind of failure, never the path
+            # and never a traceback. initialize_state leaves a failed bootstrap in place for
+            # diagnosis (it never deletes a path another process may have filled), so say so,
+            # because a retry would otherwise only report that the directory already exists.
+            reason = (
+                error.strerror
+                if isinstance(error, OSError) and error.strerror
+                else type(error).__name__
+            )
+            message = f"init failed: the state directory could not be created ({reason})."
+            try:
+                left_behind = Path(arguments.state_dir).expanduser().exists()
+            except OSError:  # the same path problem that made init fail
+                left_behind = False
+            if left_behind:
+                message += (
+                    " A partly created state directory was left in place;"
+                    " remove it before retrying."
+                )
+            print(message, file=sys.stderr)
+            return 1
         print(database_path)
         print(header_path)
         return 0

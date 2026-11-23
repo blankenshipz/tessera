@@ -101,7 +101,7 @@ approval remain distinct from execution admission, dispatch and scientific revie
 
 The [quickstart](docs/quickstart.md) follows this bounded local journey. Execution
 is a separate API/operator handoff, not a one-click desktop operation. The desktop has
-admit, dispatch-authorize and resolve forms for the frozen Kubernetes lab path
+admit, dispatch-authorize and resolve (labelled "Record human outcome") forms for the frozen Kubernetes lab path
 (`desktop/EXECUTION.md`); its dispatch profile is a fixed lab profile, not derived from targets.
 
 ```mermaid

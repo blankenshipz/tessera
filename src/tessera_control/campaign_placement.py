@@ -562,6 +562,31 @@ def placements(connection: sqlite3.Connection, campaign: Mapping[str, Any]) -> l
     return out
 
 
+def final_refusal(
+    connection: sqlite3.Connection, campaign: Mapping[str, Any], stage_key: str
+) -> dict[str, Any] | None:
+    """The refusal that ended a stage because no candidate could ever pass (each candidate's
+    skip reason, for example ``over_run_cap``), or None. Receipts carry it, since a refused
+    stage has no attempt to hang a placement on."""
+    row = connection.execute(
+        """SELECT payload_json, created_at FROM events WHERE project_id=? AND event_type=?
+        AND json_extract(payload_json,'$.campaign_id')=?
+        AND json_extract(payload_json,'$.stage_key')=?
+        AND json_extract(payload_json,'$.final') = 1 ORDER BY cursor DESC LIMIT 1""",
+        (campaign["project_id"], WAITING_EVENT, campaign["id"], stage_key),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row["payload_json"])
+    return {
+        "attempt": payload.get("attempt"),
+        "candidates": payload.get("candidates"),
+        "skipped": payload.get("skipped", []),
+        "steering": payload.get("steering"),
+        "recorded_at": row["created_at"],
+    }
+
+
 def status_view(connection: sqlite3.Connection, campaign: Mapping[str, Any]) -> list[dict]:
     """Per stage with candidates: the candidates, current steering, every recorded placement
     and, while it waits, the latest reasons. Read-only."""
