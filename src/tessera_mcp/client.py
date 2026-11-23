@@ -311,6 +311,12 @@ class ControlClient:
             "GET", f"/projects/{project}/agent-snapshots?offset={offset}&limit={limit}"
         )
 
+    async def get_snapshot(self, snapshot_id):
+        project = segment(self.config.project_id)
+        return await self._request(
+            "GET", f"/projects/{project}/agent-snapshots/{segment(snapshot_id)}"
+        )
+
     async def snapshot_license_labels(self, snapshot_id):
         project = segment(self.config.project_id)
         return await self._request(
@@ -321,6 +327,13 @@ class ControlClient:
         if view not in {"outputs", "logs", "budget", "grants", "retries", "holdout"}:
             raise ControlError("Unknown campaign view")
         return await self._request("GET", f"/campaigns/{segment(campaign_id)}/{view}")
+
+    async def campaign_stage_watch(self, campaign_id, offset=0, limit=20):
+        if not 0 <= offset or not 1 <= limit <= 100:
+            raise ControlError("Pagination requires offset >= 0 and limit 1–100")
+        return await self._request(
+            "GET", f"/campaigns/{segment(campaign_id)}/stage-watch?offset={offset}&limit={limit}"
+        )
 
     async def holdout_claims(self, partition_digest=None):
         project = segment(self.config.project_id)
@@ -457,6 +470,16 @@ class ControlClient:
             body={"expected_revision": expected_revision},
             key=idempotency_key,
             raise_refusal=True,
+        )
+
+    async def record_gate_decision(
+        self, campaign_id, expected_revision, decision, note, idempotency_key
+    ):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/gate-decision",
+            body={"expected_revision": expected_revision, "decision": decision, "note": note},
+            key=idempotency_key,
         )
 
     async def approve_campaign(

@@ -277,6 +277,17 @@ def test_a_read_only_state_directory_fails(world):
         world["state"].chmod(0o700)
 
 
+def test_the_expected_owners_can_be_named_for_a_check_run_by_someone_else(world):
+    """The installer (root) checks what it made: the default still means the running user."""
+    me = os.getuid()
+    assert status(run(world), "receipts_store") == "ok"
+    assert status(run(world, state_owner_uid=me + 1), "receipts_store") == "fail"
+    assert status(run(world, state_owner_uid=me), "receipts_store") == "ok"
+    assert (world["root"] / KEY_FILE).exists()  # the fixture installs a synthetic key file
+    assert status(run(world, key_owner_uid=me + 1), "api_key_file") == "fail"
+    assert status(run(world, key_owner_uid=me), "api_key_file") == "ok"
+
+
 def test_the_probe_leaves_nothing_behind_and_never_creates_the_journal(world):
     run(world)
     assert list(world["state"].iterdir()) == []
@@ -348,18 +359,97 @@ def test_a_missing_or_unusable_limit_fails_before_the_first_reservation(world, r
     assert report["overall"] == "not_ready"
 
 
+def spend_check(report):
+    return next(c for c in report["checks"] if c["name"] == "spend_caps")
+
+
+OLDER = "the control database is older than the model-spend slice"
+
+
 def test_a_database_older_than_the_ledger_fails(world):
     database = sqlite3.connect(world["control"] / "tessera.sqlite3")
     database.execute("DROP TABLE model_spend_limits")
     database.commit()
     database.close()
-    assert status(run(world), "spend_caps") == "fail"
+    report = run(world)
+    assert spend_check(report)["status"] == "fail"
+    assert spend_check(report)["detail"] == OLDER
+    assert report["overall"] == "not_ready"
+
+
+def _assert_unreadable(report):
+    check = spend_check(report)
+    assert check["status"] == "fail"
+    assert check["detail"] == fcr.UNREADABLE_CONTROL_DATABASE
+    assert OLDER not in json.dumps(report)
+    assert report["overall"] == "not_ready"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_a_control_database_this_user_cannot_read_is_reported_as_unreadable(world):
+    path = world["control"] / "tessera.sqlite3"
+    path.chmod(0)
+    try:
+        _assert_unreadable(run(world))
+    finally:
+        path.chmod(0o600)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes a read-only directory")
+def test_a_wal_database_in_a_directory_this_user_cannot_write_is_unreadable(world):
+    """``connect(mode=ro)`` succeeds and the first query fails (the service user's case)."""
+    path = world["control"] / "tessera.sqlite3"
+    database = sqlite3.connect(path)
+    database.execute("PRAGMA journal_mode=WAL")
+    database.close()
+    world["control"].chmod(0o555)
+    try:
+        _assert_unreadable(run(world))
+    finally:
+        world["control"].chmod(0o755)
+
+
+def _refuse_queries(monkeypatch, message):
+    """The connection opens (``mode=ro`` is lazy) and the first query is refused."""
+    real = sqlite3.connect
+
+    class Refusing:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, *args):
+            raise sqlite3.OperationalError(message)
+
+        def close(self):
+            self.connection.close()
+
+    monkeypatch.setattr(fcr.sqlite3, "connect", lambda *a, **k: Refusing(real(*a, **k)))
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["unable to open database file", "attempt to write a readonly database"],
+)
+def test_a_query_refused_for_access_is_unreadable_not_old(world, monkeypatch, message):
+    _refuse_queries(monkeypatch, message)
+    _assert_unreadable(run(world))
+
+
+def test_the_key_only_case_keeps_its_semantics_when_the_database_is_unreadable(world, monkeypatch):
+    """Only the cause text changed: an unreadable database still blocks like the old message."""
+    (world["root"] / KEY_FILE).unlink()
+    _refuse_queries(monkeypatch, "unable to open database file")
+    report = run(world)
+    assert spend_check(report)["detail"] == fcr.UNREADABLE_CONTROL_DATABASE
+    assert report["overall"] == "not_ready"
 
 
 def test_a_missing_control_database_fails_and_nothing_is_created(world, tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
-    assert status(run(world, control_state_dir=empty), "spend_caps") == "fail"
+    report = run(world, control_state_dir=empty)
+    assert spend_check(report)["status"] == "fail"
+    assert spend_check(report)["detail"] == "the control database cannot be opened read-only"
     assert list(empty.iterdir()) == []
 
 

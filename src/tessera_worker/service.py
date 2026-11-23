@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pydantic import TypeAdapter
+
+from tessera_control.image_build_models import RegisteredRepository
+
 from . import scratch_limits
 from .control_channel import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -144,6 +148,12 @@ class DevelopmentWorkerConfig:
     # None: a package carrying public_fetch is refused. Operator-owned; never from a plan.
     public_root: Path | None = None
     public_cache_dir: Path | None = None
+    # ADR 0123: an image build may push only to ``build_repositories`` (``host[/path]``), using
+    # the operator's registry auth file, which is mounted read-only into a pushing build and
+    # never read here. Both unset (the default) refuses every pushing build; setting one
+    # without the other is a configuration error. Never from a plan or control.
+    registry_auth_file: Path | None = None
+    build_repositories: tuple[str, ...] = ()
     output_capacity_inodes: int = 256
     poll_seconds: float = 1.0
     max_ticks: int = 90_000
@@ -179,6 +189,57 @@ class DevelopmentWorkerConfig:
         except ValueError as error:
             raise DevelopmentWorkerError("Control timeout configuration is invalid.") from error
         network_pool_from_config(self.docker_network_pool, self.docker_network_prefix_length)
+        check_build_registry_shape(self.registry_auth_file, self.build_repositories)
+
+
+_REPOSITORY_ADAPTER = TypeAdapter(RegisteredRepository)
+MAX_BUILD_REPOSITORIES = 32
+
+
+def check_build_registry_shape(auth_file: Any, repositories: Any) -> None:
+    """Refuse an inconsistent or malformed registry setting (no filesystem access)."""
+    invalid = DevelopmentWorkerError("Image build registry configuration is invalid.")
+    if (auth_file is None) != (not repositories):
+        raise invalid  # an auth file needs registered repositories, and the reverse
+    if auth_file is None:
+        return
+    if (
+        not isinstance(auth_file, (str, Path))
+        or not Path(auth_file).is_absolute()
+        or not isinstance(repositories, (tuple, list))
+        or len(repositories) > MAX_BUILD_REPOSITORIES
+        or len(set(repositories)) != len(repositories)
+    ):
+        raise invalid
+    try:
+        for repository in repositories:
+            _REPOSITORY_ADAPTER.validate_python(repository, strict=True)
+    except ValueError as error:
+        raise invalid from error
+
+
+def private_registry_auth_file(path: Path) -> Path:
+    """The operator's registry auth file, checked private without being read.
+
+    A regular file (no symlink) owned by the worker user with no group or world access; the
+    mode is never repaired silently. Its content is never read, logged or reported here."""
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise DevelopmentWorkerError("Registry auth file is unavailable.") from error
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise DevelopmentWorkerError(
+            "Registry auth file must be a private regular file (no symlink, no group or world "
+            "access) owned by the worker user."
+        )
+    return path
 
 
 def read_private_credential(path: Path) -> str:
@@ -436,10 +497,13 @@ class DevelopmentWorkerService:
     ) -> None:
         self.config = config
         self.clock = clock
-        # Optional, off by default (ADR 0087): a StageWatchConfig. None or disabled never
-        # imports the stage watcher.
-        self.stage_watch = stage_watch
         self.root = _private_directory(config.workspace_root)
+        # ADR 0125: on by default. None means the default marker ``<workspace>/stage-watch.kill``
+        # (never created); an explicit StageWatchConfig wins, a disabled one never imports the
+        # stage watcher.
+        from .stage_watch_config import resolve_stage_watch
+
+        self.stage_watch = resolve_stage_watch(stage_watch, self.root)
         self.output_root = _private_directory(config.development_output_root)
         self.public_root = (
             operator_private_directory(config.public_root)
@@ -449,6 +513,11 @@ class DevelopmentWorkerService:
         self.public_cache_dir = (
             operator_private_directory(config.public_cache_dir)
             if config.public_cache_dir is not None
+            else None
+        )
+        self.registry_auth_file = (
+            private_registry_auth_file(config.registry_auth_file)
+            if config.registry_auth_file is not None
             else None
         )
         self.token = read_private_credential(config.credential_file)
@@ -541,6 +610,8 @@ class DevelopmentWorkerService:
                 provider=self.provider,
                 public_root=self.public_root,
                 public_cache_dir=self.public_cache_dir,
+                registry_auth_file=self.registry_auth_file,
+                build_repositories=self.config.build_repositories,
             ) as runtime:
                 self._attach_stage_watch(runtime, adapter)
                 result = runtime.recover(lease_id, epoch)
@@ -563,20 +634,22 @@ class DevelopmentWorkerService:
             provider=self.provider,
             public_root=self.public_root,
             public_cache_dir=self.public_cache_dir,
+            registry_auth_file=self.registry_auth_file,
+            build_repositories=self.config.build_repositories,
         ) as runtime:
             self._attach_stage_watch(runtime, adapter)
             result = runtime.start(lease_id, epoch)
             return self._drive(runtime, result)
 
     def _attach_stage_watch(self, runtime: DevelopmentCpuRuntime, adapter: Any) -> None:
-        """Give the supervisor an observe-and-report stage watch runner, only when enabled.
+        """Give the supervisor an observe-and-report stage watch runner, unless opted out.
 
         Local Docker only (no remote provider). The runner reports through the worker's own
         control channel (not the credential watch, so a refused watch report never marks this
         run's credential as rejected) and keeps its outbox under this worker's private root.
         It never raises and never changes an execution result.
         """
-        if self.stage_watch is None or not getattr(self.stage_watch, "enabled", False):
+        if not getattr(self.stage_watch, "enabled", False):
             return
         if self.provider is not None:
             return

@@ -139,7 +139,7 @@ Agents with the external scopes `campaign:submit|read|cancel` may submit, read a
 `tessera-mcp`: registered by default only when the credential's live scopes include
 `campaign:*`, forced with `--campaign-tools` or `--no-campaign-tools`). They cannot approve.
 `campaign:read` covers every campaign in the credential's project, not only the caller's own;
-cancel stays submitter-only. The v2 spec, receipt, list, snapshot, output, log and budget
+cancel stays submitter-only: the cancel and steering tools (budget reduction, release revoke, pause, concurrency limit and stage cancel) act only on a campaign the caller itself submitted. The v2 spec, receipt, list, snapshot, output, log and budget
 tools and their scopes are in [mcp-campaign-client-path.md](mcp-campaign-client-path.md).
 Never give campaign scopes to an OpenCode harness credential: the pinned tool catalog would
 then block with `catalog_inventory_changed`.
@@ -347,7 +347,7 @@ left is the earliest of the campaign approval's expiry and the expiry of the app
 human's and the stage worker's credentials. A stage of the maximum 3600 s therefore needs
 at least 65 minutes (3900 s) of approval and credential life when it is dispatched; a
 one-hour credential can never start it. Each retry attempt is checked again when it is
-dispatched. Re-approval does not extend the campaign's total wall-clock bound.
+dispatched. Re-approval does not extend the campaign's total wall-clock bound. The receipt records the bound (`wall_clock`: `deadline_seconds`, `first_approved_at`, `bound_at`, the number of `approvals`, and `extended_by_reapproval: false`); it is absent for a campaign that was never approved.
 
 ## Receipt
 
@@ -630,3 +630,17 @@ each loop, never during a step, so a long route leaves it stale: alert only beyo
 route window plus one poll); no port is opened. Logs are bounded JSON
 lines with error classes only. Exit 2 means configuration or credentials were refused: do
 not restart. Restart is idempotent (per-route directories, intents).
+
+## Owner-run helpers carry their automation identity
+
+Every `tessera` command that acts with the owner credential (campaign submit, approve, cancel and
+standing approvals, provider-trust changes) sends `X-Tessera-Automation` itself: the
+`--automation-label` flag, else `TESSERA_AUTOMATION_LABEL`, else `tessera-cli:<command>`. A helper
+that acts under an owner delegation also names it with `--delegation-ref` or
+`TESSERA_DELEGATION_REF`, sent as `X-Tessera-Delegation`; the reference is never invented, and the
+server refuses it without an automation label. Both are labels only and grant nothing. The decision
+event and the campaign receipt's `approval` record them (`automation_label`, `delegation_ref`).
+Scripts that call the API directly can build the headers with
+`tessera_control.owner_identity.owner_request_headers`. The dataset snapshot upload route fails
+closed: a bare owner credential with no label is refused (a `human_session` needs none), and the
+adoption event records credential kind, decision class, label and delegation reference.

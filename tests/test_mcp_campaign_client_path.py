@@ -107,6 +107,8 @@ def test_read_tools_hit_expected_routes(tmp_path):
     _call(server, "tessera_list_snapshots", {})
     _call(server, "tessera_campaign_outputs", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_logs", {"campaign_id": "c1"})
+    _call(server, "tessera_campaign_stage_watch", {"campaign_id": "c1"})
+    _call(server, "tessera_campaign_stage_watch", {"campaign_id": "c1", "offset": 2, "limit": 5})
     _call(server, "tessera_campaign_budget", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_retries", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_standing_status", {})
@@ -120,6 +122,8 @@ def test_read_tools_hit_expected_routes(tmp_path):
         ("GET", "/projects/proj1/agent-snapshots", "offset=0&limit=50"),
         ("GET", "/campaigns/c1/outputs", ""),
         ("GET", "/campaigns/c1/logs", ""),
+        ("GET", "/campaigns/c1/stage-watch", "offset=0&limit=20"),
+        ("GET", "/campaigns/c1/stage-watch", "offset=2&limit=5"),
         ("GET", "/campaigns/c1/budget", ""),
         ("GET", "/campaigns/c1/retries", ""),
         ("GET", "/projects/proj1/agent-standing-status", ""),
@@ -138,6 +142,9 @@ def test_bad_pagination_and_ids_are_refused_locally(tmp_path):
         ("tessera_list_snapshots", {"offset": -1}),
         ("tessera_get_campaign_receipt", {"campaign_id": ".."}),
         ("tessera_campaign_logs", {"campaign_id": ""}),
+        ("tessera_campaign_stage_watch", {"campaign_id": "c1", "limit": 101}),
+        ("tessera_campaign_stage_watch", {"campaign_id": "c1", "offset": -1}),
+        ("tessera_campaign_stage_watch", {"campaign_id": ".."}),
     ):
         with pytest.raises(Exception):  # noqa: B017
             _call(server, tool, arguments)
@@ -156,16 +163,21 @@ def test_tools_register_only_for_enrolled_scopes(tmp_path):
         "tessera_campaign_holdout_claims",
         "tessera_list_stuck_campaigns",
         "tessera_campaign_report",
+        "tessera_campaign_wave_receipts",
     }
     assert _names(_server(tmp_path, [], ["campaign:submit", "snapshot:read"])) == {
         "tessera_submit_campaign",
         "tessera_validate_campaign_spec",
+        "tessera_render_campaign_spec",
+        "tessera_submit_rendered_campaign",
         "tessera_list_snapshots",
+        "tessera_get_snapshot",
         "tessera_get_snapshot_license_labels",
     }
     assert _names(_server(tmp_path, [], ["artifact:read", "campaign:logs", "budget:read"])) == {
         "tessera_campaign_outputs",
         "tessera_campaign_logs",
+        "tessera_campaign_stage_watch",
         "tessera_campaign_grants",
         "tessera_campaign_budget",
     }
@@ -175,7 +187,13 @@ def test_mutating_annotations_and_catalog_isolation(tmp_path):
     tools = {t.name: t for t in asyncio.run(_server(tmp_path, []).list_tools())}
     assert tools["tessera_submit_campaign"].annotations.readOnlyHint is False
     assert tools["tessera_cancel_campaign"].annotations.readOnlyHint is False
-    for name in ("tessera_list_campaigns", "tessera_list_snapshots", "tessera_campaign_logs"):
+    for name in (
+        "tessera_list_campaigns",
+        "tessera_list_snapshots",
+        "tessera_campaign_logs",
+        "tessera_campaign_stage_watch",
+        "tessera_get_snapshot",
+    ):
         assert tools[name].annotations.readOnlyHint is True
     # None of the optional tools may leak into the frozen harness catalog.
     assert not {n for n in tools if "campaign" in n or "snapshot" in n} & set(PERMITTED_TOOLS)

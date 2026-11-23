@@ -101,13 +101,12 @@ def test_submit_rejects_invalid_spec_without_calling(tmp_path, owner_header, cap
     assert code == 1 and not FakeTransport.calls and "Invalid campaign spec" in out.err
 
 
-def test_approve_requires_automation_label_and_exact_digest(owner_header, capsys):
+def test_approve_requires_the_exact_digest_and_labels_itself_by_default(owner_header, capsys):
     base = ["approve", "--campaign-id", "c1", "--expected-revision", "1",
-            "--expected-spec-digest", DIGEST, "--idempotency-key", "k",
-            "--owner-header", str(owner_header)]  # fmt: skip
-    with pytest.raises(SystemExit):
+            "--idempotency-key", "k", "--owner-header", str(owner_header)]  # fmt: skip
+    with pytest.raises(SystemExit):  # the digest is mandatory; the label no longer is
         cli.parser().parse_args(["campaign", *base])
-    code, _ = _run([*base, "--automation-label", "operator-cli"], capsys)
+    code, _ = _run([*base, "--expected-spec-digest", DIGEST], capsys)
     method, path, body, *_ = FakeTransport.calls[0]
     assert (code, method, path) == (0, "POST", "/campaigns/c1/approve")
     assert body == {"expected_revision": 1, "expected_spec_digest": DIGEST}

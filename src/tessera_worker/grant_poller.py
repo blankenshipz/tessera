@@ -35,11 +35,14 @@ from .service import (
     DevelopmentWorkerError,
     DevelopmentWorkerService,
     _check_container_user,
+    check_build_registry_shape,
     network_pool_from_config,
     operator_private_directory,
+    private_registry_auth_file,
     read_private_credential,
     safe_error_detail,
 )
+from .stage_watch_config import StageWatchConfig, resolve_stage_watch
 from .supervisor import SupervisorError
 
 _GRANT_ID = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
@@ -86,9 +89,17 @@ class GrantPollerConfig:
     # optional download cache. None: a plan carrying public_fetch is refused by the worker.
     public_root: Path | None = None
     public_cache_dir: Path | None = None
+    # ADR 0123: registry auth file (never read here) and the registries a build may push to;
+    # both unset refuses every pushing image build. See ``DevelopmentWorkerConfig``.
+    registry_auth_file: Path | None = None
+    build_repositories: tuple[str, ...] = ()
     # HTTP timeout for every control request, seconds (1 to 120, default 15). A slow answer is a
     # transient failure that is retried; it never stops a healthy run (ADR 0054).
     control_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    # ADR 0125: None (no explicit setting) means the stage watcher is ON with the default
+    # kill-switch marker ``<workspace_root>/stage-watch.kill``; an explicit StageWatchConfig
+    # (including a disabled one) wins.
+    stage_watch: StageWatchConfig | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -128,6 +139,7 @@ class GrantPollerConfig:
         ):
             raise DevelopmentWorkerError("Grant poller configuration is invalid.")
         _check_container_user(self.container_user, self.allow_root_container_user)
+        check_build_registry_shape(self.registry_auth_file, self.build_repositories)
         if self.scratch_bytes is not None and not limits.scratch_fits_memory(
             self.scratch_bytes, self.memory_bytes
         ):
@@ -146,6 +158,8 @@ class GrantPollerConfig:
             validate_operator_timeout(self.control_timeout_seconds)
         except ValueError as error:
             raise DevelopmentWorkerError("Grant poller configuration is invalid.") from error
+        if self.stage_watch is not None and not isinstance(self.stage_watch, StageWatchConfig):
+            raise DevelopmentWorkerError("Grant poller configuration is invalid.")
 
 
 ServiceFactory = Callable[[DevelopmentWorkerConfig], Any]
@@ -173,6 +187,9 @@ _CONFIG_KEYS = {
     "max_scratch_bytes",
     "public_root",
     "public_cache_dir",
+    "stage_watcher",
+    "registry_auth_file",
+    "build_repositories",
 }
 
 
@@ -210,6 +227,8 @@ def load_poller_config(path: Path) -> GrantPollerConfig:
         raise refused
     images = document.get("allowed_images")
     try:
+        watcher = document.get("stage_watcher")
+        stage_watch = None if watcher is None else StageWatchConfig.from_mapping(watcher)
         return GrantPollerConfig(
             control_url=str(document["control_url"]),
             credential_file=Path(document["credential_file"]),
@@ -234,6 +253,9 @@ def load_poller_config(path: Path) -> GrantPollerConfig:
             max_scratch_bytes=document.get("max_scratch_bytes"),
             public_root=_optional_path(document.get("public_root")),
             public_cache_dir=_optional_path(document.get("public_cache_dir")),
+            stage_watch=stage_watch,
+            registry_auth_file=_optional_path(document.get("registry_auth_file")),
+            build_repositories=_repository_list(document.get("build_repositories")),
         )
     except (KeyError, TypeError, ValueError, DevelopmentWorkerError) as error:
         raise refused from error
@@ -245,6 +267,14 @@ def _optional_path(value: Any) -> Path | None:
     if not isinstance(value, str) or not value:
         raise ValueError("path setting must be a non-empty string")
     return Path(value)
+
+
+def _repository_list(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("build_repositories must be a list of strings")
+    return tuple(value)
 
 
 def _private_dir(path: Path) -> Path:
@@ -279,11 +309,15 @@ class DevelopmentGrantPoller:
         for public_path in (config.public_root, config.public_cache_dir):
             if public_path is not None:
                 operator_private_directory(public_path)
+        if config.registry_auth_file is not None:
+            private_registry_auth_file(config.registry_auth_file)
         self.channel = channel or HttpControlChannel(
             config.control_url,
             read_private_credential(config.credential_file),
             timeout_seconds=config.control_timeout_seconds,
         )
+        # Resolved once, after the private root exists: every per-grant service carries it.
+        self.stage_watch = resolve_stage_watch(config.stage_watch, self.root)
         self.service_factory = service_factory or self._default_service
         self.sleep = sleep
         self.clock = clock
@@ -309,7 +343,7 @@ class DevelopmentGrantPoller:
         self._pruned = self._network_pool is None
 
     def _default_service(self, config: DevelopmentWorkerConfig) -> Any:
-        return DevelopmentWorkerService(config, channel=self.channel)
+        return DevelopmentWorkerService(config, channel=self.channel, stage_watch=self.stage_watch)
 
     def _grant_dir(self, grant_id: str) -> Path:
         if not _GRANT_ID.fullmatch(grant_id) or grant_id in {".", ".."}:
@@ -341,6 +375,8 @@ class DevelopmentGrantPoller:
                 max_scratch_bytes=self.config.max_scratch_bytes,
                 public_root=self.config.public_root,
                 public_cache_dir=self.config.public_cache_dir,
+                registry_auth_file=self.config.registry_auth_file,
+                build_repositories=self.config.build_repositories,
                 poll_seconds=self.config.poll_seconds,
             )
         )

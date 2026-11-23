@@ -64,6 +64,23 @@ class DockerPlan(DockerResources):
     target_digest: Sha256Digest
 
 
+class ImageBuildPlan(StrictRequest):
+    """The frozen image-build policy of a local-cpu stage (ADR 0123): what the builder may
+    build, from which pinned public context, and where it may push. The plan digest covers it."""
+
+    builder_image: NonBlank200
+    context_input: NonBlank200
+    dockerfile: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+    base_images: Annotated[list[NonBlank200], Field(min_length=1, max_length=8)]
+    repository: Annotated[str, StringConstraints(min_length=3, max_length=255)]
+    registry_host: Annotated[str, StringConstraints(min_length=3, max_length=253)]
+    hosts: Annotated[
+        list[Annotated[str, StringConstraints(max_length=253)]], Field(min_length=1, max_length=16)
+    ]
+    push: bool
+    max_transfer_bytes: Annotated[int, Field(strict=True, ge=1, le=32 * 1024**3)]
+
+
 class ExecutionSpec(StrictRequest):
     argv: Annotated[list[RawString4000], Field(min_length=1, max_length=128)]
     input_snapshot_digest: Sha256Digest
@@ -76,6 +93,8 @@ class ExecutionSpec(StrictRequest):
     # ADR 0097: pinned public files the local worker supervisor fetches before the container
     # starts (local-cpu only). Absent keeps every existing plan digest.
     public_fetch: PublicFetchPlan | None = None
+    # ADR 0123: the image-build policy (local-cpu only). Absent keeps every existing plan digest.
+    build: ImageBuildPlan | None = None
     network_enabled: Literal[False] = False
     # Outputs above 16 MiB use chunked large-artifact custody; the operator's
     # ArtifactLimits (default 8 GiB) bound what a package may actually request.
@@ -98,6 +117,8 @@ class ExecutionSpec(StrictRequest):
             value.pop("egress", None)
         if self.public_fetch is None:
             value.pop("public_fetch", None)
+        if self.build is None:
+            value.pop("build", None)
         return value
 
     @model_validator(mode="after")
@@ -110,6 +131,10 @@ class ExecutionSpec(StrictRequest):
             )
         if self.public_fetch is not None and (self.profile != "local-cpu" or self.egress):
             raise ValueError("Public fetch is supported only for local-cpu without egress")
+        if self.build is not None and (
+            self.profile != "local-cpu" or self.egress is None or self.public_fetch is not None
+        ):
+            raise ValueError("Image build is supported only for local-cpu with its egress plan")
         if (self.profile == "ordinary-docker") != (self.docker is not None):
             raise ValueError("Docker profile requires its explicit approved target/resource pins")
         if (self.profile == "agent-sandbox") != (self.sandbox is not None):

@@ -15,13 +15,14 @@ this is recorded status, exit code, failure class and bounded detail), ``budget:
 import json
 from typing import Any
 
+from . import license_labels
 from .campaign_holdout import campaign_claims, project_claims
 from .campaign_infra_retry import infra_attempts
 from .campaign_models import TERMINAL_CAMPAIGN, normalize, parse_spec_json
 from .campaign_rerun import custody_released
 from .campaign_store import CampaignStore
 from .data_class import snapshot_data_class
-from .store import StoreError, _connect
+from .store import NotFound, StoreError, _connect
 
 SNAPSHOT_SCOPE = "snapshot:read"
 ARTIFACT_SCOPE = "artifact:read"
@@ -63,6 +64,50 @@ class AgentCampaignReads(CampaignStore):
                 item["data_class"] = snapshot_data_class(connection, item["id"])
                 snapshots.append(item)
             return {"snapshots": snapshots, "boundary": BOUNDARY}
+        finally:
+            connection.close()
+
+    def get_snapshot(self, principal, project_id, snapshot_id) -> dict[str, Any]:
+        """One snapshot's file list (snapshot:read): what a spec can pin, never the bytes.
+
+        Per file: relative path, size, sha256 and recorded classification. The manifest root
+        (a host path), provenance and exclusions are left out. At most ``_ROW_CAP`` files are
+        listed and ``truncated`` says when there were more.
+        """
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, SNAPSHOT_SCOPE)
+            self._project(connection, actor, project_id)
+            row = connection.execute(
+                """SELECT s.id, s.digest, s.created_at, s.manifest_json
+                FROM source_snapshots s JOIN projects p ON p.id = s.project_id
+                WHERE s.id = ? AND s.project_id = ? AND p.org_id = ?""",
+                (snapshot_id, project_id, actor["org_id"]),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Snapshot was not found.")
+            manifest = json.loads(row["manifest_json"])
+            entries = manifest["entries"]
+            return {
+                "id": row["id"],
+                "digest": row["digest"],
+                "created_at": row["created_at"],
+                "total_bytes": manifest["total_bytes"],
+                "file_count": len(entries),
+                "data_class": snapshot_data_class(connection, row["id"]),
+                "license_labels": sorted(license_labels.snapshot_labels(connection, row["id"])),
+                "files": [
+                    {
+                        "relative_path": e["relative_path"],
+                        "size": e["size"],
+                        "sha256": e["sha256"],
+                        "classification": e["classification"],
+                    }
+                    for e in entries[:_ROW_CAP]
+                ],
+                "truncated": len(entries) > _ROW_CAP,
+                "boundary": BOUNDARY + " Metadata only; bytes are never returned here.",
+            }
         finally:
             connection.close()
 

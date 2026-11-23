@@ -18,6 +18,11 @@ def snapshots(
     return request.app.state.agent_campaign_reads.list_snapshots(actor, project_id, offset, limit)
 
 
+@router.get("/projects/{project_id}/agent-snapshots/{snapshot_id}")
+def snapshot(project_id: str, snapshot_id: str, request: Request, actor: Actor):
+    return request.app.state.agent_campaign_reads.get_snapshot(actor, project_id, snapshot_id)
+
+
 @router.get("/campaigns/{campaign_id}/outputs")
 def outputs(campaign_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.campaign_outputs(actor, campaign_id)

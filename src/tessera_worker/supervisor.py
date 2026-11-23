@@ -597,6 +597,10 @@ class CpuSupervisor:
                 "profile": operation.development_output.profile,
                 "fixture_marker": operation.development_output.fixture_marker,
             }
+        if operation.build_directory is not None:
+            # ADR 0123: the build's output custody and auth file are part of the fence too.
+            payload["build_directory"] = operation.build_directory
+            payload["registry_auth_file"] = operation.registry_auth_file
         return json.dumps(
             payload,
             separators=(",", ":"),

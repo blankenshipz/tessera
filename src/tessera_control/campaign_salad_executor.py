@@ -92,10 +92,13 @@ class CustodyConfig(_Closed):
 
 
 class StageWatcherBlock(_Closed):
-    """Optional, off unless ``enabled`` (ADR 0111): watch each route, report descriptively.
+    """Optional tuning of the default-on watcher (ADR 0111, amended by ADR 0125).
 
-    Bounds are ``tessera_worker.stage_watch_config.StageWatchConfig``'s (checked here); an
-    omitted bound takes its default. Without ``kill_switch_path`` no watcher starts.
+    Without this block the executor watches every route with the default kill-switch marker
+    (``DEFAULT_KILL_SWITCH_NAME`` in the executor state directory; present means engaged). Opt out
+    only with ``{"enabled": false}``. Bounds are
+    ``tessera_worker.stage_watch_config.StageWatchConfig``'s (checked here); an omitted bound
+    takes its default, an omitted ``kill_switch_path`` the default marker.
     """
 
     enabled: bool
@@ -118,6 +121,33 @@ class StageWatcherBlock(_Closed):
 
         StageWatchConfig(**self.watch_config_fields())
         return self
+
+
+DEFAULT_KILL_SWITCH_NAME = "stage-watch.kill"
+
+
+def effective_stage_watcher(
+    block: StageWatcherBlock | None, state_dir: Path | str
+) -> StageWatcherBlock | None:
+    """The watcher block this executor runs: default-on, explicit opt-out only. Never raises.
+
+    The default marker lives in the executor's own private state directory and is never
+    created here: its presence engages the kill switch (no decision requests or model calls;
+    observing and reporting continue, ADR 0087 and 0125). A block that is enabled but names no
+    marker takes the default one, as the worker does.
+    """
+    try:
+        if block is not None and not block.enabled:
+            return None
+        if block is not None and block.kill_switch_path is not None:
+            return block
+        marker = str(Path(state_dir) / DEFAULT_KILL_SWITCH_NAME)
+        fields = {} if block is None else block.model_dump()
+        fields.update(enabled=True, kill_switch_path=marker)
+        return StageWatcherBlock(**fields)
+    except Exception:
+        print("salad executor: stage watcher default unusable; no watcher", file=sys.stderr)
+        return None
 
 
 class ExecutorConfig(_Closed):
@@ -975,15 +1005,18 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
         return SaladSafetyHTTPSClient(**config.custody.client_fields()).status(state)
 
     stage_watch = None
-    if config.stage_watcher is not None and config.stage_watcher.enabled:
+    watcher_block = effective_stage_watcher(config.stage_watcher, state_dir)
+    if watcher_block is not None:
         from .stage_watch_channel import build_salad_route_watch
 
         stage_watch = build_salad_route_watch(
-            config.stage_watcher,
+            watcher_block,
             state_dir=state_dir,
             worker=worker,
             poll_seconds=config.poll_seconds,
         )
+        if stage_watch is None:
+            print("salad executor: stage watcher not started", file=sys.stderr)
     return SaladCampaignExecutor(
         config,
         profiles,

@@ -66,28 +66,32 @@ timer (`deploy/executor`).
 Watches a running stage for silence and posts observation reports and decision requests. It only
 observes and reports: it never stops, retries, resizes or approves.
 
-**On in the shipped poller unit.** `deploy/systemd/tessera-development-poll.service` passes
-`--stage-watcher --stage-watcher-kill-switch /var/lib/tessera/stage-watch.kill`. After the deploy:
+**On by default.** The worker watches every local Docker stage with no flag, with the marker
+`<workspace_root>/stage-watch.kill` (under the worker's private workspace root). The shipped
+`deploy/systemd/tessera-development-poll.service` still passes
+`--stage-watcher --stage-watcher-kill-switch /var/lib/tessera/stage-watch.kill`, and explicit values
+win. For the Salad executor, set the `stage_watcher` block in its JSON config (`enabled`, an
+absolute `kill_switch_path`).
+
+The watcher is engaged (no requests) while the marker file exists; the worker never creates it.
+`touch` the marker to engage it at once; remove the file to release it. A marker directory that is
+not private leaves the worker running with no watcher and one stderr line.
+
+**Opt out (explicit only):** `--no-stage-watcher` on the command, or
+`"stage_watcher": {"enabled": false}` in the poller JSON config, then restart:
 
 ```
-systemctl daemon-reload
 systemctl restart tessera-development-poll.service
 ```
-
-If your own unit predates this, add the two flags to its `ExecStart`. For the Salad executor, set
-the `stage_watcher` block in its JSON config (`enabled`, an absolute `kill_switch_path`).
-
-The watcher is off while the marker file exists and fails closed without a marker path.
-`touch /var/lib/tessera/stage-watch.kill` turns it off at once; remove the file to turn it on.
 
 **Check it is in use:**
 
 ```
-systemctl show tessera-development-poll.service -p ExecStart | grep -c -- '--stage-watcher'
+journalctl -u tessera-development-poll.service | grep -c 'stage watcher:'
 tessera campaign receipt --owner-header "$HEADER" --control-url "$CONTROL" --campaign-id CAMPAIGN_ID
 ```
 
-The first prints `1` or more once the unit is updated. After a stage has run, the campaign
+The first counts stderr lines for an unusable or opted-out setup (`0` is healthy). After a stage has run, the campaign
 receipt has a `stage_watch` section only if reports were recorded; no section means no reports
 yet (for example a stage too short to go silent), not a fault.
 

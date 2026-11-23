@@ -19,12 +19,16 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .artifact_limits import ABSOLUTE_MAX_ARTIFACT_BYTES, operator_limits
 from .campaign_models import (
+    BUILD_RUNTIME,
     DOCKER_CPU_RUNTIME,
     LOCAL_DOCKER_PROVIDER,
     NormalStage,
+    build_policy,
     public_fetch_policy,
 )
 from .campaign_providers import (
+    MAX_SCRATCH_BYTES,
+    MAX_WORKER_SLOTS,
     ConfigSection,
     GrantRequest,
     Observation,
@@ -38,6 +42,9 @@ from .campaign_providers import (
     unregister_provider,
 )
 from .campaign_steps import StepFailed
+from .data_class import PUBLIC
+from .egress_models import EgressPolicy
+from .image_build_models import RegisteredRepository, repository_registered
 from .models import ExecutionSpec
 from .store import Conflict, Forbidden, Store
 
@@ -107,6 +114,17 @@ class WorkerGrantProvider:
                 "or have the operator raise that provider's max_scratch_bytes (and the "
                 "worker's own ceiling)."
             )
+        build = build_policy(stage)
+        if (
+            build is not None
+            and build["push"]
+            and not repository_registered(build["repository"], self.descriptor.build_repositories)
+        ):
+            raise Conflict(
+                f"Stage {stage.key!r}: build_repository_not_registered: repository "
+                f"{build['repository']!r} is not a registry destination the operator registered "
+                f"for provider {self.descriptor.provider_id!r} (build_repositories)."
+            )
         worker_id = self.worker_for(stage)
         instance = self.descriptor.worker_principal_id
         if worker_id is None:
@@ -131,7 +149,59 @@ class WorkerGrantProvider:
         ):
             raise Conflict("Campaign worker is not authorized for this project.")
 
+    @staticmethod
+    def _build_plan(stage: NormalStage) -> tuple[dict[str, Any], list[str], EgressPolicy]:
+        """The image-build policy, the builder's derived argv and its egress (ADR 0123).
+
+        Fails closed (ADR 0047: private data never gets egress): the build's only input must be
+        its pinned public snapshot context, whatever else the spec validation already checked."""
+        policy = build_policy(stage)
+        if policy is None or stage.runtime != BUILD_RUNTIME:
+            raise ValueError(f"Stage {stage.key}: {BUILD_RUNTIME} runs only a build stage")
+        context = [i for i in stage.inputs if i.name == policy["context_input"]]
+        if (
+            len(stage.inputs) != 1
+            or len(context) != 1
+            or context[0].kind != "snapshot"
+            or context[0].data_class != PUBLIC
+        ):
+            raise ValueError(
+                f"Stage {stage.key}: an image build takes only its public snapshot build context"
+            )
+        if stage.egress is not None or stage.env is not None:
+            raise ValueError(f"Stage {stage.key}: a build stage derives its own egress, no env")
+        from tessera_worker.image_build import builder_argv
+
+        egress = EgressPolicy(
+            profile="allowlist-proxy-v1",
+            destinations=[{"host": host, "port": 443} for host in policy["hosts"]],
+            max_egress_bytes=policy["max_transfer_bytes"],
+        )
+        return policy, list(builder_argv(policy)), egress
+
     def execution_spec(self, stage: NormalStage, input_digest: str) -> dict[str, Any]:
+        if stage.build is not None or stage.runtime == BUILD_RUNTIME:
+            policy, argv, egress = self._build_plan(stage)
+            if policy["push"] and not repository_registered(
+                policy["repository"], self.descriptor.build_repositories
+            ):
+                raise ValueError(
+                    f"Stage {stage.key}: build_repository_not_registered: "
+                    f"{policy['repository']!r} is not a registered destination of provider "
+                    f"{self.descriptor.provider_id!r}"
+                )
+            return ExecutionSpec(
+                argv=argv,
+                input_snapshot_digest=input_digest,
+                pinned_skill_digests=[],
+                output_paths=stage.output_paths,
+                profile="local-cpu",
+                egress=egress,
+                network_enabled=False,
+                max_output_bytes=stage.max_output_bytes,
+                max_scratch_bytes=stage.scratch_bytes,
+                build=policy,
+            ).model_dump(mode="json")
         return ExecutionSpec(
             argv=list(stage.argv),
             input_snapshot_digest=input_digest,
@@ -360,7 +430,7 @@ class WorkerGrantProvider:
 
 ProviderIdStr = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,63}$")]
 PrincipalStr = Annotated[str, StringConstraints(min_length=1, max_length=200)]
-ScratchCeiling = Annotated[int, Field(strict=True, ge=1024 * 1024, le=64 * 1024**3)]
+ScratchCeiling = Annotated[int, Field(strict=True, ge=1024 * 1024, le=MAX_SCRATCH_BYTES)]
 
 
 class _Strict(BaseModel):
@@ -382,20 +452,25 @@ class SelfHostedInstance(_Strict):
 
     id: ProviderIdStr
     worker_principal_id: PrincipalStr
-    runtimes: Annotated[list[Literal["docker-cpu-v1"]], Field(min_length=1, max_length=1)] = [  # noqa: RUF012
+    runtimes: Annotated[
+        list[Literal["docker-cpu-v1", "docker-build-v1"]], Field(min_length=1, max_length=2)
+    ] = [  # noqa: RUF012
         "docker-cpu-v1"
     ]
     output_limits: OutputLimitsConfig = OutputLimitsConfig()
     # Grants the instance's pollers can run at once; 1 unless several pollers share the
     # principal (ADR 0048).
-    worker_slots: Annotated[int, Field(strict=True, ge=1, le=8)] = 1
+    worker_slots: Annotated[int, Field(strict=True, ge=1, le=MAX_WORKER_SLOTS)] = 1
     max_scratch_bytes: ScratchCeiling = 64 * 1024 * 1024
+    # ADR 0123: registries (``host[/path]``) a build stage on this instance may push to.
+    build_repositories: Annotated[list[RegisteredRepository], Field(max_length=32)] = []  # noqa: RUF012
 
 
 class LocalDockerConfig(_Strict):
     worker_principal_id: PrincipalStr
-    worker_slots: Annotated[int, Field(strict=True, ge=1, le=8)] = 1
+    worker_slots: Annotated[int, Field(strict=True, ge=1, le=MAX_WORKER_SLOTS)] = 1
     max_scratch_bytes: ScratchCeiling = 64 * 1024 * 1024
+    build_repositories: Annotated[list[RegisteredRepository], Field(max_length=32)] = []  # noqa: RUF012
 
 
 class ProvidersFile(_Strict):
@@ -478,12 +553,14 @@ def _descriptor(
     limits: OutputLimitsConfig | None = None,
     worker_slots: int = 1,
     max_scratch_bytes: int = 64 * 1024 * 1024,
+    runtimes: frozenset[str] = frozenset({DOCKER_CPU_RUNTIME, BUILD_RUNTIME}),
+    build_repositories: tuple[str, ...] = (),
 ) -> ProviderDescriptor:
     limits = limits or OutputLimitsConfig()
     return ProviderDescriptor(
         provider_id=provider_id,
         kind="worker_grant",
-        runtimes=frozenset({DOCKER_CPU_RUNTIME}),
+        runtimes=runtimes,
         target=None,
         billable=False,
         third_party=False,
@@ -492,6 +569,7 @@ def _descriptor(
         worker_principal_id=principal,
         worker_slots=worker_slots,
         max_scratch_bytes=max_scratch_bytes,
+        build_repositories=build_repositories,
     )
 
 
@@ -513,6 +591,9 @@ def register_from_config(config: dict | None) -> None:
     """
     parsed = ProvidersFile.model_validate(config or {})
     principal = "" if parsed.local_docker is None else parsed.local_docker.worker_principal_id
+    local_builds = (
+        () if parsed.local_docker is None else tuple(parsed.local_docker.build_repositories)
+    )
     local_slots = 1 if parsed.local_docker is None else parsed.local_docker.worker_slots
     local_scratch = (
         64 * 1024 * 1024 if parsed.local_docker is None else parsed.local_docker.max_scratch_bytes
@@ -532,7 +613,14 @@ def register_from_config(config: dict | None) -> None:
     _replace(
         LOCAL_DOCKER_PROVIDER,
         WorkerGrantProvider(
-            _descriptor(LOCAL_DOCKER_PROVIDER, principal, None, local_slots, local_scratch)
+            _descriptor(
+                LOCAL_DOCKER_PROVIDER,
+                principal,
+                None,
+                local_slots,
+                local_scratch,
+                build_repositories=local_builds,
+            )
         ),
     )
     for item in parsed.self_hosted:
@@ -545,6 +633,8 @@ def register_from_config(config: dict | None) -> None:
                     item.output_limits,
                     item.worker_slots,
                     item.max_scratch_bytes,
+                    frozenset(item.runtimes),
+                    tuple(item.build_repositories),
                 )
             ),
         )

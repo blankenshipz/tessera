@@ -253,3 +253,209 @@ def test_a_campaign_that_never_starts_fails_loudly(tmp_path):
             advance=lambda phase: None,  # nothing advances: no runner
             wait_seconds=0.0,
         )
+
+
+# ---- the agent_cannot_approve step asserts a SPECIFIC refusal, not "any exception" ----------
+
+from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
+
+from tessera_mcp.client import ControlError  # noqa: E402
+
+DENIED = "Control API denied or rejected request (HTTP {})"
+
+
+def _wrapped(text):
+    error = ToolError(f"Error executing tool tessera_approve_campaign: {text}")
+    error.__cause__ = ControlError(text)
+    return error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ControlError(DENIED.format(403)), ToolError(DENIED.format(403)), _wrapped(DENIED.format(403))],
+)
+def test_a_control_403_denial_is_labelled_http_403(error):
+    assert smoke.agent_approval_refusal(error) == "http_403"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("connection reset"),
+        TimeoutError("timed out"),
+        ControlError(DENIED.format(401)),
+        _wrapped(DENIED.format(404)),
+        ControlError("Refused (HTTP 409): stale"),
+        ControlError(DENIED.format(500)),
+        ValueError(DENIED.format(403)),  # the right words from the wrong kind of error
+        ValueError("bad"),
+        KeyError("spec_digest"),
+    ],
+)
+def test_anything_other_than_a_403_denial_is_not_a_refusal(error):
+    assert smoke.agent_approval_refusal(error) is None
+
+
+def test_the_step_records_the_label_and_class_only(tmp_path):
+    sched, agent, person, agent_approve = _rig(tmp_path)
+    env = sched.env
+    spec = _spec("running-check", _stage(env, "one"), _stage(env, "two", upstream="one"))
+    document = check.run_running_check(
+        agent, person, agent_approve, image=IMAGE, snapshot_id=env.snapshot_id, spec=spec,
+        advance=_advance(sched.world), held_polls=2, wait_seconds=3600.0,
+    )  # fmt: skip
+    evidence = {s["step"]: s for s in document["steps"]}["agent_cannot_approve"]["evidence"]
+    assert evidence["refused_with"] == "http_403" and evidence["error_class"] == "ToolError"
+
+
+@pytest.mark.parametrize("error", [ConnectionError("boom"), TimeoutError("t"), ValueError("v")])
+def test_a_failed_approval_attempt_is_not_counted_as_a_refusal(tmp_path, error):
+    sched, agent, person, _ = _rig(tmp_path)
+    env = sched.env
+    spec = _spec("running-check", _stage(env, "one"), _stage(env, "two", upstream="one"))
+
+    def broken(*_a, **_k):
+        raise error
+
+    with pytest.raises(smoke.SmokeFailure, match="other than a refusal") as caught:
+        check.run_running_check(
+            agent, person, broken, image=IMAGE, snapshot_id=env.snapshot_id, spec=spec,
+            advance=lambda phase: None,
+        )  # fmt: skip
+    assert "boom" not in str(caught.value)
+
+
+def test_an_approval_that_succeeds_for_the_agent_still_fails(tmp_path):
+    sched, agent, person, _ = _rig(tmp_path)
+    env = sched.env
+    spec = _spec("running-check", _stage(env, "one"), _stage(env, "two", upstream="one"))
+    with pytest.raises(smoke.SmokeFailure, match="was allowed to approve"):
+        check.run_running_check(
+            agent, person, lambda *_a, **_k: {"ok": True}, image=IMAGE,
+            snapshot_id=env.snapshot_id, spec=spec, advance=lambda phase: None,
+        )  # fmt: skip
+
+
+# ---- main(): the live --execute path, with no network and no control plane -----------------
+
+
+def _live_args(tmp_path, *extra, confirm=check.CONFIRM_PHRASE, mode=0o600):
+    files = {}
+    for name in ("agent", "person"):
+        path = tmp_path / f"live-{name}.token"
+        path.write_text(f"secret-live-{name}-token-value")
+        path.chmod(mode)
+        files[name] = path
+    return [
+        "--execute", "--confirm", confirm, "--control-url", "https://control.example",
+        "--project-id", "p", "--destination", "d", "--image", IMAGE,
+        "--agent-token-file", str(files["agent"]), "--person-token-file", str(files["person"]),
+        "--held-polls", "2", "--wait-seconds", "3600", *extra,
+    ]  # fmt: skip
+
+
+def _fake_live(monkeypatch, tmp_path, *, approve=None):
+    """Wire main() to in-process callers: _build_caller hands out the rig's fakes by flags."""
+    sched, agent, person, agent_approve = _rig(tmp_path)
+    env = sched.env
+    built = []
+
+    def build(arguments, token_file, **flags):
+        built.append((token_file.name, sorted(flags)))
+        if flags.get("campaign_tools"):
+            return agent
+        return person if token_file.name == "live-person.token" else (approve or agent_approve)
+
+    spec = _spec("running-check", _stage(env, "one"), _stage(env, "two", upstream="one"))
+    advance = _advance(sched.world)
+    monkeypatch.setattr(smoke, "_build_caller", build)
+    monkeypatch.setattr(check, "running_spec", lambda *a, **k: spec)
+    monkeypatch.setattr(check.time, "sleep", lambda _s: advance("running_or_later"))
+    return built, env
+
+
+def _ran_nothing(monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("must not build a caller or run")
+
+    monkeypatch.setattr(smoke, "_build_caller", boom)
+    monkeypatch.setattr(check, "run_running_check", boom)
+
+
+@pytest.mark.parametrize("confirm", [None, "yes"])
+def test_main_refuses_a_missing_or_wrong_confirmation_and_runs_nothing(
+    tmp_path, capsys, monkeypatch, confirm
+):
+    _ran_nothing(monkeypatch)
+    args = _live_args(tmp_path, confirm=confirm or "")
+    if confirm is None:
+        i = args.index("--confirm")
+        del args[i : i + 2]
+    assert check.main(args) == 2
+    captured = capsys.readouterr()
+    assert "refused: --execute needs --confirm" in captured.err and captured.out == ""
+
+
+def test_main_refuses_group_or_world_readable_token_files_and_relative_paths(tmp_path, monkeypatch):
+    _ran_nothing(monkeypatch)
+    with pytest.raises(SystemExit, match="owner-only"):
+        check.main(_live_args(tmp_path, mode=0o640))
+    with pytest.raises(SystemExit, match="owner-only"):
+        check.main(_live_args(tmp_path, mode=0o604))
+    args = _live_args(tmp_path)
+    args[args.index("--agent-token-file") + 1] = "relative.token"
+    with pytest.raises(SystemExit, match="absolute path"):
+        check.main(args)
+
+
+def test_main_runs_and_prints_the_report_without_secrets(tmp_path, capsys, monkeypatch):
+    built, _env = _fake_live(monkeypatch, tmp_path)
+    assert check.main(_live_args(tmp_path)) == 0
+    out = capsys.readouterr().out
+    document = json.loads(out)
+    assert document["schema"] == check.REPORT_SCHEMA and document["ok"] is True
+    assert [s["step"] for s in document["steps"]] == [name for name, _ in check.STEPS]
+    assert all(s["ok"] for s in document["steps"])
+    assert "secret-live" not in out and str(tmp_path) not in out and ".token" not in out
+    # three callers: the agent, the agent's approve-only server, and the person's.
+    assert [name for name, _ in built] == [
+        "live-agent.token", "live-agent.token", "live-person.token"
+    ]  # fmt: skip
+
+
+def test_main_writes_the_receipt_0600_and_never_overwrites(tmp_path, capsys, monkeypatch):
+    _fake_live(monkeypatch, tmp_path)
+    receipt = tmp_path / "receipt.json"
+    assert check.main(_live_args(tmp_path, "--receipt-file", str(receipt))) == 0
+    assert receipt.stat().st_mode & 0o777 == 0o600
+    written = json.loads(receipt.read_text())
+    assert written == json.loads(capsys.readouterr().out)
+    assert "secret-live" not in receipt.read_text() and str(tmp_path) not in receipt.read_text()
+    before = receipt.read_text()
+    with pytest.raises(FileExistsError):
+        check.main(_live_args(tmp_path, "--receipt-file", str(receipt)))
+    assert receipt.read_text() == before
+
+
+def test_main_fails_when_the_approval_attempt_dies_and_reports_no_secret(
+    tmp_path, capsys, monkeypatch
+):
+    def dropped(*_a, **_k):
+        raise ConnectionError("secret-live-agent-token-value dropped")
+
+    _fake_live(monkeypatch, tmp_path, approve=dropped)
+    receipt = tmp_path / "receipt.json"
+    assert check.main(_live_args(tmp_path, "--receipt-file", str(receipt))) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and not receipt.exists()
+    failure = json.loads(captured.err)
+    assert failure["ok"] is False and "other than a refusal" in failure["failed"]
+    assert "secret-live" not in captured.err and str(tmp_path) not in captured.err
+    assert "ConnectionError" in failure["failed"]
+
+
+def test_dry_run_builds_no_caller_and_reads_no_credential(tmp_path, capsys, monkeypatch):
+    _ran_nothing(monkeypatch)
+    missing = str(tmp_path / "does-not-exist.token")
+    assert check.main(["--agent-token-file", missing, "--person-token-file", missing]) == 0
+    assert json.loads(capsys.readouterr().out)["mode"] == "dry-run"

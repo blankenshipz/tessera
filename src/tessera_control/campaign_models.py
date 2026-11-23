@@ -447,6 +447,35 @@ class ReceiptOutputSource(_Strict):
         return self
 
 
+class ImageFromSource(_Strict):
+    """A reference to the image a finished build stage's receipt reports (ADR 0123).
+
+    Accepted only in a submit request, in place of a literal ``image``: submit resolves it, before
+    the spec is digested, to the predecessor's succeeded build-stage receipt (the provider-reported
+    ``produced_image``) and records ``image_resolved_from``. The stored spec never holds it. The
+    resolved image is not thereby runnable: dispatch still checks it against the operator's
+    worker ``--allowed-image`` and Salad profile allowlists."""
+
+    kind: Literal["receipt_image"]
+    campaign_id: Identifier | None = None
+    predecessor: Key | None = None
+    stage: Key
+
+    @model_validator(mode="after")
+    def _one_source(self) -> ImageFromSource:
+        if (self.campaign_id is None) == (self.predecessor is None):
+            raise ValueError("name exactly one of campaign_id and predecessor")
+        return self
+
+
+class ImageLineage(_Strict):
+    """Where a resolved ``image_from`` came from: the build stage and the receipt digest read."""
+
+    campaign_id: Identifier
+    stage: Key
+    source_receipt_sha256: Sha256Digest
+
+
 # A pinned public artifact (ADR 0097): large public inputs (model weights, public datasets) that
 # the control plane does not need are fetched ON the executing provider, never downloaded to the
 # control plane and shipped out. The spec names each file's https source, content digest and size
@@ -607,13 +636,77 @@ class ProviderCandidate(_Strict):
         return value
 
 
+# ADR 0123: a stage that BUILDS an image from a pinned, public build context and pushes it to a
+# registry the operator allows. The builder image is the stage's own (pinned) ``image``; the
+# provider derives the builder's arguments, so an author supplies no argv, env or egress.
+BUILD_RUNTIME = "docker-build-v1"
+BUILD_ARGV = ("tessera-image-build",)
+# The builder's egress byte budget is an EgressPolicy.max_egress_bytes, capped at 2 GiB.
+BUILD_MAX_TRANSFER_BYTES = 2 * 1024**3
+DockerfilePath = Annotated[
+    str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$", max_length=200)
+]
+# host[:port]/path, lowercase; the host is checked with the shared public-host rule.
+RegistryRepository = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]{1,5})?/[a-z0-9]+(?:[._/-][a-z0-9]+)*$",
+        max_length=255,
+    ),
+]
+
+
+def registry_host(repository: str) -> str | None:
+    """The canonical host of ``host[:port]/path`` when it is a public registry host on 443."""
+    head = repository.split("/", 1)[0]
+    host, _, port = head.partition(":")
+    if port not in ("", "443"):
+        return None
+    return canonical_public_host(host)
+
+
+def image_registry_host(image: str) -> str | None:
+    """The registry host of a pinned ``host/path@sha256:...`` image reference, if it names one."""
+    name = image.split("@", 1)[0]
+    if "/" not in name:
+        return None  # a bare name resolves against the builder's own default registry
+    head = name.split("/", 1)[0]
+    if "." not in head and ":" not in head and head != "localhost":
+        return None  # ``org/name`` is a path on the default registry, not a host
+    return registry_host(name)
+
+
+class BuildSpec(_Strict):
+    """What an image-build stage builds (ADR 0123)."""
+
+    context_input: Key  # a pinned, public ``snapshot`` input of the stage: the build context
+    dockerfile: DockerfilePath = "Dockerfile"  # a path inside the context
+    base_images: Annotated[list[PinnedImage], Field(min_length=1, max_length=8)]
+    repository: RegistryRepository  # where the built image is pushed (a registered destination)
+    push: bool = True
+    max_transfer_bytes: Annotated[int, Field(strict=True, ge=1, le=BUILD_MAX_TRANSFER_BYTES)] = (
+        BUILD_MAX_TRANSFER_BYTES
+    )
+
+    @model_validator(mode="after")
+    def _consistent(self) -> BuildSpec:
+        if any(part in {"", ".", ".."} for part in self.dockerfile.split("/")):
+            raise ValueError("the Dockerfile path is a plain path inside the build context")
+        if registry_host(self.repository) is None:
+            raise ValueError("the repository host is a public registry host on port 443")
+        if len(set(self.base_images)) != len(self.base_images):
+            raise ValueError("base images must be distinct")
+        return self
+
+
 class StageV2(_Strict):
     key: Key
     provider: ProviderId
     runtime: ProviderId
     # Validated by the provider's strict config model; part of the digest; never secrets.
     provider_config: dict[str, Any] = {}  # noqa: RUF012 - pydantic copies defaults
-    image: PinnedImage
+    # Exactly one of ``image`` and ``image_from`` (ADR 0123); a stored spec always has ``image``.
+    image: PinnedImage | None = None
     argv: Annotated[list[RawString4000], Field(min_length=1, max_length=128)]
     env: dict[str, RawString4000] | None = None
     egress: EgressPolicy | None = None
@@ -653,6 +746,19 @@ class StageV2(_Strict):
     # image). Naming it makes the code's digest and files part of the receipt. Absent keeps the
     # digest.
     code_input: Key | None = None
+    # ADR 0123: this stage builds and pushes an image (see ``BuildSpec``); absent keeps the digest.
+    build: BuildSpec | None = None
+    # ADR 0123: submit-time lineage of the image (request form and resolution record).
+    image_from: ImageFromSource | None = None
+    image_resolved_from: ImageLineage | None = None
+
+    @model_validator(mode="after")
+    def _one_image(self) -> StageV2:
+        if (self.image is None) == (self.image_from is None):
+            raise ValueError(f"Stage {self.key} names exactly one of image and image_from")
+        if self.image_resolved_from is not None and self.image_from is not None:
+            raise ValueError(f"Stage {self.key}: image_resolved_from is set by submit only")
+        return self
 
     @model_validator(mode="after")
     def _distinct_tags(self) -> StageV2:
@@ -697,6 +803,14 @@ class StageV2(_Strict):
             value.pop("expected_duration_seconds", None)
         if self.code_input is None:
             value.pop("code_input", None)
+        if self.build is None:
+            value.pop("build", None)
+        if self.image is None:
+            value.pop("image", None)
+        if self.image_from is None:
+            value.pop("image_from", None)
+        if self.image_resolved_from is None:
+            value.pop("image_resolved_from", None)
         if self.evaluation is None:
             value.pop("evaluation", None)
         if self.send_classes is None:
@@ -757,6 +871,10 @@ def parse_spec_json(text: str, *, providers: bool = False) -> CampaignSpec | Cam
         isinstance(item, ReceiptOutputSource) for stage in spec.stages for item in stage.inputs
     ):
         raise ValueError("A stored spec cannot hold an unresolved receipt_output input.")
+    if isinstance(spec, CampaignSpecV2) and any(
+        stage.image_from is not None or stage.image is None for stage in spec.stages
+    ):
+        raise ValueError("A stored spec cannot hold an unresolved image_from reference.")
     return spec
 
 
@@ -853,6 +971,8 @@ class NormalStage:
     expected_duration_seconds: int | None = None
     # ADR 0095: the pinned snapshot input that carries the stage's code, or None.
     code_input: str | None = None
+    # ADR 0123: the image-build plan (``BuildSpec`` as a dict) or None.
+    build: dict[str, Any] | None = None
 
     @property
     def holdout(self) -> HoldoutClaimSpec | None:
@@ -971,7 +1091,7 @@ def _normalize_v1(spec: CampaignSpec) -> NormalSpec:
                 provider=SALAD_PROVIDER if is_salad else LOCAL_DOCKER_PROVIDER,
                 runtime=SALAD_RUNTIME if is_salad else DOCKER_CPU_RUNTIME,
                 provider_config=config,
-                image=stage.image,
+                image=stage.image or "",
                 argv=tuple(stage.argv),
                 env=None if stage.env is None else dict(stage.env),
                 egress=stage.egress,
@@ -1086,7 +1206,7 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                 provider=stage.provider,
                 runtime=stage.runtime,
                 provider_config=dict(stage.provider_config),
-                image=stage.image,
+                image=stage.image or "",
                 argv=tuple(stage.argv),
                 env=None if stage.env is None else dict(stage.env),
                 egress=stage.egress,
@@ -1119,6 +1239,7 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                 memory_bytes=stage.memory_bytes,
                 expected_duration_seconds=stage.expected_duration_seconds,
                 code_input=stage.code_input,
+                build=None if stage.build is None else stage.build.model_dump(mode="json"),
             )
         )
     return NormalSpec(
@@ -1237,6 +1358,30 @@ MAX_PUBLIC_INPUTS_PER_STAGE = 4
 MAX_PUBLIC_FILES_PER_STAGE = 32
 
 
+def build_policy(stage: NormalStage) -> dict[str, Any] | None:
+    """What the builder may do for an image-build stage (ADR 0123), or None for any other stage.
+
+    ``hosts`` are the registry the image is pushed to and the registries its pinned base images
+    come from, sorted: the only outbound reach the builder gets (through the allowlist proxy)."""
+    if stage.build is None:
+        return None
+    plan = stage.build
+    hosts = {registry_host(plan["repository"])}
+    hosts.update(image_registry_host(image) for image in plan["base_images"])
+    hosts.discard(None)
+    return {
+        "builder_image": stage.image,
+        "context_input": plan["context_input"],
+        "dockerfile": plan["dockerfile"],
+        "base_images": list(plan["base_images"]),
+        "repository": plan["repository"],
+        "registry_host": registry_host(plan["repository"]),
+        "hosts": sorted(hosts),
+        "push": plan["push"],
+        "max_transfer_bytes": plan["max_transfer_bytes"],
+    }
+
+
 def public_fetch_policy(stage: NormalStage) -> dict[str, Any] | None:
     """What the provider may fetch for a stage (ADR 0097), or None without a public_artifact.
 
@@ -1279,6 +1424,60 @@ def stage_execution_spec(
     return _provider(stage.provider).execution_spec(stage, input_digest)
 
 
+def _validate_build(spec: NormalSpec, stage: NormalStage) -> None:
+    """ADR 0123: the shape of an image-build stage; every rule here fails closed."""
+    label = f"Stage {stage.key}"
+    if stage.build is None:
+        if stage.runtime == BUILD_RUNTIME:
+            raise ValueError(f"{label}: runtime {BUILD_RUNTIME} requires a build section")
+        return
+    if stage.runtime != BUILD_RUNTIME:
+        raise ValueError(f"{label}: a build stage's runtime is {BUILD_RUNTIME}")
+    if list(stage.argv) != list(BUILD_ARGV):
+        raise ValueError(f"{label}: a build stage's argv is exactly {list(BUILD_ARGV)}")
+    if stage.env is not None:
+        raise ValueError(f"{label}: a build stage declares no env")
+    if stage.egress is not None:
+        raise ValueError(
+            f"{label}: a build stage must not declare egress (the provider derives the narrow "
+            "allowlist from the registry hosts of the build)"
+        )
+    if stage.code_input is not None:
+        raise ValueError(f"{label}: a build stage has no code_input (its context is the build)")
+    if stage.alternates or stage.retry.reroute_providers:
+        raise ValueError(f"{label}: a build stage has no alternate_providers or reroute")
+    if stage.gate_evidence is not None or stage.evaluation is not None:
+        raise ValueError(f"{label}: a build stage has no gate_evidence or evaluation")
+    if len(stage.outputs) != 1 or stage.outputs[0].kind != "log":
+        raise ValueError(f"{label}: a build stage declares exactly one output, of kind log")
+    context = stage.build["context_input"]
+    named = [item for item in stage.inputs if item.name == context]
+    if not named or named[0].kind != "snapshot":
+        raise ValueError(
+            f"{label}: build context_input {context!r} must name a pinned snapshot input"
+        )
+    if named[0].data_class != PUBLIC:
+        raise ValueError(
+            f"{label}: the build context must be a public snapshot (it is baked into the pushed "
+            "image layers, so private data is never a build context)"
+        )
+    if len(stage.inputs) != 1:
+        raise ValueError(f"{label}: a build stage has exactly its one context input")
+    for other in spec.stages:
+        if other.key == stage.key or other.code_input is None:
+            continue
+        code = next((i for i in other.inputs if i.name == other.code_input), None)
+        if (
+            code is not None
+            and code.kind == "snapshot"
+            and code.snapshot_id == named[0].snapshot_id
+        ):
+            raise ValueError(
+                f"{label}: its build context snapshot is stage {other.key}'s code_input; "
+                "private code is never baked into a pushed image"
+            )
+
+
 def validate_structure(spec: NormalSpec) -> None:
     """Raise ValueError with a precise message when the DAG is not well formed."""
     keys = [stage.key for stage in spec.stages]
@@ -1304,6 +1503,7 @@ def validate_structure(spec: NormalSpec) -> None:
                     f"Stage {stage.key} code_input {stage.code_input!r} must be a pinned snapshot "
                     f"input, not a {named[0].kind} input (its digest is not known at submit)"
                 )
+        _validate_build(spec, stage)
         public = [item for item in stage.inputs if item.kind == "public_artifact"]
         if public:
             if len(public) > MAX_PUBLIC_INPUTS_PER_STAGE:

@@ -160,7 +160,8 @@ implemented (host firewalling is the operator's responsibility).
 A model API key for the reasoning service is installed with `tessera-service-credential install` (secret on
 standard input only; it writes the root-owned 0600 key file and the `model-credential` reference file, and a
 receipt with the reference and fingerprint). The start-up checks above are the admission: the installer adds
-none of its own. See [service credentials](service-credentials.md).
+none of its own. See [service credentials](service-credentials.md). The ordered steps left once the key
+exists are in [reasoning first call: operator steps](reasoning-first-call-ops.md).
 ## Before the first call
 
 `tessera-reasoning-readiness check` verifies everything the first receipted call needs except the key
@@ -168,7 +169,8 @@ value (environment, profile, credential reference, the key file's shape without 
 allowlist, a writable receipts store, the control-plane slices and the spend limits) and reports
 `ready`, `ready_except_key`, `not_fully_checked` (a check could not run, for example without the
 control inputs; never a pass) or `not_ready`. It never reads the key or calls the model. See
-[first-call readiness](first-call-readiness.md) and
+[first-call readiness](first-call-readiness.md), the
+[operator steps for the first call](reasoning-first-call-ops.md) and
 [ADR 0109](decisions/0109-reasoning-first-call-readiness.md).
 
 ## Required secure operator handoff
@@ -177,8 +179,11 @@ control inputs; never a pass) or `not_ready`. It never reads the key or calls th
    destination, with proposal/context/request/consume rights as needed. Never use
    an owner token. For isolated local acceptance, the authorized human setup API
    can mint this test credential and bounded grant; it is implementation/setup work,
-   **not** a secret the user must supply again. Supply its named environment reference to the supervisor
-   and the scoped MCP service, never in the prompt or profile contents.
+   **not** a secret the user must supply again. Deliver it as the `agent-token` systemd credential
+   (`/etc/tessera/credentials/reasoning-agent-token`); start-up reads that file and passes the token to
+   the supervisor child as the profile's `agent_token_env` variable (`TESSERA_REASONING_AGENT_TOKEN`).
+   This is the agent token only, never the model API key, which is never an environment variable.
+   Give the scoped MCP service the same token file, never in the prompt or profile contents.
 2. A separately human-issued bounded agent-authority grant, plus the separately
    approved execution grants/resource pins needed for experiment commands. The
    runtime reads `/agent-authority-grants/{id}` through its own agent credential;

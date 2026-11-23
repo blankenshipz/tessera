@@ -20,6 +20,7 @@ from .approval_trust import (
     AUTOMATION_KEY,
     CAMPAIGN_DELEGATION_KEY,
     DECISION_EVENT_TYPES,
+    DELEGATION_KEY,
     decision_provenance,
     require_decision_actor,
 )
@@ -1569,6 +1570,8 @@ class Store:
         actor = Store._credential_principal(connection, row, audience)
         if principal.get(AUTOMATION_KEY):
             actor[AUTOMATION_KEY] = principal[AUTOMATION_KEY]
+        if principal.get(DELEGATION_KEY):
+            actor[DELEGATION_KEY] = principal[DELEGATION_KEY]
         if (
             not external_allowed
             and connection.execute(

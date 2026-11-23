@@ -19,8 +19,10 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_get_campaign_receipt` | `GET /campaigns/{id}/receipt` | `campaign:read` |
 | `tessera_cancel_campaign` | `POST /campaigns/{id}/cancel` | `campaign:cancel` |
 | `tessera_list_snapshots` | `GET /projects/{p}/agent-snapshots` | `snapshot:read` |
+| `tessera_get_snapshot` | `GET /projects/{p}/agent-snapshots/{id}` | `snapshot:read` |
 | `tessera_campaign_outputs` | `GET /campaigns/{id}/outputs` | `artifact:read` |
 | `tessera_campaign_logs` | `GET /campaigns/{id}/logs` | `campaign:logs` |
+| `tessera_campaign_stage_watch` | `GET /campaigns/{id}/stage-watch` | `campaign:logs` |
 | `tessera_campaign_budget` | `GET /campaigns/{id}/budget` | `budget:read` |
 | `tessera_project_spend` | `GET /projects/{id}/agent-spend` | `budget:read` |
 | `tessera_campaign_retries` | `GET /campaigns/{id}/retries` | `campaign:read` |
@@ -29,6 +31,9 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_campaign_holdout` | `GET /campaigns/{id}/holdout` | `campaign:read` |
 | `tessera_campaign_holdout_claims` | `GET /projects/{p}/holdout-claims[?partition_digest=]` | `campaign:read` |
 | `tessera_validate_campaign_spec` | `POST /projects/{p}/campaign-specs/validate` | `campaign:submit` |
+| `tessera_render_campaign_spec` | `POST /projects/{p}/campaign-specs/validate` (after offline rendering) | `campaign:submit` |
+| `tessera_submit_rendered_campaign` | the submit route (after offline rendering) | `campaign:submit` |
+| `tessera_campaign_wave_receipts` | `GET /campaigns/{id}`, `/receipt` and `/gate-decisions` per id (max 20) | `campaign:read` |
 | `tessera_campaign_grants` | `GET /campaigns/{id}/grants` | `campaign:logs` |
 | `tessera_reduce_campaign_budget` | `POST /campaigns/{id}/budget-reduction` | `campaign:cancel` |
 | `tessera_revoke_campaign_release` | `POST /campaigns/{id}/releases/{release}/revoke` | `campaign:cancel` |
@@ -37,6 +42,7 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_limit_campaign_concurrency` | `POST /campaigns/{id}/concurrency-limit` | `campaign:cancel` |
 | `tessera_cancel_campaign_stage` | `POST /campaigns/{id}/stages/{stage}/cancel` | `campaign:cancel` |
 | `tessera_approve_campaign` (only with `--approval-tool`) | `GET /campaigns/{id}`, `POST /campaigns/{id}/approve` | a person's session credential; no enrollable scope grants it |
+| `tessera_record_gate_decision` (only with `--approval-tool`) | `GET /campaigns/{id}`, `POST /campaigns/{id}/gate-decision` | a person's session credential; no enrollable scope grants it |
 | `tessera_rerun_campaign` | `POST /campaigns/{id}/rerun` | `campaign:submit` + `campaign:read` + `artifact:read` (all three needed to register it) |
 | `tessera_prepare_stage_retry` | `GET /campaigns/{id}` and `/outputs` (offline build) | `campaign:read` + `artifact:read` (both needed to register it) |
 
@@ -67,7 +73,7 @@ campaign's output. `receipt_output` inputs resolve at submit from a succeeded ca
 pass `predecessors` (name to campaign id) to `tessera_submit_campaign` to name them
 ([ADR 0080](decisions/0080-campaign-inputs-from-a-predecessor-receipt.md)). The tool validates with the control plane's own parser, so an invalid
 spec never leaves the adapter; provider-registry checks still run at submit and approve.
-Find snapshot ids and digests with `tessera_list_snapshots` and a source campaign's output
+Find snapshot ids and digests with `tessera_list_snapshots`, the files a snapshot holds with `tessera_get_snapshot`, and a source campaign's output
 sha256 with `tessera_campaign_outputs`.
 
 ## Scope semantics
@@ -78,6 +84,11 @@ sha256 with `tessera_campaign_outputs`.
   reads return 404.
 - `tessera_list_snapshots` lists metadata (id, digest, size, file count, recorded data
   class). It never returns host paths. It grants no bytes. Staging stays a human step.
+- `tessera_get_snapshot` lists one snapshot's files (relative path, size, sha256, classification,
+  at most 1000, with a `truncated` flag), its data class and licence labels
+  ([ADR 0126](decisions/0126-mcp-snapshot-file-list.md)). It never returns the manifest root,
+  provenance, exclusions or bytes. File names and digests are visible to any credential with
+  `snapshot:read`.
 - `tessera_campaign_outputs` lists recorded output metadata only (name, sha256, size, class).
 - `tessera_campaign_logs` returns stage status and attempt diagnostics (status, exit code,
   failure class, bounded detail). Tessera retains no raw stdout/stderr.
@@ -118,3 +129,10 @@ reads the current revision, uses a fresh idempotency key per call unless one is 
 the approval record. The control API makes every decision: an agent credential gets HTTP 403, a stale
 revision or digest, an unapproved state, a reused key or an exceeded program/campaign cap gets 409,
 and nothing is written. Unlock conditions and pre-approvals are not exposed.
+
+The same server registers `tessera_record_gate_decision` ([ADR 0124](decisions/0124-mcp-operator-loop-tools.md)):
+a gate `go` or `no_go` with a note on a finished campaign, a thin client of the gate-decision route. The
+control API refuses any credential that is not a person's. `tessera_render_campaign_spec`,
+`tessera_submit_rendered_campaign` and `tessera_campaign_wave_receipts` are described in the same ADR:
+rendering substitutes `${NAME}` values into string leaves of a template and then follows the ordinary
+validate and submit paths, and the wave read returns up to 20 campaigns' receipts and gate decisions.

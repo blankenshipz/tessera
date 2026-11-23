@@ -49,6 +49,23 @@ class Config:
         except KeyError as exc:
             raise ValueError("Missing Tessera MCP configuration reference") from exc
 
+    def _manager_credential(self, info: os.stat_result) -> bool:
+        """A service manager's own credential placed directly in $CREDENTIALS_DIRECTORY, judged
+        by the single rule in ``tessera_agent.remote_reasoning_store`` (root-owned 0400/0440, one
+        link, group root's or this process's; the directory not writable by group, not
+        accessible to others, group pinned likewise). Anything else must be owned by this user
+        and private."""
+        from tessera_agent.remote_reasoning_store import manager_directory_ok, manager_file_ok
+
+        value = os.environ.get("CREDENTIALS_DIRECTORY", "")
+        if not value or not os.path.isabs(value) or Path(value) != Path(self.token_file).parent:
+            return False
+        try:
+            directory = os.lstat(value)
+        except OSError:
+            return False
+        return info.st_uid == 0 and manager_directory_ok(directory) and manager_file_ok(info)
+
     def token(self) -> str:
         """Reopen each call so secure atomic credential replacement supports renewal."""
         try:
@@ -57,8 +74,10 @@ class Config:
                 info = os.fstat(stream.fileno())
                 if (
                     not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077
+                    or not (
+                        (info.st_uid == os.getuid() and not info.st_mode & 0o077)
+                        or self._manager_credential(info)
+                    )
                     or info.st_size > 8192
                 ):
                     raise ValueError(

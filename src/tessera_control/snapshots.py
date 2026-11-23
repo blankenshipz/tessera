@@ -10,6 +10,7 @@ import uuid
 from dataclasses import asdict
 from typing import Any
 
+from .approval_trust import decision_provenance, require_decision_actor
 from .store import (
     Conflict,
     Forbidden,
@@ -106,12 +107,15 @@ class SnapshotStore(Store):
         replay_guard: Any | None = None,
         data_class: Any = None,
         code_approval: Any = None,
+        require_decision_label: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         """Commit reviewed bytes, manifest, audit and replay atomically, locally.
 
         ``data_class`` is an optional ``DataClassDeclaration`` (or its dict); without
         one the snapshot is ``private_derived`` (ADR 0039). ``code_approval`` is an
         optional ``CodeApproval`` of exact paths as private code (amendment 1).
+        ``require_decision_label`` makes a bare owner credential (no automation label) a refusal,
+        like other decisions; the adoption event records who stood behind it either way.
         """
         from .code_approval import parse_code_approval, record_code_approval
         from .data_class import (
@@ -131,6 +135,8 @@ class SnapshotStore(Store):
             self._project(connection, live, project_id)
             if live["role"] != "human":
                 raise Forbidden("A human must confirm local snapshot adoption.")
+            if require_decision_label:
+                require_decision_actor(live, forbidden=Forbidden)
             ident, now = "snapshot_" + uuid.uuid4().hex, utc_now()
             connection.execute(
                 "INSERT INTO source_snapshots VALUES (?, ?, ?, ?, ?, ?)",
@@ -151,6 +157,7 @@ class SnapshotStore(Store):
                 "provenance": "imported_unverified",
                 "classification": "unclassified",
                 "data_class": record,
+                **decision_provenance(live),
             }
             if code is not None:
                 adopted["code_approval"] = code

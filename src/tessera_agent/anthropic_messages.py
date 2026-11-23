@@ -681,7 +681,9 @@ class AnthropicMessagesReasoning:
     # -- credential -------------------------------------------------------------------------
     def _api_key(self) -> str:
         try:
-            raw = private_file(self.credentials_dir / CREDENTIAL_FILE).rstrip(b"\r\n")
+            raw = private_file(
+                self.credentials_dir / CREDENTIAL_FILE, credentials_dir=self.credentials_dir
+            ).rstrip(b"\r\n")
         except (OSError, ValueError):
             raise _blocked("model_credential_unavailable", sent=False) from None
         if not _KEY.fullmatch(raw):

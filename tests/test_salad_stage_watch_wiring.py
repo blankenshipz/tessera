@@ -2,7 +2,7 @@
 
 Covers the in-process watch channel (same refusal mapping as the HTTP route), the live-check
 per-poll snapshot observer (off when its config key is absent) and the executor's optional
-``stage_watcher`` block (off by default; descriptive reports only, never a route effect).
+``stage_watcher`` block (on by default, ADR 0125; descriptive reports only, never a route effect).
 """
 
 from __future__ import annotations
@@ -667,23 +667,40 @@ def _build(tmp_path, monkeypatch, block):
     return executor_module.build_executor(h.config.model_copy(update=update))
 
 
-def test_build_executor_wires_the_watch_only_when_enabled_with_a_kill_switch(
+def test_build_executor_wires_the_watch_by_default_and_only_explicit_off_disables_it(
     tmp_path, monkeypatch, salad_probe
 ):
     for name in list(sys.modules):
         if name.startswith(WATCH_MODULES):
             monkeypatch.delitem(sys.modules, name)
-    assert _build(tmp_path / "a", monkeypatch, None).stage_watch is None
     off = StageWatcherBlock(enabled=False, kill_switch_path="/run/kill")
     assert _build(tmp_path / "b", monkeypatch, off).stage_watch is None
-    no_switch = StageWatcherBlock(enabled=True)
-    assert _build(tmp_path / "c", monkeypatch, no_switch).stage_watch is None
+    assert (
+        _build(tmp_path / "b2", monkeypatch, StageWatcherBlock(enabled=False)).stage_watch is None
+    )
     assert [name for name in sys.modules if name.startswith(WATCH_MODULES)] == []
+    for name, block in (("a", None), ("c", StageWatcherBlock(enabled=True, max_reports=50))):
+        built = _build(tmp_path / name, monkeypatch, block).stage_watch
+        assert isinstance(built, SaladRouteWatch)
+        marker = tmp_path / name / "state" / executor_module.DEFAULT_KILL_SWITCH_NAME
+        assert built.runner._config.kill_switch_path == str(marker)
+        assert not marker.exists()  # never auto-created
     on = StageWatcherBlock(enabled=True, kill_switch_path=str(tmp_path / "kill"), max_reports=50)
     built = _build(tmp_path / "d", monkeypatch, on).stage_watch
     assert isinstance(built, SaladRouteWatch)
     assert built.runner.directory == tmp_path / "d" / "state" / "stage-watch"
     assert built.poll_seconds == 2.0
+
+
+def test_default_marker_is_in_the_state_dir_and_an_unusable_one_means_no_watcher(tmp_path, capsys):
+    effective = executor_module.effective_stage_watcher
+    block = effective(None, tmp_path)
+    assert block.enabled and block.kill_switch_path == str(tmp_path / "stage-watch.kill")
+    assert effective(StageWatcherBlock(enabled=False), tmp_path) is None
+    explicit = StageWatcherBlock(enabled=True, kill_switch_path="/run/k")
+    assert effective(explicit, tmp_path) is explicit
+    assert effective(None, "relative/state") is None  # unusable: bounded log, never raises
+    assert "stage watcher default unusable" in capsys.readouterr().err
 
 
 def test_build_salad_route_watch_never_raises(tmp_path, salad_probe):
@@ -698,6 +715,7 @@ def test_the_stage_watcher_block_is_closed_and_bounded(tmp_path):
     config = ExecutorConfig.model_validate(dict(base, stage_watcher=good))
     assert config.stage_watcher.watch_config_fields() == dict(good)
     assert ExecutorConfig.model_validate(base).stage_watcher is None
+    assert ExecutorConfig.model_validate(dict(base, stage_watcher={"enabled": True}))
     assert ExecutorConfig.model_validate(dict(base, stage_watcher={"enabled": False}))
     for bad in (
         dict(good, extra=1),

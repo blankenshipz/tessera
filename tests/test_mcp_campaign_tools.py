@@ -87,6 +87,7 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_campaign_report",
         "tessera_campaign_outputs",
         "tessera_campaign_logs",
+        "tessera_campaign_stage_watch",
         "tessera_campaign_budget",
         "tessera_campaign_retries",
         "tessera_campaign_standing_status",
@@ -113,8 +114,13 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_steer_campaign_placement",
         # ADR 0093: an agent submits a campaign a person already cleared (one-shot).
         "tessera_submit_cleared_campaign",
+        # ADR 0124: template rendering and per-wave receipts.
+        "tessera_render_campaign_spec",
+        "tessera_submit_rendered_campaign",
+        "tessera_campaign_wave_receipts",
     }
     assert "tessera_list_snapshots" in tools
+    assert tools["tessera_get_snapshot"].annotations.readOnlyHint is True
     assert tools["tessera_get_campaign"].annotations.readOnlyHint is True
     for name in ("tessera_submit_campaign", "tessera_cancel_campaign"):
         assert tools[name].annotations.readOnlyHint is False
@@ -207,3 +213,13 @@ def test_main_registers_campaign_tools_from_live_scopes(monkeypatch, status, arg
     module, chosen = _main_with_status(monkeypatch, status)
     assert module.main(argv) == 0
     assert chosen == {"campaign_tools": expected, "transport": "stdio"}
+
+
+def test_get_snapshot_calls_the_detail_route_and_follows_its_scope(tmp_path):
+    seen: list = []
+    _call(_server(tmp_path, seen), "tessera_get_snapshot", {"snapshot_id": "snap1"})
+    assert [(m, p) for m, p, _, _ in seen] == [("GET", "/projects/proj1/agent-snapshots/snap1")]
+    description = {t.name: t.description for t in asyncio.run(_server(tmp_path, []).list_tools())}[
+        "tessera_get_snapshot"
+    ]
+    assert "never bytes" in description and "tessera_list_snapshots" in description

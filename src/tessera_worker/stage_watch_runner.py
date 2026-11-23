@@ -30,8 +30,8 @@ is simply retried on a later tick. The runner has no stop, cancel, retry, resize
 path, holds no credential of its own and receives no management credential: its only network
 path is the worker's existing control channel, and only for the watch-reports and
 watch-decisions routes. The kill switch is read by the watcher and recorded on each report, and
-observe and report continue whatever its state. With no kill switch path the runner starts no
-watcher (fail closed).
+observe and report continue whatever its state. A config that reaches the runner with no kill switch
+path starts no watcher (fail closed); ``resolve_stage_watch`` fills the default marker first.
 
 Decision requests: ``on_start``/``on_start_remote`` take an optional ``DecisionEnvelope``. With
 none (the default) the contract has no envelope and no request is ever filed. With one, the

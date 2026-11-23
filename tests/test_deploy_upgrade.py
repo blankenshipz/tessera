@@ -442,6 +442,134 @@ def test_a_migration_made_by_something_else_is_not_credited_to_the_migrate_step(
     assert document["schema_version"]["after"] == LATEST_SCHEMA_VERSION
 
 
+def _unreadable(monkeypatch, *, after_stop=False, before_migrate=False):
+    """Make the stored version unreadable at the named boundaries (as a locked or missing
+    database makes ``_observed_version`` return None), leaving the other reads real."""
+    real = deploy_upgrade._observed_version
+    # Relies on deploy_upgrade calling _observed_version exactly twice, in this order: once
+    # after the services stop, once before the migrate step (see its `schema_trace` writes).
+    boundaries = iter(["after_stop", "before_migrate"])
+    hidden = {"after_stop": after_stop, "before_migrate": before_migrate}
+
+    def observed(plan):
+        value = real(plan)
+        boundary = next(boundaries, None)
+        assert boundary is not None, "unexpected extra _observed_version call"
+        return None if hidden[boundary] else value
+
+    monkeypatch.setattr(deploy_upgrade, "_observed_version", observed)
+
+
+def _migrating_backup(*, hide_snapshot_version):
+    """A backup that brings the schema forward first (something else migrating during the
+    backup step); optionally its result reports no readable schema version."""
+    from tessera_control.store import migrate_state
+
+    taker = deploy_upgrade.take_backup
+
+    def backup(state_dir, output, **kw):
+        migrate_state(state_dir)
+        made = taker(state_dir, output, **kw)
+        return {**made, "schema_version": None} if hide_snapshot_version else made
+
+    return backup
+
+
+def test_an_observed_version_that_cannot_be_read_is_none(tmp_path):
+    plan, _path, state = make_plan(tmp_path, with_config=False)
+    assert deploy_upgrade._observed_version(plan) == LATEST_SCHEMA_VERSION - 1
+    (state / DATABASE_NAME).unlink()
+    assert deploy_upgrade._observed_version(plan) is None
+
+
+def test_one_unreadable_boundary_widens_the_window_to_the_neighbours(tmp_path, monkeypatch):
+    # The version is unreadable after the services stop; the schema moved while they stopped.
+    # The surviving readings (preflight, snapshot) can only say "before the backup was taken".
+    plan, _path, state = make_plan(tmp_path, with_config=False)
+    fakes = _migrating_runner(Fakes(), state, "stop-executor")
+    _unreadable(monkeypatch, after_stop=True)
+    document = run(plan, fakes, execute=True)
+    assert document["result"] == "ok", document["steps"]
+    assert document["schema_trace"]["after_stop"] is None
+    step = next(s for s in document["steps"] if s["step"] == "migrate")
+    assert step["detail"].startswith("not migrated by this step")
+    assert "before the backup was taken" in step["detail"]
+    assert document["early_migration"]["changed_between"] == ["preflight", "backup_snapshot"]
+
+
+def test_an_unreadable_snapshot_version_gives_the_generic_between_two_steps_window(
+    tmp_path, monkeypatch
+):
+    # The schema moved during the backup step and the snapshot's version is unreadable, so
+    # the only readings are after the stop and before the migrate: no specific window fits.
+    plan, _path, _state = make_plan(tmp_path, with_config=False)
+    document = run(
+        plan, Fakes(), execute=True, backup=_migrating_backup(hide_snapshot_version=True)
+    )
+    assert document["result"] == "ok", document["steps"]
+    trace = document["schema_trace"]
+    assert trace["backup_snapshot"] is None
+    step = next(s for s in document["steps"] if s["step"] == "migrate")
+    assert "between two steps" in step["detail"]
+    early = document["early_migration"]
+    assert early["changed"] == "between two steps"
+    assert early["changed_between"] == ["after_stop", "before_migrate"]
+    assert early["from"] == LATEST_SCHEMA_VERSION - 1
+    assert early["to"] == LATEST_SCHEMA_VERSION
+    assert early["backup_schema_version"] is None
+    assert "between two steps" in document["warnings"][0]
+    assert "the backup was" in step["detail"]  # an unreadable snapshot is not the current one
+    assert document["fixes"] == []
+
+
+def test_two_consecutive_unreadable_boundaries_combine_their_windows(tmp_path, monkeypatch):
+    # After the stop and the snapshot are both unreadable; the schema moved during the backup.
+    plan, _path, _state = make_plan(tmp_path, with_config=False)
+    _unreadable(monkeypatch, after_stop=True)
+    document = run(
+        plan, Fakes(), execute=True, backup=_migrating_backup(hide_snapshot_version=True)
+    )
+    assert document["result"] == "ok", document["steps"]
+    trace = document["schema_trace"]
+    assert trace["after_stop"] is None and trace["backup_snapshot"] is None
+    step = next(s for s in document["steps"] if s["step"] == "migrate")
+    assert "before the migrate step began" in step["detail"]
+    assert document["early_migration"]["changed_between"] == ["preflight", "before_migrate"]
+    assert document["early_migration"]["changed"] == "before the migrate step began"
+
+
+def test_an_unreadable_version_does_not_change_the_outcome_or_other_receipt_fields(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "base").mkdir(mode=0o700)
+    (tmp_path / "hidden").mkdir(mode=0o700)
+    base_plan, _p, _s = make_plan(tmp_path / "base", with_config=False)
+    baseline = run(base_plan, Fakes(), execute=True)
+
+    plan, _path, _state = make_plan(tmp_path / "hidden", with_config=False)
+    _unreadable(monkeypatch, after_stop=True, before_migrate=True)
+    document = run(plan, Fakes(), execute=True)
+
+    assert document["result"] == baseline["result"] == "ok"
+    assert steps(document) == steps(baseline)
+    assert document["schema_trace"]["after_stop"] is None
+    assert document["schema_trace"]["before_migrate"] is None
+    # Nothing readable moved, so the migrate step is still credited with its own work.
+    step = next(s for s in document["steps"] if s["step"] == "migrate")
+    assert step["detail"] == (
+        f"migrated schema v{LATEST_SCHEMA_VERSION - 1} to v{LATEST_SCHEMA_VERSION} in this step"
+    )
+    assert "early_migration" not in document and "warnings" not in document
+    for key in ("schema_version", "services"):
+        assert document[key] == baseline[key], key
+    # A fix's receipt_sha256 digests its own timestamped receipt, so two runs differ there; compare
+    # which fixes were applied and that each one carries a receipt digest.
+    assert [f["fix"] for f in document["fixes"]] == [f["fix"] for f in baseline["fixes"]]
+    assert all(len(f.get("receipt_sha256", "")) == 64 for f in document["fixes"])
+    assert document["backup"]["kind"] == baseline["backup"]["kind"]
+    assert document["backup"]["schema_version"] == baseline["backup"]["schema_version"]
+
+
 def test_a_database_already_current_is_reported_as_nothing_to_migrate(tmp_path):
     plan, _path, _state = make_plan(tmp_path, behind=False, with_config=False)
     document = run(plan, Fakes(), execute=True)

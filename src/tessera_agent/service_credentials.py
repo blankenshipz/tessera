@@ -481,6 +481,23 @@ def _unlink(path: Path) -> None:
         pass
 
 
+def _reference_in_place(target: Path, content: bytes, require_root: bool) -> bool:
+    """True when ``target`` is already exactly the wanted reference file: a regular, single-link
+    file owned by the expected owner, with no group or other access, holding ``content``."""
+    try:
+        info = os.lstat(target)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_mode & 0o077
+            or info.st_uid != _expected_owner_uid(require_root)
+        ):
+            return False
+        return _read_private(target, _expected_owner_uid(require_root)) == content
+    except (OSError, CredentialRefused, ValueError):
+        return False
+
+
 def install(
     service: str,
     name: str,
@@ -524,8 +541,15 @@ def install(
             "that build exactly that reference.",
         )
     files = [(item["file"], None)]
+    reference_target: Path | None = None
     if item.get("reference_file"):
-        files.append((item["reference_file"]["file"], (reference + "\n").encode("ascii")))
+        reference_target = directory / item["reference_file"]["file"]
+        content = (reference + "\n").encode("ascii")
+        # The reference is not a secret: if the reasoning installer (ADR 0119) already wrote
+        # exactly this reference, keep it and install only the key. A different one still needs
+        # --replace.
+        if not _reference_in_place(reference_target, content, require_root):
+            files.append((item["reference_file"]["file"], content))
     for file, _ in files:
         target = directory / file
         if os.path.lexists(target):
@@ -560,7 +584,7 @@ def install(
                 "credential": name,
                 "reference": reference,
                 "installed_path": str(placements[0].target),
-                "reference_path": str(placements[1].target) if len(placements) > 1 else None,
+                "reference_path": None if reference_target is None else str(reference_target),
                 "profile_checked": profile_ref is not None,
                 "fingerprint": fingerprint(secret),
                 "size": len(secret),

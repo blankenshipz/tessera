@@ -93,7 +93,8 @@ def test_the_command_line_flag_alone_makes_an_approve_only_server(tmp_path, monk
 
     monkeypatch.setattr(module, "create_server", fake_create)
     monkeypatch.setattr(module, "_has_provider_trust_scope", lambda client: False)
-    monkeypatch.setattr(module, "_live_actions", lambda client: pytest.fail("no live scope read"))
+    # main() reads live scopes only to enable retention tools; none are enrolled here.
+    monkeypatch.setattr(module, "_live_actions", lambda client: frozenset())
     assert module.main(["--approval-tool"]) == 0
     assert built == [{"campaign_tools": False, "approval_tool": True}]
     built.clear()

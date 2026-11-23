@@ -161,17 +161,19 @@ def run_running_check(
     report.record("submit", "tessera_submit_campaign", campaign_id=campaign_id)
 
     view = agent("tessera_get_campaign", campaign_id=campaign_id)
-    refused = False
-    try:
-        agent_approve(
+    error_class, label = smoke.require_agent_refused(
+        lambda: agent_approve(
             "tessera_approve_campaign",
             campaign_id=campaign_id,
             expected_spec_digest=view["spec_digest"],
         )
-    except Exception as error:  # noqa: BLE001 - any refusal is the expected outcome
-        refused, refusal = True, type(error).__name__
-    _need(refused, "an agent credential was allowed to approve a campaign")
-    report.record("agent_cannot_approve", "tessera_approve_campaign", refused_with=refusal)
+    )
+    report.record(
+        "agent_cannot_approve",
+        "tessera_approve_campaign",
+        refused_with=label,
+        error_class=error_class,
+    )
 
     person(
         "tessera_approve_campaign",

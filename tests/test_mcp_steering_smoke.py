@@ -332,3 +332,176 @@ def test_smoke_spec_is_zero_dollars():
 def test_report_carries_the_grant_id():
     assert smoke.Report(grant_id="g-9").document()["smoke_grant_id"] == "g-9"
     assert smoke.Report().document()["smoke_grant_id"] is None
+
+
+# ---- the agent_cannot_approve step asserts a SPECIFIC refusal, not "any exception" ----------
+
+from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
+
+from tessera_mcp.client import ControlError  # noqa: E402
+
+
+@pytest.mark.parametrize("status,label", [(403, "http_403"), (401, None), (404, None), (500, None)])
+def test_only_a_control_403_denial_is_labelled_a_refusal(status, label):
+    text = f"Control API denied or rejected request (HTTP {status})"
+    assert smoke.agent_approval_refusal(ControlError(text)) == label
+    assert smoke.agent_approval_refusal(ToolError(text)) == label
+    wrapped = ToolError(f"Error executing tool tessera_approve_campaign: {text}")
+    wrapped.__cause__ = ControlError(text)
+    assert smoke.agent_approval_refusal(wrapped) == label
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("x"),
+        TimeoutError("x"),
+        ControlError("Refused (HTTP 409): stale"),
+        ValueError("Control API denied or rejected request (HTTP 403)"),
+        KeyError("k"),
+    ],
+)
+def test_other_failures_are_not_refusals(error):
+    assert smoke.agent_approval_refusal(error) is None
+
+
+def test_smoke_records_the_403_label_and_class(tmp_path):
+    sched, agent, person, agent_approve = _rig(tmp_path)
+    document = smoke.run_smoke(
+        agent, person, agent_approve, image=DIGEST_IMAGE, snapshot_id=sched.env.snapshot_id,
+        sleep=lambda _s: sched.world.runner.tick(), poll_seconds=0,
+    )  # fmt: skip
+    evidence = {s["step"]: s for s in document["steps"]}["agent_cannot_approve"]["evidence"]
+    assert evidence["refused_with"] == "http_403" and evidence["error_class"] == "ToolError"
+
+
+@pytest.mark.parametrize("error", [ConnectionError("boom"), TimeoutError("t"), ValueError("v")])
+def test_smoke_fails_when_the_approval_attempt_fails_for_another_reason(tmp_path, error):
+    sched, agent, person, _ = _rig(tmp_path)
+
+    def broken(*_a, **_k):
+        raise error
+
+    with pytest.raises(smoke.SmokeFailure, match="other than a refusal") as caught:
+        smoke.run_smoke(
+            agent, person, broken, image=DIGEST_IMAGE, snapshot_id=sched.env.snapshot_id,
+            sleep=lambda _s: None, poll_seconds=0,
+        )  # fmt: skip
+    assert "boom" not in str(caught.value)
+
+
+def test_smoke_still_fails_when_the_agent_is_allowed_to_approve(tmp_path):
+    sched, agent, person, _ = _rig(tmp_path)
+    with pytest.raises(smoke.SmokeFailure, match="was allowed to approve"):
+        smoke.run_smoke(
+            agent, person, lambda *_a, **_k: {"ok": True}, image=DIGEST_IMAGE,
+            snapshot_id=sched.env.snapshot_id, sleep=lambda _s: None, poll_seconds=0,
+        )  # fmt: skip
+
+
+# ---- main(): the live --execute path with in-process callers, no network --------------------
+
+
+def _live_args(tmp_path, *extra, confirm=smoke.CONFIRM_PHRASE, mode=0o600):
+    files = {}
+    for name in ("agent", "person"):
+        path = tmp_path / f"live-{name}.token"
+        path.write_text(f"secret-live-{name}-token-value")
+        path.chmod(mode)
+        files[name] = path
+    return [
+        "--execute", "--confirm", confirm, "--control-url", "https://control.example",
+        "--project-id", "p", "--destination", "d", "--image", DIGEST_IMAGE,
+        "--agent-token-file", str(files["agent"]), "--person-token-file", str(files["person"]),
+        *extra,
+    ]  # fmt: skip
+
+
+def _fake_live(monkeypatch, tmp_path, *, approve=None):
+    sched, agent, person, agent_approve = _rig(tmp_path)
+    built = []
+
+    def build(arguments, token_file, **flags):
+        built.append(token_file.name)
+        if flags.get("campaign_tools"):
+            return agent
+        return person if token_file.name == "live-person.token" else (approve or agent_approve)
+
+    real = smoke.run_smoke
+
+    def run(*a, **kw):
+        return real(*a, **{**kw, "sleep": lambda _s: sched.world.runner.tick(), "poll_seconds": 0})
+
+    monkeypatch.setattr(smoke, "_build_caller", build)
+    monkeypatch.setattr(smoke, "run_smoke", run)
+    monkeypatch.setattr(
+        smoke, "pick_snapshot", lambda listing, wanted: real_pick(listing, sched.env.snapshot_id)
+    )
+    return built
+
+
+real_pick = smoke.pick_snapshot
+
+
+def _ran_nothing(monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("must not build a caller or run")
+
+    monkeypatch.setattr(smoke, "_build_caller", boom)
+    monkeypatch.setattr(smoke, "run_smoke", boom)
+
+
+@pytest.mark.parametrize("confirm", [None, "yes"])
+def test_main_refuses_a_missing_or_wrong_confirmation_and_runs_nothing(
+    tmp_path, capsys, monkeypatch, confirm
+):
+    _ran_nothing(monkeypatch)
+    args = _live_args(tmp_path, confirm=confirm or "")
+    if confirm is None:
+        i = args.index("--confirm")
+        del args[i : i + 2]
+    assert smoke.main(args) == 2
+    captured = capsys.readouterr()
+    assert "refused: --execute needs --confirm" in captured.err and captured.out == ""
+
+
+def test_main_refuses_loose_token_files_and_relative_paths(tmp_path, monkeypatch):
+    _ran_nothing(monkeypatch)
+    with pytest.raises(SystemExit, match="owner-only"):
+        smoke.main(_live_args(tmp_path, mode=0o640))
+    args = _live_args(tmp_path)
+    args[args.index("--person-token-file") + 1] = "relative.token"
+    with pytest.raises(SystemExit, match="absolute path"):
+        smoke.main(args)
+
+
+def test_main_runs_prints_the_report_and_writes_the_receipt_0600(tmp_path, capsys, monkeypatch):
+    built = _fake_live(monkeypatch, tmp_path)
+    receipt = tmp_path / "receipt.json"
+    assert smoke.main(_live_args(tmp_path, "--receipt-file", str(receipt))) == 0
+    out = capsys.readouterr().out
+    document = json.loads(out)
+    assert document["schema"] == "tessera.mcp-steering-smoke.v1" and document["ok"] is True
+    assert [s["step"] for s in document["steps"]] == [name for name, _ in smoke.STEPS]
+    assert "secret-live" not in out and str(tmp_path) not in out and ".token" not in out
+    assert built == ["live-agent.token", "live-agent.token", "live-person.token"]
+    assert receipt.stat().st_mode & 0o777 == 0o600
+    assert json.loads(receipt.read_text()) == document
+    with pytest.raises(FileExistsError):
+        smoke.main(_live_args(tmp_path, "--receipt-file", str(receipt)))
+
+
+def test_main_fails_when_the_approval_attempt_dies_and_reports_no_secret(
+    tmp_path, capsys, monkeypatch
+):
+    def dropped(*_a, **_k):
+        raise ConnectionError("secret-live-agent-token-value dropped")
+
+    _fake_live(monkeypatch, tmp_path, approve=dropped)
+    receipt = tmp_path / "receipt.json"
+    assert smoke.main(_live_args(tmp_path, "--receipt-file", str(receipt))) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and not receipt.exists()
+    failure = json.loads(captured.err)
+    assert failure["ok"] is False and "other than a refusal" in failure["failed"]
+    assert "secret-live" not in captured.err and str(tmp_path) not in captured.err

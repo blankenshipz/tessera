@@ -12,7 +12,13 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .approval_trust import AUTOMATION_HEADER, AUTOMATION_KEY, valid_automation_label
+from .approval_trust import (
+    AUTOMATION_HEADER,
+    AUTOMATION_KEY,
+    DELEGATION_HEADER,
+    DELEGATION_KEY,
+    valid_automation_label,
+)
 from .deployment import DeploymentConfig, backend_status
 from .models import (
     ApproveTask,
@@ -39,6 +45,7 @@ def principal(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
     automation: Annotated[str | None, Header(alias=AUTOMATION_HEADER)] = None,
+    delegation: Annotated[str | None, Header(alias=DELEGATION_HEADER)] = None,
 ) -> dict[str, str]:
     if authorization is None or not authorization.startswith("Bearer "):
         _unauthorized()
@@ -57,6 +64,16 @@ def principal(
                 "X-Tessera-Automation must be a non-empty label of at most 128 characters."
             )
         actor[AUTOMATION_KEY] = automation
+    if delegation is not None:
+        # A reference to the owner delegation the helper acts under; a label only, and never
+        # accepted without the automation label it qualifies.
+        if automation is None:
+            raise StoreError("X-Tessera-Delegation requires an X-Tessera-Automation label.")
+        if not valid_automation_label(delegation):
+            raise StoreError(
+                "X-Tessera-Delegation must be a non-empty label of at most 128 characters."
+            )
+        actor[DELEGATION_KEY] = delegation
     return actor
 
 
@@ -285,6 +302,8 @@ def create_app(
     from .dataset_staging_api import router as dataset_staging_router
     from .egress_journal import EgressJournalStore
     from .egress_journal_api import router as egress_journal_router
+    from .image_build_report import ImageBuildStore
+    from .image_build_report import router as image_build_router
     from .public_fetch_report import PublicFetchStore
     from .public_fetch_report import router as public_fetch_router
     from .snapshot_chunks import ChunkedSnapshotStore
@@ -295,6 +314,7 @@ def create_app(
     app.state.egress_journal = EgressJournalStore(state_dir)
     app.state.stage_watch = StageWatchStore(state_dir)
     app.state.public_fetch = PublicFetchStore(state_dir)
+    app.state.image_build = ImageBuildStore(state_dir)
     app.state.dataset_staging = DatasetStagingStore(state_dir)
     app.state.chunked_snapshots = ChunkedSnapshotStore(state_dir)
     app.state.remote_execution = RemoteExecutionStore(state_dir)
@@ -308,6 +328,7 @@ def create_app(
     app.include_router(egress_journal_router)
     app.include_router(stage_watch_router)
     app.include_router(public_fetch_router)
+    app.include_router(image_build_router)
     app.include_router(dataset_staging_router)
     app.include_router(snapshot_chunks_router)
     app.include_router(credential_lease_router)
@@ -332,6 +353,11 @@ def create_app(
 
     app.state.agent_campaign_reads = AgentCampaignReads(state_dir)
     app.include_router(agent_campaign_reads_router)
+    from .stage_watch_read import StageWatchRead
+    from .stage_watch_read import router as stage_watch_read_router
+
+    app.state.stage_watch_read = StageWatchRead(state_dir)
+    app.include_router(stage_watch_read_router)
     from .campaign_submissions import AgentSubmissionConfig, CampaignSubmissionStore
     from .campaign_submissions_api import router as campaign_submissions_router
 

@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -199,6 +200,44 @@ def _need(condition: bool, message: str) -> None:
         raise SmokeFailure(message)
 
 
+_DENIAL_403 = re.compile(r"Control API denied or rejected request \(HTTP 403\)")
+_DENIAL_ERRORS = frozenset({"ControlError", "ToolError"})
+
+
+def agent_approval_refusal(error: BaseException) -> str | None:
+    """A short stable label (``http_403``) only if ``error`` is the control plane's HTTP 403
+    denial, as the control client words it (directly, or wrapped by the MCP tool layer).
+
+    Anything else (a dropped connection, a timeout, a 401, 404, 409 or 5xx, a bug) is None: such
+    a failure is not proof that the agent credential was refused. The error text is only
+    matched, never returned or recorded."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        names = {cls.__name__ for cls in type(current).__mro__}
+        if names & _DENIAL_ERRORS and _DENIAL_403.search(str(current)):
+            return "http_403"
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def require_agent_refused(attempt: Callable[[], Any]) -> tuple[str, str]:
+    """Run the agent's approval attempt; return ``(error class name, label)`` of a genuine
+    refusal. Fails the check if it was allowed, or failed for any other reason."""
+    try:
+        attempt()
+    except Exception as error:  # noqa: BLE001 - classified below; only a 403 denial passes
+        label = agent_approval_refusal(error)
+        _need(
+            label is not None,
+            "the approval attempt failed for a reason other than a refusal "
+            f"({type(error).__name__}; not proof the agent was refused)",
+        )
+        return type(error).__name__, label  # type: ignore[return-value]
+    raise SmokeFailure("an agent credential was allowed to approve a campaign")
+
+
 def _key(label: str) -> str:
     return f"smoke-{label}-{secrets.token_hex(6)}"
 
@@ -284,22 +323,23 @@ def run_smoke(
     _need(view.get("spec_digest") == submitted.get("spec_digest"), "the stored digest changed")
     report.record("inspect", "tessera_get_campaign", status=view["status"])
 
-    refused = False
-    try:
-        agent_approve(
+    error_class, label = require_agent_refused(
+        lambda: agent_approve(
             "tessera_approve_campaign",
             campaign_id=campaign_id,
             expected_spec_digest=view["spec_digest"],
         )
-    except Exception as error:  # noqa: BLE001 - any refusal is the expected outcome
-        refused = True
-        refusal = type(error).__name__
-    _need(refused, "an agent credential was allowed to approve a campaign")
+    )
     _need(
         agent("tessera_get_campaign", campaign_id=campaign_id).get("approval") is None,
         "the refused approval changed the campaign",
     )
-    report.record("agent_cannot_approve", "tessera_approve_campaign", refused_with=refusal)
+    report.record(
+        "agent_cannot_approve",
+        "tessera_approve_campaign",
+        refused_with=label,
+        error_class=error_class,
+    )
 
     approval = person(
         "tessera_approve_campaign",

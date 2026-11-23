@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -30,50 +31,67 @@ _MAX_OUTPUT_HELP = (
 
 
 _STAGE_WATCHER_HELP = (
-    "start the observe-and-report stage watcher beside each local Docker stage (ADR 0087; "
-    "off by default; reports go through this worker's control channel)"
+    "set the observe-and-report stage watcher beside each local Docker stage explicitly "
+    "(ADR 0087; on by default with the marker <workspace-root>/stage-watch.kill; reports go "
+    "through this worker's control channel)"
 )
 _STAGE_WATCHER_KILL_SWITCH_HELP = (
-    "absolute path of the operator kill-switch marker (present means engaged); without it "
-    "no stage watcher starts"
+    "absolute path of the operator kill-switch marker (present means engaged); with "
+    "--stage-watcher and no marker path no stage watcher starts"
 )
 
 
 def _stage_watcher_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--stage-watcher", action="store_true", help=_STAGE_WATCHER_HELP)
     command.add_argument(
+        "--no-stage-watcher",
+        action="store_true",
+        help="opt out of the default-on stage watcher (ADR 0125)",
+    )
+    command.add_argument(
         "--stage-watcher-kill-switch", default=None, help=_STAGE_WATCHER_KILL_SWITCH_HELP
     )
     command.add_argument(
         "--stage-watcher-stats",
         action="store_true",
-        help="with --stage-watcher, also sample docker stats so reports carry mem_bytes",
+        help="also sample docker stats so reports carry mem_bytes (enables the watcher config)",
     )
 
 
 def _stage_watch(arguments: argparse.Namespace):  # noqa: ANN202
-    """The StageWatchConfig for an explicit --stage-watcher, else None (nothing imported)."""
-    if not arguments.stage_watcher:
+    """The explicit StageWatchConfig, else None (the worker's default-on marker applies).
+
+    Any watcher flag is explicit, enabled configuration: ``--stage-watcher-kill-switch`` or
+    ``--stage-watcher-stats`` alone is honoured, and with no marker path the default marker is
+    used (resolved against the worker's private root).
+    """
+    marker = getattr(arguments, "stage_watcher_kill_switch", None)
+    stats = bool(getattr(arguments, "stage_watcher_stats", False))
+    flagged = bool(arguments.stage_watcher or marker is not None or stats)
+    if getattr(arguments, "no_stage_watcher", False):
+        if flagged:
+            raise ValueError("--no-stage-watcher conflicts with the other stage watcher flags")
+        from .stage_watch_config import StageWatchConfig
+
+        return StageWatchConfig()
+    if not flagged:
         return None
     from .stage_watch_config import StageWatchConfig
 
-    config = StageWatchConfig(
-        enabled=True,
-        kill_switch_path=arguments.stage_watcher_kill_switch,
-        stats=bool(getattr(arguments, "stage_watcher_stats", False)),
-    )
-    if not config.startable:
-        # Fail closed: the worker runs as usual, with no stage watcher.
-        print(
-            "stage watcher: no --stage-watcher-kill-switch given; no watcher will start",
-            file=sys.stderr,
-        )
-    return config
+    return StageWatchConfig(enabled=True, kill_switch_path=marker, stats=stats)
 
 
 _PUBLIC_ROOT_HELP = (
     "private 0700 directory for pinned public inputs this worker fetches (ADR 0097); "
     "without it a stage with public_artifact inputs is refused"
+)
+_REGISTRY_AUTH_HELP = (
+    "operator registry auth file (private regular file, not read by the worker); mounted "
+    "read-only into a pushing image build; needs --build-repository"
+)
+_BUILD_REPOSITORY_HELP = (
+    "registry destination (host[/path]) an image build may push to; repeatable; "
+    "needs --registry-auth-file; none registered refuses every pushing build"
 )
 _PUBLIC_CACHE_HELP = "optional private 0700 download cache, used only for cache-enabled inputs"
 
@@ -104,6 +122,10 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--max-output-bytes", type=int, default=None, help=_MAX_OUTPUT_HELP)
     run.add_argument("--public-root", type=Path, default=None, help=_PUBLIC_ROOT_HELP)
     run.add_argument("--public-cache-dir", type=Path, default=None, help=_PUBLIC_CACHE_HELP)
+    run.add_argument("--registry-auth-file", type=Path, default=None, help=_REGISTRY_AUTH_HELP)
+    run.add_argument(
+        "--build-repository", action="append", default=None, help=_BUILD_REPOSITORY_HELP
+    )
     run.add_argument("--container-user", default=None, help="numeric uid:gid for containers")
     run.add_argument("--allow-root-container-user", action="store_true")
     run.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
@@ -133,6 +155,10 @@ def parser() -> argparse.ArgumentParser:
     poll.add_argument("--max-output-bytes", type=int, default=None, help=_MAX_OUTPUT_HELP)
     poll.add_argument("--public-root", type=Path, default=None, help=_PUBLIC_ROOT_HELP)
     poll.add_argument("--public-cache-dir", type=Path, default=None, help=_PUBLIC_CACHE_HELP)
+    poll.add_argument("--registry-auth-file", type=Path, default=None, help=_REGISTRY_AUTH_HELP)
+    poll.add_argument(
+        "--build-repository", action="append", default=None, help=_BUILD_REPOSITORY_HELP
+    )
     poll.add_argument("--container-user", default=None, help="numeric uid:gid for containers")
     poll.add_argument("--allow-root-container-user", action="store_true")
     poll.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
@@ -163,6 +189,8 @@ def _poll_config(arguments: argparse.Namespace) -> GrantPollerConfig:
         max_output_bytes=arguments.max_output_bytes,
         public_root=arguments.public_root,
         public_cache_dir=arguments.public_cache_dir,
+        registry_auth_file=arguments.registry_auth_file,
+        build_repositories=tuple(arguments.build_repository or ()),
         container_user=arguments.container_user,
         allow_root_container_user=arguments.allow_root_container_user,
         docker_network_pool=arguments.docker_network_pool,
@@ -179,12 +207,11 @@ def _poll(arguments: argparse.Namespace) -> int:
 
     try:
         config = _poll_config(arguments)
-        poller = DevelopmentGrantPoller(config)
         stage_watch = _stage_watch(arguments)
         if stage_watch is not None:
-            poller.service_factory = lambda grant_config: DevelopmentWorkerService(
-                grant_config, channel=poller.channel, stage_watch=stage_watch
-            )
+            # An explicit flag wins over the config file's stage_watcher block.
+            config = dataclasses.replace(config, stage_watch=stage_watch)
+        poller = DevelopmentGrantPoller(config)
     except (DevelopmentWorkerError, ValueError, OSError):
         # Bounded and path-free: a refused configuration or credential is not retried.
         print(json.dumps({"status": "refused", "reason": "poller_setup_unavailable"}))
@@ -241,6 +268,8 @@ def main() -> int:
             max_output_bytes=arguments.max_output_bytes,
             public_root=arguments.public_root,
             public_cache_dir=arguments.public_cache_dir,
+            registry_auth_file=arguments.registry_auth_file,
+            build_repositories=tuple(arguments.build_repository or ()),
             container_user=arguments.container_user,
             allow_root_container_user=arguments.allow_root_container_user,
             docker_network_pool=arguments.docker_network_pool,
@@ -251,7 +280,7 @@ def main() -> int:
         )
         stage_watch = _stage_watch(arguments)
         if stage_watch is None:
-            service = DevelopmentWorkerService(config)
+            service = DevelopmentWorkerService(config)  # default-on marker (ADR 0125)
         else:
             service = DevelopmentWorkerService(config, stage_watch=stage_watch)
         result = service.run()

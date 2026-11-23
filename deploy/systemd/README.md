@@ -11,6 +11,7 @@ generic placeholder: `/etc/tessera` (configuration), `/var/lib/tessera` (state),
 | `tessera-salad-executor.service` | `python -m tessera_control.campaign_salad_executor` |
 | `tessera-salad-guardian.service` | `python -m tessera_control.salad_safety_service --run` |
 | `tessera-submit-runner.service` | `tessera-submit-runner`: submits owner-approved campaign records on a schedule (in the target, started only on an admitted host) |
+| `tessera-reasoning.service` | not here: it lives in `deploy/remote-agent-platform/` (manual start only, admission marker required, no `[Install]`) |
 | `tessera.target` | groups the four services |
 | `tessera-health-check@.service` + `tessera-health-check-*.timer` | optional freshness probes |
 

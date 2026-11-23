@@ -2,9 +2,8 @@
 
 The stage watcher is a small execution-plane agent that watches one execution attempt and reports
 what it sees. It only observes and reports. It cannot stop, cancel, retry, resize or re-route
-anything, and it makes no model call. It is **disabled by default**: the worker starts it only when the
-operator passes `--stage-watcher` (see "Wiring it") or enables the `stage_watcher` block of the
-Salad executor (see "Enabling it on the Salad executor"). It may also file closed decision
+anything, and it makes no model call. It is **on by default** in the worker (opt out with `--no-stage-watcher`, see "Wiring it"), and so is the Salad executor (opt out with
+`"stage_watcher": {"enabled": false}`, see "Enabling it on the Salad executor"). It may also file closed decision
 *requests* (retry, resize) that control records as advisory events and nobody admits (see
 "Decision requests"). Design background is in
 [ADR 0087](decisions/0087-execution-plane-agents.md) and
@@ -181,6 +180,14 @@ Each attempt entry shows counts by kind, first and last seen, the last `stuck` a
 counters, and `last_counters_seen` (the counters of the latest recorded report), so the worker's
 self-reported `refused_reports` and `dropped_reports` are visible on the receipt.
 
+## Reading the reports
+
+`GET /campaigns/{campaign_id}/stage-watch?offset=0&limit=20` (limit 1-100; human, or an agent with
+`campaign:logs`; tenant-scoped) and the MCP tool `tessera_campaign_stage_watch` return per attempt
+the counts by kind and a page of recorded reports and decision requests, newest first. Closed
+columns only (kind, seq, time, integer counters, closed decision codes); no paths or worker text.
+All values are unverified worker claims.
+
 ## Kill switch
 
 The contract names a marker file. Present means engaged. Absent under a valid parent directory
@@ -196,11 +203,22 @@ except its injected report sink.
 
 ## Wiring it
 
-Off by default. `tessera-worker development-run` and `development-poll` start a watcher beside each
-local Docker stage only with `--stage-watcher --stage-watcher-kill-switch /abs/marker` (under the
-daemon, pass both after `--`). Without `--stage-watcher` the worker never imports the watcher
-library and runs exactly as before. With `--stage-watcher` but no kill-switch path no watcher
-starts (fail closed) and the worker runs as usual.
+On by default (ADR 0125). Every `tessera-worker development-run` and `development-poll` starts a
+watcher beside each local Docker stage with no flag. The kill-switch marker defaults to
+`<workspace-root>/stage-watch.kill` inside the worker's own private state; the worker never creates
+it. Absent means watching; present means engaged (the existing marker semantics). If that
+directory is not private and usable, the worker still runs your stages with no watcher and prints
+one line on stderr. The watcher adds no connection: reports go through the worker's existing
+control channel.
+
+Opt out only explicitly: `--no-stage-watcher`, or `"stage_watcher": {"enabled": false}` in the
+`development-poll` JSON config. The same optional, closed `stage_watcher` block carries `enabled`,
+`kill_switch_path` (absolute), `silent_seconds`, `heartbeat_seconds`, `max_reports`,
+`delivery_timeout_seconds`, `stats` and the tick bounds; an unknown key refuses the config. Explicit
+values win: `--stage-watcher --stage-watcher-kill-switch /abs/marker` (under the daemon, pass both
+after `--`) overrides the config block and the default marker. A watcher flag on its own
+(`--stage-watcher`, `--stage-watcher-kill-switch`, `--stage-watcher-stats`) is explicit and enabled; with no
+marker path, like a config block that only tunes (`{"silent_seconds": 120}` stays enabled), it takes the default marker. A worker that opted out never loads the watcher library.
 
 `tessera_worker.stage_watch_runner.StageWatchRunner` is set as the CPU supervisor's optional
 `watch_runner`. Every supervisor `drive_once`/`reconcile`/`tick`/`cancel` hands it the result:
@@ -283,7 +301,11 @@ control credential.
 
 ## Enabling it on the Salad executor
 
-Off by default; with neither key below set, the executor and live check behave exactly as before.
+The executor watcher is on by default (ADR 0125): with no `stage_watcher` block it watches every
+route with the default kill-switch marker `stage-watch.kill` in the executor's private `state_dir`
+(present means engaged, with the kill-switch semantics above; Tessera never creates it). Opt out only with
+`"stage_watcher": {"enabled": false}`. If the watcher cannot start, the executor logs one bounded
+line and routes run unwatched. The live-check snapshot key stays opt-in on its own.
 [ADR 0111](decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md) makes the limited
 ADR 0033 amendment for these two hooks, which edit `salad_live_check.py` and
 `campaign_salad_executor.py` and nothing else in the frozen Salad plane. Both are read-only,
@@ -296,7 +318,7 @@ non-secret and spend-neutral, never raise into the route, add no credential and 
    that drives `StageWatchRunner` while the route child process runs, with an in-process channel
    (`stage_watch_channel.py`, which accepts only the watch-reports route) and `SaladRouteWatch`
    carrying the snapshot path and operation facts. Fields: enable flag, the absolute kill-switch marker path
-   (required; with no marker the watcher does not start, fail closed), and the optional bounds
+   (optional; defaults to `stage-watch.kill` in `state_dir`), and the optional bounds
    `silent_seconds`, `heartbeat_seconds` and `max_reports`. The block has no envelope fields.
 3. **What appears.** The snapshot file at `watch_signals_file`, and in the worker workspace
    `stage-watch/<operation_id>.sqlite3` and `<operation_id>.contract.json` (both 0600). Reports

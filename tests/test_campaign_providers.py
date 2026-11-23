@@ -73,7 +73,10 @@ def test_a_provider_declaring_an_unknown_step_is_refused():
 
 def test_builtin_local_docker_is_registered_and_self_hosted_comes_from_the_file():
     descriptor = get_provider("local-docker").descriptor
-    assert descriptor.kind == "worker_grant" and descriptor.runtimes == {"docker-cpu-v1"}
+    assert descriptor.kind == "worker_grant" and descriptor.runtimes == {
+        "docker-cpu-v1",
+        "docker-build-v1",
+    }
     try:
         worker.register_from_config(
             {"self_hosted": [{"id": "self-hosted-a", "worker_principal_id": "worker-a"}]}

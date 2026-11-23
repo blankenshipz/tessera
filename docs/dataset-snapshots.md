@@ -103,6 +103,9 @@ curl --fail --header @"$WORKER_HEADER_REF" --header 'Content-Type: application/j
   "$CONTROL_URL/worker/leases/$LEASE_ID/inputs"
 ```
 
+An owner header used for the upload must also carry `X-Tessera-Automation: <label>`
+(a person's `human_session` credential does not need it); a bare owner credential gets 403.
+
 Stable request/manifest/worker fields and exact integration ownership seams were
 recorded as local evidence ID `DATASET-SNAPSHOT-INTERFACE-INTENT8`. Local tests exercise actual
 temporary authenticated handlers, SQLite, release/grant/lease delivery and worker

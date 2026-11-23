@@ -185,9 +185,14 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
         if label:
             sub.add_argument(
                 "--automation-label",
-                required=True,
-                help="marks this decision as automation (X-Tessera-Automation); never authority",
+                help="marks this decision as automation (X-Tessera-Automation); never authority "
+                "(default: $TESSERA_AUTOMATION_LABEL or tessera-cli:campaign-<action>)",
             )
+        sub.add_argument(
+            "--delegation-ref",
+            help="the owner delegation this runs under (X-Tessera-Delegation; default: "
+            "$TESSERA_DELEGATION_REF); a label, never authority",
+        )
 
     submit = actions.add_parser("submit", help="submit a campaign spec; grants nothing")
     submit.add_argument("--project-id", required=True)
@@ -280,6 +285,10 @@ def _add_standing_commands(actions, common) -> None:
     common(revoke, mutating=True)
 
 
+_READ_ONLY_CAMPAIGN_ACTIONS = frozenset({"get", "list", "report", "receipt"})
+_READ_ONLY_STANDING_ACTIONS = frozenset({"list", "show"})
+
+
 def _standing_call(arguments, project: str, key):
     """Build the (method, path, body, key) call for a `campaign standing` verb."""
     from urllib.parse import quote
@@ -348,7 +357,6 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
         control_origin,
         read_owner_header,
     )
-    from .approval_trust import AUTOMATION_HEADER
     from .campaign_models import (
         ApproveCampaign,
         CancelCampaign,
@@ -372,20 +380,32 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
         print(json.dumps({"preapprovals": found}, indent=2, sort_keys=True))
         return 0
 
-    label = getattr(arguments, "automation_label", None)
+    from .owner_identity import IdentityError, resolve_identity
+
+    # Only decision requests carry (and validate) the identity; a read grants nothing, so a bad
+    # label in the environment must not block `get`, `list`, `report`, `receipt` or standing reads.
+    read_only = arguments.campaign_action in _READ_ONLY_CAMPAIGN_ACTIONS or (
+        arguments.campaign_action == "standing"
+        and arguments.standing_action in _READ_ONLY_STANDING_ACTIONS
+    )
+    try:
+        identity = (
+            None
+            if read_only
+            else resolve_identity(arguments, "campaign-" + str(arguments.campaign_action))
+        )
+    except IdentityError as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 2
 
     class CampaignTransport(LocalTransport):
-        """Like the proposal transport, but relays control denial bodies and the label."""
+        """Like the proposal transport, but relays control denial bodies; carries the identity."""
 
         def __call__(self, method, path, body=None, key=None):
             import urllib.error
             import urllib.request
 
-            headers = {"Authorization": self.authorization, "Content-Type": "application/json"}
-            if key:
-                headers["Idempotency-Key"] = key
-            if label:
-                headers[AUTOMATION_HEADER] = label
+            headers = self.request_headers(key)
             data = json.dumps(body).encode() if body is not None else None
             request = urllib.request.Request(
                 self.origin + path, data=data, headers=headers, method=method
@@ -406,6 +426,8 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
         transport = (transport_factory or CampaignTransport)(
             origin, read_owner_header(arguments.owner_header)
         )
+        if isinstance(transport, LocalTransport):
+            transport.identity = identity
         action = arguments.campaign_action
         key = getattr(arguments, "idempotency_key", None)
         project = quote(getattr(arguments, "project_id", "") or "", safe="")
@@ -500,6 +522,9 @@ def parser() -> argparse.ArgumentParser:
     from .deploy_check_cli import add_parser as add_deploy_check_command
 
     add_deploy_check_command(subcommands)
+    from tessera_agent.reasoning_install_cli import add_parser as add_reasoning_command
+
+    add_reasoning_command(subcommands)
     from .deploy_upgrade_cli import add_parser as add_deploy_upgrade_command
 
     add_deploy_upgrade_command(subcommands)
@@ -1102,6 +1127,10 @@ def main(argv: list[str] | None = None) -> int:
         from .deploy_upgrade_cli import run as run_deploy_upgrade
 
         return run_deploy_upgrade(arguments)
+    if arguments.command == "reasoning":
+        from tessera_agent.reasoning_install_cli import run as run_reasoning
+
+        return run_reasoning(arguments)
     if arguments.command == "dev":
         if arguments.dev_action == "smoke-credentials":
             from .smoke_credentials_cli import run as run_smoke_credentials

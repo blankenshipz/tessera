@@ -129,8 +129,17 @@ Verification of a bundle now happens in place. Restore copies a backup into a te
 directory before it trusts it; doing that for every retention check staged ~5.7 GB deploy
 backups into the temporary filesystem, which filled and raised `OSError`, so restorable backups
 were reported as unrestorable and the disk kept filling. The size, digest, schema, declared
-objects and layout checks are the same; only the copy is gone. A reason that names an OS error
+objects and layout checks are the same; only the copy is gone. The in-place open is read-only and immutable because a plain read-only open of a legacy WAL-header database can create `-wal` and `-shm` files in the backup, and restore rejects a bundle whose files are not exactly the expected list. A reason that names an OS error
 now carries the errno name (for example `ENOSPC`), never a path.
+
+The in-place check hashes the backup database and then opens it as a separate step, so a file
+changed between those two steps is not caught the way the earlier staged copy caught it (the
+staged copy was hashed and opened as one private file). This is accepted because backup roots are
+operator-owned.
+
+Two snapshots with identical database content get the same `backup_id` (the first 32 hex digits
+of the digest). This causes no failure: `plan_backups` tracks verified backups by directory
+name, not by `backup_id`.
 
 ## Consequences
 

@@ -16,15 +16,88 @@ from pathlib import Path
 
 from .provenance_client import sanitize_envelope, stable_key
 
+# What a service manager's LoadCredential= produces: root-owned, read-only files (0400 or 0440)
+# directly inside a root-owned directory that is not writable by group or other. A file like that
+# is as private as one the service user owns with mode 0600, but only inside that directory, and
+# only when its group is root's or the service's own: a 0440 file whose group is, say, ``users``
+# would let every member of that group read the key.
+MANAGER_FILE_MODES = frozenset({0o400, 0o440})
+# Indirections so a test can present root-owned files without needing root.
+_fstat = os.fstat
+_lstat = os.lstat
 
-def private_file(path: Path) -> bytes:
-    """Read an explicitly supplied credential/config file without following symlinks."""
+
+def _group_pinned(info: os.stat_result, service_gid: int | None) -> bool:
+    """The entry's group is root (0) or the service's own group (default: this process's
+    effective gid)."""
+    return info.st_gid in {0, os.getegid() if service_gid is None else service_gid}
+
+
+def manager_directory_ok(
+    info: os.stat_result, caller_uid: int | None = None, *, service_gid: int | None = None
+) -> bool:
+    """A directory the service manager placed credentials in: owned by root or the caller,
+    neither writable by group nor accessible to others, and whose group is root's or the
+    service's (``service_gid``, default the effective gid). The group is not consulted only for
+    the caller's own directory when it grants the group nothing."""
+    caller = os.getuid() if caller_uid is None else caller_uid
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, caller}:
+        return False
+    if info.st_mode & 0o027:  # group write, or any access for others
+        return False
+    if info.st_uid == caller and not info.st_mode & 0o070:
+        return True
+    return _group_pinned(info, service_gid)
+
+
+def manager_file_ok(
+    info: os.stat_result, caller_uid: int | None = None, *, service_gid: int | None = None
+) -> bool:
+    """A regular file the caller owns and only the caller can access (mode 0400/0600 style), or
+    a root-owned manager credential (0400 or 0440, one link) whose group is root's or the
+    service's (``service_gid``, default the effective gid). World bits are never allowed."""
+    caller = os.getuid() if caller_uid is None else caller_uid
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o007:
+        return False
+    if info.st_uid == caller:
+        return not info.st_mode & 0o077
+    return (
+        info.st_uid == 0
+        and stat.S_IMODE(info.st_mode) in MANAGER_FILE_MODES
+        and info.st_nlink == 1
+        and _group_pinned(info, service_gid)
+    )
+
+
+def manager_credentials_dir() -> Path | None:
+    """``$CREDENTIALS_DIRECTORY`` when it is set to an absolute path, else None."""
+    value = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    return Path(value) if value and Path(value).is_absolute() else None
+
+
+def private_file(path: Path, *, credentials_dir: Path | None = None) -> bytes:
+    """Read an explicitly supplied credential/config file without following symlinks.
+
+    A file the caller owns must be private (no group or other bits). A root-owned 0400/0440
+    file is accepted only when it sits directly inside ``credentials_dir`` (the manager's
+    credentials directory, as ``$CREDENTIALS_DIRECTORY`` names it) and that directory is itself
+    acceptable; anything else, and anything readable by others, is refused."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
-            raise ValueError("Runtime files must be private regular files.")
-        if info.st_uid != os.getuid() or info.st_size > 64 * 1024:
+        info = _fstat(fd)
+        caller = os.getuid()
+        strict = stat.S_ISREG(info.st_mode) and not info.st_mode & 0o077 and info.st_uid == caller
+        if not strict:
+            inside = (
+                credentials_dir is not None
+                and Path(path).parent == Path(credentials_dir)
+                and manager_directory_ok(_lstat(credentials_dir), caller)
+            )
+            if not (inside and manager_file_ok(info, caller)):
+                if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                    raise ValueError("Runtime files must be private regular files.")
+                raise ValueError("Runtime file ownership or size is invalid.")
+        if info.st_size > 64 * 1024:
             raise ValueError("Runtime file ownership or size is invalid.")
         return os.read(fd, 64 * 1024 + 1)
     finally:

@@ -112,14 +112,24 @@ class CampaignSteeringCommands:
             if live["role"] not in {"human", "agent"}:
                 raise Forbidden("This credential cannot submit campaigns.")
             # ADR 0076/0077: the same expansion submit performs; the identity without an adapter.
+            # ADR 0123: image_from becomes the built image before expansion and the digest.
+            image_spec, used_predecessors = self._resolve_image_refs(
+                connection, live, project_id, body.spec, body.predecessors
+            )
             spec = expand_with_registered(
-                body.spec,
+                image_spec,
                 self.adapter_entries(connection, live, project_id),
                 tenant=(live["org_id"], project_id),
             )
             # ADR 0080: resolve receipt_output references read-only, exactly as submit does.
             spec = self._resolve_receipt_refs(
-                connection, live, project_id, spec, body.predecessors, raw_spec
+                connection,
+                live,
+                project_id,
+                spec,
+                body.predecessors,
+                raw_spec,
+                used_predecessors,
             )
             normal = normalize(spec)
             smoke_credentials.check_submission(connection, live, normal)

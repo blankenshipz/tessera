@@ -56,12 +56,16 @@ Notes on the table:
 What a client with every tool enrolled still cannot do:
 
 - No tool opens, reopens or releases a holdout claim, by design: the runner opens it, once per scope.
-- Approve with an unlock condition or pre-approvals, record a gate go or no-go, or create a
+- Approve with an unlock condition or pre-approvals, record a gate go or no-go (only a person's
+  credential on the approve-only server, `tessera_record_gate_decision`, ADR 0124), or create a
   standing approval (human authority). An approve-only server cannot read the campaign it
   approves unless `--campaign-tools` is also set; the digest comes from whoever submitted.
 - Raise a campaign cap, a concurrency limit or a deadline (a long pause counts against the
   deadline); reconcile a grant that is not a confirmed exit; stage or release data (human).
 - Read artifact bytes: outputs are metadata and digests only; bytes need a human-released snapshot.
+- The audit item "agents can't discover/stage snapshots, read outputs, logs or budget": discovery,
+  outputs, logs and budget reads are present. The remaining parts, staging a snapshot, releasing
+  data and reading artifact bytes, are by design human steps. Everything else listed here is present.
 - Pause or limit one stage rather than the campaign (only single-stage cancel exists).
 - Research/review jobs (ADR 0084): a job has no cancel route although the state `cancelled`
   exists; no spend, held or settled figure is recorded (`budget_cents` is the cap only) and
@@ -105,9 +109,10 @@ duplicated here; this table is rechecked when those land.
 
 | Steering action | Tool | State |
 | --- | --- | --- |
-| Submit a whole multi-stage campaign | `tessera_submit_campaign`, `tessera_validate_campaign_spec` | present (v1 and v2 specs; a person approves the digest) |
+| Submit a whole multi-stage campaign | `tessera_submit_campaign`, `tessera_validate_campaign_spec` | present (v1 and v2 specs; a person approves the digest). `tessera_render_campaign_spec` and `tessera_submit_rendered_campaign` build the spec from a template plus values first (ADR 0124) |
 | Inspect campaign, stage, attempt | `tessera_get_campaign`, `tessera_list_campaigns`, `tessera_campaign_logs`, `tessera_campaign_retries` | present |
 | Inspect placement | `tessera_get_campaign` (`placement`: candidates, steering, recorded placements, why a stage waits), `tessera_get_campaign_receipt` | present |
+| Discover snapshots and the files they hold | `tessera_list_snapshots`, `tessera_get_snapshot` ([ADR 0126](decisions/0126-mcp-snapshot-file-list.md)) | present (metadata and file names only; `snapshot:read`) |
 | Inspect spend | `tessera_campaign_budget` (one campaign), `tessera_project_spend` (the operator's project limits and what campaigns hold and have settled) | present (`tessera_project_spend` needs `budget:read` and is read-only) |
 | Inspect held grants and releases | `tessera_campaign_grants` | present |
 | Receipts | `tessera_get_campaign_receipt` | present |
@@ -119,7 +124,7 @@ duplicated here; this table is rechecked when those land.
 | Stop / cancel | `tessera_cancel_campaign`, `tessera_cancel_campaign_stage`, `tessera_revoke_campaign_release` | present |
 | Rerun failed stages | `tessera_prepare_stage_retry` (builds a new spec; submits nothing), `tessera_rerun_campaign` | present: a server-side re-run submits a new campaign for the failed stages ([ADR 0069](decisions/0069-rerun-a-finished-campaign.md)); its cap is bounded by what the whole re-run tree has committed and `tessera_get_campaign` shows `rerun_tree` ([ADR 0074](decisions/0074-rerun-spend-is-bounded-across-the-chain.md)) |
 | Claim sealed holdout scoring | `tessera_campaign_holdout`, `tessera_campaign_holdout_claims` | read-only views, see [ADR 0068](decisions/0068-sealed-holdout-evaluation-stages.md). No tool opens, reopens or releases a claim: the runner opens it, once per scope |
-| Retrieve outcomes | `tessera_get_campaign_receipt`, `tessera_campaign_outputs`, `tessera_campaign_gate_decisions`, `tessera_experiment_results`, `tessera_program_results` | present; output bytes stay behind a human-released snapshot |
+| Retrieve outcomes | `tessera_get_campaign_receipt`, `tessera_campaign_outputs`, `tessera_campaign_gate_decisions`, `tessera_experiment_results`, `tessera_program_results` | present; `tessera_campaign_wave_receipts` reads up to 20 campaigns' receipts and gate decisions at once (ADR 0124); output bytes stay behind a human-released snapshot |
 | Research/review jobs: submit, list, read, list and read findings | `tessera_submit_review_job`, `tessera_list_review_jobs`, `tessera_read_review_job`, `tessera_list_review_findings`, `tessera_read_review_finding` | present (ADR 0084; opt-in, scopes `review:submit`, `review:read`) |
 | Research/review jobs: accept or reject a finding, approve a tier | `tessera_resolve_review_finding`, `tessera_approve_review_job_tier` | present; a person's session credential on a `--review-decision-tool` server only, by design |
 | Pause and inspect the standing agent loop | `tessera_pause_agent_loop`, `tessera_agent_loop_status` | present, opt-in (`--agent-loop-marker`; [ADR 0089](decisions/0089-mcp-agent-loop-pause-and-status.md)); pause only, a person lifts it |

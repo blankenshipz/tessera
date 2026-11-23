@@ -11,11 +11,12 @@ from typing import Any
 import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import TypeAdapter
 
-from tessera_control.campaign_models import AnyCampaignSpec
+from tessera_control.campaign_models import TERMINAL_CAMPAIGN, AnyCampaignSpec
 from tessera_control.models import ExecutionSpec
 from tessera_mcp.agent_loop_tools import register_agent_loop_tools
-from tessera_mcp.client import ControlClient
+from tessera_mcp.client import ControlClient, ControlError
 from tessera_mcp.config import Config
 from tessera_mcp.credential_reenroll import register_credential_reenroll_tool
 from tessera_mcp.generated_outputs import register_generated_output_tools
@@ -27,6 +28,7 @@ from tessera_mcp.review_tools import (
     register_review_decision_tools,
     register_review_tools,
 )
+from tessera_mcp.spec_template import TemplateError, render_spec
 from tessera_mcp.stage_retry import RetryRefused, build_retry_spec
 
 # Scope each read tool needs; a tool is registered only when its scope is enrolled.
@@ -38,9 +40,11 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_report": "campaign:read",
     "tessera_cancel_campaign": "campaign:cancel",
     "tessera_list_snapshots": "snapshot:read",
+    "tessera_get_snapshot": "snapshot:read",
     "tessera_get_snapshot_license_labels": "snapshot:read",
     "tessera_campaign_outputs": "artifact:read",
     "tessera_campaign_logs": "campaign:logs",
+    "tessera_campaign_stage_watch": "campaign:logs",
     "tessera_campaign_budget": "budget:read",
     "tessera_campaign_retries": "campaign:read",
     "tessera_campaign_standing_status": "campaign:read",
@@ -53,6 +57,10 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_holdout_claims": "campaign:read",
     # ADR 0055: steering. Validation is a dry-run submit; the others only reduce authority.
     "tessera_validate_campaign_spec": "campaign:submit",
+    # ADR 0124: render a spec from a template plus values; submit is still an ordinary submit.
+    "tessera_render_campaign_spec": "campaign:submit",
+    "tessera_submit_rendered_campaign": "campaign:submit",
+    "tessera_campaign_wave_receipts": "campaign:read",
     "tessera_prepare_stage_retry": "campaign:read",
     # ADR 0069: a server-side re-run is an ordinary submission (a person approves its digest).
     "tessera_rerun_campaign": "campaign:submit",
@@ -81,6 +89,18 @@ ALSO_REQUIRES = {
     "tessera_prepare_stage_retry": frozenset({"artifact:read"}),
     "tessera_rerun_campaign": frozenset({"campaign:read", "artifact:read"}),
 }
+
+
+_SPEC_ADAPTER = TypeAdapter(AnyCampaignSpec)
+
+
+def _render_and_parse(template: str | dict[str, Any], values: dict[str, str]) -> dict[str, Any]:
+    """Render, then parse with the same model submit uses; any refusal precedes every request."""
+    try:
+        spec = render_spec(template, values)
+    except TemplateError as error:
+        raise ValueError(str(error)) from None
+    return _SPEC_ADAPTER.validate_python(spec).model_dump(mode="json")
 
 
 def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
@@ -121,7 +141,32 @@ def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
         revision = campaign["revision"] if expected_revision is None else expected_revision
         return await client.approve_campaign(campaign_id, revision, expected_spec_digest, key)
 
+    async def tessera_record_gate_decision(
+        campaign_id: str,
+        decision: str,
+        note: str,
+        idempotency_key: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Record a human gate go or no_go on a FINISHED campaign (a person's credential).
+
+        decision is "go" or "no_go"; note is the reason (1-1000 characters) and is stored with
+        the decision. Thin client of ``POST /campaigns/{id}/gate-decision`` (ADR 0045): the
+        control API refuses any credential that is not a person's session (an agent credential
+        gets a refusal and nothing is written) and any campaign that has not finished. Read the
+        campaign's receipt and tessera_campaign_gate_decisions first. A later decision supersedes
+        an earlier one; none is deleted. A fresh idempotency key is used per call unless you
+        supply one; to replay a lost answer send the SAME key and the revision you read before.
+        """
+        if decision not in {"go", "no_go"}:
+            raise ValueError('decision must be "go" or "no_go"; nothing was sent.')
+        campaign = await client.campaign(campaign_id)
+        key = idempotency_key or "gate-" + uuid.uuid4().hex
+        revision = campaign["revision"] if expected_revision is None else expected_revision
+        return await client.record_gate_decision(campaign_id, revision, decision, note, key)
+
     server.tool(annotations=write)(tessera_approve_campaign)
+    server.tool(annotations=write)(tessera_record_gate_decision)
 
 
 RETENTION_TOOL_SCOPES = {
@@ -390,6 +435,15 @@ def register_campaign_tools(
         """
         return await client.list_snapshots(offset, limit)
 
+    async def tessera_get_snapshot(snapshot_id: str) -> dict[str, Any]:
+        """Read one snapshot's file list (snapshot:read): what a spec can pin.
+
+        Lists the files a spec can pin (relative path, size, sha256, classification) and the
+        snapshot's data class and licence labels. Metadata only, never bytes; long lists are cut
+        and say so (`truncated`). Pick ids with tessera_list_snapshots. This tool changes nothing.
+        """
+        return await client.get_snapshot(snapshot_id)
+
     async def tessera_get_snapshot_license_labels(snapshot_id: str) -> dict[str, Any]:
         """Read a snapshot's licence labels (snapshot:read): the labels and whether it is labelled.
 
@@ -414,6 +468,18 @@ def register_campaign_tools(
         Tessera retains no raw stdout/stderr; these are the recorded, bounded diagnostics.
         """
         return await client.campaign_view(campaign_id, "logs")
+
+    async def tessera_campaign_stage_watch(
+        campaign_id: str, offset: int = 0, limit: int = 20
+    ) -> dict[str, Any]:
+        """Read what the stage watcher reported for a campaign (campaign:logs), newest first.
+
+        Per stage attempt: counts of heartbeat, progress, stuck and failed reports, and a page of
+        recorded reports (closed kind, counters, time) and decision requests (retry or resize
+        asks, never admitted). Worker claims, unverified; they never decide cost or success.
+        Paged: offset >= 0, limit 1-100. Read-only; no paths or worker text.
+        """
+        return await client.campaign_stage_watch(campaign_id, offset, limit)
 
     async def tessera_campaign_retries(campaign_id: str) -> dict[str, Any]:
         """Read a campaign's infrastructure-retry state (campaign:read).
@@ -517,6 +583,89 @@ def register_campaign_tools(
         resolved_from is refused: only submit sets it.
         """
         return await client.validate_campaign_spec(spec.model_dump(mode="json"), predecessors)
+
+    async def tessera_render_campaign_spec(
+        template: str | dict[str, Any],
+        values: dict[str, str],
+        predecessors: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Render a campaign spec from a template plus values and dry-run it (campaign:submit).
+
+        The template is a campaign spec (JSON object or JSON text) whose strings may hold
+        ${NAME} placeholders (UPPER_CASE letters, digits, _). Values are strings substituted
+        into string leaves only, never into keys, so a value cannot add a field or change a
+        type. Every placeholder needs a value and every value must be used, or the call is
+        refused before anything is sent. The rendered spec then gets the same dry-run as
+        tessera_validate_campaign_spec: nothing is stored and a pass is not approval.
+        Returns {spec, validation}; submit the same arguments with
+        tessera_submit_rendered_campaign.
+        """
+        spec = _render_and_parse(template, values)
+        validation = await client.validate_campaign_spec(spec, predecessors)
+        return {"spec": spec, "validation": validation}
+
+    async def tessera_submit_rendered_campaign(
+        template: str | dict[str, Any],
+        values: dict[str, str],
+        idempotency_key: str,
+        predecessors: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Render a spec from a template plus values and submit it (campaign:submit).
+
+        Rendering is as in tessera_render_campaign_spec. Submission grants nothing: a person
+        still approves the exact spec digest returned here before anything runs. Persist
+        idempotency_key and reuse identical arguments on reconnect; changed values need a new key.
+        """
+        spec = _render_and_parse(template, values)
+        return await client.submit_campaign(spec, idempotency_key, predecessors)
+
+    async def tessera_campaign_wave_receipts(campaign_ids: list[str]) -> dict[str, Any]:
+        """Read receipts and gate decisions of a chain of campaigns, one per wave (campaign:read).
+
+        Give up to 20 campaign ids in wave order. Each entry carries the campaign status, its
+        terminal receipt (null while it has not finished, with the reason) and its recorded gate
+        decisions with the effective one. A campaign that cannot be read is reported with its
+        error and the others still return. Recorded evidence only: it judges nothing and a
+        missing receipt is never filled in.
+        """
+        if not 1 <= len(campaign_ids) <= 20 or len(set(campaign_ids)) != len(campaign_ids):
+            raise ValueError("Give 1-20 distinct campaign ids.")
+        waves = []
+        for campaign_id in campaign_ids:
+            entry: dict[str, Any] = {"campaign_id": campaign_id}
+            try:
+                campaign = await client.campaign(campaign_id)
+                entry["status"] = campaign.get("status")
+                if campaign.get("status") in TERMINAL_CAMPAIGN:
+                    try:
+                        entry["receipt"] = await client.campaign_receipt(campaign_id)
+                    except ControlError as error:
+                        # A campaign cancelled while still submitted never had an approval and
+                        # control writes no receipt for it: that 404 is "none recorded", not
+                        # a failure. Any other error stays an error.
+                        never_approved = (
+                            campaign.get("status") == "cancelled"
+                            and campaign.get("approval") is None
+                            and not campaign.get("approvals")
+                        )
+                        if never_approved and str(error).endswith("(HTTP 404)"):
+                            entry["receipt"] = None
+                            entry["receipt_absent_reason"] = "no_receipt_recorded"
+                        else:
+                            entry["error"] = str(error)
+                else:
+                    entry["receipt"] = None
+                    entry["receipt_absent_reason"] = "campaign_not_terminal"
+            except ControlError as error:
+                entry["error"] = str(error)
+                waves.append(entry)
+                continue
+            try:
+                entry["gate_decisions"] = await client.gate_decisions(campaign_id)
+            except ControlError as error:
+                entry["gate_decisions_error"] = str(error)
+            waves.append(entry)
+        return {"waves": waves}
 
     async def tessera_prepare_stage_retry(
         campaign_id: str,
@@ -692,6 +841,7 @@ def register_campaign_tools(
     )
     mutating = {
         "tessera_submit_campaign",
+        "tessera_submit_rendered_campaign",
         "tessera_rerun_campaign",
         "tessera_cancel_campaign",
         "tessera_reduce_campaign_budget",
@@ -713,9 +863,11 @@ def register_campaign_tools(
         tessera_get_campaign_receipt,
         tessera_campaign_report,
         tessera_list_snapshots,
+        tessera_get_snapshot,
         tessera_get_snapshot_license_labels,
         tessera_campaign_outputs,
         tessera_campaign_logs,
+        tessera_campaign_stage_watch,
         tessera_campaign_budget,
         tessera_campaign_retries,
         tessera_campaign_standing_status,
@@ -724,6 +876,9 @@ def register_campaign_tools(
         tessera_campaign_holdout_claims,
         tessera_cancel_campaign,
         tessera_validate_campaign_spec,
+        tessera_render_campaign_spec,
+        tessera_submit_rendered_campaign,
+        tessera_campaign_wave_receipts,
         tessera_prepare_stage_retry,
         tessera_rerun_campaign,
         tessera_campaign_grants,
@@ -1059,8 +1214,9 @@ def main(argv=None):
         "--approval-tool",
         action="store_true",
         help=(
-            "register tessera_approve_campaign. Alone it makes an approve-only server (no "
-            "submit or cancel tools); add --campaign-tools to expose those too. The control API "
+            "register tessera_approve_campaign and tessera_record_gate_decision. Alone it makes "
+            "an approve-only server (no submit or cancel tools); add --campaign-tools to expose "
+            "those too. The control API "
             "accepts approval only from a person's session credential, so run it as a separate "
             "operator server with its own credential file, not with the submitting agent's"
         ),
@@ -1189,9 +1345,21 @@ def main(argv=None):
         extra["storage_retention_tool"] = True
     if arguments.model_spend_resolve_tool:
         extra["model_spend_resolve_tool"] = True
-    live_retention = (
-        campaign_actions if campaign_actions is not None else _live_actions(client)
-    ) & frozenset(RETENTION_TOOL_SCOPES.values())
+    decision_only = (
+        arguments.approval_tool
+        or arguments.review_decision_tool
+        or arguments.person_enrollment_tool
+        or arguments.model_spend_resolve_tool
+    ) and not arguments.storage_retention_tool
+    if campaign_actions is not None:
+        held = campaign_actions
+    elif live is not None:
+        held = live
+    elif decision_only:
+        held = frozenset()  # a decision-only server makes no live scope read
+    else:
+        held = _live_actions(client)
+    live_retention = held & frozenset(RETENTION_TOOL_SCOPES.values())
     if live_retention:
         extra["retention_actions"] = live_retention
     create_server(client, campaign_tools=campaign_tools, **extra).run(transport="stdio")

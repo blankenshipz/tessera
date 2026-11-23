@@ -30,16 +30,30 @@ One-time operator setup (a person, once per project):
 Then the agent, over MCP only:
 
 1. `tessera_validate_campaign_spec`: dry run; nothing is stored. Fix refusals.
+   Choose a snapshot first: `tessera_list_snapshots` for ids and digests, then
+   `tessera_get_snapshot` for the files it holds, so a stage can name a file.
 2. `tessera_submit_campaign` with an idempotency key. A person approves the returned spec
-   digest. This is the one authority step per spec.
+   digest. This is the one authority step per spec. For a wave of similar campaigns,
+   `tessera_render_campaign_spec` renders a template (`${NAME}` placeholders, values into string
+   leaves only, every placeholder and every value used) and dry-runs it, and
+   `tessera_submit_rendered_campaign` submits the same rendering
+   ([ADR 0124](decisions/0124-mcp-operator-loop-tools.md)). It is an ordinary submission; a person
+   still approves the digest.
 3. Wait. Tessera's own runner advances stages (grants, data releases, measurements, custody) with
    no operator call. Read progress with `tessera_get_campaign`, `tessera_campaign_logs`,
-   `tessera_campaign_grants` and `tessera_campaign_budget`.
+   `tessera_campaign_grants` and `tessera_campaign_budget`. The stage watcher is on by default for
+   every stage (ADR 0125); `tessera_campaign_stage_watch(campaign_id, offset=0, limit=20)`
+   (`campaign:logs`) reads its recorded reports newest first: per attempt the counts of heartbeat,
+   progress, stuck and failed reports, a page of reports and never-admitted retry or resize
+   requests. They are unverified worker claims, with closed codes and integer counters only (no
+   paths or worker text); they never decide cost or success.
 4. When the campaign finishes read `tessera_get_campaign_receipt` and
    `tessera_campaign_outputs`. A gate (standing approval with an unlock requirement) reads that
    receipt: `tessera_campaign_standing_status` shows the refusal reason while it holds
    (`no_human_go`, `measurement_condition_false`, ...) and `tessera_campaign_gate_decisions` shows
-   the recorded go.
+   the recorded go. For a chain of waves, `tessera_campaign_wave_receipts` returns up to 20
+   campaigns' status, receipt and gate decisions in one read (a null receipt for one that has not
+   finished; one unreadable id does not fail the rest).
 5. A stage failed: `tessera_prepare_stage_retry` builds a new spec (reads only), pinning
    succeeded outputs by digest. Validate it, submit it, and a person approves the new digest.
 6. Spend control: `tessera_reduce_campaign_budget` lowers the cap (never below held plus
@@ -62,7 +76,9 @@ read it back, a refused approval by the agent's own credential, a person's appro
 decision), pause, resume, cancel, then the terminal receipt (it must record the pause and the
 approval) and a zero settled budget. It uses two credentials, an enrolled agent credential and a
 person's session credential used only for the approval. It makes no call and reads no credential
-unless run with `--execute` and the exact confirmation phrase.
+unless run with `--execute` and the exact confirmation phrase. The refused approval passes only
+when control answered HTTP 403 (recorded as `refused_with: http_403`); a dropped connection, a
+timeout or any other failure fails the check instead of counting as a refusal.
 
     scripts/mcp_steering_smoke.py                       # prints the plan and the exact spec
     scripts/mcp_steering_smoke.py --execute --confirm mcp-steering-smoke-local-docker \
@@ -139,9 +155,9 @@ are not planned to change; the rest are gaps.
 
 | # | Step | Needed today | Status |
 | --- | --- | --- | --- |
-| 1 | Approve a submitted (or retry) spec digest | a person's session | by design |
+| 1 | Approve a submitted (or retry) spec digest | a person's session; over MCP only on the approve-only server with that person's credential (`tessera_approve_campaign`, ADR 0065) | by design |
 | 2 | Create the standing approval that carries a gate (spec, caps, `unlock`) | a person's session; no MCP tool, and an agent cannot submit a gated campaign | by design; see gap 10 |
-| 3 | Record a gate `go` | a person's session, or the owner credential with an automation label where the operator started `tessera serve --accept-automation-gate-go`. No agent or MCP path | by design for the go; the opt-in is operator config |
+| 3 | Record a gate `go` | a person's session, or the owner credential with an automation label where the operator started `tessera serve --accept-automation-gate-go`. No agent path. A person's own credential can also record it over MCP on the approve-only server (`tessera_record_gate_decision`, ADR 0124); the control API still refuses any other credential | by design for the go; the opt-in is operator config |
 | 4 | A gate that needs no go (a pre-registered paired-delta `bound_outcome`) | a person creates the split lock and the standing approval | gap 11 |
 | 5 | Raise a cap, raise concurrency, extend a deadline | new approval / operator limits | by design |
 | 6 | Pause and resume, cancel one stage, a lower-only per-campaign concurrency limit | `tessera_pause_campaign`, `tessera_resume_campaign`, `tessera_cancel_campaign_stage`, `tessera_limit_campaign_concurrency` (ADR 0061). Still human: lifting a pause a person set, raising a limit, extending a deadline | closed |
@@ -154,8 +170,10 @@ are not planned to change; the rest are gaps.
 | 13 | A cap reduction does not change a re-run tree's first cap | the tree is bounded by the first spec's cap less what the tree committed (ADR 0074); a reduced cap lowers only what that campaign may spend, and a finished campaign commits what it settled | design note |
 | 14 | Approve over MCP | needs a separate approve-only server with a person's credential (`--approval-tool`); covered by the second end-to-end test | by design |
 
-No steering tool approves a spec, records a go, raises a cap, reconciles a grant or releases data (the
-operator-enabled approval tool of ADR 0065 runs only on a separate server holding a person's own
-credential; the first test does not register it, the second does); the
+No steering tool available to an agent credential approves a spec, records a go, raises a cap,
+reconciles a grant or releases data. The operator-enabled `tessera_approve_campaign` (ADR 0065)
+and `tessera_record_gate_decision` (ADR 0124) run only on a separate approve-only server holding a
+person's own credential, and the control API refuses any other credential there; the first test
+does not register them, the second registers the approval tool; the
 end-to-end test marks each human act `HUMAN` and asserts the approval count does not change
 while the runner advances the stages.

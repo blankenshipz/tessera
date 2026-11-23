@@ -21,11 +21,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from tessera_control.image_build_models import MAX_RESULT_BYTES, repository_registered
 from tessera_control.persistent_output_storage import validate_persistent_output_storage
 
 from .chunked_inputs import materialize_chunked_snapshot, verify_chunked_authority
 from .control_channel import classify_control_failure
 from .cpu import EGRESS_PROFILE, CpuOperation
+from .image_build import ImageBuildError, builder_argv, parse_build_result
 from .inputs import materialize_snapshot
 from .provider import Provider, ProviderDispatch
 from .public_fetch import PublicFetchError, fetch_public_files
@@ -34,6 +36,8 @@ from .supervisor import CpuSupervisor, DriverResult, Lease, SupervisorError
 MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
 EGRESS_REPORT_STATE = "egress_journal"
 PUBLIC_FETCH_REPORT_STATE = "public_fetch"
+IMAGE_BUILD_REPORT_STATE = "image_build"
+BUILD_OUTPUT_DIRECTORY = "build-output"
 
 # Observation delivery (ADR 0054): a report that cannot be delivered stays in the durable
 # ``reports`` journal and is retried with bounded exponential backoff, keyed by its fixed
@@ -96,6 +100,8 @@ class CpuRuntime:
         public_root: Path | None = None,
         public_cache_dir: Path | None = None,
         public_fetcher: Callable[..., list[dict[str, Any]]] = fetch_public_files,
+        registry_auth_file: Path | None = None,
+        build_repositories: tuple[str, ...] = (),
     ):
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -113,6 +119,13 @@ class CpuRuntime:
             raise SupervisorError("Runtime public inputs require private 0700 supervisor custody.")
         self.public_cache_dir = Path(public_cache_dir) if public_cache_dir is not None else None
         self._public_fetcher = public_fetcher
+        # ADR 0123: the operator's registry auth file, mounted read-only into a pushing build.
+        self.registry_auth_file = (
+            Path(registry_auth_file) if registry_auth_file is not None else None
+        )
+        # ADR 0123: the worker operator's own registered push destinations (``host[/path]``).
+        # Empty refuses every pushing build, whatever control approved.
+        self.build_repositories = tuple(build_repositories)
         self.channel = channel
         self.adapter = adapter
         self.worker_id = worker_id
@@ -260,6 +273,7 @@ class CpuRuntime:
                 )
             self._validate_network_profile(package, spec)
             self._validate_public_fetch(package, spec)
+            self._validate_build(package, spec)
             capability = package.get("persistent_output_storage")
             if self.persistent_output_collection:
                 if capability is None:
@@ -326,6 +340,57 @@ class CpuRuntime:
             or type(plan.get("cache")) is not bool
         ):
             raise SupervisorError("Control package public fetch does not match its plan.")
+
+    @staticmethod
+    def _validate_build(package: dict[str, Any], spec: dict[str, Any]) -> None:
+        """A build package carries the plan's policy exactly, the argv derived from it, and the
+        allowlist egress; nothing else may run in a build stage (ADR 0123)."""
+        policy = package.get("build")
+        if policy is None and spec.get("build") is None:
+            return
+        try:
+            if (
+                policy != spec.get("build")
+                or package.get("network_profile") != EGRESS_PROFILE
+                or package.get("public_fetch") is not None
+                or spec["argv"] != builder_argv(policy)
+            ):
+                raise SupervisorError("Control package build does not match its plan.")
+        except ImageBuildError as error:
+            raise SupervisorError("Control package build policy is invalid.") from error
+
+    def _build_custody(self, policy: dict[str, Any]) -> dict[str, str | None]:
+        """The private /outputs directory and, when pushing, the operator's registry auth."""
+        if policy["push"] and self.registry_auth_file is None:
+            raise SupervisorError("no registry auth configured for a pushing image build.")
+        if policy["push"] and not repository_registered(
+            policy["repository"], self.build_repositories
+        ):
+            # Checked before the auth file is named for a mount: the operator's push rights
+            # apply only to repositories this worker's own operator registered.
+            raise SupervisorError("build repository is not registered on this worker.")
+        output = self.directory / BUILD_OUTPUT_DIRECTORY
+        output.mkdir(mode=0o700, exist_ok=True)
+        if output.is_symlink() or stat.S_IMODE(output.stat().st_mode) != 0o700:
+            raise SupervisorError("Image build output requires a private 0700 directory.")
+        return {
+            "build_directory": str(output),
+            "registry_auth_file": str(self.registry_auth_file) if policy["push"] else None,
+        }
+
+    def _fresh_build_output(self) -> None:
+        """Start a new build operation with an empty ``build-output`` directory.
+
+        A result file an earlier operation left in the reused runtime directory must never be
+        read as this build's (ADR 0123). Called only when a new operation is admitted; recovery
+        of an existing one keeps what its own container wrote."""
+        output = self.directory / BUILD_OUTPUT_DIRECTORY
+        if output.is_symlink():
+            raise SupervisorError("Image build output requires a private 0700 directory.")
+        if output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+            if output.exists():
+                raise SupervisorError("Image build output could not be cleared.")
 
     def _fetch_public(self, operation_id: str, plan: dict[str, Any]) -> dict[str, Any]:
         """Download and verify the plan's public files into private custody (ADR 0097).
@@ -410,6 +475,7 @@ class CpuRuntime:
                     (r["input"], r["name"], r["sha256"], r["bytes"]) for r in rows
                 ),
             }
+        build = self._build_custody(package["build"]) if package.get("build") is not None else {}
         return CpuOperation(
             operation_id=package["operation_id"],
             image=package["pinned_image"],
@@ -423,6 +489,7 @@ class CpuRuntime:
             # Operator container limits belong to the operation, so the supervisor's durable
             # fence (and recovery's digest check) covers the limits the container runs with.
             **public,
+            **build,
             **self._operation_limits(package["plan"]["execution_spec"].get("max_scratch_bytes")),
         )
 
@@ -536,6 +603,8 @@ class CpuRuntime:
             if fetched is not None:
                 descriptor["public_fetch"] = fetched
             self._operation(descriptor)  # Validate before persisting local operation intent.
+            if package.get("build") is not None:
+                self._fresh_build_output()
             encoded = json.dumps(descriptor, sort_keys=True).encode()
             if len(encoded) > MAX_DESCRIPTOR_BYTES:
                 raise SupervisorError("Runtime descriptor exceeds its bound.")
@@ -699,6 +768,8 @@ class CpuRuntime:
         ):
             self._report_egress_journal()
         self._report_public_fetch()
+        if confirmed_exit:
+            self._report_image_build(exit_code)
         return response
 
     def _report_request_seconds(self) -> float | None:
@@ -942,6 +1013,83 @@ class CpuRuntime:
         try:
             self._post_report(
                 f"/worker/operations/{operation.operation_id}/public-fetch", payload, key
+            )
+        except Exception as error:
+            self._delivery_failed(intent_id, error)
+        with self._observation_connection() as connection:
+            connection.execute("UPDATE reports SET completed=1 WHERE id=?", (intent_id,))
+
+    def _read_build_result(self, exit_code: int | None) -> dict[str, Any]:
+        """The report payload body: the strict result row, or a closed failure code."""
+        policy = (self.operation_package or {}).get("build")
+        if exit_code != 0:
+            return {"failed": "build_exit_nonzero"}
+        path = self.directory / BUILD_OUTPUT_DIRECTORY / "image-build.json"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return {"failed": "result_missing"}
+        except OSError:
+            return {"failed": "result_unsafe"}
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                return {"failed": "result_unsafe"}
+            raw = source.read(MAX_RESULT_BYTES + 1)
+        try:
+            return {"result": parse_build_result(raw, policy)}
+        except ImageBuildError as error:
+            return {"failed": error.code}
+
+    @property
+    def operation_package(self) -> dict[str, Any] | None:
+        control = (self.descriptor or {}).get("control") or {}
+        return control.get("package")
+
+    def _report_image_build(self, exit_code: int | None) -> None:
+        """Post the build result row (never the image) or its failure code once, replayably."""
+        if self.lease is None or self.operation is None:
+            raise SupervisorError("Runtime has no bound operation.")
+        if (self.operation_package or {}).get("build") is None:
+            return
+        operation = self.operation
+        with self._observation_connection() as connection:
+            done = connection.execute(
+                "SELECT 1 FROM reports WHERE operation_id=? AND observed_state=? AND completed=1",
+                (operation.operation_id, IMAGE_BUILD_REPORT_STATE),
+            ).fetchone()
+            pending = connection.execute(
+                """SELECT id, payload_json, idempotency_key FROM reports
+                WHERE operation_id=? AND observed_state=? AND completed=0
+                ORDER BY id DESC LIMIT 1""",
+                (operation.operation_id, IMAGE_BUILD_REPORT_STATE),
+            ).fetchone()
+        if done is not None:
+            return
+        if pending is not None:
+            intent_id, payload, key = pending[0], json.loads(pending[1]), pending[2]
+        else:
+            payload = {
+                "lease_id": self.lease.id,
+                "expected_epoch": self.lease.epoch,
+                **self._read_build_result(exit_code),
+            }
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            key = (
+                "runtime-image-build-"
+                + hashlib.sha256(f"{operation.operation_id}:{encoded}".encode()).hexdigest()
+            )
+            with self._observation_connection() as connection:
+                cursor = connection.execute(
+                    """INSERT INTO reports
+                    (operation_id, observed_state, provider_id, termination_confirmed,
+                     payload_json, idempotency_key, completed) VALUES (?, ?, NULL, 0, ?, ?, 0)""",
+                    (operation.operation_id, IMAGE_BUILD_REPORT_STATE, encoded, key),
+                )
+                intent_id = cursor.lastrowid
+        self._begin_delivery(intent_id, False)
+        try:
+            self._post_report(
+                f"/worker/operations/{operation.operation_id}/image-build", payload, key
             )
         except Exception as error:
             self._delivery_failed(intent_id, error)

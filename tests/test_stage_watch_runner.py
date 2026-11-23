@@ -217,7 +217,8 @@ def test_disabled_by_default_constructs_nothing_and_imports_no_watcher(tmp_path:
     with make_supervisor(tmp_path, DockerAdapter(FakeDocker()), clock) as supervisor:
         assert supervisor.watch_runner is None
     assert not (tmp_path / WATCH_DIRECTORY).exists()
-    # The default worker code path never loads the watcher library.
+    # The worker code path imports only the light config module (ADR 0125 default-on); the
+    # watcher library and runner load lazily, when a stage actually starts a watcher.
     probe = (
         "import sys, tessera_worker.cli, tessera_worker.service, tessera_worker.supervisor, "
         "tessera_worker.daemon\n"
@@ -226,7 +227,8 @@ def test_disabled_by_default_constructs_nothing_and_imports_no_watcher(tmp_path:
         "'--grant-id', 'g', '--credential-file', '/c', '--workspace-root', '/w', "
         "'--development-output-root', '/o', '--allowed-image', 'i'])\n"
         "assert arguments.stage_watcher is False and _stage_watch(arguments) is None\n"
-        "print(sorted(m for m in sys.modules if 'stage_watch' in m))\n"
+        "print(sorted(m for m in sys.modules if 'stage_watch' in m and 'config' not in m "
+        "and 'limits' not in m))\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True, env=os.environ

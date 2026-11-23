@@ -44,7 +44,7 @@ from .model_destinations import (
     validate_credential_ref,
 )
 from .remote_reasoning_runtime import validate_profile
-from .remote_reasoning_store import private_file
+from .remote_reasoning_store import manager_directory_ok, manager_file_ok, private_file
 from .service_startup import (
     ANTHROPIC_API_KEY_FILE,
     MODEL_CREDENTIAL_FILE,
@@ -100,14 +100,17 @@ def _environment(environment: Mapping[str, str]) -> dict[str, Any]:
     return _check("environment", "ok", "no API-key fallback variable is set")
 
 
-def _load_profile(path: Path) -> tuple[dict | None, dict[str, Any]]:
+def _load_profile(
+    path: Path, credentials_dir: Path | None = None
+) -> tuple[dict | None, dict[str, Any]]:
     try:
-        profile = json.loads(private_file(path))
+        profile = json.loads(private_file(path, credentials_dir=credentials_dir))
     except (OSError, ValueError):
         return None, _check(
             "profile",
             "fail",
-            "the profile is missing, unreadable or not a private (0600, owned) regular file",
+            "the profile is missing, unreadable or not a private regular file (owned 0600, or a "
+            "root-owned 0400/0440 service-manager credential)",
             "install the reasoning profile as a root-owned 0600 file and load it with "
             "LoadCredential=profile:...",
         )
@@ -145,7 +148,12 @@ def _project_id(profile: dict, supplied: str | None) -> str | None:
     return declared or supplied
 
 
-def _credential_reference(profile: dict | None, root: Path | None, root_error: str | None):
+def _credential_reference(
+    profile: dict | None,
+    root: Path | None,
+    root_error: str | None,
+    filename: str = MODEL_CREDENTIAL_FILE,
+):
     name = "credential_reference"
     if profile is None:
         return _check(name, "unchecked", "the profile is not valid")
@@ -169,7 +177,7 @@ def _credential_reference(profile: dict | None, root: Path | None, root_error: s
             "pass the private directory systemd provides as CREDENTIALS_DIRECTORY (mode 0700, "
             "owned by the service user)",
         )
-    if not os.path.lexists(root / MODEL_CREDENTIAL_FILE):
+    if not os.path.lexists(root / filename):
         return _check(
             name,
             "missing",
@@ -179,7 +187,7 @@ def _credential_reference(profile: dict | None, root: Path | None, root_error: s
             "to the unit",
         )
     try:
-        require_model_credential(root, profile)
+        require_model_credential(root, profile, filename)
     except StartupBlocked as error:
         return _check(
             name,
@@ -190,7 +198,9 @@ def _credential_reference(profile: dict | None, root: Path | None, root_error: s
     return _check(name, "ok", "the reference file matches the profile's credential_ref")
 
 
-def _api_key_file(root: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _api_key_file(
+    root: Path | None, owner_uid: int | None = None, filename: str = ANTHROPIC_API_KEY_FILE
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """STAT ONLY. The key file is never opened, so its value cannot be read or leaked here."""
     name = "api_key_file"
     key = {"present": False, "size_ok": None}
@@ -201,7 +211,7 @@ def _api_key_file(root: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
     if root is None:
         return _check(name, "unchecked", "the credentials directory is unusable"), key
     try:
-        info = os.lstat(root / ANTHROPIC_API_KEY_FILE)
+        info = os.lstat(root / filename)
     except FileNotFoundError:
         return _check(name, "missing", "no API key file is present", fix), key
     except OSError:
@@ -209,12 +219,16 @@ def _api_key_file(root: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
     key["present"] = True
     key["size_ok"] = 0 < info.st_size <= KEY_FILE_MAX_BYTES
     problems = []
+    manager = manager_directory_ok(os.lstat(root)) and manager_file_ok(info)
     if not stat.S_ISREG(info.st_mode):
         problems.append("not a regular file")
-    if info.st_mode & 0o077:
-        problems.append("group or other can access it (mode must be 0600)")
-    if info.st_uid != os.getuid():
-        problems.append("not owned by the service user")
+    elif manager and info.st_uid == 0:
+        pass  # a service manager's own credential: root-owned 0400/0440 in its private directory
+    else:
+        if info.st_mode & 0o077:
+            problems.append("group or other can access it (mode must be 0600)")
+        if info.st_uid != (os.getuid() if owner_uid is None else owner_uid):
+            problems.append("not owned by the service user")
     if not key["size_ok"]:
         problems.append("size is outside 1..512 bytes")
     if problems:
@@ -242,7 +256,7 @@ def _egress_allowlist() -> dict[str, Any]:
     return _check(name, "ok", "only api.anthropic.com:443 is allowed for model calls")
 
 
-def _receipts_store(state_dir: Path) -> dict[str, Any]:
+def _receipts_store(state_dir: Path, owner_uid: int | None = None) -> dict[str, Any]:
     name = "receipts_store"
     fix = "create the state directory as the service user with mode 0700 (StateDirectory=)"
     try:
@@ -251,7 +265,7 @@ def _receipts_store(state_dir: Path) -> dict[str, Any]:
         return _check(name, "fail", "the state directory does not exist", fix)
     if not stat.S_ISDIR(info.st_mode):
         return _check(name, "fail", "the state path is not a directory", fix)
-    if info.st_uid != os.getuid():
+    if info.st_uid != (os.getuid() if owner_uid is None else owner_uid):
         return _check(name, "fail", "the state directory is not owned by the service user", fix)
     if info.st_mode & 0o022:
         return _check(name, "fail", "the state directory is group or world writable", fix)
@@ -324,6 +338,33 @@ def _control_slices(control_url: str | None, opener: Opener | None) -> dict[str,
     return _check(name, "ok", "the control plane is ready and serves the model-spend routes")
 
 
+UNREADABLE_CONTROL_DATABASE = (
+    "the control database is not readable by this user (run as a user that can read it, or "
+    "check spend caps separately)"
+)
+# ``connect(mode=ro)`` is lazy, so a file this user cannot open or read surfaces at the first
+# query, with one of these messages. Only a missing table or column means the database predates
+# the model-spend slice.
+_UNREADABLE_MARKERS = ("unable to open", "readonly", "read-only", "permission", "denied")
+_SCHEMA_MARKERS = ("no such table", "no such column")
+
+
+def _spend_query_failure(name: str, exc: sqlite3.Error) -> dict[str, Any]:
+    message = str(exc).lower()
+    if any(marker in message for marker in _SCHEMA_MARKERS):
+        return _check(
+            name,
+            "fail",
+            "the control database is older than the model-spend slice",
+            "migrate the control database (upgrade the control plane)",
+        )
+    if isinstance(exc, sqlite3.OperationalError) and any(
+        marker in message for marker in _UNREADABLE_MARKERS
+    ):
+        return _check(name, "fail", UNREADABLE_CONTROL_DATABASE)
+    return _check(name, "fail", "the control database cannot be queried")
+
+
 def _spend_caps(
     profile: dict | None, control_state_dir: Path | None, project_id: str | None
 ) -> dict[str, Any]:
@@ -344,7 +385,13 @@ def _spend_caps(
     try:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     except sqlite3.Error:
-        return _check(name, "fail", "the control database cannot be opened read-only")
+        try:
+            os.stat(database)
+        except (FileNotFoundError, NotADirectoryError):
+            return _check(name, "fail", "the control database cannot be opened read-only")
+        except OSError:
+            pass  # this user cannot even look into the control state directory
+        return _check(name, "fail", UNREADABLE_CONTROL_DATABASE)  # present, but not for this user
     try:
         try:
             rows = {
@@ -355,13 +402,8 @@ def _spend_caps(
                     (project_id, PROVIDER),
                 )
             }
-        except sqlite3.Error:
-            return _check(
-                name,
-                "fail",
-                "the control database is older than the model-spend slice",
-                "migrate the control database (upgrade the control plane)",
-            )
+        except sqlite3.Error as exc:
+            return _spend_query_failure(name, exc)
     finally:
         connection.close()
     row = rows.get(PROVIDER) or rows.get("*")
@@ -403,25 +445,42 @@ def run_checks(
     control_url: str | None = None,
     opener: Opener | None = None,
     project_id: str | None = None,
+    state_owner_uid: int | None = None,
+    key_owner_uid: int | None = None,
+    credential_files: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """All checks, in a stable order. Never reads the API key file's contents."""
+    """All checks, in a stable order. Never reads the API key file's contents.
+
+    ``state_owner_uid`` and ``key_owner_uid`` name the owners to expect when the check is run by
+    someone other than the service user (the installer, as root: the state directory belongs to
+    the service account and the key file, per ADR 0093, to root). Default: the running user.
+
+    ``credential_files`` maps the names the service sees (``model-credential``,
+    ``anthropic-api-key``) to the file names they have on disk when the check is pointed at the
+    stored directory instead of the unit's ``$CREDENTIALS_DIRECTORY`` (the unit's
+    ``LoadCredential=NAME:PATH`` lines give the mapping)."""
+    files = credential_files or {}
     environment = os.environ if environment is None else environment
-    profile, profile_check = _load_profile(Path(profile_path))
+    profile, profile_check = _load_profile(Path(profile_path), Path(credentials_directory))
     root: Path | None = None
     root_error: str | None = None
     try:
         root = credential_root({"CREDENTIALS_DIRECTORY": str(credentials_directory)})
     except (StartupBlocked, OSError):
         root_error = "the credentials directory is missing, not private or not owned by the user"
-    key_check, key = _api_key_file(root)
+    key_check, key = _api_key_file(
+        root, key_owner_uid, files.get(ANTHROPIC_API_KEY_FILE, ANTHROPIC_API_KEY_FILE)
+    )
     project = _project_id(profile, project_id) if profile else None
     checks = [
         _environment(environment),
         profile_check,
-        _credential_reference(profile, root, root_error),
+        _credential_reference(
+            profile, root, root_error, files.get(MODEL_CREDENTIAL_FILE, MODEL_CREDENTIAL_FILE)
+        ),
         key_check,
         _egress_allowlist(),
-        _receipts_store(Path(state_dir)),
+        _receipts_store(Path(state_dir), state_owner_uid),
         _control_slices(control_url, opener),
         _spend_caps(profile, control_state_dir, project),
     ]
@@ -456,6 +515,9 @@ _EXIT = {
 }
 
 
+_DEFAULT_UNIT_PATH = "/etc/systemd/system/tessera-reasoning.service"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="tessera-reasoning-readiness",
@@ -463,16 +525,47 @@ def main(argv=None) -> int:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="run the readiness checks and print JSON")
-    check.add_argument("--profile", type=Path, required=True)
-    check.add_argument("--credentials-directory", type=Path, required=True)
-    check.add_argument("--state-dir", type=Path, required=True)
+    check.add_argument("--profile", type=Path)
+    check.add_argument("--credentials-directory", type=Path)
+    check.add_argument("--state-dir", type=Path)
+    check.add_argument(
+        "--in-unit",
+        action="store_true",
+        help="run as the service user in a transient unit with the installed unit's credentials",
+    )
+    check.add_argument("--unit-path", type=Path, default=Path(_DEFAULT_UNIT_PATH))
     check.add_argument("--control-state-dir", type=Path)
     check.add_argument("--control-url")
     check.add_argument("--project-id")
     args = parser.parse_args(argv)
+    if args.in_unit:
+        from tessera_agent import readiness_in_unit
+
+        try:
+            code, output = readiness_in_unit.run_in_unit(
+                args.unit_path,
+                state_dir=args.state_dir,
+                control_state_dir=args.control_state_dir,
+                control_url=args.control_url,
+                project_id=args.project_id,
+            )
+        except ValueError as exc:
+            print(f"in-unit check refused: {exc}", file=sys.stderr)
+            return 2
+        print(output)
+        return code
+    env_dir = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    env_dir_path = Path(env_dir) if env_dir and Path(env_dir).is_absolute() else None
+    credentials_directory = args.credentials_directory or env_dir_path
+    profile = args.profile or (env_dir_path / "profile" if env_dir_path is not None else None)
+    if credentials_directory is None or profile is None or args.state_dir is None:
+        parser.error(
+            "give --profile, --credentials-directory and --state-dir, "
+            "or run with an absolute CREDENTIALS_DIRECTORY and --state-dir"
+        )
     report = run_checks(
-        profile_path=args.profile,
-        credentials_directory=args.credentials_directory,
+        profile_path=profile,
+        credentials_directory=credentials_directory,
         state_dir=args.state_dir,
         environment=dict(os.environ),
         control_state_dir=args.control_state_dir,

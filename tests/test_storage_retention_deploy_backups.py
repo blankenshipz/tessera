@@ -4,6 +4,8 @@ config copies, and a validated bundle, verified in place (no staged copy of a la
 from __future__ import annotations
 
 import errno
+import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -134,6 +136,27 @@ def test_an_in_place_check_still_rejects_what_restore_rejects(tmp_path):
         handle.write(b"\xff")
     with pytest.raises(recovery.StoreError):
         recovery.verify_restorable(other)
+
+
+def test_in_place_verification_never_writes_wal_files_into_a_legacy_wal_bundle(tmp_path):
+    """A legacy bundle whose database header says WAL must not gain -wal/-shm files when it is
+    verified where it lies: restore rejects a bundle whose file list is not exact."""
+    bundle = make_bundle(tmp_path, 1, 1)
+    database = bundle / "snapshot.sqlite3"
+    connection = sqlite3.connect(database)
+    assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    connection.close()  # a clean close checkpoints and removes -wal/-shm
+    assert not any(name.endswith(("-wal", "-shm")) for name in os.listdir(bundle))
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["size"] = database.stat().st_size
+    manifest["sha256"] = hashlib.sha256(database.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    before = sorted(os.listdir(bundle))
+    assert recovery.verify_restorable(bundle)["backup_id"] == f"{1:032x}"
+    assert sorted(os.listdir(bundle)) == before
+    assert not any(name.endswith(("-wal", "-shm")) for name in os.listdir(bundle))
+    recovery.verify_restorable(bundle)  # the exact-file-list check still passes afterwards
 
 
 def test_an_os_error_reason_names_the_errno_and_never_a_path():

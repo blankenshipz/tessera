@@ -52,6 +52,13 @@ skipping that provider's bookkeeping. A provider may also implement the optional
 default placement (ADR 0088) what a candidate is; without it the provider is `other` and stays
 where the spec put it, so a new vendor needs no change to placement.
 
+Registration also refuses a descriptor that is a subclass of `ProviderDescriptor`, a
+`worker_slots` that is not an integer from 1 to 8, and a `max_scratch_bytes` that is not a
+positive integer within the operator-file ceiling (64 GiB). It refuses a provider object that
+lacks any required `ComputeProvider` method, has a non-callable method or optional hook, or has a
+`config_model` that is neither `None` nor a pydantic model class, and the error lists every
+problem found. A refused provider leaves the registry unchanged.
+
 ### Adapting a local-docker CPU stage to Salad
 
 Contract: [ADR 0076](decisions/0076-salad-cpu-stage-adapter-and-cpu-runtime.md). A v2 stage on
@@ -101,6 +108,17 @@ for the stage's data, the 409 says what to merge into the provider trust file (s
 Check the argv before opting in: glued short flags (`-o/outputs/x`) and paths inside config files are
 not rewritten, and a hard-coded `/work/...` differs from the Salad work directory. It is verified with
 fakes only: no adapted stage has run on Salad.
+
+`registry_auth_file` (`--registry-auth-file`) and `build_repositories` (repeatable
+`--build-repository`, `host[/path]` prefixes) let this worker run a *pushing* image build
+([ADR 0123](decisions/0123-image-build-stage-and-image-lineage.md)). Both are operator-owned and
+absent by default, which refuses every pushing build; setting one without the other is a
+configuration error. The auth file is checked, never read, by the worker: it must be a regular
+file (no symlink or extra hard link) owned by the worker user with no group or world access, and
+is mounted read-only into the build container only after the stage's repository is shown to be
+under a registered prefix. Keep it outside the repository; it is the operator's own push
+credential. List the same prefixes under `build_repositories` of the matching provider in the
+`--campaign-providers` file, which control checks at submit.
 
 ### Code reaches a provider as an input
 

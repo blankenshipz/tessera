@@ -77,15 +77,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class LocalTransport:
     """Callable (method, path, body, key) -> (status, json-or-None); never exposes bodies."""
 
-    def __init__(self, origin, authorization):
+    def __init__(self, origin, authorization, identity=None):
         self.origin = origin
         self.authorization = authorization
+        self.identity = identity  # an owner_identity.OwnerIdentity; its headers go on every call
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
-    def __call__(self, method, path, body=None, key=None):
+    def request_headers(self, key=None):
+        from .owner_identity import identity_headers
+
         headers = {"Authorization": self.authorization, "Content-Type": "application/json"}
         if key:
             headers["Idempotency-Key"] = key
+        return headers | identity_headers(self.identity)
+
+    def __call__(self, method, path, body=None, key=None):
+        headers = self.request_headers(key)
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(
             self.origin + path, data=data, headers=headers, method=method

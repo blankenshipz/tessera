@@ -30,7 +30,8 @@ AUTOMATION_HEADER = "X-Tessera-Automation"
 AUTOMATION_LABEL = "platform-validation"
 # Routes whose events are decisions in approval_trust.DECISION_EVENT_TYPES and that this
 # harness calls: task approval, grant issue, attempt admission, snapshot release,
-# budget authority and the resolution of an interaction decision. Anything else is not a
+# budget authority, the resolution of an interaction decision and dataset-snapshot
+# upload (owner adoption of dataset bytes). Anything else is not a
 # decision and carries no label.
 _DECISION_ROUTES = tuple(
     re.compile(pattern)
@@ -41,6 +42,7 @@ _DECISION_ROUTES = tuple(
         r"^/snapshots/[^/]+/releases$",
         r"^/experiments/[^/]+/budget/(authorization|charges|bounds)$",
         r"^/interaction/decisions/resolve$",
+        r"^/projects/[^/]+/tabular-dataset-snapshots$",
     )
 )
 

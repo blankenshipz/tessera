@@ -86,6 +86,14 @@ class StandingApprovalCommands:
             refuse_submitted_lineage(raw_spec)
             # ADR 0077: the same expansion submit performs, so an adapter request is never
             # checked raw; the expected digest is the digest of the expanded spec.
+            if any(
+                getattr(stage, "image_from", None) is not None
+                for stage in getattr(body.spec, "stages", [])
+            ):
+                raise Conflict(
+                    "A standing approval cannot use image_from: pin the built image with a "
+                    "literal image (name@sha256:...) instead."
+                )
             spec = expand_with_registered(
                 body.spec,
                 self.adapter_entries(connection, live, project_id),

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from campaign_fixture import Env
 from fastapi.testclient import TestClient
 from test_artifact_disposition_authority import _other_tenant_headers
 
+from tessera_control import agent_campaign_reads
 from tessera_control.api import create_app
 
 DEST = {"X-Agent-Destination": "planner.local"}
@@ -74,6 +77,60 @@ def test_snapshot_catalog_is_scoped_and_metadata_only(world):
     assert _get(client, path, "reader").status_code == 403
     assert _get(client, path, "plain").status_code == 403
     assert _get(client, path + "?limit=0", "full").status_code == 422
+
+
+def test_snapshot_detail_lists_files_and_is_metadata_only(world):
+    env, client, _ = world
+    path = f"/projects/{env.project['id']}/agent-snapshots/{env.snapshot_id}"
+    response = _get(client, path, "full")
+    assert response.status_code == 200
+    body = response.json()
+    manifest = json.loads(
+        env.query("SELECT manifest_json FROM source_snapshots WHERE id=?", env.snapshot_id)[0][0]
+    )
+    assert body["id"] == env.snapshot_id and body["digest"] == env.snapshot_digest
+    assert body["file_count"] == len(manifest["entries"]) > 0
+    assert body["total_bytes"] == manifest["total_bytes"]
+    assert body["truncated"] is False and body["data_class"]
+    assert isinstance(body["license_labels"], list)
+    assert [(f["relative_path"], f["size"], f["sha256"]) for f in body["files"]] == [
+        (e["relative_path"], e["size"], e["sha256"]) for e in manifest["entries"]
+    ]
+    assert all(
+        set(f) == {"relative_path", "size", "sha256", "classification"} for f in body["files"]
+    )
+    assert "root" not in body and "provenance" not in body and "manifest" not in body
+    assert "bytes are never returned" in body["boundary"]
+    serialized = json.dumps(body)
+    assert manifest["root"] not in serialized
+    assert not any(f["relative_path"].startswith("/") for f in body["files"])
+    assert not any(isinstance(v, str) and v.startswith("/") for v in body.values())
+
+
+def test_snapshot_detail_is_scoped_and_tenant_checked(world):
+    env, client, _ = world
+    path = f"/projects/{env.project['id']}/agent-snapshots/{env.snapshot_id}"
+    assert _get(client, path, "reader").status_code == 403
+    assert _get(client, path, "plain").status_code == 403
+    other_project = f"/projects/proj_other/agent-snapshots/{env.snapshot_id}"
+    assert _get(client, other_project, "full").status_code == 404
+    missing = f"/projects/{env.project['id']}/agent-snapshots/snap_missing"
+    assert _get(client, missing, "full").status_code == 404
+    outsider = _other_tenant_headers(env.state)
+    assert client.get(path, headers={**outsider, **DEST}).status_code in (403, 404)
+
+
+def test_snapshot_detail_says_when_the_file_list_is_cut(world, monkeypatch):
+    env, client, _ = world
+    manifest = json.loads(
+        env.query("SELECT manifest_json FROM source_snapshots WHERE id=?", env.snapshot_id)[0][0]
+    )
+    monkeypatch.setattr(agent_campaign_reads, "_ROW_CAP", 1)
+    path = f"/projects/{env.project['id']}/agent-snapshots/{env.snapshot_id}"
+    body = _get(client, path, "full").json()
+    assert len(body["files"]) == 1
+    assert body["file_count"] == len(manifest["entries"])
+    assert body["truncated"] is (len(manifest["entries"]) > 1)
 
 
 def test_destination_header_is_required_for_external_agents(world):

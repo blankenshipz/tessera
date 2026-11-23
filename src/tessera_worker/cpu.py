@@ -174,10 +174,19 @@ class CpuOperation:
     # (input name, file name, sha256, bytes) rows under ``public_directory/<input name>``.
     public_directory: str | None = None
     public_files: tuple[tuple[str, str, str, int], ...] = ()
+    # ADR 0123: an image-build stage. ``build_directory`` is supervisor custody mounted rw at
+    # /outputs (the builder's result and log); ``registry_auth_file`` is the operator's auth
+    # file, mounted read-only at /run/registry-auth/auth.json, only when the build pushes.
+    build_directory: str | None = None
+    registry_auth_file: str | None = None
 
     def __post_init__(self) -> None:
         if (self.public_directory is None) != (not self.public_files):
             raise ValueError("Public directory and files must be supplied together.")
+        if (self.build_directory is None and self.registry_auth_file is not None) or (
+            self.build_directory is not None and self.development_output is not None
+        ):
+            raise ValueError("Build output and registry auth are for an image build only.")
         if self.public_files and self.network_profile != "none":
             raise ValueError("Public fetch needs network profile none.")
         for row in self.public_files:
@@ -724,6 +733,38 @@ class DockerCpuAdapter:
             raise CpuError("Development output workspace is not isolated private custody.")
         return ["--mount", f"type=bind,src={directory},dst=/outputs"]
 
+    def _build_mounts(self, operation: CpuOperation) -> list[str]:
+        """The /outputs directory of an image build and, when it pushes, the operator's
+        registry auth file (read-only). Both are supervisor custody, never an author path."""
+        if operation.build_directory is None:
+            return []
+        try:
+            directory = Path(operation.build_directory)
+            info = directory.lstat()
+            if (
+                not directory.is_absolute()
+                or not stat.S_ISDIR(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise ValueError
+            mounts = ["--mount", f"type=bind,src={directory},dst=/outputs"]
+            if operation.registry_auth_file is not None:
+                auth = Path(operation.registry_auth_file)
+                auth_info = auth.lstat()
+                if (
+                    not auth.is_absolute()
+                    or not stat.S_ISREG(auth_info.st_mode)
+                    or auth_info.st_mode & 0o022
+                ):
+                    raise ValueError
+                mounts += [
+                    "--mount",
+                    f"type=bind,src={auth},dst=/run/registry-auth/auth.json,readonly",
+                ]
+        except (OSError, ValueError) as error:
+            raise CpuError("Image build output or registry auth is not private custody.") from error
+        return mounts
+
     def scratch_for(self, requested: int | None) -> int | None:
         """The scratch an operation runs with: the operator's default, or a plan's request
         within the operator ceiling (ADR 0059). Raises ``ValueError`` with the reason when
@@ -823,6 +864,7 @@ class DockerCpuAdapter:
             *self._input_mount(operation),
             *self._public_mounts(operation),
             *self._development_output_mount(operation),
+            *self._build_mounts(operation),
             "--tmpfs",
             f"/work:rw,noexec,nosuid,nodev,size={scratch_bytes},mode=1777",
             "--log-driver",

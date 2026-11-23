@@ -10,7 +10,6 @@ import argparse
 import hmac
 import json
 import os
-import stat
 import sys
 from pathlib import Path
 
@@ -21,7 +20,12 @@ from .model_destinations import (
     refuse_api_key_environment,
 )
 from .remote_reasoning_runtime import validate_profile
-from .remote_reasoning_store import ReasoningStore, private_file
+from .remote_reasoning_store import (
+    ReasoningStore,
+    manager_directory_ok,
+    manager_file_ok,
+    private_file,
+)
 
 _FORWARDED = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 # Manager-provided file (systemd LoadCredential=model-credential:...) holding the
@@ -46,7 +50,7 @@ def credential_root(environment: dict[str, str]) -> Path:
         raise StartupBlocked("missing_manager_credential_directory")
     path = Path(value)
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+    if not manager_directory_ok(info):
         raise StartupBlocked("invalid_manager_credential_directory")
     return path
 
@@ -59,7 +63,9 @@ def refuse_forbidden_environment(environment: dict[str, str]) -> None:
         raise StartupBlocked("api_key_environment_present") from None
 
 
-def require_model_credential(root: Path, profile: dict) -> None:
+def require_model_credential(
+    root: Path, profile: dict, filename: str = MODEL_CREDENTIAL_FILE
+) -> None:
     """Anthropic profiles need the manager-provided reference file.
 
     The file must hold exactly the profile's opaque credential_ref (one trailing
@@ -68,7 +74,7 @@ def require_model_credential(root: Path, profile: dict) -> None:
     if profile["model"]["providerID"] != "anthropic":
         return
     try:
-        content = private_file(root / MODEL_CREDENTIAL_FILE)
+        content = private_file(root / filename, credentials_dir=root)
     except (OSError, ValueError):
         raise StartupBlocked("missing_or_invalid_model_credential_reference") from None
     if not content.strip():
@@ -91,17 +97,12 @@ def require_api_key_file(root: Path) -> None:
         info = (root / ANTHROPIC_API_KEY_FILE).lstat()
     except OSError:
         raise StartupBlocked("missing_or_invalid_model_api_key_credential") from None
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_mode & 0o077
-        or info.st_uid != os.getuid()
-        or not 0 < info.st_size <= 64 * 1024
-    ):
+    if not manager_file_ok(info) or not 0 < info.st_size <= 64 * 1024:
         raise StartupBlocked("missing_or_invalid_model_api_key_credential")
 
 
 def token_reference(root: Path, name: str) -> str:
-    token = private_file(root / name).decode("ascii").rstrip("\n")
+    token = private_file(root / name, credentials_dir=root).decode("ascii").rstrip("\n")
     if not token or len(token) > 4096 or any(ord(c) <= 32 or ord(c) >= 127 for c in token):
         raise StartupBlocked("invalid_runtime_credential")
     return token
@@ -114,7 +115,7 @@ def launch_spec(mode: str, state_dir: Path, environment: dict[str, str]):
     refuse_forbidden_environment(environment)
     root = credential_root(environment)
     profile_path = root / "profile"
-    profile = json.loads(private_file(profile_path))
+    profile = json.loads(private_file(profile_path, credentials_dir=root))
     child = {name: environment[name] for name in _FORWARDED if name in environment}
     # Never forward arbitrary provider keys, PYTHONPATH or loader/shell overrides.
     child["PYTHONNOUSERSITE"] = "1"
@@ -134,7 +135,9 @@ def launch_spec(mode: str, state_dir: Path, environment: dict[str, str]):
             if profile.get(field) != variable:
                 raise StartupBlocked("unsupported_credential_environment_name")
             child[variable] = token_reference(root, reference)
-        private_file(root / "prompt")  # Runtime enforces prompt digest/length.
+        private_file(
+            root / "prompt", credentials_dir=root
+        )  # Runtime enforces prompt digest/length.
         command = [
             sys.executable,
             "-m",
@@ -191,7 +194,7 @@ def main(argv=None):
             return research_main(["--config", str(reference), "--state-dir", str(args.state_dir)])
         if args.mode == "reasoning-stop":
             root = credential_root(dict(os.environ))
-            profile = json.loads(private_file(root / "profile"))
+            profile = json.loads(private_file(root / "profile", credentials_dir=root))
             validate_profile(profile)
             store = ReasoningStore(args.state_dir)
             try:

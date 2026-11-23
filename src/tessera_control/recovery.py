@@ -306,9 +306,18 @@ def _defensive(connection: sqlite3.Connection, start: float) -> None:
     connection.set_progress_handler(lambda: int(time.monotonic() - start > _seconds()), 1000)
 
 
-def _validate_snapshot(path: Path, start: float | None = None) -> tuple[int, int]:
+def _read_only_uri(path: Path, immutable: bool) -> str:
+    """``immutable`` is for in-place verification of a finished backup only: it stops SQLite
+    creating ``-wal``/``-shm`` files beside a legacy WAL-header database, which restore would
+    then reject for its exact file list."""
+    return path.absolute().as_uri() + ("?mode=ro&immutable=1" if immutable else "?mode=ro")
+
+
+def _validate_snapshot(
+    path: Path, start: float | None = None, *, immutable: bool = False
+) -> tuple[int, int]:
     start = time.monotonic() if start is None else start
-    connection = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=1)
+    connection = sqlite3.connect(_read_only_uri(path, immutable), uri=True, timeout=1)
     try:
         _defensive(connection, start)
         _deadline(start)
@@ -353,9 +362,11 @@ def _validate_snapshot(path: Path, start: float | None = None) -> tuple[int, int
         connection.close()
 
 
-def _bundle_entries(database: Path, start: float) -> tuple[list[dict[str, Any]], list[str]]:
+def _bundle_entries(
+    database: Path, start: float, *, immutable: bool = False
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Return the complete external-object declaration for one copied SQLite snapshot."""
-    connection = sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=1)
+    connection = sqlite3.connect(_read_only_uri(database, immutable), uri=True, timeout=1)
     connection.row_factory = sqlite3.Row
     try:
         _defensive(connection, start)
@@ -528,8 +539,10 @@ def _validate_bundle_layout(backup: Path, manifest: dict[str, Any]) -> None:
                     pass
 
 
-def _validate_bundle_declaration(snapshot: Path, manifest: dict[str, Any], start: float) -> None:
-    entries, legacy = _bundle_entries(snapshot, start)
+def _validate_bundle_declaration(
+    snapshot: Path, manifest: dict[str, Any], start: float, *, immutable: bool = False
+) -> None:
+    entries, legacy = _bundle_entries(snapshot, start, immutable=immutable)
     if manifest.get("objects", []) != entries or manifest.get("legacy_artifact_ids", []) != legacy:
         raise StoreError("Backup project artifact declaration does not match its control snapshot.")
 
@@ -998,15 +1011,15 @@ def _verify_in_place(backup: Path, manifest: dict[str, Any], start: float) -> No
     digest, size = _hash_in_place(database, start)
     if size != manifest["size"] or digest != manifest["sha256"]:
         raise StoreError("Backup changed while it was being verified.")
-    schema, watermark = _validate_snapshot(database, start)
+    schema, watermark = _validate_snapshot(database, start, immutable=True)
     if schema != manifest["schema_version"] or watermark != manifest["event_watermark"]:
         raise StoreError("Backup metadata does not match its manifest.")
-    snapshot_entries, _legacy = _bundle_entries(database, start)
+    snapshot_entries, _legacy = _bundle_entries(database, start, immutable=True)
     if manifest["format_version"] == LEGACY_BACKUP_FORMAT_VERSION:
         if snapshot_entries:
             raise StoreError("Legacy backup cannot restore project artifact placements.")
         return
-    _validate_bundle_declaration(database, manifest, start)
+    _validate_bundle_declaration(database, manifest, start, immutable=True)
     source_objects = backup / BACKUP_OBJECTS_DIRECTORY
     for entry in manifest["objects"]:
         _deadline(start)

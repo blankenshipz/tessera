@@ -25,6 +25,10 @@ KNOWN_KINDS = ("worker_grant", "salad_route")
 PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 MAX_OUTPUT_BYTES_LIMIT = 1 << 40
+# Worker grants one principal may hold at once, and the largest scratch ceiling a provider may
+# declare (the operator file accepts no more than either).
+MAX_WORKER_SLOTS = 8
+MAX_SCRATCH_BYTES = 64 * 1024**3
 TrustClass = Literal["public", "private_code_approved", "private_derived"]
 TRUST_CLASSES: tuple[TrustClass, ...] = ("public", "private_code_approved", "private_derived")
 SettlementBasis = Literal[
@@ -65,6 +69,9 @@ class ProviderDescriptor:
     # The largest scratch a stage may request from this provider's worker (ADR 0059): the
     # operator states what its worker's own ceiling grants, 64 MiB unless raised.
     max_scratch_bytes: int = 64 * 1024 * 1024
+    # ADR 0123: registry destinations (``host[/path]`` prefixes) an image-build stage on this
+    # provider may push to. Operator-owned; empty means no pushing build is accepted.
+    build_repositories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,6 +241,10 @@ def validate_descriptor(d: Any) -> None:
     """Refuse a malformed provider descriptor at registration (ValueError)."""
     if not isinstance(d, ProviderDescriptor):
         raise ValueError("provider descriptor required")
+    if type(d) is not ProviderDescriptor:
+        raise ValueError(
+            f"provider descriptor must be exactly ProviderDescriptor, not {type(d).__name__}"
+        )
     pid = d.provider_id
     if not isinstance(pid, str) or not PROVIDER_ID_RE.match(pid):
         raise ValueError(f"Provider id {pid!r} must match {PROVIDER_ID_RE.pattern}")
@@ -274,11 +285,60 @@ def validate_descriptor(d: Any) -> None:
         raise ValueError(f"{bad} (max_file_bytes exceeds max_total_bytes)")
     if not isinstance(d.worker_principal_id, str):
         raise ValueError(f"{bad} (worker principal)")
+    slots = d.worker_slots
+    if type(slots) is not int or not 1 <= slots <= MAX_WORKER_SLOTS:
+        raise ValueError(f"{bad} (worker_slots must be an integer in 1..{MAX_WORKER_SLOTS})")
+    scratch = d.max_scratch_bytes
+    if type(scratch) is not int or not 0 < scratch <= MAX_SCRATCH_BYTES:
+        raise ValueError(f"{bad} (max_scratch_bytes must be an integer in 1..{MAX_SCRATCH_BYTES})")
+
+
+# Every method a provider must implement; tests keep this in step with ComputeProvider.
+REQUIRED_PROVIDER_METHODS = (
+    "validate_stage",
+    "check_stage",
+    "execution_spec",
+    "prepare",
+    "grant_request",
+    "after_admit",
+    "advance",
+    "observe",
+    "cancel",
+    "settle",
+    "exposure_open",
+    "after_tick",
+    "receipt_fields",
+)
+# Hooks the runner reads with getattr; each must be callable when present.
+OPTIONAL_PROVIDER_HOOKS = ("sweep", "on_settled", "experiment_ready", "placement_capability")
+
+
+def validate_provider_object(provider: Any) -> None:
+    """Refuse a provider object that does not implement ComputeProvider (ValueError listing
+    every problem found)."""
+    problems: list[str] = []
+    for name in REQUIRED_PROVIDER_METHODS:
+        if not hasattr(provider, name):
+            problems.append(f"missing method {name}")
+        elif not callable(getattr(provider, name)):
+            problems.append(f"{name} is not callable")
+    if not hasattr(provider, "config_model"):
+        problems.append("missing config_model")
+    else:
+        model = provider.config_model
+        if model is not None and not (isinstance(model, type) and issubclass(model, BaseModel)):
+            problems.append("config_model must be None or a pydantic BaseModel subclass")
+    for name in OPTIONAL_PROVIDER_HOOKS:
+        if hasattr(provider, name) and not callable(getattr(provider, name)):
+            problems.append(f"optional hook {name} is not callable")
+    if problems:
+        raise ValueError("Provider object is not a ComputeProvider: " + "; ".join(problems))
 
 
 def register_provider(provider: ComputeProvider) -> ComputeProvider:
     d = getattr(provider, "descriptor", None)
     validate_descriptor(d)
+    validate_provider_object(provider)
     if d.provider_id in _PROVIDERS:
         raise ValueError(f"Provider already registered: {d.provider_id}")
     from .campaign_delegation import STEP_TABLE

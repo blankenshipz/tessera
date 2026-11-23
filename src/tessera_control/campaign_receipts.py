@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import timedelta
 from typing import Any
 
 from .campaign_gates import unlock_receipt_section
@@ -23,7 +24,7 @@ from .campaign_rerun import lineage_of
 from .campaign_submissions import submission_receipt_section
 from .code_approval import input_classes, snapshot_code_approval
 from .stage_watch import watch_receipt_section
-from .store import canonical_digest
+from .store import _parse_utc, _utc_string, canonical_digest
 
 # Version 2 (ADR 0040): per-attempt provider, runtime, trust and settlement fields, the
 # evidence kind and digest, and the stage I/O index. Version 1 receipts stay as written.
@@ -328,6 +329,63 @@ def _local_fetched(
     return rows or None
 
 
+def image_build_entry(
+    connection: sqlite3.Connection, attempt: Any, spec_stage: Any
+) -> dict[str, Any] | None:
+    """The ``build`` receipt object of an image-build stage (ADR 0123), or None for any other.
+
+    Every pin (context digest, Dockerfile, builder image, base images, repository) comes from
+    the approved spec, never from the worker. The produced image, digest and size come only from
+    the validated row the worker reported for this attempt's operation, and only when that row's
+    image is in the spec's repository; otherwise they are null and the entry is ``declared_only``.
+    The registry's credentials and auth paths are never read or printed."""
+    plan = getattr(spec_stage, "build", None)
+    if plan is None:
+        return None
+    from .image_build_report import image_build_for_operation
+
+    context = next((i for i in spec_stage.inputs if i.name == plan["context_input"]), None)
+    repository = plan["repository"]
+    entry: dict[str, Any] = {
+        "context_input": plan["context_input"],
+        "context_digest": None if context is None else context.digest,
+        "dockerfile": plan["dockerfile"],
+        "builder_image": spec_stage.image,
+        "base_images": list(plan["base_images"]),
+        "repository_host": repository.split("/", 1)[0],
+        "repository": repository,
+        "push": plan["push"],
+        "via_control": False,
+        "produced_image": None,
+        "digest": None,
+        "size_bytes": None,
+        "pushed": None,
+        "evidence": "declared_only",
+    }
+    operation_id = attempt["operation_id"]
+    row = None if not operation_id else image_build_for_operation(connection, operation_id)
+    if not isinstance(row, dict):
+        return entry
+    image, digest, size, pushed = (row.get(k) for k in ("image", "digest", "size_bytes", "pushed"))
+    name, _, image_digest = image.partition("@") if isinstance(image, str) else ("", "", "")
+    if (
+        name != repository
+        or not image_digest.startswith("sha256:")
+        or image_digest != f"sha256:{digest}"
+        or type(size) is not int
+        or type(pushed) is not bool
+    ):
+        return entry
+    entry.update(
+        produced_image=image,
+        digest=image_digest,
+        size_bytes=size,
+        pushed=pushed,
+        evidence="provider_reported",
+    )
+    return entry
+
+
 def _retained_fetched(
     connection: sqlite3.Connection, provider_id: str, attempt: Any, spec_stage: Any = None
 ):
@@ -441,6 +499,9 @@ def _attempt_entry(
     )
     if public is not None:
         entry["public_fetch"] = public
+    built = image_build_entry(connection, attempt, spec_stage)
+    if built is not None:
+        entry["build"] = built
     decision = (placed or {}).get((attempt["stage_key"], attempt["attempt"]))
     if decision is not None:
         # ADR 0060: the candidate chosen and why each other one was skipped.
@@ -575,12 +636,56 @@ def steering_receipt_section(connection: sqlite3.Connection, campaign_id: str) -
     }
 
 
+def _approval_delegation(
+    connection: sqlite3.Connection, campaign_id: str, approval_id: str
+) -> dict[str, str]:
+    """The owner delegation the approving helper named, from the approval's own event.
+
+    Recorded on ``campaign.approved`` by the decision provenance; absent when none was sent, so
+    existing receipts keep their shape."""
+    row = connection.execute(
+        """SELECT json_extract(payload_json,'$.delegation_ref') AS ref FROM events
+        WHERE event_type='campaign.approved' AND json_extract(payload_json,'$.approval_id')=?
+        AND json_extract(payload_json,'$.campaign_id')=? ORDER BY cursor DESC LIMIT 1""",
+        (approval_id, campaign_id),
+    ).fetchone()
+    ref = row["ref"] if row is not None else None
+    return {"delegation_ref": ref} if isinstance(ref, str) and ref else {}
+
+
 def _smoke_grant(connection: sqlite3.Connection, principal_id: str) -> dict[str, str]:
     """``smoke_grant_id`` when the approval was made under a smoke credential grant."""
     from .smoke_credentials import grant_id_for_principal
 
     grant_id = grant_id_for_principal(connection, principal_id)
     return {} if grant_id is None else {"smoke_grant_id": grant_id}
+
+
+def _wall_clock(connection: sqlite3.Connection, campaign_id: str, spec: Any) -> dict[str, Any]:
+    """The campaign's total wall-clock bound, recorded (audit G-13).
+
+    A campaign ends ``deadline_seconds`` after its FIRST approval; a re-approval gets at most the
+    time that is left (``CampaignStore.approve_campaign``), so no number of re-approvals extends
+    it. Only present once the campaign was approved. ``approvals`` is how many approval rows the
+    campaign has had; the bound does not depend on it."""
+    row = connection.execute(
+        "SELECT MIN(approved_at) AS first, COUNT(*) AS n FROM campaign_approvals "
+        "WHERE campaign_id=?",
+        (campaign_id,),
+    ).fetchone()
+    if row is None or row["first"] is None:
+        return {}
+    first = _parse_utc(row["first"])
+    seconds = int(spec.deadline_seconds)
+    return {
+        "wall_clock": {
+            "deadline_seconds": seconds,
+            "first_approved_at": _utc_string(first),
+            "bound_at": _utc_string(first + timedelta(seconds=seconds)),
+            "approvals": int(row["n"]),
+            "extended_by_reapproval": False,
+        }
+    }
 
 
 def build_receipt(
@@ -695,10 +800,12 @@ def build_receipt(
                 "approving_principal_id": approval["approving_principal_id"],
                 "decision_class": approval["decision_class"],
                 "automation_label": approval["automation_label"],
+                **_approval_delegation(connection, campaign_id, approval["id"]),
                 "approved_at": approval["approved_at"],
                 "expires_at": approval["expires_at"],
                 **_smoke_grant(connection, approval["approving_principal_id"]),
             },
+            **_wall_clock(connection, campaign_id, parse_spec_json(current["spec_json"])),
             "status": status,
             "stop_reason": reason,
             "budget": {

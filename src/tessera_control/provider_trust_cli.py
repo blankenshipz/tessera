@@ -23,7 +23,12 @@ def add_provider_trust_commands(subcommands: argparse._SubParsersAction) -> None
     reload.add_argument("--idempotency-key", required=True)
     reload.add_argument(
         "--automation-label",
-        help="marks this decision as owner-operated automation (X-Tessera-Automation)",
+        help="X-Tessera-Automation label (default: $TESSERA_AUTOMATION_LABEL or tessera-cli:...)",
+    )
+    reload.add_argument(
+        "--delegation-ref",
+        help="the owner delegation this runs under (X-Tessera-Delegation; default: "
+        "$TESSERA_DELEGATION_REF)",
     )
     for sub in (show, reload):
         sub.add_argument("--owner-header", type=Path, required=True)
@@ -37,22 +42,29 @@ def run_provider_trust(arguments: argparse.Namespace, transport_factory=None) ->
         control_origin,
         read_owner_header,
     )
-    from .approval_trust import AUTOMATION_HEADER
+    from .owner_identity import IdentityError, resolve_identity
 
-    label = getattr(arguments, "automation_label", None)
+    try:
+        # Only the reload is a decision; `show` is a read and must not validate the label.
+        identity = (
+            None
+            if arguments.provider_trust_action == "show"
+            else resolve_identity(
+                arguments, "admin-provider-trust-" + arguments.provider_trust_action
+            )
+        )
+    except IdentityError as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 2
 
     class Transport(LocalTransport):
-        """Relays control denial bodies and the automation label."""
+        """Relays control denial bodies; carries the automation identity."""
 
         def __call__(self, method, path, body=None, key=None):
             import urllib.error
             import urllib.request
 
-            headers = {"Authorization": self.authorization, "Content-Type": "application/json"}
-            if key:
-                headers["Idempotency-Key"] = key
-            if label:
-                headers[AUTOMATION_HEADER] = label
+            headers = self.request_headers(key)
             data = json.dumps(body).encode() if body is not None else None
             request = urllib.request.Request(
                 self.origin + path, data=data, headers=headers, method=method
@@ -73,6 +85,8 @@ def run_provider_trust(arguments: argparse.Namespace, transport_factory=None) ->
         transport = (transport_factory or Transport)(
             origin, read_owner_header(arguments.owner_header)
         )
+        if isinstance(transport, LocalTransport):
+            transport.identity = identity
         if arguments.provider_trust_action == "show":
             call = ("GET", "/admin/provider-trust", None, None)
         else:

@@ -24,7 +24,12 @@ from . import campaign_placement, program_budget, provider_trust, smoke_credenti
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
 from .campaign_holdout import campaign_claims, check_unclaimed
-from .campaign_io import refuse_submitted_lineage, resolve_artifact, resolve_receipt_refs
+from .campaign_io import (
+    refuse_submitted_lineage,
+    resolve_artifact,
+    resolve_image_refs,
+    resolve_receipt_refs,
+)
 from .campaign_models import (
     GRANT_SETTLE_MARGIN_SECONDS,
     TERMINAL_CAMPAIGN,
@@ -446,6 +451,7 @@ class CampaignStore(
                         "and cannot be declared public."
                     )
             self._check_code_input(connection, stage)
+            self._check_build_context(connection, stage)
             for candidate in placement_candidates(stage):
                 self.check_stage_inputs(
                     connection,
@@ -498,6 +504,46 @@ class CampaignStore(
             raise Conflict(
                 f"Stage {stage.key!r}: code_input {stage.code_input!r} has a code approval that "
                 "does not match its files."
+            )
+
+    @staticmethod
+    def _check_build_context(connection: sqlite3.Connection, stage: Any) -> None:
+        """ADR 0123: an image-build stage's context is baked into layers that are pushed to a
+        registry, so it must be a snapshot recorded public with no private-code approval, and the
+        Dockerfile must be one of its files. Registry and trust are checked elsewhere."""
+        if stage.build is None:
+            return
+        from .code_approval import _entries, snapshot_code_approval
+
+        label = f"Stage {stage.key!r}: build context {stage.build['context_input']!r}"
+        source = next(
+            (
+                i
+                for i in stage.inputs
+                if i.name == stage.build["context_input"] and i.kind == "snapshot"
+            ),
+            None,
+        )
+        if source is None:  # validate_structure refuses this; fail closed if it ever slips
+            raise Conflict(f"{label} is not a pinned snapshot input.")
+        recorded = snapshot_data_class(connection, source.snapshot_id)["data_class"]
+        if recorded != "public":
+            raise Conflict(
+                f"{label} is recorded {recorded}, not public: a build context is pushed inside "
+                "the image and is never private data."
+            )
+        if snapshot_code_approval(connection, source.snapshot_id) is not None:
+            raise Conflict(
+                f"{label} has a private code approval: approved private code is never baked "
+                "into a pushed image."
+            )
+        try:
+            files = {entry["relative_path"] for entry in _entries(connection, source.snapshot_id)}
+        except (ValueError, TypeError, KeyError):
+            files = set()
+        if stage.build["dockerfile"] not in files:
+            raise Conflict(
+                f"{label} holds no file {stage.build['dockerfile']!r} to use as the Dockerfile."
             )
 
     def _check_reroutes(
@@ -570,16 +616,51 @@ class CampaignStore(
     # -- commands -------------------------------------------------------------------
 
     @staticmethod
-    def _resolve_receipt_refs(connection, live, project_id, spec, predecessors, raw=None):
+    def _resolve_image_refs(connection, live, project_id, spec, predecessors):
+        """ADR 0123: ``image_from`` becomes the literal built image, before the Salad adapter
+        expansion reads the image and before the spec is digested. Returns the spec and the
+        predecessor names it used."""
+        if getattr(spec, "version", None) != 2 or not any(
+            stage.image_from is not None for stage in spec.stages
+        ):
+            return spec, set()
+        value = spec.model_dump(mode="json")
+        resolved, used = resolve_image_refs(
+            connection, {"org_id": live["org_id"], "project_id": project_id}, value, predecessors
+        )
+        try:
+            return parse_spec(resolved), used
+        except ValidationError as error:
+            raise _invalid(error) from None
+
+    @staticmethod
+    def _resolve_receipt_refs(
+        connection,
+        live,
+        project_id,
+        spec,
+        predecessors,
+        raw=None,
+        used_predecessors=(),
+        rerun=False,
+    ):
         if raw is not None:
-            refuse_submitted_lineage(raw)
+            refuse_submitted_lineage(raw, allow_image_lineage=rerun)
         value = spec.model_dump(mode="json")
         resolved = resolve_receipt_refs(
             connection, {"org_id": live["org_id"], "project_id": project_id}, value, predecessors
         )
+        # A predecessor must be named by some input or stage ``image_from``; one nothing
+        # references is refused, whether or not another predecessor was used.
+        referenced = set(used_predecessors) | {
+            item["predecessor"]
+            for stage in value.get("stages", [])
+            for item in stage.get("inputs", [])
+            if item.get("kind") == "receipt_output" and item.get("predecessor") is not None
+        }
+        if set(predecessors) - referenced:
+            raise Conflict("predecessors were given but no input references one.")
         if resolved == value:
-            if predecessors:
-                raise Conflict("predecessors were given but no input references one.")
             return spec
         try:
             return parse_spec(resolved)
@@ -602,15 +683,26 @@ class CampaignStore(
                 raise Forbidden("This credential cannot submit campaigns.")
             # ADR 0076/0077: a Salad adapter request becomes the explicit candidate before the spec
             # is digested; the identity for a spec without one.
+            # ADR 0123: image_from becomes the built image before expansion and the digest.
+            image_spec, used_predecessors = self._resolve_image_refs(
+                connection, live, project_id, body.spec, body.predecessors
+            )
             spec = expand_with_registered(
-                body.spec,
+                image_spec,
                 self.adapter_entries(connection, live, project_id),
                 tenant=(live["org_id"], project_id),
             )
             # ADR 0080: receipt_output references become pinned artifact inputs before the
             # spec is digested, so approval binds the exact bytes and lineage.
             spec = self._resolve_receipt_refs(
-                connection, live, project_id, spec, body.predecessors, raw_spec
+                connection,
+                live,
+                project_id,
+                spec,
+                body.predecessors,
+                raw_spec,
+                used_predecessors,
+                rerun=lineage is not None,
             )
             normal_spec = normalize(spec)
             smoke_credentials.check_submission(connection, live, normal_spec)

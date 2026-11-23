@@ -337,6 +337,7 @@ class DatasetSnapshotStore(SnapshotStore):
             request.expected_input_snapshot_digest,
             capture,
             replay_guard=replay,
+            require_decision_label=True,
         )
         observed = verify_dataset_bytes(
             content,

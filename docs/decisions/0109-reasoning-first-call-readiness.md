@@ -83,6 +83,12 @@ before a call, print it or log it. Everything else can be checked ahead of time.
 - A deployment where the reasoning host cannot reach the control database reports `spend_caps` as
   `unchecked` rather than guessing, and the command then reports `not_fully_checked` (never `ready`):
   run it where the control state is readable, or check the limits through `GET /model-spend`.
+- A run as a user that cannot read the control database (the `--in-unit` run, as the service user,
+  unless that user can read the control state) reports `spend_caps` as `fail` with "the control database
+  is not readable by this user", not as an old database; the result is then `not_ready`, as before. Check
+  the spend limits separately (as a user that can read the control state, or through
+  `GET /model-spend`). Only a missing table or column is reported as a database older than the
+  model-spend slice.
 
 ## Limits
 
@@ -102,3 +108,51 @@ before a call, print it or log it. Everything else can be checked ahead of time.
 `tests/test_first_call_readiness.py` (each check's states, the exit codes, that the key file is never
 opened and no key marker or secret reaches any output) and `tests/test_first_call_e2e_stub.py` (the
 end-to-end stub path above).
+
+## Amendment: the credentials a service manager places are accepted, and the check runs in the unit's context
+
+Systemd's `LoadCredential=` gives the service user root-owned, read-only files (0400 or 0440) in a
+root-owned directory. The original rule (owned by the caller, no group or other bits) refused every
+one of them, so the service and this check could never pass on a real unit. The rule is now:
+
+- A file the caller owns with no group or other bits is accepted, as before.
+- A root-owned file with mode exactly 0400 or 0440, one link, is accepted **only** when it sits directly
+  inside the manager's credentials directory (`$CREDENTIALS_DIRECTORY`, or the directory the check was
+  given) and that directory is owned by root or the caller, is not writable by group or other and is not
+  accessible to others. A world-readable or group-writable file, a symlink, a file in any other place
+  and a larger file are refused.
+- The group of such a file, and of its directory, must be root's (gid 0) or the service's own group:
+  a root-owned 0440 file in a `root:users` directory would let every member of `users` read the key, so
+  it is refused (a 0400 file in a foreign group too: the group is pinned whatever its bits). The
+  service's group is the effective gid of the process making the check. The readiness command does not
+  know the unit's `Group=`, so run as root against the stored directory it accepts only group root
+  there; run as the service user (or `--in-unit`) it accepts that user's group. The caller's own
+  private file is judged as before; the caller's own directory has its group pinned only when it gives
+  the group any access. The MCP tool bridge's token reader uses this same implementation.
+- The same rule applies at every place the service reads those files: start-up (the directory, the profile,
+  the prompt, the model-credential reference, the agent token, the API key's stat check), the Messages
+  client's key read, the tool bridge's token file, and this check's key-file stat (still never opened).
+
+`tessera-reasoning-readiness check --in-unit` evaluates the check in the unit's own context: it reads
+the installed unit and runs the check as its `User=` (and `Group=`) in a transient unit
+(`systemd-run`, as root) that carries the credentials and the listed sandbox properties: the unit's
+`UMask=`, `WorkingDirectory=`, `StateDirectory=` (with `StateDirectoryMode=`), `ProtectSystem=`,
+`ProtectHome=`, `PrivateTmp=`, `NoNewPrivileges=` and every `ReadWritePaths=` line (so a state
+directory outside `/var/lib`, which the installer makes writable with `ReadWritePaths=` under
+`ProtectSystem=strict`, stays writable in the check), copied as written. `Environment=` values are
+not copied: transient-unit properties travel in the `systemd-run` command line, which other users
+can read, and the check needs none of them; the in-unit run is refused outright when the unit sets
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_API_KEY`. Other directives (for example
+`PrivateDevices=`) are not replicated, so this is the unit's sandbox as far as those properties go,
+not a copy of the whole unit. systemd fails a
+unit whose absolute `LoadCredential=` source is missing (243/CREDENTIALS, before the check runs), so
+each source is checked as root with lstat first: a missing source, a symlink, anything other than a
+regular file and a source that cannot be stat'd is left out, and the check inside reports that
+credential as missing. That is how one run on a fresh install reports `ready_except_key` (exit 10).
+The check's JSON report is passed through only with one of its exit codes (0, 10, 11, 1); any other
+exit (a unit that fails to start, a signal), a runner failure, a report that is not JSON or output
+over 64 KiB ends with exit 1 and the fixed message `readiness: the in-unit check did not complete`.
+`--profile` and `--credentials-directory` now
+default to `$CREDENTIALS_DIRECTORY/profile` and `$CREDENTIALS_DIRECTORY`. The installer
+(ADR 0119) passes the owners it created to the check when it runs it as root.
+

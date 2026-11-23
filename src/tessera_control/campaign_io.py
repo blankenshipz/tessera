@@ -12,6 +12,7 @@ only names them. No class is ever upgraded: outputs are ``private_derived`` and 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from collections.abc import Mapping, Sequence
@@ -20,6 +21,9 @@ from typing import Any
 
 from .data_class import OUTPUT_DATA_CLASS
 from .store import Conflict
+
+# The shape of ``campaign_models.PinnedImage`` (a built image must satisfy the same rule).
+_PINNED_IMAGE = re.compile(r"[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -294,13 +298,24 @@ def _source_receipt_output(
     return found
 
 
-def refuse_submitted_lineage(spec_value: Any) -> None:
+def refuse_submitted_lineage(spec_value: Any, *, allow_image_lineage: bool = False) -> None:
     """Refuse any submitted ``resolved_from`` (ADR 0080): only submit's resolver sets it.
 
-    Call this on the raw request spec, before ``resolve_receipt_refs`` adds the lineage.
+    Call this on the raw request spec, before ``resolve_receipt_refs`` adds the lineage. A re-run
+    replays the platform's own stored spec, so it may carry the image lineage submit resolved
+    (``allow_image_lineage``); an input's ``resolved_from`` is refused as before.
     """
     stages = spec_value.get("stages", []) if isinstance(spec_value, Mapping) else []
     for stage in stages if isinstance(stages, list) else []:
+        if (
+            not allow_image_lineage
+            and isinstance(stage, Mapping)
+            and "image_resolved_from" in stage
+        ):
+            raise Conflict(
+                f"Stage {stage.get('key', '?')!r}: image_resolved_from is set by submit only; "
+                "remove it or use an image_from reference."
+            )
         inputs = stage.get("inputs", []) if isinstance(stage, Mapping) else []
         for item in inputs if isinstance(inputs, list) else []:
             if isinstance(item, Mapping) and "resolved_from" in item:
@@ -390,3 +405,107 @@ def resolve_receipt_refs(
             )
         stage["inputs"] = inputs
     return resolved
+
+
+def _image_ref_refusal(stage_key: str, why: str) -> Conflict:
+    return Conflict(f"Stage {stage_key!r} image_from: {why}.")
+
+
+def _built_image(receipt: Mapping[str, Any], stage: str) -> str | None:
+    """The provider-reported image a succeeded build stage's receipt entry lists, or None.
+
+    Reads the succeeded attempt's ``build`` defensively: any other shape (absent, declared
+    only, no digest reference) is None, so a receipt that does not prove the build refuses the
+    reference."""
+    for item in receipt.get("stages", []):
+        if not isinstance(item, Mapping) or item.get("stage_key") != stage:
+            continue
+        for attempt in item.get("attempts", []):
+            if not isinstance(attempt, Mapping) or attempt.get("status") != "succeeded":
+                continue
+            build = attempt.get("build")
+            if not isinstance(build, Mapping) or build.get("evidence") != "provider_reported":
+                continue
+            image = build.get("produced_image")
+            if isinstance(image, str) and _PINNED_IMAGE.fullmatch(image):
+                return image
+        return None
+    return None
+
+
+def resolve_image_refs(
+    connection: sqlite3.Connection,
+    project: Mapping[str, Any],
+    spec_value: Mapping[str, Any],
+    predecessors: Mapping[str, str],
+) -> tuple[dict[str, Any], set[str]]:
+    """Replace every stage ``image_from`` (ADR 0123) by the literal image a build receipt reports.
+
+    The source campaign must be in this org and project and ``succeeded``; its spec's stage must
+    be a build stage; its terminal receipt's entry for it must carry a ``provider_reported``
+    ``produced_image`` that is a pinned reference. The literal ``image`` and ``image_resolved_from``
+    (campaign, stage, receipt digest) are written into the spec before it is digested. Producing
+    an image never makes it runnable: dispatch still checks the resolved image against the
+    operator's worker ``--allowed-image`` and Salad profile allowlists. Returns the spec and the
+    predecessor names used; specs without references are returned unchanged."""
+    stages = spec_value.get("stages", [])
+    if not any(isinstance(s, dict) and s.get("image_from") for s in stages):
+        return dict(spec_value), set()
+    resolved = json.loads(json.dumps(spec_value))
+    used: set[str] = set()
+    for stage in resolved["stages"]:
+        ref = stage.get("image_from")
+        if not ref:
+            continue
+        key = stage.get("key", "?")
+        campaign_id = ref.get("campaign_id")
+        if campaign_id is None:
+            campaign_id = predecessors.get(ref.get("predecessor"))
+            if campaign_id is None:
+                raise _image_ref_refusal(
+                    key, f"predecessor {ref.get('predecessor')!r} is not in the submit"
+                )
+            used.add(ref["predecessor"])
+        row = connection.execute(
+            "SELECT status, spec_json FROM campaigns WHERE id=? AND org_id=? AND project_id=?",
+            (campaign_id, project["org_id"], project["project_id"]),
+        ).fetchone()
+        if row is None:
+            raise _image_ref_refusal(key, "no such campaign in this project")
+        if row["status"] != "succeeded":
+            raise _image_ref_refusal(
+                key, f"campaign {campaign_id} is {row['status']}, not succeeded"
+            )
+        source = next(
+            (
+                s
+                for s in json.loads(row["spec_json"]).get("stages", [])
+                if s.get("key") == ref["stage"]
+            ),
+            None,
+        )
+        if source is None or not source.get("build"):
+            raise _image_ref_refusal(
+                key, f"stage {ref['stage']!r} of {campaign_id} is not an image-build stage"
+            )
+        receipt_row = connection.execute(
+            "SELECT receipt_json, receipt_digest FROM campaign_receipts WHERE campaign_id=?",
+            (campaign_id,),
+        ).fetchone()
+        if receipt_row is None:
+            raise _image_ref_refusal(key, "the source campaign has no terminal receipt")
+        image = _built_image(json.loads(receipt_row["receipt_json"]), ref["stage"])
+        if image is None:
+            raise _image_ref_refusal(
+                key,
+                f"the receipt of {campaign_id} reports no provider-reported produced image for "
+                f"stage {ref['stage']!r}",
+            )
+        stage.pop("image_from")
+        stage["image"] = image
+        stage["image_resolved_from"] = {
+            "campaign_id": campaign_id,
+            "stage": ref["stage"],
+            "source_receipt_sha256": receipt_row["receipt_digest"],
+        }
+    return resolved, used

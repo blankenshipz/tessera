@@ -24,6 +24,10 @@ CLASS_STANDING_APPROVAL = "standing_approval"
 
 AUTOMATION_HEADER = "X-Tessera-Automation"
 AUTOMATION_KEY = "automation_label"
+# The reference to the owner delegation an owner-run helper acts under (a label like the automation
+# one: it names the delegation, grants nothing, and is only accepted next to an automation label).
+DELEGATION_HEADER = "X-Tessera-Delegation"
+DELEGATION_KEY = "delegation_ref"
 MAX_LABEL_LENGTH = 128
 
 # Label the desktop app sends when it is connected with the root owner credential.
@@ -113,6 +117,9 @@ def decision_provenance(actor: dict[str, Any]) -> dict[str, Any]:
     }
     if label:
         result["automation_label"] = label
+    reference = actor.get(DELEGATION_KEY)
+    if reference and label:
+        result["delegation_ref"] = reference
     delegated = actor.get(DELEGATED_ACTOR_KEY)
     if delegated:
         result["campaign_id"] = delegated["campaign_id"]

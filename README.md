@@ -280,11 +280,11 @@ approves nothing.
 
 Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes v1 and v2
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
-`tessera_get_campaign_receipt`, `tessera_campaign_report` (a plain-words read of one campaign or a time window, [ADR 0115](docs/decisions/0115-plain-words-campaign-report.md)), `tessera_list_snapshots`, `tessera_campaign_outputs`,
+`tessera_get_campaign_receipt`, `tessera_campaign_report` (a plain-words read of one campaign or a time window, [ADR 0115](docs/decisions/0115-plain-words-campaign-report.md)), `tessera_list_snapshots`, `tessera_get_snapshot` (one snapshot's file list, [ADR 0126](docs/decisions/0126-mcp-snapshot-file-list.md)), `tessera_campaign_outputs`,
 `tessera_campaign_logs`, `tessera_campaign_budget` and `tessera_project_spend` (the operator's
 project limits and campaign totals) read recorded state under separate
 scopes. Steering tools ([ADR 0055](docs/decisions/0055-mcp-steering-tools.md)) dry-run a spec
-(`tessera_validate_campaign_spec`), build a retry spec for the stages that did not succeed
+(`tessera_validate_campaign_spec`), render a spec from a template plus values and validate or submit it (`tessera_render_campaign_spec`, `tessera_submit_rendered_campaign`), read the receipts and gate decisions of up to 20 campaigns at once (`tessera_campaign_wave_receipts`; [ADR 0124](docs/decisions/0124-mcp-operator-loop-tools.md)), build a retry spec for the stages that did not succeed
 (`tessera_prepare_stage_retry`), re-run a failed campaign as a new submission that reuses its
 succeeded outputs by digest and is linked on the receipt
 (`tessera_rerun_campaign`, [ADR 0069](docs/decisions/0069-rerun-a-finished-campaign.md)),
@@ -303,7 +303,7 @@ no resume tool (a person deletes the marker), and it cancels nothing in flight. 
 recorded on the platform (`POST /projects/{id}/agent-loop/pause`, scope `loop:pause`): a request
 record, not proof the loop stopped. A human still
 approves the digest and stages snapshots; an operator may enable `tessera_approve_campaign` on a
-separate `--approval-tool` server that holds a person's own session credential (the control API
+separate `--approval-tool` server that holds a person's own session credential, which also registers `tessera_record_gate_decision` (the control API
 still refuses any agent credential and applies every admission check and cap). A $0 end-to-end smoke of this steering path against a running Tessera (dry run by default;
 `scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md); its owner-run credential command also ensures a tiny synthetic public snapshot, so the smoke needs no human staging step, and it finds the control state directory from `TESSERA_CONTROL_STATE_DIR` or the host's deploy plan instead of a typed path.
 `scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md), with a companion check that steers a RUNNING campaign (report, pause while a stage runs, resume, a gate decision) through the same tools (`scripts/mcp_steering_running_check.py`).

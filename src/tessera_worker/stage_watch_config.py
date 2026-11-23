@@ -1,18 +1,30 @@
 """Operator configuration for the worker's stage watcher (ADR 0087, observe and report only).
 
-Off by default. This module imports nothing from ``tessera_worker.stage_watcher``, so a worker
-that never enables the watcher never loads the watcher library: the runner
-(``tessera_worker.stage_watch_runner``) is imported lazily, only on the enabled branch.
+On by default (ADR 0125): a worker with no explicit setting watches every local Docker stage
+with the kill-switch marker ``<private workspace root>/stage-watch.kill`` (never created here;
+present means engaged). Opt out only explicitly: ``--no-stage-watcher`` or
+``"stage_watcher": {"enabled": false}``. This module imports nothing from
+``tessera_worker.stage_watcher``, so a worker that opted out never loads the watcher library:
+the runner (``tessera_worker.stage_watch_runner``) is imported lazily, only on the enabled
+branch.
 
-``kill_switch_path`` is required for a watcher to start. An enabled config without one is
-accepted here (so a worker is never refused because of the watcher), but the runner starts no
-watcher at all: fail closed, it reads as engaged and nothing is observed or reported.
+An enabled config without a ``kill_switch_path`` (a block that only tunes, or ``--stage-watcher``
+alone) takes the default marker ``<private workspace root>/stage-watch.kill``; if that directory is
+not usable it resolves to no watcher with one stderr line. A mapping (the poller's
+``stage_watcher`` block) that omits ``enabled`` is enabled: opting out is the explicit
+``"enabled": false``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
-from dataclasses import dataclass
+import stat
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import Any
 
 from tessera_control.stage_watch_limits import MAX_REPORTS_PER_OPERATION
 
@@ -32,6 +44,7 @@ DEFAULT_TICK_MAX_POSTS = 4
 MAX_TICK_POSTS = 32
 MAX_SECONDS = 7 * 24 * 3600
 _MAX_PATH_BYTES = 4096
+DEFAULT_KILL_SWITCH_NAME = "stage-watch.kill"
 
 
 def _bounded_int(name: str, value: object, minimum: int, maximum: int) -> None:
@@ -100,3 +113,67 @@ class StageWatchConfig:
     def startable(self) -> bool:
         """Enabled and with a kill switch: the only state in which a watcher may start."""
         return self.enabled and self.kill_switch_path is not None
+
+    @classmethod
+    def from_mapping(cls, document: Any) -> StageWatchConfig:
+        """A closed, strictly validated config from a JSON object; ``ValueError`` otherwise.
+
+        Unknown keys are refused. The message is bounded and carries no value or path.
+        """
+        allowed = {field.name for field in fields(cls)}
+        if not isinstance(document, Mapping) or not set(document) <= allowed:
+            raise ValueError("stage watcher settings must be an object with known keys only.")
+        # A block that is present is explicit configuration: tuning alone keeps the watcher on.
+        return cls(**({"enabled": True} | dict(document)))
+
+
+def _private_directory_reason(directory: Path) -> str | None:
+    try:
+        info = directory.lstat()
+    except OSError:
+        return "directory is unavailable"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return "directory is not a plain directory"
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        return "directory is not private"
+    return None
+
+
+def default_stage_watch(directory: Path | str) -> tuple[StageWatchConfig, str | None]:
+    """The default-on config for a worker whose private state directory is ``directory``.
+
+    The marker ``<directory>/stage-watch.kill`` is only named, never created. When the
+    directory is not private and usable, or the path is not a valid marker path, returns a
+    disabled config and a short path-free reason: the worker still runs, with no watcher.
+    """
+    path = Path(os.path.abspath(directory))
+    reason = _private_directory_reason(path)
+    if reason is None:
+        try:
+            marker = str(path / DEFAULT_KILL_SWITCH_NAME)
+            return StageWatchConfig(enabled=True, kill_switch_path=marker), None
+        except ValueError:
+            reason = "marker path is not valid"
+    return StageWatchConfig(), reason
+
+
+def resolve_stage_watch(
+    explicit: StageWatchConfig | None, directory: Path | str
+) -> StageWatchConfig:
+    """``explicit`` when given (it wins, disabled included), else the default-on config.
+
+    An enabled ``explicit`` without a marker path takes the default marker, like no config at all
+    (tuning or ``--stage-watcher`` alone never switches the watcher off). A default that cannot be
+    used is announced on stderr and resolves to no watcher.
+    """
+    if explicit is not None and not (explicit.enabled and explicit.kill_switch_path is None):
+        return explicit
+    config, reason = default_stage_watch(directory)
+    if explicit is not None and reason is None:
+        config = dataclasses.replace(explicit, kill_switch_path=config.kill_switch_path)
+    if reason is not None:
+        print(
+            f"stage watcher: default marker unusable ({reason}); no watcher will start",
+            file=sys.stderr,
+        )
+    return config

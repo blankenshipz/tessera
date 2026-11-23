@@ -53,6 +53,7 @@ from .remote_reasoning_store import (
     RATE_LIMIT_CONDITIONS,
     DailyCapRefused,
     ReasoningStore,
+    manager_credentials_dir,
     private_file,
     utc_day,
 )
@@ -1554,7 +1555,7 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path)
     args = parser.parse_args(argv)
-    profile = json.loads(private_file(args.profile))
+    profile = json.loads(private_file(args.profile, credentials_dir=manager_credentials_dir()))
     if args.command == "catalog":
         # Obtaining the pin is the point: only a missing/placeholder pin is tolerated here.
         pin = profile.get("tool_catalog_sha256")
@@ -1593,7 +1594,11 @@ def main(argv=None):
                 args.state_dir / "supervisor.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
             )
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            text = private_file(args.prompt_file).decode() if args.prompt_file else None
+            text = (
+                private_file(args.prompt_file, credentials_dir=manager_credentials_dir()).decode()
+                if args.prompt_file
+                else None
+            )
             if text is not None and (not text.strip() or len(text.encode()) > 8192):
                 raise ValueError("Prompt must contain 1..8192 bytes.")
             binding = {
@@ -1608,7 +1613,9 @@ def main(argv=None):
             }
             binding["model"] = profile["model"]["id"]
             binding["prompt_sha256"] = profile["prompt_sha256"]
-            binding["profile_sha256"] = hashlib.sha256(private_file(args.profile)).hexdigest()
+            binding["profile_sha256"] = hashlib.sha256(
+                private_file(args.profile, credentials_dir=manager_credentials_dir())
+            ).hexdigest()
             store.bind(profile["run_id"], binding, time.time())
             control = JsonEndpoint(
                 profile["control_url"],

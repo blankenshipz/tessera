@@ -447,6 +447,14 @@ class CampaignSubmissionStore(CampaignStore):
             source_id = None
             if body.kind == "submit":
                 refuse_submitted_lineage(raw_spec)
+                if any(
+                    getattr(stage, "image_from", None) is not None
+                    for stage in getattr(body.spec, "stages", [])
+                ):
+                    raise Conflict(
+                        "An approved submission cannot use image_from: pin the built image with "
+                        "a literal image (name@sha256:...) instead."
+                    )
                 spec = expand_with_registered(
                     body.spec,
                     self.adapter_entries(connection, live, project_id),
