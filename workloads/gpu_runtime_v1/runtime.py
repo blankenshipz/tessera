@@ -649,10 +649,19 @@ class _FetchCache:
             if (
                 not stat.S_ISREG(info.st_mode)
                 or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
                 or info.st_size > item["max_bytes"]
             ):
+                if (
+                    stat.S_ISFIFO(info.st_mode)
+                    or stat.S_ISCHR(info.st_mode)
+                    or (stat.S_ISBLK(info.st_mode) or stat.S_ISSOCK(info.st_mode))
+                ):
+                    self._discard(entry, info)  # a special file is never a cache entry
                 return None
-            fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW)
+            # O_NONBLOCK: an entry swapped for a FIFO after the lstat must not hang the open;
+            # the descriptor is checked below and then switched back to blocking reads.
+            fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         except OSError:
             return None
         digest, total = hashlib.sha256(), 0
@@ -661,12 +670,14 @@ class _FetchCache:
         try:
             with os.fdopen(fd, "rb") as source, open(part, "wb") as out:
                 opened = os.fstat(source.fileno())
-                if opened.st_size != info.st_size or (opened.st_ino, opened.st_dev) != (
-                    info.st_ino,
-                    info.st_dev,
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_size != info.st_size
+                    or (opened.st_ino, opened.st_dev) != (info.st_ino, info.st_dev)
                 ):
                     _unlink(part)
                     return None
+                os.set_blocking(source.fileno(), True)
                 while True:
                     if time.monotonic() >= deadline:
                         raise Failure("deadline")

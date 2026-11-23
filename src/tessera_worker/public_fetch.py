@@ -123,16 +123,37 @@ def _validate_pin(pin: dict[str, Any]) -> None:
         raise PublicFetchError("host_not_allowed")
 
 
+def _discard_special(entry: Path, opened: os.stat_result) -> None:
+    """Remove ``entry`` only while it is still the very object that was opened."""
+    try:
+        now = entry.lstat()
+        if (now.st_ino, now.st_dev) == (opened.st_ino, opened.st_dev):
+            entry.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _from_cache(cache: Path, pin: dict[str, Any], final: Path) -> int | None:
     """Copy a verified cache entry to ``final``; return bytes served, or None for a miss.
 
     The entry is read once: the same bytes are hashed and written to a temp file, which only
     replaces ``final`` after the digest equals the pin. The entry is deleted only when the whole
-    file was read and its sha256 differs; an I/O error, a non-regular, symlinked or hard-linked
-    entry or a size above this pin's cap is a miss that leaves the entry in place.
+    file was read and its sha256 differs; an I/O error, a symlinked, hard-linked or directory
+    entry, an entry owned by another user or a size above this pin's cap is a miss that leaves the
+    entry in place.
+
+    The open never waits: ``O_NONBLOCK`` means a FIFO or device planted at the entry path cannot
+    hang the stage. The opened descriptor must be a regular file owned by this user, else it is a
+    miss; a FIFO, device or socket (never a file or directory) is also removed, by the identity of
+    the object that was opened. ``O_NONBLOCK`` is cleared before any read.
     """
     entry, tmp = cache / pin["sha256"], final.with_name(final.name + ".cachetmp")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(entry, flags)
     except OSError:
@@ -141,12 +162,21 @@ def _from_cache(cache: Path, pin: dict[str, Any], final: Path) -> int | None:
     try:
         with os.fdopen(fd, "rb") as src:
             opened = os.fstat(src.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                if (
+                    stat.S_ISFIFO(opened.st_mode)
+                    or stat.S_ISCHR(opened.st_mode)
+                    or (stat.S_ISBLK(opened.st_mode) or stat.S_ISSOCK(opened.st_mode))
+                ):
+                    _discard_special(entry, opened)
+                return None
             if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_nlink != 1  # a hard-linked entry is not trusted
+                opened.st_nlink != 1  # a hard-linked entry is not trusted
+                or opened.st_uid != os.geteuid()
                 or opened.st_size > pin["max_bytes"]
             ):
                 return None
+            os.set_blocking(src.fileno(), True)
             tmp.unlink(missing_ok=True)
             out_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(out_fd, "wb") as out:

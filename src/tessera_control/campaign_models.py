@@ -10,6 +10,7 @@ import dataclasses
 import json
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -19,6 +20,7 @@ from pydantic import (
     StringConstraints,
     TypeAdapter,
     ValidationError,
+    field_validator,
     model_serializer,
     model_validator,
 )
@@ -824,6 +826,18 @@ class StageV2(_Strict):
         return value
 
 
+# G-06: the one timestamp form a spec may carry, so the digested text is canonical.
+NOT_BEFORE_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+NotBefore = Annotated[str, StringConstraints(pattern=NOT_BEFORE_PATTERN)]
+
+
+def parse_not_before(value: str | None) -> datetime | None:
+    """The UTC instant of a spec's ``not_before`` text, or None when absent."""
+    if value is None:
+        return None
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
 class CampaignSpecV2(_Strict):
     version: Literal[2]
     name: Annotated[str, StringConstraints(min_length=1, max_length=200)]
@@ -832,7 +846,29 @@ class CampaignSpecV2(_Strict):
     deadline_seconds: Annotated[int, Field(strict=True, ge=60, le=7 * 86_400)]
     # Providers this campaign must never use (narrows; a stage naming one is refused).
     forbid_providers: Annotated[list[ProviderId], Field(max_length=16)] = []  # noqa: RUF012
+    # G-06: nothing runs before this UTC instant (``YYYY-MM-DDTHH:MM:SSZ``). An approved campaign
+    # waits for it; the approval's own expiry still bounds the wait. Part of the spec digest when
+    # present; absent keeps every existing digest.
+    not_before: NotBefore | None = None
     stages: Annotated[list[StageV2], Field(min_length=1, max_length=MAX_STAGES_V2)]
+
+    @field_validator("not_before")
+    @classmethod
+    def _real_instant(cls, value: str | None) -> str | None:
+        try:
+            parse_not_before(value)
+        except ValueError:
+            raise ValueError(
+                "not_before must be a real UTC time like 2026-12-01T09:00:00Z"
+            ) from None
+        return value
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_not_before(self, handler):
+        value = handler(self)
+        if self.not_before is None:
+            value.pop("not_before", None)
+        return value
 
     @model_validator(mode="after")
     def _structure(self) -> CampaignSpecV2:
@@ -1055,6 +1091,7 @@ class NormalSpec:
     forbid_providers: tuple[str, ...]
     stages: tuple[NormalStage, ...]
     worker_principal_id: str | None = None
+    not_before: str | None = None
 
     def stage(self, key: str) -> NormalStage:
         return next(item for item in self.stages if item.key == key)
@@ -1249,6 +1286,8 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
         spec.deadline_seconds,
         tuple(spec.forbid_providers),
         tuple(stages),
+        None,
+        spec.not_before,
     )
 
 

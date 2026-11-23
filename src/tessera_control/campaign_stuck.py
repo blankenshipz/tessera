@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import campaign_heavy_guard_readout as heavy_readout
+from . import campaign_hold
 from .store import Store, _parse_utc, _utc_string
 
 CODES = {
@@ -155,7 +156,8 @@ def detect(
     """Every stuck condition now present in the project, as findings (nothing is written)."""
     found: list[dict[str, Any]] = []
     campaigns = connection.execute(
-        "SELECT id, status, stop_reason, updated_at FROM campaigns WHERE org_id=? AND project_id=?",
+        "SELECT id, status, stop_reason, updated_at, spec_json FROM campaigns "
+        "WHERE org_id=? AND project_id=?",
         (org_id, project_id),
     ).fetchall()
     explained: set[str] = set()
@@ -348,6 +350,8 @@ def detect(
     for c in campaigns:
         if c["status"] not in ACTIVE or c["id"] in explained:
             continue
+        if campaign_hold.waiting(c["spec_json"], c["status"], now) is not None:
+            continue  # approved and deliberately waiting for its not_before: not stuck
         stamps = [c["updated_at"]]
         stamps += [
             r[0]

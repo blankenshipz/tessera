@@ -409,7 +409,13 @@ class SaladSafetyService:
         total_cap_cents=None,
         control_origin=None,
         control_opener=None,
+        max_open_billable_frames=1,
     ):
+        # ADR 0041 resolved question 4b: concurrent billable frames need a later record that
+        # covers total-cap races, partial stops and accrual interleaving, so only 1 is allowed.
+        if type(max_open_billable_frames) is not int or max_open_billable_frames != 1:
+            raise ValueError("invalid_max_open_billable_frames")
+        self.max_open_billable_frames = max_open_billable_frames
         if total_cap_cents is not None and (
             type(total_cap_cents) is not int or not 1 <= total_cap_cents <= 1_000_000
         ):
@@ -490,6 +496,12 @@ class SaladSafetyService:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY, "
             "reservation TEXT, operation TEXT, at REAL, kind TEXT, detail TEXT)"
+        )
+        # Refused reserves (the open-billable-frame fence), kept apart from ``events`` so a
+        # refusal never reads as evidence about a reservation.
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS fence_refusals (sequence INTEGER PRIMARY KEY, "
+            "reservation TEXT, operation TEXT, at REAL, open_frames INTEGER, frame_limit INTEGER)"
         )
         self.db.executescript(FRAME_RECORD_SCHEMA)
         with self.db:
@@ -895,6 +907,44 @@ class SaladSafetyService:
             self._exposure_fence(row)
             raise ValueError("exposure_fenced")
 
+    def _open_billable_frames(self, operation):
+        """Frames other than ``operation`` that may still bill: not yet ``stopped`` or
+        ``reconciled`` (proven-absent frames reconcile). An ambiguous create with no provider
+        id still counts until it is resolved (ADR 0041 section 7.2, resolved question 4a)."""
+        others = self.db.execute(
+            "SELECT reservation FROM reservations WHERE operation!=?", (operation,)
+        ).fetchall()
+        return sum(
+            1
+            for (other,) in others
+            if self._status(self._row(other))["status"] not in {"stopped", "reconciled"}
+        )
+
+    def _over_total_cap(self, reservation, profile):
+        return self.total_cap_cents is not None and (
+            self._committed(exclude=reservation, account=False)
+            + Decimal(profile.execution.max_cost_cents)
+            > self.total_cap_cents
+        )
+
+    def _record_fence_refusal(self, reservation, operation, open_frames):
+        """Durable record of a refused reserve: the count and the limit, nothing else."""
+        try:
+            with self.db:
+                self.db.execute(
+                    "INSERT INTO fence_refusals(reservation,operation,at,open_frames,frame_limit) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        reservation,
+                        operation,
+                        self.clock(),
+                        open_frames,
+                        self.max_open_billable_frames,
+                    ),
+                )
+        except Exception:
+            self.diagnostic_write_failures += 1
+
     def _exposure_fence(self, row):
         with self.db:
             self.db.execute(
@@ -968,6 +1018,7 @@ class SaladSafetyService:
             budget_fenced=bool(row["budget_fenced"]),
             first_running_at=row["first_running_at"],
             total_cap_cents=self.total_cap_cents,
+            max_open_billable_frames=self.max_open_billable_frames,
             total_committed_cents=None,
             total_remaining_cents=None,
             escalation_pending=bool(row["escalation"]),
@@ -1697,15 +1748,14 @@ class SaladSafetyService:
             if rate * Decimal(str(billed)) * 100 / 3600 > profile.execution.max_cost_cents:
                 raise ValueError("budget_insufficient")
             # Statuses and accounting write, so gather them before the transaction.
-            others = self.db.execute(
-                "SELECT reservation FROM reservations WHERE operation!=?", (p.operation_id,)
-            ).fetchall()
-            orphan = any(
-                self._status(self._row(other))["status"] not in {"stopped", "reconciled"}
-                for (other,) in others
-            )
+            open_frames = self._open_billable_frames(p.operation_id)
+            orphan = open_frames >= self.max_open_billable_frames
             if self.total_cap_cents is not None:
                 self._committed(exclude=reservation)  # bring accounting up to date first
+            if orphan and not self._over_total_cap(reservation, profile):
+                # Receipted before the refusal: the transaction below rolls back, so the
+                # record is written here (the total-cap refusal, checked first, is not a fence).
+                self._record_fence_refusal(reservation, p.operation_id, open_frames)
             with self.db:
                 # The total-cap check and the insert are one write transaction.
                 self.db.execute("BEGIN IMMEDIATE")
@@ -2731,6 +2781,7 @@ def main(argv=None):
             verifier=jwt,
             total_cap_cents=cfg.get("total_cap_cents"),
             control_origin=cfg.get("control_origin"),
+            max_open_billable_frames=cfg.get("max_open_billable_frames", 1),
         )
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3

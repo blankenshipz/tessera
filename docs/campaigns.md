@@ -358,6 +358,13 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   intent with the same key, applies a `done` one, and never issues a second grant while
   an attempt's grant is unreconciled.
 
+A v2 spec may carry `not_before` (UTC, `YYYY-MM-DDTHH:MM:SSZ`): nothing runs earlier. After
+approval the campaign stays `running` and reads as `waiting` with reason `not_before` (the
+`waiting` key of the campaign read, the plain report and the MCP reads, with `seconds_remaining`);
+it is not failed or stuck. The approval's expiry (`deadline_seconds` from the first approval)
+still bounds the wait, so `deadline_seconds` must cover the wait plus the run, and approve is
+refused when `not_before` is not before that expiry. Recurring templates are a follow-up.
+
 ## Window requirement
 
 A stage is refused before any grant or hold (failure class `deadline_too_short`) when the

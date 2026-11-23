@@ -46,6 +46,10 @@ admin `input_ticket` are refused.
 refuses any reservation whose per-run cap, added to every other reservation's
 committed estimate, would exceed it (see below). Omitted means no total cap.
 
+`max_open_billable_frames` is optional and must be `1` (the default); the service refuses to
+start with any other value, because concurrent billable frames need a record that covers
+total-cap races, partial stops and accrual interleaving (ADR 0041 resolved question 4b).
+
 The admin token is an independently provisioned random bearer credential of at
 least 32 bytes, never the Salad management credential. Trusted clients pin the
 server certificate digest and verify hostname/CA with TLS 1.3. Workloads use only
@@ -263,6 +267,15 @@ else `max(accrued, per-run cap)`, plus this reservation's `max_cost_cents`;
 `committed > total_cap_cents` fails with `total_budget_exhausted`. Admin
 `status` adds `total_cap_cents`, `total_committed_cents` and
 `total_remaining_cents` (null without a cap), plus `first_running_at`.
+
+**Open billable frames.** A `reserve` is refused (wire code `single_operation_orphan_exposure`)
+while the number of other frames that may still bill is at `max_open_billable_frames`. A frame
+counts until its status is `stopped` or `reconciled` (a create proven absent reconciles); an
+ambiguous create with no provider id still counts. A stopped, reconciled or absent frame frees the
+slot at once, with no wait. Each refusal writes a `fence_refusals` row in the service database (the
+reservation and operation refused, the open count and the limit; no other frame's ids), apart from `events`. The
+total-cap refusal is checked first and is not recorded as a fence refusal. Admin `status` adds
+`max_open_billable_frames`.
 
 Before new work/arming/begin, the service independently reads the selected GPU's
 fresh official high-priority published hourly rate through `gpu_class`. Its

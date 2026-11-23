@@ -11,7 +11,7 @@ per runner attempt that closes in the settlement transaction, so a finished or e
 releases its hold at once. A settlement whose provider is not registered now fails closed and
 is recorded. Not implemented yet: the provider create/lookup/stop/observe surface and
 adoption of a found create (§4, Q1), crash-resume driving of open frames (§6), the guardian
-per-frame record, verdict read and `max_open_billable_frames` fence (§7, Q4), parent
+per-frame record and verdict read (§7), parent
 campaign frame rows (§5), and frames for standalone routes, local Docker and Kubernetes.
 Follow-up 6 is done: a billable frame that is `lost`, `failed` or outcome-ambiguous is never
 settled on a verdict-based basis (`guardian_bounded_hold`, `provider_billed`) until control has
@@ -37,7 +37,7 @@ the cost estimate (`estimate_not_invoice`) and the overrun block, so the *estima
 worker-reported; only the verdict is guardian-attested. `settle_frame` itself still demands a
 verdict digest only for ambiguous billable frames; the Salad driver is what requires the read for
 every bounded-hold settlement. Receipts carry the read as `guardian_record` with
-`verdict_source: guardian_read`. The `max_open_billable_frames` fence is a separate change. The original record follows. It generalizes the
+`verdict_source: guardian_read`. The guardian's `max_open_billable_frames` setting (§7.2, Q4) now exists: default 1, any other value refuses startup, the reserve fence counts open billable frames under that name, and a refusal is recorded in the guardian's `fence_refusals` table. The original record follows. It generalizes the
 create-rejection change (commit 0f05f46, since merged) and amends the settlement
 contract of ADR 0038 (`0038-campaign-specs-and-platform-campaign-runner.md`, on the campaign runner track) and the
 provider interface of ADR 0040 (`0040-multi-stage-multi-vendor-campaigns.md`, on the campaign runner track). The guardian

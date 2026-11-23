@@ -120,6 +120,8 @@ under a registered prefix. Keep it outside the repository; it is the operator's 
 credential. List the same prefixes under `build_repositories` of the matching provider in the
 `--campaign-providers` file, which control checks at submit.
 
+The builder image and the stage spec are described in [image build stages](image-build.md).
+
 ### Code reaches a provider as an input
 
 The same stage runs on local Docker, a self-hosted server or Salad because its code is an input, not

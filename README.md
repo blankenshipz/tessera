@@ -368,8 +368,8 @@ to the job receipt.
 **Credential expiry (Salad).** A Salad management credential has a fixed lifetime. Tessera reports each
 credential's state and expiry (metadata only, never the value), refuses or fails a stage that needs an
 expired or revoked one up front with a recorded reason, and the owner of the private credential directory
-rotates it with `rotate` or `renew` on the enrollment tool, from a terminal and not through any API
-([ADR 0103](docs/decisions/0103-credential-expiry-health.md),
+rotates it with `rotate` or `renew` (the same key, at most 24 hours ahead per call) on the enrollment
+tool, from a terminal and not through any API ([ADR 0103](docs/decisions/0103-credential-expiry-health.md),
 [credential health](docs/credential-health.md)). `tessera credentials reenroll` re-enrolls an
 expired credential from standard input (the only place a secret is entered), and the read-only MCP tool
 `tessera_credential_reenroll_command` shows an agent the exact command for the owner to run, never accepting

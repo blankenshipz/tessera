@@ -1,0 +1,26 @@
+# Image build stage "builder image" recipe (ADR 0123). Source only: adding this file pulls
+# or builds nothing. An operator builds it with a buildah image they have pinned, pushes it
+# to a registry they control, and pins the resulting repo@sha256 digest in the worker's
+# --allowed-image list (docs/image-build.md).
+#
+# The recipe never picks a digest: BUILDAH_IMAGE has no default and must be passed as a
+# digest-pinned reference, e.g. --build-arg BUILDAH_IMAGE=REGISTRY/buildah@sha256:<hex>.
+ARG BUILDAH_IMAGE
+FROM ${BUILDAH_IMAGE}
+# python3 runs the stdlib-only wrapper; nothing else is added.
+RUN dnf install -y --setopt=install_weak_deps=False python3 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum
+# Only the stdlib-only wrapper is packaged: no Tessera control code, credentials or
+# experiment code.
+COPY src/tessera_worker/builder_wrapper.py /usr/local/bin/tessera-image-build
+# The root filesystem is read-only at run time and /work is a tmpfs, so all storage lives
+# under /work. Registry auth is never baked in: it is only ever a read-only mount at
+# /run/registry-auth/auth.json, supplied by the worker for a pushing build.
+RUN chmod 0555 /usr/local/bin/tessera-image-build \
+    && mkdir -p /etc/containers \
+    && printf '%s\n' '[storage]' 'driver = "vfs"' 'graphroot = "/work/storage"' 'runroot = "/work/run"' > /etc/containers/storage.conf
+ENV HOME=/work TMPDIR=/work/tmp BUILDAH_ISOLATION=chroot STORAGE_DRIVER=vfs PYTHONDONTWRITEBYTECODE=1
+USER 65532:65532
+# No ENTRYPOINT: the worker supplies argv `tessera-image-build ...`. Read-only root,
+# cap-drop, the /work tmpfs, resource bounds and network policy come from the worker.

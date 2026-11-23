@@ -67,12 +67,15 @@ A v2 stage with a `build` block builds an image and pushes it to a registry the 
 
 ## Not finished (stated plainly)
 
-- The builder wrapper `tessera-image-build` and a builder image are **not in this repository**.
-  What is here is the contract: the fixed command line the provider derives (`builder_argv`), the
-  `buildah` steps a wrapper is expected to run (`buildah_commands`), and the result file
-  (`/outputs/image-build.json`) the worker validates. The wrapper must itself check that the
-  Dockerfile's `FROM` lines match the pinned base images; nothing in the platform reads the
-  Dockerfile.
+- The builder wrapper `tessera-image-build` (`src/tessera_worker/builder_wrapper.py`, stdlib
+  only) and the builder image recipe (`Dockerfile.image-build`, which needs an operator-pinned
+  buildah image) are in the repository and tested with a fake `buildah` only. The wrapper checks
+  that every `FROM`, `COPY --from` and `RUN --mount from=` names a pinned base image or an
+  earlier stage, refuses a pushing build without the mounted auth file, and never reads it. What
+  is here besides is the contract: the fixed command line the provider derives (`builder_argv`),
+  the `buildah` steps (`buildah_commands`, which the wrapper repeats and a test compares), and
+  the result file (`/outputs/image-build.json`) the worker validates. No real buildah, registry
+  or push has been exercised.
 - The worker's registry auth file and `build_repositories` are set by the operator through
   `--registry-auth-file` / `--build-repository` or the poller config keys of the same names
   (both or neither; absent refuses every pushing build). The file is checked private and never

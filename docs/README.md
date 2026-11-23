@@ -49,6 +49,7 @@ references, not claims of a supported production deployment.
 - [Enablement runbook](operations/enablement-runbook.md): what to switch on after a deploy, with a check that each feature is in use.
 - [Campaign providers](campaign-providers.md): the provider file, the self-hosted provider,
   the Salad provider and the service loop contract.
+- [Image build stages](image-build.md): the builder image recipe, operator setup and lineage into later stages.
 - [Agent Sandbox](agent-sandbox.md): direct one-shot adapter and live prerequisites.
 - [Kubernetes deployment](../deploy/kubernetes/README.md),
   [Astra operator setup](astra-operator-setup.md) and [connection tunnel](connection-tunnel.md):

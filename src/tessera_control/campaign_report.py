@@ -14,6 +14,7 @@ import sqlite3
 from datetime import UTC, datetime
 from typing import Any
 
+from . import campaign_hold
 from .campaign_models import parse_spec_json
 from .campaign_receipts import build_receipt
 from .model_spend import MICRO
@@ -466,8 +467,17 @@ def _why(status: str, reason: str | None, stages: list[dict[str, Any]]) -> str |
     return None
 
 
+def _waiting_words(hold: dict[str, Any]) -> str:
+    return (
+        f"approved and waiting to start at {hold['not_before']} "
+        f"(about {_duration_text(hold['seconds_remaining'])} from now)"
+    )
+
+
 def _headline(report: dict[str, Any]) -> str:
     campaign = report["campaign"]
+    if campaign.get("waiting"):
+        return f"The campaign is {_waiting_words(campaign['waiting'])}; nothing has run yet."
     stages = report["stages"]
     done = sum(1 for s in stages if s["state"] == "succeeded")
     status = campaign["status"]
@@ -514,6 +524,7 @@ def _campaign_report(
     finished_at = campaign["updated_at"] if finished else None
     budget = receipt["budget"]
     cap, spent, held = budget["cap"], budget["settled"], budget["held"]
+    hold = campaign_hold.waiting(campaign["spec_json"], status, datetime.now(UTC))
     campaign_info = {
         "name": _spec_name(campaign["spec_json"]),
         "status": status,
@@ -530,6 +541,9 @@ def _campaign_report(
             "spent_dollars": _dollars_from_cents(spent),
         },
     }
+    if hold is not None:
+        campaign_info["waiting"] = hold
+        campaign_info["why"] = "its start time (not_before) has not come yet"
     egress_hosts = sorted({h for s in stages if s["egress"] for h in s["egress"]["hosts"] or []})
     egress_bytes = [s["egress"]["bytes"] for s in stages if s["egress"]]
     durations = [s["duration_seconds"] for s in stages]

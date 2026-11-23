@@ -119,6 +119,59 @@ def test_non_regular_entry_is_miss_and_kept(tmp_path):
     assert (cache / SHA).is_dir()
 
 
+def _within(seconds, call, fifo=None):
+    """Run ``call`` in a thread; fail (instead of hanging the suite) when it does not return."""
+    import threading
+
+    box = {}
+    thread = threading.Thread(target=lambda: box.update(value=call()), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive() and fifo is not None:
+        # Let a regressed (blocking) open finish, so the failure is reported instead of a hang.
+        release = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        thread.join(5)
+        os.close(release)
+    assert not thread.is_alive(), "the cache lookup hung on a non-regular entry"
+    return box["value"]
+
+
+def test_fifo_entry_is_a_miss_without_hanging_and_is_removed(tmp_path):
+    cache, dest, pin, final = _setup(tmp_path)
+    (cache / SHA).unlink()
+    os.mkfifo(cache / SHA)
+    assert _within(5, lambda: pf._from_cache(cache, pin, final), cache / SHA) is None
+    assert not (cache / SHA).exists()  # a special file is never a cache entry
+    assert list(dest.iterdir()) == []
+
+
+def test_a_fifo_with_a_writer_open_is_still_a_miss(tmp_path):
+    cache, dest, pin, final = _setup(tmp_path)
+    (cache / SHA).unlink()
+    os.mkfifo(cache / SHA)
+    writer = os.open(cache / SHA, os.O_RDWR)
+    try:
+        assert _within(5, lambda: pf._from_cache(cache, pin, final)) is None
+    finally:
+        os.close(writer)
+    assert list(dest.iterdir()) == []
+
+
+def test_entry_owned_by_another_user_is_a_miss_and_kept(tmp_path, monkeypatch):
+    cache, dest, pin, final = _setup(tmp_path)
+    me = os.geteuid()
+    monkeypatch.setattr(pf.os, "geteuid", lambda: me + 1)
+    assert pf._from_cache(cache, pin, final) is None
+    assert (cache / SHA).read_bytes() == GOOD
+    assert list(dest.iterdir()) == []
+
+
+def test_a_regular_entry_is_still_served_after_the_guard(tmp_path):
+    cache, dest, pin, final = _setup(tmp_path)
+    assert _within(5, lambda: pf._from_cache(cache, pin, final)) == len(GOOD)
+    assert final.read_bytes() == GOOD
+
+
 def test_smaller_max_bytes_is_miss_and_keeps_entry(tmp_path):
     cache, dest, pin, final = _setup(tmp_path, max_bytes=len(GOOD) - 1)
     assert pf._from_cache(cache, pin, final) is None

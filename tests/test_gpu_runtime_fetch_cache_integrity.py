@@ -226,3 +226,55 @@ def test_discard_skips_an_entry_replaced_since_it_was_opened(cache):
     os.replace(replacement, entry)
     c._discard(str(entry), opened)
     assert entry.read_bytes() == DATA
+
+
+def _within(seconds, call, fifo=None):
+    """Run ``call`` in a thread; fail (instead of hanging the suite) when it does not return."""
+    import threading
+
+    box = {}
+    thread = threading.Thread(target=lambda: box.update(value=call()), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive() and fifo is not None:
+        # Let a regressed (blocking) open finish, so the failure is reported instead of a hang.
+        release = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        thread.join(5)
+        os.close(release)
+    assert not thread.is_alive(), "the cache lookup hung on a non-regular entry"
+    return box["value"]
+
+
+def test_fifo_entry_is_a_miss_without_hanging_and_is_removed(cache, target):
+    c, entry = cache
+    entry.unlink()
+    os.mkfifo(entry)
+    assert _within(5, lambda: hit(c, target), entry) is None
+    assert not os.path.lexists(entry)
+    assert_no_part(target)
+
+
+def test_entry_swapped_for_a_fifo_after_the_lstat_does_not_hang_the_open(
+    cache, target, monkeypatch
+):
+    """The lstat saw a regular file; the open then finds a FIFO. It must still be a miss."""
+    c, entry = cache
+    regular = os.lstat(entry)
+    entry.unlink()
+    os.mkfifo(entry)
+    real = os.lstat
+    monkeypatch.setattr(
+        os, "lstat", lambda path, *a, **k: regular if str(path) == str(entry) else real(path)
+    )
+    assert _within(5, lambda: hit(c, target), entry) is None
+    assert stat.S_ISFIFO(real(entry).st_mode)  # not the object the lstat described: kept
+    assert_no_part(target)
+
+
+def test_entry_owned_by_another_user_is_a_miss_and_kept(cache, target, monkeypatch):
+    c, entry = cache
+    me = os.geteuid()
+    monkeypatch.setattr(rt.os, "geteuid", lambda: me + 1)
+    assert hit(c, target) is None
+    assert entry.read_bytes() == DATA
+    assert_no_part(target)

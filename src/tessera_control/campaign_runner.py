@@ -30,10 +30,10 @@ from typing import Any
 from pydantic import ValidationError
 
 from . import campaign_heavy_guard as heavy_guard
+from . import campaign_hold, provider_trust
 from . import campaign_holdout as holdout
 from . import campaign_placement as placement
 from . import execution_frames as frames
-from . import provider_trust
 from .campaign_autoreconcile import (
     MAX_AUTO_REQUEUES,
     NOT_STARTED,
@@ -454,6 +454,10 @@ class CampaignRunner:
             if not live or now >= _parse_utc(ctx.approval["expires_at"]):
                 self._pause(ctx, "approver_not_live" if not live else "approval_expired")
                 return
+        # The not_before hold (G-06): approval expiry above still bounds the wait; nothing starts.
+        if campaign_hold.waiting(ctx.campaign["spec_json"], status, now) is not None:
+            self._actions.append(f"waiting:{campaign_id}:{campaign_hold.REASON}")
+            return
         try:
             if status == "cancel_requested":
                 self._drive_cancel(ctx)

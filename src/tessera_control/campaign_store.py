@@ -20,7 +20,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from . import campaign_heavy_guard_readout as heavy_guard_readout
-from . import campaign_placement, program_budget, provider_trust, smoke_credentials
+from . import campaign_hold, campaign_placement, program_budget, provider_trust, smoke_credentials
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
 from .campaign_holdout import campaign_claims, check_unclaimed
@@ -37,6 +37,7 @@ from .campaign_models import (
     CancelCampaign,
     SubmitCampaign,
     normalize,
+    parse_not_before,
     parse_spec,
     parse_spec_json,
     placement_candidates,
@@ -124,6 +125,15 @@ def infra_retry_policy(spec: Any) -> list[dict[str, Any]]:
 
 def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
     result = {key: value for key, value in dict(row).items() if key != "spec_json"}
+    return result
+
+
+def _read_summary(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The summary plus, while an approved campaign waits for its ``not_before``, ``waiting``."""
+    result = _summary(row)
+    hold = campaign_hold.waiting(row["spec_json"], row["status"], _parse_utc(utc_now()))
+    if hold is not None:
+        result["waiting"] = hold
     return result
 
 
@@ -962,6 +972,14 @@ class CampaignStore(
                     if bound <= now_dt:
                         raise Conflict("The campaign deadline has passed; submit a new campaign.")
                     expires_dt = min(expires_dt, bound)
+            held_until = parse_not_before(getattr(spec, "not_before", None))
+            if held_until is not None and held_until >= expires_dt:
+                # The approval would lapse before the campaign may start, so it could never run.
+                raise Conflict(
+                    "not_before is not before this approval's expiry "
+                    f"({_utc_string(expires_dt)}); the campaign could never start. Submit it "
+                    "with an earlier not_before or a longer deadline_seconds."
+                )
             provenance = decision_provenance(live)
             approval = {
                 "id": "approval_" + uuid.uuid4().hex,
@@ -1258,7 +1276,7 @@ class CampaignStore(
             reruns = reruns_of(connection, campaign_id, campaign["project_id"])
             tree = rerun_tree(connection, campaign) if (rerun_of or reruns) else None
             return {
-                **_summary(campaign),
+                **_read_summary(campaign),
                 **({} if rerun_of is None else {"rerun": rerun_of}),
                 **({} if not reruns else {"reruns": reruns}),
                 # ADR 0074: the re-run tree's first cap, what it has committed, what is left.
@@ -1295,7 +1313,7 @@ class CampaignStore(
                 ORDER BY created_at, id LIMIT ? OFFSET ?""",
                 (project_id, actor["org_id"], limit, offset),
             ).fetchall()
-            return {"campaigns": [_summary(row) for row in rows]}
+            return {"campaigns": [_read_summary(row) for row in rows]}
         finally:
             connection.close()
 
