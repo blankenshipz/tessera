@@ -56,6 +56,16 @@ person's session credential is required: an agent credential, including the reas
 `tessera_resolve_model_spend_reservation` (flag `--model-spend-resolve-tool`) calls the same route; the
 API still requires a person.
 
+## A grant pays for its calls
+
+A reasoning call names the agent authority grant that authorizes it. The reservation is refused
+(`grant_budget_exceeded`, with the remaining budget; or `grant_not_active` for a revoked or expired
+grant) when the grant cannot cover the call's worst case, with no ledger row and nothing sent. The
+grant's remaining budget is its budget minus its execution and delegation holds minus the model spend
+of the calls it paid for (an open reservation counts its worst case, a settled call its settled amount,
+a released call nothing), so settling, releasing and a person's resolution change it with the ledger
+row itself. See [ADR 0142](decisions/0142-grant-budget-debited-by-model-spend.md).
+
 ## What happens when
 
 | Situation | Result |

@@ -23,7 +23,11 @@ from urllib.parse import quote
 CAP_EXCEEDED = "model_spend_cap_exceeded"
 NOT_CONFIGURED = "model_spend_not_configured"
 UNAVAILABLE = "model_spend_unavailable"
-DENIAL_CODES = frozenset({CAP_EXCEEDED, NOT_CONFIGURED})
+# The grant that pays for a call refused it (ADR 0142): nothing was reserved or sent.
+GRANT_BUDGET_EXCEEDED = "grant_budget_exceeded"
+GRANT_NOT_ACTIVE = "grant_not_active"
+GRANT_CODES = frozenset({GRANT_BUDGET_EXCEEDED, GRANT_NOT_ACTIVE})
+DENIAL_CODES = frozenset({CAP_EXCEEDED, NOT_CONFIGURED}) | GRANT_CODES
 RESOLUTIONS = frozenset({"agent_settled", "agent_released", "person_released", "person_settled"})
 _STATUSES = frozenset({"reserved", "settled", "released"})
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -86,7 +90,12 @@ class SpendLedger:
         return f"model-spend:{digest[:48]}"
 
     def reserve(
-        self, run_id: str, seq: int, worst_cents: float, project_id: str | None = None
+        self,
+        run_id: str,
+        seq: int,
+        worst_cents: float,
+        project_id: str | None = None,
+        grant_id: str | None = None,
     ) -> Reservation:
         project = project_id or self.project_id
         worst = _cents(worst_cents)
@@ -101,6 +110,7 @@ class SpendLedger:
                 "provider_id": self.provider_id,
                 "model": self.model,
                 "worst_case_cents": worst,
+                **({"grant_id": grant_id} if grant_id else {}),
             },
             self._key(run_id, seq, "reserve"),
         )

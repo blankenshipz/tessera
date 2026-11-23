@@ -610,8 +610,8 @@ def _columns(path, table) -> list[str]:
         return [r[1] for r in db.execute(f"PRAGMA table_info({table})")]
 
 
-def test_version_is_registered_as_the_latest_step():
-    assert APPROVAL_DELEGATION_SCHEMA_VERSION == 86 == LATEST_SCHEMA_VERSION
+def test_version_is_registered_as_a_step():
+    assert APPROVAL_DELEGATION_SCHEMA_VERSION == 86 <= LATEST_SCHEMA_VERSION
     assert MIGRATIONS[85].__name__ == "migrate_approval_delegation_schema"
 
 

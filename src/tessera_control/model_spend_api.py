@@ -38,6 +38,7 @@ class ReserveBody(_Body):
     provider_id: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,63}$")]
     model: Annotated[str, StringConstraints(min_length=1, max_length=200)]
     worst_case_cents: Cents
+    grant_id: Identifier | None = None
 
 
 class SettleBody(_Body):
@@ -90,7 +91,7 @@ Spend = Annotated[ModelSpendStore, Depends(model_spend_store)]
 @router.post("/reservations")
 def reserve(body: ReserveBody, actor: Actor, key: Key, store: Spend):
     """Reserve a worst-case cost before a billed model call; fail closed (code in the body)."""
-    return result(store.reserve(actor, key, body.model_dump()))
+    return result(store.reserve(actor, key, body.model_dump(exclude_none=True)))
 
 
 @router.post("/reservations/{call_id}/settlement")

@@ -26,6 +26,7 @@ from typing import Any
 
 from .approval_trust import require_decision_actor
 from .external_agents import ExternalAgentStore
+from .grant_model_spend import grant_refusal
 from .store import Conflict, Forbidden, NotFound, StoreError, _connect, canonical_digest, utc_now
 
 
@@ -301,6 +302,17 @@ class ModelSpendStore(ExternalAgentStore):
                         "limit_cents": to_cents(limit["daily_micro"]),
                         "would_be_cents": to_cents(settled + reserved + worst),
                     }
+            grant_id = payload.get("grant_id")
+            if grant_id is not None:
+                # ADR 0142: the grant that pays for the call must be the caller's own, in this
+                # project, active, and have the worst case left. Judged with the ledger caps.
+                grant_refused, grant_row = grant_refusal(
+                    connection, actor, project_id, grant_id, worst
+                )
+                if grant_row is None:
+                    raise NotFound("Agent authority grant was not found.")
+                if refusal is None:
+                    refusal = grant_refused
             if refusal is not None:
                 self._event(
                     connection,
@@ -340,6 +352,12 @@ class ModelSpendStore(ExternalAgentStore):
                     now,
                 ),
             )
+            if grant_id is not None:
+                connection.execute(
+                    "INSERT INTO model_spend_grant_links (call_id, org_id, grant_id, created_at) "
+                    "VALUES (?,?,?,?)",
+                    (ident, org, grant_id, now),
+                )
             row = connection.execute(
                 "SELECT * FROM model_spend_calls WHERE id=?", (ident,)
             ).fetchone()

@@ -139,7 +139,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 87);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 88);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -414,6 +414,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .approval_delegations import create_delegation_schema
 
     create_delegation_schema(connection)
+    from .grant_model_spend import create_grant_model_spend_schema
+
+    create_grant_model_spend_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:

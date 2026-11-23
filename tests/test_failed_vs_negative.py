@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -251,3 +252,79 @@ def test_legacy_attempt_evidence_reports_kind_and_outcome(tmp_path: Path) -> Non
     body = {"statement": "x", "evidence": [citation | {"stance": "supports"}]}
     created = _command(records.create_conclusion, owner, reviewed["experiment_id"], payload=body)
     assert created["evidence"][0]["stance"] == "supports"
+
+
+# -- a conclusion that predates the rule can still be edited (ADR 0128 amendment) -------------
+
+
+def _legacy_stance(world, conclusion_id: str, stance: str) -> None:
+    """Store a stance on a failed run's link the way a conclusion written before the rule has it."""
+    with sqlite3.connect(world["state"] / "tessera.sqlite3") as db:
+        db.execute(
+            "UPDATE research_admitted_conclusion_evidence SET stance=? WHERE conclusion_id=?",
+            (stance, conclusion_id),
+        )
+
+
+def _legacy_draft(tmp_path: Path):
+    world = _admit(tmp_path)
+    _resolve(world, "failed", "The run crashed.")
+    cited = _citation(world)
+    draft = _create(world, cited)
+    _legacy_stance(world, draft["id"], "opposes")
+    return world, cited, draft
+
+
+def _update(world, draft: dict, evidence: list[dict], statement: str = "Revised."):
+    body = {"statement": statement, "evidence": evidence, "expected_revision": draft["revision"]}
+    return _command(world["records"].update_conclusion, world["owner"], draft["id"], payload=body)
+
+
+def test_a_statement_only_edit_keeps_unchanged_legacy_evidence(tmp_path: Path) -> None:
+    world, cited, draft = _legacy_draft(tmp_path)
+    updated = _update(world, draft, [cited | {"stance": "opposes"}])
+    assert updated["statement"] == "Revised." and updated["revision"] == draft["revision"] + 1
+    assert _item(updated)["stance"] == "opposes" and _item(updated)["run_failed"] is True
+
+
+def test_a_new_stanced_link_on_a_failed_run_is_still_refused(tmp_path: Path) -> None:
+    world, cited, draft = _legacy_draft(tmp_path)
+    fresh = _citation(world, "opposes")  # a new measurement of the same failed run
+    body = {
+        "statement": "Revised.",
+        "evidence": [cited | {"stance": "opposes"}, fresh],
+        "expected_revision": draft["revision"],
+    }
+    with pytest.raises(Conflict, match=REFUSED):
+        world["records"].update_conclusion(
+            world["owner"], draft["id"], "new", canonical_digest(body), body
+        )
+
+
+def test_a_changed_stance_on_a_legacy_link_is_still_refused(tmp_path: Path) -> None:
+    world, cited, draft = _legacy_draft(tmp_path)
+    body = {
+        "statement": "Revised.",
+        "evidence": [cited | {"stance": "supports"}],
+        "expected_revision": draft["revision"],
+    }
+    with pytest.raises(Conflict, match=REFUSED):
+        world["records"].update_conclusion(
+            world["owner"], draft["id"], "chg", canonical_digest(body), body
+        )
+
+
+def test_a_link_that_was_stored_without_a_stance_cannot_gain_one(tmp_path: Path) -> None:
+    world = _admit(tmp_path)
+    _resolve(world, "failed", "The run crashed.")
+    cited = _citation(world)
+    draft = _create(world, cited)
+    body = {
+        "statement": "Revised.",
+        "evidence": [cited | {"stance": "opposes"}],
+        "expected_revision": draft["revision"],
+    }
+    with pytest.raises(Conflict, match=REFUSED):
+        world["records"].update_conclusion(
+            world["owner"], draft["id"], "gain", canonical_digest(body), body
+        )

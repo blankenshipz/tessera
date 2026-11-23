@@ -200,7 +200,7 @@ def test_settle_frame_puts_the_read_on_the_stored_receipt(db, monkeypatch):
 def test_the_migration_is_registered_and_adds_the_table_to_an_older_database(tmp_path):
     from tessera_control.store import _connect, initialize_state
 
-    assert GUARDIAN_RECORD_SCHEMA_VERSION == 87 == LATEST_SCHEMA_VERSION
+    assert GUARDIAN_RECORD_SCHEMA_VERSION == 87 <= LATEST_SCHEMA_VERSION
     assert MIGRATIONS[GUARDIAN_RECORD_SCHEMA_VERSION - 1]
     database, _ = initialize_state(tmp_path / "state")
     connection = _connect(database)

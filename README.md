@@ -582,7 +582,11 @@ status, and [DESIGN.md](DESIGN.md) for authoritative contracts.
   reserves each call's worst case in the control plane before it is made and settles the computed
   cost afterwards. A call over a limit, or with no limit configured or the ledger unreachable, is
   refused before anything is sent (fail closed), and the model is never silently changed to a cheaper
-  one. A refusal is evaluated again once a person raises a limit or the UTC day rolls over. Only
+  one. A refusal is evaluated again once a person raises a limit or the UTC day rolls over. A call
+  that names the agent authority grant paying for it also spends that grant's budget: the
+  reservation is refused when the grant is revoked or has less left than the worst case, and the
+  grant's remaining budget is derived from the ledger, so sequential runs cannot bill past it
+  ([ADR 0142](docs/decisions/0142-grant-budget-debited-by-model-spend.md)). Only
   billed destinations use the ledger. Totals are readable through `tessera_model_spend`, every
   settlement is on the call's receipt, and a person resolves an open (uncertain) reservation through a
   recorded route. `tessera-reasoning-readiness` checks everything a first receipted call needs except the

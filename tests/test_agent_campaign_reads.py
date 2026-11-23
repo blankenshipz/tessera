@@ -382,11 +382,10 @@ def test_standing_status_subqueries_match_the_schema(world):
 
 # ---- GET /campaigns/{id}/stage-status: placement, waiting, lease and heartbeat codes ----
 
-NOW = datetime.now(UTC)
-
 
 def _ts(seconds_ago=0, seconds_ahead=0):
-    moment = NOW - timedelta(seconds=seconds_ago) + timedelta(seconds=seconds_ahead)
+    # Reference time is taken per call, not at import, so freshness thresholds hold in long runs.
+    moment = datetime.now(UTC) - timedelta(seconds=seconds_ago) + timedelta(seconds=seconds_ahead)
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 

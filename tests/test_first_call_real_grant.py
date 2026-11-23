@@ -121,11 +121,11 @@ def test_first_call_reads_the_real_grant_and_holdout_and_settles_on_the_ledger(
     assert row["settled_micro"] == ledger["settled_micro_cents"] == math.ceil(call["cost"] * MICRO)
     assert [r["state"] for r in receipt["spend_ledger"]] == ["settled"]
 
-    # The run stayed within the grant: the billed cost fits what the grant has remaining.
     after = grant.read()
     assert (after["status"], after["revision"], after["epoch"]) == ("active", 1, 1)
     assert receipt["cost"] == pytest.approx(call["cost"])
-    assert receipt["cost"] <= after["remaining_budget_cents"]
+    # The grant paid for the call: its remaining budget fell by exactly the settled amount.
+    assert after["remaining_budget_cents"] == pytest.approx(100 - row["settled_micro"] / MICRO)
 
     # The key from the credentials directory went only to the stub; the decoy never did.
     assert len(transport.messages()) == 1
@@ -137,11 +137,6 @@ def test_first_call_reads_the_real_grant_and_holdout_and_settles_on_the_ledger(
         assert secret not in out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a reasoning run settles on the model-spend ledger only; nothing consumes the "
-    "agent authority grant's budget, so remaining_budget_cents does not move",
-)
 def test_grant_budget_is_consumed_by_the_receipted_cost(
     grant, tmp_path, creds, monkeypatch, capsys
 ):
@@ -216,3 +211,132 @@ def test_an_exhausted_grant_budget_is_refused_before_the_network(
     assert ("GET", GRANT + grant.issued["id"], 200) in seen
     assert transport.sent == [] and receipt["model_calls"] == []
     assert grant.rows("SELECT * FROM model_spend_calls") == []
+
+
+# -- the grant's budget is spent by the ledger (ADR 0142) -------------------------------------
+# One run's worst case on the default profile is 1.53 cents (1_530_000 micro-cents).
+
+WORST = 1.53
+
+
+def reserve(grant, worst, *, seq=1, run_id="direct", grant_id="issued", headers=None):
+    body = {
+        "project_id": grant.project,
+        "run_id": run_id,
+        "seq": seq,
+        "provider_id": "anthropic",
+        "model": "m",
+        "worst_case_cents": worst,
+    }
+    if grant_id is not None:
+        body["grant_id"] = grant.issued["id"] if grant_id == "issued" else grant_id
+    response = grant.client.post(
+        "/model-spend/reservations",
+        json=body,
+        headers={**(headers or grant.agent), **grant._key()},
+    )
+    return response
+
+
+def test_a_budget_below_the_worst_case_is_refused_with_no_call_and_no_ledger_row(
+    prepared, tmp_path, creds, monkeypatch, capsys
+):
+    grant = ReasoningGrant(prepared, MODEL, budget_cents=1)
+    grant.limits(per_call=5, daily=20)
+    transport = Transport(ok())
+    code, receipt, _ = run(tmp_path, grant, creds, monkeypatch, capsys, transport)
+    # No billed message was sent (a token-count request is free and precedes the reservation).
+    assert code != 0 and transport.messages() == [] and receipt["model_calls"] == []
+    assert grant.rows("SELECT * FROM model_spend_calls") == []
+    assert grant.read()["remaining_budget_cents"] == 1
+
+
+def test_the_ledger_refuses_a_reservation_the_grant_cannot_cover(prepared):
+    grant = ReasoningGrant(prepared, MODEL, budget_cents=1)
+    grant.limits(per_call=5, daily=20)
+    refused = reserve(grant, WORST)
+    assert refused.status_code == 200
+    answer = refused.json()
+    assert answer["allowed"] is False and answer["code"] == "grant_budget_exceeded"
+    assert answer["remaining_cents"] == 1
+    assert grant.rows("SELECT * FROM model_spend_calls") == []
+    assert grant.rows("SELECT * FROM model_spend_grant_links") == []
+    # A smaller call fits and is debited by its reservation.
+    ok_answer = reserve(grant, 0.4, seq=2).json()
+    assert ok_answer["allowed"] is True
+    assert grant.read()["remaining_budget_cents"] == pytest.approx(0.6)
+    # The next reservation sees the live remaining budget, not the issued one.
+    assert reserve(grant, 0.7, seq=3).json()["code"] == "grant_budget_exceeded"
+
+
+def test_a_budget_just_large_enough_is_admitted_and_debited(
+    prepared, tmp_path, creds, monkeypatch, capsys
+):
+    grant = ReasoningGrant(prepared, MODEL, budget_cents=2)
+    grant.limits(per_call=5, daily=20)
+    transport = Transport(ok())
+    code, receipt, _ = run(tmp_path, grant, creds, monkeypatch, capsys, transport)
+    assert code == 0 and len(transport.messages()) == 1
+    (row,) = grant.rows("SELECT * FROM model_spend_calls")
+    assert row["status"] == "settled"
+    assert grant.read()["remaining_budget_cents"] == pytest.approx(2 - row["settled_micro"] / MICRO)
+    assert len(grant.rows("SELECT * FROM model_spend_grant_links")) == 1
+
+
+def test_sequential_runs_cannot_bill_past_the_grant(prepared, tmp_path, creds, monkeypatch, capsys):
+    grant = ReasoningGrant(prepared, MODEL, budget_cents=2)
+    grant.limits(per_call=5, daily=20)
+    refused = None
+    for n in range(1, 40):
+        transport = Transport(ok())
+        code, receipt, _ = run(
+            tmp_path, grant, creds, monkeypatch, capsys, transport, run_id=f"seq{n}"
+        )
+        if code != 0:
+            refused = (transport, receipt)
+            break
+    assert refused is not None, "the grant's budget never ran out"
+    transport, receipt = refused
+    assert transport.messages() == [] and receipt["model_calls"] == []
+    rows = grant.rows("SELECT * FROM model_spend_calls")
+    assert all(r["status"] == "settled" for r in rows) and len(rows) == n - 1
+    assert sum(r["settled_micro"] for r in rows) <= 2 * MICRO
+    assert not any(r["run_id"] == f"seq{n}" for r in rows)
+
+
+def test_a_released_reservation_gives_the_budget_back(prepared):
+    grant = ReasoningGrant(prepared, MODEL, budget_cents=2)
+    grant.limits(per_call=5, daily=20)
+    held = reserve(grant, 1.5).json()
+    assert grant.read()["remaining_budget_cents"] == pytest.approx(0.5)
+    released = grant.client.post(
+        f"/model-spend/reservations/{held['call_id']}/release",
+        json={"reason": "not_sent"},
+        headers={**grant.agent, **grant._key()},
+    )
+    assert released.status_code == 200, released.text
+    assert grant.read()["remaining_budget_cents"] == 2
+
+
+def test_a_grant_that_is_not_the_callers_or_is_revoked_cannot_pay(prepared):
+    grant = ReasoningGrant(prepared, MODEL, budget_cents=2)
+    grant.limits(per_call=5, daily=20)
+    assert reserve(grant, 0.1, grant_id="agent_authority_grant_nope").status_code == 404
+    assert grant.rows("SELECT * FROM model_spend_calls") == []
+    grant.revoke()
+    answer = reserve(grant, 0.1, seq=2).json()
+    assert answer["allowed"] is False and answer["code"] == "grant_not_active"
+    assert grant.rows("SELECT * FROM model_spend_calls") == []
+
+
+def test_model_spend_is_taken_out_of_what_the_grant_may_delegate(prepared):
+    grant = ReasoningGrant(prepared, MODEL, budget_cents=100)
+    grant.limits(per_call=5, daily=20)
+    assert reserve(grant, 2).json()["allowed"] is True
+    child = {**grant.bounds, "delegation_depth": 0, "budget_cents": 99}
+    response = grant.client.post(
+        f"/agent-authority-grants/{grant.issued['id']}/delegate",
+        json={"expected_revision": 1, "expected_epoch": 1, "bounds": child},
+        headers={**grant.agent, **grant._key()},
+    )
+    assert response.status_code == 403

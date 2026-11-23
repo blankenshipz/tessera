@@ -360,11 +360,16 @@ def test_a_lost_worker_lease_is_visible_over_mcp_and_stays_with_a_person(tmp_pat
     assert steer("tessera_campaign_budget", campaign_id=c)["held_cents"] > 0
     retries = steer("tessera_campaign_retries", campaign_id=c)
     assert retries["campaign_id"] == c
-    # It cannot resolve it: the server registers no reconcile or approve tool, and a stop does
-    # not release the grant.
+    # It cannot resolve it: the server registers no reconcile tool and no unconditional approve
+    # tool (the one "approve" name acts only under a person's signed delegation, ADR 0122, and
+    # needs its own scope), and a stop does not release the grant.
     registered = [tool.name for tool in asyncio.run(steer.server.list_tools())]
     assert registered
-    assert not [n for n in registered if "reconcile" in n or "approve" in n], registered
+    delegated = {"tessera_delegated_approve_campaign"}
+    assert not [
+        n for n in registered if n not in delegated and ("reconcile" in n or "approve" in n)
+    ], registered
+    assert "reconcile" not in " ".join(registered)
     steer(
         "tessera_cancel_campaign",
         campaign_id=c,

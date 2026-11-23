@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (GUARDIAN_RECORD_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 87
+# Literal: must equal the highest registered constant (GRANT_MODEL_SPEND_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 88
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1953,3 +1953,24 @@ def migrate_guardian_record_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(GUARDIAN_RECORD_SCHEMA_VERSION - 1, migrate_guardian_record_schema)
+
+
+# Model calls charged to an agent authority grant (ADR 0142, schema 88): an append-only link from
+# a model-spend call to the grant that pays for it; the grant's spend is derived from the ledger
+# rows it links. Additive and idempotent. The next version after the guardian record (87); if
+# another change owns it when branches merge, raise GRANT_MODEL_SPEND_SCHEMA_VERSION,
+# LATEST_SCHEMA_VERSION (the literal near the top) and the fresh-database INSERT in store.py.
+GRANT_MODEL_SPEND_SCHEMA_VERSION = 88
+
+
+def migrate_grant_model_spend_schema(connection: sqlite3.Connection) -> None:
+    from .grant_model_spend import create_grant_model_spend_schema
+
+    create_grant_model_spend_schema(connection)
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (GRANT_MODEL_SPEND_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(GRANT_MODEL_SPEND_SCHEMA_VERSION - 1, migrate_grant_model_spend_schema)

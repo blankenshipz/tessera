@@ -2529,9 +2529,34 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             "result_assessment": assessment,
         }
 
+    @staticmethod
+    def _stored_evidence_links(
+        connection: sqlite3.Connection, conclusion_id: str
+    ) -> set[tuple[str, str | None, str | None, str | None]]:
+        """The (attempt, artifact, measurement, stance) links a conclusion stores now."""
+        links: set[tuple[str, str | None, str | None, str | None]] = set()
+        for table in ("research_conclusion_evidence", "research_admitted_conclusion_evidence"):
+            for row in connection.execute(
+                f"SELECT attempt_id,artifact_id,measurement_id,stance FROM {table} "
+                "WHERE conclusion_id=?",
+                (conclusion_id,),
+            ):
+                links.add((row[0], row[1], row[2], row[3]))
+        return links
+
     def _validate_evidence(
-        self, connection: sqlite3.Connection, experiment_id: str, evidence: list[dict[str, Any]]
+        self,
+        connection: sqlite3.Connection,
+        experiment_id: str,
+        evidence: list[dict[str, Any]],
+        unchanged: set[tuple[str, str | None, str | None, str | None]] | None = None,
     ) -> list[tuple[str, str, str | None, str | None, bool, str | None]]:
+        """The evidence rows for ``evidence`` after every check.
+
+        ``unchanged`` (an update only) is the conclusion's stored links. A stance on a failed or
+        inconclusive run is refused for a new or changed link, but a citation whose every link is
+        stored with the same stance is kept as it was, so a legacy conclusion that predates the
+        rule can still be edited (ADR 0128 amendment). Every other check still runs."""
         rows: list[tuple[str, str, str | None, str | None, bool, str | None]] = []
         for citation in evidence:
             legacy = connection.execute(
@@ -2545,7 +2570,15 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             ).fetchone()
             if legacy is None and admitted is None:
                 raise NotFound("Cited attempt was not found.")
-            if citation.get("stance") in ("supports", "opposes"):
+            links = [
+                (citation["attempt_id"], artifact_id, None, citation.get("stance"))
+                for artifact_id in citation["artifact_ids"]
+            ] + [
+                (citation["attempt_id"], None, measurement_id, citation.get("stance"))
+                for measurement_id in citation["measurement_ids"]
+            ]
+            kept = bool(unchanged) and bool(links) and all(link in unchanged for link in links)
+            if citation.get("stance") in ("supports", "opposes") and not kept:
                 state = self._cited_attempt_state(
                     connection, citation["attempt_id"], admitted is not None
                 )
@@ -2668,7 +2701,10 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             ):
                 raise Conflict("Conclusion design snapshot cannot change.")
             evidence = self._validate_evidence(
-                connection, conclusion["experiment_id"], body["evidence"]
+                connection,
+                conclusion["experiment_id"],
+                body["evidence"],
+                self._stored_evidence_links(connection, conclusion_id),
             )
             revision, now = conclusion["revision"] + 1, utc_now()
             connection.execute(

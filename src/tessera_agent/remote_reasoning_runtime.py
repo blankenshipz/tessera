@@ -46,7 +46,7 @@ from .model_destinations import (
     validate_credential_ref,
 )
 from .model_input_guard import SealedInputRefused, refuse_sealed_inputs
-from .model_spend_client import CAP_EXCEEDED, NOT_CONFIGURED, SpendLedger
+from .model_spend_client import CAP_EXCEEDED, GRANT_CODES, NOT_CONFIGURED, SpendLedger
 from .provenance_client import ProvenanceClient
 from .remote_reasoning_store import (
     ANSWERED_TOOL_STATUSES,
@@ -376,7 +376,9 @@ class ReasoningSupervisor:
             raise RuntimeBlocked("budget_exhausted")
         if self.billed:
             # Billed cost (cents, computed from pinned prices) must fit the grant budget.
-            if row["cost"] > grant["remaining_budget_cents"]:
+            # With the ledger on, the grant's remaining budget already has this run's settled and
+            # open calls taken out of it (ADR 0142); without it only this run's cost is known.
+            if self._own_cost(row) > grant["remaining_budget_cents"]:
                 raise RuntimeBlocked("budget_exhausted")
             self._daily_fence()
             if self.spend is not None and self._spend_project() is None:
@@ -425,6 +427,11 @@ class ReasoningSupervisor:
         ):
             raise RuntimeBlocked("daily_cap_exceeded")
 
+    def _own_cost(self, row: dict) -> float:
+        """This run's cost to count against the grant's remaining budget: none when the control
+        plane's ledger debits the grant itself (the remaining budget already includes it)."""
+        return 0 if self.spend is not None else row["cost"]
+
     def budget_check(self, worst_tokens: int, worst_cents: float) -> bool:
         """Preflight for one billed call: run, daily (UTC) and grant caps, worst case."""
         limits = self.profile["limits"]
@@ -437,7 +444,7 @@ class ReasoningSupervisor:
             day["tokens"] + worst_tokens > limits["daily_token_cap"]
             or day["cost_cents"] + worst_cents > limits["daily_cost_cap_cents"]
             or row["tokens"] + worst_tokens > self.profile["max_tokens"]
-            or row["cost"] + worst_cents > grant.get("remaining_budget_cents", 0)
+            or self._own_cost(row) + worst_cents > grant.get("remaining_budget_cents", 0)
         ):
             return False
         if self.spend is not None:
@@ -463,15 +470,17 @@ class ReasoningSupervisor:
         if self.store.spend_open(run_id) is not None:
             raise RuntimeBlocked("model_spend_reservation_open")
         seq = self.store.spend_next_seq(run_id)
-        reservation = self.spend.reserve(run_id, seq, worst_cents, project)
+        reservation = self.spend.reserve(
+            run_id, seq, worst_cents, project, (self._grant or {}).get("id")
+        )
         if reservation.allowed:
             self.store.spend_reserved(run_id, seq, reservation.call_id, worst_cents)
             return True
-        if reservation.code in (CAP_EXCEEDED, NOT_CONFIGURED):
+        if reservation.code in (CAP_EXCEEDED, NOT_CONFIGURED, *GRANT_CODES):
             # A definite refusal: record it so the next attempt gets a new key (the ledger
             # replays a refusal for the same key forever). An unreachable ledger is not recorded.
             self.store.spend_denied(run_id, seq)
-        if reservation.code == CAP_EXCEEDED:
+        if reservation.code in (CAP_EXCEEDED, *GRANT_CODES):
             return False  # the client refuses: model_call_cap_exceeded, nothing sent
         if reservation.code == NOT_CONFIGURED:
             raise RuntimeBlocked(NOT_CONFIGURED)

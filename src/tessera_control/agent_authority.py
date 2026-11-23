@@ -21,6 +21,7 @@ from .approval_trust import require_decision_actor
 from .execution import ExecutionStore
 from .experiments import ExperimentStore
 from .external_agents import ExternalAgentStore
+from .grant_model_spend import MICRO, cents_view, grant_remaining_micro, grant_spend_micro
 from .store import (
     _EVENT_LINEAGE,
     Conflict,
@@ -188,14 +189,15 @@ class AgentAuthorityStore(ExternalAgentStore):
         return grant
 
     @staticmethod
-    def _response(row):
+    def _response(row, connection=None):
+        """The grant with its remaining budget: execution and delegation holds and (given the
+        connection) the model spend charged to it (ADR 0142) are both taken out of it."""
         result = dict(row)
         bounds = json.loads(result.pop("bounds_json"))
-        return {
-            **result,
-            "bounds": bounds,
-            "remaining_budget_cents": bounds["budget_cents"] - row["reserved_cents"],
-        }
+        remaining = (bounds["budget_cents"] - row["reserved_cents"]) * MICRO
+        if connection is not None:
+            remaining -= grant_spend_micro(connection, row["id"])
+        return {**result, "bounds": bounds, "remaining_budget_cents": cents_view(remaining)}
 
     def _grant_row(self, connection, actor, grant_id, *, subject=False):
         row = connection.execute(
@@ -403,7 +405,7 @@ class AgentAuthorityStore(ExternalAgentStore):
             connection.execute("BEGIN")
             actor = self._actor(connection, principal)
             row = self._grant_row(connection, actor, grant_id)
-            result = self._response(row)
+            result = self._response(row, connection)
             try:
                 require_active_agent_lineage(connection, grant_id)
                 result["effective_status"] = "active"
@@ -462,7 +464,8 @@ class AgentAuthorityStore(ExternalAgentStore):
             return 200, self._response(
                 connection.execute(
                     "SELECT * FROM agent_authority_grants WHERE id=?", (grant_id,)
-                ).fetchone()
+                ).fetchone(),
+                connection,
             )
 
         return self._mutate(
@@ -494,7 +497,7 @@ class AgentAuthorityStore(ExternalAgentStore):
                 or child["max_duration_seconds"] > parent["max_duration_seconds"]
                 or _time(child["expires_at"]) > _time(parent["expires_at"])
                 or any(b not in parent["bindings"] for b in child["bindings"])
-                or child["budget_cents"] > parent["budget_cents"] - row["reserved_cents"]
+                or child["budget_cents"] * MICRO > grant_remaining_micro(connection, row)
             ):
                 raise Forbidden(
                     "Delegation must be a resource, action, budget and lifetime subset."
@@ -588,7 +591,7 @@ class AgentAuthorityStore(ExternalAgentStore):
                 connection, actor, grant_id, body
             )
             charge = grant["max_exposure_cents"] if call["action"] == "attempt:admit" else 0
-            if charge > bounds["budget_cents"] - row["reserved_cents"]:
+            if charge * MICRO > grant_remaining_micro(connection, row):
                 raise Forbidden("Agent authority budget would be exceeded.")
             if call["action"] == "attempt:admit":
                 status, result = self.experiments._admit_attempt_transaction(
