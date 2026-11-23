@@ -1,4 +1,4 @@
-"""Approved campaign submissions (ADR 0093).
+"""Approved campaign submissions (ADR 0143).
 
 A human records an *approved submission*: the exact spec digest of a campaign to submit
 (``kind=submit``) or a planned re-run of a finished campaign (``kind=rerun``), with a per-run

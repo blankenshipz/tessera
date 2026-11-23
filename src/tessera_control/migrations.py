@@ -1531,7 +1531,7 @@ def migrate_code_review_schema(connection: sqlite3.Connection) -> None:
 MIGRATIONS.setdefault(CODE_REVIEW_SCHEMA_VERSION - 1, migrate_code_review_schema)
 
 
-# Approved campaign submissions (ADR 0093): a human's recorded approval an agent may consume
+# Approved campaign submissions (ADR 0143): a human's recorded approval an agent may consume
 # once, plus its append-only decisions. Additive and idempotent; registered with setdefault.
 # If another change owns this version when branches merge, renumber
 # CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION (LATEST_SCHEMA_VERSION follows it; also the

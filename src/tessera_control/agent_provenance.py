@@ -45,7 +45,7 @@ def _identifier(value: str | None) -> None:
 def _body(record: AgentProvenanceRecord | dict[str, Any]) -> dict[str, Any]:
     body = AgentProvenanceRecord.model_validate(record).model_dump(mode="json")
     # Additive optional output links must not change an older outbox's record digest.
-    for field in ("output_manifest_id", "provider_job_uid"):
+    for field in ("output_manifest_id", "provider_job_uid", "authority_kind"):
         if body["references"].get(field) is None:
             body["references"].pop(field, None)
     for field in ("record_id", "correlation_id", "causation_id", "model_id", "tool_id"):
@@ -138,7 +138,7 @@ def _event(conn, live, project_id, row: sqlite3.Row) -> dict[str, Any]:
     # Never forward arbitrary ordinary event payloads (they may contain prose).
     references = {}
     for key in ProvenanceReferences.model_fields:
-        if key in {"output_manifest_id", "provider_job_uid"}:
+        if key in {"output_manifest_id", "provider_job_uid", "authority_kind"}:
             continue
         value = payload.get(key)
         if isinstance(value, str) and _IDENTIFIER.fullmatch(value):

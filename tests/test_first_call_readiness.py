@@ -15,6 +15,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from readiness_grant_seed import seed_control_state
 from test_reasoning_credential_references import (  # noqa: F401 - anthropic is a fixture
     API_KEY,
     REF_LABEL,
@@ -23,7 +24,6 @@ from test_reasoning_credential_references import (  # noqa: F401 - anthropic is 
 )
 
 from tessera_agent import first_call_readiness as fcr
-from tessera_control.model_spend import create_model_spend_schema
 
 PROJECT = "proj1"
 KEY_FILE = "anthropic-api-key"
@@ -36,21 +36,13 @@ EXPECTED = (
 @pytest.fixture
 def world(anthropic, tmp_path):  # noqa: F811 - imported fixture
     root, profile, env = anthropic
-    profile = {**profile, "model_spend": {"project_id": PROJECT}}
+    # The profile names the grant it runs under (id, revision, epoch); the control state holds
+    # that grant (a reasoning grant, ADR 0155) beside the spend limit.
+    profile = {**profile, "model_spend": {"project_id": PROJECT}, "revision": 1, "epoch": 1}
     write_private(root / "profile", json.dumps(profile))
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
-    control = tmp_path / "control"
-    control.mkdir()
-    database = sqlite3.connect(control / "tessera.sqlite3")
-    create_model_spend_schema(database)
-    database.execute(
-        "INSERT INTO model_spend_limits VALUES ('org1', ?, 'anthropic', 20000000, 90000000, 1, "
-        "'p', 'now')",
-        (PROJECT,),
-    )
-    database.commit()
-    database.close()
+    control = seed_control_state(tmp_path / "control", profile, project=PROJECT)
     return {
         "root": root,
         "profile": profile,
@@ -89,6 +81,7 @@ def test_everything_in_place_is_ready(world):
         "receipts_store",
         "control_slices",
         "spend_caps",
+        "grant",
     ]
     assert all(c["status"] == "ok" for c in report["checks"])
     assert report["key"] == {"present": True, "size_ok": True}
@@ -472,12 +465,12 @@ def test_without_a_project_the_cap_check_is_unchecked_not_failed(world):
 
 def test_no_control_inputs_leave_those_checks_unchecked(world):
     report = run(world, control_state_dir=None, control_url=None)
-    assert report["unchecked"] == ["control_slices", "spend_caps"]
+    assert report["unchecked"] == ["control_slices", "spend_caps", "grant"]
     # Nothing failed, but an unverified spend limit is what makes the first call refuse after the
     # key is installed: this is never ready, and the summary does not say every check passed.
     assert report["overall"] == "not_fully_checked"
     assert "every check passed" not in report["summary"]
-    assert "control_slices, spend_caps" in report["summary"]
+    assert "control_slices, spend_caps, grant" in report["summary"]
 
 
 def test_unchecked_checks_block_ready_except_key_too(world):
@@ -485,7 +478,7 @@ def test_unchecked_checks_block_ready_except_key_too(world):
     report = run(world, control_state_dir=None, control_url=None)
     assert report["overall"] == "not_fully_checked" and report["overall"] != "ready_except_key"
     assert status(report, "api_key_file") == "missing"
-    assert report["unchecked"] == ["control_slices", "spend_caps"]
+    assert report["unchecked"] == ["control_slices", "spend_caps", "grant"]
     # With the control inputs given, the same deployment is ready except the key.
     assert run(world)["overall"] == "ready_except_key"
 

@@ -62,10 +62,23 @@ def cents_view(micro: int) -> int | float:
 
 
 def grant_refusal(
-    connection: sqlite3.Connection, actor: dict, project_id: str, grant_id: str, worst_micro: int
+    connection: sqlite3.Connection,
+    actor: dict,
+    project_id: str,
+    grant_id: str,
+    worst_micro: int,
+    provider_id: str | None = None,
+    model: str | None = None,
 ) -> tuple[dict | None, sqlite3.Row | None]:
     """(refusal, grant row). A grant that is not the caller's own reads as not found (None row,
-    refusal None is never returned for it: the caller raises). The refusal is a closed code."""
+    refusal None is never returned for it: the caller raises). The refusal is a closed code.
+
+    The grant's whole lineage must still be live (an ancestor revoked or expired, or its subject
+    or issuer no longer current, is ``grant_not_active``), and a reasoning grant pays only for
+    calls to its own provider and model (``grant_scope_mismatch``)."""
+    from .agent_authority import require_active_agent_lineage
+    from .store import Forbidden
+
     row = connection.execute(
         "SELECT * FROM agent_authority_grants WHERE id=? AND org_id=?",
         (grant_id, actor["org_id"]),
@@ -82,6 +95,18 @@ def grant_refusal(
         return {"code": "grant_not_active"}, row
     if expiry.tzinfo is None or datetime.now(UTC) >= expiry:
         return {"code": "grant_not_active"}, row
+    try:
+        require_active_agent_lineage(connection, grant_id)
+    except Forbidden:
+        return {"code": "grant_not_active"}, row
+    kind = bounds.get("kind", "execution")
+    if kind not in {"execution", "reasoning"}:
+        return {"code": "grant_scope_mismatch"}, row
+    if kind == "reasoning" and (
+        provider_id != bounds["provider_id"]
+        or model != f"{bounds['provider_id']}/{bounds['model']}"
+    ):
+        return {"code": "grant_scope_mismatch"}, row
     remaining = grant_remaining_micro(connection, row)
     if worst_micro > remaining:
         return {

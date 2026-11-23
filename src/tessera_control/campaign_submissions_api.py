@@ -1,4 +1,4 @@
-"""Approved campaign submission routes (ADR 0093).
+"""Approved campaign submission routes (ADR 0143).
 
 Authorization lives in ``CampaignSubmissionStore``: creating is human-only, consuming needs
 ``campaign:submit_cleared`` for a non-human credential, cancelling is reduce-only

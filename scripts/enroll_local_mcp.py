@@ -146,7 +146,7 @@ def enroll(args, transport_factory=LocalHTTP):
     if getattr(args, "allow_campaigns", False):
         scope["actions"] += ["campaign:submit", "campaign:read", "campaign:cancel"]
     if getattr(args, "allow_campaign_submit_cleared", False):
-        # Consuming a human's recorded approved submission (ADR 0093). Never part of
+        # Consuming a human's recorded approved submission (ADR 0143). Never part of
         # --allow-campaigns: the operator opts in separately.
         for action in ("campaign:submit_cleared", "campaign:read", "campaign:cancel"):
             if action not in scope["actions"]:

@@ -78,7 +78,7 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_steer_campaign_placement": "campaign:cancel",
     # Project limits and spend: the ceiling a budget or concurrency reduction works within.
     "tessera_project_spend": "budget:read",
-    # ADR 0093: approved submissions. A person records the approval; the agent only consumes or
+    # ADR 0143: approved submissions. A person records the approval; the agent only consumes or
     # cancels it. There is no tool that creates, approves or widens one.
     "tessera_list_pending_submissions": "campaign:read",
     "tessera_read_submission": "campaign:read",
@@ -177,6 +177,88 @@ def register_approval_tool(server: FastMCP, client: ControlClient) -> None:
 
     server.tool(annotations=write)(tessera_approve_campaign)
     server.tool(annotations=write)(tessera_record_gate_decision)
+
+
+def register_reasoning_grant_tool(server: FastMCP, client: ControlClient) -> None:
+    """The reasoning-grant tool, only when the operator turns it on (``--reasoning-grant-tool``).
+
+    A thin client of ``POST /projects/{id}/agent-authority-grants`` with ``bounds.kind`` set to
+    ``reasoning`` (ADR 0155). The control API still decides: it refuses any credential that is not
+    a person's session (an agent credential gets a 403; this adapter never sends an automation
+    label, so the bare owner credential is refused too), refuses with
+    ``model_spend_not_configured`` until the project has model-spend limits, and caps the expiry.
+    Run it as a separate operator server with a person's own credential file.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from tessera_control.authority_cli import MAX_EXPIRES_IN, grant_summary
+    from tessera_mcp.mcp_workflow import ReasoningBounds
+
+    write = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    )
+
+    async def tessera_issue_reasoning_grant(
+        subject_credential_id: str,
+        destination: str,
+        provider_id: str,
+        model: str,
+        budget_cents: int,
+        expires_in_seconds: int | None = None,
+        expires_at: str | None = None,
+        purpose: str = "reasoning model calls",
+        max_duration_seconds: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue a reasoning-only grant for an agent credential (a person's credential).
+
+        The grant pays for model calls to one provider and bare model id (for example
+        provider_id "anthropic") and authorizes nothing else: no stage launch, no execution, no
+        provider effect. budget_cents is at least 1. Give exactly one of expires_in_seconds
+        (1-86400 from now) or expires_at (ISO 8601 with an offset, at most 24 hours ahead); it
+        must end before the subject credential expires. destination is the agent's identity
+        destination, not the model host. max_duration_seconds caps a single run (default 86400;
+        the grant's expiry still ends every run). Refused with model_spend_not_configured until
+        a person has set the project's model-spend limits. Returns the grant id, revision, epoch,
+        remaining budget, expires_at and the runtime profile fields; never a credential. A fresh
+        idempotency key is used per call unless you supply one; to replay a lost answer send the
+        SAME key with the expires_at the first call used (the body must be identical).
+        """
+        now = datetime.now(UTC)
+        if (expires_in_seconds is None) == (expires_at is None):
+            raise ValueError("Give exactly one of expires_in_seconds or expires_at; nothing sent.")
+        if expires_at is not None:
+            try:
+                expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError("expires_at must be ISO 8601; nothing was sent.") from None
+            if expiry.tzinfo is None or expiry.utcoffset() is None:
+                raise ValueError("expires_at needs an offset; nothing was sent.")
+        else:
+            if type(expires_in_seconds) is not int or not 1 <= expires_in_seconds <= MAX_EXPIRES_IN:
+                raise ValueError(f"expires_in_seconds must be 1-{MAX_EXPIRES_IN}; nothing sent.")
+            expiry = now + timedelta(seconds=expires_in_seconds)
+        if max_duration_seconds is None:
+            # Not derived from the clock, so a replay with the same key and expires_at matches.
+            max_duration_seconds = MAX_EXPIRES_IN
+        bounds = ReasoningBounds.model_validate(
+            {
+                "kind": "reasoning",
+                "subject_credential_id": subject_credential_id,
+                "destination": destination,
+                "model": model,
+                "purpose": purpose,
+                "provider_id": provider_id,
+                "actions": ["model:call"],
+                "budget_cents": budget_cents,
+                "max_duration_seconds": max_duration_seconds,
+                "expires_at": expiry,
+            }
+        ).model_dump(mode="json")
+        key = idempotency_key or "issue-reasoning-" + uuid.uuid4().hex
+        return grant_summary(await client.issue_reasoning_grant(bounds, key))
+
+    server.tool(annotations=write)(tessera_issue_reasoning_grant)
 
 
 RETENTION_TOOL_SCOPES = {
@@ -842,7 +924,7 @@ def register_campaign_tools(
         )
 
     async def tessera_list_pending_submissions(offset: int = 0, limit: int = 50) -> dict[str, Any]:
-        """List approved submissions of this project that are still pending (ADR 0093).
+        """List approved submissions of this project that are still pending (ADR 0143).
 
         Each was approved by a person with a per-run budget cap and an expiry; read its
         revision here, then submit it with tessera_submit_cleared_campaign.
@@ -1122,6 +1204,7 @@ def create_server(
     storage_retention_tool: bool = False,
     model_spend_resolve_tool: bool = False,
     retention_actions: frozenset[str] | None = None,
+    reasoning_grant_tool: bool = False,
 ) -> FastMCP:
     server = FastMCP(
         "Tessera research bench",
@@ -1240,6 +1323,9 @@ def create_server(
     if model_spend_resolve_tool:
         # Operator-enabled; the control API accepts it only from a person's session credential.
         register_model_spend_resolve_tool(server, client)
+    if reasoning_grant_tool:
+        # Operator-enabled; the control API accepts it only from a person's session credential.
+        register_reasoning_grant_tool(server, client)
     if storage_retention_tool or retention_actions:
         # Status by --storage-retention-tool or retention:read; plan/apply by enrolled scope.
         register_storage_retention_tool(server, client, retention_actions)
@@ -1397,6 +1483,15 @@ def main(argv=None):
             "run it as a separate operator server with its own credential file"
         ),
     )
+    parser.add_argument(
+        "--reasoning-grant-tool",
+        action="store_true",
+        help=(
+            "register tessera_issue_reasoning_grant (a person issues a reasoning-only grant, "
+            "ADR 0155). The control API accepts it only from a person's session credential, so "
+            "run it as a separate operator server with its own credential file"
+        ),
+    )
     arguments = parser.parse_args(argv)
     if arguments.agent_loop_ledger is not None and arguments.agent_loop_marker is None:
         parser.error("--agent-loop-ledger requires --agent-loop-marker")
@@ -1416,6 +1511,7 @@ def main(argv=None):
         or arguments.review_decision_tool
         or arguments.person_enrollment_tool
         or arguments.model_spend_resolve_tool
+        or arguments.reasoning_grant_tool
     ):
         campaign_tools = False  # a decision flag alone is a decision-only server
     live = None
@@ -1428,6 +1524,7 @@ def main(argv=None):
         arguments.review_decision_tool
         or arguments.person_enrollment_tool
         or arguments.model_spend_resolve_tool
+        or arguments.reasoning_grant_tool
         or approve_only
     ):
         live = _live_actions(client)  # explicit --campaign-tools[/-no]: review still follows scopes
@@ -1462,11 +1559,14 @@ def main(argv=None):
         extra["storage_retention_tool"] = True
     if arguments.model_spend_resolve_tool:
         extra["model_spend_resolve_tool"] = True
+    if arguments.reasoning_grant_tool:
+        extra["reasoning_grant_tool"] = True
     decision_only = (
         arguments.approval_tool
         or arguments.review_decision_tool
         or arguments.person_enrollment_tool
         or arguments.model_spend_resolve_tool
+        or arguments.reasoning_grant_tool
     ) and not arguments.storage_retention_tool
     if campaign_actions is not None:
         held = campaign_actions

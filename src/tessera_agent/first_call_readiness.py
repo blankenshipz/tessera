@@ -2,14 +2,16 @@
 
 ``tessera-reasoning-readiness check`` verifies everything the first call needs EXCEPT the key
 value: the profile, the credential reference file, the model-runtime egress allowlist, the receipts
-store, the control-plane slices and the model-spend caps. The API key file is looked at by
-``stat`` only (present, owner, mode, size): it is never opened, read, hashed or printed, so no
-function here can leak it. A deployment that is complete apart from the key file reports
-``ready_except_key``; anything else that is missing or wrong reports ``not_ready``. A check that
-could not run (``unchecked``, for example the spend caps without ``--control-state-dir``) is NOT
-a pass: it keeps the report from saying ``ready`` or ``ready_except_key`` and the result is
-``not_fully_checked`` (its own non-zero exit status), because an unverified spend limit is exactly
-what makes the first call fail after the key is installed.
+store, the control-plane slices, the model-spend caps and the agent authority grant the profile
+names (an execution grant or a reasoning-only one, ADR 0155; read-only from the control database).
+The API key file is looked at by ``stat`` only (present, owner, mode, size): it is never opened,
+read, hashed or printed, so no function here can leak it. A deployment that is complete apart from
+the key file reports ``ready_except_key``; anything else that is missing or wrong reports
+``not_ready``. A check that could not run (``unchecked``, for example the spend caps without
+``--control-state-dir``) is NOT a pass: it keeps the report from saying ``ready`` or
+``ready_except_key`` and the result is ``not_fully_checked`` (its own non-zero exit status),
+because an unverified spend limit is exactly what makes the first call fail after the key is
+installed.
 
 It makes no model call and no outbound call except two unauthenticated probes of the control
 plane's own ``/health/ready`` and ``/model-spend/limits`` routes when ``--control-url`` is given
@@ -28,6 +30,7 @@ import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -71,7 +74,8 @@ SUMMARIES = {
     # {names} is the checks that could not run; this is not a pass.
     "not_fully_checked": (
         "not fully checked: {names} could not be verified (pass --control-url and "
-        "--control-state-dir, or check the limits through GET /model-spend); no check failed, "
+        "--control-state-dir, or check the limits through GET /model-spend and the grant through "
+        "GET /agent-authority-grants/{{id}}); no check failed, "
         "but this is not a pass and the first call may still be refused"
     ),
 }
@@ -365,6 +369,22 @@ def _spend_query_failure(name: str, exc: sqlite3.Error) -> dict[str, Any]:
     return _check(name, "fail", "the control database cannot be queried")
 
 
+def _open_control_database(name: str, control_state_dir: Path):
+    """(read-only connection, None) or (None, the failing check). Never creates the file."""
+    database = Path(control_state_dir) / "tessera.sqlite3"
+    try:
+        return sqlite3.connect(f"file:{database}?mode=ro", uri=True), None
+    except sqlite3.Error:
+        try:
+            os.stat(database)
+        except (FileNotFoundError, NotADirectoryError):
+            return None, _check(name, "fail", "the control database cannot be opened read-only")
+        except OSError:
+            pass  # this user cannot even look into the control state directory
+        # present, but not for this user
+        return None, _check(name, "fail", UNREADABLE_CONTROL_DATABASE)
+
+
 def _spend_caps(
     profile: dict | None, control_state_dir: Path | None, project_id: str | None
 ) -> dict[str, Any]:
@@ -381,17 +401,9 @@ def _spend_caps(
             "comes from the grant at run time)",
             "set model_spend.project_id in the profile or pass --project-id",
         )
-    database = Path(control_state_dir) / "tessera.sqlite3"
-    try:
-        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    except sqlite3.Error:
-        try:
-            os.stat(database)
-        except (FileNotFoundError, NotADirectoryError):
-            return _check(name, "fail", "the control database cannot be opened read-only")
-        except OSError:
-            pass  # this user cannot even look into the control state directory
-        return _check(name, "fail", UNREADABLE_CONTROL_DATABASE)  # present, but not for this user
+    connection, failure = _open_control_database(name, control_state_dir)
+    if connection is None:
+        return failure
     try:
         try:
             rows = {
@@ -430,6 +442,214 @@ def _spend_caps(
             "lower limits.max_cost_cents_per_call in the profile or raise the cap (a person)",
         )
     return _check(name, "ok", "a usable limit exists and covers the profile's per-call bound")
+
+
+ISSUE_REASONING_GRANT = (
+    "a person issues a reasoning grant with `tessera authority issue-reasoning` (or POST "
+    "/projects/{id}/agent-authority-grants with bounds.kind reasoning) and sets the profile's "
+    "grant_id, revision and epoch to the issued grant's"
+)
+_GRANT_FIXES = {
+    "grant_profile_incomplete": "set grant_id, revision and epoch in the profile",
+    "grant_missing": ISSUE_REASONING_GRANT,
+    "grant_malformed": ISSUE_REASONING_GRANT,
+    "grant_kind_unsupported": ISSUE_REASONING_GRANT,
+    "grant_revoked": ISSUE_REASONING_GRANT,
+    "grant_expired": ISSUE_REASONING_GRANT,
+    "grant_lineage_inactive": "the grant's ancestry, subject credential or issuer is no longer "
+    "live; " + ISSUE_REASONING_GRANT,
+    "grant_revision_mismatch": "set the profile's revision and epoch to the grant's current "
+    "ones, or issue a new grant",
+    "grant_scope_mismatch": "issue a grant for this profile's project, agent credential, "
+    "destination, provider and model (a reasoning grant carries exactly ['model:call'] and no "
+    "bindings), or correct the profile",
+    "grant_binding_inactive": "the execution grant this agent grant is bound to is no longer "
+    "active at its pinned revision and epoch; " + ISSUE_REASONING_GRANT,
+    "grant_budget_exhausted": ISSUE_REASONING_GRANT + " (with a budget that covers the run)",
+    "grant_budget_below_call_cap": "issue a grant whose budget covers at least one call at the "
+    "profile's limits.max_cost_cents_per_call, or lower that bound",
+}
+
+
+def _grant_finding(code: str, detail: str) -> dict[str, Any]:
+    """A named finding: the detail starts with its stable code."""
+    return _check("grant", "fail", f"{code}: {detail}", _GRANT_FIXES[code])
+
+
+def _is_revision(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _grant(
+    profile: dict | None, control_state_dir: Path | None, project_id: str | None
+) -> dict[str, Any]:
+    """The agent authority grant the profile names, read-only from the control database: it
+    exists, is active with a live lineage, unexpired, at the profile's revision and epoch, in the
+    spend project, scoped to this profile and has budget for one call at the per-call cap. A
+    reasoning grant (ADR 0155) must carry exactly ``model:call``, no binding, and the profile's
+    provider and model; an execution grant must still have every bound execution grant active.
+    Anything unreadable or malformed fails: this check never reports a grant it could not read."""
+    name = "grant"
+    if control_state_dir is None:
+        return _check(name, "unchecked", "no --control-state-dir was given")
+    if profile is None:
+        return _check(name, "unchecked", "the profile is not valid")
+    grant_id = profile.get("grant_id")
+    if not isinstance(grant_id, str) or not (
+        _is_revision(profile.get("revision")) and _is_revision(profile.get("epoch"))
+    ):
+        return _grant_finding(
+            "grant_profile_incomplete",
+            "the profile does not name the grant's id, revision and epoch",
+        )
+    connection, failure = _open_control_database(name, control_state_dir)
+    if connection is None:
+        return failure
+    try:
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                "SELECT * FROM agent_authority_grants WHERE id=?", (grant_id,)
+            ).fetchone()
+        except sqlite3.Error as exc:
+            return _grant_query_failure(name, exc)
+        if row is None:
+            return _grant_finding("grant_missing", "no agent authority grant has the profile's id")
+        try:
+            return _grant_row(connection, row, profile, project_id)
+        except sqlite3.Error as exc:
+            return _grant_query_failure(name, exc)
+        except (KeyError, TypeError, ValueError, AttributeError):  # fail closed, never crash
+            return _grant_finding("grant_malformed", "the grant and the profile cannot be compared")
+    finally:
+        connection.close()
+
+
+def _grant_query_failure(name: str, exc: sqlite3.Error) -> dict[str, Any]:
+    message = str(exc).lower()
+    if any(marker in message for marker in _SCHEMA_MARKERS):
+        return _check(
+            name,
+            "fail",
+            "the control database is older than the agent authority and model-spend slices",
+            "migrate the control database (upgrade the control plane)",
+        )
+    return _spend_query_failure(name, exc)
+
+
+def _grant_row(connection, row, profile: dict, project_id: str | None) -> dict[str, Any]:
+    from tessera_control.agent_authority import require_active_agent_lineage
+    from tessera_control.agent_authority_models import authority_kind
+    from tessera_control.grant_model_spend import MICRO, grant_remaining_micro
+    from tessera_control.store import StoreError
+
+    now = datetime.now(UTC)
+    try:
+        bounds = json.loads(row["bounds_json"])
+        if not isinstance(bounds, dict):
+            raise TypeError
+        kind = authority_kind(bounds)
+        expiry = datetime.fromisoformat(bounds["expires_at"].replace("Z", "+00:00"))
+        budget = bounds["budget_cents"]
+        if expiry.tzinfo is None or not isinstance(budget, int) or isinstance(budget, bool):
+            raise ValueError
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return _grant_finding("grant_malformed", "the grant's stored bounds cannot be read")
+    if kind not in {"execution", "reasoning"}:
+        return _grant_finding("grant_kind_unsupported", "the grant kind is not known here")
+    if row["status"] != "active":
+        return _grant_finding("grant_revoked", "the grant is not active")
+    if now >= expiry:
+        return _grant_finding("grant_expired", "the grant has expired")
+    try:
+        require_active_agent_lineage(connection, row["id"])
+    except (StoreError, ValueError, KeyError, TypeError, AttributeError):
+        return _grant_finding(
+            "grant_lineage_inactive", "the grant's lineage is revoked, expired or not live"
+        )
+    if row["revision"] != profile["revision"] or row["epoch"] != profile["epoch"]:
+        return _grant_finding(
+            "grant_revision_mismatch",
+            "the grant's revision or epoch is not the profile's (the runtime fence refuses it)",
+        )
+    model = profile.get("model") or {}
+    fields = []
+    if project_id and row["project_id"] != project_id:
+        fields.append("project")
+    if (
+        row["subject_credential_id"] != profile.get("subject_credential_id")
+        or bounds.get("subject_credential_id") != row["subject_credential_id"]
+    ):
+        fields.append("subject_credential_id")
+    if bounds.get("destination") != profile.get("destination"):
+        fields.append("destination")
+    if bounds.get("model") != model.get("id"):
+        fields.append("model")
+    duration = bounds.get("max_duration_seconds")
+    if not _is_revision(duration) or profile.get("max_duration_seconds", 0) > duration:
+        fields.append("max_duration_seconds")
+    if kind == "reasoning":
+        if bounds.get("provider_id") != model.get("providerID"):
+            fields.append("provider_id")
+        if bounds.get("actions") != ["model:call"]:
+            fields.append("actions")
+        if bounds.get("bindings") != []:
+            fields.append("bindings")
+    if fields:
+        return _grant_finding(
+            "grant_scope_mismatch",
+            "the grant does not match the profile on: " + ", ".join(fields),
+        )
+    if kind == "execution" and not _execution_bindings_active(connection, bounds, now):
+        return _grant_finding(
+            "grant_binding_inactive",
+            "an execution grant this agent grant is bound to is not active, current and unexpired",
+        )
+    remaining = grant_remaining_micro(connection, row)
+    if remaining <= 0:
+        return _grant_finding("grant_budget_exhausted", "the grant has no budget left")
+    cap = (profile.get("limits") or {}).get("max_cost_cents_per_call")
+    if not isinstance(cap, int | float) or isinstance(cap, bool) or cap <= 0:
+        return _grant_finding(
+            "grant_profile_incomplete", "the profile has no usable limits.max_cost_cents_per_call"
+        )
+    if remaining < int(cap * MICRO):
+        return _grant_finding(
+            "grant_budget_below_call_cap",
+            "the grant's remaining budget is below the profile's max_cost_cents_per_call, so the "
+            "first reservation would be refused",
+        )
+    return _check(
+        "grant",
+        "ok",
+        f"an active, unexpired {kind} grant matches the profile and covers one call at the "
+        "per-call cap",
+    )
+
+
+def _execution_bindings_active(connection, bounds: dict, now: datetime) -> bool:
+    """An execution-kind agent grant is usable only while every execution grant it is bound to
+    is active at the pinned revision and epoch and unexpired (the issuance rule)."""
+    bindings = bounds.get("bindings")
+    if not isinstance(bindings, list) or not bindings:
+        return False
+    for binding in bindings:
+        try:
+            found = connection.execute(
+                "SELECT status, revision, epoch, expires_at FROM execution_grants WHERE id=?",
+                (binding["execution_grant_id"],),
+            ).fetchone()
+            if (
+                found is None
+                or found["status"] != "active"
+                or found["revision"] != binding["expected_execution_grant_revision"]
+                or found["epoch"] != binding["expected_execution_epoch"]
+                or datetime.fromisoformat(found["expires_at"].replace("Z", "+00:00")) <= now
+            ):
+                return False
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+    return True
 
 
 # -- the report ------------------------------------------------------------------------------------
@@ -483,6 +703,7 @@ def run_checks(
         _receipts_store(Path(state_dir), state_owner_uid),
         _control_slices(control_url, opener),
         _spend_caps(profile, control_state_dir, project),
+        _grant(profile, control_state_dir, project),
     ]
     blocking = [c for c in checks if c["status"] not in {"ok", "unchecked"}]
     unchecked = [c["name"] for c in checks if c["status"] == "unchecked"]

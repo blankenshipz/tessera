@@ -209,11 +209,14 @@ class McpToolBridge:
             params = types.PaginatedRequestParams(cursor=cursor) if cursor else None
             result = await session.list_tools(params=params)
             for tool in result.tools:
+                annotations = getattr(tool, "annotations", None)
                 tools.append(
                     {
                         "name": tool.name,
                         "description": tool.description or "",
                         "input_schema": dict(tool.inputSchema or {"type": "object"}),
+                        # Not part of the catalog pin; read by the reasoning-grant tool fence.
+                        "read_only": getattr(annotations, "readOnlyHint", None) is True,
                     }
                 )
             cursor = result.nextCursor
@@ -327,6 +330,21 @@ class McpToolBridge:
             }
             for name in sorted(self.allowed)
         ]
+
+    def read_only_tools(self) -> frozenset[str]:
+        """Allowed tools the live server marks read-only (``readOnlyHint`` true). A tool with
+        no annotation, or a duplicate name, is never read-only."""
+        catalog = self._catalog
+        if catalog is None:
+            raise ToolBridgeBlocked("tool_bridge_not_started")
+        names = [tool.get("name") for tool in catalog]
+        return frozenset(
+            tool["name"]
+            for tool in catalog
+            if tool["name"] in self.allowed
+            and names.count(tool["name"]) == 1
+            and tool.get("read_only") is True
+        )
 
     def call(self, name: str, arguments: dict) -> tuple[str, bool]:
         """Run one allowed tool. Returns ``(result_text, is_error)``.

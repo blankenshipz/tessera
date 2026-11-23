@@ -35,6 +35,17 @@ writes only a transient probe file in the state directory.
    (see [model spend](model-spend.md)). Nothing is spent until a person does. The grant's project must
    equal the profile's `model_spend.project_id`; if both are set and differ, or neither is, the call
    is refused with `model_spend_not_configured`.
+   **Issue the reasoning grant.** The call names an agent authority grant, and an execution grant (which
+   needs a running experiment) is not required: a person issues a reasoning-only grant
+   ([ADR 0155](decisions/0155-reasoning-only-grant.md)). See
+   [reasoning first call: operator steps](reasoning-first-call-ops.md) for the command.
+   The profile must carry the issued `grant_id`, `revision` and `epoch`. The readiness `grant` check (it
+   needs `--control-state-dir`, otherwise it reports `unchecked`) reads the control database read-only and
+   fails closed with a named finding: `grant_profile_incomplete`, `grant_missing`, `grant_malformed`,
+   `grant_kind_unsupported`, `grant_revoked`, `grant_expired`, `grant_lineage_inactive`,
+   `grant_revision_mismatch`, `grant_scope_mismatch`, `grant_binding_inactive` (execution kind only),
+   `grant_budget_exhausted` or `grant_budget_below_call_cap`. It does not check the subject's scopes (issuance
+   does) or the read-only tool gate (the runtime does).
 5. **Run the check** in the unit's own context, as root: `tessera-reasoning-readiness check --in-unit`
    (it runs the check as the service user with the unit's `LoadCredential=` files, where they are
    root-owned 0400/0440, and the unit's listed sandbox properties; a credential whose source file

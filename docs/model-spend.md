@@ -66,6 +66,18 @@ of the calls it paid for (an open reservation counts its worst case, a settled c
 a released call nothing), so settling, releasing and a person's resolution change it with the ledger
 row itself. See [ADR 0142](decisions/0142-grant-budget-debited-by-model-spend.md).
 
+## A reasoning-only grant (no experiment needed)
+
+An execution grant needs a running experiment to bind to. For the agent loop's own model calls
+(critiques, research and review jobs, MCP steering) a person, or the owner token with an automation
+label, issues a reasoning-kind grant instead ([ADR 0155](decisions/0155-reasoning-only-grant.md)):
+actions `["model:call"]` only, no bindings, its own budget of at least 1 cent and an expiry of at most
+24 hours. Issuance is refused (`model_spend_not_configured`) when the project has no limit for the
+provider. The debit above applies unchanged, and a reservation for a different provider or model than
+the grant names is refused (`grant_scope_mismatch`). The grant limits spending and authority only; the
+egress to the model host is enforced by the model destination and the egress allowlist, not by the
+grant. It cannot consume, delegate or launch anything.
+
 ## What happens when
 
 | Situation | Result |

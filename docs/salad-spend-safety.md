@@ -145,8 +145,12 @@ The reservation becomes terminal automatically when all of these hold:
    name is not there; that the project exists comes only from step 4;
 4. the project's group list (the only proof that the project exists) is a
    complete page (HTTP 200, fewer than 100
-   well-formed items, no pagination keys such as `next`, `page`, `cursor` or
-   `continuation`) with no group of that name.
+   well-formed items, no pagination keys such as `next`, `page`, `cursor`,
+   `total` or `continuation`) with no group of that name. Salad documents no
+   paging for this read (no query parameters, `items` with `maxItems: 100`), so
+   100 or more items may be truncated and are never this proof
+   ([ADR 0031 addendum](decisions/0031-salad-single-container-gpu.md#addendum-the-project-group-list-proves-absence-only-when-complete)).
+   The list read accepts a body up to 4 MiB; every other read keeps 64 KiB.
 
 The margin: a create is only dispatched by the trusted server right after a
 guardian `ready`, which is refused at the stop deadline (never later than the

@@ -31,7 +31,27 @@ LIMIT = 65536
 READ_DEADLINE_SECONDS = 2
 CREATE_DEADLINE_SECONDS = 12
 # Keys that mean a group-list page may be one of several: such a page proves nothing.
-PAGINATION_HINTS = ("next", "page", "continu", "cursor", "token", "offset", "more", "link")
+PAGINATION_HINTS = (
+    "next",
+    "page",
+    "continu",
+    "cursor",
+    "token",
+    "offset",
+    "more",
+    "link",
+    "total",
+)
+# The project group list (GET .../containers, ``list_container_groups``) takes no query
+# parameters and returns ``{"items": [...]}`` with no page, page_size, total or cursor
+# field; the published schema caps ``items`` at ``maxItems: 100``. So the list is the
+# whole collection only when it holds fewer than LIST_COMPLETE_BELOW items and no
+# pagination key: a list of 100 (or, against the schema, more) may be truncated and
+# never proves a name absent. Each group object runs to kilobytes, so a project with
+# tens of groups outgrows the 64 KiB read cap: the list read alone gets LIST_LIMIT
+# (room for 100 groups of up to ~40 KiB each), still a bounded, single read.
+LIST_COMPLETE_BELOW = 100
+LIST_LIMIT = 4 * 1024 * 1024
 
 
 def _group_not_found(data):
@@ -434,6 +454,7 @@ class SaladHTTPTransport:
         absent_ok=False,
         rejection_ok=False,
         total=READ_DEADLINE_SECONDS,
+        limit=LIMIT,
     ):
         """One bounded request. Only with ``absent_ok`` is a fully read (Content-Length
         matched when sent), in-deadline HTTP 404 returned, as ``(404, parsed JSON
@@ -442,7 +463,9 @@ class SaladHTTPTransport:
         Only with ``rejection_ok`` (the create POST) does a fully read, in-deadline
         HTTP 400/422 whose body is a ProblemDetails object raise ``_Rejected`` with a
         bounded summary; any other body for those statuses, and every other non-2xx,
-        stays ``provider_unavailable``/``malformed_response``."""
+        stays ``provider_unavailable``/``malformed_response``.
+
+        ``limit`` bounds the body; only the project group-list read passes LIST_LIMIT."""
         connection = None
         self._request_kind = self._classify_request(method, path)
         try:
@@ -475,13 +498,13 @@ class SaladHTTPTransport:
             content_type = getheader("Content-Type") if callable(getheader) else None
             self._remaining(connection, deadline)
             raw = bytearray()
-            while len(raw) <= LIMIT:
+            while len(raw) <= limit:
                 self._remaining(connection, deadline)
-                chunk = response.read1(min(4096, LIMIT + 1 - len(raw)))
+                chunk = response.read1(min(4096, limit + 1 - len(raw)))
                 if not chunk:
                     break
                 raw.extend(chunk)
-            if len(raw) > LIMIT or secret.contains_in(raw):
+            if len(raw) > limit or secret.contains_in(raw):
                 raise _Failure("malformed_response")
             if 300 <= status < 400:
                 raise _Failure("redirect_denied")
@@ -808,8 +831,55 @@ class SaladHTTPTransport:
         except Exception as error:
             return self._failed(_unexpected(error))
 
+    def _list_groups(self, secret):
+        """The one project group-list read; every caller goes through it.
+
+        Returns ``(items, complete, paged)``. A reached, well-formed list (HTTP 200,
+        an ``items`` list of objects with string names) proves the project exists.
+        ``paged`` is True when the body carries a pagination key. ``complete`` is True
+        only when the list is the whole collection: fewer than LIST_COMPLETE_BELOW
+        items and not ``paged`` (see LIST_COMPLETE_BELOW).
+        Only a complete list can prove a name absent. Any failed, oversized or
+        malformed read raises ``_Failure``, never an empty or partial result.
+        """
+        _, data = self._request("GET", self._groups, secret, limit=LIST_LIMIT)
+        items = data.get("items")
+        if type(items) is not list or not all(
+            type(g) is dict and type(g.get("name")) is str for g in items
+        ):
+            raise _Failure("malformed_response")
+        paged = any(hint in key.lower() for key in data for hint in PAGINATION_HINTS)
+        return items, not paged and len(items) < LIST_COMPLETE_BELOW, paged
+
+    def _find_group(self, secret):
+        """Exact reserved group observation, or None when its absence is proven.
+
+        The list read proves the project exists and finds the group when listed. When
+        the list cannot prove absence (100+ items, or a pagination key), the exact-name
+        read decides: a fully read ProblemDetails 404 on that name (in a project the
+        list just reached) is absence; a 200 is the group. Anything else fails closed.
+        """
+        name = self._selection.salad.group
+        items, complete, _ = self._list_groups(secret)
+        matching = [g for g in items if g["name"] == name]
+        if len(matching) > 1:
+            raise _Failure("identity_mismatch")
+        if matching:
+            return self._group_observation(matching[0], None)
+        if complete:
+            return None
+        status, data = self._request("GET", self._group, secret, absent_ok=True)
+        if status == 404:
+            if not _group_not_found(data):
+                raise _Failure("malformed_response")
+            return None
+        if status != 200:
+            raise _Failure("malformed_response")
+        return self._group_observation(data, None)
+
     def preflight(self, selection, secret):
-        """Four requests, each with a two-second timeout, not a two-second total.
+        """Four requests (five when the group list cannot prove absence), each with a
+        two-second timeout, not a two-second total.
 
         Stamp the earliest read. The caller must enforce admission's five-second
         freshness window; a slow preflight can legitimately expire before admission.
@@ -817,14 +887,9 @@ class SaladHTTPTransport:
         try:
             self._check(selection, secret)
             observed_at = utc_now()
-            _, groups = self._request("GET", self._groups, secret)
-            items = groups["items"]
-            if type(items) is not list or len(items) >= 100:
-                raise _Failure("malformed_response")  # No proof of absence on a full page.
-            matching = [g for g in items if g["name"] == selection.salad.group]
-            if len(matching) > 1:
-                raise _Failure("identity_mismatch")
-            group = self._group_observation(matching[0], None) if matching else {}
+            found = self._find_group(secret)
+            matching = found is not None
+            group = found or {}
             _, quotas = self._request("GET", f"{self._org}/quotas", secret)
             quota = quotas["container_groups_quotas"]
             maximum = _integer(quota["container_replicas_quota"])
@@ -892,11 +957,11 @@ class SaladHTTPTransport:
         absence. A 200/202 on the exact name is ``group_not_found=False``.
         Only after a definite 404 the project's group list is read; it is the only
         proof that the project (and so the meaning of the 404) exists.
-        ``list_read`` is "absent" for a complete page (fewer than 100
-        well-formed items, no pagination keys) without the name, "absent_partial"
-        for a reached, well-formed page of 100+ items without it, "present" when any
-        item has the name, and "unavailable" when the read failed, was malformed or
-        carries pagination keys (unless it already shows the name).
+        ``list_read`` (from ``_list_groups``) is "absent" for a complete list (fewer
+        than 100 well-formed items, no pagination keys) without the name,
+        "absent_partial" for a reached, well-formed list of 100+ items without it,
+        "present" when any item has the name, and "unavailable" when the read failed,
+        was malformed or carries pagination keys (unless it already shows the name).
         """
         try:
             self._check(selection, secret)
@@ -905,20 +970,19 @@ class SaladHTTPTransport:
                 return self._result(dict(group_not_found=False, list_read="present"))
             if not _group_not_found(data):
                 raise _Failure("malformed_response")
-            list_read = "unavailable"
             try:
-                _, groups = self._request("GET", self._groups, secret)
-                items = groups.get("items")
-                if type(items) is list and all(
-                    type(g) is dict and type(g.get("name")) is str for g in items
-                ):
-                    paged = any(hint in key.lower() for key in groups for hint in PAGINATION_HINTS)
-                    if any(g["name"] == selection.salad.group for g in items):
-                        list_read = "present"
-                    elif not paged:
-                        list_read = "absent" if len(items) < 100 else "absent_partial"
+                items, complete, paged = self._list_groups(secret)
             except _Failure:
                 list_read = "unavailable"
+            else:
+                if any(g["name"] == selection.salad.group for g in items):
+                    list_read = "present"
+                elif complete:
+                    list_read = "absent"
+                elif not paged:
+                    list_read = "absent_partial"
+                else:
+                    list_read = "unavailable"
             return self._result(dict(group_not_found=True, list_read=list_read))
         except _Failure as error:
             return self._failed(error)

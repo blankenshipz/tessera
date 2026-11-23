@@ -1,4 +1,4 @@
-"""Scheduled runner for the campaign submit action (ADR 0093 item 10).
+"""Scheduled runner for the campaign submit action (ADR 0143 item 10).
 
 The runner calls ``CampaignSubmitAction.tick`` every interval so no session has to. It adds only
 scheduling, a kill-switch wait, failure backoff, a halt after repeated failures and a private

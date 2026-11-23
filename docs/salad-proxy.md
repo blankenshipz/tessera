@@ -95,6 +95,11 @@ These are closed normalized operations. `salad_http.py` implements their current
 fixed wire mapping with isolated contract tests, not live API conformance. Read
 operations reconcile an admitted group; fake preflight
 supplies project/quota/availability/absence before create without network or secrets.
+The real preflight's project group list (no query parameters, at most 100 items per
+the published schema, no paging fields) proves the reserved name absent only when it
+holds fewer than 100 items and no pagination key; otherwise the exact-name read
+decides (a ProblemDetails 404 is absence, a 200 is the group, anything else fails
+closed). See the [ADR 0031 addendum](decisions/0031-salad-single-container-gpu.md#addendum-the-project-group-list-proves-absence-only-when-complete).
 No project-creation endpoint is implemented. The fixed prospective management
 origin is `https://api.salad.com/api/public`; the legacy rejecting config also
 retains its historical `.invalid` fixture endpoint. Arbitrary endpoints, redirects,

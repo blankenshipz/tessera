@@ -7,7 +7,7 @@ gate decisions). Builds on the campaign approval and gate decisions of
 [ADR 0038](0038-campaign-specs-and-platform-campaign-runner.md) and
 [ADR 0045](0045-campaign-gates-program-budget.md), standing approvals
 ([ADR 0042](0042-standing-approvals-and-scheduled-campaign-starts.md)) and approved submissions
-(ADR 0093). It keeps the authority rule of DESIGN §5.3: no credential widens its own authority.
+(ADR 0143). It keeps the authority rule of DESIGN §5.3: no credential widens its own authority.
 
 ## Context
 

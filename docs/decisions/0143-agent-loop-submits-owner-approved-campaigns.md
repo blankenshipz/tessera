@@ -1,4 +1,4 @@
-# 0093 — The agent loop submits owner-approved campaigns and reruns
+# 0143 — The agent loop submits owner-approved campaigns and reruns
 
 ## Status
 
@@ -6,7 +6,7 @@ Proposed. Owner direction, 2026-11-22. Builds on
 [ADR 0042](0042-standing-approvals-and-scheduled-campaign-starts.md) (a human binds a spec digest to
 caps), [ADR 0045](0045-campaign-gates-program-budget.md) (program cap),
 [ADR 0055](0055-mcp-steering-tools.md) (scoped MCP tools) and ADR 0085 (the standing loop and its kill
-switch). The number was chosen after checking every ref for the highest ADR in use (0090); the
+switch). The number was reserved from the shared allocator (0093 was taken by the service credential install); the
 integrator renumbers if another branch took it. Off by default.
 
 ## Context

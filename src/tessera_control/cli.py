@@ -516,6 +516,9 @@ def parser() -> argparse.ArgumentParser:
 
     add_agent_proposal_commands(subcommands)
     _add_campaign_commands(subcommands)
+    from .authority_cli import add_authority_commands
+
+    add_authority_commands(subcommands)
     from .provider_registration_cli import add_parser as add_providers_command
 
     add_providers_command(subcommands)
@@ -657,7 +660,7 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "let a credential with campaign:submit_cleared consume a human's approved "
-            "campaign submission (default: off; needs --agent-submission-kill-switch) (ADR 0093)"
+            "campaign submission (default: off; needs --agent-submission-kill-switch) (ADR 0143)"
         ),
     )
     serve.add_argument(
@@ -1125,6 +1128,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_agent_proposal(arguments)
     if arguments.command == "campaign":
         return run_campaign(arguments)
+    if arguments.command == "authority":
+        from .authority_cli import run_authority
+
+        return run_authority(arguments)
     if arguments.command == "providers":
         from .provider_registration_cli import run as run_providers
 

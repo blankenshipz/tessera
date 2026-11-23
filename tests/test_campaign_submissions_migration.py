@@ -1,4 +1,4 @@
-"""Schema step for approved campaign submissions (ADR 0093): a populated database at the
+"""Schema step for approved campaign submissions (ADR 0143): a populated database at the
 previous version gains the same tables and triggers a fresh one has."""
 
 from __future__ import annotations

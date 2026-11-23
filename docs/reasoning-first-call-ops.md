@@ -57,6 +57,29 @@ Roles: **root** is the host operator; **person** is a human credential on the co
    (`spend_caps` in the readiness check). Until a person does this, nothing is spent: the call is
    refused before anything is sent (`model_spend_not_configured`).
 
+   **Issue a reasoning-only grant (a person).** No experiment or execution grant is needed
+   ([ADR 0155](decisions/0155-reasoning-only-grant.md)). The grant authorizes model calls only, has its
+   own budget (at least 1 cent) and an expiry of at most 24 hours, and is refused with
+   `model_spend_not_configured` until the limits above exist. Issue it with the normal route,
+   `POST /projects/{id}/agent-authority-grants` with `bounds.kind` set to `reasoning` (human session, or the
+   owner token with an automation label), with the CLI, or with the person-only MCP tool
+   (`tessera-mcp --reasoning-grant-tool`, absent by default). The CLI is:
+
+   ```sh
+   tessera authority issue-reasoning --project ID --subject-credential-id ID \
+     --destination DEST --provider anthropic --model MODEL --budget-cents N \
+     --expires-in SECONDS --owner-header PATH [--automation-label LABEL]
+   ```
+
+   `--expires-in` is 1 to 86400 seconds. `--destination` is the agent's identity destination, not the model
+   host. To replay a lost answer, re-run with the printed `--idempotency-key` and the printed
+   `--expires-at` (a relative `--expires-in` produces a different request each time). The command prints
+   the grant id, revision, epoch and the runtime profile fields (`grant_id`, `revision`, `epoch`,
+   `subject_credential_id`, `destination`); it never prints a credential. The agent profile must carry those
+   `grant_id`, `revision` and `epoch` values.    The exact flags are in `tessera authority issue-reasoning --help`. The grant limits authority and
+   spending; the egress to the model host is limited by the model destination and the egress
+   allowlist, not by the grant.
+
 3. **Check the project matches (operator).** The project in the agent's authority grant must equal
    the profile's `model_spend.project_id`. If both are set and differ, or neither is set, the
    supervisor refuses with `model_spend_not_configured`. The agent token is delivered as

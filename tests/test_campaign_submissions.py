@@ -1,4 +1,4 @@
-"""Approved campaign submissions (ADR 0093): human approval, agent consume, fail closed.
+"""Approved campaign submissions (ADR 0143): human approval, agent consume, fail closed.
 
 Synthetic fixtures only (no experiment data); the in-process control store and app.
 """

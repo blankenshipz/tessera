@@ -1,4 +1,4 @@
-"""The console entry point runs one scheduled pass end to end (ADR 0093)."""
+"""The console entry point runs one scheduled pass end to end (ADR 0143)."""
 
 import json
 import os

@@ -62,12 +62,14 @@ class ProvenanceReferences(BaseModel):
     provenance_record_id: OpaqueID | None = None
     output_manifest_id: OpaqueID | None = None
     provider_job_uid: OpaqueID | None = None
+    # The kind of an agent authority permission, set only for a non-execution (reasoning) grant.
+    authority_kind: Literal["reasoning"] | None = None
 
     @model_serializer(mode="wrap")
     def omit_absent_additive_output_links(self, handler):
         # Preserve pre-output outbox wire digests and exact acknowledgement matching.
         value = handler(self)
-        for field in ("output_manifest_id", "provider_job_uid"):
+        for field in ("output_manifest_id", "provider_job_uid", "authority_kind"):
             if value.get(field) is None:
                 value.pop(field, None)
         return value

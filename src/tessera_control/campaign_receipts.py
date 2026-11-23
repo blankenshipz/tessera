@@ -883,7 +883,7 @@ def build_receipt(
             # ADR 0122: the owner-signed delegation a decision on this campaign cited, and every
             # delegated decision (approved, gate go or no-go, escalated); absent otherwise.
             **delegation_receipt_section(connection, campaign_id),
-            # ADR 0093: the approved submission this campaign was created from and its
+            # ADR 0143: the approved submission this campaign was created from and its
             # decisions; absent otherwise, so existing receipts keep their shape.
             **submission_receipt_section(connection, campaign_id),
             # ADR 0068: the one-time holdout claims and their scored values; absent otherwise.

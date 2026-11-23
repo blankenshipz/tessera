@@ -114,7 +114,7 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_rerun_campaign",
         # ADR 0060: filters a stage's approved provider candidates.
         "tessera_steer_campaign_placement",
-        # ADR 0093: an agent submits a campaign a person already cleared (one-shot).
+        # ADR 0143: an agent submits a campaign a person already cleared (one-shot).
         "tessera_submit_cleared_campaign",
         # ADR 0124: template rendering and per-wave receipts.
         "tessera_render_campaign_spec",

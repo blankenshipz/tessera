@@ -372,6 +372,7 @@ class ReasoningSupervisor:
         for field in ("subject_credential_id", "destination", "model"):
             if bounds[field] != binding[field]:
                 raise RuntimeBlocked("grant_scope_changed")
+        self._kind_fence(bounds)
         if bounds["budget_cents"] <= 0 or grant.get("remaining_budget_cents", 0) <= 0:
             raise RuntimeBlocked("budget_exhausted")
         if self.billed:
@@ -386,6 +387,35 @@ class ReasoningSupervisor:
         if self.profile["max_duration_seconds"] > bounds["max_duration_seconds"]:
             raise RuntimeBlocked("duration_outside_grant")
         self.store.permission_current(row["id"])
+
+    def _kind_fence(self, bounds: dict):
+        """Execution grants keep their contract. A reasoning grant (model calls only) must
+        name this profile's provider, carry exactly ``model:call`` and no binding, and any tool
+        the model may call must be one the live server marks read-only: the tools run under
+        the agent credential's own scopes, which the grant cannot narrow server-side."""
+        kind = bounds.get("kind", "execution")
+        if kind == "execution":
+            return
+        if kind != "reasoning":
+            raise RuntimeBlocked("grant_kind_unsupported")
+        model = self.profile.get("model")
+        provider = model.get("providerID") if isinstance(model, dict) else None
+        if (
+            bounds.get("actions") != ["model:call"]
+            or bounds.get("bindings")
+            or not provider
+            or bounds.get("provider_id") != provider
+        ):
+            raise RuntimeBlocked("grant_scope_changed")
+        if self._allowed_tools:
+            bridge = getattr(self.harness, "tool_bridge", None)
+            reader = getattr(bridge, "read_only_tools", None)
+            try:
+                read_only = reader() if callable(reader) else frozenset()
+            except Exception:  # noqa: BLE001 - fail closed with a code only
+                read_only = frozenset()
+            if not self._allowed_tools <= read_only:
+                raise RuntimeBlocked("tool_not_read_only")
 
     @staticmethod
     def policy(profile: dict) -> dict:

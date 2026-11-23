@@ -419,11 +419,14 @@ def test_missing_environment_observation_cannot_validate_even_empty_approved_env
 
 
 def test_full_group_page_does_not_prove_reserved_name_absence():
-    f = Factory((200, {"items": [{"name": "other"}] * 100}))
+    # A full list (the schema's maxItems) is not proof: the exact-name read decides, and
+    # its failure is a failure, never absence (tests/test_salad_group_list_read.py).
+    f = Factory((200, {"items": [{"name": "other"}] * 100}), (503, {}))
     s = selection()
     with SecretBuffer(bytearray(MARKER)) as secret:
         result = SaladHTTPTransport(s, connection_factory=f).preflight(s, secret)
-    assert result.reason == "malformed_response" and len(f.calls) == 1
+    assert result.status == "unknown" and result.reason == "provider_unavailable"
+    assert result.request_kind == "read_group" and len(f.calls) == 2
 
 
 def test_preflight_does_not_count_on_call_or_other_priority_capacity():

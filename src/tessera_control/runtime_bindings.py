@@ -299,6 +299,8 @@ class RuntimeBindingStore(Store):
             raise Forbidden("actor_not_eligible")
         parent = require_active_agent_lineage(c, e["parent_grant_ref"])
         bounds = json.loads(parent["bounds_json"])
+        if bounds.get("kind", "execution") != "execution":
+            raise Forbidden("binding_mismatch")
         if (
             parent["org_id"] != actor["org_id"]
             or parent["project_id"] != scope["project"]
@@ -352,6 +354,10 @@ class RuntimeBindingStore(Store):
             self._project(c, pub, project)
             parent = require_active_agent_lineage(c, b["parent_agent_authority_grant_id"])
             bounds = json.loads(parent["bounds_json"])
+            if bounds.get("kind", "execution") != "execution":
+                # Native runtime operations are provider effects: a reasoning-only grant can
+                # never parent them (it pays for model calls and nothing else).
+                raise Forbidden("binding_mismatch")
             if (
                 parent["org_id"] != a["org_id"]
                 or parent["project_id"] != project

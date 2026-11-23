@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 
 from mcp.types import ToolAnnotations
-from pydantic import Field, field_validator
+from pydantic import Discriminator, Field, StringConstraints, Tag, field_validator
 
 from tessera_control.experiments_models import CreateExperiment
 from tessera_control.external_agent_models import AgentProvenance
@@ -79,6 +79,10 @@ Action = Literal[
 
 
 class AuthorityBounds(StrictRequest):
+    """Execution authority bounds; a body without ``kind`` is execution and the kind is never
+    sent, so existing requests and their digests are unchanged."""
+
+    kind: Annotated[Literal["execution"], Field(exclude=True)] = "execution"
     subject_credential_id: NonBlank200
     destination: NonBlank200
     model: NonBlank200
@@ -112,6 +116,47 @@ class AuthorityBounds(StrictRequest):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("Authority expiry requires a timezone")
         return value
+
+
+class ReasoningBounds(StrictRequest):
+    """Reasoning-only authority (ADR 0155): model calls to one provider and model, nothing else.
+
+    Mirrors the control plane's closed shape: exactly ``model:call``, no binding, no delegation,
+    a budget of at least 1 cent. A request has no authority effect; a person still issues it.
+    """
+
+    kind: Literal["reasoning"]
+    subject_credential_id: NonBlank200
+    destination: NonBlank200
+    model: NonBlank200
+    purpose: NonBlank4000
+    provider_id: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,63}$")]
+    actions: Annotated[list[Literal["model:call"]], Field(min_length=1, max_length=1)]
+    bindings: Annotated[list[ResourceBinding], Field(max_length=0)] = []
+    budget_cents: Annotated[int, Field(strict=True, ge=1, le=2**63 - 1)]
+    max_duration_seconds: StrictDuration
+    expires_at: datetime
+    delegation_depth: Literal[0] = 0
+
+    @field_validator("expires_at")
+    @classmethod
+    def aware_expiry(cls, value):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Authority expiry requires a timezone")
+        return value
+
+
+def _bounds_kind(value) -> str:
+    """A missing kind is execution, as on the control plane."""
+    if isinstance(value, dict):
+        return value.get("kind", "execution")
+    return getattr(value, "kind", "execution")
+
+
+AnyAuthorityBounds = Annotated[
+    Annotated[AuthorityBounds, Tag("execution")] | Annotated[ReasoningBounds, Tag("reasoning")],
+    Discriminator(_bounds_kind),
+]
 
 
 class Admit(StrictRequest):
@@ -205,9 +250,15 @@ def register_workflow(server, client: ControlClient):
 
     @server.tool(annotations=write)
     async def tessera_request_authority(
-        bounds: AuthorityBounds, idempotency_key: str
+        bounds: AnyAuthorityBounds, idempotency_key: str
     ) -> dict[str, Any]:
-        """Request human-issued bounded authority. Never issue or approve a grant."""
+        """Request human-issued bounded authority. Never issue or approve a grant.
+
+        bounds.kind is "execution" (the default when absent: actions on bound execution grants)
+        or "reasoning" (model calls only: actions exactly ["model:call"], no bindings, its own
+        provider_id, model and budget_cents >= 1). A request has no authority effect; a person
+        decides. A reasoning request needs this credential to hold model_spend:record.
+        """
         return await client._request(
             "POST",
             project("agent-authority-requests"),

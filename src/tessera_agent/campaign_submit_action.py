@@ -1,4 +1,4 @@
-"""Agent-loop action that consumes person-approved campaign submissions (ADR 0093).
+"""Agent-loop action that consumes person-approved campaign submissions (ADR 0143).
 
 The action only calls ``submit`` on approvals a person already recorded. It has no way to
 approve, create or widen anything. Events carry ids and stable reasons only.

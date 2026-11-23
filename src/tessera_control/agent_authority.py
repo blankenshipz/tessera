@@ -10,11 +10,13 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from .agent_authority_models import (
+    REASONING_KIND,
     ConsumeAgentAuthority,
     DelegateAgentAuthority,
     IssueAgentAuthority,
     RequestAgentAuthority,
     RevokeAgentAuthority,
+    authority_kind,
 )
 from .agent_provenance import record_agent_provenance
 from .approval_trust import require_decision_actor
@@ -22,6 +24,7 @@ from .execution import ExecutionStore
 from .experiments import ExperimentStore
 from .external_agents import ExternalAgentStore
 from .grant_model_spend import MICRO, cents_view, grant_remaining_micro, grant_spend_micro
+from .model_spend import _limit_row
 from .store import (
     _EVENT_LINEAGE,
     Conflict,
@@ -146,6 +149,9 @@ class AgentAuthorityStore(ExternalAgentStore):
         subject = self._live_principal(connection, dict(recipient))
         subject["agent_destination"] = bounds["destination"]
         self._scope(connection, subject, "authority:consume")
+        if authority_kind(bounds) == REASONING_KIND:
+            # A reasoning grant pays only for the subject's own ledgered model calls.
+            self._scope(connection, subject, "model_spend:record")
         expiry = _time(bounds["expires_at"])
         if not datetime.now(UTC) < expiry <= datetime.now(UTC) + timedelta(hours=24):
             raise Conflict("Authority expiry must be within the next 24 hours.")
@@ -350,7 +356,12 @@ class AgentAuthorityStore(ExternalAgentStore):
             None,
             f"agent_authority.{event}",
             1,
-            {"grant_id": row["id"], "parent_grant_id": parent_id, "request_id": request_id},
+            {
+                "grant_id": row["id"],
+                "parent_grant_id": parent_id,
+                "request_id": request_id,
+                "kind": authority_kind(bounds),
+            },
         )
         self._provenance(
             connection,
@@ -359,7 +370,13 @@ class AgentAuthorityStore(ExternalAgentStore):
             row["id"],
             "delegation" if parent_id else "permission",
             "succeeded",
-            {"permission_id": row["id"], "delegation_id": row["id"] if parent_id else None},
+            {
+                "permission_id": row["id"],
+                "delegation_id": row["id"] if parent_id else None,
+                "authority_kind": (
+                    REASONING_KIND if authority_kind(bounds) == REASONING_KIND else None
+                ),
+            },
         )
         return 201, self._response(row)
 
@@ -371,6 +388,12 @@ class AgentAuthorityStore(ExternalAgentStore):
             require_decision_actor(actor, forbidden=Forbidden)
             bounds = body["bounds"]
             self._recipient_bounds(connection, actor, project_id, bounds)
+            if authority_kind(bounds) == REASONING_KIND:
+                # No execution binding: the grant is bounded by the project's model-spend
+                # limits instead, which must exist for its provider (or the '*' default).
+                limit = _limit_row(connection, actor["org_id"], project_id, bounds["provider_id"])
+                if limit is None or limit["per_call_micro"] <= 0 or limit["daily_micro"] <= 0:
+                    raise Conflict("model_spend_not_configured")
             for binding in bounds["bindings"]:
                 self._validate_binding(connection, actor, project_id, bounds, binding)
             if body["request_id"]:
@@ -486,6 +509,10 @@ class AgentAuthorityStore(ExternalAgentStore):
             self._fence(row, body)
             require_active_agent_lineage(connection, grant_id)
             parent, child = json.loads(row["bounds_json"]), body["bounds"]
+            if authority_kind(parent) == REASONING_KIND or authority_kind(child) != authority_kind(
+                parent
+            ):
+                raise Forbidden("Reasoning authority cannot be delegated or delegated to.")
             if "authority:delegate" not in parent["actions"] or parent["delegation_depth"] <= 0:
                 raise Forbidden("Agent authority does not permit delegation.")
             self._recipient_bounds(connection, actor, row["project_id"], child)
@@ -532,6 +559,8 @@ class AgentAuthorityStore(ExternalAgentStore):
         self._fence(row, body)
         require_active_agent_lineage(connection, grant_id)
         bounds, command = json.loads(row["bounds_json"]), body["command"]
+        if authority_kind(bounds) != "execution":
+            raise Forbidden("Reasoning authority cannot consume execution actions.")
         if bounds["destination"] != actor["agent_destination"] or bounds["model"] != body["model"]:
             raise Forbidden("Agent destination or model is outside authority.")
         if command["action"] not in bounds["actions"]:

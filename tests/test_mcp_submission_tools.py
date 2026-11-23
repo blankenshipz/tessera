@@ -1,4 +1,4 @@
-"""ADR 0093 tools: paths, bodies, scope gating."""
+"""ADR 0143 tools: paths, bodies, scope gating."""
 
 import asyncio
 import json

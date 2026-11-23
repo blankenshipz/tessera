@@ -748,8 +748,14 @@ def pending_operator(options: Options) -> list[dict[str, str]]:
         },
         {
             "name": "grant_and_agent_credential",
-            "path": "the profile's grant_id and subject_credential_id",
-            "action": "a person issues the grant and enrolled agent credential the profile names",
+            "path": "the profile's grant_id, revision, epoch and subject_credential_id",
+            "action": (
+                "a person enrolls the agent credential and issues a reasoning grant for it with "
+                "`tessera authority issue-reasoning` (or POST "
+                "/projects/{id}/agent-authority-grants with bounds.kind reasoning), then puts the "
+                "issued grant's id, revision and epoch in the profile; the readiness grant check "
+                "confirms it"
+            ),
         },
         {
             "name": "admission",

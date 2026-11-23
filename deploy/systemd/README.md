@@ -75,7 +75,7 @@ retried (`RestartPreventExitStatus=2`).
 ## Submit runner (starts with the target, only if admitted)
 
 `tessera-submit-runner.service` runs the campaign-submit action of the agent
-loop ([ADR 0093](../../docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md))
+loop ([ADR 0143](../../docs/decisions/0143-agent-loop-submits-owner-approved-campaigns.md))
 on a schedule. It only turns records a person already approved into campaigns;
 it runs no model and never approves anything. It is wanted by
 `tessera.target`, so enabling the target starts it, but only on a host whose

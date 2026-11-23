@@ -74,6 +74,8 @@ def env(tmp_path):
         "run_id": "run1",
         "agent": "researcher",
         "grant_id": "grant1",
+        "revision": 1,
+        "epoch": 1,
         "subject_credential_id": "agent1",
         "destination": "lab",
         "account_mode": "anthropic-api-key-ref",
@@ -518,23 +520,13 @@ class SameUserAccounts(FakeAccounts):
         self.created.append(user)
 
 
-def _control_state(tmp_path, project="proj1"):
-    import sqlite3
+def _control_state(tmp_path, options, project="proj1"):
+    """The control state the real check reads: the spend limit and the reasoning grant the
+    installed profile names (the profile template's grant id, revision and epoch)."""
+    from readiness_grant_seed import seed_control_state
 
-    from tessera_control.model_spend import create_model_spend_schema
-
-    control = tmp_path / "control"
-    control.mkdir()
-    database = sqlite3.connect(control / "tessera.sqlite3")
-    create_model_spend_schema(database)
-    database.execute(
-        "INSERT INTO model_spend_limits VALUES ('org1', ?, 'anthropic', 20000000, 90000000, 1, "
-        "'p', 'now')",
-        (project,),
-    )
-    database.commit()
-    database.close()
-    return control
+    profile = json.loads(Path(options.profile_template).read_text())
+    return seed_control_state(tmp_path / "control", profile, project=project)
 
 
 def _real_readiness(monkeypatch):
@@ -554,7 +546,7 @@ def test_after_an_install_the_real_check_finds_the_files_it_made_and_only_the_ke
     options, _ = env
     options = replace(
         options,
-        control_state_dir=_control_state(tmp_path),
+        control_state_dir=_control_state(tmp_path, options),
         control_url="http://control.invalid",
         project_id="proj1",
     )
@@ -584,7 +576,7 @@ def test_the_documented_next_step_works_after_install_and_the_check_then_sees_th
     options, _ = env
     options = replace(
         options,
-        control_state_dir=_control_state(tmp_path),
+        control_state_dir=_control_state(tmp_path, options),
         control_url="http://control.invalid",
         project_id="proj1",
     )

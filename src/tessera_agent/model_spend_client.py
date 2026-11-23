@@ -26,7 +26,9 @@ UNAVAILABLE = "model_spend_unavailable"
 # The grant that pays for a call refused it (ADR 0142): nothing was reserved or sent.
 GRANT_BUDGET_EXCEEDED = "grant_budget_exceeded"
 GRANT_NOT_ACTIVE = "grant_not_active"
-GRANT_CODES = frozenset({GRANT_BUDGET_EXCEEDED, GRANT_NOT_ACTIVE})
+# A reasoning grant pays only for its own provider and model.
+GRANT_SCOPE_MISMATCH = "grant_scope_mismatch"
+GRANT_CODES = frozenset({GRANT_BUDGET_EXCEEDED, GRANT_NOT_ACTIVE, GRANT_SCOPE_MISMATCH})
 DENIAL_CODES = frozenset({CAP_EXCEEDED, NOT_CONFIGURED}) | GRANT_CODES
 RESOLUTIONS = frozenset({"agent_settled", "agent_released", "person_released", "person_settled"})
 _STATUSES = frozenset({"reserved", "settled", "released"})

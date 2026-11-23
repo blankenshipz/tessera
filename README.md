@@ -277,7 +277,7 @@ on a host whose operator admitted it (it then starts with `tessera.target`) and 
 `tessera serve --agent-submissions --agent-submission-kill-switch <marker-file>` is set (the
 serve command refuses to start with the first flag and not the second; while the marker file
 exists, or its state is ambiguous, every approved-submission consume is refused)
-([ADR 0093](docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md)). It runs no model and
+([ADR 0143](docs/decisions/0143-agent-loop-submits-owner-approved-campaigns.md)). It runs no model and
 approves nothing.
 A person can also sign a delegation (a program, a budget ceiling, a per-run cap, allowed providers and
 gate rules) under which the platform approves a submitted campaign or records a gate go or no-go for a
@@ -531,7 +531,7 @@ Console scripts installed by the package, one line each:
   [review jobs](docs/mcp-review-jobs.md)).
 - `tessera-submit-runner`: optional scheduled runner that turns approved, pending submission records
   into campaigns; it never approves or widens anything
-  ([ADR 0093](docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md)).
+  ([ADR 0143](docs/decisions/0143-agent-loop-submits-owner-approved-campaigns.md)).
 - `tessera-service-credential`: installs a service credential (such as a model API key) from standard
   input as root-owned systemd credential files with a receipt that holds only a reference and a
   fingerprint ([service credentials](docs/service-credentials.md),
@@ -592,7 +592,12 @@ status, and [DESIGN.md](DESIGN.md) for authoritative contracts.
   that names the agent authority grant paying for it also spends that grant's budget: the
   reservation is refused when the grant is revoked or has less left than the worst case, and the
   grant's remaining budget is derived from the ledger, so sequential runs cannot bill past it
-  ([ADR 0142](docs/decisions/0142-grant-budget-debited-by-model-spend.md)). Only
+  ([ADR 0142](docs/decisions/0142-grant-budget-debited-by-model-spend.md)). The agent loop needs no
+  running experiment to make a call: a person (or the owner with an automation label) issues a
+  reasoning-only grant that authorizes model calls alone, with its own budget and expiry, requires a
+  configured spend limit, and can neither consume, delegate nor affect any execution
+  ([ADR 0155](docs/decisions/0155-reasoning-only-grant.md)); the egress to the model host is limited by
+  the model destination and the egress allowlist, not by the grant. Only
   billed destinations use the ledger. Totals are readable through `tessera_model_spend`, every
   settlement is on the call's receipt, and a person resolves an open (uncertain) reservation through a
   recorded route. `tessera-reasoning-readiness` checks everything a first receipted call needs except the

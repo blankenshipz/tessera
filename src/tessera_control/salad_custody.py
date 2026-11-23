@@ -28,7 +28,12 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
-from .salad_workload_contract import OUTPUT_CHUNK_BYTES, OUTPUT_NAME_RE, output_chunk_count
+from .salad_workload_contract import (
+    MAX_TOTAL_OUTPUT_BYTES,
+    OUTPUT_CHUNK_BYTES,
+    OUTPUT_NAME_RE,
+    output_chunk_count,
+)
 
 # Chunk calls an inventory accepts: twice its planned chunks plus a fixed slack.
 CHUNK_RETRY_SLACK = 16
@@ -135,7 +140,9 @@ class SaladCustody:
         and the inventory is complete only when all of them are retained.
         """
         key = binding.key()
-        if type(byte_cap) is not int or not 0 <= byte_cap <= 64 * 1024 * 1024:
+        # A Salad stage's own outputs stay within the platform custody total (README):
+        # the store refuses a larger inventory even if a caller were to ask for one.
+        if type(byte_cap) is not int or not 0 <= byte_cap <= MAX_TOTAL_OUTPUT_BYTES:
             raise ValueError("invalid_byte_cap")
         if type(file_cap) is not int or not 0 <= file_cap <= 1024:
             raise ValueError("invalid_file_cap")
@@ -255,7 +262,7 @@ class SaladCustody:
                 or not isinstance(item["name"], str)
                 or not OUTPUT_NAME_RE.fullmatch(item["name"])
                 or type(item["max_bytes"]) is not int
-                or not 1 <= item["max_bytes"] <= 64 * 1024 * 1024
+                or not 1 <= item["max_bytes"] <= MAX_TOTAL_OUTPUT_BYTES
                 or item["name"] in declared
             ):
                 raise ValueError("invalid_declared_outputs")

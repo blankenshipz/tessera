@@ -48,7 +48,7 @@ should use HTTP contracts rather than direct database access.
 
 ## Closed request shapes
 
-`AgentAuthorityBounds` fields:
+`AgentAuthorityBounds` (execution kind, the default) fields:
 
 - `subject_credential_id`, `destination`, `model`, `purpose`;
 - `actions`: unique subset of `attempt:admit`, `attempt:dispatch`,
@@ -59,6 +59,15 @@ should use HTTP contracts rather than direct database access.
   `task_id`, `expected_task_revision`, `plan_digest`, `target_digest`;
 - `budget_cents`, `max_duration_seconds`, offset-aware `expires_at`,
   `delegation_depth` (bounded nonnegative integer).
+
+A second kind, `"reasoning"` ([ADR 0155](decisions/0155-reasoning-only-grant.md)), is selected by
+`kind` in the bounds (absent means execution). It carries `subject_credential_id`, `destination`,
+`model`, `purpose`, `provider_id`, `actions` exactly `["model:call"]`, empty `bindings`,
+`budget_cents` of at least 1, `max_duration_seconds`, `expires_at` and `delegation_depth` 0. It
+authorizes only model-runtime calls paid through the model-spend ledger; it cannot consume, delegate
+or parent runtime bindings, and it never affects an execution. Its `destination` is the agent's own
+identity destination; the egress limit to the model host is enforced by model destinations and the
+readiness egress allowlist, not by the grant.
 
 `RequestAgentAuthority` and `IssueAgentAuthority` carry `bounds` (the latter
 may include `request_id` to record the human response). Project and tenant are
@@ -188,9 +197,10 @@ Replay rechecks active authority but does not reserve or dispatch twice.
 Delegation reserves a subset budget against its parent; descendants cannot widen
 resources/actions/destination/model/time or outlive ancestors. No human role or
 owner token is substituted. Existing human-only routes remain human-only.
-Execution grants are separately human-issued: the new grant permits consuming
-named approved execution resources, not minting arbitrary execution authority.
-Prepare the ordinary worker lease before issuing the agent grant, and pin its
+Execution grants are separately human-issued: an execution-kind agent grant permits consuming
+named approved execution resources, not minting arbitrary execution authority. Only that kind
+binds an execution grant; a reasoning-kind grant binds none.
+For an execution-kind grant, prepare the ordinary worker lease before issuing the agent grant, and pin its
 current execution epoch: lease creation advances that epoch and never silently
 widens an existing agent grant. Authority expiry must cover the named execution
 grant's expiry for admission/dispatch; execution cannot outlive its agent fence.

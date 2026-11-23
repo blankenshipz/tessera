@@ -188,7 +188,7 @@ then block with `catalog_inventory_changed`.
 
 A person can record an *approved submission*: a spec digest they reviewed, or a failed campaign to
 rerun, with a per-run budget cap and an expiry
-([ADR 0093](decisions/0093-agent-loop-submits-owner-approved-campaigns.md)). The agent loop, or a
+([ADR 0143](decisions/0143-agent-loop-submits-owner-approved-campaigns.md)). The agent loop, or a
 session with the scope `campaign:submit_cleared`, then turns a pending record into a campaign.
 The approver on that campaign is the person who made the record; the agent never approves, widens a
 cap or changes the digest. The feature is off by default: until an operator enables it every submit is

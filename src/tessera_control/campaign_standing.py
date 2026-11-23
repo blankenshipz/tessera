@@ -358,7 +358,7 @@ def insert_approved_campaign(
     now,
 ) -> tuple[str, str, str]:
     """Insert a running campaign, its stages and the approval row a human decision stands
-    behind (standing approvals, ADR 0042; approved submissions, ADR 0093).
+    behind (standing approvals, ADR 0042; approved submissions, ADR 0143).
 
     The approving principal is always the human who made the recorded decision. Returns
     ``(campaign_id, approval_id, expires_at)``; the caller writes its own events."""

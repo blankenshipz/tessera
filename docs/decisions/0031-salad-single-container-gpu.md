@@ -46,3 +46,38 @@ financial exposure bound. This decision grants no deployment, image build/pull,
 provider call, credit purchase or paid workload authorization. Retained output
 stays quarantined; CUDA workload assertions are not scientific or hardware
 attestation. Existing source-use, evaluation and security safeguards remain intact.
+
+## Addendum: the project group list proves absence only when complete
+
+The public API reference (`list_container_groups`, `GET
+/organizations/{organization_name}/projects/{project_name}/containers`, schema
+`https://docs.salad.com/api-specs/salad-cloud.yaml` 0.9.0-alpha.17) defines no query
+parameters for this read and no paging fields in its response: the body is
+`ContainerGroupCollection`, `{"items": [ContainerGroup, ...]}` with `items` required,
+`minItems: 0` and `maxItems: 100`. Collections that do page (for example inference
+endpoints and queue jobs) take `page` (int32, minimum 1) and `page_size` (int32,
+1..100) and return `page`, `page_size` and `total_size`; the group list has none of
+them, so there is no documented way to read past 100 groups.
+
+The transport therefore makes this read in one place (`_list_groups`), used by the
+start/create preflight and by the guardian's lost-create absence read. A reached,
+well-formed list (HTTP 200, an `items` list of objects with string names) proves the
+project exists. It is complete, and can prove a name absent, only with fewer than 100
+items and no pagination-looking key. A list of 100 or more items is not proof (it may
+be truncated):
+
+- the preflight then reads the exact reserved name: a fully read ProblemDetails 404
+  is absence (the list has just proven the project exists), a 200 is the group
+  (checked like any exact read), and anything else stays a failure, never absence;
+- the guardian's automatic lost-create path is unchanged: it still needs a complete
+  list (`list_read: "absent"`); 100+ items stay `absent_partial` (operator path only).
+
+Each group object runs to kilobytes, so a project with a few dozen stopped groups can
+outgrow the transport's 64 KiB response cap and fail the list read as
+`malformed_response` before 100 groups (an estimate from the schema's fields; the live
+body size was not measured). The list read alone now takes a bounded
+4 MiB body (room for 100 groups of about 40 KiB each); every other read keeps 64 KiB.
+Failures stay closed codes (`malformed_response`, `provider_unavailable`,
+`identity_mismatch`) with `request_kind` `list` or `read_group`; requests stay
+read-only on the fixed allowlisted paths, with no query string. Deleting Tessera's own
+stopped groups (retention) is a separate change.

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Discriminator, Field, StringConstraints, Tag, field_validator, model_validator
 
 from .models import (
     NonBlank200,
@@ -34,6 +34,10 @@ class AgentAuthorityBinding(StrictRequest):
 
 
 class AgentAuthorityBounds(StrictRequest):
+    """Execution authority bounds. ``kind`` is implicit: a stored row or client body without a
+    kind is execution, and it is never serialized, so existing digests and rows are unchanged."""
+
+    kind: Annotated[Literal["execution"], Field(exclude=True)] = "execution"
     subject_credential_id: NonBlank200
     destination: NonBlank200
     model: NonBlank200
@@ -63,8 +67,54 @@ class AgentAuthorityBounds(StrictRequest):
         return self
 
 
+REASONING_KIND = "reasoning"
+MODEL_CALL = "model:call"
+ProviderId = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,63}$")]
+
+
+class ReasoningAuthorityBounds(StrictRequest):
+    """Reasoning-only authority: pays for model-runtime calls to one provider and model and
+    nothing else. It carries no execution binding, cannot be consumed for any execution action,
+    delegated, or parent a runtime binding, and spends only within the project's model-spend
+    limits and its own budget."""
+
+    kind: Literal["reasoning"]
+    subject_credential_id: NonBlank200
+    destination: NonBlank200
+    model: NonBlank200
+    purpose: NonBlank4000
+    provider_id: ProviderId
+    actions: Annotated[list[Literal["model:call"]], Field(min_length=1, max_length=1)]
+    bindings: Annotated[list[AgentAuthorityBinding], Field(max_length=0)] = []
+    budget_cents: Annotated[int, Field(strict=True, ge=1, le=2**63 - 1)]
+    max_duration_seconds: StrictDuration
+    expires_at: datetime
+    delegation_depth: Literal[0] = 0
+
+    @field_validator("expires_at")
+    @classmethod
+    def offset_required(cls, value):
+        if value.tzinfo is None:
+            raise ValueError("expiry requires an offset")
+        return value
+
+
+def authority_kind(bounds) -> str:
+    """The grant kind of stored or submitted bounds; a missing kind is execution."""
+    if isinstance(bounds, dict):
+        return bounds.get("kind", "execution")
+    return getattr(bounds, "kind", "execution")
+
+
+AnyAuthorityBounds = Annotated[
+    Annotated[AgentAuthorityBounds, Tag("execution")]
+    | Annotated[ReasoningAuthorityBounds, Tag("reasoning")],
+    Discriminator(authority_kind),
+]
+
+
 class RequestAgentAuthority(StrictRequest):
-    bounds: AgentAuthorityBounds
+    bounds: AnyAuthorityBounds
 
 
 class IssueAgentAuthority(RequestAgentAuthority):
@@ -81,7 +131,7 @@ class RevokeAgentAuthority(AuthorityFence):
 
 
 class DelegateAgentAuthority(AuthorityFence):
-    bounds: AgentAuthorityBounds
+    bounds: AnyAuthorityBounds
 
 
 class AdmitAgentAttempt(StrictRequest):

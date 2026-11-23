@@ -362,7 +362,7 @@ def create_app(
     from .campaign_submissions_api import router as campaign_submissions_router
 
     app.state.campaign_submissions = CampaignSubmissionStore(state_dir)
-    # Off by default (ADR 0093): serve, or the embedding operator, replaces it.
+    # Off by default (ADR 0143): serve, or the embedding operator, replaces it.
     app.state.agent_submission = AgentSubmissionConfig()
     app.include_router(campaign_submissions_router)
     from .approval_delegations_api import router as approval_delegations_router

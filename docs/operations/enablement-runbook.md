@@ -96,7 +96,7 @@ The first counts stderr lines for an unusable or opted-out setup (`0` is healthy
 receipt has a `stage_watch` section only if reports were recorded; no section means no reports
 yet (for example a stage too short to go silent), not a fault.
 
-## 4. Campaign-submit runner (ADR 0093)
+## 4. Campaign-submit runner (ADR 0143)
 
 Turns a record a person already approved into a campaign, on a schedule, so no session has to. It
 runs no model and approves nothing.

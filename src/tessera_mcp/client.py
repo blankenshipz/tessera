@@ -61,6 +61,7 @@ class ControlClient:
         relay_refusal=False,
         raise_refusal=False,
         relay_outside_delegation=False,
+        refusal_codes=frozenset(),
     ):
         headers = {
             "Authorization": "Bearer " + self.config.token(),
@@ -102,6 +103,15 @@ class ControlClient:
                             raise OutsideDelegation(
                                 [str(r)[:100] for r in reasons[:20] if isinstance(r, str)]
                             )
+                    if response.status_code == 409 and refusal_codes:
+                        # Only a stable code from the caller's allowlist is relayed, never text.
+                        raw = await response.aread()
+                        try:
+                            detail = json.loads(raw[:8192]).get("detail")
+                        except (ValueError, AttributeError):
+                            detail = None
+                        if isinstance(detail, str) and detail in refusal_codes:
+                            raise ControlRefusal(detail)
                     if response.status_code == 409 and relay_refusal:
                         # Only for routes whose refusal body is {status, reason} operator text
                         # (provider registration): the model needs the reason to fix its request.
@@ -238,6 +248,16 @@ class ControlClient:
             raise ControlError("days must be an integer from 1 to 90")
         project = segment(project_id or self.config.project_id)
         return await self._request("GET", f"/model-spend?project_id={project}&days={days}")
+
+    async def issue_reasoning_grant(self, bounds, idempotency_key):
+        """Issue a reasoning-only agent authority grant (a person's credential; ADR 0155)."""
+        return await self._request(
+            "POST",
+            f"/projects/{segment(self.config.project_id)}/agent-authority-grants",
+            body={"bounds": bounds, "request_id": None},
+            key=idempotency_key,
+            refusal_codes=frozenset({"model_spend_not_configured"}),
+        )
 
     async def resolve_model_spend(self, call_id, outcome, actual_cents, reason, idempotency_key):
         """Close an open model-spend reservation as not_sent or spent (a person's credential)."""

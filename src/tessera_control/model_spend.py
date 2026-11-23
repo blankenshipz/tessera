@@ -307,7 +307,13 @@ class ModelSpendStore(ExternalAgentStore):
                 # ADR 0142: the grant that pays for the call must be the caller's own, in this
                 # project, active, and have the worst case left. Judged with the ledger caps.
                 grant_refused, grant_row = grant_refusal(
-                    connection, actor, project_id, grant_id, worst
+                    connection,
+                    actor,
+                    project_id,
+                    grant_id,
+                    worst,
+                    payload["provider_id"],
+                    payload["model"],
                 )
                 if grant_row is None:
                     raise NotFound("Agent authority grant was not found.")
@@ -368,7 +374,13 @@ class ModelSpendStore(ExternalAgentStore):
                 None,
                 "model_spend.reserved",
                 1,
-                self._event_payload(row, reserved_micro_cents=worst, attempt=attempt),
+                self._event_payload(
+                    row,
+                    reserved_micro_cents=worst,
+                    attempt=attempt,
+                    # The receipt names the grant that pays for the call (ADR 0142).
+                    **({"grant_id": grant_id} if grant_id is not None else {}),
+                ),
             )
             totals = _governed_totals(connection, limit, org, project_id, day_key)
             return 200, _reservation_view(row, limit, totals)
