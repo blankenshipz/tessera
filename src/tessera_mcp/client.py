@@ -23,6 +23,18 @@ class ControlRefusal(ControlError):
         self.reason = reason
 
 
+class OutsideDelegation(ControlError):
+    """A 409 ``outside_delegation``: the delegation's rule is not met; the owner is asked."""
+
+    def __init__(self, reasons: list[str]):
+        super().__init__(
+            "Refused (HTTP 409 outside_delegation): the delegation's written rule is not met "
+            f"(reasons: {', '.join(reasons) or 'unspecified'}). The owner has been asked; "
+            "do not retry in a loop."
+        )
+        self.reasons = reasons
+
+
 MAX_ARTIFACT_BYTES = 65536
 MAX_CONTEXT_JSON_BYTES = 128 * 1024
 
@@ -48,6 +60,7 @@ class ControlClient:
         max_bytes=2 * 1024 * 1024,
         relay_refusal=False,
         raise_refusal=False,
+        relay_outside_delegation=False,
     ):
         headers = {
             "Authorization": "Bearer " + self.config.token(),
@@ -77,6 +90,18 @@ class ControlClient:
                             reason = None
                         if isinstance(reason, str) and reason:
                             raise ControlRefusal(reason[:100])
+                    if response.status_code == 409 and relay_outside_delegation:
+                        raw = await response.aread()
+                        try:
+                            body_409 = json.loads(raw[:8192])
+                            reasons = body_409.get("reasons")
+                            flagged = body_409.get("outside_delegation") is True
+                        except (ValueError, AttributeError):
+                            reasons, flagged = None, False
+                        if flagged and isinstance(reasons, list):
+                            raise OutsideDelegation(
+                                [str(r)[:100] for r in reasons[:20] if isinstance(r, str)]
+                            )
                     if response.status_code == 409 and relay_refusal:
                         # Only for routes whose refusal body is {status, reason} operator text
                         # (provider registration): the model needs the reason to fix its request.
@@ -480,6 +505,62 @@ class ControlClient:
             f"/campaigns/{segment(campaign_id)}/gate-decision",
             body={"expected_revision": expected_revision, "decision": decision, "note": note},
             key=idempotency_key,
+        )
+
+    async def list_approval_delegations(self, status=None, offset=0, limit=50):
+        if not 0 <= offset or not 1 <= limit <= 100:
+            raise ControlError("Pagination requires offset >= 0 and limit 1–100")
+        query = f"?offset={offset}&limit={limit}"
+        if status is not None:
+            query += "&status=" + segment(status)
+        return await self._request(
+            "GET", f"/projects/{segment(self.config.project_id)}/approval-delegations{query}"
+        )
+
+    async def get_approval_delegation(self, delegation_id):
+        delegation = await self._request("GET", f"/approval-delegations/{segment(delegation_id)}")
+        decisions = await self._request(
+            "GET", f"/approval-delegations/{segment(delegation_id)}/decisions"
+        )
+        return {"delegation": delegation, "decisions": decisions}
+
+    async def delegation_escalations(self, offset=0, limit=50):
+        if not 0 <= offset or not 1 <= limit <= 100:
+            raise ControlError("Pagination requires offset >= 0 and limit 1–100")
+        return await self._request(
+            "GET",
+            f"/projects/{segment(self.config.project_id)}/delegation-escalations"
+            f"?offset={offset}&limit={limit}",
+        )
+
+    async def delegated_approve_campaign(
+        self, campaign_id, delegation_id, expected_revision, expected_spec_digest, idempotency_key
+    ):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/delegated-approval",
+            body={
+                "delegation_id": delegation_id,
+                "expected_revision": expected_revision,
+                "expected_spec_digest": expected_spec_digest,
+            },
+            key=idempotency_key,
+            relay_outside_delegation=True,
+        )
+
+    async def delegated_gate_decision(
+        self, campaign_id, delegation_id, rule, expected_revision, idempotency_key
+    ):
+        return await self._request(
+            "POST",
+            f"/campaigns/{segment(campaign_id)}/delegated-gate-decision",
+            body={
+                "delegation_id": delegation_id,
+                "rule": rule,
+                "expected_revision": expected_revision,
+            },
+            key=idempotency_key,
+            relay_outside_delegation=True,
         )
 
     async def approve_campaign(

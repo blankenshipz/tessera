@@ -56,9 +56,12 @@ Notes on the table:
 What a client with every tool enrolled still cannot do:
 
 - No tool opens, reopens or releases a holdout claim, by design: the runner opens it, once per scope.
-- Approve with an unlock condition or pre-approvals, record a gate go or no-go (only a person's
-  credential on the approve-only server, `tessera_record_gate_decision`, ADR 0124), or create a
-  standing approval (human authority). An approve-only server cannot read the campaign it
+- Approve with an unlock condition or pre-approvals, or create a standing approval or an approval
+  delegation (human authority). A gate go or no-go is recorded by a person's credential on the
+  approve-only server (`tessera_record_gate_decision`, ADR 0124); a gate go or no-go and a plain
+  approval can also be made under a person's signed delegation, when its written rule is met
+  (`tessera_delegated_approve_campaign`, `tessera_delegated_gate_decision`,
+  [ADR 0122](decisions/0122-owner-signed-approval-delegations.md)). An approve-only server cannot read the campaign it
   approves unless `--campaign-tools` is also set; the digest comes from whoever submitted.
 - Raise a campaign cap, a concurrency limit or a deadline (a long pause counts against the
   deadline); reconcile a grant that is not a confirmed exit; stage or release data (human).

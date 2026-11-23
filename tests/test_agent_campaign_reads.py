@@ -166,6 +166,92 @@ def test_single_scope_does_not_unlock_the_others(world):
     assert _get(client, base, "artifacts").status_code == 403
 
 
+def _other_tenant_agent(state, actions):
+    """An enrolled agent (scopes + destination) that belongs to ANOTHER organization."""
+    import json
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    from tessera_control.store import _token_hash
+
+    token = "synthetic-other-org-agent-token-" + "x" * 30
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
+            ("org_other_agent", "Other tenant", "2026-01-01T00:00:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO projects (id, org_id, name, created_at) VALUES (?, ?, ?, ?)",
+            ("project_other_agent", "org_other_agent", "other", "2026-01-01T00:00:00Z"),
+        )
+        # The other org's own owner root, then its agent issued under that root (the same
+        # structure the real issuing path writes).
+        connection.execute(
+            "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+            "VALUES ('other_owner', 'org_other_agent', 'human', ?, NULL, ?)",
+            (_token_hash("synthetic-other-org-owner-token-" + "x" * 30), "2026-01-01T00:00:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+            "expires_at, revoked_at, created_at, created_by_principal_id) "
+            "VALUES ('credential_other_owner', 'other_owner', 'local_owner', 'control', NULL, "
+            "NULL, NULL, NULL, ?, 'other_owner')",
+            ("2026-01-01T00:00:00Z",),
+        )
+        connection.execute(
+            "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+            "VALUES (?, ?, 'agent', ?, NULL, ?)",
+            ("other_agent", "org_other_agent", _token_hash(token), "2026-01-01T00:00:00Z"),
+        )
+        expires = (datetime.now(UTC) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        connection.execute(
+            "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+            "expires_at, revoked_at, created_at, created_by_principal_id) "
+            "VALUES ('credential_other_agent', 'other_agent', 'agent', 'control', "
+            "'project_other_agent', 'credential_other_owner', ?, NULL, ?, 'other_owner')",
+            (expires, datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        connection.execute(
+            "INSERT INTO external_agent_scopes VALUES ('credential_other_agent', ?, ?)",
+            (json.dumps(actions), "planner.local"),
+        )
+        connection.commit()
+    return {"Authorization": f"Bearer {token}", **DEST}
+
+
+def test_an_agent_of_another_org_gets_a_strict_404_identical_to_a_missing_id(world):
+    env, client, campaign = world
+    other = _other_tenant_agent(env.state, ALL)
+    # Sanity: the same credential shape works for the owning org's agent.
+    assert _get(client, f"/campaigns/{campaign['id']}/outputs", "full").status_code == 200
+    for suffix in (
+        "",
+        "/outputs",
+        "/logs",
+        "/budget",
+        "/grants",
+        "/retries",
+        "/holdout",
+        "/receipt",
+    ):
+        real = client.get(f"/campaigns/{campaign['id']}{suffix}", headers=other)
+        missing = client.get(f"/campaigns/campaign_missing{suffix}", headers=other)
+        assert real.status_code == 404, (suffix, real.status_code)
+        assert (real.status_code, real.json()) == (missing.status_code, missing.json()), suffix
+    project = env.project["id"]
+    for path in (
+        "agent-snapshots",
+        "campaigns",
+        "holdout-claims",
+        "agent-spend",
+        "agent-standing-status",
+    ):
+        real = client.get(f"/projects/{project}/{path}", headers=other)
+        missing = client.get(f"/projects/project_missing/{path}", headers=other)
+        assert real.status_code == 404, (path, real.status_code)
+        assert (real.status_code, real.json()) == (missing.status_code, missing.json()), path
+
+
 def test_no_cross_project_or_cross_tenant_reads(world):
     env, client, campaign = world
     assert _get(client, "/projects/other-project/agent-snapshots", "full").status_code == 404

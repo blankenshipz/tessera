@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from .approval_trust import (
     CLASS_HUMAN_SESSION,
     CLASS_OWNER_AUTOMATION_LABELLED,
+    CLASS_OWNER_DELEGATED,
     decision_provenance,
     require_decision_actor,
 )
@@ -170,6 +171,12 @@ def _evaluate_basis(
     if decision is not None and requirement.accept_human_go:
         if decision["decision_class"] in _GO_CLASSES:
             return {"basis_kind": "human_gate_go", "gate_decision_id": decision["id"]}, None
+        if decision["decision_class"] == CLASS_OWNER_DELEGATED and decision["delegation_id"]:
+            # A go the platform recorded because an owner-signed delegation's written rule was
+            # met (ADR 0122): its class and delegation stay on the row and in the evaluation.
+            # The stored basis_kind stays "human_gate_go" (a schema CHECK); the receipt's unlock
+            # section reports the decision's class and delegation beside it.
+            return {"basis_kind": "human_gate_go", "gate_decision_id": decision["id"]}, None
         # An owner credential running a script (automation label) is not a person's go
         # unless the operator opted in (configure_go_authority).
         if requirement.bound_outcome is None:
@@ -278,12 +285,25 @@ def record_evaluations(
 def unlock_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> dict[str, Any]:
     """What admitted this campaign (an empty list when it was admitted unconditionally)."""
     rows = connection.execute(
-        """SELECT requirement_index, requirement_digest, named_campaign_id, basis_kind,
-        gate_decision_id, outcome, result_digest, evaluated_at, standing_approval_id
-        FROM campaign_unlock_evaluations WHERE campaign_id=? ORDER BY requirement_index, id""",
+        """SELECT e.requirement_index, e.requirement_digest, e.named_campaign_id, e.basis_kind,
+        e.gate_decision_id, e.outcome, e.result_digest, e.evaluated_at, e.standing_approval_id,
+        g.decision_class AS gate_decision_class, g.delegation_id AS gate_delegation_id
+        FROM campaign_unlock_evaluations e
+        LEFT JOIN campaign_gate_decisions g ON g.id=e.gate_decision_id
+        WHERE e.campaign_id=? ORDER BY e.requirement_index, e.id""",
         (campaign_id,),
     ).fetchall()
-    return {"requirements": [dict(row) for row in rows]}
+    items = []
+    for row in rows:
+        item = dict(row)
+        # Keep the receipt's existing shape unless the go was a delegated one (ADR 0122).
+        if item.pop("gate_delegation_id") is not None:
+            item["gate_decision_class"] = item["gate_decision_class"]
+            item["delegation_id"] = row["gate_delegation_id"]
+        else:
+            item.pop("gate_decision_class")
+        items.append(item)
+    return {"requirements": items}
 
 
 class CampaignGateCommands:

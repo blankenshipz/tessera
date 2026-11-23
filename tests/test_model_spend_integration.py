@@ -119,7 +119,7 @@ def test_a_refusal_before_limits_exist_is_reevaluated_once_a_human_sets_them(
     world, tmp_path, creds
 ):
     store, supervisor, run = _supervisor(world, tmp_path, creds)
-    with pytest.raises(RuntimeBlocked, match="model_spend_unconfigured"):
+    with pytest.raises(RuntimeBlocked, match="model_spend_not_configured"):
         supervisor._reserve(run, 1.0)
     assert world.limits(per_call=5, daily=20).status_code == 200
     assert supervisor._reserve(run, 1.0) is True  # a new sequence, so a new answer

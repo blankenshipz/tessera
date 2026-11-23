@@ -365,6 +365,15 @@ def create_app(
     # Off by default (ADR 0093): serve, or the embedding operator, replaces it.
     app.state.agent_submission = AgentSubmissionConfig()
     app.include_router(campaign_submissions_router)
+    from .approval_delegations_api import router as approval_delegations_router
+    from .delegated_decisions import DelegatedDecisionStore
+    from .delegated_decisions_api import router as delegated_decisions_router
+
+    # One store serves the delegation records and the decisions made under them (ADR 0122).
+    app.state.delegated_decisions = DelegatedDecisionStore(state_dir)
+    app.state.approval_delegations = app.state.delegated_decisions
+    app.include_router(approval_delegations_router)
+    app.include_router(delegated_decisions_router)
     app.include_router(snapshot_composition_router)
     app.include_router(worker_grants_router)
     from .salad_unclaimed import SaladUnclaimedStore

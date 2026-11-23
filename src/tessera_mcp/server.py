@@ -82,6 +82,14 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_read_submission": "campaign:read",
     "tessera_cancel_submission": "campaign:cancel",
     "tessera_submit_cleared_campaign": "campaign:submit_cleared",
+    # ADR 0122: owner-signed approval delegations. A person creates and revokes them; there is
+    # no tool that creates, edits, signs or revokes one. The agent reads them and may act only
+    # inside a delegation's written rule.
+    "tessera_list_approval_delegations": "campaign:read",
+    "tessera_get_approval_delegation": "campaign:read",
+    "tessera_delegation_escalations": "campaign:read",
+    "tessera_delegated_approve_campaign": "campaign:decide_delegated",
+    "tessera_delegated_gate_decision": "campaign:decide_delegated",
 }
 # Further scopes a tool needs besides its own: it is registered only when all are enrolled, so a
 # tool never appears in the list only to fail at runtime.
@@ -835,6 +843,61 @@ def register_campaign_tools(
         """
         return await client.submit_cleared_campaign(approval_id, expected_revision, idempotency_key)
 
+    async def tessera_list_approval_delegations(
+        status: str | None = None, offset: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
+        """List this project's owner-signed approval delegations (ADR 0122), read-only.
+
+        Only a person creates or revokes a delegation; an agent can read them here.
+        """
+        return await client.list_approval_delegations(status, offset, limit)
+
+    async def tessera_get_approval_delegation(delegation_id: str) -> dict[str, Any]:
+        """Read one delegation: its written rule, usage so far and the latest decisions."""
+        return await client.get_approval_delegation(delegation_id)
+
+    async def tessera_delegation_escalations(offset: int = 0, limit: int = 50) -> dict[str, Any]:
+        """List what the owner was asked: requests that fell outside a delegation's rule."""
+        return await client.delegation_escalations(offset, limit)
+
+    async def tessera_delegated_approve_campaign(
+        campaign_id: str,
+        delegation_id: str,
+        expected_revision: int,
+        expected_spec_digest: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Approve a campaign under an owner-signed delegation, only if its rule is met.
+
+        The platform computes from recorded data whether the delegation's written rule is
+        met; it approves only then. Otherwise it refuses with a 409 ``outside_delegation``
+        carrying reason codes, and the owner is asked. This never raises a cap or changes a
+        spec. Read the campaign first with tessera_get_campaign for its revision and spec
+        digest; never guess them. Persist the idempotency_key so a retry reuses it.
+        """
+        return await client.delegated_approve_campaign(
+            campaign_id, delegation_id, expected_revision, expected_spec_digest, idempotency_key
+        )
+
+    async def tessera_delegated_gate_decision(
+        campaign_id: str,
+        delegation_id: str,
+        rule: str,
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Record a campaign gate decision under a delegation, only if its rule is met.
+
+        The platform computes from recorded data whether the delegation's written rule is
+        met; it records the decision only then. Otherwise it refuses with a 409
+        ``outside_delegation`` carrying reason codes, and the owner is asked. This never
+        raises a cap or changes a spec. Read the campaign first with tessera_get_campaign
+        for its revision; never guess it. Persist the idempotency_key so a retry reuses it.
+        """
+        return await client.delegated_gate_decision(
+            campaign_id, delegation_id, rule, expected_revision, idempotency_key
+        )
+
     # A revoked release cannot be restored by an agent: only a human issues a new one.
     destructive = ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
@@ -853,6 +916,8 @@ def register_campaign_tools(
         "tessera_acknowledge_stuck",
         "tessera_cancel_submission",
         "tessera_submit_cleared_campaign",
+        "tessera_delegated_approve_campaign",
+        "tessera_delegated_gate_decision",
     }
     for function in (
         tessera_submit_campaign,
@@ -894,6 +959,11 @@ def register_campaign_tools(
         tessera_read_submission,
         tessera_cancel_submission,
         tessera_submit_cleared_campaign,
+        tessera_list_approval_delegations,
+        tessera_get_approval_delegation,
+        tessera_delegation_escalations,
+        tessera_delegated_approve_campaign,
+        tessera_delegated_gate_decision,
     ):
         if wanted(function.__name__):
             if function.__name__ == "tessera_revoke_campaign_release":

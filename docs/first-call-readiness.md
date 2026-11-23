@@ -34,7 +34,7 @@ writes only a transient probe file in the state directory.
 4. **A person sets the spend limits.** `PUT /model-spend/limits` for the project and destination
    (see [model spend](model-spend.md)). Nothing is spent until a person does. The grant's project must
    equal the profile's `model_spend.project_id`; if both are set and differ, or neither is, the call
-   is refused with `model_spend_unconfigured`.
+   is refused with `model_spend_not_configured`.
 5. **Run the check** in the unit's own context, as root: `tessera-reasoning-readiness check --in-unit`
    (it runs the check as the service user with the unit's `LoadCredential=` files, where they are
    root-owned 0400/0440, and the unit's listed sandbox properties; a credential whose source file

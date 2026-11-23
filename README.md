@@ -277,6 +277,11 @@ on a host whose operator admitted it (it then starts with `tessera.target`) and 
 `tessera serve --agent-submissions` is set
 ([ADR 0093](docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md)). It runs no model and
 approves nothing.
+A person can also sign a delegation (a program, a budget ceiling, a per-run cap, allowed providers and
+gate rules) under which the platform approves a submitted campaign or records a gate go or no-go for a
+human or an enrolled agent only when the written rule is met, each decision on a receipt that cites the
+delegation, and asks the owner for anything outside it
+([ADR 0122](docs/decisions/0122-owner-signed-approval-delegations.md)).
 
 Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes v1 and v2
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,

@@ -128,7 +128,7 @@ def test_a_call_is_refused_before_the_transport_until_a_human_sets_a_limit(
     # The first-call operator path: nothing is set, so the call is not made.
     store, supervisor, transport = rig(world, _dir(tmp_path, "first"), creds, ok())
     row = supervisor.tick("run1", PROMPT)
-    assert row["state"] != "completed" and row["reason"] == "model_spend_unconfigured"
+    assert row["state"] != "completed" and row["reason"] == "model_spend_not_configured"
     # No billed request: the client only counts tokens (a free, allowlisted call) to price the
     # worst case, then the ledger refuses before /v1/messages is ever sent.
     assert transport.messages() == []

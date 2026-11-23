@@ -118,6 +118,8 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_render_campaign_spec",
         "tessera_submit_rendered_campaign",
         "tessera_campaign_wave_receipts",
+        # ADR 0122: the delegated approval tool (other delegation tools have no "campaign").
+        "tessera_delegated_approve_campaign",
     }
     assert "tessera_list_snapshots" in tools
     assert tools["tessera_get_snapshot"].annotations.readOnlyHint is True
@@ -125,7 +127,7 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
     for name in ("tessera_submit_campaign", "tessera_cancel_campaign"):
         assert tools[name].annotations.readOnlyHint is False
         assert tools[name].annotations.destructiveHint is False
-    assert "approve" not in " ".join(tools)
+    assert "approve" not in " ".join(n for n in tools if "delegated" not in n)
     assert "grants nothing" in tools["tessera_submit_campaign"].description.lower()
 
 

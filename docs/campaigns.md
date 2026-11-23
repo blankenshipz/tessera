@@ -1,7 +1,9 @@
 # Campaigns and the platform campaign runner
 
 A campaign is a typed, digest-pinned DAG of ordinary Tessera runs that a session
-submits once and a human approves once. The platform runner then drives every step
+submits once and a human approves once (or, inside an owner-signed delegation whose written rule is
+met, the platform records the approval on the owner's behalf: see
+[delegated decisions](#delegated-decisions-adr-0122)). The platform runner then drives every step
 (task, plan, approval, snapshot release, grant, admission, collection, custody release,
 measurement, reconcile, lineage) through the same store methods a human would call, so
 no session has to stay open between stages. Contract: [ADR 0038](decisions/0038-campaign-specs-and-platform-campaign-runner.md).
@@ -94,6 +96,21 @@ verified and the fetched bytes are not public: nothing upgrades their class. A d
 Salad stage on these outputs needs the operator trust binding of ADR 0040; no Salad run is
 covered by that test.
 
+## Delegated decisions (ADR 0122)
+
+A person can sign a delegation for a project once: a program, a budget ceiling, a per-run cap, the
+providers a stage may use and optional gate rules, valid for at most 30 days. Under it a human, or an
+agent enrolled with `campaign:decide_delegated`, may approve a submitted campaign
+(`POST /campaigns/{id}/delegated-approval`) or record a gate go or no-go
+(`POST /campaigns/{id}/delegated-gate-decision`), but only when the platform finds the written rule met,
+computed from recorded data at that moment. The approval is on a receipt that cites the delegation
+(class `owner_delegated`); a request outside it returns 409 `outside_delegation` with reason codes,
+changes nothing and is listed for the owner (`GET /projects/{id}/delegation-escalations`). Creating and
+revoking a delegation is a person's act; the MCP tools only read delegations and use them
+(`tessera_list_approval_delegations`, `tessera_get_approval_delegation`, `tessera_delegation_escalations`,
+`tessera_delegated_approve_campaign`, `tessera_delegated_gate_decision`). Enroll an agent for it with
+`--allow-delegated-decisions`. Contract and limits:
+[ADR 0122](decisions/0122-owner-signed-approval-delegations.md).
 **Provider-side cache.** A `public_artifact` source with `cache: true` lets the executing provider keep
 the verified bytes by digest: the local worker in its private cache directory, and the Salad runtime only
 when the provider supplies persistent storage ([ADR 0116](decisions/0116-provider-fetch-cache.md)). Every

@@ -219,14 +219,14 @@ def test_a_ledger_that_says_not_configured_blocks_the_run(tmp_path, creds):
     control = FakeControl()
     control.deny = "model_spend_not_configured"
     _, supervisor, _, transport, _ = rig(tmp_path, creds, ok(), control=control)
-    assert supervisor.tick("run1", PROMPT)["reason"] == "model_spend_unconfigured"
+    assert supervisor.tick("run1", PROMPT)["reason"] == "model_spend_not_configured"
     assert transport.messages() == []
 
 
 def test_no_project_means_unconfigured_before_any_call(tmp_path, creds):
     _, supervisor, control, transport, _ = rig(tmp_path, creds, ok(), project=None)
     row = supervisor.tick("run1", PROMPT)
-    assert row["reason"] == "model_spend_unconfigured"
+    assert row["reason"] == "model_spend_not_configured"
     assert control.calls == [] and transport.sent == []
 
 
@@ -234,7 +234,7 @@ def test_a_grant_and_profile_project_that_disagree_is_unconfigured(tmp_path, cre
     store, supervisor, control, transport, _ = rig(tmp_path, creds, ok())
     supervisor.authority = lambda _gid: {**_grant(), "project_id": "other-project"}
     row = supervisor.tick("run1", PROMPT)
-    assert row["reason"] == "model_spend_unconfigured" and transport.sent == []
+    assert row["reason"] == "model_spend_not_configured" and transport.sent == []
 
 
 def _grant():

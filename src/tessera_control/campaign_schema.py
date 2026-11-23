@@ -46,7 +46,7 @@ def create_campaign_schema(connection: sqlite3.Connection) -> None:
         decision_class TEXT NOT NULL, automation_label TEXT,
         approved_at TEXT NOT NULL, expires_at TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('active','superseded','revoked')),
-        ended_at TEXT, trust_policy_digest TEXT)""",
+        ended_at TEXT, trust_policy_digest TEXT, delegation_id TEXT)""",
         """CREATE UNIQUE INDEX IF NOT EXISTS campaign_approvals_one_active
         ON campaign_approvals(campaign_id) WHERE status='active'""",
         f"""CREATE TABLE IF NOT EXISTS campaign_stages (

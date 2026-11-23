@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (LICENSE_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 85
+# Literal: must equal the highest registered constant (APPROVAL_DELEGATION_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 86
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1895,3 +1895,34 @@ def migrate_license_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(LICENSE_SCHEMA_VERSION - 1, migrate_license_schema)
+
+
+# Owner-signed approval delegations (ADR 0122, schema 86): the delegation record, its
+# append-only decisions, and a nullable delegation_id on campaign approvals and gate decisions.
+# Additive and idempotent. The next version after the licence labels (85); if another change owns
+# it when branches merge, raise APPROVAL_DELEGATION_SCHEMA_VERSION, LATEST_SCHEMA_VERSION (the
+# literal near the top) and the fresh-database INSERT in store.py.
+APPROVAL_DELEGATION_SCHEMA_VERSION = 86
+
+
+def migrate_approval_delegation_schema(connection: sqlite3.Connection) -> None:
+    from .approval_delegations import create_delegation_schema
+
+    create_delegation_schema(connection)
+    for table in ("campaign_approvals", "campaign_gate_decisions"):
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if "delegation_id" not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN delegation_id TEXT")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (APPROVAL_DELEGATION_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(APPROVAL_DELEGATION_SCHEMA_VERSION - 1, migrate_approval_delegation_schema)

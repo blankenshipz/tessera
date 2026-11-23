@@ -21,6 +21,7 @@ from .approval_trust import (
     CAMPAIGN_DELEGATION_KEY,
     DECISION_EVENT_TYPES,
     DELEGATION_KEY,
+    OWNER_DELEGATION_KEY,
     decision_provenance,
     require_decision_actor,
 )
@@ -138,7 +139,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 85);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 86);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -410,6 +411,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .smoke_credentials import create_smoke_credential_schema
 
     create_smoke_credential_schema(connection)
+    from .approval_delegations import create_delegation_schema
+
+    create_delegation_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
@@ -573,6 +577,9 @@ class Store:
             actor = self._credential_principal(connection, row, audience)
             # The campaign delegation marker may only be attached in-process by the runner.
             actor.pop(CAMPAIGN_DELEGATION_KEY, None)
+            # Likewise the owner-delegation marker (ADR 0122): only the delegated-decision
+            # commands attach it, never anything derived from a request.
+            actor.pop(OWNER_DELEGATION_KEY, None)
             return actor
         finally:
             connection.close()

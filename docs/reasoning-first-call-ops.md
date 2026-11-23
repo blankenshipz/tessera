@@ -55,11 +55,11 @@ Roles: **root** is the host operator; **person** is a human credential on the co
    Rules enforced by the control plane: `per_call_cents` must not exceed `daily_cents`; the check
    also needs `per_call_cents` at least the profile's `limits.max_cost_cents_per_call`
    (`spend_caps` in the readiness check). Until a person does this, nothing is spent: the call is
-   refused before anything is sent (`model_spend_unconfigured`).
+   refused before anything is sent (`model_spend_not_configured`).
 
 3. **Check the project matches (operator).** The project in the agent's authority grant must equal
    the profile's `model_spend.project_id`. If both are set and differ, or neither is set, the
-   supervisor refuses with `model_spend_unconfigured`. The agent token is delivered as
+   supervisor refuses with `model_spend_not_configured`. The agent token is delivered as
    `LoadCredential=agent-token:/etc/tessera/credentials/reasoning-agent-token`; it is a scoped agent
    credential, never an owner token, and is not the model key.
 

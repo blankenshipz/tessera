@@ -22,7 +22,7 @@ def create_campaign_gate_schema(connection: sqlite3.Connection) -> None:
         decided_by_principal_id TEXT NOT NULL REFERENCES principals(id),
         decided_credential_id TEXT REFERENCES credentials(id),
         decision_class TEXT NOT NULL, automation_label TEXT,
-        created_at TEXT NOT NULL)""",
+        created_at TEXT NOT NULL, delegation_id TEXT)""",
         "CREATE INDEX IF NOT EXISTS campaign_gate_decisions_by_campaign "
         "ON campaign_gate_decisions(campaign_id)",
         # Why a campaign was admitted: one row per satisfied requirement.

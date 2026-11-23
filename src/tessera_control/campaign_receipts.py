@@ -23,6 +23,7 @@ from .campaign_placement import placements as recorded_placements
 from .campaign_rerun import lineage_of
 from .campaign_submissions import submission_receipt_section
 from .code_approval import input_classes, snapshot_code_approval
+from .delegation_receipts import delegation_receipt_section
 from .stage_watch import watch_receipt_section
 from .store import _parse_utc, _utc_string, canonical_digest
 
@@ -803,6 +804,11 @@ def build_receipt(
                 **_approval_delegation(connection, campaign_id, approval["id"]),
                 "approved_at": approval["approved_at"],
                 "expires_at": approval["expires_at"],
+                **(
+                    {"delegation_id": approval["delegation_id"]}
+                    if approval["delegation_id"] is not None
+                    else {}
+                ),
                 **_smoke_grant(connection, approval["approving_principal_id"]),
             },
             **_wall_clock(connection, campaign_id, parse_spec_json(current["spec_json"])),
@@ -821,6 +827,9 @@ def build_receipt(
             **_chained_inputs(current["spec_json"]),
             **({"unlock": unlock} if unlock["requirements"] else {}),
             **steering_receipt_section(connection, campaign_id),
+            # ADR 0122: the owner-signed delegation a decision on this campaign cited, and every
+            # delegated decision (approved, gate go or no-go, escalated); absent otherwise.
+            **delegation_receipt_section(connection, campaign_id),
             # ADR 0093: the approved submission this campaign was created from and its
             # decisions; absent otherwise, so existing receipts keep their shape.
             **submission_receipt_section(connection, campaign_id),

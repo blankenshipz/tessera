@@ -21,6 +21,11 @@ DELEGATED_ACTOR_KEY = "campaign_delegated"
 CLASS_CAMPAIGN_DELEGATED = "campaign_delegated"
 # A campaign started under a human-created standing approval (ADR 0042).
 CLASS_STANDING_APPROVAL = "standing_approval"
+# A decision made under an owner-signed delegation whose written rule was met (ADR 0122). The
+# marker exists only on an in-process actor dict, set by the delegated-decision commands after
+# they verified the delegation inside the transaction; Store.authenticate never produces it.
+CLASS_OWNER_DELEGATED = "owner_delegated"
+OWNER_DELEGATION_KEY = "owner_delegation"
 
 AUTOMATION_HEADER = "X-Tessera-Automation"
 AUTOMATION_KEY = "automation_label"
@@ -66,6 +71,8 @@ DECISION_EVENT_TYPES = frozenset(
         "campaign.cancel_requested",
         "campaign.standing_approval_created",
         "campaign.standing_approval_revoked",
+        "campaign.delegated_approval",
+        "campaign.delegated_gate_decision",
     }
 )
 
@@ -94,6 +101,8 @@ def decision_class(actor: dict[str, Any]) -> str:
     """
     if actor.get(DELEGATED_ACTOR_KEY):
         return CLASS_CAMPAIGN_DELEGATED
+    if actor.get(OWNER_DELEGATION_KEY):
+        return CLASS_OWNER_DELEGATED
     kind = actor.get("kind")
     if kind == "human_session":
         return CLASS_HUMAN_SESSION
@@ -117,9 +126,17 @@ def decision_provenance(actor: dict[str, Any]) -> dict[str, Any]:
     }
     if label:
         result["automation_label"] = label
+    # Two separate fields that never feed each other. ``delegation_ref`` is the caller-supplied
+    # X-Tessera-Delegation label (recorded only next to an automation label; it grants nothing).
+    # ``delegation_id`` comes only from the OWNER_DELEGATION_KEY marker the delegated-decision
+    # commands attach in-process after verifying the delegation inside the transaction (ADR 0122);
+    # no request header can set that marker.
     reference = actor.get(DELEGATION_KEY)
     if reference and label:
         result["delegation_ref"] = reference
+    owner_delegation = actor.get(OWNER_DELEGATION_KEY)
+    if owner_delegation:
+        result["delegation_id"] = owner_delegation["delegation_id"]
     delegated = actor.get(DELEGATED_ACTOR_KEY)
     if delegated:
         result["campaign_id"] = delegated["campaign_id"]

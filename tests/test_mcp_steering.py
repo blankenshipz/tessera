@@ -195,7 +195,15 @@ def _call(server, name, arguments):
 def test_steering_tools_exist_only_with_their_scopes_and_no_approval_or_raise_tool(tmp_path):
     forced = {t.name for t in asyncio.run(_server(tmp_path, [], {}).list_tools())}
     assert STEERING <= forced
-    assert not [n for n in forced if "approve" in n or "reconcile" in n or "raise" in n]
+    # No tool approves unconditionally. The one name with "approve" in it acts only under a
+    # person's signed delegation and only when its written rule is met (ADR 0122).
+    delegated = {"tessera_delegated_approve_campaign"}
+    assert not [
+        n
+        for n in forced
+        if n not in delegated and ("approve" in n or "reconcile" in n or "raise" in n)
+    ]
+    assert {n for n in forced if "approve" in n} <= delegated
     read_only = _server(tmp_path, [], {}, actions=frozenset({"campaign:read"}))
     names = {t.name for t in asyncio.run(read_only.list_tools())}
     assert names & STEERING == set()  # the retry tool also needs artifact:read, to read outputs

@@ -121,6 +121,8 @@ def _stand_in_for_unlanded_schema_versions(monkeypatch):
                 "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (next_version,)
             )
 
+        # Each stand-in is its own function, so the registry's "registered once" check holds.
+        step.__qualname__ = f"stand_in_for_unlanded_schema_version_{next_version - 1}"
         return step
 
     for version in range(79, migrations.LATEST_SCHEMA_VERSION):

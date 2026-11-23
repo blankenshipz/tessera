@@ -380,7 +380,7 @@ class ReasoningSupervisor:
                 raise RuntimeBlocked("budget_exhausted")
             self._daily_fence()
             if self.spend is not None and self._spend_project() is None:
-                raise RuntimeBlocked("model_spend_unconfigured")
+                raise RuntimeBlocked(NOT_CONFIGURED)
         if self.profile["max_duration_seconds"] > bounds["max_duration_seconds"]:
             raise RuntimeBlocked("duration_outside_grant")
         self.store.permission_current(row["id"])
@@ -459,7 +459,7 @@ class ReasoningSupervisor:
         model: the call is simply not made. The ledger being unreachable is a refusal too."""
         project = self._spend_project()
         if project is None:
-            raise RuntimeBlocked("model_spend_unconfigured")
+            raise RuntimeBlocked(NOT_CONFIGURED)
         if self.store.spend_open(run_id) is not None:
             raise RuntimeBlocked("model_spend_reservation_open")
         seq = self.store.spend_next_seq(run_id)
@@ -474,7 +474,7 @@ class ReasoningSupervisor:
         if reservation.code == CAP_EXCEEDED:
             return False  # the client refuses: model_call_cap_exceeded, nothing sent
         if reservation.code == NOT_CONFIGURED:
-            raise RuntimeBlocked("model_spend_unconfigured")
+            raise RuntimeBlocked(NOT_CONFIGURED)
         raise RuntimeBlocked("model_spend_unavailable")
 
     def _release_open(self, run_id: str):

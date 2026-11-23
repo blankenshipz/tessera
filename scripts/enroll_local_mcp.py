@@ -151,6 +151,12 @@ def enroll(args, transport_factory=LocalHTTP):
         for action in ("campaign:submit_cleared", "campaign:read", "campaign:cancel"):
             if action not in scope["actions"]:
                 scope["actions"].append(action)
+    if getattr(args, "allow_delegated_decisions", False):
+        # Acting inside an owner-signed approval delegation (ADR 0122). Never part of
+        # --allow-campaigns: the operator opts in separately. Creating a delegation is human-only.
+        for action in ("campaign:decide_delegated", "campaign:read"):
+            if action not in scope["actions"]:
+                scope["actions"].append(action)
     if getattr(args, "allow_campaign_evidence", False):
         scope["actions"] += ["snapshot:read", "artifact:read", "campaign:logs"]
     if getattr(args, "allow_review_jobs", False):
@@ -325,6 +331,7 @@ def main(argv=None):
     parser.add_argument("--allow-budget", action="store_true")
     parser.add_argument("--allow-campaigns", action="store_true")
     parser.add_argument("--allow-campaign-submit-cleared", action="store_true")
+    parser.add_argument("--allow-delegated-decisions", action="store_true")
     parser.add_argument("--allow-campaign-evidence", action="store_true")
     parser.add_argument("--allow-review-jobs", action="store_true")
     parser.add_argument("--allow-review-findings", action="store_true")
