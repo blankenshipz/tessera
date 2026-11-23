@@ -587,13 +587,53 @@ Each revocation writes a `campaign.release_freed` event (`released_by: system`, 
 `reason` = the campaign status, `campaign_id`, `snapshot_id`, `snapshot_digest`,
 `release_id`). A blocked campaign whose last live attempt settles later, and a campaign that
 went idle before this rule existed, are freed by a bounded reconcile sweep on every runner
-tick (so at the first tick after a restart). While the holder still has a live attempt the
+tick (so at the first tick after a restart); it handles at most 50 campaigns per tick and
+resumes where it left off, wrapping around, so every idle holder is eventually reached. While the holder still has a live attempt the
 refusal stays, and names the holding campaign and the release expiry to the same
 organization only (another organization learns only that the snapshot is held and until
 when). A person's own release, which no campaign attempt used, is never revoked by the runner.
 A release whose `expires_at` has passed is never treated as active, whoever holds it: it
 does not refuse a new campaign, and the new release revokes it in the same transaction with a
 `workspace.snapshot_release_expired` event (`release_id`, `expired_at`, `replaced_by`).
+
+## Capacity held by stuck campaigns (ADR 0153)
+
+A `blocked` or `paused_delegation_lapsed` campaign issues nothing until a person acts, so it
+stops holding capacity it provably is not using:
+
+- An expired grant of a `granted` or `admitted` attempt that no worker ever leased and that has
+  no operation can never run (the store refuses a lease on an expired grant). The runner
+  reconciles it at zero, as the expired-unattempted reconcile route and a running campaign's
+  own step do: the grant is reconciled, the attempt ends `failed_transient`
+  (`t1_grant_expired_unleased`) settled at zero, and the project concurrency slot it held is
+  free. The not-started evidence of an `unknown` attempt (ADR 0046) is applied to a paused
+  campaign as to a blocked one.
+- For a stage with placement candidates, an attempt placed on a provider but never granted
+  (no `issue_grant` intent) stops counting against that provider's free slots while its
+  campaign is blocked, paused or terminal. It keeps its state and counts again on resume.
+
+- A grant a worker leased (or that has an operation) is driven only through the evidence
+  paths a running campaign uses, read from control-plane records: once the grant has expired,
+  an `admitted` or `running` attempt on a worker-grant provider is classified as the running
+  flow's observation would classify it (`unknown` for an expired grant with no confirmed
+  exit, a missing receipt or a missing manifest); a confirmed exit is then resolved (ADR 0053)
+  and not-started evidence applied (ADR 0046), each with its own accounting. Nothing is
+  started, cancelled or re-run, and no lease is issued.
+
+A live (unexpired) grant keeps its slot and is not touched: the run may still be going. An
+expired leased grant that no evidence settles keeps its slot, hold and exposure until a person
+reconciles it, and gets one `campaign.slot_held` event per attempt per spell (`stage_key`,
+`attempt`, `attempt_id`, `attempt_status`, `provider_id`, `grant_id`, `campaign_status`,
+`trigger`, `reason`: `leased_grant_unconfirmed`, or `exited_awaiting_collection` for an exit
+with a run receipt that the campaign collects on resume, an `evidence` summary of leases,
+operations, the latest observation and the receipt, and the `action` a person takes). A
+resumed campaign gets new capacity only through the normal `issue_grant` checks, so it waits
+rather than running beside a newer campaign. Each freed counter writes a `campaign.slot_freed`
+event (`stage_key`, `attempt`, `attempt_id`, `provider_id`, `reason`:
+`expired_unclaimed_grant`, `not_started_evidence`, `confirmed_exit` or `placed_not_granted`,
+`campaign_status`, `trigger`, and `grant_id` for a grant); the queue event is written once per
+spell out of `running`, at the transition or by the runner's reconcile sweep. No spend beyond
+the zero settlement of a grant that never ran or exited on a free worker.
 
 ## Not implemented
 

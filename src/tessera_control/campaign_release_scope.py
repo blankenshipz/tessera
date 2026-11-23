@@ -117,19 +117,26 @@ def free_idle_campaign_releases(
     return freed
 
 
-def idle_holders(connection: sqlite3.Connection, limit: int = SWEEP_LIMIT) -> list[str]:
-    """Idle campaigns that still hold an active release (the reconcile sweep's work list)."""
-    return [
+def idle_holders(
+    connection: sqlite3.Connection, *, after: str | None = None, limit: int = SWEEP_LIMIT
+) -> tuple[list[str], str | None]:
+    """Idle campaigns that still hold an active release (the reconcile sweep's work list).
+
+    Returns at most ``limit`` campaign ids after ``after``, in id order, and the cursor for
+    the next pass: the last id of a full window, or ``None`` once the window comes up short,
+    so the sweep wraps around and every holder is visited within a bounded number of passes."""
+    ids = [
         row["campaign_id"]
         for row in connection.execute(
             f"""SELECT DISTINCT a.campaign_id FROM snapshot_releases r
             JOIN campaign_stage_attempts a ON a.release_id=r.id
             JOIN campaigns c ON c.id=a.campaign_id
             WHERE r.status='active' AND c.status IN ({_in(IDLE_CAMPAIGN)})
-            ORDER BY a.campaign_id LIMIT ?""",
-            (limit,),
+            AND a.campaign_id > ? ORDER BY a.campaign_id LIMIT ?""",
+            (after or "", limit),
         )
     ]
+    return ids, (ids[-1] if ids and len(ids) >= limit else None)
 
 
 def holder_refusal(

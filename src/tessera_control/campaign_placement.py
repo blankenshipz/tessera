@@ -25,7 +25,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import campaign_heavy_guard, campaign_placement_preference, program_budget
+from . import (
+    campaign_heavy_guard,
+    campaign_placement_preference,
+    campaign_slot_reclaim,
+    program_budget,
+)
 from .campaign_infra_retry import INFRA_PREFIX
 from .campaign_models import NormalStage, _validate_provider, stage_on_candidate, stage_provider
 from .store import Conflict
@@ -192,10 +197,15 @@ def placed_not_granted(rt: Any, provider_id: str) -> int:
     """Attempts already placed on a provider that do not hold a grant yet (any campaign).
 
     They will take a slot as soon as their grant is issued, so placement counts them against
-    the provider's free slots and does not stack a second stage behind them."""
+    the provider's free slots and does not stack a second stage behind them. An attempt of a
+    blocked, paused or terminal campaign that never asked for its grant is not counted
+    (ADR 0153): it issues nothing until the campaign runs again, and then its grant passes
+    the provider's own slot check."""
     row = rt.one(
-        """SELECT count(*) AS n FROM campaign_stage_attempts
-        WHERE provider_id=? AND status='reserved' AND grant_id IS NULL""",
+        f"""SELECT count(*) AS n FROM campaign_stage_attempts a
+        JOIN campaigns c ON c.id=a.campaign_id
+        WHERE a.provider_id=? AND a.status='reserved' AND a.grant_id IS NULL
+        AND NOT {campaign_slot_reclaim.FREED_SQL}""",
         (provider_id,),
     )
     return int(row["n"]) if row else 0

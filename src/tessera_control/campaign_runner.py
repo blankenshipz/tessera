@@ -66,6 +66,14 @@ from .campaign_io import (
     resolve_artifact,
     write_io,
 )
+from .campaign_leased_hold import (
+    CONFIRMED_EXIT,
+    HELD,
+    OBSERVED,
+    expired_leased,
+    held_evidence,
+    record_slot_held,
+)
 from .campaign_models import (
     EXPERIMENT_CEILING_CENTS,
     FAILURE_CLASSES,
@@ -97,6 +105,16 @@ from .campaign_settlement import (
     SettlementRefused,
     settle_frame,
     validate_amount,
+)
+from .campaign_slot_reclaim import (
+    EXPIRED_UNCLAIMED_GRANT,
+    NOT_STARTED_EVIDENCE,
+    STUCK_CAMPAIGN,
+    idle_slot_holders,
+    record_freed_slots,
+    record_slot_freed,
+    unclaimed_candidates,
+    unclaimed_expired_grant,
 )
 from .campaign_steps import (
     DelegationLapsed,
@@ -242,6 +260,8 @@ class CampaignRunner:
         self._settlement_blocked: dict[str, str | None] = {}
         # Where the next expired-grant release scan carries on (ADR 0048).
         self._release_cursor: tuple[str, str] | None = None
+        # Where the next idle-holder reconcile sweep carries on (ADR 0153).
+        self._idle_cursor: str | None = None
         # Which open output uploads are still gaining bytes (ADR 0064).
         self.upload_progress = UploadProgress()
 
@@ -329,20 +349,39 @@ class CampaignRunner:
         """Reconcile sweep: free releases still held by idle campaigns (every tick, bounded).
 
         Covers campaigns that went idle before releases were freed at the transition, and a
-        blocked campaign whose last live attempt has since settled."""
+        blocked campaign whose last live attempt has since settled; also records the provider
+        slots such campaigns no longer hold (ADR 0153)."""
         try:
             with self.store.runner_connection() as connection:
                 self._hold_lease(connection)
-                for campaign_id in idle_holders(connection):
+                after = self._idle_cursor
+                held, held_next = idle_holders(connection, after=after)
+                slots, slots_next = idle_slot_holders(connection, after=after)
+                # Both lists are id-ordered windows after the cursor. Visit ids up to the
+                # nearer end of a full window (the rest come next pass); wrap around once
+                # both windows come up short.
+                ends = [end for end in (held_next, slots_next) if end is not None]
+                cursor = min(ends) if ends else None
+                holders = {*held, *slots}
+                for campaign_id in sorted(holders):
+                    if cursor is not None and campaign_id > cursor:
+                        break
                     self._free_campaign_releases(connection, campaign_id, "reconcile_sweep")
         except sqlite3.OperationalError as error:
             if not _is_busy(error):
                 raise
+            return
+        self._idle_cursor = cursor
 
     def _free_campaign_releases(
         self, connection: sqlite3.Connection, campaign_id: str, trigger: str
     ) -> None:
-        """Free, in the caller's transaction, the releases an idle campaign no longer needs."""
+        """Free, in the caller's transaction, the releases an idle campaign no longer needs,
+        and record the provider slots its unrequested attempts stop holding (ADR 0153)."""
+        for item in record_freed_slots(
+            connection, campaign_id, trigger=trigger, record_event=self.store.record_runner_event
+        ):
+            self._actions.append(f"slot_freed:{item['attempt_id']}")
         freed = free_idle_campaign_releases(
             connection,
             campaign_id,
@@ -476,11 +515,21 @@ class CampaignRunner:
 
     def _drive(self, campaign_id: str) -> None:
         ctx = self._load(campaign_id)
-        if ctx is None or ctx.approval is None:
+        if ctx is None:
             return
-        # Reduce-only and evidence-based: it also runs for a paused or blocked campaign (ADR 0053).
-        self._resolve_exited_attempts(ctx)
+        if ctx.campaign["status"] in STUCK_CAMPAIGN:
+            # Reduce-only (ADR 0153): an expired grant no worker ever claimed cannot run, so a
+            # stuck campaign stops holding its project slot; it needs no live approval.
+            self._reclaim_unclaimed_grants(ctx)
+        if ctx.approval is None:
+            return
         status = ctx.campaign["status"]
+        if status in STUCK_CAMPAIGN:
+            # ADR 0153: the evidence paths only (observation, confirmed exit, not started).
+            self._reconcile_stuck(ctx)
+        else:
+            # Reduce-only and evidence-based (ADR 0053).
+            self._resolve_exited_attempts(ctx)
         if status == "paused_delegation_lapsed":
             return
         now = self.now()
@@ -504,6 +553,191 @@ class CampaignRunner:
         except DelegationLapsed:
             if status in {"running", "stopping"}:
                 self._pause(ctx, "approver_not_live")
+
+    def _reclaim_unclaimed_grants(self, ctx: _Ctx) -> None:
+        """Reconcile at zero each expired grant of a stuck campaign that no worker claimed.
+
+        The same evidence and accounting as the expired-unattempted reconcile route and the
+        running campaign's own ``reconcile_unattempted`` step: the attempt ends
+        ``failed_transient``/``t1_grant_expired_unleased`` settled at zero, the grant is
+        reconciled (its hold moves to settled at zero) and the project slot it held is free.
+        A grant that was leased, or has an operation, is left for the evidence path."""
+        with self.store.runner_connection() as connection:
+            candidates = unclaimed_candidates(connection, ctx.campaign["id"])
+        for attempt_id in candidates:
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                campaign = connection.execute(
+                    "SELECT * FROM campaigns WHERE id=?", (ctx.campaign["id"],)
+                ).fetchone()
+                if campaign["status"] not in STUCK_CAMPAIGN:
+                    return
+                grant = unclaimed_expired_grant(connection, attempt_id, self.now())
+                if grant is None:
+                    continue
+                now = _iso(self.now())
+                actor = self._actor_principal(connection, campaign["id"])
+                if (
+                    reconcile_grant_row(
+                        connection, grant, settlement_cents=0, principal_id=actor, now=now
+                    )
+                    is None
+                ):
+                    continue  # the reservation ledger cannot cover it: a person reconciles
+                self._touch(
+                    connection,
+                    "campaign_stage_attempts",
+                    "id=?",
+                    (attempt_id,),
+                    status="failed_transient",
+                    failure_class="t1_grant_expired_unleased",
+                    failure_detail="grant expired unclaimed while the campaign was not running",
+                )
+                self._settle(connection, attempt_id, 0, "unclaimed_zero")
+                attempt = connection.execute(
+                    "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt_id,)
+                ).fetchone()
+                self.store.record_runner_event(
+                    connection,
+                    campaign,
+                    "execution.expired_unattempted_grant_reconciled",
+                    {
+                        "grant_id": grant["id"],
+                        "expired_authority": True,
+                        "lease_count": 0,
+                        "operation_count": 0,
+                        "settlement_cents": 0,
+                        "provider_termination_inferred": False,
+                        "operational_only": True,
+                        "automatic": True,
+                    },
+                    task_id=grant["task_id"],
+                )
+                record_slot_freed(
+                    connection,
+                    campaign,
+                    attempt,
+                    reason=EXPIRED_UNCLAIMED_GRANT,
+                    trigger="stuck_campaign_reconcile",
+                    record_event=self.store.record_runner_event,
+                    grant_id=grant["id"],
+                )
+            self._actions.append(f"slot_freed:{attempt_id}:{EXPIRED_UNCLAIMED_GRANT}")
+
+    def _reconcile_stuck(self, ctx: _Ctx) -> None:
+        """Drive a stuck campaign's attempts through the evidence paths only (ADR 0153).
+
+        An expired leased grant is classified as the running flow's observation would; a
+        confirmed exit (ADR 0053) and not-started evidence (ADR 0046) then settle it with their
+        own accounting. Whatever no evidence settles keeps its slot and is reported once per
+        spell. Nothing is started, cancelled or re-run and no lease is issued."""
+        self._observe_stuck_leased(ctx)
+        self._resolve_exited_attempts(ctx)
+        for attempt in self._rows(
+            """SELECT * FROM campaign_stage_attempts WHERE campaign_id=?
+            AND status='unknown' ORDER BY stage_key, attempt""",
+            (ctx.campaign["id"],),
+        ):
+            self._auto_reconcile(ctx, attempt["stage_key"], attempt)
+        self._hold_stuck_leased(ctx)
+
+    def _observe_stuck_leased(self, ctx: _Ctx) -> None:
+        """Classify each expired leased worker-grant attempt of a stuck campaign as
+        ``_do_observe`` would on an expired grant; a live grant is never touched."""
+        with self.store.runner_connection() as connection:
+            pairs = expired_leased(connection, ctx.campaign["id"], self.now(), OBSERVED)
+        for attempt, _grant in pairs:
+            attempt = dict(attempt)
+            try:
+                kind = self._provider(self._spec_stage(ctx, attempt["stage_key"])).descriptor.kind
+            except KeyError:
+                continue  # an unregistered provider: fail closed, the slot stays held
+            if kind != "worker_grant":
+                continue  # a route provider settles through its own guardian
+            seen = self._observe(attempt)
+            verdict = self._expired_observation(ctx, attempt, seen)
+            if verdict is None:
+                continue
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                campaign = connection.execute(
+                    "SELECT status FROM campaigns WHERE id=?", (ctx.campaign["id"],)
+                ).fetchone()
+                if campaign["status"] not in STUCK_CAMPAIGN:
+                    return
+                current = connection.execute(
+                    "SELECT revision FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+                ).fetchone()
+                # Nothing else can write while this transaction holds the lock, so an
+                # unchanged observation and attempt mean the verdict still holds.
+                if (
+                    current["revision"] != attempt["revision"]
+                    or self._observe_in(connection, attempt) != seen
+                ):
+                    continue
+                self._touch(
+                    connection,
+                    "campaign_stage_attempts",
+                    "id=? AND revision=?",
+                    (attempt["id"], attempt["revision"]),
+                    status="unknown",
+                    failure_class=verdict[0],
+                    failure_detail=verdict[1],
+                    **({"operation_id": seen["operation_id"]} if seen["operation_id"] else {}),
+                )
+            self._actions.append(f"stuck_observed:{attempt['id']}:{verdict[0]}")
+
+    def _expired_observation(
+        self, ctx: _Ctx, attempt: dict[str, Any], seen: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        """``_do_observe``'s classification of an attempt whose leased grant has expired:
+        (failure_class, detail) when it would go ``unknown``, else None (keep waiting)."""
+        if seen["grant"]["status"] not in ("active", "cancel_requested"):
+            return None
+        if seen["operation_id"] is None:
+            if seen["leases"]:
+                return "observed_unknown", "leased grant expired without an operation"
+            return None
+        reconciliation = seen["reconciliation"]
+        state = reconciliation["observed_state"] if reconciliation else "unknown"
+        confirmed = bool(reconciliation and reconciliation["termination_confirmed"])
+        if state == "running":
+            return None
+        if state != "exited" or not confirmed:
+            return "observed_unknown", f"observed {state}, termination confirmed={confirmed}"
+        receipt, manifest = seen["receipt"], seen["manifest"]
+        if (receipt is None or (manifest is None and receipt["exit_code"] == 0)) and (
+            self._outputs_arriving(ctx, attempt, seen)
+        ):
+            return None  # outputs still uploading (ADR 0064)
+        if receipt is None:
+            return "missing_receipt", "exited without a run receipt before grant expiry"
+        if manifest is None and receipt["exit_code"] == 0:
+            return "missing_manifest", "successful exit without a quarantined output manifest"
+        return None  # a complete run: the normal flow collects it on resume
+
+    def _hold_stuck_leased(self, ctx: _Ctx) -> None:
+        """One ``campaign.slot_held`` per expired leased grant no evidence settled, per spell."""
+        with self.store.runner_connection() as connection:
+            self._hold_lease(connection)
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (ctx.campaign["id"],)
+            ).fetchone()
+            if campaign["status"] not in STUCK_CAMPAIGN:
+                return
+            now = self.now()
+            for attempt, grant in expired_leased(
+                connection, campaign["id"], now, HELD, unheld=True
+            ):
+                item = record_slot_held(
+                    connection,
+                    campaign,
+                    attempt,
+                    grant,
+                    held_evidence(connection, grant, now),
+                    record_event=self.store.record_runner_event,
+                )
+                self._actions.append(f"slot_held:{attempt['id']}:{item['reason']}")
 
     def _pause(self, ctx: _Ctx, reason: str) -> None:
         with self.store.runner_connection() as connection:
@@ -3313,39 +3547,40 @@ class CampaignRunner:
 
     def _observe(self, attempt: dict[str, Any]) -> dict[str, Any]:
         with self.store.runner_connection() as connection:
-            grant = connection.execute(
-                "SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],)
+            return self._observe_in(connection, attempt)
+
+    @staticmethod
+    def _observe_in(connection: sqlite3.Connection, attempt: Mapping[str, Any]) -> dict[str, Any]:
+        """``_observe`` inside a transaction the caller already holds."""
+        grant = connection.execute(
+            "SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],)
+        ).fetchone()
+        leases = connection.execute(
+            "SELECT count(*) FROM execution_leases WHERE grant_id=?", (attempt["grant_id"],)
+        ).fetchone()[0]
+        operation = connection.execute(
+            "SELECT operation_id FROM external_operations WHERE grant_id=?",
+            (attempt["grant_id"],),
+        ).fetchone()
+        reconciliation = receipt = None
+        if operation is not None:
+            reconciliation = current_operation_reconciliation(connection, operation["operation_id"])
+            receipt = connection.execute(
+                "SELECT receipt_digest, exit_code FROM execution_run_receipts WHERE operation_id=?",
+                (operation["operation_id"],),
             ).fetchone()
-            leases = connection.execute(
-                "SELECT count(*) FROM execution_leases WHERE grant_id=?", (attempt["grant_id"],)
-            ).fetchone()[0]
-            operation = connection.execute(
-                "SELECT operation_id FROM external_operations WHERE grant_id=?",
-                (attempt["grant_id"],),
-            ).fetchone()
-            reconciliation = receipt = None
-            if operation is not None:
-                reconciliation = current_operation_reconciliation(
-                    connection, operation["operation_id"]
-                )
-                receipt = connection.execute(
-                    "SELECT receipt_digest, exit_code FROM execution_run_receipts "
-                    "WHERE operation_id=?",
-                    (operation["operation_id"],),
-                ).fetchone()
-            manifest = connection.execute(
-                "SELECT id, manifest_digest, artifacts_json FROM artifact_manifests "
-                "WHERE grant_id=?",
-                (attempt["grant_id"],),
-            ).fetchone()
-            return {
-                "grant": dict(grant),
-                "leases": leases,
-                "operation_id": operation["operation_id"] if operation else None,
-                "reconciliation": reconciliation,
-                "receipt": dict(receipt) if receipt else None,
-                "manifest": dict(manifest) if manifest else None,
-            }
+        manifest = connection.execute(
+            "SELECT id, manifest_digest, artifacts_json FROM artifact_manifests WHERE grant_id=?",
+            (attempt["grant_id"],),
+        ).fetchone()
+        return {
+            "grant": dict(grant),
+            "leases": leases,
+            "operation_id": operation["operation_id"] if operation else None,
+            "reconciliation": reconciliation,
+            "receipt": dict(receipt) if receipt else None,
+            "manifest": dict(manifest) if manifest else None,
+        }
 
     def _outputs_arriving(self, ctx: _Ctx, attempt: dict[str, Any], seen: dict[str, Any]) -> bool:
         """Whether this exited attempt's outputs are still reaching control (ADR 0064)."""
@@ -4326,6 +4561,19 @@ class CampaignRunner:
                 },
                 task_id=grant["task_id"],
             )
+            current = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (ctx.campaign["id"],)
+            ).fetchone()
+            if current["status"] in STUCK_CAMPAIGN:
+                record_slot_freed(
+                    connection,
+                    current,
+                    fresh,
+                    reason=NOT_STARTED_EVIDENCE,
+                    trigger="stuck_campaign_reconcile",
+                    record_event=self.store.record_runner_event,
+                    grant_id=grant["id"],
+                )
         self._actions.append(f"not_started:{key}:{attempt['attempt']}:{verdict.reason}")
         return True
 
@@ -4472,6 +4720,19 @@ class CampaignRunner:
                 },
                 task_id=grant["task_id"],
             )
+            current = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (ctx.campaign["id"],)
+            ).fetchone()
+            if current["status"] in STUCK_CAMPAIGN:
+                record_slot_freed(
+                    connection,
+                    current,
+                    fresh,
+                    reason=CONFIRMED_EXIT,
+                    trigger="stuck_campaign_reconcile",
+                    record_event=self.store.record_runner_event,
+                    grant_id=grant["id"],
+                )
         self._actions.append(f"exit_resolved:{key}:{attempt['attempt']}:{verdict.failure_class}")
         return True
 
@@ -4486,8 +4747,7 @@ class CampaignRunner:
             (ctx.campaign["id"],),
         )
         for attempt in rows:
-            if self._auto_reconcile(ctx, attempt["stage_key"], attempt):
-                continue
+            # Not-started evidence (ADR 0046) already ran this tick (``_reconcile_stuck``).
             grant = self._one("SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],))
             if grant is not None and grant["status"] == "reconciled":
                 try:
