@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (APPROVAL_DELEGATION_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 86
+# Literal: must equal the highest registered constant (GUARDIAN_RECORD_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 87
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1926,3 +1926,30 @@ def migrate_approval_delegation_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(APPROVAL_DELEGATION_SCHEMA_VERSION - 1, migrate_approval_delegation_schema)
+
+
+# The control-side table of what control read from the guardian's per-frame record (ADR 0041
+# section 7, schema 87). Additive and idempotent. The next version after the approval delegations
+# (86); it was reserved as 93 on its branch and renumbered at merge. If another change owns it
+# when branches merge, raise GUARDIAN_RECORD_SCHEMA_VERSION, LATEST_SCHEMA_VERSION (the literal
+# near the top) and the fresh-database INSERT in store.py.
+GUARDIAN_RECORD_SCHEMA_VERSION = 87
+
+
+def migrate_guardian_record_schema(connection: sqlite3.Connection) -> None:
+    from .execution_frames import create_execution_frame_schema
+
+    create_execution_frame_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (GUARDIAN_RECORD_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(GUARDIAN_RECORD_SCHEMA_VERSION - 1, migrate_guardian_record_schema)

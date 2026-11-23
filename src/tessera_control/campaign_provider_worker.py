@@ -487,6 +487,9 @@ class ProvidersFile(_Strict):
     salad_profiles: Any = None
     # Directory of the Salad credential store, read for expiry metadata only (never a value).
     salad_credential_directory: str | None = None
+    # Absolute path of the guardian-read config (ADR 0041): control reads each Salad frame's
+    # guardian record itself. Read by the Salad provider module.
+    salad_guardian_read: str | None = None
     # Third-party vendor plugins: ``{entry point or module name: that plugin's config}``.
     # Read by ``campaign_providers.load_plugin``; opaque here.
     plugins: dict[str, Any] = {}  # noqa: RUF012

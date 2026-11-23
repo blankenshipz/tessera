@@ -992,6 +992,11 @@ def test_the_profile_custody_host_is_compared_with_the_workload_name(
         return
     status = module.build_executor(config)
     assert status is not None
+    # The custody client connects to and pins the admin ``host`` only; the workload name is
+    # compared with the profile and never reaches the client (built when status is first asked).
+    status.control({})
+    assert built["kwargs"]["host"] == host
+    assert "workload_host" not in built["kwargs"]
 
 
 def test_the_workload_name_never_reaches_the_custody_client_or_live_check_config():

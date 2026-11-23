@@ -593,8 +593,11 @@ measurements and lineage from the verified evidence.
   follow the charges and an overrun is the event `campaign.late_overrun` (no status
   change), while the stored receipt is immutable. The executor re-reads the guardian
   status a few times (`guardian_retries`, `guardian_retry_seconds`) and logs
-  `guardian_final_unavailable` when it cannot read it; the status is worker-attested (ADR
-  0038 amendment, trust boundary). The receipt shows
+  `guardian_final_unavailable` when it cannot read it; the final status is worker-attested (ADR
+  0038 amendment, trust boundary), and it supplies only the cost estimate: the verdict for a
+  bounded-hold settlement is control's own read of the guardian's per-frame record
+  (`--salad-guardian-read`, ADR 0041). Without that read no Salad stage settles on the bounded
+  hold; it waits for a human charge. The receipt shows
   each attempt's basis, `settlement_final` (false for the bounded hold) and the guardian
   estimate labelled `estimate_not_invoice`; each input also reports `input_code` and
   `input_code_files` (ADR 0039 approved private code in the staged snapshot).

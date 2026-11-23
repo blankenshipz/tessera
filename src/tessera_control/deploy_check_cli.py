@@ -34,6 +34,11 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
     )
     command.add_argument("--providers-file", type=Path, help="absolute operator providers file")
     command.add_argument(
+        "--guardian-status-file",
+        type=Path,
+        help="absolute path to a saved Salad guardian status reply; checks it carries frame_record",
+    )
+    command.add_argument(
         "--max-backup-bytes",
         type=int,
         help="the backup size bound you will pass to tessera backup (default 1 GiB)",
@@ -68,6 +73,7 @@ def gather(
     providers_file: Path | None,
     max_backup_bytes: int | None,
     smoke: bool,
+    guardian_status_file: Path | None = None,
 ) -> list[Finding]:
     """Every check for the areas given, in a stable order (shared with ``deploy-upgrade``)."""
     from . import deploy_config, deploy_smoke, deploy_state
@@ -79,7 +85,7 @@ def gather(
     for index, path in enumerate([*executor_configs, *live_configs], start=1):
         findings.extend(deploy_config.check_config(path, label=str(index)))
     if providers_file is not None:
-        findings.extend(deploy_state.check_providers(providers_file))
+        findings.extend(deploy_state.check_providers(providers_file, None, guardian_status_file))
     for path in executor_configs:
         findings.extend(deploy_state.check_executor_profiles(path))
     findings.append(deploy_smoke.run_smoke() if smoke else deploy_smoke.smoke_skipped())
@@ -94,6 +100,7 @@ def _gather(arguments: argparse.Namespace) -> list[Finding]:
         providers_file=arguments.providers_file,
         max_backup_bytes=arguments.max_backup_bytes,
         smoke=arguments.smoke,
+        guardian_status_file=arguments.guardian_status_file,
     )
 
 

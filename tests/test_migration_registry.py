@@ -22,6 +22,12 @@ def test_registered_migrations_are_contiguous_up_to_latest():
 
 
 def test_each_migration_function_is_registered_once():
-    names = [function.__qualname__ for function in MIGRATIONS.values()]
+    # Not the tests-only placeholders tests/conftest.py registers for versions whose lanes have
+    # not landed (they are one closure, by design, and never exist in the product code).
+    names = [
+        function.__qualname__
+        for function in MIGRATIONS.values()
+        if "_bridge_unlanded_migrations" not in function.__qualname__
+    ]
     duplicates = sorted({name for name in names if names.count(name) > 1})
     assert not duplicates, f"the same migration is registered for several versions: {duplicates}"

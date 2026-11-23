@@ -328,9 +328,14 @@ def test_bounded_hold_settlement_is_provisional(tmp_path):
     world = SaladWorld(tmp_path)
     run(world, CLEAN)
     world.tick_until(lambda: world.attempt()["salad_verdict"] is not None)
-    provider = SaladRouteProvider(world.profiles)
+    # Control's own read of the guardian record is what lets the bounded hold settle.
+    provider = SaladRouteProvider(world.profiles, guardian_reader=world.guardian)
     settled = provider.settle(world.runner, world.attempt())
     assert settled == providers.Settlement(HOLD, "guardian_bounded_hold", False)
+    # Without a reader the same attempt does not settle on the bounded hold.
+    blind = SaladRouteProvider(world.profiles)
+    with pytest.raises(Exception):  # noqa: B017, PT011  (the runner's wait signal)
+        blind.settle(world.runner, world.attempt())
 
 
 def test_observe_maps_the_recorded_verdict(provider):

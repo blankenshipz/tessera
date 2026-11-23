@@ -340,6 +340,9 @@ def settle_frame(
             else {"admitted_attempt_id": admitted, "released_cents": release["released_cents"]},
         },
         estimate_cents=settlement.estimate_cents,
+        guardian_record=None
+        if frame["campaign_attempt_id"] is None
+        else frames.latest_guardian_record(connection, frame["campaign_attempt_id"]),
     )
     receipt_digest = canonical_digest(receipt)
     settlement_id = "frame_settlement_" + canonical_digest([frame_id, settlement.request_digest])

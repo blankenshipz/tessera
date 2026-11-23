@@ -203,9 +203,13 @@ class SaladRouteProvider:
         self,
         profiles: SaladCampaignProfiles | None = None,
         credential_directory: str | None = None,
+        guardian_reader: Any = None,
     ) -> None:
         self.profiles = profiles
         self.credential_directory = credential_directory
+        # Control's own read of the guardian's per-frame record (ADR 0041); None means no
+        # Salad frame can settle on a guardian verdict.
+        self.guardian_reader = guardian_reader
 
     # -- credential expiry (metadata only; never a value) -------------------------------
 
@@ -258,8 +262,14 @@ class SaladRouteProvider:
         ``provider_state``, so it is evicted with the runner (a provider-held map would
         keep both alive: the driver references its runner)."""
         driver = rt.provider_state.get(PROVIDER_ID)
-        if driver is None or driver._profiles is not self.profiles:
-            driver = rt.provider_state[PROVIDER_ID] = SaladStageDriver(rt, self.profiles)
+        if (
+            driver is None
+            or driver._profiles is not self.profiles
+            or driver._guardian_reader is not self.guardian_reader
+        ):
+            driver = rt.provider_state[PROVIDER_ID] = SaladStageDriver(
+                rt, self.profiles, self.guardian_reader
+            )
         return driver
 
     # -- submit / approve -----------------------------------------------------------------
@@ -605,11 +615,14 @@ _REGISTERED: list[bool] = []
 def register_provider_instance(
     profiles: SaladCampaignProfiles | None = None,
     credential_directory: str | None = None,
+    guardian_reader: Any = None,
 ) -> ComputeProvider:
     """Register (or replace, when this module registered it before) the ``salad`` provider."""
     if _REGISTERED:
         unregister_provider(PROVIDER_ID)
-    instance = register_provider(SaladRouteProvider(profiles, credential_directory))
+    instance = register_provider(
+        SaladRouteProvider(profiles, credential_directory, guardian_reader)
+    )
     if not _REGISTERED:
         _REGISTERED.append(True)
     return instance
@@ -635,7 +648,15 @@ def register_from_config(config: dict | None) -> None:
     directory = (config or {}).get("salad_credential_directory")
     if directory is not None and (not isinstance(directory, str) or not directory.startswith("/")):
         raise ValueError("salad_credential_directory must be an absolute path")
-    register_provider_instance(profiles, directory)
+    reader = None
+    guardian_read = (config or {}).get("salad_guardian_read")
+    if guardian_read is not None:
+        if not isinstance(guardian_read, str) or not guardian_read.startswith("/"):
+            raise ValueError("salad_guardian_read must be an absolute path")
+        from .guardian_record_reader import build_https_reader
+
+        reader = build_https_reader(guardian_read)
+    register_provider_instance(profiles, directory, reader)
 
 
 def config_sections() -> tuple[ConfigSection, ...]:

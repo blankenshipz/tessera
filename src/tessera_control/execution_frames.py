@@ -238,6 +238,22 @@ def create_execution_frame_schema(connection: sqlite3.Connection) -> None:
             receipt_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         )""",
+        # What control read from the guardian's own per-frame record (ADR 0041 section 7).
+        """CREATE TABLE IF NOT EXISTS execution_frame_guardian_records (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id TEXT NOT NULL REFERENCES execution_frames(frame_id),
+            org_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            guardian_reservation_id TEXT NOT NULL,
+            verdict TEXT NOT NULL CHECK (verdict IN ('open','stopped','reconciled','absent')),
+            record_sequence INTEGER NOT NULL CHECK (record_sequence >= 0),
+            record_digest TEXT NOT NULL CHECK (length(record_digest) = 64
+                AND record_digest NOT GLOB '*[^0-9a-f]*'),
+            read_at TEXT NOT NULL,
+            UNIQUE (frame_id, record_sequence, record_digest)
+        )""",
+        "CREATE INDEX IF NOT EXISTS execution_frame_guardian_records_by_frame "
+        "ON execution_frame_guardian_records(frame_id, sequence)",
         # A new frame starts at ``requested``, revision 1, with no outcome yet.
         """CREATE TRIGGER IF NOT EXISTS execution_frames_insert_requested
         BEFORE INSERT ON execution_frames
@@ -273,7 +289,11 @@ def create_execution_frame_schema(connection: sqlite3.Connection) -> None:
         BEFORE DELETE ON execution_frames
         BEGIN SELECT RAISE(ABORT, 'frames are never deleted'); END""",
     ]
-    for table in ("execution_frame_events", "execution_frame_settlements"):
+    for table in (
+        "execution_frame_events",
+        "execution_frame_settlements",
+        "execution_frame_guardian_records",
+    ):
         for event in ("UPDATE", "DELETE"):
             statements.append(
                 f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{event.lower()}
@@ -320,6 +340,146 @@ def frame_events(
             (frame_id, tenant.org_id, tenant.project_id),
         )
     ]
+
+
+GUARDIAN_VERDICTS = ("open", "stopped", "reconciled", "absent")
+
+
+def guardian_reads(
+    connection: sqlite3.Connection, frame_id: str, tenant: Tenant
+) -> list[dict[str, Any]]:
+    """What control read from the guardian's record for this frame, oldest first."""
+    get_frame(connection, frame_id, tenant)
+    return [
+        dict(row)
+        for row in connection.execute(
+            """SELECT * FROM execution_frame_guardian_records WHERE frame_id=? AND org_id=?
+            AND project_id=? ORDER BY sequence""",
+            (frame_id, tenant.org_id, tenant.project_id),
+        )
+    ]
+
+
+def latest_guardian_record(
+    connection: sqlite3.Connection, campaign_attempt_id: str
+) -> dict[str, Any] | None:
+    """The latest guardian read for an attempt's frame, as a receipt section, else None."""
+    row = connection.execute(
+        """SELECT r.verdict, r.record_sequence, r.record_digest
+        FROM execution_frame_guardian_records r JOIN execution_frames f
+        ON f.frame_id=r.frame_id WHERE f.campaign_attempt_id=? ORDER BY r.sequence DESC LIMIT 1""",
+        (campaign_attempt_id,),
+    ).fetchone()
+    # Every row of this table is a read control made itself over the guardian's authenticated
+    # status channel; the executor's report never writes it.
+    return None if row is None else {**dict(row), "verdict_source": "guardian_read"}
+
+
+def bind_guardian_reservation(
+    connection: sqlite3.Connection,
+    frame_id: str,
+    tenant: Tenant,
+    *,
+    reservation: str,
+    actor: Actor,
+    now: str,
+) -> dict[str, Any]:
+    """Name the guardian reservation a frame is read under (set once; the same value is a no-op).
+
+    The reservation is the guardian's own key for this frame, derived by control from the route
+    and its proposal digest. State is unchanged."""
+    frame = get_frame(connection, frame_id, tenant)
+    if (
+        type(reservation) is not str
+        or len(reservation) != 64
+        or set(reservation) - set("0123456789abcdef")
+    ):
+        raise FrameRefused("a guardian reservation is a sha256 hex digest")
+    if frame["guardian_reservation_id"] == reservation:
+        return frame
+    if frame["guardian_reservation_id"] is not None:
+        raise FrameRefused("guardian_reservation_id is already set")
+    if frame["state"] in {"settling", "closed"}:
+        raise FrameRefused(f"a {frame['state']} frame takes no guardian reservation")
+    claimed = connection.execute(
+        """UPDATE execution_frames SET guardian_reservation_id=?, revision=revision+1,
+        updated_at=? WHERE frame_id=? AND revision=? AND org_id=? AND project_id=?""",
+        (reservation, now, frame_id, frame["revision"], tenant.org_id, tenant.project_id),
+    )
+    if claimed.rowcount != 1:
+        raise Conflict("execution frame changed concurrently")
+    _record(
+        connection,
+        frame,
+        revision=frame["revision"] + 1,
+        from_state=frame["state"],
+        to_state=frame["state"],
+        trigger="guardian_reservation_bound",
+        evidence_digest=reservation,
+        ambiguous_reason=frame["ambiguous_reason"],
+        actor=actor,
+        now=now,
+        event_type="frame.guardian_reservation",
+    )
+    return get_frame(connection, frame_id, tenant)
+
+
+def record_guardian_read(
+    connection: sqlite3.Connection,
+    frame_id: str,
+    tenant: Tenant,
+    *,
+    verdict: str,
+    record_sequence: int,
+    record_digest: str,
+    now: str,
+) -> dict[str, Any]:
+    """Append what control read from the guardian's per-frame record (state unchanged).
+
+    Runs in the caller's transaction and never commits. The frame must belong to the tenant and
+    name a guardian reservation. The same ``(record_sequence, record_digest)`` again is a no-op
+    returning the stored row; the table is append-only. It records a read; it never settles."""
+    frame = get_frame(connection, frame_id, tenant)
+    if verdict not in GUARDIAN_VERDICTS:
+        raise FrameRefused("unknown guardian verdict")
+    if type(record_sequence) is not int or record_sequence < 0:
+        raise FrameRefused("guardian record sequence must be a non-negative integer")
+    if (
+        type(record_digest) is not str
+        or len(record_digest) != 64
+        or set(record_digest) - set("0123456789abcdef")
+    ):
+        raise FrameRefused("guardian record digest must be a sha256 hex digest")
+    reservation = frame["guardian_reservation_id"]
+    if not reservation:
+        raise FrameRefused("the frame names no guardian reservation")
+    existing = connection.execute(
+        """SELECT * FROM execution_frame_guardian_records WHERE frame_id=? AND record_sequence=?
+        AND record_digest=?""",
+        (frame_id, record_sequence, record_digest),
+    ).fetchone()
+    if existing is not None:
+        return dict(existing)
+    cursor = connection.execute(
+        """INSERT INTO execution_frame_guardian_records (frame_id, org_id, project_id,
+        guardian_reservation_id, verdict, record_sequence, record_digest, read_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            frame_id,
+            tenant.org_id,
+            tenant.project_id,
+            reservation,
+            verdict,
+            record_sequence,
+            record_digest,
+            now,
+        ),
+    )
+    return dict(
+        connection.execute(
+            "SELECT * FROM execution_frame_guardian_records WHERE sequence=?", (cursor.lastrowid,)
+        ).fetchone()
+    )
 
 
 def entered(connection: sqlite3.Connection, frame: Mapping[str, Any], state: str) -> bool:
@@ -715,9 +875,14 @@ def build_receipt(
     request_digest: str,
     evidence: Mapping[str, Any],
     estimate_cents: int | None,
+    guardian_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The immutable frame receipt (ADR 0041 section 2); its digest is stored on close."""
-    return {
+    """The immutable frame receipt (ADR 0041 section 2); its digest is stored on close.
+
+    ``guardian_record`` is control's latest read of the guardian's per-frame record
+    (verdict, record_sequence, record_digest); the key appears only when one was read, so a
+    frame without one keeps the receipt shape (and digest) it always had."""
+    receipt = {
         "schema": "tessera.execution-frame-receipt.v1",
         "frame_id": frame["frame_id"],
         "parent_frame_id": frame["parent_frame_id"],
@@ -744,3 +909,6 @@ def build_receipt(
         if estimate_cents is None
         else {"cents": estimate_cents, "label": "estimate_not_invoice"},
     }
+    if guardian_record is not None:
+        receipt["guardian_record"] = dict(guardian_record)
+    return receipt

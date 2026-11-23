@@ -312,8 +312,7 @@ record, not proof the loop stopped. A human still
 approves the digest and stages snapshots; an operator may enable `tessera_approve_campaign` on a
 separate `--approval-tool` server that holds a person's own session credential, which also registers `tessera_record_gate_decision` (the control API
 still refuses any agent credential and applies every admission check and cap). A $0 end-to-end smoke of this steering path against a running Tessera (dry run by default;
-`scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md); its owner-run credential command also ensures a tiny synthetic public snapshot, so the smoke needs no human staging step, and it finds the control state directory from `TESSERA_CONTROL_STATE_DIR` or the host's deploy plan instead of a typed path.
-`scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md), with a companion check that steers a RUNNING campaign (report, pause while a stage runs, resume, a gate decision) through the same tools (`scripts/mcp_steering_running_check.py`).
+`scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md), with a companion check that steers a RUNNING campaign (report, pause while a stage runs, resume, a gate decision) through the same tools (`scripts/mcp_steering_running_check.py`). The smoke's owner-run credential command also ensures a tiny synthetic public snapshot, so it needs no human staging step, and it finds the control state directory from `TESSERA_CONTROL_STATE_DIR` or the host's deploy plan instead of a typed path.
 See
 [docs/mcp-campaign-client-path.md](docs/mcp-campaign-client-path.md).
 
@@ -443,9 +442,9 @@ seven days after issue, refuses them at use time past that point and never reviv
 expired one, so the enrollment needs a renewal
 at least daily and a rotation within the week; it is revocable at any time. The same worker credential is the only authority the Salad executor uses to cancel its own routes (reduce-only, own routes, recorded as `cancel_authority: executor_worker`); no human session credential is issued or configured for it ([ADR 0075](docs/decisions/0075-executor-worker-credential-cancels-own-route.md)).
 
-Since schema 57 (the current schema number is `LATEST_SCHEMA_VERSION` in
-`src/tessera_control/migrations.py`) the source also implements an experiment-parent admission ledger (up to
-USD50), atomic full-grant reservations and a derived control-to-guardian binding.
+The source also implements an experiment-parent admission ledger (up to
+USD50), atomic full-grant reservations and a derived control-to-guardian binding (the current
+schema number is `LATEST_SCHEMA_VERSION` in `src/tessera_control/migrations.py`).
 Unknown costs block admission; cancellation and stopped status do not release
 liability. These local implementations neither migrate a running service nor prove
 provider billing bounds, native Salad grants or a completed Tessera research job.
@@ -501,7 +500,7 @@ Console scripts installed by the package, one line each:
   stopped, keeping the previous database as a restorable backup ([recovery](docs/recovery.md)).
 - `tessera-worker` / `tessera-worker-daemon`: worker CLI (`development-poll`) and its
   supervised daemon.
-  An optional, observe-and-report-only stage watcher library (disabled by default; opt-in per run with `--stage-watcher` plus a kill-switch path, and the default worker is unchanged without it; an executor option covers Salad runs) is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.
+  An optional stage watcher library (disabled by default; opt-in per run with `--stage-watcher` plus a kill-switch path, and the default worker is unchanged without it; an executor option covers Salad runs) observes and reports and never acts: it cannot stop, cancel, retry, resize or re-route anything. It may also file closed retry and resize *requests* that control records as advisory events and nobody admits ([ADR 0111](docs/decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md)). It is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.
 - `tessera-mcp`: MCP server for agent clients.
 - `tessera-salad-operator` / `tessera-salad-cleanup`: human-only Salad setup and cleanup.
 - `tessera-salad-executor` / `tessera-salad-guardian`: supervised Salad campaign executor and spend guardian (units in `deploy/systemd/`, launchd templates in `deploy/launchd/`).

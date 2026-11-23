@@ -619,6 +619,16 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
+        "--salad-guardian-read",
+        type=Path,
+        help=(
+            "owner-only config (tessera.salad.guardian-read.v1) naming the guardian's pinned "
+            "status endpoint: control reads each Salad frame's guardian record itself before "
+            "a bounded-hold settlement (ADR 0041); without it no Salad stage settles on the "
+            "guardian's verdict and the hold waits for a human charge"
+        ),
+    )
+    serve.add_argument(
         "--campaign-providers",
         type=Path,
         help=(
@@ -1289,6 +1299,15 @@ def main(argv: list[str] | None = None) -> int:
                 provider_config["salad_profiles"] = load_profiles(
                     arguments.salad_campaign_profiles
                 ).model_dump(mode="json", by_alias=True)
+            if arguments.salad_guardian_read is not None:
+                if provider_config.get("salad_guardian_read") is not None:
+                    raise ValueError(
+                        "the guardian read config comes from either --campaign-providers or "
+                        "--salad-guardian-read, not both"
+                    )
+                if not arguments.salad_guardian_read.is_absolute():
+                    raise ValueError("--salad-guardian-read must be an absolute path")
+                provider_config["salad_guardian_read"] = str(arguments.salad_guardian_read)
             if arguments.salad_credential_directory is not None:
                 if provider_config.get("salad_credential_directory") is not None:
                     raise ValueError(

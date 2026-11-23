@@ -23,8 +23,15 @@ not checked. The exit status is 0 when nothing failed, 1 when something did, 2 f
 | `backup.cap` | the estimated backup size against the bound `tessera backup` would use | pass `--max-backup-bytes N` to `tessera backup` and `restore`; the bound has no stored setting |
 | `config.N.keys` | a config's keys: ones a release removed, ones no release defines, and its own validation | `--apply drop_removed_keys` removes only the removed keys; an unknown key is yours to edit |
 | `providers.file`, `providers.audit` | the providers file and its audit chain (ADR 0081) | register through `tessera providers` |
+| `providers.frame_verdict_read` | when the providers file configures `salad_profiles`: that `salad_guardian_read` is set and a valid guardian read config, and, with `--guardian-status-file FILE` (a saved copy of the guardian's `status` reply; the check never contacts the guardian), that the reply carries `frame_record` | upgrade the guardian first so its `status` returns `frame_record`, then set `salad_guardian_read` (or `tessera serve --salad-guardian-read FILE`) |
 | `providers.executor_profiles` | each profile an executor config names, in its profiles file | register the profile through `tessera providers` |
 | `smoke.cpu` (`--smoke`) | a synthetic container: no network, read-only root, no capabilities, a pinned local image that is never pulled | `docker pull` the pinned image yourself |
+
+`providers.frame_verdict_read` fails (exit 1) with `detail.reason` `config_missing`, `config_invalid`,
+`guardian_version_missing` or `guardian_status_unreadable`. Without it, Salad frames silently stop
+auto-settling and every guardian-bounded hold waits for a human charge (ADR 0041). Deploy order:
+upgrade the guardian, confirm its status carries `frame_record`, then give control the config. Without
+`--guardian-status-file` the guardian version is not checked and the finding says so.
 
 An applied fix writes an owner-only receipt (`tessera.deploy-fix-receipt.v1`) to `--receipt-dir`.
 It records the digests before and after and the key names or schema versions that changed, never a

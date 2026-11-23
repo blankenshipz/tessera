@@ -201,7 +201,11 @@ def check_backup_cap(state_dir: Path, max_backup_bytes: int | None) -> Finding:
 # -- providers file --------------------------------------------------------------------------
 
 
-def check_providers(providers_file: Path, trust_file: Path | None = None) -> list[Finding]:
+def check_providers(
+    providers_file: Path,
+    trust_file: Path | None = None,
+    guardian_status_file: Path | None = None,
+) -> list[Finding]:
     path = Path(providers_file)
     try:
         if not path.is_absolute():
@@ -224,6 +228,7 @@ def check_providers(providers_file: Path, trust_file: Path | None = None) -> lis
     ]
     if trust_file is not None:
         findings.append(_check_trust(Path(trust_file)))
+    findings.append(check_frame_verdict_read(document, guardian_status_file))
     audit = Path(str(path) + registration.AUDIT_SUFFIX)
     if not os.path.lexists(audit):
         findings.append(
@@ -253,6 +258,86 @@ def check_providers(providers_file: Path, trust_file: Path | None = None) -> lis
             )
         )
     return findings
+
+
+def check_frame_verdict_read(document: Any, guardian_status_file: Path | None = None) -> Finding:
+    """Guardian-bounded frame verdicts are read by control (ADR 0041 stage 2). Reading is enabled
+    when the providers file configures Salad profiles; it then needs ``salad_guardian_read`` and a
+    guardian whose ``status`` carries ``frame_record``. Either missing silently turns auto-settle
+    off, so it fails here. ``guardian_status_file`` is a saved copy of the guardian's status reply
+    (this check never contacts the guardian); without it the guardian version is not checked."""
+    check_id = "providers.frame_verdict_read"
+    if not isinstance(document, dict) or not document.get("salad_profiles"):
+        return Finding(
+            check_id, "providers", "skipped", "No Salad profiles: frame verdict reading is off."
+        )
+    reason = "ok"
+    summary = ""
+    path = document.get("salad_guardian_read")
+    if path is None:
+        reason = "config_missing"
+        summary = "Salad profiles are configured but salad_guardian_read is absent."
+    else:
+        from .guardian_record_reader import load_reader_config
+
+        try:
+            if not isinstance(path, str) or not path.startswith("/"):
+                raise ValueError("salad_guardian_read must be an absolute path")
+            load_reader_config(path)
+        except ValueError as error:
+            reason = "config_invalid"
+            summary = f"salad_guardian_read is unusable: {error}."
+    if reason == "ok" and guardian_status_file is not None:
+        reason = _guardian_frame_record_reason(Path(guardian_status_file))
+        if reason != "ok":
+            summary = (
+                "The guardian status reply has no valid frame_record: upgrade the guardian "
+                "before enabling salad_guardian_read."
+                if reason == "guardian_version_missing"
+                else "The guardian status file is unreadable."
+            )
+    detail = {"reason": reason, "guardian_version_checked": guardian_status_file is not None}
+    if reason == "ok":
+        return Finding(
+            check_id,
+            "providers",
+            "ok",
+            "Frame verdict reading is configured"
+            + ("." if guardian_status_file is not None else "; guardian version not checked."),
+            detail,
+        )
+    return Finding(
+        check_id,
+        "providers",
+        "fail",
+        summary + " Salad frames will not auto-settle and holds wait for a human charge.",
+        detail,
+        Fix(
+            "configure_frame_verdict_read",
+            "Upgrade the guardian so status returns frame_record, then set salad_guardian_read "
+            "(docs/deploy-check.md).",
+            command="tessera serve --salad-guardian-read FILE",
+        ),
+    )
+
+
+def _guardian_frame_record_reason(status_file: Path) -> str:
+    from .salad_workload_jwt import strict_json
+
+    try:
+        reply = strict_json(status_file.read_bytes()[:MAX_CONFIG_BYTES])
+    except (OSError, ValueError):
+        return "guardian_status_unreadable"
+    from .guardian_record_reader import FRAME_RECORD_KEYS, VERDICTS
+
+    record = reply.get("frame_record") if isinstance(reply, dict) else None
+    if (
+        isinstance(record, dict)
+        and set(record) == FRAME_RECORD_KEYS
+        and (record.get("verdict") in VERDICTS)
+    ):
+        return "ok"
+    return "guardian_version_missing"
 
 
 def _check_trust(trust_file: Path) -> Finding:

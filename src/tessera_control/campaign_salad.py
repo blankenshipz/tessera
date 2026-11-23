@@ -31,6 +31,7 @@ from .campaign_settlement import apply_late_charge, confirm_settlement
 from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
 from .external_operations import current_operation_reconciliation
+from .guardian_record_reader import validate_frame_record
 from .programs import program_context
 from .remote_execution_models import ExecutionSelection, TargetPolicy
 from .salad_campaign_profiles import (
@@ -43,7 +44,7 @@ from .salad_campaign_profiles import (
     stage_data_policy,
     target_policy,
 )
-from .store import _parse_utc, canonical_digest
+from .store import Conflict, _parse_utc, canonical_digest
 
 if TYPE_CHECKING:
     from .campaign_runner import CampaignRunner, _Ctx
@@ -183,11 +184,16 @@ def stage_data_digest(stage: dict[str, Any], spec_stage: Any) -> str:
 
 
 class SaladStageDriver:
-    def __init__(self, runner: CampaignRunner, profiles: Any = None) -> None:
+    def __init__(
+        self, runner: CampaignRunner, profiles: Any = None, guardian_reader: Any = None
+    ) -> None:
         # ``runner`` is the ``RunnerServices`` object the provider was handed; the driver
         # also uses the runner's step/attempt helpers (ADR 0040 §2).
         self.runner = runner
         self._profiles = profiles
+        # Control's own read of the guardian's per-frame record (ADR 0041 section 7); without
+        # it no frame settles on a guardian verdict.
+        self._guardian_reader = guardian_reader
 
     # -- small helpers --------------------------------------------------------------
 
@@ -359,8 +365,7 @@ class SaladStageDriver:
         if recorded is not None and int(recorded) > 0:
             return int(recorded), "human_reconcile"
         bounded = self.bounded_hold(attempt, row)
-        if bounded is not None:
-            self._read_verdict(attempt, row)
+        if bounded is not None and self._read_verdict(attempt, row):
             return bounded, "guardian_bounded_hold"
         if self._guardian_overrun(attempt, row):
             self._block_overrun(attempt)
@@ -1529,8 +1534,7 @@ class SaladStageDriver:
             self._block_overrun(attempt)
             raise _waiting()()
         bounded = self.bounded_hold(attempt, row)
-        if bounded is not None:
-            self._read_verdict(attempt, row)
+        if bounded is not None and self._read_verdict(attempt, row):
             return bounded, "guardian_bounded_hold"
         self._await_charge(attempt)
         raise _waiting()()
@@ -1575,32 +1579,69 @@ class SaladStageDriver:
             return None
         return hold
 
-    def _read_verdict(self, attempt: dict[str, Any], row: dict[str, Any]) -> None:
-        """Record on the attempt's frame that control read the clean guardian verdict (the
-        recorded final, as ``_clean_guardian`` reads it). ``settle_frame`` refuses a
-        bounded-hold settlement of an ambiguous billable frame without it. A frame that does
-        not exist yet is opened at settlement; nothing is recorded and that settlement
-        fails closed if the frame is ambiguous."""
-        if self._clean_guardian(attempt, row) is None:
-            return
+    def _read_verdict(self, attempt: dict[str, Any], row: dict[str, Any]) -> bool:
+        """Read the guardian's per-frame record ourselves; True only when it says ``stopped``.
+
+        The executor's recorded final supplies the cost estimate (``_clean_guardian``) but never
+        the verdict: a bounded-hold settlement needs control's own read of the guardian record
+        (ADR 0041 sections 2 and 7.1). Every read is appended to the frame's guardian records;
+        the first ``stopped`` read also sets the frame's guardian verdict digest to the record's
+        digest. No reader, an unreachable or malformed answer, or an ``open`` verdict returns
+        False and nothing settles: the hold stays, and the human charge path is unchanged."""
+        reader = self._guardian_reader
+        if reader is None or row.get("route_id") is None or row.get("proposal_digest") is None:
+            return False
+        reservation = canonical_digest([row["route_id"], row["proposal_digest"]])
+        try:
+            record = reader.read(reservation)
+        except Exception:
+            return False
+        if validate_frame_record(record, reservation) is None:
+            return False
         campaign = self.runner._campaign(attempt["campaign_id"])
         tenant = frames.Tenant(campaign["org_id"], campaign["project_id"])
         with self.runner.store.runner_connection() as connection:
             self.runner._hold_lease(connection)
-            frame = frames.frame_for_attempt(connection, attempt["id"], tenant)
-            if frame is None or frame["state"] in {"settling", "closed"}:
-                return
-            frames.record_guardian_verdict(
-                connection,
-                frame["frame_id"],
-                tenant,
-                verdict_digest=canonical_digest(row["guardian_final_json"]),
-                actor=frames.Actor(
-                    "guardian_verdict",
-                    self.runner._actor_principal(connection, attempt["campaign_id"]),
-                ),
-                now=self._stamp(),
+            frame = self.runner._open_frame(connection, attempt["id"])
+            if frame["state"] in {"settling", "closed"}:
+                return False
+            actor = frames.Actor(
+                "guardian_verdict", self.runner._actor_principal(connection, attempt["campaign_id"])
             )
+            now = self._stamp()
+            try:
+                frames.bind_guardian_reservation(
+                    connection,
+                    frame["frame_id"],
+                    tenant,
+                    reservation=reservation,
+                    actor=actor,
+                    now=now,
+                )
+                frames.record_guardian_read(
+                    connection,
+                    frame["frame_id"],
+                    tenant,
+                    verdict=record["verdict"],
+                    record_sequence=record["sequence"],
+                    record_digest=record["record_digest"],
+                    now=now,
+                )
+                if record["verdict"] != "stopped":
+                    return False
+                frame = frames.get_frame(connection, frame["frame_id"], tenant)
+                if frame["guardian_verdict_digest"] is None:
+                    frames.record_guardian_verdict(
+                        connection,
+                        frame["frame_id"],
+                        tenant,
+                        verdict_digest=record["record_digest"],
+                        actor=actor,
+                        now=now,
+                    )
+            except (frames.FrameRefused, Conflict):
+                return False
+        return True
 
     def _guardian_overrun(self, attempt: dict[str, Any], row: dict[str, Any]) -> bool:
         estimate = self._clean_guardian(attempt, row)

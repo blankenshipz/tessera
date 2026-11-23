@@ -238,6 +238,48 @@ def salad_provider_reset():
     register_provider_instance(None)
 
 
+class FakeGuardianReader:
+    """Control's read of the guardian's frame record, as a test double (no network).
+
+    By default it is an honest guardian: it answers ``stopped`` when the attempt's recorded final
+    says the guardian stopped, ``reconciled`` for a reconciled final, else ``open``. A test sets
+    ``verdict`` to force an answer, ``unreachable`` to return None, or ``answer`` to a callable
+    that returns any record (malformed ones included)."""
+
+    def __init__(self, world: SaladWorld) -> None:
+        self.world = world
+        self.verdict: str | None = None
+        self.unreachable = False
+        self.answer = None
+        self.sequence = 4
+        self.reads: list[str] = []
+
+    def read(self, reservation: str):
+        self.reads.append(reservation)
+        if self.unreachable:
+            return None
+        if self.answer is not None:
+            return self.answer(reservation)
+        verdict = self.verdict
+        if verdict is None:
+            final = {}
+            for row in self.world.env.query(
+                "SELECT route_id, proposal_digest, guardian_final_json FROM campaign_salad_attempts"
+            ):
+                if canonical_digest([row["route_id"], row["proposal_digest"]]) == reservation:
+                    final = json.loads(row["guardian_final_json"] or "{}")
+            verdict = {"stopped": "stopped", "reconciled": "reconciled"}.get(
+                final.get("status"), "open"
+            )
+        digest = hashlib.sha256(f"{reservation}:{verdict}:{self.sequence}".encode()).hexdigest()
+        return {
+            "reservation": reservation,
+            "verdict": verdict,
+            "sequence": self.sequence,
+            "record_digest": digest,
+        }
+
+
 class SaladWorld:
     """An approved Salad campaign, a runner, and a test-driven executor and human."""
 
@@ -252,7 +294,8 @@ class SaladWorld:
         self.env.store = CampaignStore(self.env.state)
         # The provider owns the operator profiles (``--campaign-providers``); submit and
         # approve reach them through it.
-        register_provider_instance(self.profiles)
+        self.guardian = FakeGuardianReader(self)
+        register_provider_instance(self.profiles, guardian_reader=self.guardian)
         self.runner = CampaignRunner(self.env.state)
         self.human = self.env.human()
         self.worker = self.env.worker

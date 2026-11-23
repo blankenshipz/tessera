@@ -478,6 +478,12 @@ def _attempt_entry(
     egress = _egress_entry(connection, attempt, spec_stage)
     if egress is not None:
         entry["egress"] = egress
+    # ADR 0041 section 7: what control read from the guardian's per-frame record, when it did.
+    from .execution_frames import latest_guardian_record
+
+    guardian_record = latest_guardian_record(connection, attempt["id"])
+    if guardian_record is not None:
+        entry["guardian_record"] = guardian_record
     if code_info is not None:
         # The code's transfer: where it went, under which trust setting. ``granted`` and the
         # approval come only from the recorded grant event, never from the grant id, the stage's

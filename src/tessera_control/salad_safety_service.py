@@ -356,6 +356,41 @@ def _running(observation):
     )
 
 
+FRAME_RECORD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS frame_records (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation TEXT NOT NULL, at REAL NOT NULL, kind TEXT NOT NULL, detail TEXT);
+CREATE INDEX IF NOT EXISTS frame_records_by_reservation ON frame_records(reservation, sequence);
+CREATE TRIGGER IF NOT EXISTS frame_records_no_update BEFORE UPDATE ON frame_records
+BEGIN SELECT RAISE(ABORT, 'frame_records is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS frame_records_no_delete BEFORE DELETE ON frame_records
+BEGIN SELECT RAISE(ABORT, 'frame_records is append-only'); END;
+"""
+FRAME_VERDICTS = ("open", "stopped", "reconciled", "absent")
+# Reconciliation reason codes that prove a create never existed (verdict ``absent``). A closed
+# set: only these exact codes map to ``absent``, never a substring of a free-text reason.
+REASON_LOST_CREATE_ABSENT = "lost_create_absent"
+REASON_CREATE_REJECTED_ABSENT = "create_rejected_absent"
+REASON_OPERATOR_LOST_CREATE_ABSENT = "operator_lost_create_absent"
+ABSENT_REASONS = frozenset(
+    {
+        REASON_LOST_CREATE_ABSENT,
+        REASON_CREATE_REJECTED_ABSENT,
+        REASON_OPERATOR_LOST_CREATE_ABSENT,
+    }
+)
+
+
+def frame_verdict(status, reason):
+    """The frame verdict for a guardian status: ``stopped``, ``reconciled`` or ``absent`` (a
+    create proven never to have existed), else ``open``. Nothing else is terminal."""
+    if status == "stopped":
+        return "stopped"
+    if status == "reconciled":
+        return "absent" if reason in ABSENT_REASONS else "reconciled"
+    return "open"
+
+
 class SaladSafetyService:
     """Single-thread service owns all SQLite connections and guardian execution."""
 
@@ -456,6 +491,7 @@ class SaladSafetyService:
             "CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY, "
             "reservation TEXT, operation TEXT, at REAL, kind TEXT, detail TEXT)"
         )
+        self.db.executescript(FRAME_RECORD_SCHEMA)
         with self.db:
             self.db.execute("UPDATE reservations SET recovery=1")
         self.guardian = SaladGuardian(
@@ -481,6 +517,63 @@ class SaladSafetyService:
         self.guardian.close()
         self.custody.db.close()
         self.db.close()
+
+    def _frame_note(self, reservation, kind, detail=None, *, once=False):
+        """Append one row to the reservation's frame record. The caller owns the transaction.
+
+        ``once`` skips a row of the same kind and detail already recorded, so a repeated
+        observation never grows the record."""
+        text = None if detail is None else json.dumps(detail, sort_keys=True)
+        if (
+            once
+            and self.db.execute(
+                "SELECT 1 FROM frame_records WHERE reservation=? AND kind=? AND detail IS ?",
+                (reservation, kind, text),
+            ).fetchone()
+        ):
+            return
+        self.db.execute(
+            "INSERT INTO frame_records(reservation,at,kind,detail) VALUES(?,?,?,?)",
+            (reservation, self.clock(), kind, text),
+        )
+
+    def _frame_record(self, reservation, status):
+        """The additive ``frame_record`` of a status: verdict, last sequence and the digest of
+        every row, in order. A terminal verdict appends its ``terminal`` row first, so a verdict
+        returned here is always covered by the digest returned with it."""
+        verdict = frame_verdict(status.get("status"), status.get("reason"))
+        if verdict != "open":
+            with self.db:
+                self._frame_note(
+                    reservation,
+                    "terminal",
+                    {"status": status.get("status"), "verdict": verdict},
+                    once=True,
+                )
+        rows = self.db.execute(
+            "SELECT sequence,kind,at,detail FROM frame_records WHERE reservation=? "
+            "ORDER BY sequence",
+            (reservation,),
+        ).fetchall()
+        digest = hashlib.sha256(
+            json.dumps([list(row) for row in rows], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return dict(
+            reservation=reservation,
+            verdict=verdict,
+            sequence=rows[-1][0] if rows else 0,
+            record_digest=digest,
+        )
+
+    def _cancel(self, operation):
+        """``guardian.cancel``, then record that a stop was requested for the frame."""
+        self.guardian.cancel(operation)
+        row = self.db.execute(
+            "SELECT reservation FROM reservations WHERE operation=?", (operation,)
+        ).fetchone()
+        if row:
+            with self.db:
+                self._frame_note(row[0], "stop_requested", once=True)
 
     def _row(self, reservation=None, operation=None):
         self.db.row_factory = __import__("sqlite3").Row
@@ -814,7 +907,7 @@ class SaladSafetyService:
         finally:
             if row["provider_id"]:
                 try:
-                    self.guardian.cancel(row["operation"])
+                    self._cancel(row["operation"])
                 except ValueError:
                     pass
 
@@ -829,9 +922,9 @@ class SaladSafetyService:
             status = dict(
                 status="reconciled",
                 reason={
-                    "automatic": "lost_create_absent",
-                    "create_rejected": "create_rejected_absent",
-                }.get(record["kind"], "operator_lost_create_absent"),
+                    "automatic": REASON_LOST_CREATE_ABSENT,
+                    "create_rejected": REASON_CREATE_REJECTED_ABSENT,
+                }.get(record["kind"], REASON_OPERATOR_LOST_CREATE_ABSENT),
                 orphan=False,
                 allocation_uncertain=False,
                 manifest=None,
@@ -892,6 +985,8 @@ class SaladSafetyService:
         status["allocation_uncertain"] = bool(row["allocation_uncertain"]) or status.get(
             "allocation_uncertain", False
         )
+        # ADR 0041 section 7: the guardian's own append-only per-frame record (additive).
+        status["frame_record"] = self._frame_record(row["reservation"], status)
         return status
 
     def _reconcile(self, row, attestation):
@@ -987,7 +1082,7 @@ class SaladSafetyService:
             )
         self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
         if row["provider_id"]:
-            self.guardian.cancel(row["operation"])
+            self._cancel(row["operation"])
 
     def _create_rejected(self, row, rejection):
         """Trusted-server report that the create was cleanly rejected (400/422).
@@ -1032,6 +1127,9 @@ class SaladSafetyService:
                         "create_rejection_reported",
                         json.dumps(record, sort_keys=True),
                     ),
+                )
+                self._frame_note(
+                    row["reservation"], "create_rejected", {"reported_at": now}, once=True
                 )
             else:
                 self.db.execute(
@@ -1169,6 +1267,12 @@ class SaladSafetyService:
                     detail,
                 ),
             )
+            self._frame_note(
+                row["reservation"],
+                "lost_create_absent",
+                {"kind": record["kind"]},
+                once=True,
+            )
         if self.inputs:
             self.inputs.drop(row["operation"])
         self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
@@ -1217,7 +1321,7 @@ class SaladSafetyService:
             self._provider(row)
             bound = self._row(row["reservation"])
             self.guardian.arm(self._assignment(bound), stop_only=True)
-            self.guardian.cancel(bound["operation"])
+            self._cancel(bound["operation"])
         except Exception:
             pass  # unresolved again: the ordinary recovery loop keeps trying
 
@@ -1241,6 +1345,7 @@ class SaladSafetyService:
                 "UPDATE reservations SET provider_id=? WHERE reservation=?",
                 (group, row["reservation"]),
             )
+            self._frame_note(row["reservation"], "bound", {"provider_id": group}, once=True)
         if "instances" not in observation:
             current = self._row(row["reservation"])
             observation = self._retrying_read(
@@ -1632,6 +1737,7 @@ class SaladSafetyService:
                         running,
                     ),
                 )
+                self._frame_note(reservation, "reserved", once=True)
                 row = self._row(reservation)
                 if (
                     row["proposal"] != serialized
@@ -1735,7 +1841,7 @@ class SaladSafetyService:
                 )
             self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
             if row["provider_id"]:
-                self.guardian.cancel(row["operation"])
+                self._cancel(row["operation"])
         elif action == "status":
             return self._status(row)
         elif action == "create_rejected":
@@ -1816,11 +1922,13 @@ class SaladSafetyService:
             )
         if action == "ready":
             # A create may follow this admission; a rejection report must come after it.
+            admitted = self.clock()
             with self.db:
                 self.db.execute(
                     "UPDATE reservations SET last_ready_at=? WHERE reservation=?",
-                    (self.clock(), reservation),
+                    (admitted, reservation),
                 )
+                self._frame_note(reservation, "ready", {"create_admitted_at": admitted})
         return dict(reservation=reservation, state="ready", observed_at=self.loop_at)
 
     def loop(self):
@@ -1922,7 +2030,7 @@ class SaladSafetyService:
                     continue
             if row["recovery"]:
                 self.guardian.arm(self._assignment(row), stop_only=True)
-                self.guardian.cancel(row["operation"])
+                self._cancel(row["operation"])
             else:
                 self.guardian.arm(self._assignment(row))
             state = self.guardian.status(row["operation"])

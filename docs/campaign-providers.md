@@ -524,6 +524,13 @@ principal and custody host). Work for a profile it does not name is refused (`re
 and waits at `awaiting_lease` until the grant expires, so list every profile that stages may use,
 including a CPU profile that heavy stages are placed on ([ADR 0070](decisions/0070-salad-first-placement-preference.md)).
 
+The executor's `custody` block names `host` (the admin endpoint it connects to and pins by
+`certificate_sha256`) and, optionally, `workload_host`: the name workloads are told to reach
+custody by, when that differs from `host`. Every profile's `custody_host` must equal
+`workload_host` (or `host` when it is absent), or the executor refuses to start. The executor
+never connects to `workload_host`, and nothing proves it is the same service; the custody
+service itself still refuses a request whose destination is not its own.
+
 ## Service loop contract
 
 `development-poll` and the Salad executor (`python -m
@@ -627,3 +634,18 @@ and the executor re-derives the same value from the stage. Two refusals apply ev
   `public`.
 - Provider trust is checked again at ticket issue and at each pull, so narrowing the setting
   stops later pulls.
+
+## Guardian read for Salad settlement (ADR 0041)
+
+`tessera serve --salad-guardian-read FILE` (or `"salad_guardian_read": "/abs/path"` in the
+`--campaign-providers` file; not both) names an owner-only (0600) JSON file,
+`{"schema": "tessera.salad.guardian-read.v1", "host", "port": 443, "token_file", "ca_file",
+"certificate_sha256"}`, for the guardian's pinned status endpoint. Control reads each Salad
+frame's guardian record itself and settles at the guardian-bounded hold only on a `stopped`
+verdict it read. Without the file, a Salad stage never settles on the bounded hold: the hold stays
+until a human records the charge. The cost estimate still comes from the executor's recorded final.
+
+Frames already in flight across an upgrade keep the verdict digest the earlier executor-final code
+recorded. A later `stopped` read still settles them, but that frame's verdict digest then differs
+from the `record_digest` on the receipt's `guardian_record`; the receipt still names the read that
+was made. New frames take the read's digest as their verdict digest.

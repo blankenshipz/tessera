@@ -17,7 +17,27 @@ Follow-up 6 is done: a billable frame that is `lost`, `failed` or outcome-ambigu
 settled on a verdict-based basis (`guardian_bounded_hold`, `provider_billed`) until control has
 recorded a guardian verdict digest on the frame (`settle_frame` refuses with `VerdictRequired`;
 the Salad driver records it from the guardian final it already reads). Human charge and
-reconcile bases are unchanged. The per-frame guardian record and fence are still open. The original record follows. It generalizes the
+reconcile bases are unchanged. The guardian now keeps an append-only per-frame record
+(`frame_records` in the safety service's own database, keyed by the reservation, rows at
+reserve, bind, `ready` admission, stop request, create rejection, lost-create absence and the
+first observed terminal state) and returns it additively on `status` as `frame_record`
+(`verdict` of `open`, `stopped`, `reconciled` or `absent`, the last `sequence` and a
+`record_digest` over every row). Control has an append-only table of what it read from that record
+(`execution_frame_guardian_records`, schema 87, `record_guardian_read`), and the frame receipt and
+the campaign receipt's attempt entry carry the latest read as `guardian_record` when there is
+one. Control now reads that record itself before a Salad stage settles on
+`guardian_bounded_hold`: with `--salad-guardian-read FILE` (or `salad_guardian_read` in the
+providers file) the Salad driver asks the guardian's pinned, authenticated status channel for the
+frame's `frame_record`, binds the frame's `guardian_reservation_id`, appends the read, and sets the
+frame's guardian verdict digest to the record's digest only when the verdict is `stopped`. The
+executor's recorded final no longer supplies the verdict: with no reader configured, an
+unreachable or malformed answer, or any verdict other than `stopped`, nothing settles on the
+bounded hold and the hold waits for a human charge as before. The executor's final still supplies
+the cost estimate (`estimate_not_invoice`) and the overrun block, so the *estimate* remains
+worker-reported; only the verdict is guardian-attested. `settle_frame` itself still demands a
+verdict digest only for ambiguous billable frames; the Salad driver is what requires the read for
+every bounded-hold settlement. Receipts carry the read as `guardian_record` with
+`verdict_source: guardian_read`. The `max_open_billable_frames` fence is a separate change. The original record follows. It generalizes the
 create-rejection change (commit 0f05f46, since merged) and amends the settlement
 contract of ADR 0038 (`0038-campaign-specs-and-platform-campaign-runner.md`, on the campaign runner track) and the
 provider interface of ADR 0040 (`0040-multi-stage-multi-vendor-campaigns.md`, on the campaign runner track). The guardian
