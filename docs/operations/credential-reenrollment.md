@@ -44,8 +44,21 @@ Run as the user that owns the private credential directory, in a terminal you co
    but its receipt file could not be written (the receipt is printed on stdout instead), 1 means
    unexpected.
 4. The receipt records the provider, reference, version and expiry metadata. It never contains the
-   secret. The receipt file is written atomically (a temporary file in the same directory, synced, then
-   linked into place without overwriting), so a failed write leaves no partial receipt.
+   secret. The receipt file is written atomically: an owner-only temporary file in the same
+   directory is written and synced, then hard-linked to the final name, which never overwrites an
+   existing file; the temporary file is always removed. On a filesystem without hard links (the
+   link fails with `EPERM`, `ENOTSUP`/`EOPNOTSUPP` or `EMLINK`) the temporary file is instead moved
+   with a rename that refuses to overwrite (Linux `renameat2` with `RENAME_NOREPLACE`, macOS
+   `renamex_np` with `RENAME_EXCL`). Where neither is available the command refuses rather than use
+   a plain rename that could replace an existing receipt. Any other link error (including `EXDEV`)
+   is not worked around. A failed write never leaves a partial receipt, and exit 3 names why the
+   file was not written:
+   - `stored_receipt_exists`: a receipt with that name already exists; it was left unchanged.
+   - `stored_receipt_link_unsupported`: the receipt directory's filesystem supports neither hard
+     links nor a no-replace rename.
+   - `stored_receipt_unwritable`: any other write failure (permissions, a full disk, an I/O error).
+   In every case the new version IS stored, no `receipt:` path is printed, and the receipt is
+   printed on stdout instead.
 5. Replacing the key here does NOT revoke the old one at the provider: after the services have
    restarted and use the new version, delete the previous key in the provider's console (the
    command reminds you).
@@ -94,7 +107,9 @@ to do:
 | `bad_expiry` | Use a whole number of hours in range. |
 | `profiles_unreadable`, `profile_reference_unknown`, `profile_pin_ambiguous` | Fix the profiles file: exactly one profile should name this reference. |
 | `receipt_directory_invalid` | Use an existing absolute directory (checked before anything is read or stored). |
-| exit 3, `stored_receipt_unwritable` | The new version IS stored; only the receipt file could not be written (the directory became unwritable or the file already exists). The receipt is printed on stdout: keep it, then clean up the directory. |
+| exit 3, `stored_receipt_exists` | The new version IS stored; a receipt file with the same name already exists and was not overwritten. Save the receipt printed on stdout, and compare it with the existing file before moving either. Do not re-run the command to get a file (that stores another version). |
+| exit 3, `stored_receipt_link_unsupported` | The new version IS stored; the receipt directory's filesystem supports neither hard links nor a no-replace rename. Save the receipt from stdout, and use a receipt directory on a local POSIX filesystem next time. |
+| exit 3, `stored_receipt_unwritable` | The new version IS stored; the receipt file could not be written (permissions, a full disk or an I/O error) and no partial file was left. Save the receipt from stdout, then fix the directory. |
 | `unknown_provider` | Only providers with a registered adapter can be re-enrolled. |
 | `enrollment_rejected` | The store refused the write; nothing was changed, re-check the directory. |
 | Finding not cleared after success | Pin the new version in the profile, restart the services, re-read health. |

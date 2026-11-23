@@ -12,6 +12,9 @@ create those source files:
 * it refuses when a general API-key environment variable would also supply the key (in the
   installer's environment, or set by the service's unit fragment, drop-in or environment file; the
   unit scan is best-effort, the service's own start-up check is the enforcement);
+* ``withdraw`` removes those same two files (both or neither, the key file never opened) and
+  appends a receipt that copies the reference and fingerprint from the latest install receipt;
+  with nothing installed it records ``already_absent``;
 * ``check`` re-validates the installed files and the unit's ``LoadCredential`` declarations;
 * ``receipts verify`` and ``receipts archive-broken`` recover from a damaged receipt chain.
 
@@ -606,6 +609,168 @@ def install(
     return receipt
 
 
+# -- withdraw --------------------------------------------------------------------------------
+
+
+class _Removal:
+    """One installed file this run moves aside, with what is needed to put exactly it back.
+
+    The file is never opened: it is inspected with ``lstat``, hard-linked to a fresh ``.prev``
+    name (``link`` fails if that name exists, so only OUR backup is ever used), then unlinked."""
+
+    def __init__(self, directory: Path, file: str) -> None:
+        if Path(file).name != file or file in {"", ".", ".."}:
+            raise CredentialRefused("unsafe_permissions")
+        self.directory, self.file = directory, file
+        self.target = directory / file  # a bare name in the checked (symlink-free) directory
+        self.backup = directory / f".{file}.{secrets.token_hex(8)}.prev"
+        try:
+            info = os.lstat(self.target)
+        except FileNotFoundError:
+            self.identity = None
+        except OSError:
+            raise CredentialRefused("store_unavailable") from None
+        else:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise CredentialRefused("unsafe_permissions")  # symlink, other type, hard link
+            self.identity = (info.st_dev, info.st_ino)
+        self.backed_up = False
+        self.removed = False
+
+    @property
+    def present(self) -> bool:
+        return self.identity is not None
+
+    def move_aside(self) -> None:
+        os.link(self.target, self.backup, follow_symlinks=False)
+        self.backed_up = True
+        info = os.lstat(self.backup)
+        if (info.st_dev, info.st_ino) != self.identity or not stat.S_ISREG(info.st_mode):
+            raise CredentialRefused("store_unavailable")  # the name changed since it was checked
+        os.unlink(self.target)
+        self.removed = True
+
+    def restore(self) -> None:
+        if self.removed:
+            try:
+                os.link(self.backup, self.target, follow_symlinks=False)
+            except OSError:
+                return  # never overwrite whatever now holds the name; the backup stays
+            self.removed = False
+        if self.backed_up:
+            _unlink(self.backup)
+            self.backed_up = False
+
+    def finish(self) -> bool:
+        if self.backed_up:
+            try:
+                os.unlink(self.backup)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            self.backed_up = False
+        return True
+
+
+def _latest_install(rows: list[dict[str, Any]], service: str, name: str) -> dict[str, Any] | None:
+    """The newest install receipt for this service credential in the (verified) chain."""
+    for row in reversed(rows):
+        if (
+            isinstance(row, dict)
+            and row.get("service") == service
+            and row.get("credential") == name
+            and row.get("action", "install") == "install"
+        ):
+            return row
+    return None
+
+
+def withdraw(
+    service: str,
+    name: str,
+    *,
+    credentials_dir: str | os.PathLike | None = None,
+    owner_label: str,
+    reason_label: str | None = None,
+    require_root: bool = True,
+    receipts_path: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """Remove one installed credential and its companion reference file; return the receipt.
+
+    The files are the ones ``install`` writes, named by the registry inside the checked credential
+    directory (never a caller-supplied file path). Both present files are removed or neither, and
+    the key file is never opened: the receipt copies the reference and fingerprint from the latest
+    install receipt in the chain. Idempotent: with nothing installed the receipt's outcome is
+    ``already_absent``. A broken receipt chain refuses before any file is touched."""
+    item = _credential(service, name)
+    owner = _label(owner_label)
+    reason = None if reason_label is None else _label(reason_label)
+    if require_root and os.geteuid() != 0:
+        raise CredentialRefused("store_unavailable", "Withdrawing for a service needs root.")
+    directory = Path(credentials_dir or _service(service)["credentials_dir"])
+    if not directory.is_absolute():
+        raise CredentialRefused("unsafe_permissions")
+    _checked_directory(directory, require_root)
+    receipts = Path(receipts_path or directory / RECEIPTS_NAME)
+    state = verify_receipts(receipts)
+    if not state["ok"]:
+        raise CredentialRefused(
+            "store_unavailable",
+            "The receipt chain is broken; run `tessera-service-credential receipts verify`, then "
+            "`receipts archive-broken` to restart it.",
+        )
+    installed = _latest_install(read_receipts(receipts), service, name)
+    files = [item["file"]]
+    if item.get("reference_file"):
+        files.append(item["reference_file"]["file"])
+    removals = [_Removal(directory, file) for file in files]  # every name checked before any move
+    present = [removal for removal in removals if removal.present]
+    try:
+        for removal in present:
+            removal.move_aside()
+        if present:
+            _fsync_directory(directory)
+        receipt = _append_receipt(
+            receipts,
+            {
+                "at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "service": service,
+                "credential": name,
+                "action": "withdraw",
+                "outcome": "removed" if present else "already_absent",
+                "removed_paths": [str(removal.target) for removal in present],
+                "reference": None if installed is None else installed.get("reference"),
+                "fingerprint": None if installed is None else installed.get("fingerprint"),
+                "install_receipt_hash": None if installed is None else installed.get("hash"),
+                "withdrawn_by_uid": os.getuid(),
+                "owner_label": owner,
+                "reason_label": reason,
+            },
+        )
+    except (OSError, CredentialRefused) as error:
+        for removal in reversed(present):
+            removal.restore()
+        try:
+            _fsync_directory(directory)
+        except OSError:
+            pass
+        detail = str(error) if isinstance(error, CredentialRefused) else None
+        raise CredentialRefused("store_unavailable", detail) from None
+    finished = all([removal.finish() for removal in present])
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        finished = False
+    if not finished:
+        raise CredentialRefused(
+            "store_unavailable",
+            "The credential was withdrawn and receipted, but a backup could not be deleted; "
+            "remove the .prev file in the credential directory.",
+        )
+    return receipt
+
+
 # -- check ------------------------------------------------------------------------------------
 
 
@@ -669,8 +834,8 @@ def _refuse(error: CredentialRefused) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tessera-service-credential",
-        description="Install a service credential from standard input; the secret is never an "
-        "argument or an environment variable.",
+        description="Install a service credential from standard input (the secret is never an "
+        "argument or an environment variable), check it, or withdraw it with a receipt.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -693,6 +858,14 @@ def _parser() -> argparse.ArgumentParser:
     install_cmd.add_argument("--replace", action="store_true")
     install_cmd.add_argument("--receipts")
     install_cmd.add_argument("--profile", help="service profile whose credential_ref must match")
+    withdraw_cmd = commands.add_parser(
+        "withdraw", help="remove an installed credential and its reference file, with a receipt"
+    )
+    common(withdraw_cmd)
+    withdraw_cmd.add_argument("--name", required=True)
+    withdraw_cmd.add_argument("--owner-label", required=True, help="who withdraws (a label)")
+    withdraw_cmd.add_argument("--reason", help="why (a label)")
+    withdraw_cmd.add_argument("--receipts")
     check_cmd = commands.add_parser("check", help="re-validate the installed files and the unit")
     common(check_cmd, units=True)
     list_cmd = commands.add_parser("list", help="installed names, fingerprints and receipts")
@@ -747,6 +920,18 @@ def main(argv: list[str] | None = None) -> int:
                 require_root=require_root,
                 receipts_path=args.receipts,
                 profile_path=_profile_default(args.service, args.profile),
+            )
+            print(json.dumps(receipt, indent=2))
+            return 0
+        if args.command == "withdraw":
+            receipt = withdraw(
+                args.service,
+                args.name,
+                credentials_dir=args.credentials_dir,
+                owner_label=args.owner_label,
+                reason_label=args.reason,
+                require_root=require_root,
+                receipts_path=args.receipts,
             )
             print(json.dumps(receipt, indent=2))
             return 0

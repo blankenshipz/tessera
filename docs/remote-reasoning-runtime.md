@@ -160,7 +160,7 @@ implemented (host firewalling is the operator's responsibility).
 A model API key for the reasoning service is installed with `tessera-service-credential install` (secret on
 standard input only; it writes the root-owned 0600 key file and the `model-credential` reference file, and a
 receipt with the reference and fingerprint). The start-up checks above are the admission: the installer adds
-none of its own. See [service credentials](service-credentials.md). The ordered steps left once the key
+none of its own. `tessera-service-credential withdraw` removes both files with a receipt (do not delete them by hand). See [service credentials](service-credentials.md). The ordered steps left once the key
 exists are in [reasoning first call: operator steps](reasoning-first-call-ops.md).
 ## Before the first call
 

@@ -102,7 +102,9 @@ standard input. It refuses a general `ANTHROPIC_API_KEY` in the environment or t
 file and the `reasoning-model-credential` reference file (root-owned, 0600, atomically), refuses if the
 profile's `credential_ref` is not `anthropic-api-key://OWNER/REFERENCE`, and records a receipt with the
 reference and fingerprint only. The service's start-up mapper then admits it as it admits any such files. A
-unit of your own needs the two `LoadCredential=` lines. See
+unit of your own needs the two `LoadCredential=` lines. To roll back, stop the unit and run
+`tessera-service-credential withdraw --service tessera-reasoning --name anthropic-api-key --owner-label WHO`
+as root (both files removed together, receipted; never delete them by hand). See
 [service credentials](../../docs/service-credentials.md).
 
 ### First-call readiness

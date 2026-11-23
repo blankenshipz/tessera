@@ -10,6 +10,8 @@ from it. Adding a provider is one ``register`` call with an adapter factory."""
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 import re
@@ -32,6 +34,13 @@ _GENERIC_NEXT = (
 
 
 DEFAULT_EXPIRY_HOURS = 72
+_RECEIPT_REASONS = {
+    "stored_receipt_exists": "a receipt file with that name already exists and was left unchanged",
+    "stored_receipt_link_unsupported": (
+        "this filesystem supports neither hard links nor a rename that refuses to overwrite"
+    ),
+    "stored_receipt_unwritable": "the receipt directory could not be written",
+}
 
 
 class ReenrollStored(Exception):  # noqa: N818 - the version is stored, a later step failed
@@ -209,7 +218,86 @@ def _read_secret(stream):
         raise ReenrollRefused("secret_entry_failed") from None
 
 
+# os.link() errnos meaning "this filesystem cannot hard-link" for a file we just created (link
+# count 1, same directory): EPERM (e.g. FAT/exFAT, some FUSE mounts), ENOTSUP/EOPNOTSUPP (network
+# and FUSE filesystems), EMLINK (a link-count limit of 1). EXDEV is NOT here: the temp file is in
+# the same directory, so a cross-device answer is unexpected and is refused, not worked around.
+# EEXIST is never here: an existing receipt is refused, never replaced.
+_LINK_UNSUPPORTED_ERRNOS = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK})
+_NOREPLACE_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+)
+_AT_FDCWD = -100  # Linux
+_RENAME_NOREPLACE = 1  # Linux renameat2 flag
+_RENAME_EXCL = 0x4  # macOS renamex_np flag
+
+
+class _NoReplaceUnsupported(Exception):
+    """Neither a hard link nor a rename that refuses to overwrite is available here."""
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically rename ``source`` to ``target``, failing with FileExistsError if ``target``
+    exists. Raises _NoReplaceUnsupported where the platform or filesystem cannot do that; never
+    falls back to a plain rename/replace, which would overwrite. A seam for tests."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        raise _NoReplaceUnsupported from None
+    src, dst = os.fsencode(source), os.fsencode(target)
+    if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        call = libc.renameat2
+        call.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        call.restype = ctypes.c_int
+        result = call(_AT_FDCWD, src, _AT_FDCWD, dst, _RENAME_NOREPLACE)
+    elif sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        call = libc.renamex_np
+        call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        call.restype = ctypes.c_int
+        result = call(src, dst, _RENAME_EXCL)
+    else:
+        raise _NoReplaceUnsupported
+    if result == 0:
+        return
+    code = ctypes.get_errno()
+    if code in _NOREPLACE_UNSUPPORTED_ERRNOS:
+        raise _NoReplaceUnsupported
+    raise OSError(code, os.strerror(code))  # EEXIST becomes FileExistsError
+
+
+def _place_receipt(temp: Path, path: Path) -> bool:
+    """Put ``temp`` at ``path`` without ever replacing an existing file; True if ``temp`` was
+    moved (renamed) rather than linked. Raises ReenrollRefused with the precise category."""
+    try:
+        try:
+            os.link(temp, path)
+            return False
+        except FileExistsError:
+            raise
+        except OSError as error:
+            if error.errno not in _LINK_UNSUPPORTED_ERRNOS:
+                raise
+        _rename_noreplace(temp, path)
+        return True
+    except FileExistsError:
+        raise ReenrollRefused("receipt_exists") from None
+    except _NoReplaceUnsupported:
+        raise ReenrollRefused("receipt_link_unsupported") from None
+    except OSError:
+        raise ReenrollRefused("receipt_unwritable") from None
+
+
 def _write_receipt(directory: Path, receipt: dict[str, Any]) -> Path:
+    """Write the receipt atomically: an owner-only temp file in the same directory, fsync, then a
+    hard link (or, where hard links are unsupported, a no-replace rename) to the final name.
+    Refuses with ``receipt_exists``, ``receipt_link_unsupported`` or ``receipt_unwritable``; a
+    refusal leaves no final file written by this call and no temp file."""
     slug = re.sub(r"[^a-z0-9]+", "-", receipt["reference"].lower()).strip("-")
     path = (
         directory / f"credential-reenroll-{receipt['provider']}-{slug}-v{receipt['version']}.json"
@@ -217,7 +305,7 @@ def _write_receipt(directory: Path, receipt: dict[str, Any]) -> Path:
     payload = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
     temp = directory / f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    created = False
+    created = moved = False
     try:
         try:
             fd = os.open(temp, flags, 0o600)
@@ -226,10 +314,9 @@ def _write_receipt(directory: Path, receipt: dict[str, Any]) -> Path:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            # link() refuses to replace an existing receipt (FileExistsError).
-            os.link(temp, path)
+            moved = _place_receipt(temp, path)
         finally:
-            if created:  # never remove a name this call did not create
+            if created and not moved:  # never remove a name this call did not create
                 try:
                     os.unlink(temp)
                 except FileNotFoundError:
@@ -306,9 +393,9 @@ def reenroll(
     }
     try:
         path = _write_receipt(directory, receipt) if directory is not None else None
-    except ReenrollRefused:
+    except ReenrollRefused as error:
         # The version IS stored: say so, and hand back the receipt so the record is not lost.
-        raise ReenrollStored("stored_receipt_unwritable", receipt, adapter.after_note) from None
+        raise ReenrollStored(f"stored_{error.category}", receipt, adapter.after_note) from None
     cleared = after["state"] == "ok"
     return {
         "after_note": adapter.after_note,
@@ -401,9 +488,13 @@ def run(arguments: argparse.Namespace, *, stdin=None, transport=None) -> int:
         print(f"Credential re-enrollment refused: {error.category}.", file=sys.stderr)
         return 2
     except ReenrollStored as stored:
+        reason = _RECEIPT_REASONS.get(
+            stored.category, _RECEIPT_REASONS["stored_receipt_unwritable"]
+        )
         print(
             f"Credential re-enrollment: {stored.category}. The new version "
-            f"{stored.receipt['version']} IS stored; only the receipt file was not written. "
+            f"{stored.receipt['version']} IS stored; only the receipt file was NOT written "
+            f"({reason}). "
             "The receipt follows on stdout so the record is not lost.",
             file=sys.stderr,
         )

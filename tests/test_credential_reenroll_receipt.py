@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
+import sys
 
 import pytest
-from test_credential_reenroll import NEW, argv, enroll_expired, run, store  # noqa: F401
+from test_credential_reenroll import (  # noqa: F401
+    NEW,
+    argv,
+    enroll_expired,
+    no_secret,
+    run,
+    store,
+)
 
 from tessera_control import credential_reenroll as cr
 
@@ -87,7 +97,7 @@ def test_existing_receipt_is_refused_and_unmodified(tmp_path):
     final.write_bytes(b"older receipt\n")
     with pytest.raises(cr.ReenrollRefused) as caught:
         cr._write_receipt(tmp_path, RECEIPT)
-    assert caught.value.args[0] == "receipt_unwritable"
+    assert caught.value.args[0] == "receipt_exists"
     assert final.read_bytes() == b"older receipt\n"
     assert os.listdir(tmp_path) == [FINAL]
 
@@ -132,5 +142,168 @@ def test_full_flow_existing_receipt_exits_stored(store, monkeypatch, capsys):  #
     (receipts / FINAL).write_bytes(b"older\n")
     code, out, err, _ = run(monkeypatch, capsys, argv(path, receipts))
     assert code == 3
+    assert "stored_receipt_exists" in err and "IS stored" in err and "NOT written" in err
     assert (receipts / FINAL).read_bytes() == b"older\n"
     assert NEW.decode() not in out + err
+
+
+def _link_unsupported(code):
+    def link(source, target):
+        raise OSError(code, os.strerror(code))
+
+    return link
+
+
+def _renameat2_available():
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        return hasattr(ctypes.CDLL(None, use_errno=True), "renameat2")
+    except OSError:
+        return False
+
+
+def _fail_inside_receipt_write(monkeypatch, failure):
+    """Run the real _write_receipt with a failure injected only inside it (not in the store)."""
+    real = cr._write_receipt
+
+    def failing(directory, receipt):
+        with pytest.MonkeyPatch.context() as inner:
+            if failure == "fsync":
+
+                def boom(fd):
+                    raise OSError("disk full")
+
+                inner.setattr(cr.os, "fsync", boom)
+            else:
+                real_write = os.write
+
+                def partial(fd, data):
+                    real_write(fd, bytes(data)[:5])
+                    raise OSError("interrupted")
+
+                inner.setattr(cr.os, "write", partial)
+                inner.setattr(cr.os, "fdopen", lambda fd, mode: _Stream(fd))
+            return real(directory, receipt)
+
+    monkeypatch.setattr(cr, "_write_receipt", failing)
+
+
+def _assert_stored_exit(code, out, err, category):
+    assert code == 3
+    assert category in err and "IS stored" in err and "NOT written" in err
+    assert json.loads(out)["version"] == 2  # the receipt is on stdout so the record is not lost
+    assert "receipt:" not in out + err  # never claims a receipt file
+    no_secret(out, err)
+
+
+@pytest.mark.parametrize("failure", ["fsync", "write"])
+def test_cli_mid_write_failure_exits_stored_unwritable(store, monkeypatch, capsys, failure):  # noqa: F811
+    path, receipts = store
+    enroll_expired(path)
+    _fail_inside_receipt_write(monkeypatch, failure)
+    code, out, err, _ = run(monkeypatch, capsys, argv(path, receipts))
+    _assert_stored_exit(code, out, err, "stored_receipt_unwritable")
+    assert os.listdir(receipts) == []  # no partial final file, no temp
+
+
+@pytest.mark.parametrize("code", [errno.EPERM, errno.ENOTSUP, errno.EMLINK])
+def test_no_hard_links_falls_back_to_noreplace_rename(tmp_path, monkeypatch, code):
+    if not _renameat2_available():
+        pytest.skip("renameat2 is not available on this platform")
+    monkeypatch.setattr(cr.os, "link", _link_unsupported(code))
+    try:
+        path = cr._write_receipt(tmp_path, RECEIPT)
+    except cr.ReenrollRefused as refused:
+        if refused.category == "receipt_link_unsupported":
+            pytest.skip("this filesystem does not support RENAME_NOREPLACE")
+        raise
+    assert path == tmp_path / FINAL
+    assert os.listdir(tmp_path) == [FINAL]
+    assert path.read_bytes() == EXPECTED
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_fallback_refuses_an_existing_receipt(tmp_path, monkeypatch):
+    if not _renameat2_available():
+        pytest.skip("renameat2 is not available on this platform")
+    monkeypatch.setattr(cr.os, "link", _link_unsupported(errno.EPERM))
+    final = tmp_path / FINAL
+    final.write_bytes(b"older receipt\n")
+    with pytest.raises(cr.ReenrollRefused) as caught:
+        cr._write_receipt(tmp_path, RECEIPT)
+    assert caught.value.category == "receipt_exists"
+    assert final.read_bytes() == b"older receipt\n"
+    assert os.listdir(tmp_path) == [FINAL]
+
+
+def test_fallback_existing_receipt_exits_stored_exists(store, monkeypatch, capsys):  # noqa: F811
+    path, receipts = store
+    enroll_expired(path)
+    (receipts / FINAL).write_bytes(b"older\n")
+    monkeypatch.setattr(cr.os, "link", _link_unsupported(errno.EPERM))
+
+    def noreplace(source, target):  # the seam answers as renameat2 would for an existing target
+        assert os.path.exists(target)
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST))
+
+    monkeypatch.setattr(cr, "_rename_noreplace", noreplace)
+    code, out, err, _ = run(monkeypatch, capsys, argv(path, receipts))
+    _assert_stored_exit(code, out, err, "stored_receipt_exists")
+    assert os.listdir(receipts) == [FINAL]
+    assert (receipts / FINAL).read_bytes() == b"older\n"
+
+
+def _seam_unsupported(source, target):
+    raise cr._NoReplaceUnsupported
+
+
+def test_neither_link_nor_noreplace_rename_refuses(tmp_path, monkeypatch):
+    monkeypatch.setattr(cr.os, "link", _link_unsupported(errno.EPERM))
+    monkeypatch.setattr(cr, "_rename_noreplace", _seam_unsupported)
+    with pytest.raises(cr.ReenrollRefused) as caught:
+        cr._write_receipt(tmp_path, RECEIPT)
+    assert caught.value.category == "receipt_link_unsupported"
+    assert os.listdir(tmp_path) == []
+
+
+def test_neither_link_nor_noreplace_rename_exits_stored(store, monkeypatch, capsys):  # noqa: F811
+    path, receipts = store
+    enroll_expired(path)
+    monkeypatch.setattr(cr.os, "link", _link_unsupported(errno.ENOTSUP))
+    monkeypatch.setattr(cr, "_rename_noreplace", _seam_unsupported)
+    code, out, err, _ = run(monkeypatch, capsys, argv(path, receipts))
+    _assert_stored_exit(code, out, err, "stored_receipt_link_unsupported")
+    assert os.listdir(receipts) == []
+
+
+def test_unexpected_link_errno_does_not_fall_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(cr.os, "link", _link_unsupported(errno.EXDEV))
+
+    def never(source, target):
+        raise AssertionError("no fallback for an unexpected errno")
+
+    monkeypatch.setattr(cr, "_rename_noreplace", never)
+    with pytest.raises(cr.ReenrollRefused) as caught:
+        cr._write_receipt(tmp_path, RECEIPT)
+    assert caught.value.category == "receipt_unwritable"
+    assert os.listdir(tmp_path) == []
+
+
+def test_noreplace_unsupported_errnos_map_to_unsupported(tmp_path, monkeypatch):
+    if not _renameat2_available():
+        pytest.skip("renameat2 is not available on this platform")
+
+    class Fake:
+        argtypes = restype = None
+
+        def __call__(self, *args):
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: type("L", (), {"renameat2": Fake()})())
+    source = tmp_path / "a"
+    source.write_bytes(b"x")
+    with pytest.raises(cr._NoReplaceUnsupported):
+        cr._rename_noreplace(source, tmp_path / "b")
+    assert source.exists()  # never a plain rename that could overwrite

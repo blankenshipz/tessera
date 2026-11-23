@@ -121,9 +121,20 @@ Roles: **root** is the host operator; **person** is a human credential on the co
 - Revoke the agent authority grant (person): `POST /agent-authority-grants/{id}/revoke`. Revoke or
   expire the agent credential as well. A person can set `per_call_cents` and `daily_cents` low
   again with `PUT /model-spend/limits`.
-- Rotate the key with the same `install` command plus `--replace`. The installer has no remove
-  subcommand (only `install`, `check`, `list`, `receipts`); to withdraw the key, delete the two
-  files under `/etc/tessera/credentials/` as root and revoke the key at the provider.
+- Rotate the key with the same `install` command plus `--replace`. To withdraw it, stop the unit
+  first, then run as root:
+
+  ```sh
+  sudo tessera-service-credential withdraw --service tessera-reasoning --name anthropic-api-key \
+    --owner-label WHO [--reason TEXT]
+  ```
+
+  It removes the key file and the `model-credential` reference file under
+  `/etc/tessera/credentials/` together (both or neither), refuses symlinks, hard links and paths
+  outside the directory, never reads the key, and appends a hash-chained receipt (who, the
+  credential reference and fingerprint from the install receipt, when, outcome). A second run records
+  `already_absent`. `check` then reports the credential as not configured, and the unit will not
+  start until a key is installed again. Then revoke the key at the provider.
 
 ## Not proven offline
 

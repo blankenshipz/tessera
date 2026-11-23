@@ -46,9 +46,29 @@ sudo tessera-service-credential check --service tessera-reasoning   # files, fin
 sudo tessera-service-credential list --service tessera-reasoning    # names and fingerprints from the receipts
 ```
 
+## Withdraw (roll back an install)
+
+To take a key out of service, do not delete files by hand. As root:
+
+```sh
+sudo tessera-service-credential withdraw \
+  --service tessera-reasoning --name anthropic-api-key \
+  --owner-label WHO [--reason TEXT]
+```
+
+It removes the key file and its `model-credential` reference file together (both or neither) from the checked
+credential directory, through the same registry `install` uses. It refuses symlinks, hard links and anything
+outside the directory, and never reads or prints the key. It is idempotent: a second run records
+`already_absent`. It appends a hash-chained receipt with who withdrew, which credential reference, when and the
+outcome; the reference and fingerprint come from the earlier install receipt, not from the file.
+
+Afterwards `check` reports the credential as not configured, and the unit (whose `LoadCredential=` names that
+file) will not start until a credential is installed again. Stop or disable the service first if it should stay
+down. Withdrawing does not revoke the key at the provider; do that separately.
+
 ## If the receipt chain is broken
 
-Every install verifies the chain first. If a receipt line was edited or the tail truncated, installs are
+Every install and withdraw verifies the chain first. If a receipt line was edited or the tail truncated, they are
 refused (`store_unavailable`). Look with `receipts verify`; if you accept the break, run
 `sudo tessera-service-credential receipts archive-broken --service tessera-reasoning`. It moves the broken
 file aside under a dated name and starts a new chain whose first record names the archived file's last good
