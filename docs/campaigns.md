@@ -657,6 +657,15 @@ event (`stage_key`, `attempt`, `attempt_id`, `provider_id`, `reason`:
 spell out of `running`, at the transition or by the runner's reconcile sweep. No spend beyond
 the zero settlement of a grant that never ran or exited on a free worker.
 
+Termination evidence (ADR 0160): when the development poller has stopped driving a grant
+without a confirmed exit, it keeps looking at the exact container and reports, as the worker
+that held the lease, an exit with its code, or `termination_evidence: container_absent` once the
+container id control recorded for that lease is gone and the lease has ended. The Salad executor
+reports the guardian's confirmed stop of the route's exact group
+(`termination_evidence: provider_group_stopped`). The paths above then settle the grant; any
+doubt (no recorded identity, another container, a container that may still run, Docker not
+answering) holds it, with the reason in the grant's local `termination-evidence.json`.
+
 ## Not implemented
 
 Bound gate outcomes without human-entered metric records (a human

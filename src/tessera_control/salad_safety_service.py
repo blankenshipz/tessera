@@ -1078,6 +1078,9 @@ class SaladSafetyService:
         status["input_delivery"] = (
             self.inputs.status(row["operation"]) if self.inputs else dict(ticket_held=False)
         )
+        # ADR 0160: the exact provider group this verdict is about (None before any bind), so a
+        # caller can match a stop to the group control recorded and never to another one.
+        status["provider_id"] = row["provider_id"]
         status.update(
             estimated_exposure_cents=row["accrued_cents"],
             actual_billed_cost_cents=None,

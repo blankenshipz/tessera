@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -313,6 +314,58 @@ LEASE_HELD_PHASES = frozenset(
 MAX_TERMINATION_OBSERVE_FAILURES = 3
 
 
+GROUP_STOP_MARKER = "group-stop.json"
+GROUP_STOP_MAX_FAILURES = 5
+GROUP_STOP_RECHECK_SECONDS = 30.0
+
+
+def _same_group(left: Any, right: Any) -> bool:
+    """Exact group identity; a UUID matches in any of its spellings, anything else verbatim."""
+    if not isinstance(left, str) or not isinstance(right, str) or not left or not right:
+        return False
+    try:
+        return uuid.UUID(left) == uuid.UUID(right)
+    except ValueError:
+        return left == right
+
+
+def group_stop_hold_reason(stop: Any, provider_id: str) -> str | None:
+    """None when the guardian's status proves the exact group stopped, else why it holds."""
+    from .salad_guardian import RECONCILE_PROVIDER
+
+    if type(stop) is not dict:
+        return "guardian_status_unavailable"
+    if not stop.get("provider_id"):
+        return "guardian_group_unrecorded"
+    if not _same_group(stop["provider_id"], provider_id):
+        return "guardian_group_mismatch"
+    if stop.get("status") == "stopped":
+        return None
+    if stop.get("status") == "reconciled" and stop.get("reason") == RECONCILE_PROVIDER:
+        return None
+    return "guardian_not_stopped"
+
+
+def _read_private_json(path: Path) -> dict[str, Any] | None:
+    try:
+        if path.is_symlink():
+            return None
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if type(value) is dict else None
+
+
+def _write_private_json(path: Path, document: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump(document, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
 def _key(step: str, attempt_id: str) -> str:
     return f"salad-exec-{step}-{hashlib.sha256(attempt_id.encode()).hexdigest()[:40]}"
 
@@ -357,6 +410,10 @@ class SaladCampaignExecutor:
         self._step = "grant_poll"  # the control call in flight, named on a recorded refusal
         # Whether this pass already sent its pre-lease registry heartbeat.
         self._heartbeat_sent = False
+        # ADR 0160: failed group-stop reports per attempt; bounded, in memory only.
+        self._group_stop_failures: dict[str, int] = {}
+        self._group_stop_given_up: set[str] = set()
+        self._group_stop_next: dict[str, float] = {}
         self.log: list[dict[str, Any]] = []
 
     # -- one pass ---------------------------------------------------------------------------
@@ -659,12 +716,87 @@ class SaladCampaignExecutor:
             return None
 
     def _resume(self, item: dict[str, Any]) -> None:
-        """An `executing` attempt after a restart: finish only from a receipt on disk."""
+        """An `executing` attempt after a restart: finish only from a receipt on disk.
+
+        With no receipt, the guardian's confirmed stop of the exact group is delivered as
+        termination evidence (ADR 0160); nothing else is recorded and no outcome is invented."""
         self._keepalive(item)
         receipts = self._route_dir(item["route_id"]) / "receipts"
         receipt = read_receipt(receipts) if receipts.is_dir() else None
         if receipt is not None:
             self._finish(item, receipt)
+            return
+        self._report_group_stop(item)
+
+    def _report_group_stop(self, item: dict[str, Any]) -> None:
+        """Report the guardian's confirmed stop of the route's exact group (ADR 0160).
+
+        Only when the guardian's own status names the same provider group control recorded on
+        the route, and says ``stopped`` (exact terminal, custody sealed) or ``reconciled`` by the
+        provider's fresh exact read of the group stopped. Anything else holds and is logged with
+        a reason. The observation is sent once, as the worker that held the lease, with a time
+        fixed in a private marker so a retry replays the same request."""
+        attempt, route_id = item["attempt_id"], item["route_id"]
+        read = getattr(self.control, "guardian_stop", None)
+        report = getattr(self.control, "report_group_stopped", None)
+        if read is None or report is None or attempt in self._group_stop_given_up:
+            return
+        directory = self._route_dir(route_id)
+        if not directory.is_dir():
+            return  # never launched here: there is no group to speak for
+        marker = directory / GROUP_STOP_MARKER
+        recorded = _read_private_json(marker)
+        if recorded is not None and recorded.get("reported") is True:
+            return
+        lease = self._lease_for(item)
+        if lease is None:
+            self._note("group_stop_held", attempt, "lease_unknown")
+            return
+        if recorded is None:
+            now = time.monotonic()
+            if now < self._group_stop_next.get(attempt, 0.0):
+                return  # looked recently; the guardian is read at most every recheck interval
+            self._group_stop_next[attempt] = now + GROUP_STOP_RECHECK_SECONDS
+            provider_id = self.control.route(route_id).get("provider_id")
+            if not provider_id:
+                self._note("group_stop_held", attempt, "group_identity_unrecorded")
+                return
+            try:
+                stop = read(route_id)
+            except Exception as error:  # noqa: BLE001 - an unreadable guardian holds
+                self._note("group_stop_held", attempt, type(error).__name__)
+                return
+            reason = group_stop_hold_reason(stop, provider_id)
+            if reason is not None:
+                self._note("group_stop_held", attempt, reason)
+                return
+            recorded = {
+                "provider_id": provider_id,
+                "observed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "guardian_status": stop["status"],
+                "guardian_reason": str(stop.get("reason") or "")[:80],
+                "reported": False,
+            }
+            _write_private_json(marker, recorded)
+        try:
+            report(
+                lease[0],
+                lease[1],
+                item["operation_id"],
+                recorded["provider_id"],
+                recorded["observed_at"],
+            )
+        except Exception as error:  # noqa: BLE001 - recorded and bounded, never fatal
+            failures = self._group_stop_failures.get(attempt, 0) + 1
+            self._group_stop_failures[attempt] = failures
+            if failures >= GROUP_STOP_MAX_FAILURES:
+                self._group_stop_given_up.add(attempt)
+            self._note("group_stop_report_failed", attempt, type(error).__name__)
+            return
+        recorded["reported"] = True
+        _write_private_json(marker, recorded)
+        self._group_stop_failures.pop(attempt, None)
+        self._note("group_stop_reported", attempt, recorded["guardian_status"])
 
     # -- step 5: custody import, upload, observation, outcome -------------------------------
 
@@ -1008,6 +1140,34 @@ class StoreControl:
             canonical_digest(payload),
             payload,
         )
+
+    def report_group_stopped(self, lease_id, epoch, operation_id, provider_id, observed_at):
+        """The guardian's confirmed stop of the exact group, as termination evidence (ADR 0160)."""
+        payload = dict(
+            expected_epoch=epoch,
+            operation_id=operation_id,
+            observed_state="exited",
+            observed_at=observed_at,
+            provider_id=provider_id,
+            termination_confirmed=True,
+            termination_evidence="provider_group_stopped",
+        )
+        self.executions.report_execution_observation(
+            self.worker,
+            lease_id,
+            _key("observe-group-stopped", operation_id),
+            canonical_digest(payload),
+            payload,
+        )
+
+    def guardian_stop(self, route_id):
+        """The guardian's verdict and the group it is about, or None with no guardian."""
+        if self.guardian_status is None:
+            return None
+        status = self.guardian_status(self.routes.get(self.worker, route_id))
+        if type(status) is not dict:
+            return None
+        return {key: status.get(key) for key in ("status", "reason", "provider_id")}
 
     def record_outcome(self, attempt_id, payload):
         self.campaigns.record_salad_outcome(

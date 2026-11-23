@@ -12,6 +12,8 @@ from pydantic import ValidationError
 
 from .approval_trust import require_decision_actor
 from .execution_models import (
+    CONTAINER_ABSENT,
+    PROVIDER_GROUP_STOPPED,
     AcquireExecutionLease,
     AttestKubernetesNeverSubmitted,
     ConfigureProjectExecution,
@@ -1566,6 +1568,67 @@ class ExecutionStore(Store):
             replay_guard=self._guard_lease_replay,
         )
 
+    def _check_termination_evidence(
+        self,
+        connection: sqlite3.Connection,
+        worker: dict[str, Any],
+        lease: sqlite3.Row,
+        operation: sqlite3.Row | None,
+        evidence: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Refuse indirect termination evidence unless it names exactly what control recorded.
+
+        ADR 0160. The caller already checked that the reporting worker holds or held this
+        lease, that the grant is the worker's and unresolved, and that the operation is bound
+        to this lease and epoch. ``container_absent`` additionally needs the container identity
+        an earlier observation of this lease recorded and every lease of the grant ended (no
+        authority remains under which a container could be created); ``provider_group_stopped``
+        needs the provider group the operation's route recorded. Anything else is refused.
+        """
+        if operation is None:
+            raise Conflict("Termination evidence requires a journaled external operation.")
+        provider_id = payload["provider_id"]
+        if evidence == CONTAINER_ABSENT:
+            recorded = connection.execute(
+                """SELECT 1 FROM execution_observations WHERE lease_id=? AND worker_principal_id=?
+                AND provider_id=? LIMIT 1""",
+                (lease["id"], worker["id"], provider_id),
+            ).fetchone()
+            if operation["provider_id"] != provider_id or recorded is None:
+                raise Conflict(
+                    "Container absence counts as termination only for the container identity "
+                    "control already recorded for this lease."
+                )
+            now = self._now()
+            for row in connection.execute(
+                "SELECT expires_at FROM execution_leases WHERE grant_id=?", (lease["grant_id"],)
+            ):
+                if _parse_utc(row["expires_at"]) > now:
+                    raise Conflict(
+                        "Container absence counts as termination only after the lease ended."
+                    )
+            return
+        if evidence == PROVIDER_GROUP_STOPPED:
+            groups: dict[str, str | None] = {}
+            for row in connection.execute(
+                """SELECT payload_json FROM events WHERE org_id=?
+                AND event_type='remote_execution.state'
+                AND json_extract(payload_json,'$.proposal.operation_id')=?
+                ORDER BY cursor DESC""",
+                (worker["org_id"], operation["operation_id"]),
+            ):
+                state = json.loads(row["payload_json"])
+                groups.setdefault(state["id"], state.get("provider_id"))  # newest per route
+            named = {group for group in groups.values() if group}
+            if named != {provider_id}:
+                raise Conflict(
+                    "Group stop evidence must name the one provider group control recorded "
+                    "for this operation's route."
+                )
+            return
+        raise Conflict("Termination evidence kind is not supported.")
+
     def report_execution_observation(
         self,
         principal: dict[str, Any],
@@ -1644,6 +1707,11 @@ class ExecutionStore(Store):
                     raise Conflict("A launch error cannot follow evidence that a container exists.")
             if payload["termination_confirmed"] and payload.get("provider_id") is None:
                 raise Conflict("Termination confirmation requires a provider identity.")
+            termination_evidence = payload.get("termination_evidence")
+            if termination_evidence is not None:
+                self._check_termination_evidence(
+                    connection, worker, lease, operation, termination_evidence, payload
+                )
             observed_at = _parse_utc(payload["observed_at"])
             if payload["termination_confirmed"] and operation is not None:
                 receipt = connection.execute(
@@ -1739,7 +1807,12 @@ class ExecutionStore(Store):
             else:
                 semantic_transition = True
             exit_code = payload.get("exit_code")
-            if semantic_transition or launch_error is not None or exit_code is not None:
+            if (
+                semantic_transition
+                or launch_error is not None
+                or exit_code is not None
+                or termination_evidence is not None
+            ):
                 self._event(
                     connection,
                     worker,
@@ -1760,6 +1833,11 @@ class ExecutionStore(Store):
                         "operational_only": True,
                         **({"launch_error": launch_error} if launch_error is not None else {}),
                         **({"exit_code": exit_code} if exit_code is not None else {}),
+                        **(
+                            {"termination_evidence": termination_evidence}
+                            if termination_evidence is not None
+                            else {}
+                        ),
                     },
                 )
             return 201, {

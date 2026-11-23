@@ -125,7 +125,9 @@ start, and each could stay taken by such a campaign:
 
 - A claimed grant whose expired run left no evidence (no confirmed exit, no launch error) still
   needs a person: control cannot tell an unreported run from no run. The `slot_held` event
-  says so; nothing frees it automatically.
+  says so; nothing frees it automatically. Narrowed by ADR 0160: the worker now reports the
+  exit, or the absence of the exact container it recorded, after it stopped driving the grant,
+  and the Salad executor reports the guardian's confirmed exact-group stop.
 - Rule 3 runs only while the campaign has an active approval, like the other evidence routes;
   a stuck campaign without one is reported by neither rule 3 nor rule 7.
 - The not-started auto-reconcile now also runs for a campaign blocked by a late overrun

@@ -119,6 +119,10 @@ LAUNCH_ERROR_CLASSES = (
     "container_create_failed",
     "launch_failed",
 )
+# ADR 0160: the closed kinds of indirect termination evidence a worker may report.
+CONTAINER_ABSENT = "container_absent"
+PROVIDER_GROUP_STOPPED = "provider_group_stopped"
+TERMINATION_EVIDENCE = (CONTAINER_ABSENT, PROVIDER_GROUP_STOPPED)
 
 
 class ReportExecutionObservation(ExecutionRequest):
@@ -135,6 +139,10 @@ class ReportExecutionObservation(ExecutionRequest):
     # The worker's own report that launching failed before any container existed
     # (ADR 0046). Only an unknown observation with no provider identity can carry it.
     launch_error: Literal[LAUNCH_ERROR_CLASSES] | None = None  # type: ignore[valid-type]
+    # ADR 0160: what a confirmed exit rests on when the worker did not see the container exit
+    # itself. ``container_absent``: the exact container control recorded no longer exists;
+    # ``provider_group_stopped``: the Salad guardian confirmed the exact group stopped.
+    termination_evidence: Literal[TERMINATION_EVIDENCE] | None = None  # type: ignore[valid-type]
 
     @field_validator("observed_at", mode="before")
     @classmethod
@@ -176,6 +184,21 @@ class ReportExecutionObservation(ExecutionRequest):
         ):
             raise ValueError(
                 "a launch error requires an unknown observation with no provider identity"
+            )
+        return value
+
+    @field_validator("termination_evidence")
+    @classmethod
+    def termination_evidence_names_a_confirmed_exit(cls, value: str | None, info) -> str | None:
+        if value is not None and (
+            info.data.get("observed_state") != "exited"
+            or not info.data.get("termination_confirmed")
+            or info.data.get("provider_id") is None
+            or info.data.get("exit_code") is not None
+        ):
+            raise ValueError(
+                "termination evidence requires a confirmed exit with a provider identity "
+                "and no exit code"
             )
         return value
 

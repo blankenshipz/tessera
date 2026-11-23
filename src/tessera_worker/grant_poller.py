@@ -44,6 +44,7 @@ from .service import (
 )
 from .stage_watch_config import StageWatchConfig, resolve_stage_watch
 from .supervisor import SupervisorError
+from .termination_evidence import RunDocker, TerminationEvidenceSweep, settled
 
 _GRANT_ID = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _MAX_CONSECUTIVE_FAILURES = 5
@@ -302,6 +303,7 @@ class DevelopmentGrantPoller:
         prune_networks: Callable[[DockerNetworkPool], list[str]] | None = None,
         jitter: Callable[[], float] = random.random,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        inspect_docker: RunDocker | None = None,
     ) -> None:
         self.config = config
         self.root = _private_dir(Path(config.workspace_root))
@@ -341,6 +343,23 @@ class DevelopmentGrantPoller:
         )
         self._prune_networks = prune_networks
         self._pruned = self._network_pool is None
+        # ADR 0160: deliver definitive termination evidence for grants this poller stopped
+        # driving. It reads Docker, so it is on by default only with the real service; an
+        # injected service (a test double) needs an explicit ``inspect_docker``.
+        if inspect_docker is None and service_factory is None:
+            inspect_docker = _docker
+        self.termination = (
+            None
+            if inspect_docker is None
+            else TerminationEvidenceSweep(
+                self.channel,
+                run=inspect_docker,
+                clock=clock,
+                wall_clock=wall_clock,
+                poll_seconds=config.poll_seconds,
+                jitter=jitter,
+            )
+        )
 
     def _default_service(self, config: DevelopmentWorkerConfig) -> Any:
         return DevelopmentWorkerService(config, channel=self.channel, stage_watch=self.stage_watch)
@@ -589,6 +608,34 @@ class DevelopmentGrantPoller:
         limit = self.config.max_grants
         return limit is None or self.grants_run + len(report["grants"]) < limit
 
+    def _ended(self) -> list[Path]:
+        """Grants this poller stopped driving that still await termination evidence."""
+        base = self.root / "grants"
+        if not base.is_dir():
+            return []
+        return [
+            entry
+            for entry in sorted(base.iterdir())
+            if _GRANT_ID.fullmatch(entry.name)
+            and entry.is_dir()
+            and not entry.is_symlink()
+            and ((entry / "result.json").exists() or (entry / ABANDONED_MARKER).exists())
+            and (entry / "workspace" / "runtime" / "runtime.json").exists()
+            and not settled(entry)
+        ]
+
+    def _sweep_termination(self, report: dict[str, Any]) -> None:
+        if self.termination is None:
+            return
+        try:
+            swept = self.termination.sweep(self._ended())
+        except (OSError, ValueError):
+            report["errors"] += 1
+            return
+        if swept:
+            # Ids, statuses and reasons only (ADR 0160).
+            report.setdefault("termination_evidence", []).extend(swept)
+
     def _cycle(self, report: dict[str, Any]) -> None:
         attempted: set[str] = set()
         for grant_id in self._recoverable():
@@ -599,6 +646,7 @@ class DevelopmentGrantPoller:
             if image is None or image not in self.config.allowed_images:
                 continue
             self._record(report, grant_id, self._run_one(grant_id, image))
+        self._sweep_termination(report)
         try:
             listing = self.channel.get(LIST_PATH)
         except ConnectionError:

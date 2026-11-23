@@ -512,6 +512,8 @@ def report_observation(
         payload.pop("launch_error", None)
     if payload.get("exit_code") is None:
         payload.pop("exit_code", None)
+    if payload.get("termination_evidence") is None:
+        payload.pop("termination_evidence", None)
     with _refusals(store, worker, "observe", lease_id=body.lease_id):
         return result(
             store.report_execution_observation(
