@@ -274,7 +274,9 @@ Example systemd units for the poller, Salad executor and guardian are in
 A person can record an approved submission (a reviewed spec digest or a failed campaign to rerun);
 the optional `tessera-submit-runner` then turns pending records into campaigns on a schedule, only
 on a host whose operator admitted it (it then starts with `tessera.target`) and when
-`tessera serve --agent-submissions` is set
+`tessera serve --agent-submissions --agent-submission-kill-switch <marker-file>` is set (the
+serve command refuses to start with the first flag and not the second; while the marker file
+exists, or its state is ambiguous, every approved-submission consume is refused)
 ([ADR 0093](docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md)). It runs no model and
 approves nothing.
 A person can also sign a delegation (a program, a budget ceiling, a per-run cap, allowed providers and
@@ -289,8 +291,6 @@ person ([ADR 0150](docs/decisions/0150-deferred-launch-delegated-preclear.md)).
 Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes v1 and v2
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
 `tessera_get_campaign_receipt`, `tessera_campaign_report` (a plain-words read of one campaign or a time window, [ADR 0115](docs/decisions/0115-plain-words-campaign-report.md)), `tessera_list_snapshots`, `tessera_get_snapshot` (one snapshot's file list, [ADR 0126](docs/decisions/0126-mcp-snapshot-file-list.md)), `tessera_campaign_outputs`,
-`tessera_campaign_logs`, `tessera_campaign_budget` and `tessera_project_spend` (the operator's
-`tessera_get_campaign_receipt`, `tessera_campaign_report` (a plain-words read of one campaign or a time window, [ADR 0115](docs/decisions/0115-plain-words-campaign-report.md)), `tessera_list_snapshots`, `tessera_campaign_outputs`,
 `tessera_campaign_logs`, `tessera_campaign_stage_status` (per stage: placement, what it waited on, latest attempt and executor lease and heartbeat state and the latest control refusal of a worker step from any provider, as codes, ages and counts), `tessera_campaign_budget` and `tessera_project_spend` (the operator's
 project limits and campaign totals) read recorded state under separate
 scopes. Steering tools ([ADR 0055](docs/decisions/0055-mcp-steering-tools.md)) dry-run a spec

@@ -52,6 +52,7 @@ CAMPAIGN_TOOL_SCOPES = {
     # Platform stuck-campaign detections: listing is read-only; acknowledging marks one seen.
     "tessera_list_stuck_campaigns": "campaign:read",
     "tessera_acknowledge_stuck": "campaign:cancel",
+    "tessera_heavy_local_audit": "campaign:read",
     "tessera_campaign_gate_decisions": "campaign:read",
     # ADR 0068: read-only one-time holdout claims and their scored metrics.
     "tessera_campaign_holdout": "campaign:read",
@@ -397,6 +398,15 @@ def register_campaign_tools(
         if scan:
             await client.scan_stuck(str(uuid.uuid4()))
         return await client.list_stuck(status, limit)
+
+    async def tessera_heavy_local_audit() -> dict[str, Any]:
+        """List heavy stages running on a local provider now (campaign:read), with why.
+
+        Per live heavy attempt in a non-terminal campaign of this project: campaign_id,
+        attempt_id, provider_id, the recorded placement reasons and detail, and whether the
+        fallback was explained. Read-only; includes no_remote_profile placements.
+        """
+        return await client.heavy_local_audit()
 
     async def tessera_acknowledge_stuck(
         finding_id: str, idempotency_key: str, note: str = ""
@@ -944,6 +954,7 @@ def register_campaign_tools(
         tessera_get_campaign,
         tessera_list_campaigns,
         tessera_list_stuck_campaigns,
+        tessera_heavy_local_audit,
         tessera_acknowledge_stuck,
         tessera_get_campaign_receipt,
         tessera_campaign_report,

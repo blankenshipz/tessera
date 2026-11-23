@@ -93,8 +93,9 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_campaign_retries",
         "tessera_campaign_standing_status",
         "tessera_campaign_gate_decisions",
-        # Platform stuck-campaign findings: read-only list (the acknowledge tool has no "campaign"
-        # in its name; both are covered in test_mcp_campaign_stuck.py).
+        # Platform stuck-campaign findings: read-only list (the acknowledge and heavy-audit
+        # tools have no "campaign" in their names; see test_mcp_campaign_stuck.py and
+        # test_heavy_local_audit_api.py).
         "tessera_list_stuck_campaigns",
         # ADR 0068: read-only holdout claims and scored metrics.
         "tessera_campaign_holdout",

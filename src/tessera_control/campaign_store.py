@@ -154,6 +154,16 @@ class LicenseRefused(Conflict):
         self.labels: list[str] = sorted(labels)
 
 
+class DataClassConflict(Conflict):
+    """An input's data class the provider instance is not trusted to receive (ADR 0040).
+    ``data_class`` is that class when the refusal names one (None for a mismatched code approval
+    or an unreadable manifest); ADR 0141 records it as a structured cause."""
+
+    def __init__(self, message: str = "", data_class: str | None = None) -> None:
+        super().__init__(message)
+        self.data_class = data_class
+
+
 class CampaignStore(
     CampaignGateCommands,
     CampaignSteeringCommands,
@@ -332,8 +342,9 @@ class CampaignStore(
                         hint = " " + CampaignStore.trust_hint(
                             stage.provider, worker, error.admit_class
                         )
-                    raise Conflict(
-                        f"Stage {stage.key!r} input {source.name!r}: {error} ({who}).{hint}"
+                    raise DataClassConflict(
+                        f"Stage {stage.key!r} input {source.name!r}: {error} ({who}).{hint}",
+                        error.data_class,
                     ) from None
             elif not provider_trust.provider_admits_class(
                 stage.provider,
@@ -343,10 +354,11 @@ class CampaignStore(
                 approval_digest,
                 connection=connection,
             ):
-                raise Conflict(
+                raise DataClassConflict(
                     f"Stage {stage.key!r} input {source.name!r} is derived data and {who} is "
                     "not trusted to receive private_derived (provider trust setting). "
-                    + CampaignStore.trust_hint(stage.provider, worker)
+                    + CampaignStore.trust_hint(stage.provider, worker),
+                    "private_derived",
                 )
         return CampaignStore.check_license_labels(connection, stage, spec, scope)
 

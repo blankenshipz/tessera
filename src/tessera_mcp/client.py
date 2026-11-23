@@ -313,6 +313,11 @@ class ControlClient:
             "GET", f"/projects/{project}/campaign-stuck?status={status}&limit={limit}"
         )
 
+    async def heavy_local_audit(self):
+        """Heavy stages running on a local provider now, with reasons (campaign:read)."""
+        project = segment(self.config.project_id)
+        return await self._request("GET", f"/projects/{project}/campaign-stuck/heavy-local-audit")
+
     async def scan_stuck(self, idempotency_key):
         """Run the platform's detector now (detections are recorded on receipts)."""
         project = segment(self.config.project_id)

@@ -146,6 +146,68 @@ def _finding(campaign_id, code, subject, stage_key, evidence) -> dict[str, Any]:
     }
 
 
+def _heavy_local_attempts(
+    connection: sqlite3.Connection, project_id: str, campaign_id: str, now: datetime
+) -> list[dict[str, Any]]:
+    """Live heavy attempts that recorded a local-fallback warning for that same attempt, as
+    evidence dicts (plus ``stage_key``). ``explained`` says whether the guard recorded an explicit
+    fallback reason (campaign_heavy_guard.explained); ``detail`` is the recorded guard detail."""
+    from .campaign_heavy_guard import explained
+
+    warned = {
+        (e.get("stage_key"), e.get("attempt")): e
+        for e in heavy_readout._events(
+            connection, project_id, campaign_id, heavy_readout.FALLBACK_EVENT
+        )
+        if (e.get("mode") or "warn") == "warn"
+    }
+    out = []
+    for a in connection.execute(
+        "SELECT id, stage_key, attempt, status FROM campaign_stage_attempts "
+        f"WHERE campaign_id=? AND status IN ({','.join('?' * len(HEAVY_LIVE_ATTEMPT))}) "
+        "ORDER BY stage_key, attempt",
+        (campaign_id, *HEAVY_LIVE_ATTEMPT),
+    ).fetchall():
+        event = warned.get((a["stage_key"], a["attempt"]))
+        if event is None:
+            continue
+        reasons = list(event.get("reasons") or [])
+        detail = event.get("detail")
+        out.append(
+            {
+                "stage_key": a["stage_key"],
+                "attempt_id": a["id"],
+                "attempt": a["attempt"],
+                "attempt_status": a["status"],
+                "provider_id": event.get("provider_id"),
+                "reasons": reasons,
+                "signals": list(event.get("signals") or []),
+                "detail": detail,
+                "explained": bool(explained(reasons, detail)),
+                "age_seconds": _age(now, event["_at"]),
+            }
+        )
+    return out
+
+
+def heavy_local_audit(
+    connection: sqlite3.Connection, org_id: str, project_id: str, now: datetime
+) -> list[dict[str, Any]]:
+    """Owner audit: every heavy stage running on a local provider now, in any non-terminal
+    campaign of the project, with whether its fallback was explained. Unlike the stuck finding it
+    includes ``no_remote_profile`` placements. Read-only; each item carries ``campaign_id``."""
+    out = []
+    for c in connection.execute(
+        "SELECT id, status FROM campaigns WHERE org_id=? AND project_id=? ORDER BY id",
+        (org_id, project_id),
+    ).fetchall():
+        if c["status"] in TERMINAL_CAMPAIGN:
+            continue
+        for item in _heavy_local_attempts(connection, project_id, c["id"], now):
+            out.append({"campaign_id": c["id"], **item})
+    return out
+
+
 def detect(
     connection: sqlite3.Connection,
     org_id: str,
@@ -273,40 +335,17 @@ def detect(
         guards = heavy_readout.stage_guards(connection, project_id, cid)
         if not guards:
             continue
-        warned = {
-            (e.get("stage_key"), e.get("attempt")): e
-            for e in heavy_readout._events(
-                connection, project_id, cid, heavy_readout.FALLBACK_EVENT
+        for item in _heavy_local_attempts(connection, project_id, cid, now):
+            evidence = {k: v for k, v in item.items() if k != "stage_key"}
+            finding = _finding(
+                cid, "heavy_stage_on_local", item["attempt_id"], item["stage_key"], evidence
             )
-            if (e.get("mode") or "warn") == "warn"
-            # No Salad profile exists to check, so a live local attempt is not "stuck on local".
-            and list(e.get("reasons") or []) != ["no_remote_profile"]
-        }
-        for a in connection.execute(
-            "SELECT id, stage_key, attempt, status FROM campaign_stage_attempts "
-            f"WHERE campaign_id=? AND status IN ({','.join('?' * len(HEAVY_LIVE_ATTEMPT))})",
-            (cid, *HEAVY_LIVE_ATTEMPT),
-        ).fetchall():
-            event = warned.get((a["stage_key"], a["attempt"]))
-            if event is None:
-                continue
-            found.append(
-                _finding(
-                    cid,
-                    "heavy_stage_on_local",
-                    a["id"],
-                    a["stage_key"],
-                    {
-                        "attempt_id": a["id"],
-                        "attempt": a["attempt"],
-                        "attempt_status": a["status"],
-                        "provider_id": event.get("provider_id"),
-                        "reasons": list(event.get("reasons") or []),
-                        "signals": list(event.get("signals") or []),
-                        "age_seconds": _age(now, event["_at"]),
-                    },
-                )
-            )
+            if item["reasons"] == ["no_remote_profile"]:
+                # Configuration gap: no Salad profile exists. Same code (the findings code check
+                # is fixed), marked in evidence, with its own suggested action.
+                evidence["config_gap"] = "no_remote_profile"
+                finding["suggested_action"] = "configure_a_salad_profile"
+            found.append(finding)
         for key, guard in guards.items():
             if guard["mode"] != "refuse" or not guard["waiting"]:
                 continue

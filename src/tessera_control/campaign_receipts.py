@@ -10,6 +10,7 @@ from typing import Any
 
 from .campaign_gates import unlock_receipt_section
 from .campaign_heavy_guard import recorded as recorded_heavy_guards
+from .campaign_heavy_guard import refusals as recorded_heavy_refusals
 from .campaign_heavy_remote import records as heavy_remote_records
 from .campaign_holdout import receipt_section as holdout_receipt_section
 from .campaign_io import stage_io
@@ -752,6 +753,11 @@ def build_receipt(
     guards = recorded_heavy_guards(connection, current)
     # ADR 0141: what submit did about each heavy stage's remote candidate (from the spec).
     remote_candidates = heavy_remote_records(current["spec_json"])
+    # ADR 0107 amendment 2026-11-23c: a heavy stage the guard refused with no attempt for
+    # that number (from the recorded refusal or the ended refuse-mode wait).
+    refusals = recorded_heavy_refusals(
+        connection, current, stages, {attempt["stage_key"] for attempt in attempts}
+    )
     grants = {
         row["id"]: row["worker_principal_id"]
         for row in connection.execute(
@@ -813,6 +819,11 @@ def build_receipt(
                 **(
                     {"heavy_remote_candidate": remote_candidates[stage["stage_key"]]}
                     if stage["stage_key"] in remote_candidates
+                    else {}
+                ),
+                **(
+                    {"placement": {"heavy_guard": refusals[stage["stage_key"]]}}
+                    if stage["stage_key"] in refusals
                     else {}
                 ),
             }

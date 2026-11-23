@@ -233,6 +233,9 @@ def test_a_heavy_stage_without_a_remote_candidate_is_not_listed(tmp_path, near):
     world = _cpu_world(tmp_path, near, HEAVY)
     single = {k: v for k, v in world.spec["stages"][0].items() if k != "alternate_providers"}
     world.spec = salad_spec_v2(world.env, [single])
+    # Amendment 2026-11-23b: unexplained, so placed only with the operator's opt-out (the
+    # default refusal is tests/test_heavy_unexplained_local.py).
+    preference.configure({"heavy_unexplained_local": "warn"}, [NEAR, "salad"])
     world.start()
     world.tick_until(lambda: world.attempt() is not None)
     world.tick(3)
@@ -249,6 +252,7 @@ def test_a_heavy_stage_without_a_remote_candidate_is_not_listed(tmp_path, near):
             "reasons": ["not_listed"],
             "detail": [],
             "mode": "warn",
+            "unexplained_local": "warn",
         }
     }
 
@@ -288,7 +292,11 @@ def test_refuse_mode_waits_for_a_one_provider_heavy_stage(tmp_path, near):
     world = _cpu_world(tmp_path, near, HEAVY)
     single = {k: v for k, v in world.spec["stages"][0].items() if k != "alternate_providers"}
     world.spec = salad_spec_v2(world.env, [single])
-    preference.configure({"heavy_local_fallback": "refuse"}, [NEAR, "salad"])
+    # Amendment 2026-11-23b: ``not_listed`` alone is unexplained; refuse mode waits for it only
+    # with the operator's opt-out (by default the stage fails, tests/test_heavy_unexplained_local).
+    preference.configure(
+        {"heavy_local_fallback": "refuse", "heavy_unexplained_local": "warn"}, [NEAR, "salad"]
+    )
     world.start()
     world.tick(5)
     assert world.attempt() is None and not _fallbacks(world)

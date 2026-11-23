@@ -234,8 +234,8 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
 
 ## Limits and refusals worth knowing
 
-- `max_exposure_cents` x `retry.max_attempts` may not exceed 5000 (the experiment budget
-  ceiling) for any stage.
+- `max_exposure_cents` x (`retry.max_attempts` + `retry.infra_retries`) may not exceed 5000
+  (the experiment budget ceiling) for any stage.
 - v1: at most 32 stages, 256 input edges and 8 inputs per stage. v2: 64 stages, 512 edges,
   8 data inputs per stage plus the stage's `code_input` when it names one (ADR 0121; the code
   input is not counted as a data input or an edge), 1 MiB of canonical JSON, 1..128 typed outputs per stage, and at most
@@ -279,7 +279,17 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   shows a per-stage `heavy_guard`. The operator may set `placement_preferences.heavy_local_fallback`
   to `refuse`, so the stage waits (`heavy_local_refused`) instead of running locally; the default
   `warn` changes nothing else
-  ([campaign providers](campaign-providers.md#heavy-stage-placement-guard)). Without a Salad
+  ([campaign providers](campaign-providers.md#heavy-stage-placement-guard)). A local placement
+  needs an explicit fallback reason (Salad unavailable, skipped by a check, over a cap, refused by
+  trust or licence, an operator decision, or the ADR 0141 record saying why no Salad candidate was
+  added); without one the stage fails with `heavy_local_unexplained` and a
+  `campaign.heavy_stage_local_refused` event unless the operator set
+  `placement_preferences.heavy_unexplained_local: warn` (amendment 2026-11-23b). A stage the guard
+  refused before any attempt (that failure, or a refuse-mode wait that ended the stage failed or
+  cancelled) carries the refusal on its receipt stage entry as `placement.heavy_guard` (`code`,
+  `reasons`, `mode`, `detail`), rebuilt from the recorded event; a Salad candidate refused at submit
+  names its structured `cause` (`license_label` with `labels`, `data_class` with `data_class`) on
+  the ADR 0141 record and in the guard `detail` (amendment 2026-11-23c). Without a Salad
   profile a heavy local placement records only `no_remote_profile` (as a warning, also in refuse mode); light stages are
   unaffected.
 - **Grant lifetime and slots (ADR 0048).** A stage whose `grant_ttl_seconds` is shorter than

@@ -80,6 +80,9 @@ not concern.
    - `heavy_stage_on_local` (suggested `check_salad_credential_or_profile`): a live attempt
      (reserved, granted, admitted or running) with a warn event for the same attempt. Evidence:
      `attempt_id`, `attempt`, `attempt_status`, `provider_id`, `reasons`, `signals`, `age_seconds`.
+     Amendment 2026-11-23c: a heavy local attempt whose only reason is `no_remote_profile` also
+     fires this finding as a configuration gap (evidence `config_gap: no_remote_profile`, suggested
+     `configure_a_salad_profile`), and the evidence carries `detail` and `explained`.
    - `heavy_stage_refused_local` (suggested `restore_remote_capacity_or_allow_local`): a stage
      waiting on a refusal for longer than the project's `lease_grace_seconds` (default 300).
      Evidence: `stage_key`, `attempt`, `reasons`, `waiting_seconds`, `grace_seconds`. It clears when
@@ -166,3 +169,67 @@ receipt with an accurate reason. This amends Decisions 1-3 and 5; nothing else c
 
 Tests: `tests/test_heavy_stage_placement_reasons.py`. `tests/test_heavy_stage_guard.py` changed two
 tests for the contract (gpu is a guard signal; no profile records `no_remote_profile`).
+
+## Amendment (2026-11-23b): no unexplained local fallback
+
+Owner rule: nothing heavy silently lands on a local provider. A guarded heavy stage (heavy, Salad
+profile registered) may use a local candidate only with an explicit fallback reason. This amends
+Decisions 3 and 5 for unexplained fallbacks only; explained ones, light stages and projects
+without a Salad profile are unchanged.
+
+- **Explained** (`campaign_heavy_guard.EXPLAINED_REASONS`, classified by
+  `campaign_heavy_guard.explained(reasons, detail)`): `no_remote_profile`,
+  `credential_unavailable`, `no_fitting_profile`, `remote_failed_infra`, `remote_skipped` (a
+  placement check skipped Salad: capacity, a cap or budget, trust or licence refusal, an
+  unregistered provider, a plan or retry rule), `operator_override` and the new
+  `remote_candidate_not_added`. `operator_override` stays explained: it is set only for an
+  operator's own recorded act (a steering pin or exclusion, a placement rule, or the default
+  policy switched off), and the guard still records it.
+- **`remote_candidate_not_added`** (new, in place of `not_listed`): the stage lists no remote
+  candidate and its ADR 0141 `heavy_remote_candidate` record says why none was added (any reason
+  in `campaign_heavy_remote.NOT_ADDED_REASONS`: egress, GPU, scratch, runtime, unpinned input,
+  alternates full, no fitting or unfit profile, operator/stage/campaign/program cap, campaign
+  forbids or provider unregistered, a refused submit check such as trust, data class or licence).
+  `detail` gains `{provider_id, reason: <record reason>, source: "heavy_remote_candidate"}`. A
+  record with an unknown reason keeps `not_listed` (unexplained) with the same detail entry. The
+  record is read from the stored, approved spec; submit discards a submitted one, so only Tessera
+  writes it.
+- **Unexplained**: `not_listed` with no such record (the ADR 0141 setting was not configured) and
+  `remote_not_tried`. By default (`placement_preferences.heavy_unexplained_local: "refuse"`, also
+  when the section is absent) the local candidate is skipped with the permanent reason
+  `heavy_local_unexplained`:
+  - on the placement path, a local candidate that would be unexplained while a remote candidate is
+    still to be tried is decided after the remote ones: Salad is tried (and chosen when it
+    qualifies, the local recorded as skipped `heavy_local_unexplained` / `remote_not_tried`); if
+    Salad is then skipped, that skip explains the local candidate, which is placed (or refused in
+    `refuse` mode) exactly as before;
+  - when nothing can explain it, the stage fails promptly with stop reason
+    `stage_failed:<key>:heavy_local_unexplained` and one `campaign.heavy_stage_local_refused`
+    event (the fallback event's fields plus `code` and `unexplained_local`), recorded in the same
+    transaction as the failure. Nothing is placed, held or run. It does not wait: an approved
+    spec can never gain a remote candidate, so waiting would only run out the deadline. This
+    also holds in `heavy_local_fallback: refuse` mode, which keeps waiting for explained
+    reasons only.
+  - The single-provider path applies the same rule before reservation; a remote listed only in
+    `retry.reroute_providers` counts as skipped (`infra_retry_only`) as on the placement path.
+- **Opt-out**: `heavy_unexplained_local: "warn"` restores the earlier behaviour (placed with the
+  warning, or waiting in `refuse` mode); such blocks and events carry
+  `unexplained_local: "warn"`, so the receipt shows the operator chose it. Explained blocks keep
+  the earlier shape.
+- `tessera_get_campaign`'s per-stage `heavy_guard` shows a refused stage as `mode: refuse`,
+  `code: heavy_local_unexplained`, `waiting: false`.
+
+*Amended 2026-11-23c (receipt):* a heavy stage the guard refused with no attempt for that number
+also carries the refusal on its receipt **stage** entry, as `placement.heavy_guard`: `{warning:
+false, refused: true, code, provider_id, attempt, mode, signals, reasons, detail,
+unexplained_local?, recorded_at}`, built only from the recorded `campaign.heavy_stage_local_refused`
+event (code `heavy_local_unexplained`) or, for a stage that has no attempt and ended `failed` or
+`cancelled`, from its latest `campaign.stage_waiting_placement` when that wait was the guard's
+refuse-mode refusal (code `heavy_local_refused`, provider from the recorded skip). No clock is
+read; every other stage entry is unchanged. Tests: `tests/test_heavy_refusal_receipt.py`.
+
+Tests: `tests/test_heavy_unexplained_local.py`. Changed for the contract:
+`tests/test_heavy_stage_guard.py` (the `not_listed` warning and the one-provider refuse-mode wait
+now opt into `warn`), `tests/test_heavy_stage_placement_reasons.py` (the gpu-stage local warning
+opts into `warn`), `tests/test_heavy_stage_remote_candidate.py` (without the setting the local
+fallback is refused).

@@ -13,7 +13,8 @@ stored spec: ``added`` with the reason ``operator_heavy_remote_candidate``, or t
 candidate was added (egress, scratch, no fitting profile, a cap it would exceed, a refused
 check ...). A submitted record is discarded and recomputed, so only Tessera writes it; with it
 goes at most the first alternate, and only one of the derived shape (never one the author
-listed). Light stages, stages that already list a remote
+listed). A refused candidate's record also names its structured ``cause`` (amendment
+2026-11-23c, ``refusal_cause``). Light stages, stages that already list a remote
 candidate, v1 specs and a missing setting are left exactly as they were: the ADR 0107 warning
 then records any local fallback at placement.
 
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from typing import Annotated, Any, Literal
@@ -41,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 from .campaign_models import (
     DOCKER_CPU_RUNTIME,
     HEAVY_REMOTE_ADDED,
+    HEAVY_REMOTE_REFUSED,
     MAX_ALTERNATE_PROVIDERS,
     SALAD_RUNTIME,
     CampaignSpecV2,
@@ -48,10 +51,38 @@ from .campaign_models import (
     stage_on_candidate,
     stage_provider,
 )
+from .campaign_providers import TRUST_CLASSES
 from .store import StoreError
 
 FIELD = "heavy_remote_candidate"
 MAX_DETAIL = 500
+# Every reason ``_decide`` and ``apply`` record for a candidate not added. Each is an explicit
+# fallback reason for ADR 0107 (amendment 2026-11-23b): the stage cannot run there (egress, GPU,
+# scratch, runtime, an unpinned input, no fitting profile), a cap or budget it would exceed, the
+# campaign forbids the provider, the provider is unregistered, the spec has no room for another
+# alternate, or a submit check (trust, data class, licence label) refused the candidate.
+NOT_ADDED_REASONS = frozenset(
+    {
+        "egress_bound",
+        "gpu_candidate_unavailable",
+        "forbidden_by_campaign",
+        "provider_unregistered",
+        "scratch_requested",
+        "runtime_not_adaptable",
+        "input_not_pinned",
+        "alternates_full",
+        "no_fitting_profile",
+        "profile_unfit",
+        "over_operator_cap",
+        "over_stage_cap",
+        "over_campaign_budget",
+        "program_budget",
+        HEAVY_REMOTE_REFUSED,
+    }
+)
+# Amendment 2026-11-23c: the structured cause of a refused candidate (never parsed from text).
+LABEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+MAX_LABELS = 64
 
 
 class HeavyRemoteCandidate(BaseModel):
@@ -280,6 +311,24 @@ def _check_candidate(store: Any, connection, live, project_id, spec, key: str, p
     )
 
 
+def refusal_cause(error: BaseException) -> dict[str, Any]:
+    """The structured cause of a submit check's refusal of the added candidate, from the
+    exception's type and attributes only (its message is never parsed): ``license_label`` with
+    the effective ``labels`` checked (``LicenseRefused``), ``data_class`` with the class the
+    provider is not trusted to receive (``DataClassConflict``), ``input_not_admitted`` for a
+    data refusal that names no class, otherwise ``other``. No path, value or secret."""
+    from .campaign_store import DataClassConflict, LicenseRefused
+
+    if isinstance(error, LicenseRefused):
+        labels = sorted({str(item) for item in error.labels if LABEL_RE.match(str(item))})
+        return {"cause": "license_label", "labels": labels[:MAX_LABELS]}
+    if isinstance(error, DataClassConflict):
+        if error.data_class in TRUST_CLASSES:
+            return {"cause": "data_class", "data_class": error.data_class}
+        return {"cause": "input_not_admitted"}
+    return {"cause": "other"}
+
+
 def apply(
     store: Any,
     connection: sqlite3.Connection,
@@ -318,11 +367,12 @@ def apply(
                 data = current.model_dump(mode="json")
                 stage = data["stages"][index]
                 stage[FIELD] = _record(
-                    "candidate_refused",
+                    HEAVY_REMOTE_REFUSED,
                     record["provider"],
                     record["signals"],
                     profile=record.get("profile"),
                     detail=f"{type(error).__name__}: {error}",
+                    **refusal_cause(error),
                 )
             else:
                 current = trial

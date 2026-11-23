@@ -68,6 +68,9 @@ PERMANENT_REASONS = frozenset(
         # ADR 0058 limits on a candidate listed only in ``retry.reroute_providers``.
         "infra_retry_only",
         "reroute_refused",
+        # ADR 0107 amendment 2026-11-23b: a heavy stage's local candidate with no explicit
+        # fallback reason; an approved spec never gains one, so the stage does not wait for it.
+        campaign_heavy_guard.UNEXPLAINED_REASON,
     }
 )
 
@@ -374,8 +377,51 @@ def decide(
     # Ordering counts the guard's signals, so what is heavy for ordering is heavy for the guard.
     ordered, preference = campaign_placement_preference.preferred_order(base, heavy_result[1])
     ids, excluded = candidate_order(base, list(attempts or ()), ordered)
-    skipped: list[Skip] = []
+    # (position in ``ids``, skip): kept in candidate order however late a skip is decided.
+    skips: list[tuple[int, Skip]] = []
     refusal: dict[str, Any] | None = None
+    # ADR 0107 amendment 2026-11-23b: local candidates that passed every check but would land
+    # with no explicit fallback reason while a remote candidate is still to be tried. They are
+    # decided after the remote ones, whose outcome may explain them.
+    deferred: list[tuple[int, str, NormalStage]] = []
+
+    def skipped() -> list[Skip]:
+        return [item for _, item in sorted(skips, key=lambda pair: pair[0])]
+
+    def guard_local(pid: str, final: bool) -> tuple[Skip | None, dict[str, Any] | None, bool]:
+        """(skip, warning, defer) for a local candidate of a guarded heavy stage."""
+        nonlocal refusal
+        codes, detail = campaign_heavy_guard.reasons(
+            guard, base, pid, skipped(), steering, preference, attempts or ()
+        )
+        if guard.refuses_unexplained(codes, detail):
+            if not final:
+                return None, None, True
+            refusal = campaign_heavy_guard.record(
+                guard, codes, detail, refused=True, code=campaign_heavy_guard.UNEXPLAINED_REASON
+            )
+            return Skip(pid, campaign_heavy_guard.UNEXPLAINED_REASON, ",".join(codes)), None, False
+        if guard.mode == "refuse":
+            # ADR 0107: a heavy stage reached a local candidate while a remote profile is
+            # registered: skip it so the stage waits (refuse) ...
+            refusal = campaign_heavy_guard.record(guard, codes, detail, refused=True)
+            return Skip(pid, campaign_heavy_guard.REFUSED_REASON, ",".join(codes)), None, False
+        # ... or record why (warn).
+        return None, campaign_heavy_guard.record(guard, codes, detail), False
+
+    def chosen(index: int, pid: str, stage: NormalStage, warning, not_evaluated) -> Decision:
+        done = skipped()
+        return Decision(
+            ids,
+            pid,
+            tuple(done),
+            steering,
+            stage.max_exposure_cents,
+            not_evaluated,
+            preference=_with_outcome(preference, pid, done),
+            heavy_guard=warning,
+        )
+
     for index, pid in enumerate(ids):
         stage = stage_on_candidate(base, pid)
         skip = (
@@ -386,34 +432,34 @@ def decide(
         )
         warning = None
         if skip is None and guard is not None and guard.is_local(pid):
-            # ADR 0107: a heavy stage reached a local candidate while a remote profile is
-            # registered: record why (warn), or skip it so the stage waits (refuse).
-            codes, detail = campaign_heavy_guard.reasons(
-                guard, base, pid, skipped, steering, preference, attempts or ()
-            )
-            if guard.mode == "refuse":
-                refusal = campaign_heavy_guard.record(guard, codes, detail, refused=True)
-                skip = Skip(pid, campaign_heavy_guard.REFUSED_REASON, ",".join(codes))
-            else:
-                warning = campaign_heavy_guard.record(guard, codes, detail)
+            later_remote = any(guard.is_remote(other) for other in ids[index + 1 :])
+            skip, warning, defer = guard_local(pid, final=not later_remote)
+            if defer:
+                deferred.append((index, pid, stage))
+                continue
         if skip is None:
-            return Decision(
-                ids,
-                pid,
-                tuple(skipped),
-                steering,
-                stage.max_exposure_cents,
-                ids[index + 1 :],
-                preference=_with_outcome(preference, pid, skipped),
-                heavy_guard=warning,
-            )
-        skipped.append(skip)
+            # A deferred local candidate was passed over for this one: say so.
+            for position, other, _ in deferred:
+                skips.append(
+                    (
+                        position,
+                        Skip(other, campaign_heavy_guard.UNEXPLAINED_REASON, "remote_not_tried"),
+                    )
+                )
+            return chosen(index, pid, stage, warning, ids[index + 1 :])
+        skips.append((index, skip))
+    for index, pid, stage in deferred:
+        skip, warning, _ = guard_local(pid, final=True)
+        if skip is None:
+            return chosen(index, pid, stage, warning, ())
+        skips.append((index, skip))
+    done = skipped()
     return Decision(
         ids,
         None,
-        tuple(skipped),
+        tuple(done),
         steering,
-        preference=_with_outcome(preference, None, skipped),
+        preference=_with_outcome(preference, None, done),
         heavy_guard=refusal,
     )
 
@@ -436,6 +482,10 @@ def _with_outcome(
 def failure_reason(decision: Decision) -> str:
     """The stage failure for a decision no candidate can ever pass, in the single-provider
     vocabulary where one applies."""
+    # ADR 0107 amendment 2026-11-23b: a local candidate passed every check and only the guard
+    # refused it, so the guard is what left no candidate.
+    if any(item.reason == campaign_heavy_guard.UNEXPLAINED_REASON for item in decision.skipped):
+        return campaign_heavy_guard.UNEXPLAINED_REASON
     # Candidates that could never serve this attempt do not change the verdict.
     reasons = {item.reason for item in decision.skipped} - {
         "excluded_by_steering",

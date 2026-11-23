@@ -34,7 +34,8 @@ curl -s -H "$(cat "$HEADER")" "$CONTROL/projects/$PROJECT/campaign-stuck?status=
 
 The first call scans now; the second lists findings (an empty list is correct when nothing is
 stuck). A failing scanner records a `campaign.stuck_scan_failed` event. An agent can read the same
-with the MCP tool `tessera_list_stuck_campaigns`.
+with the MCP tool `tessera_list_stuck_campaigns`; `tessera_heavy_local_audit` lists the heavy
+stages running on a local provider now, with reasons.
 
 ## 2. Credential-expiry health
 

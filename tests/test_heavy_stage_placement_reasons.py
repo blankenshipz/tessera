@@ -149,9 +149,14 @@ def test_a_gpu_tag_is_a_guard_signal(local_providers):
 
 def test_a_gpu_stage_placed_locally_while_salad_is_registered_warns(tmp_path, near):
     world = _cpu_world(tmp_path, near, {"placement_tags": ["gpu"]})
+    # Amendment 2026-11-23b: the local fallback is ``remote_not_tried`` (unexplained); it is
+    # placed and warned only with the operator's opt-out (by default Salad is tried first).
+    preference.configure({"heavy_unexplained_local": "warn"}, [NEAR, "salad"])
     world.start()
     world.tick_until(lambda: world.attempt() is not None)
     (placed,) = _placed(world)
     assert placed["provider_id"] == NEAR
     assert placed["heavy_guard"]["signals"] == ["tag:gpu"]
+    assert placed["heavy_guard"]["reasons"] == ["remote_not_tried"]
+    assert placed["heavy_guard"]["unexplained_local"] == "warn"
     assert len(_events(world)) == 1

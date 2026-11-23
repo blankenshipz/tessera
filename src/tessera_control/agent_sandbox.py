@@ -34,15 +34,21 @@ SERVICE_DEFAULTS = {
 }
 
 
-def _egress(package):
-    """The deterministic per-run egress objects, or None for network-none packages."""
-    from tessera_worker.agent_sandbox import egress_manifests, is_egress_package
+def _is_egress(package):
+    """The shared worker predicate; a half-marked package is refused, never network-none."""
+    from tessera_worker.agent_sandbox import is_egress_package
 
     try:
-        egress = is_egress_package(package)
+        return is_egress_package(package)
     except ValueError:
         raise Conflict("Immutable Sandbox binding has inconsistent egress markers.") from None
-    return egress_manifests(package) if egress else None
+
+
+def _egress(package):
+    """The deterministic per-run egress objects, or None for network-none packages."""
+    from tessera_worker.agent_sandbox import egress_manifests
+
+    return egress_manifests(package) if _is_egress(package) else None
 
 
 def _contains(wanted, actual):
@@ -886,7 +892,7 @@ class AgentSandboxStore(RuntimePackageStore):
             if not state["quiescent"]:
                 raise Conflict("Unknown or active Pods prevent collection/deletion.")
             self._custody(connection, operation, package, body)
-            if package.get("network_profile") is not None:
+            if _is_egress(package):
                 from .egress_journal import egress_journal_for_operation
 
                 # Deleting the proxy Pod discards its journal; retain it until recorded.

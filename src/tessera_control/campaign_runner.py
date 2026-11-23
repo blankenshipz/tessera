@@ -1365,8 +1365,9 @@ class CampaignRunner:
         if not base.has_candidates or (
             not base.alternates and not placement.reroute_due(base, self._attempts(ctx, key))
         ):
-            if not self._single_provider_guard(ctx, key, base):
-                return False
+            verdict = self._single_provider_guard(ctx, key, base)
+            if verdict != "go":
+                return verdict == "failed"
             if prepare:
                 progress = self._provider(base).prepare(self, ctx, key)
                 if progress != "ready":
@@ -1399,16 +1400,30 @@ class CampaignRunner:
             return progress == "progress"
         return self._reserve(ctx, key)
 
-    def _single_provider_guard(self, ctx: _Ctx, key: str, base: NormalStage) -> bool:
+    def _single_provider_guard(self, ctx: _Ctx, key: str, base: NormalStage) -> str:
         """ADR 0107 for a stage that is not placed (one provider): a heavy stage on a local
         provider while a remote profile is registered records its warning once per attempt
-        number (warn) or waits with the reason (refuse). False means wait."""
+        number (warn) or waits with the reason (refuse): ``go`` or ``wait``. With no explicit
+        fallback reason (amendment 2026-11-23b) the stage fails instead (``failed``) unless the
+        operator set ``heavy_unexplained_local: warn``."""
         with self.connection() as connection:
             guard = heavy_guard.applies(connection, ctx.campaign, base)
         if guard is None or not guard.is_local(base.provider):
-            return True
+            return "go"
         number = self._stage_row(ctx, key)["attempts_used"] + 1
-        codes, detail = heavy_guard.reasons(guard, base, base.provider, (), None, None)
+        attempts = self._attempts(ctx, key)
+        # A remote listed only in ``retry.reroute_providers`` is skipped as on the placement
+        # path (``infra_retry_only``), so both paths give the same reasons.
+        _, excluded = placement.candidate_order(base, attempts)
+        codes, detail = heavy_guard.reasons(
+            guard, base, base.provider, excluded.values(), None, None, attempts
+        )
+        if guard.refuses_unexplained(codes, detail):
+            block = heavy_guard.record(
+                guard, codes, detail, refused=True, code=heavy_guard.UNEXPLAINED_REASON
+            )
+            self._heavy_local_refused(ctx, key, number, base.provider, block)
+            return "failed"
         with self.store.runner_connection() as connection:
             if guard.mode == "refuse":
                 block = heavy_guard.record(guard, codes, detail, refused=True)
@@ -1424,7 +1439,7 @@ class CampaignRunner:
                     },
                     {"skipped": [skip.payload()], "steering": None, "heavy_guard": block},
                 )
-                return False
+                return "wait"
             block = heavy_guard.record(guard, codes, detail)
             self._emit_once_in(
                 connection,
@@ -1437,6 +1452,29 @@ class CampaignRunner:
                     if k not in ("stage_key", "attempt")
                 },
             )
+        return "go"
+
+    def _heavy_local_refused(
+        self, ctx: _Ctx, key: str, number: int, provider_id: str, block: Mapping[str, Any]
+    ) -> bool:
+        """ADR 0107 amendment 2026-11-23b: a heavy stage would land on ``provider_id`` (local)
+        with no explicit fallback reason. One ``campaign.heavy_stage_local_refused`` event and
+        the stage failure (stop reason ``heavy_local_unexplained``) in one transaction; nothing
+        is placed, held or run."""
+        with self.store.runner_connection() as connection:
+            self._emit_once_in(
+                connection,
+                ctx,
+                heavy_guard.REFUSED_EVENT,
+                {"stage_key": key, "attempt": number},
+                {
+                    k: v
+                    for k, v in heavy_guard.event_payload(key, number, provider_id, block).items()
+                    if k not in ("stage_key", "attempt")
+                },
+            )
+            self._mark_stage_failed(connection, ctx, key, heavy_guard.UNEXPLAINED_REASON)
+        self._actions.append(f"heavy_local_refused:{key}:{number}")
         return True
 
     def _decide_placement(
@@ -1564,6 +1602,11 @@ class CampaignRunner:
             {"skipped": payload["skipped"], "steering": payload["steering"], "final": True},
         )
         reason = placement.failure_reason(decision)
+        if reason == heavy_guard.UNEXPLAINED_REASON and decision.heavy_guard is not None:
+            refused = next(s for s in decision.skipped if s.reason == reason)
+            return self._heavy_local_refused(
+                ctx, key, number, refused.provider_id, decision.heavy_guard
+            )
         if reason == "resource_limit_no_provider":
             attempts = self._attempts(ctx, key)
             self.emit_once(
@@ -1943,19 +1986,24 @@ class CampaignRunner:
 
     def _stage_failed(self, ctx: _Ctx, key: str, reason: str) -> bool:
         with self.store.runner_connection() as connection:
-            self._touch(
-                connection,
-                "campaign_stages",
-                "campaign_id=? AND stage_key=? AND status NOT IN "
-                "('failed','succeeded','blocked_unknown')",
-                (ctx.campaign["id"], key),
-                status="failed",
-            )
-            connection.execute(
-                "UPDATE campaigns SET stop_reason=? WHERE id=? AND stop_reason IS NULL",
-                (f"stage_failed:{key}:{reason}"[:300], ctx.campaign["id"]),
-            )
+            self._mark_stage_failed(connection, ctx, key, reason)
         return True
+
+    def _mark_stage_failed(
+        self, connection: sqlite3.Connection, ctx: _Ctx, key: str, reason: str
+    ) -> None:
+        self._touch(
+            connection,
+            "campaign_stages",
+            "campaign_id=? AND stage_key=? AND status NOT IN "
+            "('failed','succeeded','blocked_unknown')",
+            (ctx.campaign["id"], key),
+            status="failed",
+        )
+        connection.execute(
+            "UPDATE campaigns SET stop_reason=? WHERE id=? AND stop_reason IS NULL",
+            (f"stage_failed:{key}:{reason}"[:300], ctx.campaign["id"]),
+        )
 
     def _stage_unknown(self, ctx: _Ctx, key: str, reason: str | None = None) -> bool:
         with self.store.runner_connection() as connection:

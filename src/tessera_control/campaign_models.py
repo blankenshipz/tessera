@@ -644,6 +644,7 @@ class ProviderCandidate(_Strict):
 # ``operator_heavy_remote_candidate`` means the first alternate is the candidate Tessera added,
 # otherwise ``reason`` says why none was added. It is part of the digest a person approves.
 HEAVY_REMOTE_ADDED = "operator_heavy_remote_candidate"
+HEAVY_REMOTE_REFUSED = "candidate_refused"
 ReasonCode = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 
 
@@ -655,6 +656,18 @@ class HeavyRemoteRecord(_Strict):
     profile: Key | None = None
     max_exposure_cents: Cents | None = None
     detail: Annotated[str, StringConstraints(max_length=500)] | None = None
+    # Amendment 2026-11-23c: why a refused candidate (``candidate_refused``) was refused, in
+    # structured form: ``license_label`` (with the effective ``labels``), ``data_class`` (with
+    # the class not admitted), ``input_not_admitted`` or ``other``. Absent on every other record.
+    cause: ReasonCode | None = None
+    labels: (
+        Annotated[
+            list[Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]],
+            Field(max_length=64),
+        ]
+        | None
+    ) = None
+    data_class: TrustClass | None = None
 
     @model_validator(mode="after")
     def _consistent(self) -> HeavyRemoteRecord:
@@ -662,12 +675,19 @@ class HeavyRemoteRecord(_Strict):
             raise ValueError("heavy_remote_candidate: added and reason disagree")
         if self.added and (self.profile is None or self.max_exposure_cents is None):
             raise ValueError("heavy_remote_candidate: an added candidate names its profile and cap")
+        # A record stored before the amendment has no cause; only a refused one may name it.
+        if self.cause is not None and self.reason != HEAVY_REMOTE_REFUSED:
+            raise ValueError("heavy_remote_candidate: only a refused candidate names its cause")
+        if self.labels is not None and self.cause != "license_label":
+            raise ValueError("heavy_remote_candidate: labels belong to a license_label cause")
+        if self.data_class is not None and self.cause != "data_class":
+            raise ValueError("heavy_remote_candidate: data_class belongs to a data_class cause")
         return self
 
     @model_serializer(mode="wrap")
     def _omit_absent(self, handler):
         value = handler(self)
-        for name in ("profile", "max_exposure_cents", "detail"):
+        for name in ("profile", "max_exposure_cents", "detail", "cause", "labels", "data_class"):
             if getattr(self, name) is None:
                 value.pop(name, None)
         return value

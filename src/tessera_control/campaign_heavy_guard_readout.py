@@ -1,7 +1,9 @@
 """Read-only view of the heavy-stage placement guard's recorded events (ADR 0107).
 
 The guard itself records ``campaign.heavy_stage_local_fallback`` (a warning) and the transient
-skip reason ``heavy_local_refused`` inside ``campaign.stage_waiting_placement``. This module only
+skip reason ``heavy_local_refused`` inside ``campaign.stage_waiting_placement``, and (amendment
+2026-11-23b) ``campaign.heavy_stage_local_refused`` when a stage failed with no explicit fallback
+reason (``heavy_local_unexplained``). This module only
 reads them, for campaign status and the stuck detector. It writes nothing and returns ids,
 codes and timestamps, never free text beyond the recorded reason codes.
 """
@@ -16,6 +18,7 @@ FALLBACK_EVENT = "campaign.heavy_stage_local_fallback"
 WAITING_EVENT = "campaign.stage_waiting_placement"
 PLACED_EVENT = "campaign.stage_placed"
 REFUSED_REASON = "heavy_local_refused"
+UNEXPLAINED_EVENT = "campaign.heavy_stage_local_refused"
 
 
 def _events(connection: sqlite3.Connection, project_id, campaign_id, event_type) -> list[dict]:
@@ -77,6 +80,21 @@ def stage_guards(
             "recorded_at": event["_at"],
             "_cursor": event["_cursor"],
         }
+    for event in _events(connection, project_id, campaign_id, UNEXPLAINED_EVENT):
+        key = event.get("stage_key")
+        refused = {
+            "mode": "refuse",
+            "code": event.get("code"),
+            "reasons": list(event.get("reasons") or []),
+            "signals": list(event.get("signals") or []),
+            "provider_id": event.get("provider_id"),
+            "attempt": event.get("attempt"),
+            "waiting": False,  # the stage failed; nothing waits
+            "recorded_at": event["_at"],
+            "_cursor": event["_cursor"],
+        }
+        if key not in latest or refused["_cursor"] > latest[key]["_cursor"]:
+            latest[key] = refused
     last_wait: dict[str, dict[str, Any]] = {}
     for event in waits:
         last_wait[event.get("stage_key")] = event
@@ -111,5 +129,7 @@ def status_view(
         }
         if item.get("provider_id"):
             entry["provider_id"] = item["provider_id"]
+        if item.get("code"):
+            entry["code"] = item["code"]
         out.append(entry)
     return sorted(out, key=lambda e: e["stage_key"])

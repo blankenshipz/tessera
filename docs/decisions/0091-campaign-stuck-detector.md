@@ -60,7 +60,9 @@ not be read by the platform's own agent loop.
 7. **Surfaces.** Routes under `/projects/{project_id}/campaign-stuck`: `POST scan`, `GET` (list),
    `POST {finding_id}/acknowledge`, `PUT settings`. List and scan need a human or an agent with
    `campaign:read`; acknowledge needs a human or an agent with `campaign:cancel`; settings are
-   human only. `tessera_mcp` adds `tessera_list_stuck_campaigns` and `tessera_acknowledge_stuck`.
+   human only. `tessera_mcp` adds `tessera_list_stuck_campaigns` and `tessera_acknowledge_stuck`. A read-only
+   `GET .../campaign-stuck/heavy-local-audit` (`campaign:read`) and the tool
+   `tessera_heavy_local_audit` expose the heavy-local owner audit.
 8. **A work source for the agent loop.** `tessera_agent.stuck_work_source.StuckWorkSource` offers
    the open findings of a project as candidate work for the standing loop (ADR 0085), with the id
    `<finding id>:<occurrences>` so a reappearance is new work. It only reads: the loop's own

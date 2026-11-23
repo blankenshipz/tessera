@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from campaign_fixture import Env
 
+from tessera_control import campaign_heavy_guard as guard
 from tessera_control import campaign_stuck as stuck
 from tessera_control.store import _connect, _utc_string
 
@@ -141,10 +142,13 @@ def test_a_running_heavy_attempt_with_a_warning_is_stuck_on_local(world):
     assert found["code"] == "heavy_stage_on_local"
     assert found["suggested_action"] == "check_salad_credential_or_profile"
     assert found["stage_key"] == world.stage
+    world_detail = [{"provider_id": "salad", "reason": "not_enrolled"}]
     assert found["evidence"] == {
         "attempt_id": ident, "attempt": 1, "attempt_status": "running",
         "provider_id": "local-docker", "reasons": ["no_fitting_profile"],
         "signals": ["heavy_tag"], "age_seconds": 90,
+        "detail": [{"provider_id": "salad", "reason": "not_enrolled"}],
+        "explained": guard.explained(["no_fitting_profile"], world_detail),
     }  # fmt: skip
 
 

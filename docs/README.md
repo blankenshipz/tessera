@@ -44,6 +44,16 @@ references, not claims of a supported production deployment.
   explicit identity, policy, financial references and revocation.
 - [Provider trust](provider-trust.md): per-provider data-class setting for
   campaign stages (ADR 0040).
+- [Credential health](credential-health.md) and
+  [re-enrolling an expired credential](operations/credential-reenrollment.md): reported expiry
+  of provider credentials (metadata only), refused work, and the supported rotation.
+- [Service credentials](service-credentials.md): installing a service credential (such as a model
+  API key) as a systemd credential reference.
+- [Model spend](model-spend.md): the operator budget for the reasoning runtime's model calls.
+- [People enrollment](people-enrollment.md): enrolling a person as a separate human enrolment root.
+- [Large artifacts](large-artifacts.md): chunked, bounded-memory handling of multi-gigabyte outputs.
+- [Stage watcher](stage-watcher.md): the execution-plane agent that observes one attempt and reports.
+- [Salad proxy](salad-proxy.md): the Salad server proxy milestone and activation runbook.
 - [Deploy check](deploy-check.md): one report of what a deploy still needs, with receipted fixes.
 - [Deploy upgrade](deploy-upgrade.md): the checked upgrade command, dry-run first, with a deploy receipt.
 - [Enablement runbook](operations/enablement-runbook.md): what to switch on after a deploy, with a check that each feature is in use.
@@ -64,6 +74,9 @@ references, not claims of a supported production deployment.
 - [Records API](records-api.md), [agent authority](agent-authority-interface.md),
   [provenance](agent-provenance-interface.md), [MCP workflow](mcp-full-workflow.md),
   [A2A peer](a2a-peer.md) and [runtime bindings](runtime-bindings-interface.md).
+- [Campaign client path](mcp-campaign-client-path.md), [steering a campaign over MCP](mcp-steering.md)
+  and [research and review jobs over MCP](mcp-review-jobs.md): directing campaigns and requesting
+  advisory review jobs through `tessera_mcp`.
 - [Gate evidence](gate-evidence.md): split locks, leakage audits, per-seed metrics,
   replicate aggregates, bound (version-2) gates and research-program spend.
 - [Admission](execution-admission.md), [capability policy](agent-capability-policy.md),

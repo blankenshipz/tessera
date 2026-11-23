@@ -68,6 +68,19 @@ class CampaignStuckStore(ExternalAgentStore):
         finally:
             connection.close()
 
+    def heavy_audit(self, principal, project_id: str) -> dict[str, Any]:
+        """Heavy stages running on a local provider now (read only, nothing written)."""
+        connection = _connect(self.database_path)
+        try:
+            actor = self._actor(connection, principal)
+            self._may(connection, actor, "campaign:read")
+            self._project(connection, actor, project_id)
+            items = stuck.heavy_local_audit(connection, actor["org_id"], project_id, self.clock())
+            items.sort(key=lambda i: (i["campaign_id"], str(i.get("attempt_id"))))
+            return {"project_id": project_id, "items": items, "count": len(items)}
+        finally:
+            connection.close()
+
     def scan(self, principal, project_id: str, key: str) -> tuple[int, dict[str, Any]]:
         def command(connection, live):
             self._may(connection, live, "campaign:read")
@@ -169,6 +182,11 @@ def list_stuck(
     limit: int = Query(default=50, ge=1, le=200),
 ):
     return store.read(actor, project_id, status, limit)
+
+
+@router.get("/heavy-local-audit")
+def heavy_local_audit(project_id: str, actor: Actor, store: Stuck):
+    return store.heavy_audit(actor, project_id)
 
 
 @router.post("/scan")

@@ -19,11 +19,10 @@ Historical counts from harness runs whose raw logs were not retained (removed fo
 |---|---|---|---|---|---|
 | Local weak-attestation opt-in only | (raw log not retained) | 96 | 5 | 0 | 16 |
 | No opt-in (default) | (raw log not retained) | 95 | 0 | 0 | 21 |
-| `--only no_session` on a temporary merge with the grant poller | (raw log not retained) | 6 | 0 | 0 | 0 |
+| `--only no_session` with the grant poller | (raw log not retained) | 6 | 0 | 0 | 0 |
 
-The third run was made on a temporary tree that included the grant poller
-(`development-poll`), to show that the worker daemon runs that poller unchanged. Without
-a work source the same case reports GAP.
+The third run included the grant poller (`development-poll`), to show that the worker
+daemon runs that poller unchanged. Without a work source the same case reports GAP.
 
 PASS-WEAK is the five weak-class supervised cases (ADR 0035); it is reported
 separately and never counted as `PASS`. The six strong-class Docker cases are GAP
@@ -79,7 +78,7 @@ or 5. Closing those items needs a Tessera-run path (see Platform gaps).
 | 5 | Stop and cleanup | **PASS-WEAK / GAP (strong)** | Termination and exact-ID non-force cleanup confirmed in each of the five weak-class cases, no container or volume residue; same run as 1a, so not independent evidence of it; strong class GAP |
 | 6 | Failure evidence to operator | **FIXED (unit-tested, not in harness)** | Swallowed `SupervisorError` now surfaces a bounded, path-free `detail` |
 | 7 | Restart and recovery | **PASS / GAP** | Control SIGKILLed between requests and again while a real container runs: custody (operation, lease, epoch, grant, hold, events) survives, one container is ever created, the worker's evidence is honest (`unknown`, workspace kept, no receipt claimed). GAP: reconciling a provider effect after a control crash is not proven; recovery ended `quarantine_failed` (container exit 137) |
-| 8 | Work runs with no session | **PASS with the grant poller as work source (measured on a temporary merged tree); GAP without a work source** | A supervised worker daemon, started once as a boot unit would be, picks up a submitted job and completes it with an observed receipt, then does the same after control is SIGKILLed and restarted, with the harness starting no worker. Real without a work source: a rejected credential makes the worker CLI exit 3 and the daemon back off by the credential schedule without crash-looping, and its status command reports the degraded state |
+| 8 | Work runs with no session | **PASS with the grant poller as work source (measured with the poller included); GAP without a work source** | A supervised worker daemon, started once as a boot unit would be, picks up a submitted job and completes it with an observed receipt, then does the same after control is SIGKILLed and restarted, with the harness starting no worker. Real without a work source: a rejected credential makes the worker CLI exit 3 and the daemon back off by the credential schedule without crash-looping, and its status command reports the degraded state |
 
 ## 1. Agent sandbox run
 

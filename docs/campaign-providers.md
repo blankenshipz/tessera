@@ -305,6 +305,23 @@ reason codes); with no other candidate the stage waits and the `campaign.stage_w
 event carries `heavy_guard {warning: false, refused: true, ...}`. It is placed when a remote
 candidate qualifies; a single-provider stage in `refuse` mode waits until the operator switches to
 `warn`. Non-heavy stages and projects without a usable Salad profile are unchanged.
+
+No unexplained local fallback (amendment 2026-11-23b): a heavy stage uses a local candidate only
+with an explicit reason: any code above except `not_listed` and `remote_not_tried`, or
+`remote_candidate_not_added` (the stage lists no remote candidate and its ADR 0141
+`heavy_remote_candidate` record says why none was added; `detail` gains `{provider_id, reason,
+source: "heavy_remote_candidate"}`). Otherwise, by default, a remote candidate still to be tried
+is tried first, and when none is left the stage fails with stop reason
+`stage_failed:<key>:heavy_local_unexplained` and one `campaign.heavy_stage_local_refused` event
+(the fallback event's fields plus `code` and `unexplained_local`); it never waits, because an
+approved spec cannot gain a candidate. This applies in both `heavy_local_fallback` modes and to
+stages without alternates. To keep the earlier recorded warning instead:
+
+```json
+"placement_preferences": {"heavy_unexplained_local": "warn"}
+```
+
+Such warnings carry `unexplained_local: "warn"` on the event, placement and receipt.
 `tessera_get_campaign` shows per stage `heavy_guard {mode, reasons, signals, provider_id?, waiting,
 recorded_at}` only when an event exists. The [stuck detector](campaign-stuck.md) flags
 `heavy_stage_on_local` and `heavy_stage_refused_local`.
@@ -338,7 +355,8 @@ full-duration estimate and never exceeds the setting, the stage's `max_exposure_
 campaign cap or what a program budget admits; no cap is raised and the submission is never
 refused for it. A submitted record is discarded and recomputed. Light stages, stages that already
 list a remote candidate and v1 specs are unchanged. Without the setting nothing is added, and a
-heavy local placement is the recorded ADR 0107 fallback (`not_listed`).
+heavy local placement is an unexplained ADR 0107 fallback (`not_listed`): refused by default (see
+above). A record with `added: false` explains the fallback (`remote_candidate_not_added`).
 
 A heavy stage tagged `gpu` gets a **GPU** candidate only, never a CPU one (ADR 0141 amendment
 2026-11-23). The operator opens a GPU profile to it by giving the profile a `stage_adapter`

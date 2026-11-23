@@ -57,11 +57,16 @@ class DataClassRefused(ValueError):
 
     ``admit_class`` is the provider-trust class whose admission would lift this refusal
     (None when no trust setting could: a mismatched code approval, an unreadable manifest,
-    public data without evidence)."""
+    public data without evidence). ``data_class`` is the class the provider was not trusted to
+    receive (the snapshot's recorded class, or ``private_code_approved``), None when the
+    refusal is not about a class (a mismatched approval, an unreadable manifest)."""
 
-    def __init__(self, message: str, admit_class: str | None = None) -> None:
+    def __init__(
+        self, message: str, admit_class: str | None = None, data_class: str | None = None
+    ) -> None:
         super().__init__(message)
         self.admit_class = admit_class
+        self.data_class = data_class
 
 
 class DataClassDeclaration(BaseModel):

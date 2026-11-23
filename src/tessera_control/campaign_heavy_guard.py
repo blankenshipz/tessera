@@ -9,6 +9,18 @@ same transaction as the placement. With ``heavy_local_fallback: refuse`` in the 
 ``placement_preferences`` the local candidate is skipped instead, with the transient reason
 ``heavy_local_refused``, so the stage waits until a remote candidate qualifies.
 
+Amendment 2026-11-23b: a heavy stage reaches a local candidate only with an explicit fallback
+reason (``EXPLAINED_REASONS``, or ``not_listed`` explained by the stage's ADR 0141
+``heavy_remote_candidate`` record). Unexplained (``not_listed`` with no such record,
+``remote_not_tried``), the local candidate is skipped with the permanent reason
+``heavy_local_unexplained`` (``UNEXPLAINED_REASON``): an untried remote candidate is tried first,
+and when none is left the stage fails with that code and one ``REFUSED_EVENT``. The operator's
+``heavy_unexplained_local: warn`` restores the recorded warning.
+
+Amendment 2026-11-23c: ``refusals`` rebuilds, from recorded events only, the refusal of a heavy
+stage that has no attempt for it, for its receipt stage entry; a refused ADR 0141 candidate's
+structured ``cause`` (``CAUSE_KEYS``) is copied into its ``detail`` entry.
+
 The guard never adds a destination, changes an order, skips another check or touches a spec. A
 stage that is not heavy, or a project with no registered profile, is placed exactly as before.
 It reads metadata only: the stage's declarations, recorded input sizes and the profile list.
@@ -23,10 +35,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import campaign_placement_preference as preference
+from .campaign_heavy_remote import FIELD as RECORD_SOURCE
+from .campaign_heavy_remote import NOT_ADDED_REASONS, records
 from .campaign_models import NormalStage
 
 EVENT = "campaign.heavy_stage_local_fallback"
 REFUSED_REASON = "heavy_local_refused"
+# Amendment 2026-11-23b: a heavy stage's local candidate with no explicit fallback reason.
+UNEXPLAINED_REASON = "heavy_local_unexplained"
+REFUSED_EVENT = "campaign.heavy_stage_local_refused"
 REMOTE_PROVIDER = "salad"
 # Extra heavy tag beyond ADR 0088's ``heavy`` and ``training`` (the class is not changed by it).
 EXTRA_HEAVY_TAGS = frozenset({"pretraining"})
@@ -50,8 +67,24 @@ REASON_ORDER = (
     "remote_failed_infra",
     "remote_skipped",
     "operator_override",
+    "remote_candidate_not_added",
     "not_listed",
     "remote_not_tried",
+)
+# Explicit fallback reasons: Salad unavailable (no profile, credential, fitting profile,
+# infrastructure, a placement check skipping it: capacity, a cap, a trust or licence refusal),
+# an operator's own placement decision (steering, a placement rule, the default policy switched
+# off), or the ADR 0141 record saying why no remote candidate was added.
+EXPLAINED_REASONS = frozenset(
+    {
+        "no_remote_profile",
+        "credential_unavailable",
+        "no_fitting_profile",
+        "remote_failed_infra",
+        "remote_skipped",
+        "operator_override",
+        "remote_candidate_not_added",
+    }
 )
 
 
@@ -166,6 +199,55 @@ def mode() -> str:
     return preference.heavy_local_fallback()
 
 
+def _record_explains(record: Mapping[str, Any]) -> bool:
+    return record.get("added") is False and record.get("reason") in NOT_ADDED_REASONS
+
+
+def explained(
+    reasons: Iterable[str],
+    detail: Mapping[str, Any] | Iterable[Mapping[str, Any]] | None = None,
+) -> bool:
+    """True when at least one reason is an explicit fallback reason (``EXPLAINED_REASONS``).
+
+    ``not_listed`` alone is explained only by the stage's ADR 0141 record saying why no remote
+    candidate was added (a reason in ``NOT_ADDED_REASONS``). ``detail`` may be that record, the
+    recorded ``heavy_guard`` block, or the block's ``detail`` list (an entry whose ``source`` is
+    ``heavy_remote_candidate``); a placement skip entry never explains ``not_listed``."""
+    codes = set(reasons)
+    if codes & EXPLAINED_REASONS:
+        return True
+    if "not_listed" not in codes or detail is None:
+        return False
+    if isinstance(detail, Mapping):
+        if "added" in detail:
+            return _record_explains(detail)
+        detail = detail.get("detail") or ()
+    try:
+        entries = list(detail)
+    except TypeError:
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and item.get("source") == RECORD_SOURCE
+        and item.get("reason") in NOT_ADDED_REASONS
+        for item in entries
+    )
+
+
+def _stage_record(campaign: Mapping[str, Any], stage_key: str) -> dict[str, Any] | None:
+    """The stage's ADR 0141 ``heavy_remote_candidate`` record in the stored (approved) spec."""
+    try:
+        spec_json = campaign["spec_json"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not spec_json:
+        return None
+    try:
+        return records(spec_json).get(stage_key)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
 @dataclass(frozen=True)
 class Guard:
     """The guard's view of one stage for one placement: it applies (heavy, profile registered)."""
@@ -175,6 +257,13 @@ class Guard:
     kinds: Mapping[str, str]
     # False: no usable Salad profile for the project; the guard then only records (warn).
     registered: bool = True
+    # Amendment 2026-11-23b: ``refuse`` (default) or ``warn`` for an unexplained local fallback.
+    unexplained: str = "refuse"
+    # The stage's ADR 0141 record, when submit wrote one.
+    remote_record: Mapping[str, Any] | None = None
+
+    def refuses_unexplained(self, codes: Iterable[str], detail: Iterable[Any]) -> bool:
+        return self.unexplained == "refuse" and not explained(codes, list(detail))
 
     def is_local(self, provider_id: str) -> bool:
         return self.kinds.get(provider_id) == "local"
@@ -200,7 +289,14 @@ def applies(
     if not is_heavy:
         return None
     kinds = {pid: preference.candidate_kind(stage, pid) for pid in stage.candidate_ids}
-    return Guard(tuple(signals), mode() if registered else "warn", kinds, registered)
+    return Guard(
+        tuple(signals),
+        mode() if registered else "warn",
+        kinds,
+        registered,
+        preference.heavy_unexplained_local(),
+        _stage_record(campaign, stage.key),
+    )
 
 
 def reasons(
@@ -249,7 +345,22 @@ def reasons(
         ):
             found.add("operator_override")
     if not remote:
-        found.add("not_listed")
+        record = guard.remote_record
+        if record is not None and record.get("added") is False:
+            # ADR 0141: submit recorded why no remote candidate was added (codes only here),
+            # with a refused candidate's structured cause when the record has one.
+            entry = {
+                "provider_id": str(record.get("provider") or REMOTE_PROVIDER),
+                "reason": str(record.get("reason") or ""),
+                "source": RECORD_SOURCE,
+            }
+            for key in CAUSE_KEYS:
+                if record.get(key) is not None:
+                    entry[key] = record[key]
+            detail.append(entry)
+        found.add(
+            "remote_candidate_not_added" if record and _record_explains(record) else "not_listed"
+        )
     else:
         tried = {item.provider_id for item in remote_skips} | set(infra_failed)
         untried = [pid for pid in remote if pid not in tried]
@@ -271,8 +382,13 @@ def record(
     detail: list[dict[str, str]],
     *,
     refused: bool = False,
+    code: str | None = None,
 ) -> dict[str, Any]:
-    """The ``heavy_guard`` block of a placement (warning) or of a waiting record (refusal)."""
+    """The ``heavy_guard`` block of a placement (warning) or of a waiting record (refusal).
+
+    An unexplained fallback (amendment 2026-11-23b) also carries ``unexplained_local``, the
+    effective operator mode, and a refusal of it the ``code`` ``heavy_local_unexplained``;
+    explained ones keep the earlier shape."""
     value: dict[str, Any] = {
         "warning": not refused,
         "signals": list(guard.signals),
@@ -282,14 +398,19 @@ def record(
     }
     if refused:
         value["refused"] = True
+    if code is not None:
+        value["code"] = code
+    if not explained(codes, detail):
+        value["unexplained_local"] = guard.unexplained
     return value
 
 
 def event_payload(
     stage_key: str, attempt: int, provider_id: str, block: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """The ``campaign.heavy_stage_local_fallback`` payload: ids and codes only."""
-    return {
+    """The ``campaign.heavy_stage_local_fallback`` (or ``REFUSED_EVENT``) payload: ids and
+    codes only."""
+    value = {
         "stage_key": stage_key,
         "attempt": attempt,
         "provider_id": provider_id,
@@ -298,6 +419,19 @@ def event_payload(
         "reasons": list(block["reasons"]),
         "detail": [dict(item) for item in block["detail"]],
     }
+    for key in OPTIONAL_KEYS:
+        if key in block:
+            value[key] = block[key]
+    return value
+
+
+# Keys a block carries only for an unexplained fallback (absent keeps earlier payloads).
+OPTIONAL_KEYS = ("code", "unexplained_local")
+# ADR 0141 amendment 2026-11-23c: a refused candidate's structured cause, copied from the record
+# into its detail entry only when the record has it (no free text, no path).
+CAUSE_KEYS = ("cause", "labels", "data_class")
+# Stage statuses in which a refuse-mode wait has ended (receipts).
+ENDED_WAIT_STATUSES = frozenset({"failed", "cancelled"})
 
 
 def recorded(connection: sqlite3.Connection, campaign: Mapping[str, Any]) -> dict:
@@ -316,5 +450,98 @@ def recorded(connection: sqlite3.Connection, campaign: Mapping[str, Any]) -> dic
             "reasons": payload.get("reasons") or [],
             "detail": payload.get("detail") or [],
             "mode": payload.get("mode"),
+            **{key: payload[key] for key in OPTIONAL_KEYS if key in payload},
         }
+    return out
+
+
+def _refusal_block(
+    payload: Mapping[str, Any], code: str, provider_id: Any, recorded_at: Any
+) -> dict[str, Any]:
+    block = {
+        "warning": False,
+        "refused": True,
+        "code": code,
+        "provider_id": provider_id,
+        "attempt": payload.get("attempt"),
+        "mode": payload.get("mode"),
+        "signals": list(payload.get("signals") or ()),
+        "reasons": list(payload.get("reasons") or ()),
+        "detail": [dict(item) for item in payload.get("detail") or ()],
+    }
+    if "unexplained_local" in payload:
+        block["unexplained_local"] = payload["unexplained_local"]
+    block["recorded_at"] = recorded_at
+    return block
+
+
+def refusals(
+    connection: sqlite3.Connection,
+    campaign: Mapping[str, Any],
+    stages: Iterable[Mapping[str, Any]],
+    attempted: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    """Each stage's heavy-guard refusal for its receipt entry (amendment 2026-11-23c), from
+    recorded events only (no clock read), by stage key:
+
+    - the stage's latest ``REFUSED_EVENT`` (code ``heavy_local_unexplained``: the stage failed
+      without an attempt for that number);
+    - otherwise, for a stage that has no attempt and has ended (``ENDED_WAIT_STATUSES``), its
+      latest placement wait when that wait was a refuse-mode refusal (code
+      ``heavy_local_refused``, from the recorded skip).
+
+    A stage with neither is absent, so its receipt entry is unchanged."""
+    from .campaign_placement import WAITING_EVENT
+
+    attempted = set(attempted)
+    out: dict[str, dict[str, Any]] = {}
+    rows = connection.execute(
+        """SELECT payload_json, created_at FROM events WHERE project_id=? AND event_type=?
+        AND json_extract(payload_json,'$.campaign_id')=? ORDER BY cursor""",
+        (campaign["project_id"], REFUSED_EVENT, campaign["id"]),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        out[payload.get("stage_key")] = _refusal_block(
+            payload,
+            str(payload.get("code") or UNEXPLAINED_REASON),
+            payload.get("provider_id"),
+            row["created_at"],
+        )
+    ended = {
+        stage["stage_key"]
+        for stage in stages
+        if stage["status"] in ENDED_WAIT_STATUSES
+        and stage["stage_key"] not in attempted
+        and stage["stage_key"] not in out
+    }
+    if not ended:
+        return out
+    waits: dict[str, tuple[dict[str, Any], Any]] = {}
+    for row in connection.execute(
+        """SELECT payload_json, created_at FROM events WHERE project_id=? AND event_type=?
+        AND json_extract(payload_json,'$.campaign_id')=? ORDER BY cursor""",
+        (campaign["project_id"], WAITING_EVENT, campaign["id"]),
+    ):
+        payload = json.loads(row["payload_json"])
+        if payload.get("stage_key") in ended:
+            waits[payload["stage_key"]] = (payload, row["created_at"])
+    for key, (payload, recorded_at) in waits.items():
+        block = payload.get("heavy_guard")
+        refused = next(
+            (
+                item
+                for item in payload.get("skipped") or ()
+                if isinstance(item, Mapping) and item.get("reason") == REFUSED_REASON
+            ),
+            None,
+        )
+        if not isinstance(block, Mapping) or not block.get("refused") or refused is None:
+            continue  # the latest wait was not the guard's refusal
+        out[key] = _refusal_block(
+            {**block, "attempt": payload.get("attempt")},
+            REFUSED_REASON,
+            refused.get("provider_id"),
+            recorded_at,
+        )
     return out

@@ -117,16 +117,18 @@ def test_a_stage_already_listing_salad_is_unchanged(tmp_path, near):
     assert "heavy_remote_candidate" not in stage
 
 
-def test_without_the_setting_nothing_is_added_and_the_local_fallback_is_warned(tmp_path, near):
+def test_without_the_setting_nothing_is_added_and_the_local_fallback_is_refused(tmp_path, near):
     world = cpu_world(tmp_path, near, slots=1)
     world.spec = spec_of(world, **HEAVY)
     world.start()
     stage = _stored(world)["stages"][0]
     assert "alternate_providers" not in stage and "heavy_remote_candidate" not in stage
-    world.tick_until(lambda: world.attempt() is not None)
-    assert world.attempt()["provider_id"] == NEAR
-    (event,) = world.events(guard.EVENT)
+    # ADR 0107 amendment 2026-11-23b: no record explains ``not_listed``, so nothing runs locally.
+    world.tick(3)
+    assert world.attempt() is None and not world.events(guard.EVENT)
+    (event,) = world.events(guard.REFUSED_EVENT)
     assert event["reasons"] == ["not_listed"] and event["signals"] == ["declared_memory"]
+    assert event["code"] == guard.UNEXPLAINED_REASON
 
 
 @pytest.mark.parametrize(

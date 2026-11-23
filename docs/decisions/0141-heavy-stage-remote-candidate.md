@@ -51,8 +51,24 @@ nobody approved, which ADR 0060 and 0066 forbid.
    record: a submitted one is discarded and recomputed; with it goes at most the first alternate, and only
    if it has the shape the adapter derives (the record's provider and profile, adapted), never an
    author-listed one.
+   *Amended 2026-11-23c (structured cause):* a `candidate_refused` record also names its cause
+   in structured fields, from the refusal's type and attributes (the message is never parsed):
+   `cause: "license_label"` with `labels` (the effective licence labels checked, from
+   `LicenseRefused.labels`), `cause: "data_class"` with `data_class` (the class the provider is
+   not trusted to receive, from `DataClassConflict.data_class`), `cause: "input_not_admitted"`
+   (an input refusal that names no class: a mismatched code approval, an unreadable manifest) or
+   `cause: "other"` (the provider's stage, grant or narrowing check). These fields appear only on
+   a refused record (absent on records stored earlier), are part of the digest like the rest of
+   the record, carry no path or secret, and are copied into the ADR 0107 guard `detail` entry
+   (`source: "heavy_remote_candidate"`), so the fallback event, placement and receipt show them.
+   A placement-time skip of a listed Salad candidate keeps its reason code (`license_label`,
+   `untrusted`) and free-text detail unchanged.
 7. **Fallback.** A stage placed locally afterwards (skipped candidate, no candidate added, or no
    setting) is the ADR 0107 recorded fallback with its reasons.
+   *Amended 2026-11-23 (ADR 0107 amendment 2026-11-23b):* a record with `added: false` explains
+   the local fallback (reason `remote_candidate_not_added`, the record's reason in `detail`); with
+   no setting there is no record, the fallback is unexplained and, unless the operator set
+   `heavy_unexplained_local: warn`, the stage fails with `heavy_local_unexplained`.
 
 ## Not done
 
@@ -65,7 +81,8 @@ nobody approved, which ADR 0060 and 0066 forbid.
 
 `tests/test_heavy_stage_remote_candidate.py`: a heavy local-only stage stored and approved with
 Salad first and placed there with an idle local host; validate and submit digests agree; light
-and already-listing stages unchanged; no setting keeps the ADR 0107 `not_listed` warning;
+and already-listing stages unchanged; no setting refuses the unexplained `not_listed` fallback
+(ADR 0107 amendment 2026-11-23b);
 operator, stage-cap and program-budget refusals recorded; GPU stage not given a CPU candidate;
 no fitting profile and an adapter refusal recorded; a forged record discarded without removing an author-listed alternate; strict setting;
 v1 unchanged; an approved submission binding the candidate.

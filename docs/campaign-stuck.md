@@ -14,14 +14,22 @@ or retry. A person, or what existing policy and the standing agent loop already 
 | `stale_execution_lease` | an execution lease past its expiry plus the grace, for a live attempt | `reconcile_or_cancel_the_grant` |
 | `runner_lease_stale` | no live campaign runner while campaigns are active | `check_the_campaign_runner_service` |
 | `no_progress` | nothing in the campaign changed for longer than `unchanged_seconds` | `check_provider_capacity_or_cancel` |
-| `heavy_stage_on_local` | a live attempt (reserved, granted, admitted or running) has a heavy-stage warning event for the same attempt (ADR 0107) | `check_salad_credential_or_profile` |
+| `heavy_stage_on_local` | a live attempt (reserved, granted, admitted or running) has a heavy-stage warning event for the same attempt (ADR 0107) | `check_salad_credential_or_profile`; `configure_a_salad_profile` when the only reason is `no_remote_profile` (evidence `config_gap`) |
 | `heavy_stage_refused_local` | a stage has waited on a `heavy_local_refused` refusal longer than `lease_grace_seconds` (ADR 0107); clears when placed | `restore_remote_capacity_or_allow_local` |
 
 Evidence for the two heavy-stage codes: `heavy_stage_on_local` carries `attempt_id`, `attempt`,
-`attempt_status`, `provider_id`, `reasons`, `signals` and `age_seconds`; `heavy_stage_refused_local`
+`attempt_status`, `provider_id`, `reasons`, `signals`, `detail` (the recorded guard detail),
+`explained` (whether the guard recorded an explicit fallback reason) and `age_seconds`; `heavy_stage_refused_local`
 carries `stage_key`, `attempt`, `reasons`, `waiting_seconds` and `grace_seconds` (the project's
 `lease_grace_seconds`, default 300). A schema migration widens the findings code check to accept
-both codes.
+both codes. A `no_remote_profile`-only placement fires `heavy_stage_on_local` as a configuration gap: its
+evidence carries `config_gap: "no_remote_profile"` and its suggested action is
+`configure_a_salad_profile` (no new code, so no migration). The owner audit `campaign_stuck.heavy_local_audit` lists every heavy stage running on a
+local provider in the project's non-terminal campaigns, with `explained`, including that case. It
+is served read-only (`campaign:read`, no scan, nothing written) as
+`GET /projects/{project_id}/campaign-stuck/heavy-local-audit` (`{"items": [...], "count": n}`,
+ordered by campaign then attempt) and as the MCP tool `tessera_heavy_local_audit`. It
+is per project; `scan_all` covers all projects but only persists findings.
 
 A finding carries a stable id, the code, the suggested action, when it was first and last seen,
 how many times it has occurred, and evidence (ids, statuses, ages in seconds). The evidence is

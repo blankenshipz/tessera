@@ -112,6 +112,10 @@ class PlacementPreferences(_Closed):
     # ADR 0107: what a heavy stage placed on a local candidate while a remote profile is
     # registered does: ``warn`` (placed, with a recorded warning) or ``refuse`` (it waits).
     heavy_local_fallback: Literal["warn", "refuse"] = "warn"
+    # ADR 0107 amendment 2026-11-23b: a heavy stage reaching a local candidate with no explicit
+    # fallback reason is ``refuse``d (the stage fails, ``heavy_local_unexplained``) or, opted
+    # back in, placed with the recorded warning (``warn``).
+    heavy_unexplained_local: Literal["refuse", "warn"] = "refuse"
     # ADR 0141: the remote candidate submit adds to a heavy stage that lists none (absent: none).
     heavy_remote_candidate: HeavyRemoteCandidate | None = None
 
@@ -175,6 +179,12 @@ def heavy_bytes_threshold() -> int:
 def heavy_local_fallback() -> str:
     """``warn`` (the default, also when no section is configured) or ``refuse`` (ADR 0107)."""
     return "warn" if _ACTIVE is None else _ACTIVE.heavy_local_fallback
+
+
+def heavy_unexplained_local() -> str:
+    """``refuse`` (the default, also when no section is configured) or ``warn`` (ADR 0107
+    amendment 2026-11-23b)."""
+    return "refuse" if _ACTIVE is None else _ACTIVE.heavy_unexplained_local
 
 
 def default_enabled() -> bool:

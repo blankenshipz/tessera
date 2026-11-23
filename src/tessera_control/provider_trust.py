@@ -644,6 +644,7 @@ def provider_admits(
                 "trusted to receive (private_code_approved); without a provider trust "
                 "setting only data recorded public is admitted",
                 admit_class=PRIVATE_CODE_APPROVED,
+                data_class=PRIVATE_CODE_APPROVED,
             )
         approved = frozenset(f["relative_path"] for f in approval["files"])
     has_data = approval is None or any(e["relative_path"] not in approved for e in entries)
@@ -653,6 +654,7 @@ def provider_admits(
             "(without a provider trust setting only data recorded public with license and "
             "source evidence is admitted)",
             admit_class=recorded if recorded == "private_derived" else None,
+            data_class=recorded,
         )
     return AdmittedInput(
         code_paths=approved,
