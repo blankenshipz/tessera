@@ -726,10 +726,30 @@ def test_the_stage_watcher_block_is_closed_and_bounded(tmp_path):
         dict(good, max_reports=1),
         dict(good, max_reports=MAX_REPORTS_PER_OPERATION + 1),
         dict(good, delivery_timeout_seconds=1.0),
-        {"kill_switch_path": "/run/kill"},
     ):
         with pytest.raises(ValueError):
             ExecutorConfig.model_validate(dict(base, stage_watcher=bad))
+
+
+def test_a_block_without_enabled_is_a_tuning_only_block_and_stays_enabled(tmp_path):
+    base = Harness(tmp_path).config.model_dump(by_alias=True)
+    config = ExecutorConfig.model_validate(dict(base, stage_watcher={"silent_seconds": 600}))
+    assert config.stage_watcher.enabled is True
+    assert config.stage_watcher.silent_seconds == 600
+    effective = executor_module.effective_stage_watcher(config.stage_watcher, tmp_path)
+    assert effective.enabled and effective.silent_seconds == 600
+    assert effective.kill_switch_path == str(tmp_path / executor_module.DEFAULT_KILL_SWITCH_NAME)
+    explicit = ExecutorConfig.model_validate(
+        dict(base, stage_watcher={"kill_switch_path": "/run/k"})
+    )
+    assert explicit.stage_watcher.enabled is True
+    off = ExecutorConfig.model_validate(
+        dict(base, stage_watcher={"enabled": False, "silent_seconds": 600})
+    )
+    assert executor_module.effective_stage_watcher(off.stage_watcher, tmp_path) is None
+    absent = ExecutorConfig.model_validate(base)
+    assert absent.stage_watcher is None
+    assert executor_module.effective_stage_watcher(None, tmp_path).enabled
 
 
 def test_load_config_accepts_the_block_and_refuses_a_bad_one(tmp_path):

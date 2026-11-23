@@ -70,7 +70,12 @@ revising a conclusion is rejected. A conclusion may also carry an optional `deci
 reviewed. Each cited evidence link has an optional `stance` (`supports` or `opposes`; null means
 unstated, and links recorded before it existed are not relabelled supporting); an
 `EvidenceCitation.stance` on a create or update body is inherited by that citation's artifact and
-measurement links. Responses and export show the decision and each link's stance, and for each link the cited run's operational status and result separately: `attempt_kind`, `attempt_outcome`, `result_assessment` and `run_failed`, so a failed run is never mistaken for a negative result; a citation with a stance is refused when the cited run failed, was cancelled, unknown, unresolved or inconclusive, or was assessed inconclusive (cite it without a stance as context) ([ADR 0128](decisions/0128-conclusion-evidence-shows-run-status-and-result.md)). Neither is a
+measurement links. Responses and export show the decision and each link's stance, and for each link
+the cited run's operational status and result separately: `attempt_kind`, `attempt_outcome`,
+`result_assessment` and `run_failed`, so a failed run is never mistaken for a negative result; a
+citation with a stance is refused when the cited run failed, was cancelled, unknown, unresolved or
+inconclusive, or was assessed inconclusive (cite it without a stance as context)
+([ADR 0128](decisions/0128-conclusion-evidence-shows-run-status-and-result.md)). Neither is a
 review approval, authority, or scientific validity (`scientific_validity` stays `not_assessed`);
 nothing requires a decision before review, and agents cannot write conclusions. See
 [ADR 0104](decisions/0104-conclusion-decision-and-evidence-stance.md). `GET /experiments/{id}/export` includes complete

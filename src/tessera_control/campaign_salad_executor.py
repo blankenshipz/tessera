@@ -97,12 +97,13 @@ class StageWatcherBlock(_Closed):
 
     Without this block the executor watches every route with the default kill-switch marker
     (``DEFAULT_KILL_SWITCH_NAME`` in the executor state directory; present means engaged). Opt out
-    only with ``{"enabled": false}``. Bounds are
+    only with ``{"enabled": false}``. A block that omits ``enabled`` (for example one that only
+    tunes ``silent_seconds``) stays enabled, as on the poller. Bounds are
     ``tessera_worker.stage_watch_config.StageWatchConfig``'s (checked here); an omitted bound
     takes its default, an omitted ``kill_switch_path`` the default marker.
     """
 
-    enabled: bool
+    enabled: bool = True
     kill_switch_path: _Path | None = None
     silent_seconds: int | None = None
     heartbeat_seconds: int | None = None
