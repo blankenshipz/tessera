@@ -410,6 +410,7 @@ class SaladSafetyService:
         control_origin=None,
         control_opener=None,
         max_open_billable_frames=1,
+        max_prestart_rebinds=3,
     ):
         # ADR 0041 resolved question 4b: concurrent billable frames need a later record that
         # covers total-cap races, partial stops and accrual interleaving, so only 1 is allowed.
@@ -512,6 +513,8 @@ class SaladSafetyService:
             observe=self._observe,
             stop=self._stop,
             clock=clock,
+            custody_started=self._custody_started,
+            max_prestart_rebinds=max_prestart_rebinds,
         )
         self.loop_at = None
         # Real-time pacing for bounded rate-read retries (tests may replace both).
@@ -1376,6 +1379,25 @@ class SaladSafetyService:
         except Exception:
             pass  # unresolved again: the ordinary recovery loop keeps trying
 
+    def _custody_started(self, operation):
+        """True once anything beyond the provider placing the instance has happened for the
+        operation: a run was seen, the workload began, an input was fetched, an output was
+        requested or written, or the service is in recovery. Until then a change of allocation
+        is only the provider re-scheduling an instance that never ran."""
+        row = self._row(operation=operation)
+        if (
+            row["begun"]
+            or row["output"]
+            or row["seen_running"]
+            or row["first_running_at"] is not None
+            or row["input_requests"]
+            or row["output_requests"]
+            or row["allocation_uncertain"]
+            or row["recovery"]
+        ):
+            return True
+        return bool(self.inputs is not None and self.inputs.served(operation))
+
     def _provider(self, row):
         result = self._retrying_read(
             row,
@@ -1416,10 +1438,35 @@ class SaladSafetyService:
             # Nothing can write before the container runs, so placement is bound
             # only once it is running; any later identity change is still flagged.
             return observation, group, allocation, machine
+        if (
+            instances
+            and row["allocation"]
+            and instances[0].get("state") not in STARTED
+            and not (instances[0].get("machine_id") and instances[0].get("instance_id"))
+            and not self._custody_started(row["operation"])
+        ):
+            # A replacement the provider has not placed yet, before anything ran: keep the
+            # bound placement until it is placed; the guardian's clocks keep running meanwhile.
+            return observation, group, row["allocation"], row["machine"]
         if instances:
             instance = instances[0]
             machine = normalized_uuid(instance["machine_id"])
             allocation = normalized_uuid(instance["instance_id"]) + ":" + machine
+            if (
+                row["allocation"]
+                and (allocation != row["allocation"] or machine != row["machine"])
+                and not self._custody_started(row["operation"])
+                and self.guardian.rebinds_left(row["operation"]) > 0
+            ):
+                # Re-scheduled before anything ran or any custody began: record the new placement
+                # and let the guardian re-bind (it applies the bound on how often). It sees the
+                # old allocation as ``prior_allocation_id`` and decides; nothing is flagged here.
+                with self.db:
+                    self.db.execute(
+                        "UPDATE reservations SET allocation=?,machine=? WHERE reservation=?",
+                        (allocation, machine, row["reservation"]),
+                    )
+                return observation, group, allocation, machine
             if row["allocation"] and (allocation != row["allocation"] or machine != row["machine"]):
                 # Return changed identity to guardian, never adopt replacement.
                 with self.db:
@@ -1435,6 +1482,14 @@ class SaladSafetyService:
                     "UPDATE reservations SET allocation=?,machine=? WHERE reservation=?",
                     (allocation, machine, row["reservation"]),
                 )
+                if instance.get("state") == "running":
+                    # The placement is bound from an instance that is running right now: record
+                    # that something ran (the flag only; accrual is still started by the poll),
+                    # so a later change of allocation is never taken for a pre-start re-schedule.
+                    self.db.execute(
+                        "UPDATE reservations SET seen_running=1 WHERE reservation=?",
+                        (row["reservation"],),
+                    )
         return observation, group, allocation, machine
 
     def _assignment(self, row):
@@ -2782,6 +2837,7 @@ def main(argv=None):
             total_cap_cents=cfg.get("total_cap_cents"),
             control_origin=cfg.get("control_origin"),
             max_open_billable_frames=cfg.get("max_open_billable_frames", 1),
+            max_prestart_rebinds=cfg.get("max_prestart_rebinds", 3),
         )
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3

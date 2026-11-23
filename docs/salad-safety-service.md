@@ -386,3 +386,15 @@ The service cannot kill through an unavailable Salad API, guarantee node-local
 quiescence, enforce provider billing as a hard financial cap, or survive simultaneous
 host/storage/supervisor loss. Multiple concurrent Salad operations are not this
 milestone's acceptance; deploy and capacity-test the single-operation journey.
+
+## Allocation change before anything ran
+
+Salad can reschedule a container group while its image is still being pulled. An allocation change
+seen before any instance was observed running and before any custody began (no input fetched, no
+output written, not in recovery) is therefore a re-bind, not a stop: the guardian adopts the new
+allocation, records `prestart_reallocation` (old and new allocation, time) on its status, and keeps
+waiting. The deadline, the running window, the heartbeat and billing clocks are never reset, and the
+number of re-binds is bounded by `max_prestart_rebinds` (default 3; 0 turns the behaviour off; values
+above 10 are refused at startup). Once the bound is spent, once any instance ran, or once any custody
+began, a change of allocation stops the run with `allocation_changed` exactly as before, and a guardian
+that cannot tell whether custody began stops too.

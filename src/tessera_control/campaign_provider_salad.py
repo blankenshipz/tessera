@@ -594,13 +594,19 @@ class SaladRouteProvider:
                 "published_hourly_rate_usd": final.get("published_hourly_rate_usd"),
                 "label": "estimate_not_invoice",
             }
-        return {
+        fields = {
             "salad_verdict": attempt["salad_verdict"],
             "salad_evidence_digest": attempt["salad_evidence_digest"],
             "salad_phase": row["phase"] if row else None,
             "salad_route_id": row["route_id"] if row else None,
             "guardian_estimate": estimate,
         }
+        if row is not None and row["guardian_final_json"] is not None:
+            rebinds = json.loads(row["guardian_final_json"]).get("prestart_rebinds")
+            if rebinds:
+                # Recorded by the guardian: an allocation change before anything ran, re-bound.
+                fields["guardian_prestart_rebinds"] = rebinds
+        return fields
 
     @staticmethod
     def _translate(call):

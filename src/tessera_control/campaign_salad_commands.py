@@ -55,6 +55,22 @@ class _SaladPackage(BaseModel):
 _CentsText = Annotated[str, StringConstraints(pattern=r"^[0-9]{1,12}(\.[0-9]{1,12})?$")]
 
 
+class _PrestartRebind(BaseModel):
+    """One re-bind of the guardian to a new allocation before anything ran (bounded text)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    at: Annotated[str, StringConstraints(max_length=40)]
+    from_allocation: Annotated[str, StringConstraints(max_length=96)]
+    to_allocation: Annotated[str, StringConstraints(max_length=96)]
+    reason: Literal["prestart_reallocation"]
+
+
+class _PrestartRebinds(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    count: Annotated[int, Field(ge=1, le=10)]
+    events: Annotated[list[_PrestartRebind], Field(max_length=3)]
+
+
 class _GuardianFinal(BaseModel):
     """The final guardian status projection the executor records (nothing else)."""
 
@@ -70,6 +86,8 @@ class _GuardianFinal(BaseModel):
     estimated_exposure_cents: _CentsText | None = None
     actual_billed_cost_cents: Annotated[int, Field(ge=0)] | None = None
     observed_at: Annotated[str, StringConstraints(max_length=40)]
+    # Present only when the guardian re-bound its allocation before anything ran.
+    prestart_rebinds: _PrestartRebinds | None = None
 
 
 class _SaladOutcome(BaseModel):
@@ -239,7 +257,15 @@ class SaladWorkerCommands:
                 None
                 if body.guardian_final is None
                 else json.dumps(
-                    body.guardian_final.model_dump(), sort_keys=True, separators=(",", ":")
+                    {
+                        key: value
+                        for key, value in body.guardian_final.model_dump().items()
+                        # Absent unless used, so the stored shape (and its digest) of every
+                        # run without a pre-start re-bind is unchanged.
+                        if key != "prestart_rebinds" or value is not None
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
                 )
             )
             # The control plane computes the digest and infers no status from the receipt.

@@ -29,6 +29,14 @@ RECONCILE_REASONS = {
     RECONCILE_OPERATOR: "operator_reconciled",
     RECONCILE_PROVIDER: "provider_confirmed_stop",
 }
+# An allocation change seen before any instance ran and before any custody began (no input
+# fetched, no output written) is benign: the assignment is re-bound and the guardian keeps
+# waiting. The event kind carries the old and new allocation as JSON after the prefix.
+PRESTART_REBIND_PREFIX = "prestart_reallocation:"
+PRESTART_REBIND_REASON = "prestart_reallocation"
+DEFAULT_MAX_PRESTART_REBINDS = 3
+MAX_PRESTART_REBINDS_LIMIT = 10
+_REBIND_ID_CAP = 96
 
 
 @dataclass(frozen=True)
@@ -113,7 +121,19 @@ class SaladGuardian:
         observe: Callable[[GuardianAssignment], ProviderObservation],
         stop: Callable[[GuardianAssignment], str],
         clock=time.time,
+        custody_started: Callable[[str], bool] | None = None,
+        max_prestart_rebinds: int = DEFAULT_MAX_PRESTART_REBINDS,
     ):
+        if (
+            type(max_prestart_rebinds) is not int
+            or not 0 <= max_prestart_rebinds <= MAX_PRESTART_REBINDS_LIMIT
+        ):
+            raise ValueError("invalid_max_prestart_rebinds")
+        # ``custody_started(operation)`` is the provider adapter's answer to "has any custody
+        # begun for this operation" (an input fetched, an output written, a run observed). With
+        # no callable the guardian cannot know, so it never re-binds: every change stops.
+        self.custody_started = custody_started
+        self.max_prestart_rebinds = max_prestart_rebinds
         self.db = private_database(path)
         self._lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -251,7 +271,7 @@ class SaladGuardian:
             "ORDER BY sequence LIMIT 1",
             (operation, len(STOP_CAUSE_PREFIX), STOP_CAUSE_PREFIX),
         ).fetchone()
-        return dict(
+        result = dict(
             status=row[0],
             reason=row[1],
             stop_cause=cause[0][len(STOP_CAUSE_PREFIX) :] if cause else None,
@@ -263,6 +283,72 @@ class SaladGuardian:
             node_writers="unknown",
             quarantine=True,
         )
+        rebinds = self._prestart_rebinds(operation)
+        if rebinds:
+            # Additive: absent unless an allocation was re-bound before anything started.
+            result["prestart_rebinds"] = {
+                "count": len(rebinds),
+                "events": rebinds[-MAX_PRESTART_REBINDS_LIMIT:],
+            }
+        return result
+
+    def _prestart_rebinds(self, operation: str) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT at,kind FROM events WHERE operation=? AND substr(kind,1,?)=? ORDER BY sequence",
+            (operation, len(PRESTART_REBIND_PREFIX), PRESTART_REBIND_PREFIX),
+        ).fetchall()
+        found = []
+        for at, kind in rows:
+            try:
+                detail = json.loads(kind[len(PRESTART_REBIND_PREFIX) :])
+            except ValueError:
+                continue
+            found.append(
+                {
+                    "at": at,
+                    "from": detail.get("from"),
+                    "to": detail.get("to"),
+                    "reason": PRESTART_REBIND_REASON,
+                }
+            )
+        return found
+
+    def _may_rebind(self, operation: str, first_running, stopping: bool) -> bool:
+        """True when an allocation change is a benign pre-start re-allocation: nothing ran,
+        no custody began, the guardian is not already stopping, and the bound is not spent."""
+        if stopping or first_running is not None or self.custody_started is None:
+            return False
+        if self.max_prestart_rebinds <= 0:
+            return False
+        try:
+            if self.custody_started(operation):
+                return False
+        except Exception:
+            return False  # cannot tell: fail closed, stop as before
+        return self.rebinds_left(operation) > 0
+
+    def rebinds_left(self, operation: str) -> int:
+        """How many more pre-start re-binds the bound allows for this operation."""
+        used = self.db.execute(
+            "SELECT count(*) FROM events WHERE operation=? AND substr(kind,1,?)=?",
+            (operation, len(PRESTART_REBIND_PREFIX), PRESTART_REBIND_PREFIX),
+        ).fetchone()[0]
+        return max(0, self.max_prestart_rebinds - used)
+
+    def _rebind(self, operation: str, old: str, new: str, now: float) -> None:
+        """Re-bind to ``new`` without touching any clock, deadline or stop decision."""
+        detail = json.dumps(
+            {"from": old[:_REBIND_ID_CAP], "to": new[:_REBIND_ID_CAP]}, separators=(",", ":")
+        )
+        with self.db:
+            self.db.execute(
+                "UPDATE assignments SET assigned_allocation=? WHERE operation=?",
+                (new, operation),
+            )
+            self.db.execute(
+                "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                (operation, now, PRESTART_REBIND_PREFIX + detail),
+            )
 
     def tick(self, operation: str) -> dict:
         row = self.db.execute(
@@ -334,7 +420,11 @@ class SaladGuardian:
                 and o.prior_allocation_id is not None
                 and o.allocation_id != o.prior_allocation_id
             ):
-                reason, stopping, uncertain = "allocation_changed", True, True
+                if self._may_rebind(operation, first_running, stopping):
+                    self._rebind(operation, allocation, o.allocation_id, now)
+                    terminal = o.state == "stopped" and not uncertain
+                else:
+                    reason, stopping, uncertain = "allocation_changed", True, True
             elif not exact or not fresh or o.state not in {"running", "stopped", "pending"}:
                 reason, stopping = "provider_unknown", True
             elif allocation == "unallocated" and o.allocation_id != "unallocated":
@@ -345,7 +435,11 @@ class SaladGuardian:
                     )
                 terminal = o.state == "stopped" and not uncertain
             elif o.allocation_id != allocation:
-                reason, stopping, uncertain = "allocation_changed", True, True
+                if self._may_rebind(operation, first_running, stopping):
+                    self._rebind(operation, allocation, o.allocation_id, now)
+                    terminal = o.state == "stopped" and not uncertain
+                else:
+                    reason, stopping, uncertain = "allocation_changed", True, True
             else:
                 terminal = o.state == "stopped" and not uncertain
         except Exception:

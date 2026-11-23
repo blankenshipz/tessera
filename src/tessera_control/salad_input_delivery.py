@@ -161,6 +161,15 @@ class GuardianInputs:
             session.snapshot = None
             session.cached = None
 
+    def served(self, operation: str) -> bool:
+        """True once any workload fetch for the operation was served (held or carried over a
+        drop). A fetch means an instance redeemed the ticket: custody of the input began."""
+        session = self._sessions.get(operation)
+        if session is not None and (session.chunks_served or session.bytes_served):
+            return True
+        carried = self._carried.get(operation)
+        return carried is not None and bool(carried[2] or carried[3])
+
     def status(self, operation: str) -> dict[str, Any]:
         """Metadata only; the token is never reported."""
         session = self._sessions.get(operation)

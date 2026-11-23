@@ -948,6 +948,26 @@ def _text(value: Any) -> str | None:
     return None
 
 
+def _project_rebinds(value: Any) -> dict[str, Any] | None:
+    """The guardian's pre-start re-binds (count and the last three), or None when it has none
+    or the shape is not the expected one (then nothing is recorded, never a guess)."""
+    if type(value) is not dict or type(value.get("count")) is not int or value["count"] < 1:
+        return None
+    events = []
+    for item in (value.get("events") or [])[-3:]:
+        if type(item) is not dict or type(item.get("at")) not in {int, float}:
+            return None
+        events.append(
+            {
+                "at": datetime.fromtimestamp(item["at"], UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "from_allocation": str(item.get("from") or "")[:96],
+                "to_allocation": str(item.get("to") or "")[:96],
+                "reason": "prestart_reallocation",
+            }
+        )
+    return {"count": min(value["count"], 10), "events": events}
+
+
 def project_guardian_final(
     status: dict[str, Any], *, now: datetime | None = None
 ) -> dict[str, Any] | None:
@@ -966,6 +986,9 @@ def project_guardian_final(
         actual_billed_cost_cents=billed if type(billed) is int and billed >= 0 else None,
         observed_at=(now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
+    rebinds = _project_rebinds(status.get("prestart_rebinds"))
+    if rebinds is not None:
+        projected["prestart_rebinds"] = rebinds
     try:
         _GuardianFinal.model_validate(projected)
     except ValidationError:
