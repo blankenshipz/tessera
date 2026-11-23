@@ -75,6 +75,20 @@ class CustodyConfig(_Closed):
     token_file: _Path
     ca_file: _Path
     certificate_sha256: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+    # The name workloads are told to reach custody by (a profile's ``custody_host``), when it
+    # differs from ``host``, the admin endpoint this executor itself connects to and pins. Absent:
+    # ``host`` is both. It is only compared with the profile; it is never connected to or recorded.
+    workload_host: (
+        Annotated[str, StringConstraints(pattern=r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")]
+        | None
+    ) = None
+
+    def client_fields(self) -> dict[str, Any]:
+        """The fields of the custody HTTPS client and the closed live-check config."""
+        return self.model_dump(mode="json", exclude={"workload_host"})
+
+    def workload_name(self) -> str:
+        return self.workload_host or self.host
 
 
 class StageWatcherBlock(_Closed):
@@ -465,7 +479,7 @@ class SaladCampaignExecutor:
             credential_directory=self.config.credential_directory,
             guardian_socket=self.config.guardian_socket,
             guardian_uid=self.config.guardian_uid,
-            custody=self.config.custody.model_dump(mode="json"),
+            custody=self.config.custody.client_fields(),
             approved_max_cost_cents=plan["budget_cents"],
             max_seconds=max_seconds,
             max_polls=min(MAX_POLLS, max(30, -(-max_seconds // 5))),
@@ -899,7 +913,7 @@ def trusted_importer(config: ExecutorConfig, worker, state_dir):
                 worker=worker,
                 policy=policy,
                 resolver=resolver,
-                safety=SaladSafetyHTTPSClient(**config.custody.model_dump(mode="json")),
+                safety=SaladSafetyHTTPSClient(**config.custody.client_fields()),
             )
             reply = server.import_retained(route_id, destination=str(destination))
         finally:
@@ -917,7 +931,10 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
     profiles = [loaded.get(name) for name in config.profile_names]
     if any(profile is None for profile in profiles):
         raise ValueError("Unknown Salad campaign profile.")
-    if any(config.custody.host != profile.custody_host for profile in profiles):
+    # The executor may only hand workloads a custody name it owns: the name it was configured to
+    # advertise (``workload_host``, else ``host``) must be the profile's ``custody_host``. The
+    # admin ``host`` it connects to may differ.
+    if any(config.custody.workload_name() != profile.custody_host for profile in profiles):
         raise ValueError("Custody host differs from the profile.")
     state_dir = Path(config.state_dir)
     worker = Store(state_dir).authenticate_worker(
@@ -927,7 +944,7 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
     def guardian_status(state):
         from .salad_server import SaladSafetyHTTPSClient
 
-        return SaladSafetyHTTPSClient(**config.custody.model_dump(mode="json")).status(state)
+        return SaladSafetyHTTPSClient(**config.custody.client_fields()).status(state)
 
     stage_watch = None
     if config.stage_watcher is not None and config.stage_watcher.enabled:

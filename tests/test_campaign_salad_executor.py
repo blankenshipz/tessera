@@ -642,7 +642,7 @@ def test_build_executor_wires_the_guardian_status_through_the_custody_client(tmp
     config = h.config.model_copy(update={"custody": h.config.custody})
     module.build_executor(config)
     projected = project = captured["status"]({"reservation": "r"})
-    assert built["kwargs"] == config.custody.model_dump(mode="json")
+    assert built["kwargs"] == config.custody.client_fields()
     assert built["state"] == {"reservation": "r"} and projected["status"] == "stopped"
     assert module.project_guardian_final(project)["estimated_exposure_cents"] == "3.5"
 
@@ -804,3 +804,71 @@ def test_the_config_names_profile_or_profiles_and_build_loads_each(tmp_path, mon
     )
     with pytest.raises(ValueError, match="Unknown"):
         module.build_executor(unknown)
+
+
+@pytest.mark.parametrize(
+    ("host", "workload_host", "accepted"),
+    [
+        # no workload name: ``host`` is both, as before
+        ("custody.example-tailnet.ts.net", None, True),
+        ("custody-admin.internal", None, False),
+        # split: connect to the admin endpoint, advertise the profile's workload name
+        ("custody-admin.internal", "custody.example-tailnet.ts.net", True),
+        ("custody-admin.internal", "other.example-tailnet.ts.net", False),
+        # a matching admin host does not excuse a different advertised name
+        ("custody.example-tailnet.ts.net", "other.example-tailnet.ts.net", False),
+    ],
+)
+def test_the_profile_custody_host_is_compared_with_the_workload_name(
+    tmp_path, monkeypatch, host, workload_host, accepted
+):
+    h = Harness(tmp_path)
+    built = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            built["kwargs"] = kwargs
+
+        def status(self, state):
+            return dict(FINAL)
+
+    class FakeProfiles:
+        def get(self, name):
+            return h.executor.profile
+
+    class FakeStore:
+        def __init__(self, state_dir):
+            pass
+
+        def authenticate_worker(self, token):
+            return {"id": WORKER}
+
+    import tessera_control.salad_live_check as live
+    import tessera_control.salad_server as server
+    import tessera_control.store as store
+
+    monkeypatch.setattr(server, "SaladSafetyHTTPSClient", FakeClient)
+    monkeypatch.setattr(store, "Store", FakeStore)
+    monkeypatch.setattr(live, "_private_bytes", lambda path, cap: b"token")
+    monkeypatch.setattr(module, "load_profiles", lambda path: FakeProfiles())
+    monkeypatch.setattr(module, "trusted_importer", lambda *a: None)
+    monkeypatch.setattr(module, "StoreControl", lambda state_dir, worker, status: status)
+    fields = {"host": host, **({"workload_host": workload_host} if workload_host else {})}
+    custody_config = h.config.custody.model_copy(update=fields)
+    config = h.config.model_copy(update={"custody": custody_config})
+    if not accepted:
+        with pytest.raises(ValueError, match="Custody host differs from the profile"):
+            module.build_executor(config)
+        return
+    status = module.build_executor(config)
+    assert status is not None
+
+
+def test_the_workload_name_never_reaches_the_custody_client_or_live_check_config():
+    config = module.CustodyConfig(**custody(), workload_host="custody.example-tailnet.ts.net")
+    assert "workload_host" not in config.client_fields()
+    assert config.client_fields() == module.CustodyConfig(**custody()).client_fields()
+    assert config.workload_name() == "custody.example-tailnet.ts.net"
+    assert module.CustodyConfig(**custody()).workload_name() == custody()["host"]
+    with pytest.raises(ValueError):
+        module.CustodyConfig(**custody(), workload_host="Not A Host")
