@@ -234,6 +234,15 @@ at the route deadline plus the lost-create margin. The live-check receipt report
 `reason: "create_not_sent"`. A failure after the POST was sent (a reset, a timeout
 waiting for the reply) stays `provider_unavailable`/unknown.
 
+Pre-start failures: when a step before `start` fails (reading the route, create, the
+pre-start settle wait, input ticket mint, guardian delivery confirmation, the start
+dispatch, or a bounded wall-clock operation), the live-check receipt keeps its status and
+`reason` and adds `prestart_failure: {"class", "exception"}`. `class` is one of the closed
+set `route_state_unreadable`, `create_failed`, `group_unsettled`, `ticket_mint_failed`,
+`input_delivery_unconfirmed`, `start_failed`, `wall_bound_exceeded`, and the named fallback
+`prestart_unclassified`; `exception` is the exception's type name only, never its text.
+It is `null` when no pre-start step failed (and absent from older receipts).
+
 Release: the trusted server sends admin `create_rejected` with the summary. The
 guardian re-validates it (closed keys, status 400/422, or 0 for a create that was never
 sent, bounded printable text).

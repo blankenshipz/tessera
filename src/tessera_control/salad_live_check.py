@@ -29,6 +29,52 @@ MAX_ROUTE_SECONDS = 7200
 MAX_POLLS = 720
 
 
+# Closed set of pre-start failure classes recorded on the receipt (field `prestart_failure`).
+# Each names the step that failed before dispatch("start"); the receipt status and reason are
+# unchanged by it. `prestart_unclassified` is the named fallback for a failure at a step that
+# cannot be attributed more precisely; it is never silently merged into another class.
+PRESTART_FAILURE_CLASSES = frozenset(
+    {
+        "route_state_unreadable",  # reading the durable route / input declaration
+        "create_failed",  # dispatch("create") raised
+        "group_unsettled",  # pre-start settle wait: observe/heartbeat raised or group not stopped
+        "ticket_mint_failed",  # the server could not mint or hand the input ticket to the guardian
+        "input_delivery_unconfirmed",  # guardian status did not confirm the held ticket/digest
+        "start_failed",  # dispatch("start") raised
+        "wall_bound_exceeded",  # a bounded live operation timed out before start
+        "prestart_unclassified",  # any other failure that carries no closed class
+    }
+)
+
+
+class PrestartStepError(Exception):
+    """Carries a closed failure class out of a session step; never carries message text."""
+
+    def __init__(self, failure_class):
+        super().__init__(failure_class)
+        self.failure_class = failure_class
+
+
+def _exception_type_name(error):
+    """The exception's class name only (bounded, identifier-shaped); never its text."""
+    name = type(error).__name__
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
+
+
+def _prestart_failure(error, default):
+    if isinstance(error, TimeoutError):
+        failure_class = "wall_bound_exceeded"
+    elif isinstance(error, PrestartStepError) and error.failure_class in PRESTART_FAILURE_CLASSES:
+        failure_class = error.failure_class
+    else:
+        failure_class = default if default in PRESTART_FAILURE_CLASSES else "prestart_unclassified"
+    cause = error.__cause__ if isinstance(error, PrestartStepError) else None
+    return {
+        "class": failure_class,
+        "exception": _exception_type_name(cause if cause is not None else error),
+    }
+
+
 @contextmanager
 def _wall_bound(seconds):
     # Standalone trusted Linux CLI, not an API thread or an existing timer owner.
@@ -422,16 +468,26 @@ class SaladLiveSession:
         declared = route_input(state["proposal"])
         if declared is None:
             raise ValueError("route declares no input")
-        with _wall_bound(30):
-            self.server.deliver_inputs(route)
-        held = self._exchange(self._body(route, "status")).get("input_delivery")
+        try:
+            with _wall_bound(30):
+                self.server.deliver_inputs(route)
+        except TimeoutError:
+            raise
+        except Exception as error:
+            raise PrestartStepError("ticket_mint_failed") from error
+        try:
+            held = self._exchange(self._body(route, "status")).get("input_delivery")
+        except TimeoutError:
+            raise
+        except Exception as error:
+            raise PrestartStepError("input_delivery_unconfirmed") from error
         if (
             type(held) is not dict
             or held.get("ticket_held") is not True
             or held.get("snapshot_digest") != declared.snapshot_digest
             or held.get("snapshot_digest") != state["proposal"]["selection"]["manifests"]["data"]
         ):
-            raise ValueError("guardian input delivery unconfirmed")
+            raise PrestartStepError("input_delivery_unconfirmed")
 
     def revoke_inputs(self, route):
         """Drop at the guardian and revoke at control; a no-op for routes without input."""
@@ -949,7 +1005,12 @@ def _drive(
         # (timeout, provider_unknown, rate_stale, ...), if any.
         "guardian_last_rate_read_failure": None,
         "guardian_last_provider_read_failure": None,
+        # Closed class of the pre-start step that failed ({"class", "exception"}: the
+        # exception's type name only, never its text), or None. Diagnostic; it does not
+        # change status or reason.
+        "prestart_failure": None,
     }
+    step = {"name": None}
     deadline = clock() + max_seconds
     interval = min(POLL_INTERVAL_CAP_SECONDS, max(1, max_seconds / max_polls))
     launched = False
@@ -1018,6 +1079,7 @@ def _drive(
     try:
         # This is a read of the durable record, not a new admission. A rerun or
         # reconnect with existing effects never reaches create/start.
+        step["name"] = "route_state_unreadable"
         state = session.state(route_id)
         original_digest = state["proposal_digest"]
         receipt["input_expected"] = session.input_expected(route_id) is True
@@ -1032,8 +1094,12 @@ def _drive(
         elif receipt["input_expected"]:
             receipt["input_code"] = "unknown"
         prior_launches = [e for e in state["effects"] if e["action"] in {"create", "start"}]
+        # The state read succeeded. A reconnect or rerun skips create/start, so any later
+        # failure is post-start and must not carry a pre-start class.
+        step["name"] = None
         if not prior_launches:
             launched = True  # lost create reply still requires exact stop/reconcile
+            step["name"] = "create_failed"
             created = dispatch("create")
             receipts = created.get("receipts") if isinstance(created, dict) else None
             created = receipts[-1] if isinstance(receipts, list) and receipts else {}
@@ -1052,6 +1118,7 @@ def _drive(
             # instance: the guardian's terminal reading) before start. A group that reads
             # stopped but never reports a settled shape is handed to start after a bounded
             # wait, where the transport's own exact read decides.
+            step["name"] = "group_unsettled"
             polls = 0
             stopped_since = None
             settle_started = clock()
@@ -1086,9 +1153,12 @@ def _drive(
                 # The group exists but is stopped (unbilled). Delivery must be confirmed
                 # before start; a failure here never starts it and falls through to the
                 # exact cancel/stop below.
+                step["name"] = "prestart_unclassified"
                 session.deliver_inputs(route_id)
                 receipt["input_delivered"] = True
+            step["name"] = "start_failed"
             dispatch("start")
+            step["name"] = None
         for _ in range(max_polls):
             if clock() >= deadline:
                 break
@@ -1122,16 +1192,18 @@ def _drive(
                 while waited < PRESTART_POLL_INTERVAL_SECONDS and clock() < deadline:
                     if launched:
                         heartbeat()
-                    step = min(interval, PRESTART_POLL_INTERVAL_SECONDS - waited)
-                    sleep(min(step, max(0, deadline - clock())))
-                    waited += step
+                    slice_seconds = min(interval, PRESTART_POLL_INTERVAL_SECONDS - waited)
+                    sleep(min(slice_seconds, max(0, deadline - clock())))
+                    waited += slice_seconds
         else:
             raise ValueError("poll bound")
         if clock() >= deadline or not evidence["output_retained"]:
             raise ValueError("output unavailable")
         execution_complete = True
-    except Exception:
+    except Exception as error:
         receipt["reason"] = "execution_or_output_unresolved"
+        if step["name"] is not None and receipt["create_rejection"] is None:
+            receipt["prestart_failure"] = _prestart_failure(error, step["name"])
     finally:
         # Even a failed dispatch/preflight or existing uncertain group gets one
         # exact stop attempt. Never delete, choose a new target, or retry stop.
