@@ -30,8 +30,11 @@ composition. A refusal is a closed code (`upstream_missing`, `upstream_not_succe
 `upstream_not_settled`, `output_missing`, `digest_mismatch`, `data_class_refused`,
 `license_refused`, `campaign_not_found`) recorded as `campaign.stage_input_bind_refused`; the
 stage fails as `late_bind_refused:<code>`. The binding is the event
-`campaign.stage_inputs_bound` and the receipt's `input.late_bound_inputs` (source stage,
-output, digest, bytes, data class, labels); providers read it through
+`campaign.stage_inputs_bound` and the receipt's `input.late_bound_inputs` (per input: source stage,
+output, digest, bytes, data class, labels, and `bound_at`, the binding event's timestamp). A
+refused binding shows on the dependent stage's receipt as one `input_not_pinned` entry
+(`status`, `code` = the refusal code, `input`, `source_stage`; never the free-text reason),
+appended after any entries the stage bound before the refusal was recorded; a refused Salad alternate records the same event, so it shows too. Providers read it through
 `RunnerServices.bound_inputs` and receive resolved digests only. Submitting grants nothing and spends nothing. A v2 stage may also pin
 another campaign's output (`kind: artifact`); that resolves through the source campaign's
 v2 receipt and its stage I/O index, so a campaign that finished before schema v65 cannot be

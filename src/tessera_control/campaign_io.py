@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .data_class import OUTPUT_DATA_CLASS
+from .data_class import OUTPUT_DATA_CLASS, PRIVATE_DERIVED
 from .store import Conflict
 
 # The shape of ``campaign_models.PinnedImage`` (a built image must satisfy the same rule).
@@ -266,8 +266,13 @@ def resolve_artifact(
         path=row["path"],
         sha256=source.sha256,
         size_bytes=int(item["size"]),
-        # The platform's recorded class for the pinned row; never relabelled.
-        data_class=row["data_class"],
+        # The platform's recorded class for the pinned row, never relabelled; a spec that
+        # declares private_derived can only keep it at least that restrictive.
+        data_class=(
+            PRIVATE_DERIVED
+            if getattr(source, "data_class", None) == PRIVATE_DERIVED
+            else row["data_class"]
+        ),
         kind=row["kind"],
         media_type=row["media_type"],
         source_campaign_id=source.campaign_id,

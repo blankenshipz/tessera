@@ -386,3 +386,49 @@ def test_a_known_input_beside_a_late_one_needs_the_recorded_sizes():
         holder, _profile(), lambda source: [("main.py", "c" * 64, 5)], lambda s: [("data.json", 10)]
     )
     assert plan[1] == 15
+
+
+def test_a_refused_salad_alternate_shows_on_the_receipt(tmp_path, host, monkeypatch):
+    """The runner binds the stage (local resolver call passes); the Salad driver's own resolution
+    is then refused. It records the runner's refusal event beside its own, in one step with the
+    failure, and the receipt shows ``input_not_pinned`` after the bound entry (fail closed)."""
+    import inspect
+
+    real = late_bound_inputs.resolve_stage_inputs
+
+    def refuse_from_the_salad_driver(*args, **kwargs):
+        if any(f.filename.endswith("campaign_salad.py") for f in inspect.stack()):
+            raise late_bound_inputs.LateBindRefused(
+                "license_refused",
+                "private free text /secret/path",
+                input_name="up",
+                source_stage=UP,
+            )
+        return real(*args, **kwargs)
+
+    world = _world(tmp_path, host)
+    monkeypatch.setattr(late_bound_inputs, "resolve_stage_inputs", refuse_from_the_salad_driver)
+    _to_salad_stage(world)
+    world.tick_until(lambda: _stage_row(world)["status"] == "failed")
+    stop = world.row("SELECT stop_reason FROM campaigns WHERE id=?", world.campaign_id)
+    assert stop["stop_reason"] == "stage_failed:g1:license_refused"
+    assert world.row("SELECT 1 FROM campaign_salad_attempts") is None  # nothing reached Salad
+    assert world.events(LATE_BOUND_EVENT) == []
+    (salad_event,) = world.events(LATE_BIND_REFUSED_EVENT)
+    (event,) = world.events(late_bound_inputs.REFUSED_EVENT)
+    assert salad_event["code"] == event["code"] == "license_refused"
+    assert event["input"] == "up" and event["source_stage"] == UP and event["provider"] == "salad"
+    assert "reason" not in event
+    with world.env.store.runner_connection() as connection:
+        campaign = connection.execute(
+            "SELECT * FROM campaigns WHERE id=?", (world.campaign_id,)
+        ).fetchone()
+        receipt, _ = build_receipt(connection, campaign, "failed")
+    entry = next(s for s in receipt["stages"] if s["stage_key"] == "g1")
+    assert entry["input"][late_bound_inputs.LAUNCH_INPUTS_KEY][-1] == {
+        "status": "input_not_pinned",
+        "code": "license_refused",
+        "input": "up",
+        "source_stage": UP,
+    }
+    assert "secret" not in json.dumps(receipt)

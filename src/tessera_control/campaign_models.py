@@ -418,12 +418,27 @@ class ArtifactSource(_Strict):
     # Present only when submit resolved a ``receipt_output`` reference; absent keeps every
     # existing spec digest unchanged.
     resolved_from: ReceiptLineage | None = None
+    # An artifact is a run output, so it is always private_derived (ADR 0039). A spec may say
+    # so explicitly; it can never declare a less restrictive class. The default is omitted from
+    # the serialized spec, so existing spec digests are unchanged.
+    data_class: DataClass = PRIVATE_DERIVED
+
+    @field_validator("data_class")
+    @classmethod
+    def _never_downgraded(cls, value: DataClass) -> DataClass:
+        if value != OUTPUT_DATA_CLASS:
+            raise ValueError("an artifact input is a run output and stays private_derived")
+        return value
 
     @model_serializer(mode="wrap")
     def _omit_absent_lineage(self, handler):
         value = handler(self)
         if self.resolved_from is None:
             value.pop("resolved_from", None)
+        if self.data_class == PRIVATE_DERIVED and "data_class" in value:
+            # Keep an explicit declaration visible only when the spec stated it.
+            if "data_class" not in self.model_fields_set:
+                value.pop("data_class")
         return value
 
 
@@ -1295,6 +1310,7 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                         stage=item.stage,
                         output=item.output,
                         sha256=item.sha256,
+                        data_class=item.data_class,
                     )
                 )
         stages.append(

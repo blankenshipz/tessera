@@ -59,3 +59,32 @@ against the resolved artifact rather than the spec's claim.
 - A tightened trust file or a label added after approval refuses at bind time instead of releasing.
 - Not done here: provider adapters' own acceptance and staging of late-bound inputs, and a bound input
   pinned across campaigns (use an `artifact` or `receipt_output` input for that).
+
+## Amendment (2026-11-23): receipt fields
+
+Each `late_bound_inputs` entry on the dependent stage's receipt also carries `bound_at`, the
+timestamp of the `campaign.stage_inputs_bound` event (written in the binding transaction; no extra
+clock read). The launch inputs a provider receives and the event payload are unchanged. When
+binding is refused, the receipt's `late_bound_inputs` holds one entry `{"status":
+"input_not_pinned", "code": <closed refusal code>, "input": <name>, "source_stage": <stage>}` taken
+from `campaign.stage_input_bind_refused` (which now also records `source_stage`); the free-text
+reason stays off the receipt. A stage with both a `campaign.stage_inputs_bound` and a
+`campaign.stage_input_bind_refused` event shows both: the bound entries first, then the
+`input_not_pinned` entry, so a consumer can tell the final failure came from a refused bind.
+(Retries on the same provider reuse the pinned binding.) The Salad driver's own refusal also
+records the runner's `campaign.stage_input_bind_refused` (same payload shape: closed code, input,
+source stage, provider, worker; no free-text reason) in the same transaction as its
+`campaign.salad_late_bind_refused` event, so the receipt code stays provider-agnostic, one event is
+the source of truth, and a refused Salad alternate shows `input_not_pinned` like any other. Additive:
+a new event row only, no schema change. A `license_refused` refusal names the first resolved input carrying a
+label the provider may not receive. Stages with no stage-output input keep their receipt bytes,
+and a stage that bound without a refusal keeps its entries unchanged.
+
+## Amendment (2026-11-23): the heavy-stage Salad candidate covers chained stages
+
+[ADR 0141](0141-heavy-stage-remote-candidate.md)'s submit rule now adds the operator's Salad
+candidate to a heavy stage whose non-pinned inputs are all `stage` inputs of the same campaign
+(previously `input_not_pinned`). The candidate is derived exactly as an explicit adapter request
+is: the contract declares the late-bind key with a cap from the upstream outputs' declared
+`max_bytes`, and decisions 1 to 4 above bind, re-check and pin the digest at stage start. Nothing
+about binding or refusal changes; a refused bind fails the stage before anything reaches Salad.

@@ -292,3 +292,12 @@ In addition to the list above, when the campaign runner track merges after this 
    become `private_derived` data.
 4. **Use `require_public_input` unchanged** for `salad-gpu-v1` stage inputs; it now
    returns the approved code paths and already applies the per-path rule.
+
+## Amendment: an artifact input may state its class
+
+A campaign spec's `artifact` input accepts an explicit `data_class`. It is validated against the
+known classes and can only be `private_derived`, because an artifact is a run output: `public` or
+an unknown value is refused when the spec is parsed. The default is `private_derived` and is omitted
+from the stored spec, so existing spec digests do not change. At resolution the input's class is
+never less restrictive than the recorded class of the pinned output, and it is carried onto the
+receipt's input row.

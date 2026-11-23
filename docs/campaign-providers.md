@@ -380,7 +380,8 @@ downloads gets the candidate, with the pins as its only fetches; amendment 2026-
 `no_gpu_profile` (a GPU stage and no GPU profile opened as below),
 `gpu_profile_unfit` (the adapter refused the GPU profile; `detail` says why),
 `forbidden_by_campaign`, `provider_unregistered`, `scratch_requested`, `runtime_not_adaptable`,
-`input_not_pinned` (an input is another stage's output), `alternates_full`,
+`input_not_pinned` (an input is neither pinned nor another stage's output in this campaign),
+`alternates_full`,
 `no_fitting_profile`, `profile_unfit` (the adapter refused; `detail` says why),
 `over_operator_cap`, `over_stage_cap`, `over_campaign_budget`, `program_budget`,
 `candidate_refused` (a submit check such as trust refused it). The candidate's hold is its
@@ -411,6 +412,16 @@ so a price set too low fails the Salad attempt rather than spending past the cap
 (for example an expired credential) falls back to the local provider with its ADR 0107 reason. An explicit `{"adapt": {"profile": ...}}`
 request still takes a CPU-only profile only. CPU heavy stages are unchanged and never get a GPU
 profile.
+
+A heavy stage that reads an earlier stage's output (`kind: stage`, e.g. a train stage after a
+prep stage) gets the candidate too: the DAG edge is in the approved spec, and the runner binds
+the upstream digest at stage start (ADR 0140), re-checking data class and licence for Salad; the
+Salad driver then pins the bound snapshot digest exactly as for a pre-pinned input. The contract's
+input cap is the upstream outputs' declared `max_bytes` (an unbounded output, or a bound over the
+profile's `disk_mb` or `stage_adapter.max_input_bytes`, records `profile_unfit`). The exposure
+estimate is the full-duration cost as for any adapted stage; input size does not change it. If
+the upstream has not succeeded and settled at bind time, the stage fails with
+`late_bind_refused:<code>` and nothing reaches Salad.
 
 ## The provider file
 

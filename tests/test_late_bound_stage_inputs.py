@@ -132,7 +132,9 @@ def test_dependent_stage_binds_upstream_output_and_receipt_records_the_lineage_e
         ]
     )
     stages = {s["stage_key"]: s for s in receipt["stages"]}
-    assert stages["b"]["input"][late_bound.LAUNCH_INPUTS_KEY] == [expected]
+    (entry,) = stages["b"]["input"][late_bound.LAUNCH_INPUTS_KEY]
+    assert entry.pop("bound_at")  # binding event timestamp; see test_late_bound_receipt_fields
+    assert [entry] == [expected]
     # A stage without stage-output inputs keeps its receipt shape.
     assert late_bound.LAUNCH_INPUTS_KEY not in stages["a"]["input"]
     events = [e["payload"] for e in world.events_of(late_bound.BOUND_EVENT)]

@@ -143,6 +143,7 @@ def salad_config(spec_stage: Any) -> SaladStageSpec:
 # the resolver's own codes (``late_bound_inputs.REFUSAL_CODES``) or one of these.
 LATE_BOUND_EVENT = "campaign.salad_late_bound_inputs"
 LATE_BIND_REFUSED_EVENT = "campaign.salad_late_bind_refused"
+BIND_REFUSED_EVENT = "campaign.stage_input_bind_refused"  # the runner's refusal event (ADR 0140)
 LATE_BIND_UNRESOLVED = "late_bound_input_unresolved"  # no composed input snapshot recorded
 LATE_BIND_MISSING = "late_bound_input_missing"  # a resolved output is not in the snapshot
 LATE_BIND_MISMATCH = "late_bound_input_digest_mismatch"  # snapshot bytes differ from receipt
@@ -238,6 +239,8 @@ class SaladStageDriver:
         # Control's own read of the guardian's per-frame record (ADR 0041 section 7); without
         # it no frame settles on a guardian verdict.
         self._guardian_reader = guardian_reader
+        # (input, source stage) of the resolver refusal found by ``_late_bound_refusal``.
+        self._refused_inputs: dict[str, tuple[str | None, str | None]] = {}
 
     # -- small helpers --------------------------------------------------------------
 
@@ -549,7 +552,7 @@ class SaladStageDriver:
         key = stage["stage_key"]
         refusal = self._late_bound_refusal(ctx, stage, spec_stage)
         if refusal is not None:
-            self._refuse_late_bound(ctx, key, refusal)
+            self._refuse_late_bound(ctx, key, refusal, spec_stage)
             return False
         row = self._stage_row(ctx, key)
         contract = stage_workload(stage, spec_stage)
@@ -639,6 +642,7 @@ class SaladStageDriver:
                     approval_digest=(ctx.approval or {}).get("trust_policy_digest"),
                 )
             except resolver.LateBindRefused as error:
+                self._refused_inputs[key] = (error.input_name, error.source_stage)
                 return error.code
             snapshot = connection.execute(
                 "SELECT digest, manifest_json FROM source_snapshots WHERE id=? AND project_id=?",
@@ -693,13 +697,32 @@ class SaladStageDriver:
         )
         return None
 
-    def _refuse_late_bound(self, ctx: _Ctx, key: str, code: str) -> None:
+    def _refuse_late_bound(self, ctx: _Ctx, key: str, code: str, spec_stage: StageSpec) -> None:
         """Fail the stage with the closed code: no unstarted attempt keeps its reservation and
         no step, review or route is made for it."""
         for attempt in self.runner._attempts(ctx, key):
             if attempt["status"] == "reserved" and attempt["grant_id"] is None:
                 self.runner._cancel_unstarted(ctx, attempt)
-        self.runner.emit_once(ctx, LATE_BIND_REFUSED_EVENT, {"stage_key": key}, {"code": code})
+        input_name, source_stage = self._refused_inputs.pop(key, (None, None))
+        # One transaction: the Salad event and the runner's refusal event (the receipt's single
+        # source of truth; same shape as the runner's, closed code only, no free-text reason).
+        with self.runner.store.runner_connection() as connection:
+            self.runner._emit_once_in(
+                connection, ctx, LATE_BIND_REFUSED_EVENT, {"stage_key": key}, {"code": code}
+            )
+            self.runner._emit_once_in(
+                connection,
+                ctx,
+                BIND_REFUSED_EVENT,
+                {"stage_key": key},
+                {
+                    "code": code,
+                    "input": input_name,
+                    "source_stage": source_stage,
+                    "provider": "salad",
+                    "worker_principal_id": salad_config(spec_stage).worker_principal_id,
+                },
+            )
         self.runner._stage_failed(ctx, key, code)
 
     # -- attempt lifecycle ------------------------------------------------------------

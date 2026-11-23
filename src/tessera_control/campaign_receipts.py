@@ -686,12 +686,21 @@ def _license_section(
 
 def _bound_section(connection: sqlite3.Connection, campaign: Any, stage_key: str) -> dict[str, Any]:
     """The stage-output inputs bound when the stage started (ADR 0140): per input the source
-    stage, output name, resolved digest, bytes, data class and licence labels (the lineage
-    edge). Absent for a stage that bound none, so existing receipts keep their bytes."""
-    from .late_bound_inputs import LAUNCH_INPUTS_KEY, bound_inputs
+    stage, output name, resolved digest, bytes, data class, licence labels and ``bound_at`` (the
+    binding event's timestamp). A refused binding is one ``input_not_pinned`` entry with the
+    closed refusal code, appended after any entries the stage bound before it, so the final
+    failure reads as a refused bind. Absent for a stage that bound or refused none, so existing
+    receipts keep their bytes."""
+    from .late_bound_inputs import (
+        LAUNCH_INPUTS_KEY,
+        bound_receipt_entries,
+        refused_receipt_entries,
+    )
 
-    bound = bound_inputs(connection, campaign, stage_key)
-    return {LAUNCH_INPUTS_KEY: [item.to_json() for item in bound]} if bound else {}
+    entries = bound_receipt_entries(connection, campaign, stage_key) + refused_receipt_entries(
+        connection, campaign, stage_key
+    )
+    return {LAUNCH_INPUTS_KEY: entries} if entries else {}
 
 
 def steering_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> dict[str, Any]:

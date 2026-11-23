@@ -31,6 +31,7 @@ LAUNCH_INPUTS_KEY = "late_bound_inputs"
 BOUND_EVENT = "campaign.stage_inputs_bound"
 REFUSED_EVENT = "campaign.stage_input_bind_refused"
 UNLABELLED = "unlabelled"
+NOT_PINNED = "input_not_pinned"  # receipt status of an input whose binding was refused
 
 REFUSAL_CODES = frozenset(
     {
@@ -51,12 +52,20 @@ _RUNNING = frozenset({"pending", "preparing", "running"})
 class LateBindRefused(Exception):  # noqa: N818 - a refusal, named like LicenseRefused
     """A stage-output input could not be bound; ``code`` is one of ``REFUSAL_CODES``."""
 
-    def __init__(self, code: str, detail: str = "", *, input_name: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        detail: str = "",
+        *,
+        input_name: str | None = None,
+        source_stage: str | None = None,
+    ) -> None:
         if code not in REFUSAL_CODES:
             raise ValueError(f"unknown late-bind refusal code {code!r}")
         self.code = code
         self.detail = detail[:300]
         self.input_name = input_name
+        self.source_stage = source_stage
         super().__init__(f"{code}: {self.detail}" if self.detail else code)
 
 
@@ -115,7 +124,10 @@ def launch_payload(resolved: Iterable[ResolvedStageInput]) -> dict[str, Any]:
 
 def _refuse(code: str, item: Any, why: str) -> LateBindRefused:
     return LateBindRefused(
-        code, f"input {item.name!r} from stage {item.stage!r}: {why}", input_name=item.name
+        code,
+        f"input {item.name!r} from stage {item.stage!r}: {why}",
+        input_name=item.name,
+        source_stage=item.stage,
     )
 
 
@@ -244,6 +256,7 @@ def check_resolved_routing(
     from .license_labels import license_refusal
 
     narrowed = frozenset(stage.send_classes) if getattr(stage, "send_classes", None) else None
+    resolved = tuple(resolved)
     carried: set[str] = set()
     for item in resolved:
         if not provider_trust.provider_admits_class(
@@ -260,12 +273,44 @@ def check_resolved_routing(
                 f"{item.data_class} and provider {stage.provider!r} with worker principal "
                 f"{worker!r} is not trusted to receive it",
                 input_name=item.name,
+                source_stage=item.source_stage,
             )
         carried |= set(item.license_labels)
-    reason = license_refusal(stage.provider, carried, provider_trust.current_policy(connection))
+    policy = provider_trust.current_policy(connection)
+    reason = license_refusal(stage.provider, carried, policy)
     if reason:
-        raise LateBindRefused("license_refused", reason)
+        # Attributed to the first input carrying a label the provider may not receive.
+        culprit = next(
+            (
+                item
+                for item in resolved
+                if license_refusal(stage.provider, item.license_labels, policy)
+            ),
+            None,
+        )
+        raise LateBindRefused(
+            "license_refused",
+            reason,
+            input_name=None if culprit is None else culprit.name,
+            source_stage=None if culprit is None else culprit.source_stage,
+        )
     return frozenset(carried)
+
+
+def _bound_row(
+    connection: sqlite3.Connection, campaign: Mapping[str, Any], stage_key: str
+) -> tuple[str, tuple[ResolvedStageInput, ...]] | None:
+    row = connection.execute(
+        """SELECT created_at, payload_json FROM events WHERE project_id=? AND event_type=?
+        AND json_extract(payload_json, '$.campaign_id') = ?
+        AND json_extract(payload_json, '$.stage_key') = ?
+        ORDER BY rowid DESC LIMIT 1""",
+        (campaign["project_id"], BOUND_EVENT, campaign["id"], stage_key),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row[1])
+    return row[0], tuple(ResolvedStageInput.from_json(item) for item in payload[LAUNCH_INPUTS_KEY])
 
 
 def bound_inputs(
@@ -273,14 +318,41 @@ def bound_inputs(
 ) -> tuple[ResolvedStageInput, ...]:
     """The bindings recorded for a stage (empty when it has no stage-output input or has not
     started). Scoped to the campaign's project like every event read."""
+    found = _bound_row(connection, campaign, stage_key)
+    return () if found is None else found[1]
+
+
+def bound_receipt_entries(
+    connection: sqlite3.Connection, campaign: Mapping[str, Any], stage_key: str
+) -> list[dict[str, Any]]:
+    """Receipt entries for a stage's bindings: each resolved input plus ``bound_at``, the
+    ``campaign.stage_inputs_bound`` event's own timestamp (written in the binding transaction)."""
+    found = _bound_row(connection, campaign, stage_key)
+    if found is None:
+        return []
+    return [{**item.to_json(), "bound_at": found[0]} for item in found[1]]
+
+
+def refused_receipt_entries(
+    connection: sqlite3.Connection, campaign: Mapping[str, Any], stage_key: str
+) -> list[dict[str, Any]]:
+    """``input_not_pinned`` entries from the stage's ``campaign.stage_input_bind_refused`` event:
+    the closed refusal code, the input name and the source stage; never the free-text reason."""
     row = connection.execute(
         """SELECT payload_json FROM events WHERE project_id=? AND event_type=?
         AND json_extract(payload_json, '$.campaign_id') = ?
         AND json_extract(payload_json, '$.stage_key') = ?
         ORDER BY rowid DESC LIMIT 1""",
-        (campaign["project_id"], BOUND_EVENT, campaign["id"], stage_key),
+        (campaign["project_id"], REFUSED_EVENT, campaign["id"], stage_key),
     ).fetchone()
     if row is None:
-        return ()
+        return []
     payload = json.loads(row[0])
-    return tuple(ResolvedStageInput.from_json(item) for item in payload[LAUNCH_INPUTS_KEY])
+    return [
+        {
+            "status": NOT_PINNED,
+            "code": payload.get("code"),
+            "input": payload.get("input"),
+            "source_stage": payload.get("source_stage"),
+        }
+    ]

@@ -2784,6 +2784,7 @@ class CampaignRunner:
                 {
                     "code": error.code,
                     "input": error.input_name,
+                    "source_stage": error.source_stage,
                     "provider": spec_stage.provider,
                     "worker_principal_id": worker,
                     "reason": error.detail,

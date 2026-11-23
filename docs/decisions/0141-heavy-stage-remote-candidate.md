@@ -129,3 +129,29 @@ built CPU candidates only and a GPU profile has no static rate to estimate from.
    change.
 
 Tests: `tests/test_heavy_stage_gpu_candidate.py`.
+
+## Amendment 2026-11-23: chained heavy stages (late-bound inputs)
+
+With [ADR 0140](0140-late-bound-stage-output-inputs.md) the Salad stage adapter accepts a
+`stage` input, so the rule no longer refuses it:
+
+- A heavy stage whose inputs are each pinned (`snapshot`, `artifact`, `public_artifact`) or a
+  `stage` input naming another stage of the same campaign gets the candidate as in decision 4.
+  The DAG edge is part of the spec the owner approves, so the digest the runner binds at stage
+  start is covered; no new per-run approval is added. The runner re-checks data class and licence
+  against Salad's trust at bind, and the Salad driver pins the bound snapshot digest on the
+  reviewed contract (same delivery and verification path as a pre-pinned input).
+- Sizing: the candidate is derived with the spec's upstream outputs, so the contract's input cap
+  is the upstream outputs' declared `max_bytes` (plus any pinned inputs), held to the profile's
+  `disk_mb` and `stage_adapter.max_input_bytes`; an unbounded or oversized input is the adapter's
+  refusal, recorded as `profile_unfit` with its detail. No size is invented. The exposure estimate
+  stays the full-duration cost and is held to the same operator, stage, campaign and program caps.
+- `input_not_pinned` now means an input that is neither pinned nor a `stage` input naming another
+  stage of this campaign (defensive: the stored spec cannot otherwise hold one).
+- If the upstream has not succeeded and settled at bind time, the runner refuses
+  (`late_bind_refused:<code>`, ADR 0140) and nothing reaches Salad.
+
+The "Not done" line on stage outputs is superseded. Tests:
+`tests/test_chained_heavy_salad_candidate.py` (submit record and late-bind contract, a declared
+bound over the profile input cap, end-to-end bind and Salad placement with the bound digest, an
+upstream refusal never reaching Salad, the input classification).

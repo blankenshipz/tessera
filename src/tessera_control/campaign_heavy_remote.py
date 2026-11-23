@@ -177,6 +177,29 @@ def _profiles(
     return found
 
 
+PINNED_KINDS = frozenset({"snapshot", "artifact", "public_artifact"})
+
+
+def _unpinned_input(spec: CampaignSpecV2, key: str, inputs: Any) -> str | None:
+    """Why an input of stage ``key`` is neither pinned nor late-bindable (None when all are).
+
+    Pinned inputs carry their digest in the spec. A ``stage`` input is late-bound (ADR 0140):
+    it must name another stage of this same campaign (spec validation keeps the graph acyclic),
+    so the DAG edge the person approves covers the digest the runner binds at stage start, with
+    data class and licence re-checked there. Anything else is not served."""
+    others = {item.key for item in spec.stages} - {key}
+    for item in inputs:
+        kind = getattr(item, "kind", None)
+        if kind in PINNED_KINDS:
+            continue
+        if kind == "stage":
+            if getattr(item, "stage", None) in others:
+                continue
+            return f"input {item.name!r} names no other stage of this campaign"
+        return f"input {getattr(item, 'name', '?')!r} of kind {kind!r} is not pinned"
+    return None
+
+
 def _decide(
     connection: sqlite3.Connection,
     spec: CampaignSpecV2,
@@ -190,7 +213,11 @@ def _decide(
     from . import campaign_heavy_guard as guard
     from . import campaign_placement_preference as preference
     from . import program_budget
-    from .campaign_salad_adapter import candidate_estimate_cents, derive_candidate_config
+    from .campaign_salad_adapter import (
+        candidate_estimate_cents,
+        derive_candidate_config,
+        upstream_outputs,
+    )
 
     stage = spec.stages[index]
     normal = normalize(spec).stage(stage.key)
@@ -221,11 +248,9 @@ def _decide(
         return skip("scratch_requested", f"{pid} grants no scratch request")
     if normal.runtime != DOCKER_CPU_RUNTIME:
         return skip("runtime_not_adaptable", f"only a {DOCKER_CPU_RUNTIME} stage is adapted")
-    if any(item.kind == "stage" for item in normal.inputs):
-        return skip(
-            "input_not_pinned",
-            "an input is another stage's output, whose digest is not known at submit",
-        )
+    unpinned = _unpinned_input(spec, stage.key, normal.inputs)
+    if unpinned is not None:
+        return skip("input_not_pinned", unpinned)
     if len(stage.alternate_providers or ()) >= MAX_ALTERNATE_PROVIDERS:
         return skip("alternates_full")
     profiles = _profiles(provider, setting, tenant, gpu)
@@ -240,7 +265,11 @@ def _decide(
     first: tuple[dict[str, Any], None] | None = None
     for profile in profiles:
         try:
-            config = derive_candidate_config(stage, profile, entries, gpu=gpu)
+            # A stage-output input is sized by the upstream outputs' declared max_bytes, as
+            # the adapter does for an explicit request (ADR 0140); unbounded is refused.
+            config = derive_candidate_config(
+                stage, profile, entries, upstream_outputs(spec), gpu=gpu
+            )
         except StoreError as error:
             unfit = "gpu_profile_unfit" if gpu else "profile_unfit"
             outcome = skip(unfit, str(error), profile=profile.name)
