@@ -18,6 +18,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import license_labels, provider_trust
 from .data_class import DataClassRefused, require_public_provider_input
 from .input_delivery import InputDeliveryStore
 from .snapshot_chunks import CHUNK_BYTES, chunk_index, chunk_plan, is_chunked, read_chunk
@@ -36,6 +37,28 @@ from .store import (
 TICKET_TTL = timedelta(hours=1)
 MANIFEST_PATH = "/provider-inputs/manifest"
 CHUNK_PATH_TEMPLATE = "/provider-inputs/chunks/{seq}"
+
+
+def _require_license_labels(
+    connection: sqlite3.Connection, provider_id: str | None, snapshot_id: str
+) -> None:
+    """ADR 0113 at ticket issue and every pull, behind placement admission: a provider whose
+    trust entry restricts licence labels receives the snapshot only if every label it carries
+    is allowed. Labels that cannot be read for a restricted provider refuse (fail closed)."""
+    policy = provider_trust.current_policy(connection)
+    if policy.allowed_license_labels(provider_id) is None:
+        return
+    try:
+        labels = license_labels.snapshot_labels(connection, snapshot_id)
+    except sqlite3.OperationalError:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable labels are a refusal, never an admit
+        raise Forbidden(
+            "Provider input refused: licence labels could not be determined (fail closed)."
+        ) from None
+    reason = license_labels.license_refusal(provider_id, labels, policy)
+    if reason:
+        raise Forbidden(f"Provider input refused: {reason}")
 
 
 class TicketRequest(BaseModel):
@@ -122,17 +145,21 @@ class ProviderInputStore(InputDeliveryStore):
                 live["id"],
                 grant["snapshot_digest"],
                 grant["snapshot_release_id"],
+                allow_private_derived=True,
             )
             # ADR 0039/0040, defence in depth behind route admission: a ticket is minted
             # only for an input the route's provider instance (target provider plus the
             # operation's worker principal) is trusted to receive. A route-less
-            # operation receives public data only.
+            # operation receives public data only. This, not the release check above, is
+            # the data-class gate, so a private_derived release reaches only a trusted
+            # provider.
             try:
                 admitted, provider_id, bound_worker = require_public_provider_input(
                     connection, live["org_id"], operation_id, grant["snapshot_id"]
                 )
             except DataClassRefused as error:
                 raise Forbidden(f"Provider input refused: {error}.") from None
+            _require_license_labels(connection, provider_id, grant["snapshot_id"])
             now = self._now()
             # The soft lease (30 s, renewed by heartbeats) is re-checked on every pull; the
             # ticket's own lifetime follows the lease's hard expiry, release and one hour.
@@ -289,12 +316,15 @@ class ProviderInputStore(InputDeliveryStore):
                 ticket["snapshot_digest"],
                 grant["snapshot_release_id"],
                 verify_retained=False,
+                allow_private_derived=True,
             )
-            # ADR 0039: every pull re-checks the class, so a ticket minted before the
-            # guard (or before a class could change) never outlives it.
-            require_public_provider_input(
+            # ADR 0039: every pull re-checks the class (and ADR 0113 the licence labels),
+            # so a ticket minted before the guard (or before a class, label or trust
+            # setting could change) never outlives it.
+            _, provider_id, _ = require_public_provider_input(
                 connection, operation["org_id"], ticket["operation_id"], ticket["snapshot_id"]
             )
+            _require_license_labels(connection, provider_id, ticket["snapshot_id"])
             return ticket, live
         except TicketInvalid:
             raise
