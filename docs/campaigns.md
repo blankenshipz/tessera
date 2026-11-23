@@ -376,6 +376,14 @@ class, measurements derived by the platform from retained bytes, stop-rule resul
 lineage node and edge ids, `verdict {operational, scientific_verdict}` and
 `receipt_digest`, plus `chained_inputs` when an input was resolved from a predecessor's receipt
 (ADR 0080). `scientific_verdict` is `pending_human_approval` or `not_assessed`.
+`pending_human_approval` there means a stage is bound to a program or gate, so the scientific
+verdict is left to a person. What a campaign is waiting on *now* is shown live in the campaign view
+(`GET /campaigns/{id}`, `tessera_get_campaign`) as `pending_human_approval`, a list derived from
+recorded state: `campaign_approval` (submitted, awaiting a person's approval of its spec digest),
+`campaign_reapproval` (its approval lapsed), and `salad_review` (a Salad attempt's pending plan or
+source-use review, with the stage, attempt and decision request). Each item names what is awaited,
+and it disappears the moment the decision is made, refused or expired, or the campaign ends; an
+empty list means nothing awaits a person.
 Do not report a campaign as run without reading its receipt.
 
 ## Code as an input

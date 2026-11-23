@@ -46,6 +46,7 @@ from .campaign_models import (
     stage_provider,
     topological_order,
 )
+from .campaign_pending_approval import pending_human_approval
 from .campaign_rerun import (
     RERUN_EVENT,
     RerunCampaign,
@@ -1276,6 +1277,8 @@ class CampaignStore(
                 "placement_preference": campaign_placement.preference_view(campaign),
                 # ADR 0068: one-time holdout claims this campaign opened, with scored values.
                 "holdout_claims": campaign_claims(connection, campaign_id),
+                # Audit G-11: what a person still has to decide; empty once nothing is awaited.
+                "pending_human_approval": pending_human_approval(connection, campaign),
             }
         finally:
             connection.close()
