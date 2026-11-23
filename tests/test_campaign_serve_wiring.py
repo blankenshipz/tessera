@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import nullcontext
 
 import pytest
 from fastapi.testclient import TestClient
@@ -64,6 +65,8 @@ def _serve(monkeypatch, *flags):
     monkeypatch.setattr("tessera_control.provider_trust.record_at_start", lambda *a, **k: None)
     monkeypatch.setattr(cli.uvicorn, "run", lambda *a, **k: None)
     monkeypatch.setattr(cli, "require_sqlite_runtime", lambda: None)
+    # The placeholder state directory does not exist: skip the maintenance lock file.
+    monkeypatch.setattr(cli.maintenance_lock, "shared", lambda state_dir: nullcontext())
     monkeypatch.setattr(
         sys, "argv", ["tessera", "serve", "--state-dir", "/x", "--port", "9", *flags]
     )

@@ -469,3 +469,52 @@ def test_another_campaigns_delegation_cannot_stage_this_campaigns_chunk_source(
     )
     status, composed = store.compose(principal, env.project["id"], key, digest, body)
     assert status == 201 and uploads() == before + 1
+
+
+def test_a_composed_snapshot_inherits_its_sources_licence_labels(tmp_path):
+    """ADR 0113: a derivative carries the union of its sources' labels (no copy sheds one)."""
+    from tessera_control import license_labels
+
+    state, owner, _worker, manifest, _first, _second, _custody = _released_manifest(tmp_path)
+    project_id = manifest["project_id"]
+    labelled = _adopt(state, owner, project_id, {"a.txt": b"alpha"}, "labelled")
+    plain = _adopt(state, owner, project_id, {"b.txt": b"beta"}, "plain")
+    with _db(state) as db:
+        license_labels.add_snapshot_labels(db, owner, labelled["id"], ["non-commercial"], "now")
+        db.commit()
+    store = SnapshotCompositionStore(state)
+
+    def compose(sources, name):
+        entries = []
+        import hashlib
+
+        for source_name, _snap, files in sources:
+            entries += [
+                (f"{source_name}/{p}", hashlib.sha256(c).hexdigest(), len(c), "imported_unverified")
+                for p, c in files.items()
+            ]
+        body = {
+            "sources": [
+                {
+                    "name": source_name,
+                    "kind": "snapshot",
+                    "snapshot_id": snap["id"],
+                    "expected_digest": snap["digest"],
+                }
+                for source_name, snap, _ in sources
+            ],
+            "expected_snapshot_digest": inventory_digest(composed_inventory(entries)),
+        }
+        return store.compose(owner, project_id, name, canonical_digest(body), body)[1]
+
+    mixed = compose([("l", labelled, {"a.txt": b"alpha"}), ("p", plain, {"b.txt": b"beta"})], "k1")
+    clean = compose([("p", plain, {"b.txt": b"beta"})], "k2")
+    with _db(state) as db:
+        assert license_labels.snapshot_labels(db, mixed["id"]) == {"non-commercial"}
+        assert license_labels.snapshot_labels(db, clean["id"]) == {license_labels.UNLABELLED}
+        events = db.execute(
+            "SELECT payload_json FROM events WHERE event_type='snapshot.license_labels_added'"
+        ).fetchall()
+    assert [json.loads(row[0])["snapshot_id"] for row in events if "inherited_from" in row[0]] == [
+        mixed["id"]
+    ]

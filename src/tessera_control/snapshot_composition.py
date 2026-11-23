@@ -32,6 +32,7 @@ from .approval_trust import CAMPAIGN_DELEGATION_KEY, require_decision_actor
 from .artifact_custody import ArtifactCustodyStore
 from .campaign_delegation import admit, assert_compose_sources_owned
 from .data_class import record_snapshot_data_class
+from .license_labels import inherit_snapshot_labels
 from .snapshot_chunks import (
     UPLOAD_TTL,
     check_chunk_metadata,
@@ -511,6 +512,27 @@ class SnapshotCompositionStore(SnapshotStore):
             # ADR 0039: a composed snapshot is built from other snapshots' bytes and run
             # outputs, so it is always private_derived and never a human public declaration.
             record = record_snapshot_data_class(connection, live, ident, derived=True, now=now)
+            # Licence labels follow the data (ADR 0113): the derivative carries the union of its
+            # sources' labels, written with the snapshot row so no copy can shed one.
+            inherited = inherit_snapshot_labels(
+                connection,
+                live,
+                ident,
+                project_id,
+                [source.snapshot_id for source in body.sources if source.kind == "snapshot"],
+                [source.manifest_id for source in body.sources if source.kind == "manifest"],
+                now,
+            )
+            if inherited is not None:
+                self._event(
+                    connection,
+                    live,
+                    project_id,
+                    None,
+                    "snapshot.license_labels_added",
+                    1,
+                    inherited,
+                )
             self._event(
                 connection,
                 live,

@@ -25,7 +25,9 @@ improve on the existing baseline, using the same data split and evaluation metho
 The **intended agent-assisted workflow** is:
 
 1. **Establish the question and baseline.** Identify the script, input snapshot,
-   environment, metric and success criterion before changing the experiment.
+   environment, metric and success criterion before changing the experiment. (The
+   environment digest and the headline metric are recorded as the researcher's claim;
+   Tessera does not verify them.)
 2. **Review one bounded intervention.** Let an agent propose the change and checks;
    you review the exact plan, approved compute target, data access, cost/exposure
    limits, deadline and stop rules. A proposal is not permission to run.
@@ -235,7 +237,10 @@ Through the API a human manages only its own organization's Salad profiles (chec
 database), and deployment-wide entries (local-docker, self-hosted, plugins) need the deployment's root
 owner. A change applies at the next start, and provider trust remains operator-edited.
 Descriptors are validated at registration. `--provider-trust` sets which data classes each
-provider's worker may receive (public only by default). With the owner-set mode
+provider's worker may receive (public only by default); a provider entry may also list
+`allowed_license_labels`, and a stage whose inputs (or the data they derive from) carry any other
+licence label is refused for that provider, fail closed
+([ADR 0113](docs/decisions/0113-license-placement-guard.md)). With the owner-set mode
 `all_registered_providers` (ADR 0047), agents and specs route any data class among the
 configured, registered providers without a per-run approval; data never goes to the public
 internet or an unregistered destination in any mode, because non-public inputs cannot use
@@ -358,7 +363,10 @@ credential's state and expiry (metadata only, never the value), refuses or fails
 expired or revoked one up front with a recorded reason, and the owner of the private credential directory
 rotates it with `rotate` or `renew` on the enrollment tool, from a terminal and not through any API
 ([ADR 0103](docs/decisions/0103-credential-expiry-health.md),
-[credential health](docs/credential-health.md)).
+[credential health](docs/credential-health.md)). `tessera credentials reenroll` re-enrolls an
+expired credential from standard input (the only place a secret is entered), and the read-only MCP tool
+`tessera_credential_reenroll_command` shows an agent the exact command for the owner to run, never accepting
+a secret ([re-enrollment](docs/operations/credential-reenrollment.md)).
 
 **What still needs a human (Salad stages).** By default every Salad stage stops for a
 person at its source assessment and at each attempt's plan and source-use reviews; a bare
@@ -481,6 +489,8 @@ Console scripts installed by the package, one line each:
   `tessera retention plan|apply|verify` prunes old backups and unreferenced artifacts by an
   operator policy: a dry run first, never the last restorable backup or anything a live
   campaign, lineage or hold references, every deletion on a receipt (ADR 0089, `docs/recovery.md`).
+  `tessera db compact` reclaims free space in the control database while the service is
+  stopped, keeping the previous database as a restorable backup ([recovery](docs/recovery.md)).
 - `tessera-worker` / `tessera-worker-daemon`: worker CLI (`development-poll`) and its
   supervised daemon.
   An optional, observe-and-report-only stage watcher library (disabled by default; opt-in per run with `--stage-watcher` plus a kill-switch path, and the default worker is unchanged without it; an executor option covers Salad runs) is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.

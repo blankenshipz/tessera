@@ -49,6 +49,7 @@ def principal(
         actor = request.app.state.store.authenticate(token)
     except Forbidden:
         _unauthorized()
+    request.app.state.store.check_credential_route(actor, request.method, request.url.path)
     if automation is not None:
         # Only a label: it never grants authority, it marks decisions as automation.
         if not valid_automation_label(automation):
@@ -228,6 +229,9 @@ def create_app(
     app.state.admin = AdminStore(state_dir)
     app.include_router(admin_router)
     app.include_router(provider_registration_router)
+    from .license_labels_api import router as license_labels_router
+
+    app.include_router(license_labels_router)
     from .model_spend_api import router as model_spend_router
 
     app.include_router(model_spend_router)

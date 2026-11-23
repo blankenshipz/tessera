@@ -1123,6 +1123,38 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             if row is None:
                 raise NotFound("Experiment execution plan was not found.")
 
+    @staticmethod
+    def _require_reason_for_removed_values(
+        connection: sqlite3.Connection, experiment: dict[str, Any], body: dict[str, Any]
+    ) -> None:
+        """A revision does not carry the environment digest or metric forward: it records
+        exactly what it states. Dropping a value the current revision recorded is a plan
+        change, so it needs a ``change_reason`` like any other change (ADR 0118)."""
+        if body.get("change_reason"):
+            return
+        current = experiment["current_design_revision"]
+        previous = connection.execute(
+            "SELECT metric FROM research_experiment_designs WHERE experiment_id=? AND revision=?",
+            (experiment["id"], current),
+        ).fetchone()
+        removed = previous is not None and previous[0] is not None and body.get("metric") is None
+        before = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT kind, environment_digest FROM research_experiment_variants "
+                "WHERE experiment_id=? AND design_revision=?",
+                (experiment["id"], current),
+            )
+        }
+        after = {v["kind"]: v.get("environment_digest") for v in body["variants"]}
+        removed = removed or any(
+            before.get(kind) is not None and after.get(kind) is None for kind in before
+        )
+        if removed:
+            raise StoreError(
+                "Removing a recorded environment digest or metric needs a change_reason."
+            )
+
     def revise_design(
         self,
         principal: dict[str, Any],
@@ -1141,6 +1173,7 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             if experiment["current_design_revision"] != body["expected_revision"]:
                 raise Conflict("Experiment design revision is no longer current.")
             revision, now = body["expected_revision"] + 1, utc_now()
+            self._require_reason_for_removed_values(connection, experiment, body)
             if (
                 connection.execute(
                     "UPDATE research_experiments SET goal=?,success_criterion=?,current_design_revision=?,updated_at=? WHERE id=? AND current_design_revision=?",

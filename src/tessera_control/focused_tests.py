@@ -82,6 +82,12 @@ class Selection:
     smoke: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     reasons: dict[str, list[str]] = field(default_factory=dict)
+    # Changes a 'replace' override mapped to fewer tests than the computed map would have: the
+    # importers and dependents it dropped are named, never silently lost.
+    narrowed: list[str] = field(default_factory=list)
+    # Changed files with no test that the overrides file declares safe to leave untested
+    # ([unmapped] safe = [...]); everything else unmapped blocks.
+    safe_unmapped: list[str] = field(default_factory=list)
 
     @property
     def files(self) -> list[str]:
@@ -124,6 +130,10 @@ class Overrides:
     limits: Limits = field(default_factory=Limits)
     smoke: tuple[str, ...] = ()
     modules: tuple[ModuleOverride, ...] = ()
+    safe_unmapped: tuple[str, ...] = ()
+
+    def is_safe_unmapped(self, path: str) -> bool:
+        return any(fnmatch.fnmatchcase(path, pattern) for pattern in self.safe_unmapped)
 
 
 # --- source and test discovery -----------------------------------------------------------
@@ -270,7 +280,7 @@ def load_overrides(root: Path) -> Overrides:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as error:
         raise ValueError(f"{OVERRIDES_FILE}: {error}") from error
-    _expect_keys("the file", data, {"limits", "smoke", "module"})
+    _expect_keys("the file", data, {"limits", "smoke", "module", "unmapped"})
     cache: list[list[str]] = []
 
     def files() -> list[str]:
@@ -290,6 +300,19 @@ def load_overrides(root: Path) -> Overrides:
         smoke = _resolve_tests(
             root, "smoke.files", _string_list("smoke.files", smoke_table["files"]), files
         )
+    unmapped_table = _expect_keys("[unmapped]", data.get("unmapped", {}), {"safe"})
+    safe: list[str] = []
+    if "safe" in unmapped_table:
+        safe = _string_list("unmapped.safe", unmapped_table["safe"])
+        for pattern in safe:
+            # A safe pattern may never cover code: a changed Python file is always mapped or
+            # blocking, whatever the file says.
+            if any(
+                fnmatch.fnmatchcase(p, pattern) and p.endswith(".py") for p in files()
+            ) or pattern.endswith(".py"):
+                raise ValueError(
+                    f"{OVERRIDES_FILE}: unmapped.safe may not cover Python files: {pattern}"
+                )
     entries = data.get("module", [])
     if not isinstance(entries, list):
         raise ValueError(f"{OVERRIDES_FILE}: module must be an array of tables ([[module]])")
@@ -321,7 +344,7 @@ def load_overrides(root: Path) -> Overrides:
         if not isinstance(note, str):
             raise ValueError(f"{OVERRIDES_FILE}: {where}.note must be a string")
         modules.append(ModuleOverride(tuple(match), mode, tuple(tests), cap, note))
-    return Overrides(limits, tuple(smoke), tuple(modules))
+    return Overrides(limits, tuple(smoke), tuple(modules), tuple(safe))
 
 
 # --- selection ---------------------------------------------------------------------------
@@ -386,8 +409,26 @@ def select(
             offer(rule.tests, "override")
         if broad:
             selection.broad.append(posix)
+        if replace:
+            # What the computed map would have offered beyond the replace rule: reported, since
+            # a shared module can lose its importers this way.
+            full: dict[str, str] = {}
+
+            def collect(paths, why, into=full):
+                into.update({path: why for path in paths})
+
+            _computed(root, posix, contents, collect, mentioning)
+            lost = sorted(set(full) - set(candidates) - {p for r in rules for p in r.tests})
+            if lost:
+                selection.narrowed.append(
+                    f"{posix}: a 'replace' override selects {len(candidates)} test file(s); "
+                    f"{len(lost)} importing or dependent test file(s) are not selected"
+                )
         if not candidates:
-            selection.unmapped.append(posix)
+            if overrides.is_safe_unmapped(posix):
+                selection.safe_unmapped.append(posix)
+            else:
+                selection.unmapped.append(posix)
             continue
         caps = [rule.cap for rule in rules if rule.cap is not None]
         cap = min(caps) if caps else limits.hub_cap
@@ -515,17 +556,24 @@ def git_changed(root: Path, base: str) -> list[str]:
     return sorted(names)
 
 
-def changed_files(root: Path, range_spec: str | None = None, base: str = "main") -> list[str]:
-    """With ``range_spec`` ('A..B', or a revision meaning rev..HEAD): exactly
-    ``git diff --name-only A...B`` (no working tree). Without it: the branch's changes since
-    the merge base with ``base`` plus uncommitted and untracked files."""
+def changed_files(
+    root: Path, range_spec: str | None = None, base: str = "main", *, exact: bool = False
+) -> list[str]:
+    """With ``range_spec`` ('A..B', or a revision meaning rev..HEAD): ``git diff --name-only
+    A...B`` (changes on B's side since the merge base; no working tree), or with ``exact`` the
+    files that differ between the two revisions (``A B``), which is what an upgrade from A to B
+    needs when A is not an ancestor of B. Without a range: the branch's changes since the merge
+    base with ``base`` plus uncommitted and untracked files."""
     root = Path(root)
     if range_spec is None:
         return git_changed(root, base)
     start, end = parse_range(range_spec)
-    done = _git(root, "diff", "--name-only", f"{start}...{end}", "--")
+    if exact:
+        done = _git(root, "diff", "--name-only", start, end, "--")
+    else:
+        done = _git(root, "diff", "--name-only", f"{start}...{end}", "--")
     if done.returncode != 0:
-        raise ValueError(f"git diff {start}...{end} failed: {done.stderr.strip()}")
+        raise ValueError(f"git diff {start} {end} failed: {done.stderr.strip()}")
     return sorted({line for line in done.stdout.splitlines() if line})
 
 
@@ -682,6 +730,11 @@ def main(argv: list[str] | None = None, *, changed_files_fn: Callable | None = N
     parser.add_argument(
         "--full", action="store_true", help="run the whole suite (dev/pytest_parallel.py)"
     )
+    parser.add_argument(
+        "--allow-unmapped",
+        action="store_true",
+        help="with a run: go ahead although some changed files have no test (blocks by default)",
+    )
     args, extra = parser.parse_known_args(argv)
     root = args.root.resolve()
     range_spec, pytest_args = _split_range(extra, root)
@@ -719,6 +772,8 @@ def main(argv: list[str] | None = None, *, changed_files_fn: Callable | None = N
         )
     for line in selection.truncated:
         print(f"focused tests: selection cut (not widened): {line}", file=sys.stderr)
+    for line in selection.narrowed:
+        print(f"focused tests: selection narrowed by override: {line}", file=sys.stderr)
     files = sorted(selection.smoke) if args.smoke_only else selection.all_files
     if not files:
         if selection.unmapped and not args.smoke_only:
@@ -737,6 +792,13 @@ def main(argv: list[str] | None = None, *, changed_files_fn: Callable | None = N
     if args.list:
         print("\n".join(files))
         return 0
+    if selection.unmapped and not args.smoke_only and not args.allow_unmapped:
+        print(
+            "focused tests: not running: some changed files have no test (listed above). "
+            "Add a test or an override, or pass --allow-unmapped to run the rest knowingly",
+            file=sys.stderr,
+        )
+        return 2
     jobs = clamp_jobs(args.jobs or 1, overrides.limits.max_jobs)
     print(f"focused tests: {len(files)} file(s), {jobs} job(s), stopping at the first failure")
     return run(files, root, jobs, pytest_args, max_jobs=overrides.limits.max_jobs)

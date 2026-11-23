@@ -423,6 +423,58 @@ def _attempt_entry(
     return {**entry, **extra}
 
 
+def _license_section(
+    connection: sqlite3.Connection,
+    campaign: Any,
+    normal: Any,
+    spec_stage: Any,
+    stage_provider: str | None = None,
+) -> dict[str, Any]:
+    """The stage's effective licence labels (ADR 0113), only when they matter: some candidate
+    provider restricts labels, or an input carries a label other than ``unlabelled``. Otherwise
+    nothing is added, so existing receipts keep their bytes. Never raises."""
+    try:
+        from . import license_labels, provider_trust
+
+        policy = provider_trust.current_policy(connection)
+        restricted = any(
+            policy.lists_license_labels(provider) for provider in spec_stage.candidate_ids
+        )
+        labels = license_labels.stage_labels(
+            connection,
+            normal,
+            spec_stage.key,
+            org_id=campaign["org_id"],
+            project_id=campaign["project_id"],
+        )
+        provider = stage_provider or spec_stage.provider
+        seen = connection.execute(
+            """SELECT payload_json FROM events WHERE project_id=? AND event_type=?
+            AND json_extract(payload_json, '$.campaign_id') = ?
+            AND json_extract(payload_json, '$.stage_key') = ?
+            AND json_extract(payload_json, '$.provider') IS ?
+            ORDER BY rowid DESC LIMIT 1""",
+            (
+                campaign["project_id"],
+                "campaign.stage_license_checked",
+                campaign["id"],
+                spec_stage.key,
+                provider,
+            ),
+        ).fetchone()
+        if seen is not None:
+            # As checked when the stage was dispatched (labels added later do not rewrite it).
+            return {
+                "license_labels": sorted(json.loads(seen[0])["labels"]),
+                "license_labels_checked": "dispatch",
+            }
+        if restricted or labels != {license_labels.UNLABELLED}:
+            return {"license_labels": sorted(labels), "license_labels_checked": "current"}
+    except Exception:  # noqa: BLE001 - a receipt never fails because labels are unreadable
+        return {}
+    return {}
+
+
 def steering_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> dict[str, Any]:
     """Pause, concurrency limit and stage cancels (ADR 0061); empty for an unsteered campaign,
     so existing receipts keep their shape and digest."""
@@ -444,6 +496,14 @@ def steering_receipt_section(connection: sqlite3.Connection, campaign_id: str) -
             "stage_cancels": [dict(item) for item in cancels],
         }
     }
+
+
+def _smoke_grant(connection: sqlite3.Connection, principal_id: str) -> dict[str, str]:
+    """``smoke_grant_id`` when the approval was made under a smoke credential grant."""
+    from .smoke_credentials import grant_id_for_principal
+
+    grant_id = grant_id_for_principal(connection, principal_id)
+    return {} if grant_id is None else {"smoke_grant_id": grant_id}
 
 
 def build_receipt(
@@ -507,6 +567,9 @@ def build_receipt(
                     "digest": stage["input_snapshot_digest"],
                     "data_class": stage["input_data_class"],
                     **code,
+                    **_license_section(
+                        connection, current, normal, spec_stage, stage["provider_id"]
+                    ),
                 },
                 **({} if code_info is None else {"code": code_info}),
                 "output_data_class": stage["output_data_class"],
@@ -557,6 +620,7 @@ def build_receipt(
                 "automation_label": approval["automation_label"],
                 "approved_at": approval["approved_at"],
                 "expires_at": approval["expires_at"],
+                **_smoke_grant(connection, approval["approving_principal_id"]),
             },
             "status": status,
             "stop_reason": reason,

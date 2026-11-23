@@ -137,7 +137,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 83);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 85);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -394,6 +394,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .campaign_stuck import create_stuck_schema
 
     create_stuck_schema(connection)
+    from .license_labels import create_license_schema
+
+    create_license_schema(connection)
     from .people import create_people_schema
 
     create_people_schema(connection)
@@ -403,6 +406,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .model_spend import create_model_spend_schema
 
     create_model_spend_schema(connection)
+    from .smoke_credentials import create_smoke_credential_schema
+
+    create_smoke_credential_schema(connection)
 
 
 def validate_database(database_path: Path) -> None:
@@ -536,6 +542,18 @@ class Store:
 
     def authenticate(self, token: str) -> dict[str, Any]:
         return self._authenticate(token, "control")
+
+    def check_credential_route(self, actor: dict[str, Any], method: str, path: str) -> None:
+        """Refuse a route a restricted credential (a smoke approver) may not use."""
+        if actor.get("kind") != "human_session":
+            return
+        from .smoke_credentials import check_route
+
+        connection = _connect(self.database_path)
+        try:
+            check_route(connection, actor, method, path)
+        finally:
+            connection.close()
 
     def authenticate_worker(self, token: str) -> dict[str, Any]:
         """Authenticate only a worker-audience credential for future worker routes."""
@@ -1440,6 +1458,11 @@ class Store:
         try:
             connection.execute("BEGIN IMMEDIATE")
             live_principal = self._live_principal(connection, principal, audience=audience)
+            if live_principal.get("kind") == "human_session":
+                from .smoke_credentials import check_route
+
+                # A smoke grant's approver credential can only approve (and read).
+                check_route(connection, live_principal, method, path)
             recovery = connection.execute(
                 "SELECT state FROM control_recovery WHERE singleton=1"
             ).fetchone()

@@ -77,7 +77,8 @@ credentials and `.venv/` must stay out of Git and image contexts.
   stopping at the first failure: `tessera dev focused-tests` (or
   `.venv/bin/python dev/focused_tests.py`) selects them from your changes, or from a range
   (`A..B`), plus a fixed smoke set, under caps (it lists the set with reasons by default;
-  `--run` executes it under the `--jobs` cap, `--explain` shows why each test is in;
+  `--run` executes it under the `--jobs` cap and stops (exit 2) when a changed file has no test
+  unless `--allow-unmapped`, `--explain` shows why each test is in;
   [ADR 0117](docs/decisions/0117-focused-test-selection.md)), or run specific files with
   `pytest -x`. It never runs the full suite unless `--full` is passed with `--run`. Run the whole suite once per branch, right before
   merge, in the background.

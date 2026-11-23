@@ -9,7 +9,6 @@ import os
 import secrets
 import sqlite3
 import stat
-import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -971,20 +970,73 @@ def _restore_state(backup: Path, state_dir: Path) -> tuple[Path, Path]:
     return database, state_dir / OWNER_HEADER_NAME
 
 
+def _hash_in_place(path: Path, start: float) -> tuple[str, int]:
+    """Digest and size of one regular single-link file, streamed (no copy, bounded)."""
+    digest = hashlib.sha256()
+    size = 0
+    with _open_regular(path, _limit()) as file:
+        while chunk := file.read(1024 * 1024):
+            _deadline(start)
+            size += len(chunk)
+            if size > _limit():
+                raise _size_error()
+            digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def _verify_in_place(backup: Path, manifest: dict[str, Any], start: float) -> None:
+    """The same checks ``_stage_verified`` makes, but reading the bundle where it lies.
+
+    Restore copies everything into a private stage first so it never trusts a changing input;
+    a retention check of a finished backup needs no copy, and a multi-gigabyte snapshot staged
+    into a temporary directory fills it (the staged copy raised OSError and the backup was
+    wrongly reported as unrestorable)."""
+    database = backup / BACKUP_DATABASE
+    digest, size = _hash_in_place(database, start)
+    if size != manifest["size"] or digest != manifest["sha256"]:
+        raise StoreError("Backup changed while it was being verified.")
+    schema, watermark = _validate_snapshot(database, start)
+    if schema != manifest["schema_version"] or watermark != manifest["event_watermark"]:
+        raise StoreError("Backup metadata does not match its manifest.")
+    snapshot_entries, _legacy = _bundle_entries(database, start)
+    if manifest["format_version"] == LEGACY_BACKUP_FORMAT_VERSION:
+        if snapshot_entries:
+            raise StoreError("Legacy backup cannot restore project artifact placements.")
+        return
+    _validate_bundle_declaration(database, manifest, start)
+    source_objects = backup / BACKUP_OBJECTS_DIRECTORY
+    for entry in manifest["objects"]:
+        _deadline(start)
+        if entry["availability"] != "present":
+            continue
+        try:
+            source_namespace = (
+                source_objects / entry["tenant_namespace"] / entry["project_namespace"]
+            )
+            _safe_directory(source_objects, "Source project artifact root is unsafe.")
+            _safe_directory(source_namespace.parent, "Source project artifact namespace is unsafe.")
+            _safe_directory(source_namespace, "Source project artifact namespace is unsafe.")
+            object_digest, object_size = _hash_in_place(_object_path(source_objects, entry), start)
+        except OSError as error:
+            raise StoreError("Recovery artifact object is missing or unsafe.") from error
+        if object_size != entry["size"]:
+            raise StoreError("Recovery artifact object size does not match its declaration.")
+        if object_digest != entry["sha256"]:
+            raise StoreError("Recovery artifact object checksum does not match its declaration.")
+
+
 def verify_restorable(backup: Path) -> dict[str, Any]:
     """Run restore's own validation on a backup without restoring it; return its manifest.
 
     Raises ``StoreError`` (or OSError/sqlite errors) when restore would reject the bundle.
-    The size bound is the largest an operator may configure."""
+    The size bound is the largest an operator may configure. The bundle is verified in place,
+    with no staged copy (see ``_verify_in_place``)."""
     require_sqlite_runtime()
     token = _BYTE_LIMIT.set(MAX_CONFIGURABLE_BACKUP_BYTES)
     try:
         start = time.monotonic()
         manifest = _read_manifest(backup)
-        with tempfile.TemporaryDirectory(prefix="tessera-verify-") as scratch:
-            stage = Path(scratch) / "stage"
-            stage.mkdir(mode=0o700)
-            _stage_verified(backup, stage, manifest, start)
+        _verify_in_place(backup, manifest, start)
         return manifest
     finally:
         _BYTE_LIMIT.reset(token)

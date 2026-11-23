@@ -26,7 +26,11 @@ ended up, if at all, in free text that a reader could not find or compare.
 4. **Optional and additive.** Omitted stays null. Legacy designs are never relabelled, and
    existing digests and requests are unchanged.
 5. **A change is a plan change.** A revision that changes either value is recorded like any
-   other plan change, with its `change_reason`.
+   other plan change, with its `change_reason`. A revision records exactly what it states:
+   nothing is carried forward from the previous revision. Dropping a value the current
+   revision recorded (the metric, or either variant's environment digest) is a plan change
+   too, so it is refused without a `change_reason`; adding a value, or restating an unchanged
+   one, needs none.
 6. **Recorded, not verified.** The platform does not check that a digest matches an actual
    environment, or that the metric appears in the recorded measurements. A later check could
    compare `metric` with recorded measurement names; that is not done.
@@ -43,6 +47,10 @@ ended up, if at all, in free text that a reader could not find or compare.
 - Designs made before this change simply show null for both.
 
 ## Not done
+
+- The design and variant tables are not immutable at the database level: unlike the
+  assessment table they have no triggers, so "never edited in place" is a code convention,
+  as it already is for the existing columns.
 
 - No desktop form fields for either value.
 - No enforcement that a design has them.

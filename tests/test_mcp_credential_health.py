@@ -64,8 +64,12 @@ def test_the_tool_is_registered_with_the_provider_trust_tools_and_read_only(tmp_
     assert {"tessera_get_provider_trust", "tessera_credential_health"} <= set(tools)
     assert tools["tessera_credential_health"].annotations.readOnlyHint is True
     assert tools["tessera_credential_health"].annotations.destructiveHint is False
-    # No write tool was added for credentials or trust.
-    assert {n for n in tools if "credential" in n} == {"tessera_credential_health"}
+    # No write tool was added for credentials or trust; the re-enrollment tool is read-only.
+    assert {n for n in tools if "credential" in n} == {
+        "tessera_credential_health",
+        "tessera_credential_reenroll_command",
+    }
+    assert tools["tessera_credential_reenroll_command"].annotations.readOnlyHint is True
 
 
 def test_the_call_passes_through_to_the_health_route_only(tmp_path):

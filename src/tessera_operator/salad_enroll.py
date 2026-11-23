@@ -95,6 +95,16 @@ def _existing(resolver, reference):
     return metadata
 
 
+def enroll_version(resolver, reference, version, secret, expires_at):
+    """Enroll ``secret`` (consumed and wiped) as ``version`` of ``reference``: the one primitive
+    shared by ``rotate`` and ``tessera credentials reenroll``. A failure names only a category."""
+    try:
+        with secret:
+            resolver.enroll(reference, version, secret, expires_at=expires_at)
+    except Exception:
+        raise Refused("enrollment_rejected") from None
+
+
 def rotate(args):
     if not 1 <= args.expires_in_hours <= 8760:
         raise Refused("bad_expiry")
@@ -108,11 +118,7 @@ def rotate(args):
         except Exception:
             raise Refused("secret_entry_failed") from None
         version, expires_at = previous.version + 1, time.time() + args.expires_in_hours * 3600
-        try:
-            with secret:
-                resolver.enroll(args.reference, version, secret, expires_at=expires_at)
-        except Exception:
-            raise Refused("enrollment_rejected") from None
+        enroll_version(resolver, args.reference, version, secret, expires_at)
         print(
             json.dumps(
                 {

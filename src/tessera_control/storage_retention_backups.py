@@ -1,5 +1,9 @@
 """Backup bundle selection and deletion for the storage retention policy.
 
+Backups are the `tessera backup` bundle (manifest.json) and the deploy-upgrade command's
+pre-migration snapshot (snapshot-manifest.json, an older schema that `restore` refuses; its
+config copies in a sibling `<name>-configs` directory are listed and removed with it).
+
 Only bundles that `tessera restore` would accept (its own validation, including object
 digests and the declared layout) count: an unrestorable bundle is skipped and reported, so it
 never uses up the keep-last floor nor protects itself at the cost of a restorable one. Only
@@ -10,6 +14,7 @@ bundle immediately before removing it and never follows symlinks.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -27,6 +32,12 @@ from tessera_control.storage_retention_models import MIN_KEEP, Candidate, Retent
 
 MANIFEST_NAME = "manifest.json"
 SNAPSHOT_NAME = "snapshot.sqlite3"
+# The deploy-upgrade command's pre-migration snapshot (an older schema `tessera backup` refuses):
+# snapshot.sqlite3 plus this manifest, restored by putting the database back, not by `restore`.
+SNAPSHOT_MANIFEST_NAME = "snapshot-manifest.json"
+SNAPSHOT_KIND = "pre-migration-snapshot"
+COMPANION_SUFFIX = "-configs"  # config copies the deploy-upgrade command keeps beside a backup
+_SNAPSHOT_STAMP = re.compile(r"^backup-(\d{8}T\d{6}Z)$")
 _MAX_MANIFEST_BYTES = 1 << 20
 # Sentinel "path" of the one skipped entry reported when the backup root itself is unreadable.
 ROOT_UNREADABLE_PATH = "."
@@ -65,7 +76,52 @@ def _hash_regular(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+def _snapshot_manifest(directory: Path) -> dict[str, Any]:
+    """The pre-migration snapshot format, normalized to the fields a bundle manifest has.
+
+    It records no id or time, so the id is the digest's first 32 hex digits and the time is the
+    stamp in the directory name (``backup-YYYYmmddTHHMMSSZ``), else the manifest file's mtime."""
+    encoded = _read_regular(directory / SNAPSHOT_MANIFEST_NAME, _MAX_MANIFEST_BYTES)
+    if len(encoded) > _MAX_MANIFEST_BYTES:
+        raise BackupRetentionError("manifest too large")
+    raw = json.loads(encoded)
+    if not isinstance(raw, dict) or raw.get("kind") != SNAPSHOT_KIND:
+        raise BackupRetentionError("snapshot manifest is not a pre-migration snapshot")
+    digest, size, schema = raw.get("sha256"), raw.get("bytes"), raw.get("schema_version")
+    if (
+        not isinstance(digest, str)
+        or not _HEX64.fullmatch(digest)
+        or type(size) is not int
+        or size < 1
+        or type(schema) is not int
+        or schema < 1
+    ):
+        raise BackupRetentionError("snapshot manifest fields are invalid")
+    match = _SNAPSHOT_STAMP.fullmatch(directory.name)
+    if match:
+        created = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    else:
+        created = datetime.fromtimestamp((directory / SNAPSHOT_MANIFEST_NAME).lstat().st_mtime, UTC)
+    return {
+        "format": "pre_migration_snapshot",
+        "backup_id": digest[:32],
+        "sha256": digest,
+        "size": size,
+        "schema_version": schema,
+        "created_at": created.isoformat().replace("+00:00", "Z"),
+    }
+
+
 def _manifest(directory: Path) -> dict[str, Any]:
+    try:
+        return _bundle_manifest(directory)
+    except FileNotFoundError:
+        if (directory / SNAPSHOT_MANIFEST_NAME).exists():
+            return _snapshot_manifest(directory)
+        raise
+
+
+def _bundle_manifest(directory: Path) -> dict[str, Any]:
     encoded = _read_regular(directory / MANIFEST_NAME, _MAX_MANIFEST_BYTES)
     if len(encoded) > _MAX_MANIFEST_BYTES:
         raise BackupRetentionError("manifest too large")
@@ -101,12 +157,54 @@ def _verify_restorable(directory: Path, manifest: dict[str, Any]) -> None:
     cause the last restorable backup to be deleted."""
     from tessera_control import recovery
 
+    if manifest.get("format") == "pre_migration_snapshot":
+        _verify_snapshot(directory, manifest)
+        return
     try:
         checked = recovery.verify_restorable(directory)
     except (recovery.StoreError, sqlite3.Error, OSError, ValueError, KeyError) as error:
         raise BackupRetentionError(f"restore would reject it: {_why(error)}") from error
     if checked["backup_id"] != manifest["backup_id"] or checked["sha256"] != manifest["sha256"]:
         raise BackupRetentionError("manifest changed during verification")
+
+
+def _verify_snapshot(directory: Path, manifest: dict[str, Any]) -> None:
+    """A pre-migration snapshot is restorable when it is exactly the two recorded files, the
+    database matches its recorded size and digest, and SQLite reads it (read-only, in place)
+    at the schema version the manifest names."""
+    with os.scandir(directory) as entries:
+        names = {entry.name for entry in entries}
+    if names != {SNAPSHOT_NAME, SNAPSHOT_MANIFEST_NAME}:
+        raise BackupRetentionError("snapshot directory holds unexpected files")
+    size, digest = _hash_regular(directory / SNAPSHOT_NAME)
+    if size != manifest["size"] or digest != manifest["sha256"]:
+        raise BackupRetentionError("snapshot does not match its manifest")
+    try:
+        connection = sqlite3.connect(
+            (directory / SNAPSHOT_NAME).absolute().as_uri() + "?mode=ro", uri=True, timeout=1
+        )
+        try:
+            if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise BackupRetentionError("snapshot database failed its integrity check")
+            rows = connection.execute("SELECT schema_version FROM schema_meta").fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise BackupRetentionError(
+            f"snapshot database unreadable: {type(error).__name__}"
+        ) from error
+    if rows != [(manifest["schema_version"],)]:
+        raise BackupRetentionError("snapshot schema version does not match its manifest")
+
+
+def _companion(root: Path, name: str) -> Path | None:
+    """The config-copies directory beside a backup, when it is a plain direct child."""
+    path = root / (name + COMPANION_SUFFIX)
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return path if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) else None
 
 
 def _tree_bytes(directory: Path) -> int:
@@ -153,6 +251,8 @@ def list_backups(
             continue
         if not stat.S_ISDIR(info.st_mode):
             continue
+        if name.endswith(COMPANION_SUFFIX) and (root / name[: -len(COMPANION_SUFFIX)]).is_dir():
+            continue  # config copies kept beside a backup: listed and removed with it
         try:
             manifest = _manifest(child)
         except FileNotFoundError:
@@ -165,6 +265,9 @@ def list_backups(
             if verify:
                 _verify_restorable(child, manifest)
             size = _tree_bytes(child)
+            companion = _companion(root, name)
+            if companion is not None:
+                size += _tree_bytes(companion)
         except (OSError, BackupRetentionError) as error:
             skipped.append({"path": name, "reason": f"incomplete or unverified: {_why(error)}"})
             continue
@@ -183,7 +286,13 @@ def list_backups(
 
 
 def _why(error: Exception) -> str:
-    return str(error) if isinstance(error, BackupRetentionError) else type(error).__name__
+    """A reason safe to receipt: our own text, else the error type (and the errno name for an OS
+    error, so a full disk reads ENOSPC rather than a bare OSError); never a path or message."""
+    if isinstance(error, BackupRetentionError):
+        return str(error)
+    if isinstance(error, OSError) and error.errno in errno.errorcode:
+        return f"{type(error).__name__} {errno.errorcode[error.errno]}"
+    return type(error).__name__
 
 
 def select_backups(
@@ -252,7 +361,10 @@ def delete_backup(root: Path, candidate: Candidate) -> dict[str, Any]:
         _verify_restorable(directory, manifest)
     except (OSError, ValueError) as error:
         raise BackupRetentionError(f"backup no longer verifies: {_why(error)}") from error
+    companion = _companion(root, name)
     shutil.rmtree(directory)  # does not follow symlinks
+    if companion is not None:
+        shutil.rmtree(companion)  # the config copies kept beside this backup go with it
     return {
         "ref": candidate.ref,
         "path": name,

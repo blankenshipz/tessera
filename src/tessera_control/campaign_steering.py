@@ -18,6 +18,7 @@ from typing import Annotated, Any
 
 from pydantic import Field, StringConstraints, ValidationError
 
+from . import smoke_credentials
 from .campaign_models import (
     TERMINAL_CAMPAIGN,
     SubmitCampaign,
@@ -121,6 +122,7 @@ class CampaignSteeringCommands:
                 connection, live, project_id, spec, body.predecessors, raw_spec
             )
             normal = normalize(spec)
+            smoke_credentials.check_submission(connection, live, normal)
             self._check_references(connection, live, project_id, spec)
             order = topological_order(spec)
             return {

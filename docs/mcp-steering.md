@@ -71,6 +71,25 @@ unless run with `--execute` and the exact confirmation phrase.
         --image REGISTRY/IMAGE@sha256:DIGEST [--snapshot-id ID] [--ca-file CA] \
         [--receipt-file /abs/new-report.json]
 
+### Credentials from a smoke grant (owner-run)
+
+The smoke needs an agent credential enrolled for a destination and a person-side credential for
+the approval, and neither can be hand-issued. The owner of the state directory issues a scoped,
+short-lived pair instead ([ADR 0120](decisions/0120-scoped-smoke-credentials.md)):
+
+    tessera dev smoke-credentials issue --state-dir STATE --project-id PROJECT \
+        --destination DESTINATION --out-dir /abs/DIR [--ttl-minutes 30]
+    scripts/mcp_steering_smoke.py --execute --confirm mcp-steering-smoke-local-docker \
+        --control-url https://CONTROL --smoke-credentials-dir /abs/DIR \
+        --image REGISTRY/IMAGE@sha256:DIGEST --receipt-file /abs/new-report.json
+    tessera dev smoke-credentials revoke --state-dir STATE --grant-id GRANT_ID
+
+`--smoke-credentials-dir` reads `smoke-grant.json` and refuses an expired grant, a grant that is
+not local-docker only with a zero budget, or files that are not owner-only; it fills in the
+project, destination and token files unless you pass them explicitly. The dry run prints the grant
+id and expiry (never a token), and the report records `smoke_grant_id`. The campaign spec is $0
+(`budget_cap_cents` 0, stage `max_exposure_cents` 0).
+
 The agent credential needs the campaign scopes (submit, read, cancel), `snapshot:read` and
 `budget:read`; the image must be one the local docker provider allows. The campaign is paused
 right after approval and cancelled straight after the resume, so at most a local zero-cost

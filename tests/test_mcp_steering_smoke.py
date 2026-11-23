@@ -124,12 +124,14 @@ def test_smoke_steers_one_campaign_and_every_step_leaves_a_record(tmp_path):
         agent_approve,
         image=DIGEST_IMAGE,
         snapshot_id=sched.env.snapshot_id,
+        grant_id="g-1",
         sleep=lambda _seconds: world.runner.tick(),
         poll_seconds=0,
     )
     steps = {s["step"]: s for s in document["steps"]}
     assert list(steps) == [name for name, _ in smoke.STEPS]
     assert all(s["ok"] for s in document["steps"])
+    assert document["smoke_grant_id"] == "g-1"
     assert steps["agent_cannot_approve"]["evidence"]["refused_with"]
     assert steps["terminal_receipt"]["evidence"]["status"] in smoke.TERMINAL
     assert steps["terminal_receipt"]["evidence"]["settled_cents"] == 0  # $0
@@ -159,3 +161,112 @@ def test_smoke_fails_loudly_when_the_campaign_never_finishes(tmp_path):
             sleep=ticks.append,
             poll_seconds=0,
         )
+
+
+def _grant_dir(tmp_path, **changes):
+    from datetime import UTC, datetime, timedelta
+
+    root = tmp_path / "grant"
+    root.mkdir(mode=0o700)
+    grant = {
+        "schema": "tessera.smoke-credentials.v1",
+        "grant_id": "grant-1",
+        "project_id": "proj-1",
+        "destination": "dest-1",
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=30)).isoformat(),
+        "agent_credential_id": "a1",
+        "approver_credential_id": "p1",
+        "providers": ["local-docker"],
+        "max_budget_cents": 0,
+        "control_url": None,
+        **changes,
+    }
+    for name, text in (
+        ("smoke-grant.json", json.dumps(grant)),
+        ("agent.token", "synthetic-agent"),
+        ("approver.token", "synthetic-approver"),
+    ):
+        (root / name).write_text(text)
+        (root / name).chmod(0o600)
+    return root
+
+
+def _grant_args(root, *extra):
+    return [
+        "--execute", "--confirm", smoke.CONFIRM_PHRASE, "--control-url", "https://control.example",
+        "--smoke-credentials-dir", str(root), "--image", "r.example/i@sha256:" + "a" * 64, *extra,
+    ]  # fmt: skip
+
+
+def test_grant_directory_fills_the_options(tmp_path):
+    root = _grant_dir(tmp_path)
+    grant = smoke.load_grant(str(root))
+    assert (grant.grant_id, grant.project_id, grant.destination) == ("grant-1", "proj-1", "dest-1")
+    assert grant.agent_token_file == root / "agent.token"
+    assert grant.approver_token_file == root / "approver.token"
+
+
+def test_grant_dry_run_prints_id_and_expiry_but_no_token(tmp_path, capsys):
+    root = _grant_dir(tmp_path)
+    assert smoke.main(["--smoke-credentials-dir", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert json.loads(out)["smoke_grant"]["grant_id"] == "grant-1"
+    assert "expires_at" in json.loads(out)["smoke_grant"]
+    assert "synthetic-agent" not in out and "synthetic-approver" not in out
+
+
+def test_grant_fills_execute_options_and_explicit_ones_win(tmp_path, monkeypatch):
+    root = _grant_dir(tmp_path)
+    seen = {}
+
+    def fake_run(agent, person, agent_approve, **kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "smoke_grant_id": kwargs["grant_id"], "steps": []}
+
+    built = []
+    monkeypatch.setattr(smoke, "run_smoke", fake_run)
+    monkeypatch.setattr(
+        smoke, "_build_caller", lambda a, f, **_: built.append((a.project_id, a.destination, f))
+    )
+    assert smoke.main(_grant_args(root, "--destination", "other")) == 0
+    assert seen["grant_id"] == "grant-1"
+    assert built[0] == ("proj-1", "other", root / "agent.token")
+    assert built[2][2] == root / "approver.token"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"expires_at": "2000-01-01T00:00:00+00:00"},
+        {"providers": ["local-docker", "salad"]},
+        {"providers": []},
+        {"max_budget_cents": 1},
+        {"schema": "other.v1"},
+        {"grant_id": ""},
+    ],
+)
+def test_bad_grants_are_refused(tmp_path, capsys, changes):
+    root = _grant_dir(tmp_path, **changes)
+    assert smoke.main(_grant_args(root)) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("target", ["smoke-grant.json", "agent.token", ".", "approver.token"])
+def test_permissive_modes_are_refused(tmp_path, capsys, target):
+    root = _grant_dir(tmp_path)
+    (root / target).chmod(0o755 if target == "." else 0o644)
+    assert smoke.main(_grant_args(root)) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+def test_smoke_spec_is_zero_dollars():
+    spec = smoke.smoke_spec("r.example/i@sha256:" + "a" * 64, {"id": "s", "digest": "d"})
+    assert spec["budget_cap_cents"] == 0
+    assert all(
+        s["max_exposure_cents"] == 0 and s["provider"] == "local-docker" for s in spec["stages"]
+    )
+
+
+def test_report_carries_the_grant_id():
+    assert smoke.Report(grant_id="g-9").document()["smoke_grant_id"] == "g-9"
+    assert smoke.Report().document()["smoke_grant_id"] is None

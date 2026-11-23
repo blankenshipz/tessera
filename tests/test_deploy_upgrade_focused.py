@@ -50,8 +50,8 @@ def repo(tmp_path, monkeypatch):
         (root / "tests" / name).write_text("def test_x():\n    pass\n")
     state = {"root": root, "changed": ["tests/test_alpha.py"], "ranges": [], "head": TO}
 
-    def changed_files(where, range_spec=None, base="main"):
-        state["ranges"].append(range_spec)
+    def changed_files(where, range_spec=None, base="main", *, exact=False):
+        state["ranges"].append((range_spec, exact))
         return list(state["changed"])
 
     monkeypatch.setattr(focused_tests, "changed_files", changed_files)
@@ -157,7 +157,7 @@ def test_a_dry_run_lists_the_selection_and_runs_nothing(tmp_path, repo):
     document = upgrade(plan, recorder, execute=False)
     assert document["result"] == "ok" and document["mode"] == "dry-run"
     assert recorder.log == [] and recorder.runs == []
-    assert repo["ranges"] == [f"{FROM}..{TO}"]
+    assert repo["ranges"] == [(f"{FROM}..{TO}", True)]
     check = focused_check(document)
     assert check["status"] == "ok" and "1 focused test file(s) selected" in check["summary"]
     assert "changed 1" in check["summary"]
@@ -316,3 +316,57 @@ def test_the_default_runner_keeps_pytest_output_off_stdout(tmp_path, monkeypatch
     assert captured.out == "" and "shard 0" in captured.err
     assert started == [{"cwd": tmp_path, "stdout": seen["stderr"]}]
     assert seen["files"] == ["tests/test_x.py"] and seen["jobs"] == 2
+
+
+def test_the_upgrade_asks_for_the_exact_difference_between_the_two_releases(tmp_path, repo):
+    plan, _state = focused_plan(tmp_path, repo["root"])
+    upgrade(plan, Recorder(Fakes()), execute=False)
+    assert repo["ranges"] == [(f"{FROM}..{TO}", True)]
+
+
+def test_one_unmapped_file_blocks_even_when_other_tests_are_selected(tmp_path, repo):
+    # A mapped test change plus a file nothing maps to used to pass: it must block now.
+    repo["changed"] = ["tests/test_alpha.py", "src/pkg/data.bin"]
+    plan, _state = focused_plan(tmp_path, repo["root"])
+    recorder = Recorder(Fakes())
+    document = upgrade(plan, recorder, execute=True)
+    assert document["result"] == "failed" and document["failed_step"] == "preflight"
+    entry = document["focused_tests"]
+    assert entry["result"] == "unmapped" and entry["unmapped"] == ["src/pkg/data.bin"]
+    assert "tests/test_alpha.py" in entry["files"]
+    assert recorder.log == []  # nothing ran, nothing stopped: the full suite is not a fallback
+
+
+def test_a_file_declared_safe_does_not_block_and_is_recorded(tmp_path, repo):
+    (repo["root"] / "dev").mkdir(exist_ok=True)
+    (repo["root"] / "src" / "pkg" / "data").mkdir()
+    (repo["root"] / "src" / "pkg" / "data" / "x.txt").write_text("x")
+    (repo["root"] / focused_tests.OVERRIDES_FILE).write_text(
+        '[unmapped]\nsafe = ["src/pkg/data/*.txt"]\n'
+    )
+    repo["changed"] = ["tests/test_alpha.py", "src/pkg/data/x.txt"]
+    plan, _state = focused_plan(tmp_path, repo["root"])
+    document = upgrade(plan, Recorder(Fakes()), execute=True)
+    assert document["result"] == "ok", document["steps"]
+    entry = document["focused_tests"]
+    assert entry["unmapped"] == [] and entry["safe_unmapped"] == ["src/pkg/data/x.txt"]
+
+
+def test_cuts_and_broad_selections_are_in_the_summary_and_the_receipt(tmp_path, repo):
+    root = repo["root"]
+    (root / "dev").mkdir(exist_ok=True)
+    (root / "src" / "pkg" / "hub.py").write_text("X = 1\n")
+    (root / "src" / "pkg" / "__init__.py").write_text("")
+    for index in range(4):
+        (root / "tests" / f"test_imp{index}.py").write_text("from pkg.hub import X\n")
+    (root / focused_tests.OVERRIDES_FILE).write_text(
+        '[[module]]\nmatch = ["src/pkg/hub.py"]\ncap = 2\n'
+    )
+    repo["changed"] = ["src/pkg/hub.py", "src/pkg/__init__.py"]
+    plan, _state = focused_plan(tmp_path, root)
+    document = upgrade(plan, Recorder(Fakes()), execute=False)
+    entry = document["focused_tests"]
+    assert entry["truncated"] and "dropped" in entry["truncated"][0]
+    assert entry["broad"] == ["src/pkg/__init__.py"]
+    check = focused_check(document)
+    assert "cut by a cap" in check["summary"] and "broad" in check["summary"]

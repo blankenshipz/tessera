@@ -42,6 +42,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import maintenance_lock
 from .salad_campaign_profiles import (
     DATA_POLICIES,
     DATA_POLICY_PUBLIC,
@@ -959,7 +960,13 @@ def main(argv=None) -> int:
     options = parser.parse_args(argv)
     try:
         config = load_config(options.config)
+        # Before anything opens the control database: `tessera db compact` refuses while this
+        # shared lock is held, and a running compaction makes this start refuse (exit 1).
+        maintenance_lock.hold_shared_for_process(config.state_dir)
         executor = build_executor(config)
+    except maintenance_lock.MaintenanceBusy as error:
+        print(f"salad executor refused: {error}", file=sys.stderr)
+        return 1
     except Exception:
         print(json.dumps({"status": "refused", "reason": "executor_setup_unavailable"}))
         return 2

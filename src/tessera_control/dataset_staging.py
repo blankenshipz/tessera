@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .artifact_custody import ArtifactCustodyStore
 from .campaign_holdout import holdout_output_source
 from .data_class import PRIVATE_DERIVED, record_snapshot_data_class
+from .license_labels import inherit_snapshot_labels
 from .snapshot_chunks import (
     collect_expired_uploads,
     enforce_project_chunk_cap,
@@ -182,6 +183,7 @@ class DatasetStagingStore(SnapshotStore):
             # ADR 0039: built from run outputs, so always private_derived; no API
             # field can declare it public (StageArtifactSnapshot forbids extras).
             record = record_snapshot_data_class(connection, live, ident, derived=True, now=now)
+            self._inherit_labels(connection, live, project_id, ident, manifest["id"], now)
             self._event(
                 connection,
                 live,
@@ -237,6 +239,24 @@ class DatasetStagingStore(SnapshotStore):
             replay_guard=replay_guard,
         )
 
+    def _inherit_labels(
+        self,
+        connection: sqlite3.Connection,
+        live: dict[str, Any],
+        project_id: str,
+        snapshot_id: str,
+        manifest_id: str,
+        now: str,
+    ) -> None:
+        """ADR 0113: a snapshot staged from collected outputs carries the stage's labels."""
+        inherited = inherit_snapshot_labels(
+            connection, live, snapshot_id, project_id, [], [manifest_id], now
+        )
+        if inherited is not None:
+            self._event(
+                connection, live, project_id, None, "snapshot.license_labels_added", 1, inherited
+            )
+
     def _stage_chunked(
         self,
         connection: sqlite3.Connection,
@@ -285,6 +305,7 @@ class DatasetStagingStore(SnapshotStore):
                 raise Conflict("Released artifact bytes no longer match the manifest.")
             seq = insert_chunks(connection, ident, item["relative_path"], content, seq)
         record = record_snapshot_data_class(connection, live, ident, derived=True, now=now)
+        self._inherit_labels(connection, live, project_id, ident, manifest["id"], now)
         self._event(
             connection,
             live,

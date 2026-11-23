@@ -13,14 +13,14 @@ import json
 import logging
 import sqlite3
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
 
 from . import campaign_heavy_guard_readout as heavy_guard_readout
-from . import campaign_placement, program_budget, provider_trust
+from . import campaign_placement, program_budget, provider_trust, smoke_credentials
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
 from .campaign_holdout import campaign_claims, check_unclaimed
@@ -119,6 +119,16 @@ def infra_retry_policy(spec: Any) -> list[dict[str, Any]]:
 def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
     result = {key: value for key, value in dict(row).items() if key != "spec_json"}
     return result
+
+
+class LicenseRefused(Conflict):
+    """A provider's licence-label restriction refuses a stage's inputs (a permanent refusal for
+    that provider; placement records it as ``license_label``). ``labels`` are the sorted
+    effective labels that were refused."""
+
+    def __init__(self, message: str = "", labels: Iterable[str] = ()) -> None:
+        super().__init__(message)
+        self.labels: list[str] = sorted(labels)
 
 
 class CampaignStore(
@@ -265,13 +275,17 @@ class CampaignStore(
         stage: Any,
         provider: Any,
         approval_digest: str | None = None,
-    ) -> None:
+        *,
+        spec: Any = None,
+        scope: tuple[str, str] | None = None,
+    ) -> frozenset[str] | None:
         """ADR 0040 section 4: every input must be one the provider instance may receive.
 
         A snapshot input goes through ``provider_admits`` (recorded class and code approval);
         a stage or artifact input is always ``private_derived``. Raises Conflict (409) naming
         the stage, input, provider and worker principal; used at submit, at approve and again
-        when the runner reserves the stage.
+        when the runner reserves the stage. Returns the effective licence labels checked
+        (None when the provider is unrestricted).
         """
         worker = CampaignStore.stage_worker(provider, stage)
         narrowed = frozenset(stage.send_classes) if stage.send_classes else None
@@ -311,6 +325,50 @@ class CampaignStore(
                     "not trusted to receive private_derived (provider trust setting). "
                     + CampaignStore.trust_hint(stage.provider, worker)
                 )
+        return CampaignStore.check_license_labels(connection, stage, spec, scope)
+
+    @staticmethod
+    def check_license_labels(
+        connection: sqlite3.Connection,
+        stage: Any,
+        spec: Any,
+        scope: tuple[str, str] | None,
+    ) -> frozenset[str] | None:
+        """Licence-label placement guard (fail closed).
+
+        A provider whose trust entry lists ``allowed_license_labels`` receives a stage only if
+        every effective label of every input (snapshot labels, inherited through lineage) is in
+        that list; a provider the trust file lists without the key is unrestricted, and one it
+        does not list may receive only ``unlabelled`` data. When the labels cannot be
+        determined for a restricted provider the stage is refused, never admitted. A busy or
+        locked database (``sqlite3.OperationalError``) is transient and propagates so the
+        caller retries; it is never turned into a refusal. Returns the labels checked."""
+        policy = provider_trust.current_policy(connection)
+        allowed = policy.allowed_license_labels(stage.provider)
+        if allowed is None:
+            return None
+        from . import license_labels
+
+        if spec is None or scope is None:
+            raise Conflict(
+                f"Stage {stage.key!r}: provider {stage.provider!r} restricts licence labels and "
+                "they cannot be determined here; refused (fail closed)."
+            )
+        try:
+            labels = license_labels.stage_labels(
+                connection, spec, stage.key, org_id=scope[0], project_id=scope[1]
+            )
+        except sqlite3.OperationalError:
+            raise
+        except Exception:  # noqa: BLE001 - an unreadable lineage is a refusal, never an admit
+            raise Conflict(
+                f"Stage {stage.key!r}: licence labels of its inputs could not be determined for "
+                f"provider {stage.provider!r}; refused (fail closed)."
+            ) from None
+        reason = license_labels.license_refusal(stage.provider, labels, policy)
+        if reason:
+            raise LicenseRefused(f"Stage {stage.key!r}: {reason}", labels)
+        return frozenset(labels)
 
     @staticmethod
     def _check_worker(
@@ -390,9 +448,21 @@ class CampaignStore(
             self._check_code_input(connection, stage)
             for candidate in placement_candidates(stage):
                 self.check_stage_inputs(
-                    connection, candidate, providers[stage.key, candidate.provider], digest
+                    connection,
+                    candidate,
+                    providers[stage.key, candidate.provider],
+                    digest,
+                    spec=normal,
+                    scope=(live["org_id"], project_id),
                 )
-            self._check_reroutes(connection, project_id, stage, digest)
+            self._check_reroutes(
+                connection,
+                project_id,
+                stage,
+                digest,
+                spec=normal,
+                scope=(live["org_id"], project_id),
+            )
         try:
             # ADR 0068: a sealed partition opens once per scope; a claimed one is refused here
             # as well as at the claim itself.
@@ -431,12 +501,21 @@ class CampaignStore(
             )
 
     def _check_reroutes(
-        self, connection: sqlite3.Connection, project_id: str, stage: Any, digest: Any
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+        stage: Any,
+        digest: Any,
+        *,
+        spec: Any = None,
+        scope: tuple[str, str] | None = None,
     ) -> None:
         """Every provider an infrastructure retry may move to is checked as the stage's own
         is, at submit and approval (ADR 0058, ADR 0047)."""
         for provider_id in stage.retry.reroute_providers:
-            self.check_reroute(connection, project_id, stage, provider_id, digest)
+            self.check_reroute(
+                connection, project_id, stage, provider_id, digest, spec=spec, scope=scope
+            )
 
     @staticmethod
     def check_reroute(
@@ -445,6 +524,9 @@ class CampaignStore(
         stage: Any,
         provider_id: str,
         digest: Any,
+        *,
+        spec: Any = None,
+        scope: tuple[str, str] | None = None,
     ) -> Any:
         """One reroute target must be registered, an unbilled worker-grant provider of the
         stage's runtime, pass the provider's own stage check and the trust narrowing, and be
@@ -480,7 +562,9 @@ class CampaignStore(
             )
         except ValueError as error:
             raise Conflict(f"Stage {stage.key!r}: {error}") from None
-        CampaignStore.check_stage_inputs(connection, moved, provider, digest)
+        CampaignStore.check_stage_inputs(
+            connection, moved, provider, digest, spec=spec, scope=scope
+        )
         return moved
 
     # -- commands -------------------------------------------------------------------
@@ -529,6 +613,7 @@ class CampaignStore(
                 connection, live, project_id, spec, body.predecessors, raw_spec
             )
             normal_spec = normalize(spec)
+            smoke_credentials.check_submission(connection, live, normal_spec)
             encoded_spec = json.dumps(spec.model_dump(mode="json"), sort_keys=True)
             spec_hash = spec_digest(spec)
             self._check_references(connection, live, project_id, spec)
@@ -728,6 +813,9 @@ class CampaignStore(
                 raise Conflict("Stored campaign spec failed validation.") from None
             if spec_digest(spec) != campaign["spec_digest"]:
                 raise Conflict("Stored campaign spec digest changed.")
+            smoke_grant_id = smoke_credentials.check_approval(
+                connection, live, campaign, normalize(spec)
+            )
             if forward:
                 # Cleanup re-approvals must not depend on forward-only references (a retired
                 # worker or snapshot must not strand a cancel).
@@ -840,6 +928,7 @@ class CampaignStore(
                     "superseded_approval_id": superseded["id"] if superseded else None,
                     "resulting_status": resulting,
                     "preapprovals": declared,
+                    **({"smoke_grant_id": smoke_grant_id} if smoke_grant_id else {}),
                 },
             )
             return 200, {

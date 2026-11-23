@@ -59,6 +59,8 @@ PERMANENT_REASONS = frozenset(
         "provider_invalid",
         "not_enrolled",
         "untrusted",
+        # A provider's licence-label restriction refuses the stage's inputs (ADR 0113).
+        "license_label",
         "over_run_cap",
         "over_campaign_budget",
         "plan_mismatch",
@@ -218,7 +220,7 @@ def _check(
     exposure_open: Callable[[sqlite3.Connection], bool],
 ) -> Skip | None:
     """The first existing check this candidate fails, or None when it may run now."""
-    from .campaign_store import CampaignStore
+    from .campaign_store import CampaignStore, LicenseRefused
 
     pid = stage.provider
     campaign = ctx.campaign
@@ -239,6 +241,8 @@ def _check(
                     base,
                     pid,
                     (ctx.approval or {}).get("trust_policy_digest"),
+                    spec=ctx.spec,
+                    scope=(campaign["org_id"], campaign["project_id"]),
                 )
             except Conflict as error:
                 return Skip(pid, "reroute_refused", str(error)[:300])
@@ -260,7 +264,11 @@ def _check(
                 stage,
                 provider,
                 approval_digest=(ctx.approval or {}).get("trust_policy_digest"),
+                spec=ctx.spec,
+                scope=(campaign["org_id"], campaign["project_id"]),
             )
+        except LicenseRefused as error:
+            return Skip(pid, "license_label", str(error)[:300])
         except Conflict as error:
             return Skip(pid, "untrusted", str(error)[:300])
         if hold > base.max_exposure_cents:
@@ -441,11 +449,12 @@ def failure_reason(decision: Decision) -> str:
             "over_run_cap",
             "plan_mismatch",
             "untrusted",
+            "license_label",
             "not_enrolled",
         }:
             return "resource_limit_no_provider"
         reasons = others
-    if reasons == {"untrusted"}:
+    if reasons and reasons <= {"untrusted", "license_label"}:
         return "input_not_admitted"
     if reasons and reasons <= {"unregistered", "provider_invalid", "reroute_refused"}:
         return "provider_unavailable"

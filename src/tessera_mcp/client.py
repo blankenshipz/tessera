@@ -311,6 +311,12 @@ class ControlClient:
             "GET", f"/projects/{project}/agent-snapshots?offset={offset}&limit={limit}"
         )
 
+    async def snapshot_license_labels(self, snapshot_id):
+        project = segment(self.config.project_id)
+        return await self._request(
+            "GET", f"/projects/{project}/snapshots/{segment(snapshot_id)}/license-labels"
+        )
+
     async def campaign_view(self, campaign_id, view):
         if view not in {"outputs", "logs", "budget", "grants", "retries", "holdout"}:
             raise ControlError("Unknown campaign view")

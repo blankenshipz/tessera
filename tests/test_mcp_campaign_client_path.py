@@ -155,11 +155,13 @@ def test_tools_register_only_for_enrolled_scopes(tmp_path):
         "tessera_campaign_holdout",
         "tessera_campaign_holdout_claims",
         "tessera_list_stuck_campaigns",
+        "tessera_campaign_report",
     }
     assert _names(_server(tmp_path, [], ["campaign:submit", "snapshot:read"])) == {
         "tessera_submit_campaign",
         "tessera_validate_campaign_spec",
         "tessera_list_snapshots",
+        "tessera_get_snapshot_license_labels",
     }
     assert _names(_server(tmp_path, [], ["artifact:read", "campaign:logs", "budget:read"])) == {
         "tessera_campaign_outputs",

@@ -105,6 +105,25 @@ digest. Agents never set the policy or choose what is deleted: the operator's po
 selects, the digest binds the apply to what was listed, and a stale digest is refused and
 receipted. MCP tools: `tessera_storage_retention_status`, `_plan`, `_apply`.
 
+### Deploy-upgrade backups
+
+`tessera deploy-upgrade` takes, before it migrates, either a validated `tessera backup` bundle
+(when the database is already at the release's schema) or a pre-migration snapshot (an older
+schema that `restore` refuses): `snapshot.sqlite3` plus `snapshot-manifest.json`, and, beside it,
+a `<name>-configs` directory of config copies. Retention manages all of them in one
+backup root. A snapshot is restorable when the directory is exactly those two files, the database
+matches the recorded size and digest, and SQLite reads it read-only at the recorded schema
+version; its id is the digest's first 32 digits and its time the `backup-<stamp>` of its name. The
+config copies are listed with, counted in the size of, and removed with their backup. The keep-last
+floor and the "never the last restorable backup" rule apply across both formats.
+
+Verification of a bundle now happens in place. Restore copies a backup into a temporary
+directory before it trusts it; doing that for every retention check staged ~5.7 GB deploy
+backups into the temporary filesystem, which filled and raised `OSError`, so restorable backups
+were reported as unrestorable and the disk kept filling. The size, digest, schema, declared
+objects and layout checks are the same; only the copy is gone. A reason that names an OS error
+now carries the errno name (for example `ENOSPC`), never a path.
+
 ## Consequences
 
 - Receipts are files, not database rows: no schema change, and they are outside backups, so

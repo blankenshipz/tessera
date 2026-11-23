@@ -290,6 +290,32 @@ def _object(pairs):
     return result
 
 
+def check_management_credential(organization, secret, *, connection_factory=BoundedHTTPSConnection):
+    """One read-only GET of the organization's quotas with ``secret``: proves the management
+    credential is accepted. Same vetted fixed-origin request path (no retry, redirect or proxy).
+    Returns None; raises ``_Failure`` whose ``reason`` is a closed string, never a body."""
+    if type(secret) is not SecretBuffer or not secret._buffer:
+        raise _Failure("credential_unavailable")
+    if not isinstance(organization, str) or not re.fullmatch(
+        r"[a-z][a-z0-9-]{0,61}[a-z0-9]", organization
+    ):
+        raise _Failure("organization_invalid")
+    probe = SaladHTTPTransport._credential_probe(connection_factory)
+    try:
+        _, quotas = probe._request("GET", f"{PREFIX}/organizations/{organization}/quotas", secret)
+    except _Failure as failure:
+        # The request path reports every non-success status as provider_unavailable and keeps
+        # the last status on the probe (never in a result): a 401/403 is the provider refusing
+        # the key.
+        if failure.reason == "provider_unavailable" and probe._last_status in (401, 403):
+            raise _Failure("credential_rejected") from None
+        raise
+    try:
+        _integer(quotas["container_groups_quotas"]["container_replicas_quota"])
+    except (KeyError, TypeError):
+        raise _Failure("malformed_response") from None
+
+
 class SaladHTTPTransport:
     """Pin an immutable server selection; factory injection is for isolated tests only.
 
@@ -298,6 +324,15 @@ class SaladHTTPTransport:
     not Tessera operation IDs. read_group with None is lost-create reconciliation.
     read_instance reads the exact group's instance collection, not arbitrary IDs.
     """
+
+    @classmethod
+    def _credential_probe(cls, connection_factory):
+        """A transport with no execution selection, for the one read-only credential check
+        (``check_management_credential``). ``_request`` uses only these two attributes; a change
+        that makes it use more must set them here (the credential-check tests exercise it)."""
+        probe = object.__new__(cls)
+        probe._factory, probe._post_sent, probe._last_status = connection_factory, False, None
+        return probe
 
     def __init__(
         self,
@@ -411,6 +446,7 @@ class SaladHTTPTransport:
             self._remaining(connection, deadline)
             response = connection.getresponse()
             status = response.status
+            self._last_status = status  # read only by the credential probe, never reported
             getheader = getattr(response, "getheader", None)
             declared = getheader("Content-Length") if callable(getheader) else None
             content_type = getheader("Content-Type") if callable(getheader) else None

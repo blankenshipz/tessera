@@ -412,10 +412,16 @@ class OperatorObservabilityStore(Store):
                 alerts.append({"code": "credential_expired", "severity": "critical"})
             elif credentials["warning_count"]:
                 alerts.append({"code": "credential_expiring", "severity": "warning"})
+            from . import db_compaction_health
+
+            database = db_compaction_health.recommendation(connection)
+            if database["recommended"]:
+                alerts.append({"code": "db_compaction_recommended", "severity": "warning"})
             return {
                 "projection_at": utc_now(),
                 "alerts": alerts,
                 "credentials": credentials,
+                "database": database,
                 "workers": {
                     "stale_count": stale,
                     "unknown_freshness_count": unknown_worker_freshness,

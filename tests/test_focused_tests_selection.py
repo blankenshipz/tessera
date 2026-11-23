@@ -396,3 +396,65 @@ def test_a_separator_after_the_range_is_not_passed_to_pytest(tmp_path):
     assert focused_tests._split_range(["--", "A..B", "-q"], root) == ("A..B", ["-q"])
     assert focused_tests._split_range(["A..B", "-q"], root) == ("A..B", ["-q"])
     assert focused_tests._split_range(["-q"], root) == (None, ["-q"])
+
+
+def test_a_replace_override_names_the_importers_it_dropped(repo):
+    overrides_file(
+        repo,
+        '[[module]]\nmatch = ["src/pkg/hub.py"]\nmode = "replace"\n'
+        'tests = ["tests/test_core_a.py"]\n',
+    )
+    selection = ft.select(repo, ["src/pkg/hub.py"], smoke=True)
+    assert selection.narrowed and "src/pkg/hub.py" in selection.narrowed[0]
+    assert "7 importing or dependent" in selection.narrowed[0]  # six importers + a dependent
+    # An add override (the default mode) drops nothing, so nothing is reported.
+    overrides_file(
+        repo, '[[module]]\nmatch = ["src/pkg/hub.py"]\ntests = ["tests/test_core_a.py"]\n'
+    )
+    assert ft.select(repo, ["src/pkg/hub.py"], smoke=False).narrowed == []
+
+
+def test_a_declared_safe_file_is_not_unmapped_and_a_code_pattern_is_refused(repo):
+    write(repo / "src/pkg/data/blob.txt", "x")
+    overrides_file(repo, '[unmapped]\nsafe = ["src/pkg/data/*.txt"]\n')
+    selection = ft.select(repo, ["src/pkg/data/blob.txt", "src/pkg/odd.bin"], smoke=False)
+    assert selection.safe_unmapped == ["src/pkg/data/blob.txt"]
+    assert selection.unmapped == ["src/pkg/odd.bin"]
+    for pattern in ("src/**/*.py", "src/pkg/hub.py", "*.py"):
+        overrides_file(repo, f'[unmapped]\nsafe = ["{pattern}"]\n')
+        with pytest.raises(ValueError, match="may not cover Python files"):
+            ft.load_overrides(repo)
+
+
+def test_run_blocks_on_an_unmapped_file_unless_allowed(repo, capsys, monkeypatch):
+    ran = []
+    monkeypatch.setattr(ft, "run", lambda files, *a, **k: ran.append(list(files)) or 0)
+    overrides_file(repo, SMOKE)
+    changed = changed_as(["src/pkg/leaf.py", "Makefile"])
+    assert ft.main(["--root", str(repo)], changed_files_fn=changed) == 2
+    assert ran == [] and "no test maps to: Makefile" in capsys.readouterr().err
+    assert ft.main(["--root", str(repo), "--allow-unmapped"], changed_files_fn=changed) == 0
+    assert ran and "tests/test_leaf.py" in ran[0]
+    # Listing and explaining still work (they only report), with the warning.
+    assert ft.main(["--root", str(repo), "--list"], changed_files_fn=changed) == 0
+
+
+def test_the_exact_range_includes_a_non_ancestor_revisions_own_side(tmp_path):
+    git(tmp_path, "init", "-q", "-b", "main")
+    write(tmp_path / "base.txt", "1")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "base")
+    git(tmp_path, "checkout", "-q", "-b", "side")
+    write(tmp_path / "side_only.py", "x = 1\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "side")
+    side = git(tmp_path, "rev-parse", "HEAD")
+    git(tmp_path, "checkout", "-q", "main")
+    write(tmp_path / "main_only.py", "y = 1\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "main")
+    main_head = git(tmp_path, "rev-parse", "HEAD")
+    three = ft.changed_files(tmp_path, f"{side}..{main_head}")
+    exact = ft.changed_files(tmp_path, f"{side}..{main_head}", exact=True)
+    assert three == ["main_only.py"]  # the side branch's own change is not in A...B
+    assert exact == ["main_only.py", "side_only.py"]  # an upgrade between the trees needs both

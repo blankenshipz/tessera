@@ -37,6 +37,10 @@ fails before any hold; the campaign stop reason is `credential_expired`, `creden
 
 ## Rotating, step by step
 
+For the one-command `tessera credentials reenroll` flow and the MCP tool that shows the owner the
+exact command, see [re-enrolling an expired credential](operations/credential-reenrollment.md).
+The enrollment-tool steps below remain valid.
+
 Run as the user that owns the private credential directory, in a terminal you control:
 
 1. `python -m tessera_operator.salad_enroll rotate --credential-directory DIR --reference credential-ref:NAME

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (ATTEMPT_ASSESSMENT_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 83
+# Literal: must equal the highest registered constant (LICENSE_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 85
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1841,3 +1841,57 @@ def migrate_design_environment_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(DESIGN_ENVIRONMENT_SCHEMA_VERSION - 1, migrate_design_environment_schema)
+
+
+# Smoke credential grants: a short-lived, local-docker-only, $0-budget agent credential paired
+# with a narrowly scoped approver credential (see smoke_credentials.py). Additive and idempotent;
+# registered with setdefault. The number is renumbered when it merges after other schema changes
+# (raise SMOKE_CREDENTIALS_SCHEMA_VERSION, LATEST_SCHEMA_VERSION and the INSERT in store.py).
+SMOKE_CREDENTIALS_SCHEMA_VERSION = 84
+
+
+def migrate_smoke_credentials_schema(connection: sqlite3.Connection) -> None:
+    from .smoke_credentials import create_smoke_credential_schema
+
+    preexisting = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+    create_smoke_credential_schema(connection)
+    if len(connection.execute("PRAGMA foreign_key_check").fetchall()) > preexisting:
+        raise ValueError("Migration v84 introduced foreign key violations.")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (SMOKE_CREDENTIALS_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(SMOKE_CREDENTIALS_SCHEMA_VERSION - 1, migrate_smoke_credentials_schema)
+
+
+# Licence labels on snapshots (ADR 0113). Additive and idempotent. The branch reserved 86, but
+# the registry requires a contiguous chain, so it takes the next free version (85) after the
+# smoke credential grants (84). If another change owns this version when branches merge, raise
+# LICENSE_SCHEMA_VERSION (and LATEST_SCHEMA_VERSION and the fresh-database INSERT in store.py).
+LICENSE_SCHEMA_VERSION = 85
+
+
+def migrate_license_schema(connection: sqlite3.Connection) -> None:
+    from .license_labels import create_license_schema
+
+    create_license_schema(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (LICENSE_SCHEMA_VERSION,)
+    )
+
+
+MIGRATIONS.setdefault(LICENSE_SCHEMA_VERSION - 1, migrate_license_schema)

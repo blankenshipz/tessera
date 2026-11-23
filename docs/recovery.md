@@ -81,6 +81,56 @@ and accounting remain records; they do not prove provider termination or reconci
 spend. The held copy has no dispatch, lease-renewal, replay, or cleanup authority.
 Reconcile external operations before considering replacement work.
 
+## Compacting the control database
+
+SQLite never shrinks its file when rows are deleted (retention and maintenance free pages that
+are reused later, not returned to the disk). To give the space back, stop `tessera serve`, the
+Salad campaign executor (`tessera-salad-executor`) and anything else that keeps the control
+database open, and run (ADR 0114):
+
+```sh
+uv run --locked tessera db compact --state-dir .tessera --dry-run   # checks only, writes nothing (it cannot prove nothing else has the database open; a real run does)
+uv run --locked tessera db compact --state-dir .tessera [--backup-root /safe/place] [--min-free-bytes N]
+```
+
+Preconditions, all checked before anything is written: the maintenance lock
+(`<state-dir>/.maintenance.lock`) is free; the database is at the current schema (run
+`tessera migrate` first if not), is not a held restore and not a symbolic link; a backup root
+exists (the `backup_root` in `storage-retention.json`, or `--backup-root`); and free disk is enough
+on the state directory's filesystem (at least `--min-free-bytes`, default 8 GiB, and room for a
+copy) and on the backup root's (a copy of the database plus 1 GiB).
+
+What the lock enforces, exactly: `tessera serve` and `tessera-salad-executor` (also with
+`--once`) hold the lock shared for their whole life, so compaction refuses while either runs, and
+either refuses to start (exit 1) while a compaction runs. No other process takes it. Short-lived
+commands that open the database directly (`tessera migrate`, `backup`, `restore`, `retention`, the
+executor enrollment renewal timer) are covered by the writer guard instead: compaction holds a
+`BEGIN IMMEDIATE` write transaction on the source through verification and the swap and re-checks
+the source's fingerprint before swapping, so such a writer fails with a busy error and loses
+nothing. A long-lived process that opens the database without the lock is not protected; stop it
+first.
+
+The run builds a compacted copy with `VACUUM INTO` beside the database, verifies it (integrity and
+foreign-key checks, per-table row counts, `schema_meta`, `control_recovery`, the event cursor),
+writes the previous database as an ordinary backup bundle under the backup root
+(`pre-compact-<UTC timestamp>-<id>`), swaps the file atomically and verifies again; if that
+fails it puts the old file back. It prints the receipt as JSON and writes it to
+`<state-dir>/db-compact/<UTC timestamp>-<run_id>.json`. Fields include `status` (`compacted`;
+`dry_run` for a dry run), `bytes_before`, `bytes_after`, `bytes_reclaimed`, `page_size`,
+`page_count_before`, `page_count_after`, `freelist_pages_before`, `tables` (rows per table),
+`duration_seconds`, `free_disk_bytes` and `required_free_bytes` (and the `backup_` equivalents),
+and `backup` (`path`, `backup_id`, `sha256`, `size`, `registered_with_retention`). It is a file,
+not a control-database event.
+
+To roll back after a successful run, stop the service and restore the kept bundle with the usual
+`tessera restore --backup <bundle>`. When the bundle is under the retention policy's
+`backup_root`, storage retention lists, keeps and ages it like any other backup; with a different
+`--backup-root` it is restorable but retention does not manage it.
+
+`GET /operator/health` reports a `database` object (freelist statistics) and raises a
+`db_compaction_recommended` warning when the reclaimable space is at least 64 MiB and at least
+25% of the file. The alert only recommends; nothing compacts on its own.
+
 ## Stale local-pilot workers and expired reservations
 
 `GET /operator/health` distinguishes an unavailable budget caused entirely by

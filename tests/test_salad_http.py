@@ -1387,3 +1387,43 @@ def test_the_count_key_names_that_reach_receipts_are_bounded_and_count_shaped():
     keys = read.observation["instance_count_keys"]
     assert len(keys) <= 16 and all(k.endswith("_count") and len(k) <= 40 for k in keys)
     assert "Not A Key" not in keys and "free text with spaces" not in keys
+
+
+# -- the read-only management credential check (credential re-enrollment) -----------------
+
+
+def _check(response, organization="acme-org"):
+    from tessera_control.salad_http import check_management_credential
+
+    factory = Factory(response)
+    secret = SecretBuffer(bytearray(b"synthetic-management-key"))
+    try:
+        check_management_credential(organization, secret, connection_factory=factory)
+    finally:
+        secret.zeroize()
+    return factory
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_the_credential_check_reports_a_refused_key_distinctly(status):
+    with pytest.raises(Exception) as caught:
+        _check((status, {"detail": "no"}))
+    assert caught.value.reason == "credential_rejected"
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+def test_the_credential_check_reports_an_outage_as_unavailable_not_rejected(status):
+    with pytest.raises(Exception) as caught:
+        _check((status, {"detail": "busy"}))
+    assert caught.value.reason == "provider_unavailable"
+
+
+def test_the_credential_check_accepts_a_good_quota_and_one_get_only():
+    factory = _check((200, {"container_groups_quotas": {"container_replicas_quota": 5}}))
+    assert [call[0] for call in factory.calls] == ["GET"]  # read-only, one request
+
+
+def test_a_malformed_organization_is_its_own_reason():
+    with pytest.raises(Exception) as caught:
+        _check((200, {}), organization="Not Valid!")
+    assert caught.value.reason == "organization_invalid"

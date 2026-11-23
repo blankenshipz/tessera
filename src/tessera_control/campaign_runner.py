@@ -99,7 +99,7 @@ from .campaign_steps import (
     StepResult,
     StepTransient,
 )
-from .campaign_store import CampaignStore
+from .campaign_store import CampaignStore, LicenseRefused
 from .code_approval import snapshot_code_approval
 from .data_class import DataClassRefused
 from .execution import reconcile_grant_row
@@ -1670,12 +1670,37 @@ class CampaignRunner:
         # instance is not trusted to receive (a 409-class refusal naming provider and worker).
         try:
             with self.store.runner_connection() as connection:
-                CampaignStore.check_stage_inputs(
+                checked = CampaignStore.check_stage_inputs(
                     connection,
                     spec_stage,
                     self._provider(spec_stage),
                     approval_digest=(ctx.approval or {}).get("trust_policy_digest"),
+                    spec=ctx.spec,
+                    scope=(ctx.campaign["org_id"], ctx.campaign["project_id"]),
                 )
+                if checked is not None and (
+                    checked != {"unlabelled"}
+                    or provider_trust.current_policy(connection).lists_license_labels(target)
+                ):
+                    # The labels as checked at dispatch, for the receipt (a later label add
+                    # never rewrites what this stage was admitted with).
+                    self._emit_once_in(
+                        connection,
+                        ctx,
+                        "campaign.stage_license_checked",
+                        {"stage_key": key, "provider": target},
+                        {"labels": sorted(checked)},
+                    )
+        except LicenseRefused as error:
+            # ADR 0113: a provider's licence-label restriction (tightened after approval, or a
+            # label added since) refuses the inputs; on the record, nothing held.
+            self.emit_once(
+                ctx,
+                "campaign.stage_license_refused",
+                {"stage_key": key},
+                {"provider": target, "labels": list(error.labels), "reason": str(error)[:300]},
+            )
+            return self._stage_failed(ctx, key, "input_not_admitted")
         except Conflict:
             return self._stage_failed(ctx, key, "input_not_admitted")
         hold = spec_stage.max_exposure_cents

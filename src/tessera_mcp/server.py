@@ -17,6 +17,7 @@ from tessera_control.models import ExecutionSpec
 from tessera_mcp.agent_loop_tools import register_agent_loop_tools
 from tessera_mcp.client import ControlClient
 from tessera_mcp.config import Config
+from tessera_mcp.credential_reenroll import register_credential_reenroll_tool
 from tessera_mcp.generated_outputs import register_generated_output_tools
 from tessera_mcp.mcp_workflow import register_workflow
 from tessera_mcp.people_tools import register_person_enrollment_tools
@@ -37,6 +38,7 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_report": "campaign:read",
     "tessera_cancel_campaign": "campaign:cancel",
     "tessera_list_snapshots": "snapshot:read",
+    "tessera_get_snapshot_license_labels": "snapshot:read",
     "tessera_campaign_outputs": "artifact:read",
     "tessera_campaign_logs": "campaign:logs",
     "tessera_campaign_budget": "budget:read",
@@ -388,6 +390,17 @@ def register_campaign_tools(
         """
         return await client.list_snapshots(offset, limit)
 
+    async def tessera_get_snapshot_license_labels(snapshot_id: str) -> dict[str, Any]:
+        """Read a snapshot's licence labels (snapshot:read): the labels and whether it is labelled.
+
+        Metadata only. A person sets labels and they can only be added, never removed or
+        changed by an agent; a snapshot with none reads as `unlabelled`. A provider may be
+        limited to data whose every label it allows, so a stage whose inputs carry a label that a
+        candidate provider does not allow is refused for that provider (derived data inherits the
+        labels of its inputs). This tool changes nothing.
+        """
+        return await client.snapshot_license_labels(snapshot_id)
+
     async def tessera_campaign_outputs(campaign_id: str) -> dict[str, Any]:
         """List a campaign's recorded stage outputs (artifact:read): name, sha256, size, class.
 
@@ -700,6 +713,7 @@ def register_campaign_tools(
         tessera_get_campaign_receipt,
         tessera_campaign_report,
         tessera_list_snapshots,
+        tessera_get_snapshot_license_labels,
         tessera_campaign_outputs,
         tessera_campaign_logs,
         tessera_campaign_budget,
@@ -762,6 +776,9 @@ def register_provider_trust_tools(server: FastMCP, client: ControlClient) -> Non
         owner action with the enrollment tool; this tool changes nothing.
         """
         return await client.credential_health()
+
+    # Same gate as the health tool; read-only guidance, never a secret.
+    register_credential_reenroll_tool(server, client)
 
 
 def register_model_spend_tools(server: FastMCP, client: ControlClient) -> None:

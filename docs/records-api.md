@@ -60,7 +60,7 @@ success criterion is judged on). Both are stored immutably per design revision, 
 responses, revision history and export, and null when omitted; legacy designs are not relabelled.
 They are recorded, not verified: the platform does not check that a digest matches an environment
 or that the metric appears in measurements. A revision changing either is a plan change and records the optional
-`change_reason` like any other revision ([ADR 0118](decisions/0118-design-environment-and-metric.md)).
+`change_reason` like any other revision (a revision records exactly what it states, nothing is carried forward, and dropping a value the current revision recorded is refused without a `change_reason`) ([ADR 0118](decisions/0118-design-environment-and-metric.md)).
 `POST /experiments/{id}/conclusions` accepts an optional `design_revision`; when
 omitted for compatibility it freezes the current design revision. A conclusion and
 its `POST /conclusions/{id}/review` response expose that `design_revision` and a

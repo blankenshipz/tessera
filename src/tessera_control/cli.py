@@ -15,6 +15,7 @@ from pathlib import Path
 
 import uvicorn
 
+from . import maintenance_lock
 from .api import create_app
 from .deployment import serving_config
 from .recovery import backup_state, restore_state
@@ -511,6 +512,15 @@ def parser() -> argparse.ArgumentParser:
     from .provider_trust_cli import add_provider_trust_commands
 
     add_provider_trust_commands(subcommands)
+    from .smoke_credentials_cli import add_dev_commands
+
+    add_dev_commands(subcommands)
+    from .db_cli import add_db_commands
+
+    add_db_commands(subcommands)
+    from .credential_reenroll import add_parser as add_credentials_command
+
+    add_credentials_command(subcommands)
     add_workspace_commands(subcommands)
     _add_minikube_provisioning_command(subcommands)
     _add_astra_setup_command(subcommands)
@@ -1050,8 +1060,22 @@ def _run_astra_namespace(arguments: argparse.Namespace) -> int:
         return 1
 
 
-def main() -> int:
-    arguments = parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    words = sys.argv[1:] if argv is None else argv
+    if words[:1] == ["credentials"]:
+        # The installed ``tessera`` calls main() with no argument; the guard must hold for it too.
+        arguments, extra = parser().parse_known_args(words)
+        if extra:  # an unknown argument may carry a credential: never echo it
+            print(
+                "Credential arguments invalid; use --help (no secret arguments).", file=sys.stderr
+            )
+            return 2
+    else:
+        arguments = parser().parse_args(argv)
+    if arguments.command == "credentials":
+        from .credential_reenroll import run as run_credentials
+
+        return run_credentials(arguments)
     if arguments.command == "agent-sandbox":
         from .agent_sandbox_cli import run_agent_sandbox
 
@@ -1079,6 +1103,10 @@ def main() -> int:
 
         return run_deploy_upgrade(arguments)
     if arguments.command == "dev":
+        if arguments.dev_action == "smoke-credentials":
+            from .smoke_credentials_cli import run as run_smoke_credentials
+
+            return run_smoke_credentials(arguments)
         from .focused_tests_cli import run_dev
 
         return run_dev(arguments)
@@ -1120,6 +1148,10 @@ def main() -> int:
             print(f"migrate failed: {error}", file=sys.stderr)
             return 1
         return 0
+    if arguments.command == "db":
+        from .db_cli import run_db
+
+        return run_db(arguments)
     if arguments.command == "retention":
         from . import storage_retention
 
@@ -1342,11 +1374,20 @@ def main() -> int:
                             raise RuntimeError("runtime owner shutdown failed") from None
 
                 app.router.lifespan_context = owner_lifespan
-            uvicorn.run(
-                app,
-                host=arguments.bind_host,
-                port=arguments.port,
-            )
+            try:
+                service_lock = maintenance_lock.shared(arguments.state_dir)
+                service_lock.__enter__()
+            except (StoreError, OSError) as error:
+                print(f"serve failed: {error}", file=sys.stderr)
+                return 1
+            try:
+                uvicorn.run(
+                    app,
+                    host=arguments.bind_host,
+                    port=arguments.port,
+                )
+            finally:
+                service_lock.__exit__(None, None, None)
         finally:
             # Also cover app construction, startup/bind failures and runners that
             # never entered lifespan. RuntimeOwnerComposition.close is one-shot.

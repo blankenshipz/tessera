@@ -48,6 +48,10 @@ MAX_FILE_BYTES = 256 * 1024
 _PROVIDER_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PRINCIPAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _PROVIDER_KEYS = frozenset({"data_classes", "worker_principal_ids"})
+# Optional narrowing: the licence labels (licence_labels.py) a provider may receive; absent means
+# unrestricted, and an absent key leaves the canonical form and digest exactly as before.
+_OPTIONAL_PROVIDER_KEYS = frozenset({"allowed_license_labels"})
+MAX_ALLOWED_LICENSE_LABELS = 16
 POLICY_CHANGED = "provider_trust.policy_changed"
 RELOAD_REFUSED = "provider_trust.reload_refused"
 DEPLOYMENT_START = "deployment_start"
@@ -81,9 +85,14 @@ def _canonical(value: Any) -> dict[str, Any]:
     for provider_id, entry in sorted(providers.items()):
         if not isinstance(provider_id, str) or not _PROVIDER_ID.fullmatch(provider_id):
             raise TrustPolicyRefused("trust file provider id is invalid")
-        if not isinstance(entry, dict) or set(entry) != _PROVIDER_KEYS:
+        if (
+            not isinstance(entry, dict)
+            or not _PROVIDER_KEYS <= set(entry)
+            or set(entry) - _PROVIDER_KEYS - _OPTIONAL_PROVIDER_KEYS
+        ):
             raise TrustPolicyRefused(
-                f"provider {provider_id!r} must have exactly data_classes and worker_principal_ids"
+                f"provider {provider_id!r} must have data_classes and worker_principal_ids "
+                "(and may have allowed_license_labels)"
             )
         classes, principals = entry["data_classes"], entry["worker_principal_ids"]
         if (
@@ -115,10 +124,32 @@ def _canonical(value: Any) -> dict[str, Any]:
             "data_classes": [c for c in TRUST_CLASSES if c in classes],
             "worker_principal_ids": sorted(principals),
         }
+        if "allowed_license_labels" in entry:
+            canonical[provider_id]["allowed_license_labels"] = _license_labels(
+                provider_id, entry["allowed_license_labels"]
+            )
     document: dict[str, Any] = {"schema": SCHEMA, "providers": canonical}
     if mode != MODE_LISTED:
         document["mode"] = mode
     return document
+
+
+def _license_labels(provider_id: str, value: Any) -> list[str]:
+    from .license_labels import UNKNOWN_LINEAGE, valid_label
+
+    if (
+        not isinstance(value, list)
+        or not 1 <= len(value) <= MAX_ALLOWED_LICENSE_LABELS
+        or not all(valid_label(label) for label in value)
+        or len(set(value)) != len(value)
+        or UNKNOWN_LINEAGE in value
+    ):
+        raise TrustPolicyRefused(
+            f"provider {provider_id!r} allowed_license_labels must be 1 to "
+            f"{MAX_ALLOWED_LICENSE_LABELS} unique lowercase label slugs "
+            f"(not {UNKNOWN_LINEAGE!r})"
+        )
+    return sorted(value)
 
 
 def _registered(provider_id: str) -> bool:
@@ -159,6 +190,29 @@ class TrustPolicy:
         """Classes for the instance; {"public"} unless the principal is listed under
         exactly that provider."""
         return _allowed_in(self.document, provider_id, worker_principal_id)
+
+    def lists_license_labels(self, provider_id: str | None) -> bool:
+        """True when the trust file itself lists ``allowed_license_labels`` for the provider."""
+        entry = self.document.get("providers", {}).get(provider_id) if provider_id else None
+        return bool(entry) and "allowed_license_labels" in entry
+
+    def allowed_license_labels(self, provider_id: str | None) -> frozenset[str] | None:
+        """The licence labels the provider may receive, or None when it is unrestricted.
+
+        A provider the trust file does not list is refused anything labelled (fail closed):
+        it may receive only ``unlabelled`` data. A listed provider without the key is
+        unrestricted (the operator has recorded the provider and chose no label limit). No
+        provider id (not a placed stage) is unrestricted."""
+        if not provider_id:
+            return None
+        entry = self.document.get("providers", {}).get(provider_id)
+        if entry is None:
+            from .license_labels import UNLABELLED
+
+            return frozenset({UNLABELLED})
+        if "allowed_license_labels" not in entry:
+            return None
+        return frozenset(entry["allowed_license_labels"])
 
     def provider_for_worker(self, worker_principal_id: str) -> str | None:
         """None means the principal is unbound."""

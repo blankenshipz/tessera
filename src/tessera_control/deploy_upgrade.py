@@ -189,6 +189,10 @@ def focused_preflight(
         "files": [],
         "smoke": [],
         "unmapped": [],
+        "safe_unmapped": [],
+        "truncated": [],
+        "broad": [],
+        "narrowed": [],
         "reasons": {},
         "result": None,
         "duration_seconds": 0.0,
@@ -197,7 +201,18 @@ def focused_preflight(
     def done(status: str, result: str, summary: str) -> tuple[deploy_check.Finding, dict]:
         entry["result"] = result
         entry["duration_seconds"] = round(clock() - began, 3)
-        keys = ("selected", "files", "smoke", "unmapped", "reasons", "jobs")
+        keys = (
+            "selected",
+            "files",
+            "smoke",
+            "unmapped",
+            "safe_unmapped",
+            "truncated",
+            "broad",
+            "narrowed",
+            "reasons",
+            "jobs",
+        )
         detail = {key: entry[key] for key in keys}
         return _focused_finding(status, summary, result=result, **detail), entry
 
@@ -211,7 +226,11 @@ def focused_preflight(
     from . import focused_tests
 
     try:
-        changed = focused_tests.changed_files(root, f"{plan.from_revision}..{plan.source_revision}")
+        # ``exact``: the files that differ between the two releases, also when from_revision is
+        # not an ancestor of source_revision (the three-dot form would drop its own side).
+        changed = focused_tests.changed_files(
+            root, f"{plan.from_revision}..{plan.source_revision}", exact=True
+        )
         selection = focused_tests.select(
             root, changed, overrides=focused_tests.load_overrides(root), smoke=True
         )
@@ -227,8 +246,15 @@ def focused_preflight(
         files=files,
         smoke=sorted(selection.smoke),
         unmapped=sorted(selection.unmapped),
+        safe_unmapped=sorted(selection.safe_unmapped),
+        truncated=list(selection.truncated),
+        broad=sorted(selection.broad),
+        narrowed=list(selection.narrowed),
     )
-    if selection.unmapped and not selection.files:
+    if selection.unmapped:
+        # Fail closed: any changed file with no test blocks, not only an empty selection. The
+        # upgrade never falls back to the full suite and never goes ahead on a partial map; an
+        # operator declares files safe to leave untested in the overrides file ([unmapped]).
         return done(
             "fail",
             "unmapped",
@@ -249,7 +275,8 @@ def focused_preflight(
             "ok",
             "listed",
             f"{len(files)} focused test file(s) selected, not run in a dry run"
-            + (f" ({summary})" if summary else ""),
+            + (f" ({summary})" if summary else "")
+            + _limits_note(entry),
         )
     if blocked:
         return done("skipped", "not-run", "not run: the preflight is already blocked")
@@ -261,7 +288,24 @@ def focused_preflight(
         return done("fail", "error", f"focused tests could not run: {type(error).__name__}")
     if code != 0:
         return done("fail", "failed", f"focused tests failed (exit {code}, {len(files)} file(s))")
-    return done("ok", "passed", f"{len(files)} focused test file(s) passed (jobs {jobs})")
+    return done(
+        "ok",
+        "passed",
+        f"{len(files)} focused test file(s) passed (jobs {jobs})" + _limits_note(entry),
+    )
+
+
+def _limits_note(entry: dict[str, Any]) -> str:
+    """A short, honest note when the selection was cut, is broad or was narrowed by an override:
+    the details are in the finding and the receipt."""
+    parts = []
+    if entry["truncated"]:
+        parts.append(f"{len(entry['truncated'])} cut by a cap")
+    if entry["broad"]:
+        parts.append(f"{len(entry['broad'])} broad change(s)")
+    if entry["narrowed"]:
+        parts.append(f"{len(entry['narrowed'])} narrowed by an override")
+    return f" [{', '.join(parts)}: see the receipt]" if parts else ""
 
 
 def _reason_counts(selection: Any) -> dict[str, int]:

@@ -660,7 +660,12 @@ class CampaignSubmissionStore(CampaignStore):
             self._check_references(connection, creator, row["project_id"], spec)
             for stage in normalize(spec).stages:
                 self.check_stage_inputs(
-                    connection, stage, stage_provider(stage.provider), row["trust_policy_digest"]
+                    connection,
+                    stage,
+                    stage_provider(stage.provider),
+                    row["trust_policy_digest"],
+                    spec=normalize(spec),
+                    scope=(row["org_id"], row["project_id"]),
                 )
         except sqlite3.OperationalError:
             raise  # transient storage trouble is not a refusal

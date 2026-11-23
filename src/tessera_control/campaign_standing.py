@@ -324,7 +324,12 @@ def _check(runner, connection, row, now) -> tuple[str | None, Any]:
         runner.store._check_references(connection, live, row["project_id"], spec)
         for stage in normalize(spec).stages:
             runner.store.check_stage_inputs(
-                connection, stage, stage_provider(stage.provider), row["trust_policy_digest"]
+                connection,
+                stage,
+                stage_provider(stage.provider),
+                row["trust_policy_digest"],
+                spec=normalize(spec),
+                scope=(row["org_id"], row["project_id"]),
             )
     except (Conflict, Forbidden, NotFound, KeyError, ValueError) as error:
         return f"{type(error).__name__}: {error}"[:300], None

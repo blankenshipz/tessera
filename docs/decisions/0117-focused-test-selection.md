@@ -62,9 +62,17 @@ wrapper, selects too little. Neither result is a gate someone can trust or affor
      runs nothing;
    - under `--execute` the selection is run during preflight, before any service stops, before
      the backup and before the migration, so a failure costs no downtime;
-   - a failing run, a selection that cannot be mapped (changed files and no test for any of
-     them), a range git cannot resolve, or a checkout that is not at `source_revision` blocks the
-     upgrade; it never falls back to the full suite;
+   - a failing run, ANY changed file with no test that maps to it (not only an empty
+     selection), a range git cannot resolve, or a checkout that is not at `source_revision`
+     blocks the upgrade; it never falls back to the full suite. A file is exempt only when the
+     overrides file declares it safe to leave untested (`[unmapped] safe = [...]`, a list of
+     path globs that may never cover a Python file); such files are listed in the receipt as
+     `safe_unmapped`;
+   - the range is the exact difference between the two releases (`git diff from to`), so a
+     `from_revision` that is not an ancestor of `source_revision` does not lose its own side;
+   - the receipt and the dry-run summary also record what the selection left out: `truncated`
+     (a hub cap or `max_files` cut, with the counts), `broad` (changes that affect many tests) and
+     `narrowed` (a `replace` override that dropped importing or dependent tests, with the count);
    - when no repository checkout exists on the host (packaged installs), the step is skipped
      with a clear note rather than passed;
    - the receipt carries a `focused_tests` key only when the step is enabled, so existing
@@ -79,7 +87,11 @@ wrapper, selects too little. Neither result is a gate someone can trust or affor
 - A host cannot be saturated by a focused run, and nothing runs the full suite by accident.
 - An operator who enables the upgrade step gets a test gate that cannot cost downtime, at the
   price of a longer preflight and of needing a checkout on the host.
-- Limits: selection is static (names and import text), so dynamic imports and data-driven
+- `tessera dev focused-tests --run` also blocks (exit 2) when a changed file has no test, unless
+  `--allow-unmapped` is given; listing and explaining only warn.
+- Limits: the CLI range form `A..B` selects `git diff A...B` (changes on B's side since the merge
+  base); the upgrade uses the exact difference instead. Import detection is textual, so dynamic
+  imports are missed. Selection is static (names and import text), so dynamic imports and data-driven
   coupling are only caught by overrides or the full pre-merge run, which stays required once per
   branch.
 

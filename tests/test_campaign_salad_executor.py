@@ -684,10 +684,13 @@ def test_the_projection_keeps_only_recorded_keys_and_is_unclean_when_a_flag_is_m
 def test_main_once_writes_health_and_bad_config_exits_2(tmp_path, monkeypatch, capsys):
     h = Harness(tmp_path)
     h.control.items = []
-    monkeypatch.setattr(module, "load_config", lambda path: h.config)
+    (tmp_path / "state").mkdir(mode=0o700)
+    config = h.config.model_copy(update={"state_dir": tmp_path / "state"})
+    monkeypatch.setattr(module, "load_config", lambda path: config)
     monkeypatch.setattr(module, "build_executor", lambda config: h.executor)
     health = tmp_path / "health.json"
     assert module.main(["--config", "x", "--once", "--health-file", str(health)]) == 0
+    module.maintenance_lock._release_process_locks()
     document = json.loads(health.read_text())
     assert document["schema"] == "tessera.service-health.v1" and document["loops"] == 1
     assert stat.S_IMODE(os.stat(health).st_mode) == 0o600
@@ -699,12 +702,14 @@ def test_main_once_writes_health_and_bad_config_exits_2(tmp_path, monkeypatch, c
 def test_main_max_cycles_bounds_the_loop(tmp_path, monkeypatch):
     h = Harness(tmp_path)
     h.control.items = []
-    fast = h.config.model_copy(update={"poll_seconds": 0.01})
+    (tmp_path / "state").mkdir(mode=0o700)
+    fast = h.config.model_copy(update={"poll_seconds": 0.01, "state_dir": tmp_path / "state"})
     monkeypatch.setattr(module, "load_config", lambda path: fast)
     monkeypatch.setattr(module, "build_executor", lambda config: h.executor)
     health = tmp_path / "health.json"
     args = ["--config", "x", "--max-cycles", "2", "--health-file", str(health)]
     assert module.main(args) == 0
+    module.maintenance_lock._release_process_locks()
     assert json.loads(health.read_text())["loops"] == 2
 
 

@@ -46,6 +46,24 @@ entry; replacing the entry would drop the other workers listed there. Nothing li
 automatically: the file stays the operator's policy, and a refusal is the only thing the platform
 adds.
 
+## Limiting a provider by licence label
+
+A provider entry may also carry `allowed_license_labels`: a list of 1 to 16 unique label slugs (the
+same slugs a person adds to snapshots, see [licence labels](license-labels.md)). A provider the file lists
+without the key is unrestricted and the setting digest is unchanged; a provider the file does not list
+(a registered provider under `all_registered_providers`, say) is refused anything labelled and may receive
+only `unlabelled` data. Present, the provider receives a stage only if every
+effective label of every input, inherited through lineage, is in the list; unlabelled data needs
+`unlabelled` in it, and data whose lineage cannot be resolved (`unknown-lineage`) is always refused. It
+applies in every mode, `all_registered_providers` included, and only narrows what the data class rules
+admit.
+
+```json
+"salad": {"data_classes": ["public", "private_derived"],
+          "worker_principal_ids": ["<worker-principal-id>"],
+          "allowed_license_labels": ["cc-by", "public-domain"]}
+```
+
 ## Upgrade impact
 
 On upgrade without a file, local CPU grants on `private_derived` releases (including

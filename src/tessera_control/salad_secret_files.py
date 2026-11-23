@@ -183,6 +183,10 @@ class PrivateFileSecretResolver:
                     previous = None
                 else:
                     old.zeroize()
+                if previous and previous.get("revoked") is True:
+                    # Checked under the lock, so a revocation that lands while a caller was
+                    # validating a new key is never silently undone by the enrollment.
+                    raise ValueError("credential reference is revoked")
                 if previous and version <= previous["version"]:
                     raise ValueError("credential version must increase")
                 self._write(

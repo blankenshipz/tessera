@@ -60,12 +60,15 @@ disabled by default.
 
 When enabled, preflight adds the finding `tests.focused`. A dry run lists the selected test files
 and runs nothing. Under `--execute` it runs them in preflight, before the backup, the migration
-and any service stop, so a failure costs no downtime. A failing run, a selection that cannot map
-the changed files (the upgrade never falls back to the full suite), a range git cannot resolve, or
-a checkout that is not at `source_revision` blocks the upgrade. With no repository checkout at
+and any service stop, so a failure costs no downtime. A failing run, ANY changed file that no
+focused test maps to (the upgrade never falls back to the full suite; files the overrides file
+declares safe under `[unmapped] safe` are exempt and listed), a range git cannot resolve, or a
+checkout that is not at `source_revision` blocks the upgrade. The range is the exact difference
+between the two releases, also when `from_revision` is not an ancestor. With no repository checkout at
 `repo_root` (no `tests/` and `src/`, as on a packaged install) the step is skipped and the finding
 says so. The receipt gets a `focused_tests` key (range, jobs, selected files, smoke set, unmapped
-files, result, duration) only when the step is enabled.
+and declared-safe files, what a cap cut, broad changes, selections narrowed by an override, result,
+duration) only when the step is enabled.
 
 **Backup.** A database already at the new schema gets the validated `tessera backup` under
 `max_backup_bytes`. An older database cannot be backed up that way, so it gets a pre-migration

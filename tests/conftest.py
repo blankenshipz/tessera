@@ -16,7 +16,33 @@ from tessera_control.approval_trust import AUTOMATION_KEY
 from tessera_control.store import Store
 
 
+def _bridge_unlanded_migrations() -> None:
+    """Pass-through steps for schema versions whose migrations live on changes not merged yet.
+
+    A change that owns a reserved schema number above the base's latest cannot migrate an old
+    database on its own: the versions in between belong to other changes. Until they land, tests
+    that walk the whole chain get a version bump for each missing step (data is not touched), so
+    the chain is contiguous. A real migration registered by the source always wins (``setdefault``)
+    and this does nothing once the chain has no gap. Tests only; the product code has no such
+    shim.
+    """
+    from tessera_control import migrations
+
+    def bump(target):
+        def step(connection):
+            connection.execute(
+                "UPDATE schema_meta SET schema_version=? WHERE singleton=1", (target,)
+            )
+
+        return step
+
+    for version in range(1, migrations.LATEST_SCHEMA_VERSION):
+        if version not in migrations.MIGRATIONS and version >= 80:
+            migrations.MIGRATIONS[version] = bump(version + 1)
+
+
 def pytest_configure(config):
+    _bridge_unlanded_migrations()
     config.addinivalue_line(
         "markers", "real_owner_trust: do not auto-label owner credentials as test automation"
     )

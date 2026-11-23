@@ -14,7 +14,7 @@ from test_result_checkpoints import _reconciled_manifest
 from tessera_control.api import create_app
 from tessera_control.experiments import ExperimentStore
 from tessera_control.experiments_models import CreateExperiment
-from tessera_control.store import NotFound, Store, _token_hash, utc_now
+from tessera_control.store import NotFound, Store, StoreError, _token_hash, utc_now
 
 ENV_BASE = "e" * 64
 ENV_NEW = "f" * 64
@@ -158,3 +158,45 @@ def test_a_legacy_design_without_the_fields_still_works(tmp_path: Path) -> None:
     assert legacy["designs"][0]["metric"] is None
     revised = _command(records.revise_design, owner, created["id"], payload=_typed(1, grant))
     assert revised["design"]["metric"] == "wall_time_seconds"
+
+
+def test_dropping_a_recorded_value_needs_a_change_reason(tmp_path: Path) -> None:
+    state, owner, _worker, grant, *_ = _reconciled_manifest(tmp_path)
+    records = ExperimentStore(state)
+    created = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_typed(grant=grant)
+    )
+    # A revision records exactly what it states: nothing is carried forward.
+    for dropped in (
+        _design(1, grant),  # neither metric nor either environment digest
+        _typed(1, grant, metric=None),  # metric dropped, digests kept
+        _typed(1, grant, new=None),  # one environment digest dropped
+    ):
+        with pytest.raises(StoreError, match="needs a change_reason"):
+            _command(records.revise_design, owner, created["id"], payload=dropped)
+    # Nothing was written by the refused attempts.
+    assert [d["revision"] for d in records.export_experiment(owner, created["id"])["designs"]] == [
+        1
+    ]
+    revised = _command(
+        records.revise_design,
+        owner,
+        created["id"],
+        payload=_design(1, grant) | {"change_reason": "The metric is no longer meaningful."},
+    )
+    assert revised["design"]["metric"] is None
+    assert _env(revised["design"]) == {"baseline": None, "intervention": None}
+
+
+def test_revising_without_a_change_reason_is_fine_when_nothing_was_dropped(tmp_path: Path) -> None:
+    state, owner, _worker, grant, *_ = _reconciled_manifest(tmp_path)
+    records = ExperimentStore(state)
+    created = _command(
+        records.create_experiment, owner, grant["project_id"], payload=_design(grant=grant)
+    )
+    revised = _command(
+        records.revise_design, owner, created["id"], payload=_typed(1, grant)
+    )  # adding values to a design that had none needs no reason
+    assert revised["design"]["metric"] == "wall_time_seconds"
+    again = _command(records.revise_design, owner, created["id"], payload=_typed(2, grant))
+    assert again["design"]["metric"] == "wall_time_seconds"  # unchanged values, no reason needed

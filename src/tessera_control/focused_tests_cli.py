@@ -21,8 +21,9 @@ NO_CHECKOUT = (
 
 
 def add_dev_commands(subcommands: argparse._SubParsersAction) -> None:
-    command = subcommands.add_parser("dev", help="developer commands that need a checkout")
-    actions = command.add_subparsers(dest="dev_action", required=True)
+    from .dev_cli import dev_actions
+
+    actions = dev_actions(subcommands)
     focused = actions.add_parser(
         "focused-tests",
         help="select (and with --run, run) the tests for the changed code",
@@ -48,6 +49,11 @@ def add_dev_commands(subcommands: argparse._SubParsersAction) -> None:
     focused.add_argument("--max-files", type=int, help="cap the number of selected files")
     focused.add_argument(
         "--full", action="store_true", help="run the whole suite instead (requires --run)"
+    )
+    focused.add_argument(
+        "--allow-unmapped",
+        action="store_true",
+        help="with --run: go ahead although some changed files have no test (blocks by default)",
     )
     focused.add_argument("--root", type=Path, help="a directory inside the checkout (default cwd)")
     focused.add_argument("--base", default="main", help="branch to diff against (default main)")
@@ -98,6 +104,8 @@ def focused_argv(arguments: argparse.Namespace, root: Path) -> list[str]:
         argv += ["--max-files", str(arguments.max_files)]
     if arguments.full:
         argv.append("--full")
+    if arguments.allow_unmapped:
+        argv.append("--allow-unmapped")
     # After "--" so focused_tests.main never parses them as its own options; the range goes
     # first there because main takes the first bare A..B token as the range and drops it.
     rest = ([] if arguments.range is None else [arguments.range]) + arguments.pytest_args

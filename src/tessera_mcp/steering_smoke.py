@@ -12,6 +12,11 @@ reads no credential. ``--execute`` with the exact ``--confirm`` phrase runs it a
 control plane. Two credentials are used on purpose, as in production: an enrolled agent credential
 (submit, read, pause, resume, cancel) and a person's session credential used only for the
 approval, which no agent credential can give.
+
+``--smoke-credentials-dir DIR`` reads the owner-issued ``smoke-grant.json`` (and uses
+``DIR/agent.token`` and ``DIR/approver.token``) so no credential has to be hand-issued; the grant is
+local-docker only, $0 and short-lived, all enforced by the control plane. The grant id is recorded
+as ``smoke_grant_id`` in the report. No token is ever printed or logged.
 """
 
 from __future__ import annotations
@@ -21,16 +26,20 @@ import asyncio
 import json
 import os
 import secrets
+import stat
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 CONFIRM_PHRASE = "mcp-steering-smoke-local-docker"
 PROVIDER = "local-docker"
 RUNTIME = "docker-cpu-v1"
+GRANT_SCHEMA = "tessera.smoke-credentials.v1"
+GRANT_FILE = "smoke-grant.json"
 TERMINAL = frozenset({"succeeded", "stopped", "failed", "cancelled"})
 STEPS = (
     ("preflight", "tessera_status, tessera_list_snapshots, tessera_validate_campaign_spec"),
@@ -51,15 +60,95 @@ class SmokeFailure(AssertionError):
     """A step did not leave the record the smoke expects."""
 
 
+class GrantRefused(ValueError):
+    """The smoke-credentials directory or its grant file cannot be used."""
+
+
+@dataclass(frozen=True)
+class Grant:
+    grant_id: str
+    project_id: str
+    destination: str
+    expires_at: str
+    agent_token_file: Path
+    approver_token_file: Path
+
+
+def _parse_time(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise GrantRefused("the grant's expires_at is not a timestamp")
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise GrantRefused("the grant's expires_at is not a timestamp") from error
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def load_grant(directory: str, now: datetime | None = None) -> Grant:
+    """Read and validate ``DIR/smoke-grant.json``; never reads a token."""
+    root = Path(directory)
+    if not root.is_absolute():
+        raise GrantRefused("--smoke-credentials-dir must be an absolute path")
+    try:
+        if not stat.S_ISDIR(root.stat().st_mode):
+            raise GrantRefused("--smoke-credentials-dir is not a directory")
+    except OSError as error:
+        raise GrantRefused("--smoke-credentials-dir cannot be read") from error
+    if root.stat().st_mode & 0o077:
+        raise GrantRefused("--smoke-credentials-dir must not be group or world accessible")
+    files = {name: root / name for name in (GRANT_FILE, "agent.token", "approver.token")}
+    for name, path in files.items():
+        try:
+            mode = path.stat().st_mode
+        except OSError as error:
+            raise GrantRefused(f"{name} is missing from the smoke-credentials directory") from error
+        if not stat.S_ISREG(mode) or mode & 0o077:
+            raise GrantRefused(f"{name} must be a regular owner-only (0600) file")
+    try:
+        data = json.loads(files[GRANT_FILE].read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise GrantRefused("smoke-grant.json is not valid JSON") from error
+    if not isinstance(data, dict) or data.get("schema") != GRANT_SCHEMA:
+        raise GrantRefused(f"smoke-grant.json is not a {GRANT_SCHEMA} document")
+    if data.get("providers") != [PROVIDER]:
+        raise GrantRefused(f"the grant must allow exactly the {PROVIDER} provider")
+    budget = data.get("max_budget_cents")
+    if isinstance(budget, bool) or budget != 0:
+        raise GrantRefused("the grant's max_budget_cents must be 0")
+    text = {}
+    for key in ("grant_id", "project_id", "destination"):
+        value = data.get(key)
+        if not isinstance(value, str) or not value:
+            raise GrantRefused(f"the grant has no {key}")
+        text[key] = value
+    expires = _parse_time(data.get("expires_at"))
+    if expires <= (now or datetime.now(UTC)):
+        raise GrantRefused("the smoke grant has expired: issue a new one")
+    return Grant(
+        text["grant_id"],
+        text["project_id"],
+        text["destination"],
+        data["expires_at"],
+        files["agent.token"],
+        files["approver.token"],
+    )
+
+
 @dataclass
 class Report:
     steps: list[dict[str, Any]] = field(default_factory=list)
+    grant_id: str | None = None
 
     def record(self, step: str, tool: str, **evidence: Any) -> None:
         self.steps.append({"step": step, "tool": tool, "ok": True, "evidence": evidence})
 
     def document(self) -> dict[str, Any]:
-        return {"schema": "tessera.mcp-steering-smoke.v1", "ok": True, "steps": self.steps}
+        return {
+            "schema": "tessera.mcp-steering-smoke.v1",
+            "ok": True,
+            "smoke_grant_id": self.grant_id,
+            "steps": self.steps,
+        }
 
 
 def smoke_spec(image: str, snapshot: dict[str, Any], name: str = "mcp-steering-smoke") -> dict:
@@ -67,7 +156,7 @@ def smoke_spec(image: str, snapshot: dict[str, Any], name: str = "mcp-steering-s
     return {
         "version": 2,
         "name": name,
-        "budget_cap_cents": 1,
+        "budget_cap_cents": 0,
         "deadline_seconds": 3600,
         "stages": [
             {
@@ -78,7 +167,7 @@ def smoke_spec(image: str, snapshot: dict[str, Any], name: str = "mcp-steering-s
                 "argv": ["python", "-c", "open('result.json','w').write('{\"ok\": true}')"],
                 "outputs": [{"name": "result", "path": "result.json", "max_bytes": 1024}],
                 "max_duration_seconds": 60,
-                "max_exposure_cents": 1,
+                "max_exposure_cents": 0,
                 "inputs": [
                     {
                         "kind": "snapshot",
@@ -137,6 +226,7 @@ def run_smoke(
     *,
     image: str,
     snapshot_id: str | None = None,
+    grant_id: str | None = None,
     wait_seconds: float = 120.0,
     poll_seconds: float = 2.0,
     sleep: Callable[[float], None] = time.sleep,
@@ -144,7 +234,7 @@ def run_smoke(
 ) -> dict[str, Any]:
     """Run the steps. ``agent`` and ``agent_approve`` use the agent credential, ``person`` the
     person's; each is ``call(tool_name, **arguments) -> dict`` and raises on a refusal."""
-    report = Report()
+    report = Report(grant_id=grant_id)
 
     status = agent("tessera_status")
     snapshot = pick_snapshot(agent("tessera_list_snapshots"), snapshot_id)
@@ -280,7 +370,14 @@ def _brief(value: Any) -> dict[str, Any]:
     return {k: value[k] for k in ("status", "revision", "id") if k in value}
 
 
-def plan(arguments: argparse.Namespace) -> dict[str, Any]:
+def plan(arguments: argparse.Namespace, grant: Grant | None = None) -> dict[str, Any]:
+    document = _plan(arguments)
+    if grant is not None:
+        document["smoke_grant"] = {"grant_id": grant.grant_id, "expires_at": grant.expires_at}
+    return document
+
+
+def _plan(arguments: argparse.Namespace) -> dict[str, Any]:
     return {
         "mode": "dry-run",
         "provider": PROVIDER,
@@ -334,6 +431,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--execute", action="store_true", help="run against a live control plane")
     p.add_argument("--confirm", help=f"required with --execute: {CONFIRM_PHRASE}")
     p.add_argument("--control-url", help="control plane origin (https, or loopback http)")
+    p.add_argument(
+        "--smoke-credentials-dir",
+        help="absolute directory from `tessera dev smoke-credentials issue`: fills in the "
+        "project, destination and token files unless given explicitly",
+    )
     p.add_argument("--project-id")
     p.add_argument("--destination", help="the agent credential's enrolled destination")
     p.add_argument("--ca-file", help="CA bundle for the control plane's certificate")
@@ -348,8 +450,19 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
+    grant: Grant | None = None
+    if arguments.smoke_credentials_dir:
+        try:
+            grant = load_grant(arguments.smoke_credentials_dir)
+        except GrantRefused as refusal:
+            print(f"refused: {refusal}", file=sys.stderr)
+            return 2
+        arguments.project_id = arguments.project_id or grant.project_id
+        arguments.destination = arguments.destination or grant.destination
+        arguments.agent_token_file = arguments.agent_token_file or str(grant.agent_token_file)
+        arguments.person_token_file = arguments.person_token_file or str(grant.approver_token_file)
     if not arguments.execute:
-        print(json.dumps(plan(arguments), indent=2, sort_keys=True))
+        print(json.dumps(plan(arguments, grant), indent=2, sort_keys=True))
         return 0
     if arguments.confirm != CONFIRM_PHRASE:
         print(f"refused: --execute needs --confirm {CONFIRM_PHRASE}", file=sys.stderr)
@@ -387,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_approve,
             image=arguments.image,
             snapshot_id=arguments.snapshot_id,
+            grant_id=grant.grant_id if grant else None,
             wait_seconds=arguments.wait_seconds,
         )
     except SmokeFailure as failure:
