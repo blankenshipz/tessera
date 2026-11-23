@@ -55,6 +55,9 @@ The service scans periodically: `tessera serve --campaign-stuck-scan-seconds N` 
 A scan reads the database only; it does not contact providers or workers. If a project's scan
 raises, a `campaign.stuck_scan_failed` event (project id, exception class, consecutive failures) is
 recorded at the first failure and every tenth after.
+The failure counter is held in memory by the scanner and resets on restart, so a restarting project
+that is still failing records a fresh first-failure event. The event carries no receipt digest, and a
+later successful scan clears the counter without recording a recovery event.
 
 Routes, under `/projects/{project_id}/campaign-stuck`:
 

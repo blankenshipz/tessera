@@ -84,6 +84,7 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_cancel_campaign",
         "tessera_list_campaigns",
         "tessera_get_campaign_receipt",
+        "tessera_campaign_report",
         "tessera_campaign_outputs",
         "tessera_campaign_logs",
         "tessera_campaign_budget",

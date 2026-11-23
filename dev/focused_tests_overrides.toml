@@ -1,0 +1,89 @@
+# Overrides for dev/focused_tests.py (tessera_control.focused_tests).
+#
+# Every path and glob here is checked on load: an unknown key, a test file that does not
+# exist, a glob that matches nothing or a bad cap is an error (exit 2), so this file cannot
+# silently rot. `match` globs are fnmatch patterns on repository-relative changed paths.
+# `mode = "add"` adds `tests` to the computed selection; `mode = "replace"` replaces the
+# computed importers and dependents with `tests` (tests named for the module are kept).
+# `cap` limits how many test files one matching change may select; a cut keeps
+# override > changed > named > direct import > dependent and is reported. It never widens
+# to the full suite.
+
+[limits]
+max_files = 60 # global cap on selected test files (the smoke set is extra)
+max_jobs = 4   # most pytest processes --jobs may start
+hub_cap = 40   # per changed path, when no [[module]] cap applies
+
+[smoke]
+files = [
+  "tests/test_schema_upgrade_parity.py",
+  "tests/test_campaign_schema_v65.py",
+  "tests/test_campaign_receipt_chaining.py",
+  "tests/test_campaign_code_receipts.py",
+  "tests/test_campaign_api.py",
+  "tests/test_execution_api.py",
+  "tests/test_campaign_cli.py",
+  "tests/test_campaign_runner.py",
+  "tests/test_deploy_upgrade_plan.py",
+  "tests/test_deploy_check_cli.py",
+  "tests/test_docs_links.py",
+]
+
+[[module]]
+note = "schema changes: every migration test plus the parity and fingerprint checks"
+match = ["src/tessera_control/migrations.py"]
+mode = "add"
+tests = [
+  "tests/test_*_migration.py",
+  "tests/test_migration_convergence.py",
+  "tests/test_migration_registry.py",
+  "tests/test_schema_upgrade_parity.py",
+  "tests/test_schema_fingerprint.py",
+  "tests/test_campaign_schema_v65.py",
+]
+cap = 25
+
+[[module]]
+note = "the store is imported by most tests; run its core tests instead of every importer"
+match = ["src/tessera_control/store.py"]
+mode = "replace"
+tests = [
+  "tests/test_campaign_store.py",
+  "tests/test_schema_upgrade_parity.py",
+  "tests/test_migration_convergence.py",
+  "tests/test_schema_fingerprint.py",
+  "tests/test_campaign_api.py",
+  "tests/test_execution_api.py",
+  "tests/test_records_api.py",
+  "tests/test_artifacts.py",
+  "tests/test_campaign_runner.py",
+  "tests/test_campaign_receipt_chaining.py",
+]
+cap = 40
+
+[[module]]
+note = "the HTTP app: the API test files first"
+match = ["src/tessera_control/api.py"]
+mode = "add"
+tests = ["tests/test_*_api.py"]
+cap = 40
+
+[[module]]
+match = ["src/tessera_control/campaign_receipts.py"]
+mode = "add"
+tests = [
+  "tests/test_campaign_receipt_chaining.py",
+  "tests/test_campaign_code_receipts.py",
+  "tests/test_execution_run_receipts.py",
+]
+
+[[module]]
+match = ["src/tessera_control/campaign_runner.py"]
+mode = "add"
+tests = [
+  "tests/test_campaign_runner.py",
+  "tests/test_campaign_frames_runner.py",
+  "tests/test_campaign_salad_runner.py",
+  "tests/test_campaign_submit_runner.py",
+  "tests/test_campaign_submit_runner_main.py",
+]

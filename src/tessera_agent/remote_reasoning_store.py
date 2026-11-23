@@ -173,7 +173,6 @@ class ReasoningStore:
             os.close(fd)
         self.directory = directory
         self.db = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS)
-        self.db.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA synchronous=FULL")
         self._migrate()

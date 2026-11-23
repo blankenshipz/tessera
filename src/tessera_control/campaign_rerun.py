@@ -99,14 +99,15 @@ def load_source(connection: sqlite3.Connection, campaign: sqlite3.Row) -> dict[s
                 "custody_released": custody_released(connection, row["manifest_id"]),
             }
         )
+    tree = rerun_tree(connection, campaign)
     return {
         "id": campaign["id"],
         "status": campaign["status"],
         "spec": json.loads(campaign["spec_json"]),
         "spec_digest": campaign["spec_digest"],
         "settled_cents": campaign["settled_cents"],
-        "lineage_remaining_cents": lineage_remaining(connection, campaign),
-        "lineage_holding": lineage_holding(connection, campaign),
+        "lineage_remaining_cents": lineage_remaining(connection, campaign, tree),
+        "lineage_holding": lineage_holding(connection, campaign, tree),
         "stages": stages,
         "outputs": outputs,
     }
@@ -172,9 +173,17 @@ def rerun_tree(connection: sqlite3.Connection, campaign: sqlite3.Row) -> dict[st
     }
 
 
-def lineage_holding(connection: sqlite3.Connection, campaign: sqlite3.Row) -> list[dict[str, Any]]:
-    """Unfinished members of the tree holding budget (never the first campaign), for messages."""
-    tree = rerun_tree(connection, campaign)
+def lineage_holding(
+    connection: sqlite3.Connection,
+    campaign: sqlite3.Row,
+    tree: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Unfinished members of the tree holding budget (never the first campaign), for messages.
+
+    ``tree`` is an already computed ``rerun_tree`` result, to avoid walking the tree twice.
+    """
+    if tree is None:
+        tree = rerun_tree(connection, campaign)
     return [
         {"campaign_id": m["campaign_id"], "committed_cents": m["committed_cents"]}
         for m in tree["members"]
@@ -196,9 +205,17 @@ def holding_hint(source: dict[str, Any]) -> str:
     )
 
 
-def lineage_remaining(connection: sqlite3.Connection, campaign: sqlite3.Row) -> int:
-    """What is left of the tree's first cap for one more re-run (see ``rerun_tree``)."""
-    tree = rerun_tree(connection, campaign)
+def lineage_remaining(
+    connection: sqlite3.Connection,
+    campaign: sqlite3.Row,
+    tree: dict[str, Any] | None = None,
+) -> int:
+    """What is left of the tree's first cap for one more re-run (see ``rerun_tree``).
+
+    ``tree`` is an already computed ``rerun_tree`` result, to avoid walking the tree twice.
+    """
+    if tree is None:
+        tree = rerun_tree(connection, campaign)
     return 0 if tree["truncated"] else int(tree["remaining_cents"])  # unread members: fail closed
 
 

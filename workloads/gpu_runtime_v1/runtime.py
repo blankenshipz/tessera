@@ -555,6 +555,7 @@ def fetch_one(item, dest_path, deadline, opener=None, redirect_hosts=frozenset()
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     part = dest_path + ".part"
     digest, total = hashlib.sha256(), 0
+    started = time.monotonic()
     try:
         response = open_following(item["url"], deadline, opener, redirect_hosts)
         try:
@@ -592,7 +593,8 @@ def fetch_one(item, dest_path, deadline, opener=None, redirect_hosts=frozenset()
     except Exception:
         _unlink(part)
         raise Failure("fetch") from None
-    return {"url": item["url"], "sha256": item["sha256"], "bytes": total}
+    seconds = round(time.monotonic() - started, 3)
+    return {"url": item["url"], "sha256": item["sha256"], "bytes": total, "seconds": seconds}
 
 
 def _unlink(path):

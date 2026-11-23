@@ -16,8 +16,8 @@ sequence once the grant had expired.
    reconciled its grant and freed the slot before the upload could register.
 2. **Expiry marked the output late.** `ArtifactStore._late` set `late = 1` on any artifact or
    manifest that arrived after the grant or lease expiry, even while the attempt was held open.
-   Late manifests are refused when a result is committed or accepted (`result_checkpoints.py`, `result_acceptances.py`), so a
-   held attempt still could not yield a usable receipt.
+   Late manifests are refused when a result is committed or accepted (`result_checkpoints.py`,
+   `result_acceptances.py`), so a held attempt still could not yield a usable receipt.
 
 From the code (no live logs were available, so this is derived, not observed): the repeated
 `/complete` 201 answers are a caller rerunning the whole upload set after a later step fails,
@@ -72,6 +72,11 @@ longer `active` or `cancel_requested`).
    the grant had expired, and a manifest is late if any of its artifacts is. This enforces, with
    control's own time, what the receipt checks of decision 5 can only cross-check.
 
+   The grace is measured from the upload's begin time. Parts sent after the begin are not gated
+   again, because the digest declared at begin fixes the bytes. The existing hold ceiling still
+   applies: output registered after `MAX_EXTENDED_HOLD_SECONDS` (2 h) past the exit is late
+   whatever the grace says.
+
 ## Consequences
 
 - A registered upload that finishes minutes after the grant expired is stored on time, its
@@ -92,5 +97,5 @@ longer `active` or `cancel_requested`).
   (`MAX_OBSERVATION_FUTURE_SKEW`, 5 s) is refused a receipt for a run that finished after the exit
   control recorded, the same way the endpoint already refuses a future `finished_at`.
 - A worker needing longer than 120 s between its exit and registering its upload is still
-  resolved, and (decision 6) its late output is marked late. A worker-side "registering" signal sent with the exit report would remove that timing
-  dependence; it is a follow-up.
+  resolved, and (decision 6) its late output is marked late. A worker-side "registering" signal sent
+  with the exit report would remove that timing dependence; it is a follow-up.

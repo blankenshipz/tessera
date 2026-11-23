@@ -22,6 +22,7 @@ from .campaign_models import (
     DOCKER_CPU_RUNTIME,
     LOCAL_DOCKER_PROVIDER,
     NormalStage,
+    public_fetch_policy,
 )
 from .campaign_providers import (
     ConfigSection,
@@ -141,6 +142,9 @@ class WorkerGrantProvider:
             network_enabled=False,
             max_output_bytes=stage.max_output_bytes,
             max_scratch_bytes=stage.scratch_bytes,
+            # ADR 0097: the worker's supervisor fetches pinned public files (no egress for the
+            # container); None for a stage without a public_artifact keeps the plan digest.
+            public_fetch=public_fetch_policy(stage),
         ).model_dump(mode="json")
 
     # -- submit -----------------------------------------------------------------------

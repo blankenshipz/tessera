@@ -1,0 +1,266 @@
+"""Verified download of large public files on the executing provider.
+
+Each file is fetched from its pinned https URL with a manual, host-checked redirect chain,
+hashed while streaming, and accepted only when its sha256 equals the pin and its size stays
+within the pinned cap. A failed file leaves nothing in the destination. Only the returned
+receipt rows (source host, digest, bytes, timing) are meant to travel back to the control plane.
+
+Error messages carry a closed code and a host, never a URL query string or credential.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Iterable, Iterator
+from pathlib import Path
+from typing import Any
+
+from tessera_control.public_fetch_models import canonical_public_host
+
+CODES = frozenset(
+    {
+        "host_not_allowed",
+        "scheme_not_allowed",
+        "too_many_redirects",
+        "bad_status",
+        "redirect_without_location",
+        "size_exceeded",
+        "size_mismatch",
+        "digest_mismatch",
+        "io_error",
+    }
+)
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_REDIRECTS = (301, 302, 303, 307, 308)
+_CHUNK = 1 << 20
+
+Opener = Callable[[str], tuple[int, dict[str, str], Iterator[bytes]]]
+
+
+class PublicFetchError(ValueError):
+    """A refused or failed fetch. ``code`` is one of CODES; the message is code and host only."""
+
+    def __init__(self, code: str, host: str | None = None):
+        assert code in CODES
+        self.code = code
+        self.host = host
+        super().__init__(f"{code}: {host}" if host else code)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None  # redirects are followed manually, host by host
+
+
+def http_open(url: str) -> tuple[int, dict[str, str], Iterator[bytes]]:
+    """One GET without automatic redirects: (status, headers, iterator of chunks)."""
+    request = urllib.request.Request(url, headers={"User-Agent": "tessera-public-fetch/1"})
+    try:
+        response = urllib.request.build_opener(_NoRedirect).open(request, timeout=120)
+    except urllib.error.HTTPError as err:
+        return err.code, dict(err.headers), iter(())
+    return response.status, dict(response.headers), iter(lambda: response.read(_CHUNK), b"")
+
+
+def _check_url(url: str, allowed: frozenset[str], *, pinned: bool = False) -> str:
+    """Scheme, host and port rules for one hop. A pinned URL (the first hop) also may not carry
+    a query or fragment; a redirect target may (signed content-network URLs do)."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise PublicFetchError("host_not_allowed") from None
+    if parsed.scheme != "https":
+        raise PublicFetchError("scheme_not_allowed", host)
+    if not host or parsed.username is not None or parsed.password is not None:
+        raise PublicFetchError("host_not_allowed", host)
+    canonical = canonical_public_host(
+        host
+    )  # trailing dot, case, IDNA; refuses IP forms, internal names
+    if port not in (None, 443) or canonical is None:
+        raise PublicFetchError("host_not_allowed", host)
+    if canonical not in allowed or (pinned and (parsed.query or parsed.fragment)):
+        raise PublicFetchError("host_not_allowed", host)
+    return canonical
+
+
+def _open_chain(url: str, allowed: frozenset[str], opener: Opener, max_hops: int):
+    for hop in range(max_hops + 1):
+        host = _check_url(url, allowed, pinned=hop == 0)
+        status, headers, body = opener(url)
+        if status in _REDIRECTS:
+            location = {k.lower(): v for k, v in headers.items()}.get("location")
+            if not location:
+                raise PublicFetchError("redirect_without_location", host)
+            url = urllib.parse.urljoin(url, location)
+            continue
+        if status != 200:
+            raise PublicFetchError("bad_status", host)
+        return host, headers, body
+    raise PublicFetchError("too_many_redirects", urllib.parse.urlsplit(url).hostname)
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    digest, size = hashlib.sha256(), 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def _validate_pin(pin: dict[str, Any]) -> None:
+    name = pin.get("name")
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name) or ".." in name:
+        raise PublicFetchError("io_error")
+    if not isinstance(pin.get("sha256"), str) or not _SHA_RE.fullmatch(pin["sha256"]):
+        raise PublicFetchError("digest_mismatch")
+    max_bytes = pin.get("max_bytes")
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+        raise PublicFetchError("size_exceeded")
+    if not isinstance(pin.get("url"), str):
+        raise PublicFetchError("host_not_allowed")
+
+
+def _from_cache(cache: Path, pin: dict[str, Any], final: Path) -> int | None:
+    entry = cache / pin["sha256"]
+    if not entry.is_file():
+        return None
+    try:
+        digest, size = _hash_file(entry)
+    except OSError:
+        digest, size = "", -1
+    if digest != pin["sha256"] or size > pin["max_bytes"]:
+        entry.unlink(missing_ok=True)  # never trusted: corrupt entries are dropped and refetched
+        return None
+    try:
+        shutil.copyfile(entry, final)  # a copy, never a link: the mount accepts one link only
+        os.chmod(final, 0o444)
+    except OSError:
+        final.unlink(missing_ok=True)
+        raise PublicFetchError("io_error") from None
+    return size
+
+
+def _download(
+    pin: dict[str, Any], allowed, opener: Opener, max_hops: int, part: Path
+) -> tuple[str, str, int]:
+    host, headers, body = _open_chain(pin["url"], allowed, opener, max_hops)
+    declared = {k.lower(): v for k, v in headers.items()}.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > pin["max_bytes"]:
+        raise PublicFetchError("size_exceeded", host)
+    digest, size = hashlib.sha256(), 0
+    try:
+        with part.open("wb") as out:
+            for chunk in body:
+                size += len(chunk)
+                if size > pin["max_bytes"]:
+                    raise PublicFetchError("size_exceeded", host)
+                digest.update(chunk)
+                out.write(chunk)
+    except OSError:
+        raise PublicFetchError("io_error", host) from None
+    if digest.hexdigest() != pin["sha256"]:
+        raise PublicFetchError("digest_mismatch", host)
+    return host, digest.hexdigest(), size
+
+
+def fetch_public_files(
+    files: list[dict[str, Any]],
+    *,
+    dest: str | Path,
+    redirect_hosts: Iterable[str] = (),
+    cache_dir: str | Path | None = None,
+    opener: Opener = http_open,
+    clock: Callable[[], float] = time.monotonic,
+    max_hops: int = 3,
+) -> list[dict[str, Any]]:
+    """Fetch and verify every pinned file into ``dest``; return one receipt row per file."""
+    for pin in files:
+        _validate_pin(pin)
+    named = [urllib.parse.urlsplit(pin["url"]).hostname for pin in files] + list(redirect_hosts)
+    allowed = frozenset(h for h in map(canonical_public_host, named) if h is not None)
+    dest_dir = Path(dest)
+    cache = Path(cache_dir) if cache_dir is not None else None
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if cache is not None:
+            cache.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise PublicFetchError("io_error") from None
+    rows: list[dict[str, Any]] = []
+    for pin in files:
+        final, part = dest_dir / pin["name"], dest_dir / (pin["name"] + ".part")
+        pinned_host = canonical_public_host(urllib.parse.urlsplit(pin["url"]).hostname) or ""
+        started = clock()
+        _check_url(pin["url"], allowed, pinned=True)  # also before a cache hit: pins are rules too
+        cached_size = _from_cache(cache, pin, final) if cache is not None else None
+        if cached_size is not None:
+            size, cached = cached_size, True
+        else:
+            cached = False
+            try:
+                _, _, size = _download(pin, allowed, opener, max_hops, part)
+                final.unlink(missing_ok=True)
+                os.chmod(part, 0o444)
+                os.replace(part, final)
+                if cache is not None:  # written only after verification
+                    _store_cache(cache, pin["sha256"], final)
+            except BaseException:
+                part.unlink(missing_ok=True)
+                final.unlink(missing_ok=True)
+                raise
+        rows.append(
+            {
+                "name": pin["name"],
+                "source_host": pinned_host,
+                "sha256": pin["sha256"],
+                "bytes": size,
+                "seconds": round(clock() - started, 3),
+                "cached": cached,
+            }
+        )
+    return rows
+
+
+def _store_cache(cache: Path, digest: str, source: Path) -> None:
+    entry, tmp = cache / digest, cache / f".{digest}.tmp"
+    try:
+        tmp.unlink(missing_ok=True)
+        shutil.copyfile(source, tmp)  # a copy, never a link: the mounted file keeps one link
+        os.replace(tmp, entry)
+    except OSError:
+        tmp.unlink(missing_ok=True)  # a cache failure never fails a verified fetch
+
+
+def load_pins(source: str | Path | dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read pins (file or dict): {files: {name: {url, sha256, max_bytes}}, redirect_hosts: []}."""
+    data = source if isinstance(source, dict) else json.loads(Path(source).read_text())
+    named = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(named, dict) or not named:
+        raise ValueError("pins need a non-empty files mapping")
+    files = []
+    for name, pin in sorted(named.items()):
+        if not isinstance(pin, dict) or {"url", "sha256", "max_bytes"} - set(pin):
+            raise ValueError(f"pin {name!r} needs url, sha256 and max_bytes")
+        files.append(
+            {
+                "name": name,
+                "url": pin["url"],
+                "sha256": pin["sha256"],
+                "max_bytes": pin["max_bytes"],
+            }
+        )
+    hosts = data.get("redirect_hosts", [])
+    if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+        raise ValueError("redirect_hosts must be a list of host names")
+    return files, list(hosts)

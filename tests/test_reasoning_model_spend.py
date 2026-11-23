@@ -640,7 +640,7 @@ def test_a_422_from_the_run_scoped_route_leaves_the_rows_as_they_were(tmp_path, 
     class Answers422:
         def call(self, method, path, body=None, key=None):
             asked.append(path)
-            raise RuntimeError("HTTP 422")
+            raise RuntimeBlocked("http_422")
 
     ledger = SpendLedger(Answers422(), "p", "anthropic", QUALIFIED)
     assert ledger.status(open_row["call_id"], "") is None and asked == []

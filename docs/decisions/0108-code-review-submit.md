@@ -24,6 +24,25 @@ environment, no shell, a timeout and no stdin. It never fetches, clones or conta
 branches and SHAs are validated (a branch must also pass `git check-ref-format`; a SHA is 40
 lowercase hex). Git error text and paths are never put in a refusal.
 
+Wiring: `tessera serve --code-review-git-remotes FILE` (fallback environment variable
+`TESSERA_CODE_REVIEW_GIT_REMOTES`; the flag wins) loads the file through `load_git_remotes` at
+startup, and `create_app(..., code_review_git_remotes=FILE)` does the same for embedders. Default
+off. A missing or malformed file stops startup (`tessera serve` exits 2 with a fixed message; the
+file's content is never printed).
+
+Secret and data guard: the reader refuses the whole submit before any content reaches a snapshot
+(and so a model destination). A changed path (added, modified or deleted) whose name matches
+`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.p12`, `*.pfx`, `credentials*`,
+`secrets*`, `*.sqlite*` or `*.db`, or that has a directory segment `.aws`, `.ssh`, `.gnupg`, `data`
+or `datasets`, is refused `path_denied` (409). A file whose content has a PEM private-key header,
+an Anthropic API key, an AWS access key id or a GitHub token shape is refused `content_denied`
+(409). The response carries only the code; the matched rule's label is kept on the internal
+refusal, never a path or content. The remotes file may add `deny_paths` (extra globs, refused as
+`path_denied`) and `allow_paths` (globs exempting a path from the built-in name and directory
+rules only, never from `deny_paths` or the content check). A glob without `/` matches any path
+segment, one with `/` is anchored at the repository root; at most 64 each, case-insensitive,
+validated at load. Both default to none.
+
 ### B. Head, base and changed files
 
 The branch must point at the supplied `head_sha` (`branch_not_found`, `head_mismatch`). The base is

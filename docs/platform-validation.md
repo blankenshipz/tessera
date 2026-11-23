@@ -378,7 +378,7 @@ while a user session runs it (a launchd daemon at boot has no Docker until then)
   back in random order while the test assumes creation order. That is an intermittent
   defect in the test or the ordering, not addressed here. The run took about 35 minutes
   because the shards slow each other down when run together. Between full runs only focused
-  tests are run (`dev/focused_tests.py`); the full suite is a once-per-change pre-merge
+  tests are run (`tessera dev focused-tests`, ADR 0117); the full suite is a once-per-change pre-merge
   run (`make test-parallel`).
 - The focused worker, daemon, refusal and harness tests (181) and the test-tooling tests
   (42: the changed-test selector and the parallel runner) pass; with the grant poller included, 163 worker-side tests

@@ -185,6 +185,8 @@ def stage_has_nonpublic_input(stage: Any) -> bool:
     input recorded beyond ``public`` and a ``send_classes`` that names any other class."""
     for source in getattr(stage, "inputs", ()):
         kind = getattr(source, "kind", "snapshot")
+        if kind == "public_artifact":
+            continue  # pinned public bytes fetched on the provider (ADR 0097): never private
         if kind != "snapshot" or getattr(source, "data_class", None) != "public":
             return True
     return any(c != "public" for c in (getattr(stage, "send_classes", None) or ()))

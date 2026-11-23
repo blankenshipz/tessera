@@ -10,7 +10,8 @@ other rule of that ADR is unchanged.
 ADR 0069 bounded each re-run by its source's own cap, so a chain of explicit-cap or `identical`
 re-runs could, link by link, be approved to spend more in total than the first campaign's cap.
 Each link needed a person's approval, but a reader could reasonably expect "never above the
-original" to cover the chain. This ADR adds a check over the whole tree of re-runs, siblings and unsettled links included.
+original" to cover the chain. This ADR adds a check over the whole tree of re-runs, siblings and unsettled
+links included.
 
 ## Decision
 
@@ -23,7 +24,8 @@ original" to cover the chain. This ADR adds a check over the whole tree of re-ru
    to read (200 members) reports itself truncated and refuses further re-runs.
 2. **Enforced at submission, twice.** The plan gives the message; the bound itself is re-read
    inside the submit transaction, under the write lock, so two re-runs planned against the same
-   state cannot both fit: the second is refused ("no longer covers") and writes nothing. The plan refuses a cap above what is left, whether the cap is the
+   state cannot both fit: the second is refused ("no longer covers") and writes nothing.
+   The plan refuses a cap above what is left, whether the cap is the
    default, an explicit `budget_cap_cents`, or the cap an `identical` re-run inherits from its
    spec. The default is the source's cap less its settled spend, and never more than what is left.
    A stage exposure that does not fit in what is left is refused with the amount left in the

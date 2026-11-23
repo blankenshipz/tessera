@@ -29,7 +29,8 @@ Without it every state is `unknown`.
 ## What a refusal looks like
 
 At submit or approval a stage on a provider with a blocking state is refused (409) with the reference,
-version, expiry and the rotation hint. During placement the candidate is skipped as
+version, expiry and the rotation hint. The refusal is only the 409 answer: no durable record is written for it. Only waits, skips (on the
+placement receipt) and stuck findings are recorded. During placement the candidate is skipped as
 `credential_unavailable`, with that reason on the placement receipt. A running single-provider stage
 fails before any hold; the campaign stop reason is `credential_expired`, `credential_revoked` or
 `credential_version_mismatch`, and the event `campaign.stage_credential_blocked` records it.

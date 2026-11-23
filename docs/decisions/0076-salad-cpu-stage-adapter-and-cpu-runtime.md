@@ -122,6 +122,9 @@ The adapter refuses with a 409 that names the limit when the stage cannot run on
   not known when the spec is submitted). Only stages reading one pinned snapshot do.
 - Not verified against Salad: no live call was made. The launcher and runtime are tested with fakes
   and a real subprocess; the CPU image recipe is not built by tests.
+- Author guidance: check your argv before opting in. Glued short flags such as `-o/outputs/x` are
+  not rewritten, and a hard-coded `/work/...` path differs on Salad; see
+  [campaign-providers.md](../campaign-providers.md).
 
 ## Tests
 

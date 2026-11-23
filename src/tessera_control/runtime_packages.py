@@ -13,6 +13,7 @@ from .experiments import admitted_attempt_package_identity, bind_admitted_attemp
 from .migrations import plan_payload
 from .models import ExecutionSpec
 from .persistent_output_storage import validate_persistent_output_storage
+from .public_fetch_models import PublicFetchPlan
 from .store import Conflict, NotFound, StoreError, _parse_utc, canonical_digest
 
 
@@ -124,6 +125,11 @@ class RuntimePackageStore(ExecutionStore):
                 package["egress"] = EgressPolicy.model_validate(spec["egress"]).model_dump(
                     mode="json"
                 )
+            if spec.get("public_fetch") is not None:
+                # ADR 0097: the plan's pinned public files, fetched by the worker supervisor.
+                package["public_fetch"] = PublicFetchPlan.model_validate(
+                    spec["public_fetch"]
+                ).model_dump(mode="json")
         elif spec["profile"] == "agent-sandbox" and spec.get("egress") is not None:
             package["network_profile"] = "allowlist-proxy-v1"
             package["egress"] = EgressPolicy.model_validate(spec["egress"]).model_dump(mode="json")

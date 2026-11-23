@@ -310,6 +310,10 @@ A CPU and a GPU Salad profile (example values; the credential is a reference, ne
 
 The GPU profile is the same with `"gpu_class": "<GPU class UUID>"` instead of `cpu_rate`.
 
+`MAX_RUN_CENTS = 5000` and `MAX_TASK_CENTS = 10000` in `salad_campaign_profiles.py` are hard
+schema ceilings only. The 50-cent per-run cap used for live GPU runs is operator configuration in
+the profile (`max_run_cents` of 50 or less); no other code enforces it.
+
 Refused before anything is written: an unknown section, provider or plugin (or one that is not
 installed); a field the provider's model does not define; an image not given as a `sha256:` digest;
 a cost ceiling or resource outside the provider's limits; a secret-like field name or a
@@ -394,6 +398,18 @@ default backs 192 MiB) is logged as a warning at startup, and a request over tha
 run. A default `scratch_bytes` above 64 MiB must fit `memory_bytes`
 (256 MiB when unset) or the poller config is refused at load. Size them to the host: one poller
 runs one container at a time.
+
+`public_root` (also `--public-root`) and the optional `public_cache_dir` (`--public-cache-dir`)
+enable pinned public inputs ([ADR 0097](decisions/0097-provider-side-fetch-of-pinned-public-artifacts.md))
+on this worker: the supervisor, not the container, downloads each `public_artifact` file, checks its
+sha256, and mounts it read-only at `/inputs-public/<input>` in a container that stays network
+none. Both are operator-owned directories, created `0700` if missing and refused when a symlink,
+owned by another user or accessible to group or world; the cache is used only for inputs that set
+`cache`. Without `public_root` a plan carrying a public fetch is refused with a message naming the
+flag. The local fallback currently supports stages that also have a snapshot input (mixed stages),
+because an execution grant binds a snapshot; a stage whose only inputs are `public_artifact` fails
+closed on a worker-grant provider with `public_only_stage_needs_a_snapshot_input` and runs
+on Salad.
 
 `docker_network_pool` (optional, with `docker_network_prefix_length`, default 24; also
 `--docker-network-pool` / `--docker-network-prefix-length` on `development-poll` and

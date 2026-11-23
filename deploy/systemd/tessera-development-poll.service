@@ -18,7 +18,7 @@ EnvironmentFile=-/etc/tessera/development-poll.env
 StateDirectory=tessera tessera/health
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/tessera
-ExecStart=/opt/tessera/.venv/bin/python -m tessera_worker.cli development-poll --config /etc/tessera/development-poll.json --health-file /var/lib/tessera/health/development-poll.json
+ExecStart=/opt/tessera/.venv/bin/python -m tessera_worker.cli development-poll --config /etc/tessera/development-poll.json --health-file /var/lib/tessera/health/development-poll.json --stage-watcher --stage-watcher-kill-switch /var/lib/tessera/stage-watch.kill
 Restart=on-failure
 RestartSec=10
 # Exit 2 means configuration or prerequisites were refused; it will not fix itself.

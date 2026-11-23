@@ -143,3 +143,61 @@ def test_cli_serve_loads_the_campaign_providers_file(monkeypatch, tmp_path):
     path.chmod(0o644)
     code, _ = _serve(monkeypatch, "--campaign-providers", str(path))
     assert code == 2
+
+
+# -- the stuck-campaign scanner is independent of the runner -----------------------------------
+
+
+@pytest.fixture
+def scanner(monkeypatch):
+    from tessera_control import campaign_stuck
+
+    log: list = []
+
+    class Handle:
+        def stop(self, timeout=10.0):
+            log.append("stop")
+
+    def fake_start(database_path, interval_seconds):
+        log.append(("start", database_path.name, interval_seconds))
+        return Handle()
+
+    monkeypatch.setattr(campaign_stuck, "start_background", fake_start)
+    return log
+
+
+def test_the_scanner_runs_without_the_campaign_runner(tmp_path, scanner):
+    state = tmp_path / "state"
+    initialize_state(state)
+    app = create_app(state)  # no campaign_runner_interval: --no-campaign-runner
+    assert scanner == []
+    with TestClient(app) as client:
+        assert scanner == [("start", "tessera.sqlite3", 300.0)]
+        assert client.get("/health/live").status_code == 200
+    assert scanner[-1] == "stop" and len(scanner) == 2
+
+
+def test_the_scanner_interval_is_passed_and_zero_still_disables_it_in_the_scanner(
+    tmp_path, scanner
+):
+    state = tmp_path / "state"
+    initialize_state(state)
+    with TestClient(create_app(state, campaign_stuck_scan_seconds=45.0)):
+        assert scanner == [("start", "tessera.sqlite3", 45.0)]
+
+
+def test_the_scanner_and_the_runner_both_start_and_both_stop(tmp_path, scanner, events):
+    state = tmp_path / "state"
+    initialize_state(state)
+    with TestClient(create_app(state, campaign_runner_interval=0.5)):
+        assert [e[0] for e in events if isinstance(e, tuple)] == ["start"]
+        assert [e[0] for e in scanner if isinstance(e, tuple)] == ["start"]
+    assert events[-1] == "stop" and scanner[-1] == "stop"
+
+
+def test_a_zero_interval_starts_no_scan_thread(tmp_path):
+    from tessera_control import campaign_stuck
+
+    handle = campaign_stuck.start_background(tmp_path / "x.sqlite3", 0)
+    assert handle._thread is None  # the real scanner: 0 disables it
+    handle.stop()

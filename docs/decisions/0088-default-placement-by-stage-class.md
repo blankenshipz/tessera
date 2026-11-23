@@ -98,6 +98,11 @@ fields (memory and expected runtime).
   placement does not change. This is the extension point for pluggable compute.
 - ADR 0070's "Why no memory criterion" is superseded for the default policy by `memory_bytes` and
   `expected_duration_seconds`; operator rules still have no memory criterion.
+- The fallback evidence is partly synthetic. Of the four fallback tests in
+  `tests/test_campaign_placement_default.py`, only the skipped-candidate test reaches its fallback
+  without patching. The over-run-cap, no-longer-trusted and over-campaign-budget tests force the
+  condition by monkeypatching (`stage_on_candidate`, `provider_admits`), so they show the
+  fallback and its receipt reason, not that the real cap, trust or budget check fires.
 
 A candidate the provider registry no longer knows cannot be ranked (kind `unknown`): the heavy
 policy does not move it first, the stage runs on the next listed candidate, and the receipt's

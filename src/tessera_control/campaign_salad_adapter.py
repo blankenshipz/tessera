@@ -95,15 +95,20 @@ def default_program(stage: Any) -> dict[str, Any]:
 
 def input_plan(
     stage: Any, profile: SaladCampaignProfile, entries: InputEntries | None
-) -> tuple[str, int]:
+) -> tuple[str, int] | None:
     """(snapshot digest, byte cap) of the one snapshot the stage's inputs become on Salad.
 
     One pinned snapshot is itself. Several snapshot and pinned-artifact inputs are the snapshot the
     runner composes before staging, whose digest is a pure function of the sources' file digests, so
     it is known now and the runner's own composition must reproduce it exactly (a changed source
-    fails closed). An input produced by another stage of the same campaign has no digest yet."""
+    fails closed). An input produced by another stage of the same campaign has no digest yet.
+
+    A ``public_artifact`` input is fetched by the provider and is never part of the snapshot
+    (ADR 0097): it is ignored here, and a stage with no other input has no snapshot (None)."""
     adapter = profile.stage_adapter
-    sources = list(stage.inputs)
+    sources = [s for s in stage.inputs if getattr(s, "kind", None) != "public_artifact"]
+    if not sources:
+        return None
     other = [s.name for s in sources if s.kind not in ("snapshot", "artifact")]
     if other:
         raise _refuse(
@@ -197,7 +202,7 @@ def derive_candidate_config(
     ):
         if value:
             raise _refuse(stage, f"{field} cannot be carried to Salad")
-    snapshot_digest, input_bytes = input_plan(stage, profile, entries)
+    plan = input_plan(stage, profile, entries)
     outputs = list(stage.outputs)
     if len(outputs) > MAX_SALAD_OUTPUTS:
         raise _refuse(stage, f"more than {MAX_SALAD_OUTPUTS} outputs")
@@ -222,7 +227,7 @@ def derive_candidate_config(
         str(total),
         str(len(outputs)),
         hashlib.sha256(raw).hexdigest(),
-        f"input:{snapshot_digest}:{input_bytes}",
+        *([] if plan is None else [f"input:{plan[0]}:{plan[1]}"]),
         *refs,
     ]
     if len(template) > MAX_TEMPLATE_TOKENS:
@@ -238,11 +243,17 @@ def derive_candidate_config(
                 "outputs": [{"name": o.path, "max_bytes": o.max_bytes} for o in outputs],
                 "egress": {"kind": "provider_broad", "fetches": []},
                 "custody_host": profile.custody_host,
-                "input": {
-                    "kind": "staged_snapshot",
-                    "snapshot_digest": snapshot_digest,
-                    "max_bytes": input_bytes,
-                },
+                **(
+                    {}
+                    if plan is None
+                    else {
+                        "input": {
+                            "kind": "staged_snapshot",
+                            "snapshot_digest": plan[0],
+                            "max_bytes": plan[1],
+                        }
+                    }
+                ),
             }
         )
     except ValidationError as error:

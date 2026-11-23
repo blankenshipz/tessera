@@ -30,6 +30,7 @@ from .egress_models import EgressPolicy
 from .evaluation_models import MetricCategory
 from .gate_evidence_models import OutcomeId
 from .models import RawString4000, Sha256Digest, StrictDuration
+from .public_fetch_models import canonical_public_host, public_fetch_host
 from .research_models import NonBlank200, NonBlank4000
 from .salad_workload_contract import WorkloadContractV1
 from .store import canonical_digest
@@ -443,8 +444,81 @@ class ReceiptOutputSource(_Strict):
         return self
 
 
+# A pinned public artifact (ADR 0097): large public inputs (model weights, public datasets) that
+# the control plane does not need are fetched ON the executing provider, never downloaded to the
+# control plane and shipped out. The spec names each file's https source, content digest and size
+# bound; the provider fetches, verifies the digest before use and fails closed on a mismatch.
+PUBLIC_FILE_MAX_BYTES = 8 * 1024**3  # the Salad workload contract's per-fetch bound
+PublicFileName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+PublicHost = Annotated[
+    str, StringConstraints(pattern=r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$", max_length=253)
+]
+
+
+class PublicFile(_Strict):
+    name: PublicFileName
+    url: Annotated[str, StringConstraints(max_length=2048)]
+    sha256: Sha256Digest
+    max_bytes: Annotated[int, Field(strict=True, ge=1, le=PUBLIC_FILE_MAX_BYTES)]
+
+    @model_validator(mode="after")
+    def _https_public_host(self) -> PublicFile:
+        host = public_fetch_host(self.url)
+        if host is None:
+            raise ValueError(
+                "a public file source is an https URL on a public fully qualified host "
+                "(no credentials, no port, no query or fragment)"
+            )
+        return self
+
+
+class PublicArtifactSource(_Strict):
+    """Pinned public files fetched on the executing provider (ADR 0097).
+
+    ``redirect_hosts`` are the only other hosts a download may be redirected to (a content
+    network behind the pinned host); ``cache`` lets the provider keep the verified bytes by
+    digest so a rerun does not refetch (the digest is still verified on every use)."""
+
+    kind: Literal["public_artifact"]
+    name: Key
+    files: Annotated[list[PublicFile], Field(min_length=1, max_length=32)]
+    redirect_hosts: Annotated[list[PublicHost], Field(max_length=8)] = Field(default_factory=list)
+    cache: bool = False
+
+    @model_validator(mode="after")
+    def _consistent(self) -> PublicArtifactSource:
+        names = [f.name for f in self.files]
+        if len(set(names)) != len(names):
+            raise ValueError("public file names must be unique within an input")
+        for host in self.redirect_hosts:
+            if canonical_public_host(host) != host:
+                raise ValueError("redirect hosts are canonical public fully qualified hosts")
+        if len(set(self.redirect_hosts)) != len(self.redirect_hosts):
+            raise ValueError("redirect hosts must be unique")
+        return self
+
+    @property
+    def hosts(self) -> list[str]:
+        """Every host a fetch may contact: the pinned hosts, then the redirect hosts."""
+        found = {public_fetch_host(f.url) for f in self.files} - {None}
+        return sorted(found | set(self.redirect_hosts))
+
+    @model_serializer(mode="wrap")
+    def _omit_defaults(self, handler):
+        value = handler(self)
+        if not self.redirect_hosts:
+            value.pop("redirect_hosts", None)
+        if not self.cache:
+            value.pop("cache", None)
+        return value
+
+
 StageInputV2 = Annotated[
-    SnapshotSource | StageOutputSource | ArtifactSource | ReceiptOutputSource,
+    SnapshotSource
+    | StageOutputSource
+    | ArtifactSource
+    | ReceiptOutputSource
+    | PublicArtifactSource,
     Field(discriminator="kind"),
 ]
 
@@ -683,7 +757,7 @@ def _check_v1_shape(stage: StageSpec) -> None:
 
 @dataclass(frozen=True)
 class NormalInput:
-    kind: Literal["snapshot", "stage", "artifact"]
+    kind: Literal["snapshot", "stage", "artifact", "public_artifact"]
     name: str
     # snapshot
     snapshot_id: str | None = None
@@ -696,6 +770,11 @@ class NormalInput:
     campaign_id: str | None = None
     output: str | None = None
     sha256: str | None = None
+    # public_artifact (ADR 0097): (name, url, sha256, max_bytes) per file, the redirect hosts
+    # and whether the provider may cache the verified bytes by digest
+    public_files: tuple[tuple[str, str, str, int], ...] = ()
+    redirect_hosts: tuple[str, ...] = ()
+    cache: bool = False
 
 
 @dataclass(frozen=True)
@@ -939,10 +1018,25 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                         paths=tuple(upstream[name] for name in item.outputs),
                     )
                 )
+            elif isinstance(item, PublicArtifactSource):
+                inputs.append(
+                    NormalInput(
+                        "public_artifact",
+                        item.name,
+                        public_files=tuple(
+                            (f.name, f.url, f.sha256, f.max_bytes) for f in item.files
+                        ),
+                        redirect_hosts=tuple(item.redirect_hosts),
+                        cache=item.cache,
+                    )
+                )
             elif isinstance(item, ReceiptOutputSource):
                 # Structure checks of a submit request see the reference as an artifact
                 # input; submit replaces it before anything is stored (ADR 0080) and
                 # parse_spec_json refuses a stored spec that still holds one.
+                # The all-zero sha256 below is a placeholder that is unreachable for a stored
+                # spec: every store path resolves the reference first or refuses, and
+                # parse_spec_json guards the stored case.
                 inputs.append(
                     NormalInput(
                         "artifact",
@@ -1079,7 +1173,8 @@ def stage_classes(
     """(input_class, output_class) per stage.
 
     A stage input is public only when every source is a snapshot the spec declares public;
-    any stage-output or artifact source (outputs are always private_derived, ADR 0039) or
+    a ``public_artifact`` (ADR 0097) is public data fetched on the provider and never changes the
+    class; any stage-output or artifact source (outputs are always private_derived, ADR 0039) or
     any private_derived snapshot makes the stage input private_derived. This is the spec's
     own claim; the control plane additionally checks it against the recorded class.
     """
@@ -1088,7 +1183,8 @@ def stage_classes(
     classes: dict[str, tuple[DataClass, DataClass]] = {}
     for stage in normal.stages:
         restricted = any(
-            item.kind != "snapshot" or item.data_class == PRIVATE_DERIVED for item in stage.inputs
+            (item.kind not in ("snapshot", "public_artifact")) or item.data_class == PRIVATE_DERIVED
+            for item in stage.inputs
         )
         classes[stage.key] = (PRIVATE_DERIVED if restricted else PUBLIC, OUTPUT_DATA_CLASS)
     return classes
@@ -1104,8 +1200,54 @@ def stage_output_class(spec: CampaignSpec | CampaignSpecV2 | NormalSpec, key: st
     return stage_classes(spec)[key][1]
 
 
+def custody_inputs(stage: NormalStage) -> tuple[NormalInput, ...]:
+    """The inputs the control plane holds and composes; a public_artifact is fetched by the
+    provider and is never part of a snapshot (ADR 0097)."""
+    return tuple(item for item in stage.inputs if item.kind != "public_artifact")
+
+
 def needs_composition(stage: NormalStage) -> bool:
-    return len(stage.inputs) > 1 or any(item.kind != "snapshot" for item in stage.inputs)
+    custody = custody_inputs(stage)
+    return len(custody) > 1 or any(item.kind != "snapshot" for item in custody)
+
+
+MAX_PUBLIC_INPUTS_PER_STAGE = 4
+MAX_PUBLIC_FILES_PER_STAGE = 32
+
+
+def public_fetch_policy(stage: NormalStage) -> dict[str, Any] | None:
+    """What the provider may fetch for a stage (ADR 0097), or None without a public_artifact.
+
+    ``hosts`` are the pinned and redirect hosts, sorted: the only outbound reach the provider's
+    pre-stage fetch gets. ``files`` carry the input name, file name, url, digest and size bound."""
+    items = [item for item in stage.inputs if item.kind == "public_artifact"]
+    if not items:
+        return None
+    hosts: set[str] = set()
+    files: list[dict[str, Any]] = []
+    total = 0
+    for item in sorted(items, key=lambda i: i.name):
+        hosts.update(item.redirect_hosts)
+        for name, url, sha256, max_bytes in item.public_files:
+            host = public_fetch_host(url)
+            if host is not None:
+                hosts.add(host)
+            total += max_bytes
+            files.append(
+                {
+                    "input": item.name,
+                    "name": name,
+                    "url": url,
+                    "sha256": sha256,
+                    "max_bytes": max_bytes,
+                }
+            )
+    return {
+        "hosts": sorted(hosts),
+        "files": files,
+        "max_bytes_total": total,
+        "cache": any(item.cache for item in items),
+    }
 
 
 def stage_execution_spec(
@@ -1139,6 +1281,23 @@ def validate_structure(spec: NormalSpec) -> None:
                 raise ValueError(
                     f"Stage {stage.key} code_input {stage.code_input!r} must be a pinned snapshot "
                     f"input, not a {named[0].kind} input (its digest is not known at submit)"
+                )
+        public = [item for item in stage.inputs if item.kind == "public_artifact"]
+        if public:
+            if len(public) > MAX_PUBLIC_INPUTS_PER_STAGE:
+                raise ValueError(
+                    f"Stage {stage.key} declares more than {MAX_PUBLIC_INPUTS_PER_STAGE} "
+                    "public_artifact inputs"
+                )
+            if sum(len(item.public_files) for item in public) > MAX_PUBLIC_FILES_PER_STAGE:
+                raise ValueError(
+                    f"Stage {stage.key} fetches more than {MAX_PUBLIC_FILES_PER_STAGE} "
+                    "public files in total"
+                )
+            if stage.egress is not None:
+                raise ValueError(
+                    f"Stage {stage.key}: a stage with public_artifact inputs must not declare "
+                    "egress (the provider derives the fetch allowlist from the pinned hosts)"
                 )
         for item in stage.inputs:
             if item.kind != "stage":
@@ -1288,6 +1447,8 @@ def _validate_evaluation(spec: NormalSpec, stage: NormalStage) -> None:
         if other.key == stage.key:
             continue
         for item in other.inputs:
+            if item.kind == "public_artifact":
+                continue
             digest = item.digest if item.kind == "snapshot" else item.sha256
             if digest == holdout.partition_digest:
                 raise ValueError(

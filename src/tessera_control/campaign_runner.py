@@ -71,6 +71,7 @@ from .campaign_models import (
     GRANT_SETTLE_MARGIN_SECONDS,
     NormalSpec,
     NormalStage,
+    custody_inputs,
     needs_composition,
     normalize,
     parse_spec_json,
@@ -2189,14 +2190,32 @@ class CampaignRunner:
             recorded = CampaignStore.recorded_snapshot_class(connection, snapshot_id)
         return "private_derived" if "private_derived" in (declared, recorded) else "public"
 
+    @staticmethod
+    def _public_entries(item: Any) -> list[IoEntry]:
+        """Index entries for a pinned public artifact (ADR 0097): the pinned digest of each file
+        and its declared size bound (the provider fetches; the control plane never sees bytes)."""
+        return [
+            IoEntry(
+                name=f"{item.name}/{name}",
+                kind="other",
+                sha256=sha256,
+                size_bytes=max_bytes,
+                data_class="public",
+                path=name,
+            )
+            for name, _url, sha256, max_bytes in item.public_files
+        ]
+
     def _input_entries(
-        self, ctx: _Ctx, spec_stage: NormalStage, input_snapshot_id: str
+        self, ctx: _Ctx, spec_stage: NormalStage, input_snapshot_id: str | None
     ) -> list[IoEntry]:
         """Index entries for every resolved input, with the platform's recorded classes."""
         project = ctx.campaign["project_id"]
         entries: list[IoEntry] = []
         for item in sorted(spec_stage.inputs, key=lambda i: i.name):
-            if item.kind == "snapshot":
+            if item.kind == "public_artifact":
+                entries.extend(self._public_entries(item))
+            elif item.kind == "snapshot":
                 with self.store.runner_connection() as connection:
                     recorded = CampaignStore.recorded_snapshot_class(connection, item.snapshot_id)
                 size = sum(int(e["size"]) for e in self._snapshot_entries(item.snapshot_id))
@@ -2227,7 +2246,7 @@ class CampaignRunner:
                             lineage_node_id=self._node_for(project, listed[path]["sha256"]),
                         )
                     )
-            else:
+            elif item.kind == "artifact":
                 resolved = self._resolve_artifact(ctx, item)
                 entries.append(
                     IoEntry(
@@ -2347,6 +2366,72 @@ class CampaignRunner:
             )
         return True
 
+    def _input_ready_public(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: NormalStage,
+        attempt: dict[str, Any] | None,
+    ) -> bool:
+        """A stage whose only inputs are pinned public artifacts (ADR 0097): nothing to compose,
+        admit or release; the provider fetches them. The stage records no snapshot, a digest of
+        the pinned sources and the ``public`` class."""
+        key = stage["stage_key"]
+        entries = self._input_entries(ctx, spec_stage, None)
+        digest = canonical_digest(
+            [[e.name, e.sha256, e.size_bytes] for e in sorted(entries, key=lambda e: e.name)]
+        )
+        with self.store.runner_connection() as connection:
+            self._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+                input_snapshot_id=None,
+                input_snapshot_digest=digest,
+                input_data_class="public",
+                prep_phase="input_ready",
+            )
+            if attempt is not None:
+                self._touch(
+                    connection,
+                    "campaign_stage_attempts",
+                    "id=?",
+                    (attempt["id"],),
+                    provider_id=spec_stage.provider,
+                    trust_policy_digest=provider_trust.current_policy(connection).digest,
+                    admission_basis="public_only",
+                )
+            write_io(
+                connection,
+                ctx.campaign,
+                key,
+                None if attempt is None else attempt["id"],
+                "input",
+                entries,
+                _iso(self.now()),
+            )
+        return True
+
+    def _stamp_public(
+        self, ctx: _Ctx, key: str, spec_stage: NormalStage, attempt: dict[str, Any]
+    ) -> None:
+        entries = self._input_entries(ctx, spec_stage, None)
+        with self.store.runner_connection() as connection:
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                provider_id=spec_stage.provider,
+                trust_policy_digest=provider_trust.current_policy(connection).digest,
+                admission_basis="public_only",
+            )
+            write_io(
+                connection, ctx.campaign, key, attempt["id"], "input", entries, _iso(self.now())
+            )
+        return None
+
     def _prep_input(
         self,
         ctx: _Ctx,
@@ -2354,8 +2439,11 @@ class CampaignRunner:
         spec_stage: NormalStage,
         attempt: dict[str, Any] | None = None,
     ) -> bool:
+        custody = custody_inputs(spec_stage)
+        if not custody:
+            return self._input_ready_public(ctx, stage, spec_stage, attempt)
         if not needs_composition(spec_stage):
-            source = spec_stage.inputs[0]
+            source = custody[0]
             return self._input_ready(
                 ctx, stage, spec_stage, source.snapshot_id, source.digest, attempt
             )
@@ -2363,7 +2451,7 @@ class CampaignRunner:
         def build() -> tuple[dict[str, str], dict[str, Any]]:
             sources: list[dict[str, Any]] = []
             entries: list[tuple[str, str, int, str]] = []
-            for item in spec_stage.inputs:
+            for item in custody:
                 if item.kind == "snapshot":
                     sources.append(
                         {
@@ -2408,7 +2496,7 @@ class CampaignRunner:
                                 "imported_unverified",
                             )
                         )
-                else:
+                elif item.kind == "artifact":
                     resolved = self._resolve_artifact(ctx, item)
                     sources.append(
                         {
@@ -2450,6 +2538,17 @@ class CampaignRunner:
                 return stamped
         if self._deadline_too_short(ctx, stage, spec_stage, attempt):
             return True
+        if stage["input_snapshot_id"] is None and attempt["release_id"] is None:
+            # No custody input: the execution grant needs a snapshot to bind (execution plane),
+            # on every provider. A stage whose only inputs are public_artifact therefore fails
+            # closed here until the grant path can bind no snapshot; give it a snapshot input.
+            raise StepFailed(
+                "issue_grant",
+                "step_refused",
+                "public_only_stage_needs_a_snapshot_input: an execution grant binds a "
+                "snapshot, so a stage whose only inputs are public_artifact cannot run yet; "
+                "add a snapshot input (the public files are still fetched on the provider)",
+            )
         if attempt["release_id"] is None:
             if self._sealed_input_refused(ctx, spec_stage, attempt):
                 return True
@@ -2592,6 +2691,8 @@ class CampaignRunner:
         snapshot_id = stage["input_snapshot_id"]
         worker = self._provider(spec_stage).grant_request(self, ctx, spec_stage).worker_principal_id
         narrowed = frozenset(spec_stage.send_classes) if spec_stage.send_classes else None
+        if snapshot_id is None:
+            return self._stamp_public(ctx, key, spec_stage, attempt)
         try:
             with self.store.runner_connection() as connection:
                 admitted = provider_trust.provider_admits(
@@ -3640,6 +3741,9 @@ class CampaignRunner:
             elif source.kind == "artifact":
                 # The node that produced the pinned output already exists (same project).
                 inputs.append((f"{source.name}", source.sha256, None, "other"))
+            elif source.kind == "public_artifact":
+                for name, _url, sha256, _max in source.public_files:
+                    inputs.append((f"{source.name}/{name}", sha256, None, "other"))
             else:
                 upstream = self._upstream_manifest(ctx, source.stage)
                 listed = {e["relative_path"]: e for e in json.loads(upstream["artifacts_json"])}

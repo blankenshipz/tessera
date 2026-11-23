@@ -213,6 +213,30 @@ def list_gate_decisions(campaign_id: str, actor: Actor, store: Campaigns) -> dic
     return store.list_gate_decisions(actor, campaign_id)
 
 
+@router.get("/campaigns/{campaign_id}/report")
+def get_campaign_report(
+    campaign_id: str, actor: Actor, store: Campaigns, detail: bool = False
+) -> dict[str, Any]:
+    """A plain-words report of the campaign (no internal ids unless detail=true)."""
+    return store.get_campaign_report(actor, campaign_id, detail=detail)
+
+
+@router.get("/projects/{project_id}/campaign-report")
+def get_campaign_window_report(
+    project_id: str,
+    actor: Actor,
+    store: Campaigns,
+    since: str,
+    until: str,
+    detail: bool = False,
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    """A plain-words report of the project's campaigns created in [since, until)."""
+    return store.get_campaign_window_report(
+        actor, project_id, since, until, detail=detail, limit=limit
+    )
+
+
 @router.get("/campaigns/{campaign_id}/receipt")
 def get_campaign_receipt(campaign_id: str, actor: Actor, store: Campaigns) -> dict[str, Any]:
     return store.get_campaign_receipt(actor, campaign_id)

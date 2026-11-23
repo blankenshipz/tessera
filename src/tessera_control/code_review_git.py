@@ -16,10 +16,17 @@ read-only plumbing is used (never fetch, clone or any remote command).
 
 Refusals are :class:`GitSourceRefused` with a stable ``code``; messages never carry git's
 stderr, repository paths or file paths.
+
+Secret and data guard: before any content reaches a snapshot (and so a model destination), a
+changed path matching a secret-shaped name, a secret or data directory or an operator ``deny_paths``
+glob refuses the whole submit ``path_denied``, and a file whose content has a private-key PEM
+header or an API-key shaped token refuses it ``content_denied``. The refusal carries only the
+matched rule's label (``GitSourceRefused.rule``), never a path or any content.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -54,8 +61,37 @@ REFUSAL_CODES = (
     "no_changes",
     "change_too_large",
     "unsupported_entry",
+    "path_denied",
+    "content_denied",
     "git_failed",
 )
+
+# Built-in secret/data guard. Names match a path's last segment, directories any earlier segment;
+# all case-insensitive. An operator ``allow_paths`` glob exempts a path from these built-in
+# rules (never from ``deny_paths`` or the content check).
+_DENY_NAME_GLOBS = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "id_ed25519*",
+    "*.p12",
+    "*.pfx",
+    "credentials*",
+    "secrets*",
+    "*.sqlite*",
+    "*.db",
+)
+_DENY_DIRS = frozenset({".aws", ".ssh", ".gnupg", "data", "datasets"})
+# Narrow, high-signal content patterns: a PEM private-key header and well-known API token shapes.
+_SECRET_CONTENT = (
+    ("private_key_pem", re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")),
+    ("anthropic_api_key", re.compile(rb"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("aws_access_key_id", re.compile(rb"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])")),
+    ("github_token", re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}")),
+)
+MAX_GUARD_GLOBS = 64
 
 _REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
@@ -79,11 +115,12 @@ _CONFIG_ARGS = (
 class GitSourceRefused(Exception):
     """A git source request was refused; ``code`` is one of :data:`REFUSAL_CODES`."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, rule: str | None = None):
         if code not in REFUSAL_CODES:
             raise ValueError("unknown git source refusal code")
         super().__init__(code)
         self.code = code
+        self.rule = rule  # the matched guard rule's label; never a path or content
 
 
 @dataclass(frozen=True)
@@ -176,6 +213,38 @@ def _git_env() -> dict[str, str]:
     }
 
 
+def _check_globs(globs: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(globs, str):
+        raise ValueError("path globs must be a list of strings")
+    result: list[str] = []
+    for glob in globs:
+        if (
+            not isinstance(glob, str)
+            or not glob
+            or len(glob) > 200
+            or "\0" in glob
+            or glob.startswith("/")
+            or ".." in glob.split("/")
+        ):
+            raise ValueError("path globs must be non-empty relative glob strings")
+        result.append(glob.lower())
+    if len(result) > MAX_GUARD_GLOBS:
+        raise ValueError("too many path globs")
+    return tuple(dict.fromkeys(result))
+
+
+def _glob_match(path: str, glob: str) -> bool:
+    """A glob without ``/`` matches any path segment; one with ``/`` is anchored at the
+    repository root and matches the path or any directory prefix of it. ``*`` stays in a segment."""
+    segments = path.split("/")
+    if "/" not in glob:
+        return any(fnmatch.fnmatchcase(segment, glob) for segment in segments)
+    parts = glob.rstrip("/").split("/")
+    return len(segments) >= len(parts) and all(
+        fnmatch.fnmatchcase(s, g) for s, g in zip(segments, parts, strict=False)
+    )
+
+
 class GitRemotes:
     """Operator mapping of repository name → local bare repository path on the control host."""
 
@@ -186,7 +255,11 @@ class GitRemotes:
         max_changed_files: int = MAX_CHANGED_FILES,
         max_total_bytes: int = MAX_TOTAL_BYTES,
         timeout_seconds: float = GIT_TIMEOUT_SECONDS,
+        deny_paths: Iterable[str] = (),
+        allow_paths: Iterable[str] = (),
     ):
+        self._deny_paths = _check_globs(deny_paths)
+        self._allow_paths = _check_globs(allow_paths)
         repos: dict[str, Path] = {}
         for name, raw in mapping.items():
             if not valid_repo_name(name):
@@ -245,6 +318,7 @@ class GitRemotes:
             raise GitSourceRefused("no_changes")
         if len(changed) > self.max_changed_files:
             raise GitSourceRefused("change_too_large")
+        self.check_paths_allowed(item.path for item in changed)
 
         # Size budget over base + head contents; also refuses symlinks/submodules early.
         base_paths = [c.path for c in changed if c.status in ("M", "D")]
@@ -269,6 +343,7 @@ class GitRemotes:
         path = self._repo_path(repo)
         sha = _check_sha(sha, "invalid_sha")
         wanted = _check_paths(paths)
+        self.check_paths_allowed(wanted)
         self._require_commit(path, sha)
         if not wanted:
             return {}
@@ -285,7 +360,9 @@ class GitRemotes:
             present.append((item, entry))
         if not present:
             return {}
-        return self._read_blobs(path, present, total)
+        blobs = self._read_blobs(path, present, total)
+        self.check_content_allowed(blobs.values())
+        return blobs
 
     def tree_has_files(self, repo: str, sha: str, paths: Iterable[str]) -> set[str]:
         """Which of ``paths`` are regular files (not directories, symlinks or submodules)."""
@@ -303,6 +380,36 @@ class GitRemotes:
             and entry.kind == "blob"
             and entry.mode in _REGULAR_MODES
         }
+
+    def check_paths_allowed(self, paths: Iterable[str]) -> None:
+        """Refuse ``path_denied`` if any path matches the secret/data guard (see module doc)."""
+        for item in paths:
+            rule = self._denied_rule(item)
+            if rule is not None:
+                raise GitSourceRefused("path_denied", rule)
+
+    def check_content_allowed(self, contents: Iterable[bytes]) -> None:
+        """Refuse ``content_denied`` if any content has a private key or API token shape."""
+        for data in contents:
+            for label, pattern in _SECRET_CONTENT:
+                if pattern.search(data) is not None:
+                    raise GitSourceRefused("content_denied", label)
+
+    def _denied_rule(self, item: str) -> str | None:
+        lowered = item.lower()
+        for glob in self._deny_paths:
+            if _glob_match(lowered, glob):
+                return "operator_deny_paths"
+        if any(_glob_match(lowered, glob) for glob in self._allow_paths):
+            return None
+        *directories, name = lowered.split("/")
+        for directory in directories:
+            if directory in _DENY_DIRS:
+                return "directory:" + directory
+        for glob in _DENY_NAME_GLOBS:
+            if fnmatch.fnmatchcase(name, glob):
+                return "name:" + glob
+        return None
 
     # -- validation -------------------------------------------------------------------------
 
@@ -553,7 +660,8 @@ class GitRemotes:
 
 
 def load_git_remotes(path: Path | str, **limits: object) -> GitRemotes:
-    """Load ``{"repos": {"name": "/abs/path.git"}}``; raises ValueError on a malformed file."""
+    """Load ``{"repos": {"name": "/abs/path.git"}}`` plus optional ``deny_paths`` and
+    ``allow_paths`` glob lists (see the module doc); raises ValueError on a malformed file."""
     with open(path, "rb") as handle:
         raw = handle.read(MAX_CONFIG_BYTES + 1)
     if len(raw) > MAX_CONFIG_BYTES:
@@ -562,8 +670,18 @@ def load_git_remotes(path: Path | str, **limits: object) -> GitRemotes:
         data = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("git remotes config is not valid JSON") from None
-    if not isinstance(data, dict) or set(data) != {"repos"} or not isinstance(data["repos"], dict):
-        raise ValueError('git remotes config must be {"repos": {name: path}}')
+    optional = {"deny_paths", "allow_paths"}
+    if (
+        not isinstance(data, dict)
+        or "repos" not in data
+        or not set(data) <= {"repos"} | optional
+        or not isinstance(data["repos"], dict)
+    ):
+        raise ValueError('git remotes config must be {"repos": {name: path}} plus optional lists')
+    for key in optional & set(data):
+        if not isinstance(data[key], list):
+            raise ValueError(f"git remotes config {key} must be a list of globs")
+        limits.setdefault(key, data[key])
     mapping: dict[str, Path] = {}
     for name, value in data["repos"].items():
         if not isinstance(value, str):

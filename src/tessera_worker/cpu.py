@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 _IMAGE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9./:_-]*@sha256:[a-f0-9]{64}\Z")
 _OPERATION = re.compile(r"[a-f0-9]{32}\Z")
+_PUBLIC_INPUT = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+_PUBLIC_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 # Historical default bound; the operator-configurable bound is DockerCpuAdapter.max_input_bytes.
 MAX_INPUT_BYTES = 16 * 1024 * 1024
@@ -168,8 +170,26 @@ class CpuOperation:
     development_output: DevelopmentOutputMount | None = None
     network_profile: str = "none"
     egress: dict[str, Any] | None = None
+    # ADR 0097: files the supervisor fetched and verified before create, as
+    # (input name, file name, sha256, bytes) rows under ``public_directory/<input name>``.
+    public_directory: str | None = None
+    public_files: tuple[tuple[str, str, str, int], ...] = ()
 
     def __post_init__(self) -> None:
+        if (self.public_directory is None) != (not self.public_files):
+            raise ValueError("Public directory and files must be supplied together.")
+        if self.public_files and self.network_profile != "none":
+            raise ValueError("Public fetch needs network profile none.")
+        for row in self.public_files:
+            if (
+                len(row) != 4
+                or not _PUBLIC_INPUT.fullmatch(str(row[0]))
+                or not _PUBLIC_FILE.fullmatch(str(row[1]))
+                or not re.fullmatch(r"[a-f0-9]{64}", str(row[2]))
+                or type(row[3]) is not int
+                or row[3] < 0
+            ):
+                raise ValueError("Invalid public file identity.")
         if self.network_profile == "none":
             if self.egress is not None:
                 raise ValueError("Network profile none cannot carry an egress policy.")
@@ -296,7 +316,10 @@ class DockerCpuAdapter:
         network_pool: DockerNetworkPool | None = None,
         max_input_bytes: int | None = None,
         max_scratch_bytes: int | None = None,
+        public_root: Path | None = None,
     ):
+        # Private 0700 custody for supervisor-fetched public files (ADR 0097); None refuses them.
+        self.public_root = Path(public_root) if public_root is not None else None
         # Operator-owned subnet pool for Tessera-created networks; None keeps Docker's
         # default address pools (the historical behaviour).
         self.network_pool = network_pool
@@ -616,6 +639,62 @@ class DockerCpuAdapter:
             raise CpuError("Input snapshot file set is incomplete or has extra files.")
         return ["--mount", f"type=bind,src={directory},dst=/inputs,readonly"]
 
+    def _public_mounts(self, operation: CpuOperation) -> list[str]:
+        """Read-only mounts at /inputs-public/<input name> for the fetched, verified files.
+
+        A sibling of /inputs (a bind inside the read-only /inputs bind cannot be created). Each
+        directory must be supervisor custody holding exactly the planned regular files; the
+        bytes were hashed when fetched and the 0700 root keeps anyone else from changing them."""
+        if operation.public_directory is None:
+            return []
+        if self.public_root is None:
+            raise CpuError("Public input root is not configured.")
+        try:
+            root_info = self.public_root.lstat()
+            if (
+                stat.S_ISLNK(root_info.st_mode)
+                or not stat.S_ISDIR(root_info.st_mode)
+                or stat.S_IMODE(root_info.st_mode) != 0o700
+            ):
+                raise CpuError("Public input root is no longer private supervisor custody.")
+            directory = Path(operation.public_directory)
+            if directory.parent != self.public_root or directory.name != (
+                f"tessera-public-{operation.operation_id}"
+            ):
+                raise CpuError("Public input directory is not this operation's custody.")
+            names = sorted({row[0] for row in operation.public_files})
+            arguments: list[str] = []
+            for name in names:
+                source = directory / name
+                expected = {row[1]: row[3] for row in operation.public_files if row[0] == name}
+                info = source.lstat()
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISDIR(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != 0o555
+                ):
+                    raise CpuError("Public input directory is unsafe.")
+                found: dict[str, int] = {}
+                with os.scandir(source) as entries:
+                    for entry in entries:
+                        item = Path(entry.path).lstat()
+                        if (
+                            not stat.S_ISREG(item.st_mode)
+                            or item.st_nlink != 1
+                            or stat.S_IMODE(item.st_mode) != 0o444
+                        ):
+                            raise CpuError("Public input contains unsafe filesystem nodes.")
+                        found[entry.name] = item.st_size
+                if found != expected:
+                    raise CpuError("Public input no longer matches its verified files.")
+                arguments += [
+                    "--mount",
+                    f"type=bind,src={source},dst=/inputs-public/{name},readonly",
+                ]
+        except OSError as error:
+            raise CpuError("Public input changed while being verified.") from error
+        return arguments
+
     def _development_output_mount(self, operation: CpuOperation) -> list[str]:
         mount = operation.development_output
         if mount is None:
@@ -742,6 +821,7 @@ class DockerCpuAdapter:
             "--workdir",
             "/work",
             *self._input_mount(operation),
+            *self._public_mounts(operation),
             *self._development_output_mount(operation),
             "--tmpfs",
             f"/work:rw,noexec,nosuid,nodev,size={scratch_bytes},mode=1777",

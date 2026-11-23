@@ -28,6 +28,8 @@ from tessera_control.storage_retention_models import MIN_KEEP, Candidate, Retent
 MANIFEST_NAME = "manifest.json"
 SNAPSHOT_NAME = "snapshot.sqlite3"
 _MAX_MANIFEST_BYTES = 1 << 20
+# Sentinel "path" of the one skipped entry reported when the backup root itself is unreadable.
+ROOT_UNREADABLE_PATH = "."
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _BACKUP_ID = re.compile(r"[0-9a-f]{32}")
 
@@ -134,7 +136,12 @@ def list_backups(
     try:
         names = sorted(os.listdir(root))
     except OSError as error:
-        return [], [{"path": ".", "reason": f"backup root unreadable: {type(error).__name__}"}]
+        return [], [
+            {
+                "path": ROOT_UNREADABLE_PATH,
+                "reason": f"backup root unreadable: {type(error).__name__}",
+            }
+        ]
     for name in names:
         child = root / name
         try:

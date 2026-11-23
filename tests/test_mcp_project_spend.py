@@ -61,7 +61,7 @@ def test_project_spend_needs_budget_scope_and_the_credentials_project(tmp_path):
     assert client.get(path, headers={**_token("reader"), **DEST}).status_code == 403
     assert client.get(path, headers=_token("spender")).status_code == 403  # no destination
     other = client.get("/projects/not-a-project/agent-spend", headers={**_token("spender"), **DEST})
-    assert other.status_code in {403, 404}
+    assert other.status_code == 404
 
 
 def test_project_spend_tool_hits_its_route_read_only(tmp_path):
@@ -184,5 +184,5 @@ def test_project_spend_refuses_another_real_project_with_the_same_org(tmp_path):
     response = client.get(
         "/projects/project_second/agent-spend", headers={**_token("spender"), **DEST}
     )
-    assert response.status_code in {403, 404}
+    assert response.status_code == 404
     assert "campaigns_by_status" not in response.text

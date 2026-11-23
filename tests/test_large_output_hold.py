@@ -217,6 +217,55 @@ def test_a_worker_that_reports_its_exit_and_registers_its_output_late_gets_it_ma
     _late_output(world, attempt, monkeypatch, PAYLOAD, registered_after=timedelta(minutes=3))
 
 
+@pytest.mark.parametrize(
+    ("began_after", "late"), [(timedelta(seconds=10), False), (timedelta(minutes=3), True)]
+)
+def test_a_small_staged_upload_is_late_by_when_it_began_not_when_it_completed(
+    tmp_path, monkeypatch, began_after, late
+):
+    """complete_upload registers the artifact at artifact_uploads.created_at, not at ``now``."""
+    world, campaign = _world(tmp_path, retry={"max_attempts": 1})
+    attempt = _exited(world, campaign)
+    reach = world.channel.post
+    gid = attempt["grant_id"]
+    lease = world.row("SELECT * FROM execution_leases WHERE grant_id=?", gid)
+    operation = world.row("SELECT operation_id FROM external_operations WHERE grant_id=?", gid)
+    content = b"{}"
+    base = f"/worker/leases/{lease['id']}/artifact-uploads"
+    started = reach(
+        base,
+        {
+            "expected_epoch": lease["epoch"],
+            "operation_id": operation["operation_id"],
+            "relative_path": "data.json",
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        },
+        "begin-small",
+    )
+    exited = world.row(
+        "SELECT recorded_at FROM execution_observations WHERE grant_id=? "
+        "AND observed_state='exited' ORDER BY rowid LIMIT 1",
+        gid,
+    )
+    began = datetime.fromisoformat(exited["recorded_at"].replace("Z", "+00:00")) + began_after
+    world.env.execute(
+        "UPDATE artifact_uploads SET created_at=? WHERE id=?",
+        began.isoformat().replace("+00:00", "Z"),
+        started["id"],
+    )
+    _expire_just_after_the_exit(world, attempt)
+    for store in (ArtifactStore, ExecutionStore):  # completion happens ten minutes after the exit
+        monkeypatch.setattr(store, "_now", lambda self: datetime.now(UTC) + timedelta(minutes=10))
+    reach(
+        f"{base}/{started['id']}/chunks",
+        {"offset": 0, "content_base64": base64.b64encode(content).decode()},
+        "chunk-small",
+    )
+    done = reach(f"{base}/{started['id']}/complete", {}, "done-small")
+    assert done["late"] is late
+
+
 def test_a_receipt_for_a_run_that_finished_after_its_reported_exit_is_refused(
     tmp_path, monkeypatch
 ):
@@ -492,6 +541,7 @@ class _Late:
         ("epoch_mismatch", 1),
         ("plan_changed", 1),
         ("registered_inside_the_grace", 0),
+        ("registered_at_exactly_the_grace", 0),  # inclusive: only registered > exit + 120 s is late
         ("registered_after_the_grace", 1),  # a worker that kept computing after its exit report
         ("single_request_arriving_after_the_grace", 1),  # no upload to register: arrival counts
         ("manifest_follows_its_artifacts", 0),
@@ -527,6 +577,8 @@ def test_the_not_late_rule_covers_every_grant_and_is_bounded(case, late):
         kwargs["grant"] = {"plan_digest": "other"}
     elif case == "registered_inside_the_grace":
         kwargs["registered_at"] = probe.stamp(exit_at + timedelta(seconds=119))
+    elif case == "registered_at_exactly_the_grace":
+        kwargs["registered_at"] = probe.stamp(exit_at + timedelta(seconds=120))
     elif case == "registered_after_the_grace":
         kwargs["registered_at"] = probe.stamp(exit_at + timedelta(seconds=121))
     elif case == "single_request_arriving_after_the_grace":

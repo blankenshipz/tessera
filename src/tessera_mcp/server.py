@@ -34,6 +34,7 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_get_campaign": "campaign:read",
     "tessera_list_campaigns": "campaign:read",
     "tessera_get_campaign_receipt": "campaign:read",
+    "tessera_campaign_report": "campaign:read",
     "tessera_cancel_campaign": "campaign:cancel",
     "tessera_list_snapshots": "snapshot:read",
     "tessera_campaign_outputs": "artifact:read",
@@ -354,6 +355,31 @@ def register_campaign_tools(
         """
         return await client.campaign_receipt(campaign_id)
 
+    async def tessera_campaign_report(
+        campaign_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        detail: bool = False,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """A plain-words report of what a campaign did (campaign:read): the owner's after-run read.
+
+        Give campaign_id for one campaign, or since and until (ISO-8601 UTC, until exclusive) for
+        every campaign of this project created in that window. For each stage it says what ran,
+        where, what it cost, how long it took, which hosts it reached, what data went in and out
+        and how it ended, plus model-call spend for the period. The `text` field is the report in
+        plain sentences; the rest is the same facts as data. Internal ids and digests are left out
+        unless detail is true. Costs not yet settled and figures a worker has not reported are
+        stated as such, never estimated. It reads recorded evidence; it judges nothing.
+        """
+        if campaign_id is not None:
+            if since is not None or until is not None:
+                raise ValueError("Give campaign_id or since and until, not both.")
+            return await client.campaign_report(campaign_id, detail)
+        if since is None or until is None:
+            raise ValueError("Give campaign_id, or both since and until.")
+        return await client.campaign_window_report(since, until, detail, limit)
+
     async def tessera_list_snapshots(offset: int = 0, limit: int = 50) -> dict[str, Any]:
         """List this project's source snapshots (snapshot:read): id, digest, size, data class.
 
@@ -672,6 +698,7 @@ def register_campaign_tools(
         tessera_list_stuck_campaigns,
         tessera_acknowledge_stuck,
         tessera_get_campaign_receipt,
+        tessera_campaign_report,
         tessera_list_snapshots,
         tessera_campaign_outputs,
         tessera_campaign_logs,

@@ -10,7 +10,7 @@ from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
 # Literal: must equal the highest registered constant (ATTEMPT_ASSESSMENT_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 82
+LATEST_SCHEMA_VERSION = 83
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1802,3 +1802,42 @@ def migrate_attempt_assessment_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(ATTEMPT_ASSESSMENT_SCHEMA_VERSION - 1, migrate_attempt_assessment_schema)
+
+
+# Design environment and metric (schema 83). Additive and idempotent: a nullable environment
+# digest on each design variant and a nullable headline metric name on each design revision.
+# Existing rows read as NULL and are never relabelled. This is the version reserved for this
+# change (ADR 0118); the allocator's migration number cannot be used because the registry
+# requires a contiguous chain. If another change owns this version when branches merge, raise
+# DESIGN_ENVIRONMENT_SCHEMA_VERSION and LATEST_SCHEMA_VERSION and the fresh-database INSERT
+# in store.py.
+DESIGN_ENVIRONMENT_SCHEMA_VERSION = 83
+
+
+def migrate_design_environment_schema(connection: sqlite3.Connection) -> None:
+    additions = (
+        (
+            "research_experiment_variants",
+            "environment_digest",
+            "environment_digest TEXT CHECK (environment_digest IS NULL OR "
+            "(length(environment_digest)=64 AND environment_digest NOT GLOB '*[^0-9a-f]*'))",
+        ),
+        ("research_experiment_designs", "metric", "metric TEXT"),
+    )
+    for table, column, definition in additions:
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (DESIGN_ENVIRONMENT_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(DESIGN_ENVIRONMENT_SCHEMA_VERSION - 1, migrate_design_environment_schema)

@@ -136,6 +136,34 @@ def test_refusals_name_the_input_and_reason(chained, ref, predecessors, message)
     assert "'reuse'" in str(caught.value) and "'prior'" in str(caught.value)
 
 
+def test_the_last_succeeded_attempt_wins_when_attempts_produced_different_hashes():
+    """ADR 0080: a receipt listing two succeeded attempts of one output resolves to the later.
+
+    Receipts are append-only, so the resolver's receipt reader is exercised on a built receipt.
+    """
+    from tessera_control.campaign_io import _source_receipt_output
+
+    def attempt(number, status, sha):
+        io = [{"direction": "output", "name": "result", "sha256": sha * 64}]
+        return {"attempt": number, "status": status, "io": io}
+
+    receipt = {
+        "stages": [
+            {"stage_key": "other", "attempts": [attempt(1, "succeeded", "9")]},
+            {
+                "stage_key": "s1",
+                "attempts": [
+                    attempt(1, "succeeded", "a"),
+                    attempt(2, "succeeded", "b"),
+                    attempt(3, "failed", "c"),  # a failed attempt after them is ignored
+                ],
+            },
+        ]
+    }
+    assert _source_receipt_output(receipt, "s1", "result") == ("b" * 64, 2)
+    assert _source_receipt_output(receipt, "s1", "absent") is None
+
+
 def test_a_predecessor_that_has_not_succeeded_is_refused(chained):
     world, first, row = chained
     spec = world.env.spec()

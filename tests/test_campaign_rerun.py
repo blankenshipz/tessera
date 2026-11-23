@@ -369,6 +369,20 @@ def test_the_tree_bound_counts_siblings_and_unsettled_links(tmp_path):
     assert three["spec"]["budget_cap_cents"] == 4
 
 
+def test_an_idempotent_replay_still_succeeds_after_the_tree_has_filled_to_its_bound(tmp_path):
+    world, cid = _failed_after_one_success(tmp_path)
+    env = world.env
+    agent = env.agent(ACTIONS, "steerer")
+    first_cap = env.store.get_campaign(env.owner, cid)["spec"]["budget_cap_cents"]
+    first = _rerun(world, agent, cid, "fill-1", budget_cap_cents=first_cap)
+    # The tree is now full: a NEW request is refused, the replay returns the stored answer.
+    assert env.store.get_campaign(env.owner, cid)["rerun_tree"]["remaining_cents"] == 0
+    with pytest.raises(Conflict, match="0 cents left"):
+        _rerun(world, agent, cid, "fill-2", budget_cap_cents=1)
+    assert _rerun(world, agent, cid, "fill-1", budget_cap_cents=first_cap) == first
+    assert env.query("SELECT count(*) AS n FROM campaigns")[0]["n"] == 2
+
+
 @pytest.mark.parametrize("state", ["stopped", "cancelled"])
 def test_a_stopped_or_cancelled_source_can_be_rerun(tmp_path, state):
     world, cid = _failed_after_one_success(tmp_path)

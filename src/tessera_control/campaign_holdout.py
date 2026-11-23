@@ -115,6 +115,8 @@ def sealed_input_refusal(connection: sqlite3.Connection, project_id: str, stage:
     claimed = sealed_digests(connection, project_id)
     holdout = stage.holdout
     for item in stage.inputs:
+        if item.kind == "public_artifact":
+            continue  # public data fetched on the provider (ADR 0097) is never a sealed partition
         digest = item.digest if item.kind == "snapshot" else item.sha256
         if digest in claimed and (holdout is None or holdout.input != item.name):
             return (

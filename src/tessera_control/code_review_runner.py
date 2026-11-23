@@ -545,7 +545,7 @@ class CodeReviewRunner:
 
     def _execute(self, job: dict) -> None:
         job_id = job["id"]
-        attempt = (job.get("code_review") or {}).get("attempts", 1)
+        attempt = job["code_review"]["attempts"]
         remaining = remaining_budget_cents(job)
         if remaining <= 0:
             # Earlier attempts already spent the budget: a retry would spend it twice.

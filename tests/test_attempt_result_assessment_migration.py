@@ -24,7 +24,7 @@ def _objects(path):
 def test_the_previous_version_migrates_to_the_assessment_schema_and_matches_a_fresh_database(
     tmp_path,
 ) -> None:
-    assert LATEST_SCHEMA_VERSION == ATTEMPT_ASSESSMENT_SCHEMA_VERSION == 82
+    assert ATTEMPT_ASSESSMENT_SCHEMA_VERSION == 82 <= LATEST_SCHEMA_VERSION
     previous = ATTEMPT_ASSESSMENT_SCHEMA_VERSION - 1
     assert previous in MIGRATIONS  # this migration is registered at its own version
     fresh = tmp_path / "fresh"
@@ -37,13 +37,13 @@ def test_the_previous_version_migrates_to_the_assessment_schema_and_matches_a_fr
         db.execute(f"DROP TABLE {TABLE}")
         db.execute("UPDATE schema_meta SET schema_version=?", (previous,))
         before = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    assert migrate_state(old) == ATTEMPT_ASSESSMENT_SCHEMA_VERSION
-    assert migrate_state(old) == ATTEMPT_ASSESSMENT_SCHEMA_VERSION  # idempotent
+    assert migrate_state(old) == LATEST_SCHEMA_VERSION
+    assert migrate_state(old) == LATEST_SCHEMA_VERSION  # idempotent
     assert _objects(old) == _objects(fresh)
     assert {name for kind, name in _objects(old) if kind == "table"} == {TABLE}
     with sqlite3.connect(old / "tessera.sqlite3") as db:
         assert db.execute("SELECT schema_version FROM schema_meta").fetchone()[0] == (
-            ATTEMPT_ASSESSMENT_SCHEMA_VERSION
+            LATEST_SCHEMA_VERSION
         )
         assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before
         assert db.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0] == 0

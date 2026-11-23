@@ -146,7 +146,19 @@ the base branch and adopts snapshots of the changed files only (base, head and a
 then submits a `diff` job with the pinned prompt for the round. Refusals use stable reasons
 (`git_remote_not_configured`, `branch_not_found`, `head_mismatch`, `base_not_found`, `no_changes`,
 `change_too_large`, `unsupported_entry`, `focused_tests_invalid`, `review_chain_mismatch`,
-`review_round_limit`, `review_already_merge`, `recheck_findings_invalid`).
+`review_round_limit`, `review_already_merge`, `recheck_findings_invalid`, `path_denied`,
+`content_denied`).
+
+Operator setup: start the server with `tessera serve --code-review-git-remotes FILE` (or set
+`TESSERA_CODE_REVIEW_GIT_REMOTES`); off by default, a malformed file stops startup. The file is
+`{"repos": {"name": "/abs/path.git"}, "deny_paths": [...], "allow_paths": [...]}`; the two lists
+are optional. Before anything is snapshotted for a model, a changed path that looks secret-shaped
+(`.env*`, key and certificate files, `credentials*`, `secrets*`, databases, `.aws`, `.ssh`,
+`.gnupg`, or under `data/` or `datasets/`) or a file with a private-key header or API-key shaped
+token refuses the submit (`path_denied`, `content_denied`). `deny_paths` adds globs; `allow_paths`
+exempts paths from the built-in name and directory rules only. Without an `idempotency_key`, the
+MCP tool and `tessera-review submit` derive one from repo, branch, head SHA, base branch and
+re-review fields, so a retry replays the same review.
 
 Focused tests only: each entry is a relative POSIX path under a `tests/` directory segment, named
 `test_*.py`, a regular file at the head, with no glob characters, `..` or directory. A directory or

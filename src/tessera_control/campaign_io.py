@@ -195,6 +195,8 @@ def resolve_artifact(
     ).fetchone()
     if row is None:
         raise _refuse(source, "no such output in this project")
+    # Only receipt-output inputs carry resolved_from today; revisit this lineage guard if
+    # another input kind gains a resolved_from attribute.
     lineage = getattr(source, "resolved_from", None)
     if lineage is not None:
         recorded = connection.execute(

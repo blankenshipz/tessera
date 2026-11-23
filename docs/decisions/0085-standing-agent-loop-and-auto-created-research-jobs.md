@@ -46,8 +46,8 @@ data on a destination the operator has not registered.
    tier are used afterwards. Quota never changes the configured tier.
 4. **Unknown outcomes are not retried.** The loop records a durable start in a call ledger before
    it calls the provider. The ledger must be durable: the loop refuses to be built over a volatile
-   one (an explicit opt-in exists for tests only). A refusal known to precede acceptance (quota, or an explicit "not
-   started") is retryable. Any other error, or a start record with no finish (for example a crash),
+   one (an explicit opt-in exists for tests only). A refusal known to precede acceptance (quota,
+   or an explicit "not started") is retryable. Any other error, or a start record with no finish (for example a crash),
    is an *uncertain* outcome: it is never repeated automatically, because the provider may already
    have accepted a paid call. Uncertain items are surfaced, and only an operator resolution clears
    them. No new call starts while any ledger row is recorded as started, whether or not that item is
@@ -96,7 +96,8 @@ data on a destination the operator has not registered.
     and live reservations, the submission runs with no lock held, and a second short transaction
     records the job or the skip. Two processes sharing a ledger therefore cannot both pass the cap,
     and a slow submission never blocks another writer. New reservations never exceed the caps: a reservation
-    older than its time limit is stale but still counts against both caps. Each reservation has an owner token; a takeover issues a new one, and a late
+    older than its time limit is stale but still counts against both caps. Each reservation has
+    an owner token; a takeover issues a new one, and a late
     failure from a previous owner changes nothing, so it can never free the current owner's slot. It
     is released only when
     the same trigger is replayed (the same idempotency key is sent, so the submission side returns
@@ -108,7 +109,8 @@ data on a destination the operator has not registered.
     always recorded. If an operator released its reservation and the slot was then taken, the late
     success still lands on the record and is flagged `over_cap`, since the receipt must match what
     ran. A failure or refusal from an orphaned owner changes nothing and leaves a row in a stale
-    completions log, so every attempt stays auditable. Old skip rows can be pruned; jobs are kept
+    completions log, so every attempt stays auditable. Old skip rows can be pruned, and `stale_completions` receipts
+    are pruned with them (the same cutoff applies to both); jobs are kept
     for audit. Pruning a final skip makes that trigger and kind eligible again, so a trigger the
     destination policy refused (for example `destination_not_enrolled`) is submitted and refused
     again. That is safe for egress, since the submission side re-checks policy on every submit, but

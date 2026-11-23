@@ -14,7 +14,7 @@ import logging
 import sqlite3
 import uuid
 from collections.abc import Iterator, Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
@@ -177,6 +177,8 @@ class CampaignStore(
         project = {"org_id": live["org_id"], "project_id": project_id}
 
         def entries(source: Any) -> list[tuple[str, str, int]]:
+            if source.kind == "public_artifact":
+                return []  # fetched on the provider (ADR 0097): no custody bytes
             if source.kind == "artifact":
                 found = resolve_artifact(connection, project, source)
                 return [(found.path, found.sha256, found.size_bytes)]
@@ -275,6 +277,8 @@ class CampaignStore(
         narrowed = frozenset(stage.send_classes) if stage.send_classes else None
         who = f"provider {stage.provider!r} with worker principal {worker!r}"
         for source in stage.inputs:
+            if source.kind == "public_artifact":
+                continue  # public data fetched on the provider (ADR 0097): never custody
             if source.kind == "snapshot":
                 try:
                     provider_trust.provider_admits(
@@ -370,7 +374,7 @@ class CampaignStore(
                 if source.kind == "artifact":
                     resolve_artifact(connection, project, source)
                 if source.kind != "snapshot":
-                    continue
+                    continue  # stage, public_artifact (ADR 0097): no snapshot admission
                 snapshot = SnapshotStore._snapshot(connection, live, source.snapshot_id)
                 if snapshot["project_id"] != project_id or snapshot["digest"] != source.digest:
                     raise Conflict("Campaign input snapshot does not match its pinned digest.")
@@ -1127,6 +1131,43 @@ class CampaignStore(
                 "receipt_digest": row["receipt_digest"],
                 "created_at": row["created_at"],
             }
+        finally:
+            connection.close()
+
+    def get_campaign_report(self, principal, campaign_id, *, detail: bool = False) -> dict:
+        """The plain-words report of one campaign, from its receipt data (campaign:read)."""
+        from . import campaign_report
+
+        connection = _connect(self.database_path)
+        try:
+            actor = self._read_actor(connection, principal)
+            self._campaign(connection, actor, campaign_id)
+            report = campaign_report.build_report(connection, campaign_id, detail=detail)
+            return {**report, "text": campaign_report.render_text(report)}
+        finally:
+            connection.close()
+
+    def get_campaign_window_report(
+        self, principal, project_id, since, until, *, detail: bool = False, limit: int = 100
+    ) -> dict:
+        """The plain-words report of the project's campaigns created in [since, until)."""
+        from . import campaign_report
+
+        if not 1 <= limit <= 200:
+            raise StoreError("Invalid report bounds.")
+        for value in (since, until):
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (AttributeError, ValueError):
+                raise StoreError("since and until must be ISO-8601 timestamps.") from None
+        connection = _connect(self.database_path)
+        try:
+            actor = self._read_actor(connection, principal)
+            self._project(connection, actor, project_id)
+            report = campaign_report.window_report(
+                connection, project_id, since, until, detail=detail, limit=limit
+            )
+            return {**report, "text": campaign_report.render_text(report)}
         finally:
             connection.close()
 

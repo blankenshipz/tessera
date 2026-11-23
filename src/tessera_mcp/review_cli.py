@@ -10,11 +10,10 @@ import argparse
 import asyncio
 import json
 import sys
-import uuid
 
 from tessera_mcp.client import ControlClient, ControlError, segment
 from tessera_mcp.config import Config
-from tessera_mcp.review_tools import build_code_review_body
+from tessera_mcp.review_tools import build_code_review_body, default_code_review_key
 
 
 def _parser():
@@ -72,7 +71,7 @@ def main(argv=None, client_factory=None) -> int:
             message = "Tessera configuration/credential reference invalid"
         print(message, file=sys.stderr)
         return 2
-    key = arguments.idempotency_key or "code-review-" + uuid.uuid4().hex
+    key = arguments.idempotency_key or default_code_review_key(body)
     try:
         job = asyncio.run(client._request("POST", path, body=body, key=key))
     except ControlError as exc:

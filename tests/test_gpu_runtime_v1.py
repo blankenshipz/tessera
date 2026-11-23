@@ -251,6 +251,7 @@ def test_fetch_all_verifies_and_records(tmp_path):
     paths, fetched = rt.fetch_all(manifest_for(BLOBS), str(tmp_path), deadline(), opener_for(BLOBS))
     assert Path(paths["entry"][0]).read_bytes() == ENTRY_SRC
     assert Path(paths["wheel"][0]).parent.name == "wheels"
+    assert all(isinstance(row.pop("seconds"), float) for row in fetched)
     assert fetched == [
         {"url": u, "sha256": sha(d), "bytes": len(d)} for (u, _, _), d in BLOBS.items()
     ]
@@ -396,6 +397,7 @@ def test_begin_once_precedes_entry_and_output_retained_with_fetched(tmp_path):
     assert outputs == [{"name": "output.json", "sha256": sha(output), "bytes": len(output)}]
     body = json.loads(output)
     assert body["answer"] == 42
+    assert all(row.pop("seconds") >= 0 for row in body["fetched"])
     assert body["fetched"] == [
         {"url": u, "sha256": sha(d), "bytes": len(d)} for (u, _, _), d in BLOBS.items()
     ]

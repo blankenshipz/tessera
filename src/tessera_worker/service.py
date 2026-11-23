@@ -139,6 +139,11 @@ class DevelopmentWorkerConfig:
     # Operator ceiling on one operation's output bytes (16 MiB .. 1 TiB); None keeps the
     # installation default (tessera_control.artifact_limits).
     max_output_bytes: int | None = None
+    # ADR 0097: private supervisor custody for fetched public inputs (shared by the adapter, which
+    # mounts them read-only, and the runtime, which fetches), and the optional download cache.
+    # None: a package carrying public_fetch is refused. Operator-owned; never from a plan.
+    public_root: Path | None = None
+    public_cache_dir: Path | None = None
     output_capacity_inodes: int = 256
     poll_seconds: float = 1.0
     max_ticks: int = 90_000
@@ -221,6 +226,30 @@ def _private_directory(path: Path) -> Path:
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise DevelopmentWorkerError("Development worker directory must be private 0700 custody.")
+    return path.resolve(strict=True)
+
+
+def operator_private_directory(path: Path) -> Path:
+    """Create (0700) or validate an operator directory for public-fetch custody (ADR 0097).
+
+    Refused when it is a symlink, not a directory, owned by someone else, or accessible to
+    group or world; the mode is never repaired silently."""
+    path = Path(path)
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = path.lstat()
+    except OSError as error:
+        raise DevelopmentWorkerError("Public fetch directory is unavailable.") from error
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise DevelopmentWorkerError(
+            "Public fetch directory must be a private 0700 directory (no symlink, no group or "
+            "world access) owned by the worker user."
+        )
     return path.resolve(strict=True)
 
 
@@ -412,6 +441,16 @@ class DevelopmentWorkerService:
         self.stage_watch = stage_watch
         self.root = _private_directory(config.workspace_root)
         self.output_root = _private_directory(config.development_output_root)
+        self.public_root = (
+            operator_private_directory(config.public_root)
+            if config.public_root is not None
+            else None
+        )
+        self.public_cache_dir = (
+            operator_private_directory(config.public_cache_dir)
+            if config.public_cache_dir is not None
+            else None
+        )
         self.token = read_private_credential(config.credential_file)
         self.channel = channel or HttpControlChannel(
             config.control_url, self.token, timeout_seconds=config.control_timeout_seconds
@@ -472,6 +511,7 @@ class DevelopmentWorkerService:
             max_scratch_bytes=self.config.max_scratch_bytes,
             container_user=self.config.container_user or default_container_user(),
             allow_root_container_user=self.config.allow_root_container_user,
+            public_root=self.public_root,
             network_pool=network_pool_from_config(
                 self.config.docker_network_pool, self.config.docker_network_prefix_length
             ),
@@ -499,6 +539,8 @@ class DevelopmentWorkerService:
                 worker_id=worker_id,
                 development_profile=profile,
                 provider=self.provider,
+                public_root=self.public_root,
+                public_cache_dir=self.public_cache_dir,
             ) as runtime:
                 self._attach_stage_watch(runtime, adapter)
                 result = runtime.recover(lease_id, epoch)
@@ -519,6 +561,8 @@ class DevelopmentWorkerService:
             worker_id=worker_id,
             development_profile=profile,
             provider=self.provider,
+            public_root=self.public_root,
+            public_cache_dir=self.public_cache_dir,
         ) as runtime:
             self._attach_stage_watch(runtime, adapter)
             result = runtime.start(lease_id, epoch)

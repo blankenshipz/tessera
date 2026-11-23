@@ -9,6 +9,8 @@ under ``--review-decision-tool``. The control API still decides: it refuses any 
 that is not a person's session, so an agent credential gets a 403 that is passed through.
 """
 
+import hashlib
+import json
 import re
 import uuid
 from typing import Annotated, Any, Literal
@@ -74,6 +76,28 @@ def _check_focused_test(path) -> str:
     if "tests" not in parts[:-1] or not _TEST_FILE_RE.fullmatch(parts[-1]):
         raise ValueError("focused tests must be test_*.py files under a tests/ directory")
     return path
+
+
+def default_code_review_key(body: dict[str, Any]) -> str:
+    """Deterministic idempotency key from the review's identity (repo, branch, head SHA, base
+    branch and, for a re-review, the previous job and findings, which fix the round), so a retry
+    replays the first submit instead of creating and paying for a second review."""
+    identity = json.dumps(
+        [
+            body.get(name)
+            for name in (
+                "repo",
+                "branch",
+                "head_sha",
+                "base_branch",
+                "previous_job_id",
+                "recheck_findings",
+            )
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "code-review-" + hashlib.sha256(identity.encode()).hexdigest()[:32]
 
 
 def build_code_review_body(
@@ -305,7 +329,7 @@ def register_review_tools(
             "POST",
             project("code-reviews"),
             body=body,
-            key=idempotency_key or "code-review-" + uuid.uuid4().hex,
+            key=idempotency_key or default_code_review_key(body),
         )
 
     @(server.tool(annotations=read) if allowed("tessera_list_review_jobs") else _skip)

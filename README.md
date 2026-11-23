@@ -46,7 +46,9 @@ scientific validity:** a complete record, successful process or agent critique
 does not establish that the method is sound or the conclusion is justified.
 
 This end-to-end agent workflow is a design target, **not today's integrated alpha**.
-Today you can use the local desktop/control service for versioned designs, studies,
+Today you can use the local desktop/control service for versioned designs (a design can
+record an environment digest and the headline metric, which the platform stores but does not
+verify), studies,
 linked measurements, a baseline-versus-intervention comparison of the recorded numbers
 (difference, sample sizes and a 95% interval, never a verdict), human conclusions/corrections
 (a researcher can record a continue/revise/reject decision on a conclusion, with each cited
@@ -266,13 +268,14 @@ Example systemd units for the poller, Salad executor and guardian are in
 [`deploy/systemd`](deploy/systemd/README.md).
 A person can record an approved submission (a reviewed spec digest or a failed campaign to rerun);
 the optional `tessera-submit-runner` then turns pending records into campaigns on a schedule, only
-when an operator starts it and `tessera serve --agent-submissions` is set
+on a host whose operator admitted it (it then starts with `tessera.target`) and when
+`tessera serve --agent-submissions` is set
 ([ADR 0093](docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md)). It runs no model and
 approves nothing.
 
 Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes v1 and v2
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
-`tessera_get_campaign_receipt`, `tessera_list_snapshots`, `tessera_campaign_outputs`,
+`tessera_get_campaign_receipt`, `tessera_campaign_report` (a plain-words read of one campaign or a time window, [ADR 0115](docs/decisions/0115-plain-words-campaign-report.md)), `tessera_list_snapshots`, `tessera_campaign_outputs`,
 `tessera_campaign_logs`, `tessera_campaign_budget` and `tessera_project_spend` (the operator's
 project limits and campaign totals) read recorded state under separate
 scopes. Steering tools ([ADR 0055](docs/decisions/0055-mcp-steering-tools.md)) dry-run a spec

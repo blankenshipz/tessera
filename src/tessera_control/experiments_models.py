@@ -36,6 +36,9 @@ class DesignVariant(ExperimentRequest):
     name: NonBlank200
     method_digest: Digest
     input_digest: Digest
+    # sha256 of the environment (image, lockfile or requirements). The platform records it and
+    # never interprets it; optional so existing clients keep working.
+    environment_digest: Digest | None = None
     metadata: dict[str, Any]
     execution_task_id: Identifier | None = None
     execution_plan_digest: Digest | None = None
@@ -53,6 +56,8 @@ class CreateExperiment(ExperimentRequest):
     goal: NonBlank4000
     success_criterion: NonBlank4000
     protocol: NonBlank4000
+    # Name of the single headline metric the success criterion is judged on (optional).
+    metric: NonBlank200 | None = None
     variants: Annotated[list[DesignVariant], Field(min_length=2, max_length=2)]
 
     @model_validator(mode="after")

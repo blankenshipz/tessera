@@ -276,8 +276,10 @@ def test_one_campaign_is_steered_start_to_finish_over_mcp_tools(tmp_path):
     # -- journal evidence, and the tool calls the agent and the approver made ---------------
     assert [e["campaign_id"] for e in _events(env, "campaign.rerun_submitted")] == [b, c]
     assert [e["campaign_id"] for e in _events(env, "campaign.budget_reduced")] == [a]
-    assert len(env.query("SELECT 1 FROM campaign_approvals")) == 3  # a, b, c: each a person's
-    assert {
+    assert (
+        len(env.query("SELECT 1 FROM campaign_approvals")) == 3
+    )  # a, b, c: each a person's; depends on spec-order scheduling
+    agent_only = {
         "tessera_submit_campaign",
         "tessera_get_campaign",
         "tessera_project_spend",
@@ -293,9 +295,12 @@ def test_one_campaign_is_steered_start_to_finish_over_mcp_tools(tmp_path):
         "tessera_campaign_grants",
         "tessera_campaign_budget",
         "tessera_revoke_campaign_release",
-        "tessera_approve_campaign",
-    } <= set(CALLS) | set(steer.calls)
-    assert CALLS.count("tessera_approve_campaign") == 4  # refused-digest attempt, then a, b, c
+    }
+    assert agent_only <= set(steer.calls)  # the agent alone made every non-approval call
+    assert set(CALLS) == {"tessera_approve_campaign"}  # the approver made only approvals
+    assert "tessera_approve_campaign" not in steer.calls  # the agent never approved
+    # Depends on spec-order scheduling: refused-digest attempt, then a, b, c.
+    assert CALLS.count("tessera_approve_campaign") == 4
 
 
 def _one_stage_campaign(tmp_path, v1=False):

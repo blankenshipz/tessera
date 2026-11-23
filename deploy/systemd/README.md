@@ -10,8 +10,8 @@ generic placeholder: `/etc/tessera` (configuration), `/var/lib/tessera` (state),
 | `tessera-development-poll.service` | `python -m tessera_worker.cli development-poll` (same as `tessera-worker development-poll`) |
 | `tessera-salad-executor.service` | `python -m tessera_control.campaign_salad_executor` |
 | `tessera-salad-guardian.service` | `python -m tessera_control.salad_safety_service --run` |
-| `tessera-submit-runner.service` | `tessera-submit-runner`: submits owner-approved campaign records on a schedule (manual start, not in the target) |
-| `tessera.target` | groups the three services |
+| `tessera-submit-runner.service` | `tessera-submit-runner`: submits owner-approved campaign records on a schedule (in the target, started only on an admitted host) |
+| `tessera.target` | groups the four services |
 | `tessera-health-check@.service` + `tessera-health-check-*.timer` | optional freshness probes |
 
 The executor and guardian are also installed as the console scripts
@@ -70,14 +70,15 @@ endpoint as described in `docs/salad-safety-service.md`; `Restart=on-failure`
 covers crashes. Exit code 2 (configuration or prerequisite refused) is not
 retried (`RestartPreventExitStatus=2`).
 
-## Submit runner (manual start)
+## Submit runner (starts with the target, only if admitted)
 
 `tessera-submit-runner.service` runs the campaign-submit action of the agent
 loop ([ADR 0093](../../docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md))
 on a schedule. It only turns records a person already approved into campaigns;
-it runs no model and never approves anything. It is not part of
-`tessera.target` and has no `[Install]` section, so `systemctl enable` does
-nothing for it. Its settings:
+it runs no model and never approves anything. It is wanted by
+`tessera.target`, so enabling the target starts it, but only on a host whose
+operator created the admission marker below (without it systemd skips the
+start). Its settings:
 
 - Admission: it starts only if the marker `/etc/tessera/submit-runner.admitted`
   exists (`ConditionPathExists=`; without it systemd skips the start).
@@ -97,8 +98,10 @@ nothing for it. Its settings:
 Control must also run with `tessera serve --agent-submissions`; otherwise every
 submit is refused `feature_disabled`.
 
-Start: `touch /etc/tessera/submit-runner.admitted`, then
-`systemctl start tessera-submit-runner.service`.
+Admit and start: `touch /etc/tessera/submit-runner.admitted`, then
+`systemctl start tessera-submit-runner.service` (or restart the target; after
+that it starts with the target). Control is started with
+`tessera serve --agent-submissions --agent-submission-kill-switch /etc/tessera/submit-runner.kill`.
 
 Stop new submissions at once: `touch /etc/tessera/submit-runner.kill`. While
 the marker exists (or its state is ambiguous, for example its parent directory
@@ -109,3 +112,20 @@ ticks.
 Campaigns that were already submitted keep running and are untouched. To stop
 the process: `systemctl stop tessera-submit-runner.service`; to withdraw
 admission, remove the marker file.
+
+## Stage watcher (on in the poller)
+
+`tessera-development-poll.service` starts the poller with `--stage-watcher
+--stage-watcher-kill-switch /var/lib/tessera/stage-watch.kill`
+([ADR 0111](../../docs/decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md)).
+The watcher only observes and reports (it never stops, retries or approves). It
+runs while the kill-switch marker is absent; `touch /var/lib/tessera/stage-watch.kill`
+turns it off at once, and a poller started without a marker path refuses to run
+the watcher (it fails closed). Remove both flags from `ExecStart` to disable it.
+
+## Credential health
+
+`GET /credential-health` and the `credentials` section of `/operator/health` report
+`unknown` until control is started with `tessera serve --salad-credential-directory DIR`
+(the absolute, owner-only directory that holds the Salad management credentials; it
+reads their metadata, never the secret). Add the flag to the `serve` command you run.

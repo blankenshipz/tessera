@@ -75,8 +75,8 @@ partition digest and the claim scope. No per-scoring "go" is needed.
 - A claim opened for a run that then failed (including a grant that expired before any worker
   leased it, or a launch the worker reported as refused) is spent. One-time is the stricter
   reading: control does not try to prove the labels were never read.
-**Known limits / future decision.** The next three bullets and the seal-permanence and
-seal-start notes below are documented limits, not defects; changing any of them needs its own
+**Known limits / future decision.** The next three bullets (the third covers seal
+permanence and seal start) are documented limits, not defects; changing any of them needs its own
 decision.
 
 - Claims and seals are project-scoped, because the project is the tenant boundary every

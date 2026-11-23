@@ -219,7 +219,6 @@ class AutoJobLedger:
                 raise ValueError("ledger file must not be accessible by group or others.")
         self.db = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
         self.db.row_factory = sqlite3.Row
-        self.db.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
         self._depth = 0
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS jobs (

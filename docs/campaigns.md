@@ -151,8 +151,8 @@ submit, refusal and cancel is recorded and appears in the campaign receipt. `tes
 
 ### Running the submit runner
 
-`tessera-submit-runner` calls the submit action on a schedule. It is off until an operator starts it,
-and control must also run with `tessera serve --agent-submissions` (otherwise every submit is refused
+`tessera-submit-runner` calls the submit action on a schedule. It starts only on a host whose operator admitted it
+(then with `tessera.target`), and control must also run with `tessera serve --agent-submissions` (otherwise every submit is refused
 `feature_disabled`). It runs no model: it only consumes records a person approved.
 
 ```
@@ -170,7 +170,7 @@ and `--max-ticks` bound the work, and `--once` runs a single tick. The runner re
 a private, append-only JSONL log of receipts. While the kill-switch file exists (or its state is ambiguous, e.g. a missing parent directory)
 the runner pauses without exiting, calls neither the action nor the control plane, and resumes by
 itself when the file is removed; exit 0 comes only from a stop request, and exit 3 after repeated
-failed ticks. Campaigns already submitted are untouched. An example unit (manual start, admission marker, token
+failed ticks. Campaigns already submitted are untouched. An example unit (starts with the target only where the admission marker exists, token
 passed as a credential) is in [`deploy/systemd`](../deploy/systemd/README.md).
 
 ## What the runner does
@@ -275,6 +275,13 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   and only the `stage_infra_retries_exhausted` event names it. A `resource_limit_metrics` metric
   may not also be in `stop_when`. The memory gate covers every `infra_exit_codes` code, and the
   heartbeat figures are the worker's unverified claim. Every attempt and its reason are on the receipt.
+- **Plain-words report (ADR 0115).** `tessera campaign report --campaign-id ID` (or `--project-id P
+  --since T --until T` for a window) prints what a campaign did in sentences: per stage what ran,
+  where, what it cost, how long it took, the hosts it reached, the data that went in and out and
+  how it ended, with no internal ids unless `--detail`. `GET /campaigns/{id}/report`,
+  `GET /projects/{id}/campaign-report` and the MCP tool `tessera_campaign_report` give the same
+  as data plus `text`. Figures that are not recorded yet are said so, and model-call spend is the
+  project's for the period, not attributed to the campaign.
 - **Confirmed exits (ADR 0053).** An `admitted`, `running` or `unknown` attempt whose worker
   confirmed the exit, with no contradicting observation, is resolved by the runner on its next tick:
   the grant and its slot are released and the cost recorded (never above the hold), the attempt becomes
@@ -587,7 +594,9 @@ trusted-server worker credential: the worker token of the Salad executor enrollm
 principal is listed under `salad` in the provider trust file (see
 [provider trust: stable executor](provider-trust.md#stable-executor-route-setups-that-mint-principals)). The closed, owner-only config
 (`tessera.salad.campaign-executor.v1`) names the state directory, the operator profile file
-and profile, the worker credential file (which also authorizes the executor's reduce-only cancel of its own routes, [ADR 0075](decisions/0075-executor-worker-credential-cancels-own-route.md); no human session credential is needed), the credential directory, guardian socket
+and profile, the worker credential file (which also authorizes the executor's reduce-only cancel of
+its own routes, [ADR 0075](decisions/0075-executor-worker-credential-cancels-own-route.md); no human
+session credential is needed), the credential directory, guardian socket
 and uid, custody, a private work directory, the source revision and a 2 to 30 s poll.
 Per pass it leases and packages admitted Salad grants (refusing a plan budget above the
 profile's per-task ceiling), keeps leases alive (a renewal refusal is recorded and never

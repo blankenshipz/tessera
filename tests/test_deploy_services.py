@@ -67,7 +67,7 @@ def test_stop_reverse_order_skips_none_and_continues_on_failure():
 def test_start_forward_order_and_health():
     runner = Recorder()
     results = ds.start_services(
-        [svc("a"), svc("b")], runner, probe=lambda h: (True, "healthy"), sleep=lambda s: None
+        [svc("a"), svc("b")], runner, probe=lambda h, **_: (True, "healthy"), sleep=lambda s: None
     )
     assert [c[0] for c in runner.calls] == [["restart", "a"], ["restart", "b"]]
     assert [(r.step, r.name, r.ok) for r in results] == [
@@ -80,7 +80,7 @@ def test_start_forward_order_and_health():
 
 def test_start_stops_at_first_failed_restart():
     runner = Recorder({("restart", "a"): 3})
-    results = ds.start_services([svc("a"), svc("b")], runner, probe=lambda h: (True, "x"))
+    results = ds.start_services([svc("a"), svc("b")], runner, probe=lambda h, **_: (True, "x"))
     assert len(runner.calls) == 1
     assert [(r.step, r.ok, r.detail) for r in results] == [("restart", False, "exit 3")]
 
@@ -89,7 +89,7 @@ def test_health_polls_until_healthy():
     clock = Clock()
     polls = []
 
-    def probe(health):
+    def probe(health, **_):
         polls.append(clock())
         return len(polls) >= 3, "starting"
 
@@ -104,7 +104,7 @@ def test_health_timeout_ends_loop():
     results = ds.start_services(
         [svc("a", wait=5), svc("b")],
         runner,
-        probe=lambda h: (False, "stale"),
+        probe=lambda h, **_: (False, "stale"),
         sleep=clock.sleep,
         clock=clock,
     )

@@ -74,9 +74,12 @@ credentials and `.venv/` must stay out of Git and image contexts.
 
 - **Task acceptance:** derive targeted tests/lint from the requested behavior. While
   working, run only the tests of the modules you changed and their direct dependents,
-  stopping at the first failure: `.venv/bin/python dev/focused_tests.py` selects them from
-  your changes (`--list` shows the selection, extra arguments go to pytest), or run
-  specific files with `pytest -x`. Run the whole suite once per branch, right before
+  stopping at the first failure: `tessera dev focused-tests` (or
+  `.venv/bin/python dev/focused_tests.py`) selects them from your changes, or from a range
+  (`A..B`), plus a fixed smoke set, under caps (it lists the set with reasons by default;
+  `--run` executes it under the `--jobs` cap, `--explain` shows why each test is in;
+  [ADR 0117](docs/decisions/0117-focused-test-selection.md)), or run specific files with
+  `pytest -x`. It never runs the full suite unless `--full` is passed with `--run`. Run the whole suite once per branch, right before
   merge, in the background.
   Docs-only changes require scoped diff, references/anchors, source consistency
   and affected package checks, not unrelated runtime traces. Run
@@ -94,7 +97,8 @@ credentials and `.venv/` must stay out of Git and image contexts.
 
   `make test-parallel` (or `.venv/bin/python dev/pytest_parallel.py --jobs N`) runs the
   same file shards concurrently with separate basetemps and logs, without pytest-xdist.
-  While working, run only the affected files: `make test TESTS="tests/test_a.py"` (`-x`).
+  The full suite stays a once-per-branch pre-merge run (`make test-parallel`); while working,
+  run only the focused set or the affected files: `make test TESTS="tests/test_a.py"` (`-x`).
 
   Every `tests/**/test_*.py` file belongs to exactly one shard. Report concurrent
   changes, failures, skipped and unrun checks explicitly.

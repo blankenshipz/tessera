@@ -53,6 +53,14 @@ baseline-plus-intervention design. Every design revision includes its own immuta
 A design revision (`POST /experiments/{id}/designs`) may carry an optional `change_reason`;
 it is recorded on the append-only `experiment.design_revised` event (not on the design
 snapshot or export), so a change of plan records why it changed.
+A design variant may carry an optional `environment_digest` (sha256 of the environment: image,
+lockfile or requirements; never interpreted by the platform), and `POST /projects/{id}/experiments`
+and a design revision may carry an optional `metric` (the name of the single headline metric the
+success criterion is judged on). Both are stored immutably per design revision, shown in design
+responses, revision history and export, and null when omitted; legacy designs are not relabelled.
+They are recorded, not verified: the platform does not check that a digest matches an environment
+or that the metric appears in measurements. A revision changing either is a plan change and records the optional
+`change_reason` like any other revision ([ADR 0118](decisions/0118-design-environment-and-metric.md)).
 `POST /experiments/{id}/conclusions` accepts an optional `design_revision`; when
 omitted for compatibility it freezes the current design revision. A conclusion and
 its `POST /conclusions/{id}/review` response expose that `design_revision` and a

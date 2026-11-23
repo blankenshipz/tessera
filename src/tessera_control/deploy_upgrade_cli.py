@@ -28,6 +28,37 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
     command.add_argument("--format", choices=("text", "json"), default="text")
 
 
+def add_rollback_parser(subcommands: argparse._SubParsersAction) -> None:
+    command = subcommands.add_parser(
+        "deploy-rollback",
+        help="put the pre-migration snapshot named by a deploy-upgrade receipt back",
+        description=(
+            "Verifies the receipt and snapshot digests, refuses while a plan service is healthy "
+            "or the database is locked, restores the snapshot and the rewritten configs, and "
+            "writes a rollback receipt. It starts no service."
+        ),
+    )
+    command.add_argument("--plan", type=Path, required=True, help="the same plan file")
+    command.add_argument("--receipt", type=Path, required=True, help="the deploy receipt")
+
+
+def run_rollback(arguments: argparse.Namespace) -> int:
+    from . import deploy_upgrade
+    from .deploy_upgrade_plan import PlanError, load_plan
+
+    try:
+        plan = load_plan(arguments.plan)
+        document = deploy_upgrade.rollback(plan, arguments.receipt)
+    except (PlanError, deploy_upgrade.RollbackRefused) as error:
+        print(f"deploy-rollback: {error}", file=sys.stderr)
+        return 2
+    except OSError as error:
+        print(f"deploy-rollback: failed ({type(error).__name__})", file=sys.stderr)
+        return 1
+    print(json.dumps(document, sort_keys=True, indent=2))
+    return 0
+
+
 def _text(document: dict) -> str:
     lines = [f"{document['mode']}: {document['result']}"]
     for step in document["steps"]:
@@ -39,6 +70,7 @@ def _text(document: dict) -> str:
         lines.append(f"failed at: {document['failed_step']}")
         if document.get("backup"):
             lines.append(f"backup to restore from: {document['backup']['name']}")
+            lines.append("roll back with: tessera deploy-rollback --plan PLAN --receipt RECEIPT")
     lines.append(f"duration: {document['duration_seconds']}s")
     return "\n".join(lines)
 

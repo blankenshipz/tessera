@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -27,10 +28,12 @@ from .control_channel import classify_control_failure
 from .cpu import EGRESS_PROFILE, CpuOperation
 from .inputs import materialize_snapshot
 from .provider import Provider, ProviderDispatch
+from .public_fetch import PublicFetchError, fetch_public_files
 from .supervisor import CpuSupervisor, DriverResult, Lease, SupervisorError
 
 MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
 EGRESS_REPORT_STATE = "egress_journal"
+PUBLIC_FETCH_REPORT_STATE = "public_fetch"
 
 # Observation delivery (ADR 0054): a report that cannot be delivered stays in the durable
 # ``reports`` journal and is retried with bounded exponential backoff, keyed by its fixed
@@ -90,6 +93,9 @@ class CpuRuntime:
         persistent_output_collection: bool = False,
         persistent_output_storage: dict[str, Any] | None = None,
         provider: Provider | None = None,
+        public_root: Path | None = None,
+        public_cache_dir: Path | None = None,
+        public_fetcher: Callable[..., list[dict[str, Any]]] = fetch_public_files,
     ):
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -98,6 +104,15 @@ class CpuRuntime:
         self.input_root = Path(input_root)
         if self.input_root.is_symlink() or stat.S_IMODE(self.input_root.stat().st_mode) != 0o700:
             raise SupervisorError("Runtime inputs require private 0700 supervisor custody.")
+        # ADR 0097: private custody for supervisor-fetched public files, and the optional
+        # worker-configured cache (used only when a plan's cache flag is true).
+        self.public_root = Path(public_root) if public_root is not None else None
+        if self.public_root is not None and (
+            self.public_root.is_symlink() or stat.S_IMODE(self.public_root.stat().st_mode) != 0o700
+        ):
+            raise SupervisorError("Runtime public inputs require private 0700 supervisor custody.")
+        self.public_cache_dir = Path(public_cache_dir) if public_cache_dir is not None else None
+        self._public_fetcher = public_fetcher
         self.channel = channel
         self.adapter = adapter
         self.worker_id = worker_id
@@ -244,6 +259,7 @@ class CpuRuntime:
                     "Control package experiment identity does not match its operation."
                 )
             self._validate_network_profile(package, spec)
+            self._validate_public_fetch(package, spec)
             capability = package.get("persistent_output_storage")
             if self.persistent_output_collection:
                 if capability is None:
@@ -294,6 +310,81 @@ class CpuRuntime:
         else:
             raise SupervisorError("Control package has an unknown network profile.")
 
+    @staticmethod
+    def _validate_public_fetch(package: dict[str, Any], spec: dict[str, Any]) -> None:
+        """The package carries the plan's public fetch exactly, only without any egress."""
+        plan = package.get("public_fetch")
+        if plan is None and spec.get("public_fetch") is None:
+            return
+        if (
+            not isinstance(plan, dict)
+            or plan != spec.get("public_fetch")
+            or package.get("network_profile") != "none"
+            or not isinstance(plan.get("files"), list)
+            or not isinstance(plan.get("hosts"), list)
+            or not plan["files"]
+            or type(plan.get("cache")) is not bool
+        ):
+            raise SupervisorError("Control package public fetch does not match its plan.")
+
+    def _fetch_public(self, operation_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+        """Download and verify the plan's public files into private custody (ADR 0097).
+
+        Runs in the supervisor, before any container exists; the container stays network none
+        and only ever sees the verified files. Any failure removes everything fetched."""
+        if self.public_root is None:
+            raise SupervisorError(
+                "Public fetch refused: this worker has no public input root; the operator "
+                "must set --public-root (or public_root in the poller config)."
+            )
+        directory = self.public_root / f"tessera-public-{operation_id}"
+        self._discard_public(directory)
+        directory.mkdir(mode=0o700)
+        cache = self.public_cache_dir if plan["cache"] else None
+        rows: list[dict[str, Any]] = []
+        try:
+            for name in sorted({item["input"] for item in plan["files"]}):
+                pins = [
+                    {key: item[key] for key in ("name", "url", "sha256", "max_bytes")}
+                    for item in plan["files"]
+                    if item["input"] == name
+                ]
+                fetched = self._public_fetcher(
+                    pins,
+                    dest=directory / name,
+                    redirect_hosts=tuple(plan["hosts"]),
+                    cache_dir=cache,
+                )
+                rows += [{"input": name} | dict(row) for row in fetched]
+            expected = {(row["input"], row["name"]) for row in rows}
+            if expected != {(item["input"], item["name"]) for item in plan["files"]}:
+                raise SupervisorError("Public fetch failed: incomplete result.")
+            for name in {row["input"] for row in rows}:
+                found = {entry.name for entry in os.scandir(directory / name)}
+                if found != {row["name"] for row in rows if row["input"] == name}:
+                    raise SupervisorError("Public fetch failed: unexpected files.")
+                (directory / name).chmod(0o555)
+        except PublicFetchError as error:
+            self._discard_public(directory)
+            raise SupervisorError(f"Public fetch failed: {error.code}") from None
+        except OSError:
+            self._discard_public(directory)
+            raise SupervisorError("Public fetch failed: io_error") from None
+        except BaseException:
+            self._discard_public(directory)
+            raise
+        return {"directory": str(directory), "rows": rows}
+
+    @staticmethod
+    def _discard_public(directory: Path) -> None:
+        if not directory.exists():
+            return
+        for current, directories, _ in os.walk(directory):
+            Path(current).chmod(0o700)
+            for item in directories:
+                (Path(current) / item).chmod(0o700)
+        shutil.rmtree(directory, ignore_errors=True)
+
     def _operation(self, descriptor: dict[str, Any]) -> CpuOperation:
         response = descriptor["control"]
         package = response["package"]
@@ -303,6 +394,22 @@ class CpuRuntime:
             != package["snapshot_digest"]
         ):
             raise SupervisorError("Staged manifest does not match the control package.")
+        fetched = descriptor.get("public_fetch")
+        plan = package.get("public_fetch")
+        if (fetched is None) != (plan is None):
+            raise SupervisorError("Runtime descriptor public fetch does not match its package.")
+        public: dict[str, Any] = {}
+        if fetched is not None:
+            pins = {(f["input"], f["name"]): f["sha256"] for f in plan["files"]}
+            rows = fetched["rows"]
+            if {(r["input"], r["name"]): r["sha256"] for r in rows} != pins:
+                raise SupervisorError("Runtime descriptor public fetch contradicts its plan.")
+            public = {
+                "public_directory": fetched["directory"],
+                "public_files": tuple(
+                    (r["input"], r["name"], r["sha256"], r["bytes"]) for r in rows
+                ),
+            }
         return CpuOperation(
             operation_id=package["operation_id"],
             image=package["pinned_image"],
@@ -315,6 +422,7 @@ class CpuRuntime:
             egress=package["plan"]["execution_spec"].get("egress"),
             # Operator container limits belong to the operation, so the supervisor's durable
             # fence (and recovery's digest check) covers the limits the container runs with.
+            **public,
             **self._operation_limits(package["plan"]["execution_spec"].get("max_scratch_bytes")),
         )
 
@@ -382,6 +490,12 @@ class CpuRuntime:
             self._validate_package(response, lease_id, epoch)
             self._bind_journal(lease_id, epoch)
             package = response["package"]
+            # ADR 0097: the supervisor fetches pinned public files before inputs or a container.
+            fetched = (
+                self._fetch_public(package["operation_id"], package["public_fetch"])
+                if package.get("public_fetch") is not None
+                else None
+            )
             bundle = self.channel.post(
                 f"/worker/leases/{lease_id}/inputs",
                 {"expected_epoch": epoch},
@@ -419,6 +533,8 @@ class CpuRuntime:
                 "input_directory": str(staged.directory),
                 "input_manifest_json": staged.manifest_json,
             }
+            if fetched is not None:
+                descriptor["public_fetch"] = fetched
             self._operation(descriptor)  # Validate before persisting local operation intent.
             encoded = json.dumps(descriptor, sort_keys=True).encode()
             if len(encoded) > MAX_DESCRIPTOR_BYTES:
@@ -582,6 +698,7 @@ class CpuRuntime:
             and self.operation.network_profile == EGRESS_PROFILE
         ):
             self._report_egress_journal()
+        self._report_public_fetch()
         return response
 
     def _report_request_seconds(self) -> float | None:
@@ -638,8 +755,13 @@ class CpuRuntime:
                 connection.execute(
                     """UPDATE reports SET abandoned=1, last_error='superseded'
                     WHERE operation_id=? AND completed=0 AND abandoned=0 AND id<>?
-                    AND observed_state NOT IN ('exited', ?)""",
-                    (self.operation.operation_id, intent_id, EGRESS_REPORT_STATE),
+                    AND observed_state NOT IN ('exited', ?, ?)""",
+                    (
+                        self.operation.operation_id,
+                        intent_id,
+                        EGRESS_REPORT_STATE,
+                        PUBLIC_FETCH_REPORT_STATE,
+                    ),
                 )
             row = connection.execute(
                 "SELECT next_attempt_at, first_failed_at FROM reports WHERE id=?", (intent_id,)
@@ -768,6 +890,58 @@ class CpuRuntime:
         try:
             self._post_report(
                 f"/worker/operations/{operation.operation_id}/egress-journal", payload, key
+            )
+        except Exception as error:
+            self._delivery_failed(intent_id, error)
+        with self._observation_connection() as connection:
+            connection.execute("UPDATE reports SET completed=1 WHERE id=?", (intent_id,))
+
+    def _report_public_fetch(self) -> None:
+        """Post the per-file fetch rows (never the files) once, replayably (ADR 0097)."""
+        if self.lease is None or self.operation is None:
+            raise SupervisorError("Runtime has no bound operation.")
+        fetched = (self.descriptor or {}).get("public_fetch")
+        if fetched is None:
+            return
+        operation = self.operation
+        with self._observation_connection() as connection:
+            done = connection.execute(
+                "SELECT 1 FROM reports WHERE operation_id=? AND observed_state=? AND completed=1",
+                (operation.operation_id, PUBLIC_FETCH_REPORT_STATE),
+            ).fetchone()
+            pending = connection.execute(
+                """SELECT id, payload_json, idempotency_key FROM reports
+                WHERE operation_id=? AND observed_state=? AND completed=0
+                ORDER BY id DESC LIMIT 1""",
+                (operation.operation_id, PUBLIC_FETCH_REPORT_STATE),
+            ).fetchone()
+        if done is not None:
+            return
+        if pending is not None:
+            intent_id, payload, key = pending[0], json.loads(pending[1]), pending[2]
+        else:
+            payload = {
+                "lease_id": self.lease.id,
+                "expected_epoch": self.lease.epoch,
+                "files": fetched["rows"],
+            }
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            key = (
+                "runtime-public-fetch-"
+                + hashlib.sha256(f"{operation.operation_id}:{encoded}".encode()).hexdigest()
+            )
+            with self._observation_connection() as connection:
+                cursor = connection.execute(
+                    """INSERT INTO reports
+                    (operation_id, observed_state, provider_id, termination_confirmed,
+                     payload_json, idempotency_key, completed) VALUES (?, ?, NULL, 0, ?, ?, 0)""",
+                    (operation.operation_id, PUBLIC_FETCH_REPORT_STATE, encoded, key),
+                )
+                intent_id = cursor.lastrowid
+        self._begin_delivery(intent_id, False)
+        try:
+            self._post_report(
+                f"/worker/operations/{operation.operation_id}/public-fetch", payload, key
             )
         except Exception as error:
             self._delivery_failed(intent_id, error)

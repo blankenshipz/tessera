@@ -88,11 +88,14 @@ def _read_health_file(path: str) -> Any:
     return json.loads(data)
 
 
-def _probe_file(health: HealthLike, now: Callable[[], float]) -> tuple[bool, str]:
+def _probe_file(
+    health: HealthLike, now: Callable[[], float], not_before: float | None = None
+) -> tuple[bool, str]:
     try:
         doc = _read_health_file(health.path)
         schema, state = doc.get("schema"), doc.get("state")
-        age = abs(now() - float(doc["last_loop_at"]))
+        written = float(doc["last_loop_at"])
+        age = abs(now() - written)
         limit = float(health.max_age_seconds)
     except Exception as error:
         return False, f"unreadable health file ({type(error).__name__})"
@@ -102,6 +105,10 @@ def _probe_file(health: HealthLike, now: Callable[[], float]) -> tuple[bool, str
         return False, "service not running"
     if age > limit:
         return False, f"stale health file (age {age:.0f}s)"
+    # A fresh file written by the process this run just replaced proves nothing: the new
+    # process must have written it at or after the restart.
+    if not_before is not None and written < not_before:
+        return False, "health file predates the restart"
     return True, "healthy"
 
 
@@ -125,10 +132,14 @@ def probe_health(
     *,
     now: Callable[[], float] = time.time,
     opener: Any = None,
+    not_before: float | None = None,
 ) -> tuple[bool, str]:
-    """Return (healthy, short reason); never includes file or response content."""
+    """Return (healthy, short reason); never includes file or response content.
+
+    ``not_before`` (wall-clock seconds) is the restart time: a health file whose
+    ``last_loop_at`` is earlier was written by the old process and does not count."""
     if health.kind == "file":
-        return _probe_file(health, now)
+        return _probe_file(health, now, not_before)
     if health.kind == "http":
         return _probe_http(health, opener)
     return False, "unknown health kind"
@@ -170,14 +181,18 @@ def start_services(
     services: Sequence[ServiceLike],
     runner: Runner,
     *,
-    probe: Callable[[HealthLike], tuple[bool, str]] = probe_health,
+    probe: Callable[..., tuple[bool, str]] = probe_health,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    wall: Callable[[], float] = time.time,
 ) -> list[StepResult]:
-    """Restart in order, waiting for health; stop at the first failure."""
+    """Restart in order, waiting for health; stop at the first failure.
+
+    The probe is called as ``probe(health, not_before=restart_wall_time)``."""
     results: list[StepResult] = []
     for service in services:
         started = clock()
+        restarted_at = wall()
         code, _ = _run(runner, service.restart_argv, service.command_timeout_seconds)
         ok = code == 0
         results.append(
@@ -187,7 +202,7 @@ def start_services(
             return results
         waited_from = clock()
         while True:
-            healthy, reason = probe(service.health)
+            healthy, reason = probe(service.health, not_before=restarted_at)
             elapsed = clock() - waited_from
             if healthy:
                 results.append(StepResult("health", service.name, True, round(elapsed, 3), reason))

@@ -149,11 +149,10 @@ def register_agent_loop_tools(
         recorded: dict[str, Any] | None = None
         if client is not None:
             project = segment(client.config.project_id)
-            recorded = await client._request(
-                "POST",
-                f"/projects/{project}/agent-loop/pause",
-                body={"reason": reason[:REASON_CAP] or "pause"},
-                key="loop-pause-" + uuid.uuid4().hex,
+            recorded = await client.request_agent_loop_pause(
+                project,
+                {"reason": reason[:REASON_CAP] or "pause"},
+                "loop-pause-" + uuid.uuid4().hex,
             )
         dir_fd = _open_private_parent(marker_path)
         try:

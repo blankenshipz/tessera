@@ -118,7 +118,7 @@ def test_execute_runs_the_steps_in_order_and_fixes_everything(tmp_path):
     assert document["result"] == "ok", document["steps"]
     order = [s["step"] for s in document["steps"]]
     assert order == [
-        "preflight", "stop:executor", "stop:control", "backup", "config-fixes", "migrate",
+        "preflight", "stop:executor", "stop:control", "backup", "migrate", "config-fixes",
         "restart:control", "health:control", "restart:executor", "health:executor", "smoke",
     ]  # fmt: skip
     # Stopped last to first, restarted first to last.
@@ -133,7 +133,8 @@ def test_execute_runs_the_steps_in_order_and_fixes_everything(tmp_path):
         "latest": LATEST_SCHEMA_VERSION,
         "after": LATEST_SCHEMA_VERSION,
     }
-    assert len(list((tmp_path / "backups").iterdir())) == 1
+    # The backup and the copies of the configs the fix rewrote.
+    assert len(list((tmp_path / "backups").iterdir())) == 2
     assert sorted(f["fix"] for f in document["fixes"]) == ["drop_removed_keys", "migrate"]
     assert document["source_revision"] == "a" * 40
     assert document["duration_seconds"] >= 0 and document["started_at"].endswith("Z")
@@ -160,7 +161,8 @@ def test_a_blocking_preflight_stops_before_any_service_is_touched(tmp_path):
 
 
 def test_a_failed_backup_restores_the_stopped_services_and_changes_nothing(tmp_path):
-    plan, _path, state = make_plan(tmp_path)
+    # Nothing pending: with a pending migration the services stay stopped (see the follow-ups).
+    plan, _path, state = make_plan(tmp_path, behind=False)
     fakes = Fakes()
 
     def broken_backup(*_a, **_k):
@@ -173,7 +175,7 @@ def test_a_failed_backup_restores_the_stopped_services_and_changes_nothing(tmp_p
     with sqlite3.connect(state / DATABASE_NAME) as db:
         assert (
             db.execute("SELECT schema_version FROM schema_meta").fetchone()[0]
-            == LATEST_SCHEMA_VERSION - 1
+            == LATEST_SCHEMA_VERSION
         )
 
 

@@ -24,11 +24,32 @@ per-action view, so update that one.
 | Adjust concurrency | none | `tessera_limit_campaign_concurrency` -> `POST /campaigns/{id}/concurrency-limit` (ADR 0061): a lower-only per-campaign cap on stages running at once. The project limit (`execution_project_limits`) stays the operator's and applies on top | `campaign:cancel`, submitter only |
 | Pause and resume | none | `tessera_pause_campaign`, `tessera_resume_campaign` (ADR 0061): a pause stops new stage reservations and leaves running attempts alone; a person's pause is lifted only by a person | `campaign:cancel`, submitter only |
 | Cancel or stop | `tessera_cancel_campaign` (reduce-only) | covered; plus `tessera_cancel_campaign_stage` (ADR 0061) for one unfinished stage; dependents are skipped and the campaign ends `stopped` | `campaign:cancel`, submitter only |
-| Retry a failed stage | none | `tessera_prepare_stage_retry`: builds a NEW v2 spec for the stages that did not succeed (and anything that consumed them), pinning succeeded stages' outputs by digest as `kind: artifact` inputs. It reads only and submits nothing; the agent validates and submits it and a human approves its digest. A pin resolves only from a succeeded attempt in a terminal receipt whose output manifest is retained and custody-released: the runner does that when the stage succeeds, `tessera_campaign_outputs` shows it as `custody_released`, and the tool refuses an output that is not (a human revoking custody makes the pin fail) | registered with `campaign:read` + `artifact:read`; `campaign:submit` to submit |
-| Re-run a failed campaign | `tessera_prepare_stage_retry` plus a hand-made submit; no record linking the new campaign to the old | `tessera_rerun_campaign` -> `POST /campaigns/{id}/rerun` ([ADR 0069](decisions/0069-rerun-a-finished-campaign.md)): one call submits a NEW campaign of a failed, stopped or cancelled campaign's failed stages (succeeded outputs reused by digest through custody and lineage, v2) or its identical spec. It is an ordinary submission: nothing is approved or granted, the new digest is approved by a person, the cap may not exceed the first campaign's cap less what the whole re-run tree has committed, with `rerun_tree` on `tessera_get_campaign` ([ADR 0074](decisions/0074-rerun-spend-is-bounded-across-the-chain.md)), every submit-time check runs, and the link (source, stages, reused outputs) is on the new campaign's receipt and both campaigns' views | `campaign:submit` + `campaign:read` (+ `artifact:read` to reuse outputs) |
-| Revoke a stale release | none (human route only) | `tessera_revoke_campaign_release` -> `POST /campaigns/{id}/releases/{release}/revoke` (annotated destructive): only after the campaign finished (or is cancelling), only a release one of its attempts used, only the submitter. The runner's own cleanup reads active releases each tick, so a release the agent revoked first is simply no longer listed; a revoke the runner sent from an older read gets a stale-revision refusal that does not stall the cancel (tested) | `campaign:cancel` |
+| Retry a failed stage | none | `tessera_prepare_stage_retry`: builds a NEW v2 spec for the stages that did not succeed and pins succeeded outputs by digest; reads only, submits nothing (see note 1) | registered with `campaign:read` + `artifact:read`; `campaign:submit` to submit |
+| Re-run a failed campaign | `tessera_prepare_stage_retry` plus a hand-made submit; no record linking the new campaign to the old | `tessera_rerun_campaign` -> `POST /campaigns/{id}/rerun` ([ADR 0069](decisions/0069-rerun-a-finished-campaign.md)): one call submits a NEW campaign, an ordinary submission (see note 2) | `campaign:submit` + `campaign:read` (+ `artifact:read` to reuse outputs) |
+| Revoke a stale release | none (human route only) | `tessera_revoke_campaign_release` -> `POST /campaigns/{id}/releases/{release}/revoke` (annotated destructive), only after the campaign finished (see note 3) | `campaign:cancel` |
 | Reconcile a grant | none (human, evidence-checked) | not exposed. A confirmed exit is resolved by the platform itself (ADR 0053); everything else needs a person's evidence. `tessera_campaign_grants` shows what is unresolved | human |
-| Retrieve outcomes: receipts, artifact digests, gate results | `tessera_get_campaign_receipt`, `tessera_campaign_outputs`, `tessera_campaign_gate_decisions` (and the experiment and program roll-ups) | covered; no change | `campaign:read`, `artifact:read` |
+| Retrieve outcomes: receipts, artifact digests, gate results | `tessera_get_campaign_receipt`, `tessera_campaign_report`, `tessera_campaign_outputs`, `tessera_campaign_gate_decisions` (and the experiment and program roll-ups) | covered; no change | `campaign:read`, `artifact:read` |
+
+Notes on the table:
+
+1. Retry: the new spec covers the stages that did not succeed and anything that consumed them, and
+   pins succeeded stages' outputs by digest as `kind: artifact` inputs. The agent validates and
+   submits it, and a human approves its digest. A pin resolves only from a succeeded attempt in a
+   terminal receipt whose output manifest is retained and custody-released. The runner does that
+   when the stage succeeds, `tessera_campaign_outputs` shows it as `custody_released`, and the tool
+   refuses an output that is not (a human revoking custody makes the pin fail).
+2. Re-run: the call submits a NEW campaign of a failed, stopped or cancelled campaign's failed
+   stages (succeeded outputs reused by digest through custody and lineage, v2) or its identical
+   spec. Nothing is approved or granted, and the new digest is approved by a person. The cap may
+   not exceed the first campaign's cap less what the whole re-run tree has committed, shown as
+   `rerun_tree` on `tessera_get_campaign`
+   ([ADR 0074](decisions/0074-rerun-spend-is-bounded-across-the-chain.md)). Every submit-time check
+   runs, and the link (source, stages, reused outputs) is on the new campaign's receipt and both
+   campaigns' views.
+3. Revoke: allowed only after the campaign finished (or is cancelling), only for a release one of
+   its attempts used, and only by the submitter. The runner's own cleanup reads active releases
+   each tick, so a release the agent revoked first is simply no longer listed; a revoke the runner
+   sent from an older read gets a stale-revision refusal that does not stall the cancel (tested).
 
 ## Open
 

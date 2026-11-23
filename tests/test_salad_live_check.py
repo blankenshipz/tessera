@@ -429,7 +429,7 @@ def test_worker_cancel_is_scoped_to_the_routes_own_worker(tmp_path, monkeypatch)
     from test_execution import _worker
 
     owner_actor = store.authenticate(h.journey.owner.removeprefix("Bearer "))
-    other = _worker(h.journey.state, owner_actor, h.route["project_id"], "other-worker-token")
+    _worker(h.journey.state, owner_actor, h.route["project_id"], "other-worker-token")
     other = store.authenticate_worker("other-worker-token")
     assert other["id"] != session.server.worker["id"]
     with pytest.raises(Forbidden, match="own dispatcher worker"):

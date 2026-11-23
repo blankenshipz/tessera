@@ -52,6 +52,7 @@ from .salad_workload_contract import COMMAND as SALAD_COMMAND
 from .salad_workload_contract import (
     GPU_RUNTIME_V1,
     check_gpu_runtime_inline_rules,
+    gpu_runtime_inline_manifest,
     is_image_item,
 )
 from .store import Conflict, Store
@@ -77,6 +78,51 @@ def _salad_config(stage: Any) -> SaladStageSpec | None:
     """The stage's Salad fields, or None when the stage carries none."""
     found = getattr(stage, "salad", None) or getattr(stage, "provider_config", None)
     return salad_config(stage) if found else None
+
+
+PUBLIC_ARTIFACT_MISMATCH = "public_artifact_contract_mismatch"
+PUBLIC_ARTIFACT_DELIVERY = "public_artifact_input_delivery"
+
+
+def public_pins(stage: Any) -> tuple[list[tuple[str, str, int]], list[str]] | None:
+    """The stage's ``public_artifact`` pins as ``(sorted (url, sha256, max_bytes) rows, sorted
+    redirect hosts)`` (ADR 0097), or None when it has none. Reads both the normalized input
+    (``public_files``) and the spec source (``files``)."""
+    rows: list[tuple[str, str, int]] = []
+    hosts: set[str] = set()
+    found = False
+    for source in getattr(stage, "inputs", ()):
+        if getattr(source, "kind", None) != "public_artifact":
+            continue
+        found = True
+        files = getattr(source, "public_files", None)
+        if files is None or (not files and getattr(source, "files", None)):
+            files = [(f.name, f.url, f.sha256, f.max_bytes) for f in source.files]
+        rows += [(url, sha, size) for _name, url, sha, size in files]
+        hosts |= set(source.redirect_hosts)
+    return (sorted(rows), sorted(hosts)) if found else None
+
+
+def public_artifact_refusal(stage: Any, config: SaladStageSpec) -> str | None:
+    """Closed reason when the workload contract does not carry exactly the spec's pinned
+    public files and redirect hosts, else None (ADR 0097). The contract's fetch rows are what
+    the in-container runtime may download, so a reviewer-approved spec can fetch nothing else."""
+    pins = public_pins(stage)
+    if pins is None:
+        return None
+    egress = config.workload.egress
+    contract_rows = sorted((f.url, f.sha256, f.max_bytes) for f in egress.fetches)
+    if contract_rows != pins[0] or sorted(egress.redirect_hosts) != pins[1]:
+        return PUBLIC_ARTIFACT_MISMATCH
+    sources = [getattr(s, "kind", None) for s in stage.inputs]
+    if config.workload.input is not None and "snapshot" not in sources:
+        return PUBLIC_ARTIFACT_DELIVERY  # a snapshot the contract expects is never delivered
+    if stage_has_nonpublic_input(stage) and config.workload.runtime == GPU_RUNTIME_V1:
+        # Private data is pulled only after begin-once; a manifest read from that input would
+        # fetch after the private snapshot is materialized. Only an inline manifest fetches first.
+        if gpu_runtime_inline_manifest(config.workload) is None:
+            return PUBLIC_ARTIFACT_MISMATCH
+    return None
 
 
 def _hosts_declared(config: SaladStageSpec) -> bool:
@@ -126,11 +172,20 @@ class SaladRouteProvider:
 
         when = time.time() if now is None else now
         metadata = None
+        # Names only the class of cause, never a path or a value.
+        reason = "no credential directory is configured for this service"
         if self.credential_directory:
+            reason = "the credential store could not be read by this service"
             resolver = None
             try:
                 resolver = PrivateFileSecretResolver(self.credential_directory)
                 metadata = resolver.read_metadata(profile.credential_reference)
+            except FileNotFoundError:
+                metadata = None
+                reason = "the credential directory or file does not exist"
+            except PermissionError:
+                metadata = None
+                reason = "permission denied reading the credential store"
             except Exception:  # noqa: BLE001 - unreadable store is "unknown", not a crash
                 metadata = None
             finally:
@@ -140,11 +195,7 @@ class SaladRouteProvider:
             metadata, when, pinned_version=profile.credential_version
         )
         if metadata is None:
-            state["reason"] = (
-                "no credential directory is configured for this service"
-                if not self.credential_directory
-                else "the credential store could not be read by this service"
-            )
+            state["reason"] = reason
         return {
             "provider_id": PROVIDER_ID,
             "profile": profile.name,
@@ -208,7 +259,14 @@ class SaladRouteProvider:
         # this duration, so it bounds the time humans have to resolve the attempt's reviews.
         if stage.max_duration_seconds > 3600 or (not config.adapted and len(stage.argv) > 32):
             raise ValueError(f"{label}: max_duration_seconds <= 3600 and at most 32 argv items")
-        if stage_has_nonpublic_input(stage) and _hosts_declared(config):
+        refusal = public_artifact_refusal(stage, config)
+        if refusal is not None:
+            raise ValueError(f"{label}: {refusal}")
+        if (
+            public_pins(stage) is None
+            and stage_has_nonpublic_input(stage)
+            and _hosts_declared(config)
+        ):
             raise ValueError(
                 f"{label}: a stage with non-public input cannot declare workload fetch or "
                 "redirect hosts"
@@ -281,10 +339,17 @@ class SaladRouteProvider:
             )
         self._check_worker(connection, project["org_id"], project_id, config.worker_principal_id)
         self._check_credential(profile)
-        if _hosts_declared(config) and any(
-            provider_trust.admission_basis(connection, source.snapshot_id) != "public_only"
-            for source in stage.inputs
-            if source.kind == "snapshot"
+        refusal = public_artifact_refusal(stage, config)
+        if refusal is not None:
+            raise Conflict(f"Salad stage refused: {refusal}.")
+        if (
+            public_pins(stage) is None
+            and _hosts_declared(config)
+            and any(
+                provider_trust.admission_basis(connection, source.snapshot_id) != "public_only"
+                for source in stage.inputs
+                if source.kind == "snapshot"
+            )
         ):
             raise Conflict(
                 "Salad stage input is not public (or carries approved code) and cannot "

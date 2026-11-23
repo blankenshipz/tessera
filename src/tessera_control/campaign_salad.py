@@ -164,6 +164,24 @@ def _credential_event(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def stage_data_digest(stage: dict[str, Any], spec_stage: Any) -> str:
+    """The digest the stage's data manifest binds: the recorded input snapshot digest, or, for a
+    stage with no snapshot (only ``public_artifact`` inputs, ADR 0097), the digest of its pinned
+    public files, computed as the runner records it. Never None, so the pins stay bound."""
+    recorded = stage.get("input_snapshot_digest")
+    if recorded:
+        return str(recorded)
+    rows: list[list[Any]] = []
+    for item in spec_stage.inputs:
+        if getattr(item, "kind", None) != "public_artifact":
+            continue
+        files = getattr(item, "public_files", None)
+        if files is None or (not files and getattr(item, "files", None)):
+            files = [(f.name, f.url, f.sha256, f.max_bytes) for f in item.files]
+        rows += [[f"{item.name}/{name}", sha, size] for name, _url, sha, size in files]
+    return canonical_digest(sorted(rows))
+
+
 class SaladStageDriver:
     def __init__(self, runner: CampaignRunner, profiles: Any = None) -> None:
         # ``runner`` is the ``RunnerServices`` object the provider was handed; the driver
@@ -358,7 +376,7 @@ class SaladStageDriver:
             salad_config(spec_stage).workload,
             operation_id=row["operation_id"],
             epoch=row["epoch"],
-            snapshot_digest=stage["input_snapshot_digest"],
+            snapshot_digest=stage_data_digest(stage, spec_stage),
             image=spec_stage.image,
             max_cost_cents=spec_stage.max_exposure_cents,
             plan_max_seconds=spec_stage.max_duration_seconds,
@@ -495,7 +513,7 @@ class SaladStageDriver:
                     {
                         "name": f"{key} baseline"[:200],
                         "method_digest": code["code_digest"],
-                        "input_digest": stage["input_snapshot_digest"],
+                        "input_digest": stage_data_digest(stage, spec_stage),
                         "metadata": {"experiment_id": stage["experiment_id"]},
                     },
                 ),
@@ -503,7 +521,7 @@ class SaladStageDriver:
             self._set_stage_row(ctx, key, study_variant_id=result.response["id"])
             return False
         if row["split_lock_id"] is None:
-            member = f"{ctx.campaign['id']}/{key}/{stage['input_snapshot_digest']}"[:200]
+            member = f"{ctx.campaign['id']}/{key}/{stage_data_digest(stage, spec_stage)}"[:200]
             result = self.runner._step(
                 ctx,
                 key,
@@ -606,7 +624,7 @@ class SaladStageDriver:
             "evaluation_protocol": {
                 "version": 2,
                 "identity": {
-                    "data_digest": stage["input_snapshot_digest"],
+                    "data_digest": stage_data_digest(stage, spec_stage),
                     "code_digest": digests["code_digest"],
                     "environment_digest": digests["environment_digest"],
                 },
@@ -664,7 +682,9 @@ class SaladStageDriver:
         if provider_id is not None:
             spec_stage = stage_on_candidate(spec_stage, provider_id)
         salad = salad_config(spec_stage)
-        snapshot = next(i for i in spec_stage.inputs if i.kind == "snapshot")
+        # A stage may have no snapshot input (only public_artifact inputs, ADR 0097).
+        snapshot = next((i for i in spec_stage.inputs if i.kind == "snapshot"), None)
+        preview_digest = None if snapshot is None else snapshot.digest
         placeholder = {
             "study_id": "study_preview",
             "source_id": "source_preview",
@@ -675,7 +695,7 @@ class SaladStageDriver:
         row = {"operation_id": "operation-preview", "epoch": 1}
         stage = {
             "stage_key": key,
-            "input_snapshot_digest": snapshot.digest,
+            "input_snapshot_digest": preview_digest,
             "variant_id": "variant_preview",
         }
         plan = self._plan_scope(ctx, stage, spec_stage, row, context, placeholder, preview=True)

@@ -14,7 +14,11 @@ import threading
 import pytest
 from test_anthropic_tool_e2e import DAY1, PROMPT, RATE_LIMITED, end_turn, setup, tool_use
 
-from tessera_agent.remote_reasoning_store import DailyCapRefused, ReasoningStore
+from tessera_agent.remote_reasoning_store import (
+    BUSY_TIMEOUT_SECONDS,
+    DailyCapRefused,
+    ReasoningStore,
+)
 
 DAY = "2026-11-28"
 WORST_TOKENS = 100 + 1000  # counted input + max_output_tokens_per_call
@@ -187,7 +191,7 @@ def test_store_refusal_writes_nothing_and_normal_reservation_works(tmp_path):
 def test_store_connection_waits_for_another_writer(tmp_path):
     store = ReasoningStore(tmp_path / "state")
     (timeout_ms,) = store.db.execute("PRAGMA busy_timeout").fetchone()
-    assert timeout_ms >= 5000
+    assert timeout_ms >= BUSY_TIMEOUT_SECONDS * 1000
     store.close()
 
 

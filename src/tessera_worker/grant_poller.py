@@ -32,6 +32,7 @@ from .service import (
     DevelopmentWorkerService,
     _check_container_user,
     network_pool_from_config,
+    operator_private_directory,
     read_private_credential,
     safe_error_detail,
 )
@@ -70,6 +71,10 @@ class GrantPollerConfig:
     # Operator ceiling on the scratch a plan may request (ADR 0059); None keeps the 64 MiB
     # default ceiling. Checked against the host's memory when above the historical bounds.
     max_scratch_bytes: int | None = None
+    # ADR 0097: operator-owned private directory for supervisor-fetched public inputs, and the
+    # optional download cache. None: a plan carrying public_fetch is refused by the worker.
+    public_root: Path | None = None
+    public_cache_dir: Path | None = None
     # HTTP timeout for every control request, seconds (1 to 120, default 15). A slow answer is a
     # transient failure that is retried; it never stops a healthy run (ADR 0054).
     control_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
@@ -155,6 +160,8 @@ _CONFIG_KEYS = {
     "control_timeout_seconds",
     "max_output_bytes",
     "max_scratch_bytes",
+    "public_root",
+    "public_cache_dir",
 }
 
 
@@ -214,9 +221,19 @@ def load_poller_config(path: Path) -> GrantPollerConfig:
             ),
             max_output_bytes=document.get("max_output_bytes"),
             max_scratch_bytes=document.get("max_scratch_bytes"),
+            public_root=_optional_path(document.get("public_root")),
+            public_cache_dir=_optional_path(document.get("public_cache_dir")),
         )
     except (KeyError, TypeError, ValueError, DevelopmentWorkerError) as error:
         raise refused from error
+
+
+def _optional_path(value: Any) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("path setting must be a non-empty string")
+    return Path(value)
 
 
 def _private_dir(path: Path) -> Path:
@@ -246,6 +263,9 @@ class DevelopmentGrantPoller:
         self.config = config
         self.root = _private_dir(Path(config.workspace_root))
         self.output_root = _private_dir(Path(config.development_output_root))
+        for public_path in (config.public_root, config.public_cache_dir):
+            if public_path is not None:
+                operator_private_directory(public_path)
         self.channel = channel or HttpControlChannel(
             config.control_url,
             read_private_credential(config.credential_file),
@@ -299,6 +319,8 @@ class DevelopmentGrantPoller:
                 control_timeout_seconds=self.config.control_timeout_seconds,
                 max_output_bytes=self.config.max_output_bytes,
                 max_scratch_bytes=self.config.max_scratch_bytes,
+                public_root=self.config.public_root,
+                public_cache_dir=self.config.public_cache_dir,
                 poll_seconds=self.config.poll_seconds,
             )
         )

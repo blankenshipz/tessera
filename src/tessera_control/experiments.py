@@ -72,13 +72,14 @@ def create_experiment_schema(connection: sqlite3.Connection) -> None:
         """CREATE TABLE IF NOT EXISTS research_experiment_designs (
         experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
         revision INTEGER NOT NULL CHECK (revision >= 1), goal TEXT NOT NULL, success_criterion TEXT NOT NULL,
-        protocol TEXT NOT NULL,
+        protocol TEXT NOT NULL, metric TEXT,
         created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
         PRIMARY KEY (experiment_id,revision))""",
         """CREATE TABLE IF NOT EXISTS research_experiment_variants (
         id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES research_experiments(id),
         design_revision INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('baseline','intervention')),
         name TEXT NOT NULL, method_digest TEXT NOT NULL, input_digest TEXT NOT NULL,
+        environment_digest TEXT CHECK (environment_digest IS NULL OR (length(environment_digest)=64 AND environment_digest NOT GLOB '*[^0-9a-f]*')),
         metadata_json TEXT NOT NULL, execution_task_id TEXT REFERENCES tasks(id),
         execution_plan_digest TEXT, revision INTEGER NOT NULL CHECK (revision >= 1),
         created_at TEXT NOT NULL, created_by_principal_id TEXT NOT NULL REFERENCES principals(id),
@@ -1019,7 +1020,14 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                 experiment,
             )
             self._insert_design(
-                connection, actor, experiment, 1, body["protocol"], body["variants"], now
+                connection,
+                actor,
+                experiment,
+                1,
+                body["protocol"],
+                body["variants"],
+                now,
+                body.get("metric"),
             )
             self._event(
                 connection,
@@ -1046,17 +1054,19 @@ class ExperimentStore(EvidenceIngestMixin, Store):
         protocol: str,
         variants: list[dict[str, Any]],
         now: str,
+        metric: str | None = None,
     ) -> None:
         connection.execute(
             """INSERT INTO research_experiment_designs
-            (experiment_id,revision,goal,success_criterion,protocol,created_at,created_by_principal_id)
-            VALUES (?,?,?,?,?,?,?)""",
+            (experiment_id,revision,goal,success_criterion,protocol,metric,created_at,created_by_principal_id)
+            VALUES (?,?,?,?,?,?,?,?)""",
             (
                 experiment["id"],
                 revision,
                 experiment["goal"],
                 experiment["success_criterion"],
                 protocol,
+                metric,
                 now,
                 actor["id"],
             ),
@@ -1064,9 +1074,9 @@ class ExperimentStore(EvidenceIngestMixin, Store):
         for variant in variants:
             connection.execute(
                 """INSERT INTO research_experiment_variants
-                (id,experiment_id,design_revision,kind,name,method_digest,input_digest,metadata_json,
+                (id,experiment_id,design_revision,kind,name,method_digest,input_digest,environment_digest,metadata_json,
                  execution_task_id,execution_plan_digest,revision,created_at,created_by_principal_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
                 (
                     "experiment_variant_" + uuid.uuid4().hex,
                     experiment["id"],
@@ -1075,6 +1085,7 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                     variant["name"],
                     variant["method_digest"],
                     variant["input_digest"],
+                    variant.get("environment_digest"),
                     json.dumps(variant["metadata"], sort_keys=True, separators=(",", ":")),
                     variant["execution_task_id"],
                     variant["execution_plan_digest"],
@@ -1155,7 +1166,14 @@ class ExperimentStore(EvidenceIngestMixin, Store):
                 connection, actor, experiment["project_id"], body["variants"]
             )
             self._insert_design(
-                connection, actor, updated, revision, body["protocol"], body["variants"], now
+                connection,
+                actor,
+                updated,
+                revision,
+                body["protocol"],
+                body["variants"],
+                now,
+                body.get("metric"),
             )
             self._event(
                 connection,

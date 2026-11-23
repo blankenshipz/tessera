@@ -72,7 +72,7 @@ approving anything.
    unexpected shape is recorded as malformed and submits nothing. A contract test runs the action
    against the real control routes so a change in the response shape fails a test.
 10. **The runner.** `tessera-submit-runner` calls the action on a schedule, so no session has to. It is
-   manual-start and admission-gated like the reasoning unit, never enabled on boot, and reads its control
+   admission-gated like the reasoning unit (it starts with `tessera.target`, but only on a host whose operator created the admission marker; see the amendment) and reads its control
    endpoint and agent credential by reference (a token file), never by value. It refuses to start without
    a kill-switch marker path, and refuses to start when `ANTHROPIC_API_KEY` is set. While the kill switch
    is engaged it neither calls the action nor the control plane, and it never touches running campaigns.
@@ -115,7 +115,12 @@ Control: create is human-only; consuming never makes the agent the approver; off
 switch fail closed; each refusal reason records a decision and creates nothing; one campaign per approval
 under replay and concurrency; per-run, program and project caps; rerun lineage cap; cancel by agent and
 human; decisions append-only; tenant isolation; the receipt section. MCP: tools absent without their scope.
-Agent action: kill switch before each call, refusals not retried in a tick and not blocking the next record, API key refused, malformed list response submits nothing, and a contract test against the real routes. Runner: kill switch pauses all calls (an ambiguous marker counts as engaged) and resumes when cleared, backoff and halt including on submit errors, refusals are not failures, a private single-holder journal with no secrets, clean stop, refusal to start with an API key or missing references, and an end-to-end run through the real control routes. No live
+Agent action: kill switch before each call, refusals not retried in a tick and not blocking the next
+record, API key refused, malformed list response submits nothing, and a contract test against the
+real routes. Runner: kill switch pauses all calls (an ambiguous marker counts as engaged) and
+resumes when cleared, backoff and halt including on submit errors, refusals are not failures, a
+private single-holder journal with no secrets, clean stop, refusal to start with an API key or
+missing references, and an end-to-end run through the real control routes. No live
 provider or paid calls.
 
 ## Open questions
@@ -123,3 +128,14 @@ provider or paid calls.
 1. Whether a record may cover more than one campaign (a bounded count) rather than exactly one.
 2. Whether the operator flag should live in the control server configuration or in the operator
    console, once that surface exists.
+
+## Amendment: the runner starts with the target, behind the same gates
+
+The shipped unit now has `[Install] WantedBy=tessera.target` and `tessera.target` wants it, so a
+host no longer needs a person to start it by hand each time. Nothing that made it safe changed:
+the unit still starts only where an operator created `/etc/tessera/submit-runner.admitted`
+(`ConditionPathExists`), control still refuses every submit as `feature_disabled` unless it runs
+with `--agent-submissions` and a kill-switch path, the agent still needs the separate
+`campaign:submit_cleared` scope, a person still creates each approved-submission record, and the
+kill switch still pauses it. The feature stays off by default in the code: this changes only who
+has to type `systemctl start` on a host that already opted in.

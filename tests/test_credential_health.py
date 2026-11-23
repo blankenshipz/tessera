@@ -187,6 +187,34 @@ def test_provider_credential_health_states(tmp_path, world, kwargs, state):
     assert SECRET.decode() not in json.dumps(entry)
 
 
+def test_each_unreadable_cause_has_its_own_class_only_reason(tmp_path, world, monkeypatch):
+    profiles = salad_profile(world.env)
+    directory = store(tmp_path)
+
+    def reason(provider):
+        (entry,) = provider.credential_health()
+        assert entry["state"] == "unknown"
+        assert str(tmp_path) not in entry["reason"] and SECRET.decode() not in entry["reason"]
+        return entry["reason"]
+
+    assert "no credential directory" in reason(SaladRouteProvider(profiles))
+    assert "does not exist" in reason(SaladRouteProvider(profiles, str(tmp_path / "nope")))
+
+    def raiser(error):
+        def read(self, reference):
+            raise error
+
+        return read
+
+    for error, text in (
+        (FileNotFoundError(str(directory)), "does not exist"),
+        (PermissionError(str(directory)), "permission denied"),
+        (OSError(str(directory)), "could not be read"),
+    ):
+        monkeypatch.setattr(PrivateFileSecretResolver, "read_metadata", raiser(error))
+        assert text in reason(SaladRouteProvider(profiles, str(directory)))
+
+
 def test_without_a_directory_or_with_an_unreadable_one_the_state_is_unknown(tmp_path, world):
     profiles = salad_profile(world.env)
     (entry,) = SaladRouteProvider(profiles).credential_health()

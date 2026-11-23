@@ -180,7 +180,7 @@ def _read_git(git, body):
     except GitSourceRefused as refusal:
         # A malformed name, SHA or path is the request's fault (422); the rest are 409.
         status = 422 if refusal.code in GIT_INVALID_CODES else 409
-        raise ReviewRefused(refusal.code, status) from None
+        raise ReviewRefused(refusal.code, status, refusal.rule) from None
     if set(tests) - set(head):
         raise ReviewRefused("focused_tests_invalid", 422)
     return {

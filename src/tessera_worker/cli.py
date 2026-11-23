@@ -71,6 +71,13 @@ def _stage_watch(arguments: argparse.Namespace):  # noqa: ANN202
     return config
 
 
+_PUBLIC_ROOT_HELP = (
+    "private 0700 directory for pinned public inputs this worker fetches (ADR 0097); "
+    "without it a stage with public_artifact inputs is refused"
+)
+_PUBLIC_CACHE_HELP = "optional private 0700 download cache, used only for cache-enabled inputs"
+
+
 class _Parser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         parsed = super().parse_args(args, namespace)
@@ -95,6 +102,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--allowed-image", required=True)
     run.add_argument("--egress-proxy-image", default=None)
     run.add_argument("--max-output-bytes", type=int, default=None, help=_MAX_OUTPUT_HELP)
+    run.add_argument("--public-root", type=Path, default=None, help=_PUBLIC_ROOT_HELP)
+    run.add_argument("--public-cache-dir", type=Path, default=None, help=_PUBLIC_CACHE_HELP)
     run.add_argument("--container-user", default=None, help="numeric uid:gid for containers")
     run.add_argument("--allow-root-container-user", action="store_true")
     run.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
@@ -122,6 +131,8 @@ def parser() -> argparse.ArgumentParser:
         help="operator ceiling on a plan's scratch request (ADR 0059); default 64 MiB",
     )
     poll.add_argument("--max-output-bytes", type=int, default=None, help=_MAX_OUTPUT_HELP)
+    poll.add_argument("--public-root", type=Path, default=None, help=_PUBLIC_ROOT_HELP)
+    poll.add_argument("--public-cache-dir", type=Path, default=None, help=_PUBLIC_CACHE_HELP)
     poll.add_argument("--container-user", default=None, help="numeric uid:gid for containers")
     poll.add_argument("--allow-root-container-user", action="store_true")
     poll.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
@@ -150,6 +161,8 @@ def _poll_config(arguments: argparse.Namespace) -> GrantPollerConfig:
         scratch_bytes=arguments.scratch_bytes,
         max_scratch_bytes=arguments.max_scratch_bytes,
         max_output_bytes=arguments.max_output_bytes,
+        public_root=arguments.public_root,
+        public_cache_dir=arguments.public_cache_dir,
         container_user=arguments.container_user,
         allow_root_container_user=arguments.allow_root_container_user,
         docker_network_pool=arguments.docker_network_pool,
@@ -220,6 +233,8 @@ def main() -> int:
             allowed_image=arguments.allowed_image,
             egress_proxy_image=arguments.egress_proxy_image,
             max_output_bytes=arguments.max_output_bytes,
+            public_root=arguments.public_root,
+            public_cache_dir=arguments.public_cache_dir,
             container_user=arguments.container_user,
             allow_root_container_user=arguments.allow_root_container_user,
             docker_network_pool=arguments.docker_network_pool,

@@ -11,7 +11,13 @@ from .campaign_gates import unlock_receipt_section
 from .campaign_heavy_guard import recorded as recorded_heavy_guards
 from .campaign_holdout import receipt_section as holdout_receipt_section
 from .campaign_io import stage_io
-from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
+from .campaign_models import (
+    normalize,
+    parse_spec_json,
+    public_fetch_host,
+    stage_on_candidate,
+    stage_provider,
+)
 from .campaign_placement import placements as recorded_placements
 from .campaign_rerun import lineage_of
 from .campaign_submissions import submission_receipt_section
@@ -197,6 +203,69 @@ def _scratch(connection: sqlite3.Connection, attempt: sqlite3.Row, spec_stage: A
     return {"requested_bytes": requested, "granted_bytes": granted}
 
 
+def public_fetch_entry(
+    provider_id: str | None, spec_stage: Any, fetched: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
+    """The ``public_fetch`` receipt object of a stage with ``public_artifact`` inputs (ADR 0097).
+
+    The pin (host, sha256) always comes from the approved spec. ``bytes`` and ``seconds`` come
+    only from the provider's own reported ``fetched`` rows (``url``, ``sha256``, ``bytes``,
+    ``seconds``) for the same url and digest, marked ``provider_reported``; with none they are
+    null and the file is ``declared_only``. Only the host is printed, never the URL."""
+    files: list[tuple[str, str, str]] = []
+    hosts: set[str] = set()
+    for source in getattr(spec_stage, "inputs", ()):
+        if getattr(source, "kind", None) != "public_artifact":
+            continue
+        files += [(name, url, sha) for name, url, sha, _size in source.public_files]
+        hosts |= set(source.redirect_hosts)
+    if not files:
+        return None
+    reported = {
+        (row.get("url"), row.get("sha256")): row for row in fetched or () if isinstance(row, dict)
+    }
+    entries = []
+    for name, url, sha in files:
+        host = public_fetch_host(url)
+        hosts.add(host)
+        row = reported.get((url, sha))
+        size = None if row is None else row.get("bytes")
+        seconds = None if row is None else row.get("seconds")
+        if not isinstance(size, int) or isinstance(size, bool):
+            row, size, seconds = None, None, None
+        if seconds is not None and (
+            isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+        ):
+            seconds = None
+        entries.append(
+            {
+                "name": name,
+                "source_host": host,
+                "sha256": sha,
+                "bytes": size,
+                "seconds": seconds,
+                "evidence": "declared_only" if row is None else "provider_reported",
+            }
+        )
+    return {
+        "provider": provider_id,
+        "placement": "provider_side",
+        "hosts": sorted(hosts),
+        "files": entries,
+        "via_control": False,
+    }
+
+
+def _retained_fetched(connection: sqlite3.Connection, provider_id: str, attempt: Any):
+    """The provider's retained ``fetched`` rows for the attempt, or None when the provider has
+    no way to reach them from the database (the file bytes live in custody storage, not here)."""
+    try:
+        reader = getattr(stage_provider(provider_id), "retained_fetched", None)
+    except KeyError:
+        return None
+    return None if reader is None else reader(connection, dict(attempt))
+
+
 def _placed_runtime(spec_stage: Any, provider_id: str | None) -> str:
     """The runtime of the candidate the stage was last placed on (ADR 0060)."""
     try:
@@ -290,6 +359,11 @@ def _attempt_entry(
             "approved": None if granted is None else granted.get("approved"),
             "approval_digest": None if granted is None else granted.get("approval_digest"),
         }
+    public = public_fetch_entry(
+        provider_id, spec_stage, _retained_fetched(connection, provider_id, attempt)
+    )
+    if public is not None:
+        entry["public_fetch"] = public
     decision = (placed or {}).get((attempt["stage_key"], attempt["attempt"]))
     if decision is not None:
         # ADR 0060: the candidate chosen and why each other one was skipped.

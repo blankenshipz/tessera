@@ -1,9 +1,11 @@
 # Example unit; every path is a generic placeholder (see README.md).
-# Manual start only: there is deliberately no [Install] section, so enabling
-# or starting tessera.target never starts it. Contains no secret: the agent
-# credential is an owner-only file passed with LoadCredential=.
+# Starts with tessera.target, but only on a host whose operator admitted it: the
+# ConditionPathExists marker below is the gate, and control must also run with
+# --agent-submissions. Contains no secret: the agent credential is an owner-only
+# file passed with LoadCredential=.
 [Unit]
-Description=Tessera campaign-submit runner (admitted, manual start only)
+Description=Tessera campaign-submit runner (starts only on an admitted host)
+PartOf=tessera.target
 After=network-online.target
 Wants=network-online.target
 # Admission: an operator creates this empty marker file to allow a start.
@@ -45,3 +47,6 @@ LockPersonality=yes
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/tessera/submit-runner
+
+[Install]
+WantedBy=tessera.target

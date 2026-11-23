@@ -19,6 +19,7 @@ from pydantic import (
 from .agent_sandbox_models import SandboxPlan
 from .artifact_limits import ABSOLUTE_MAX_ARTIFACT_BYTES, operator_limits
 from .egress_models import EgressPolicy
+from .public_fetch_models import PublicFetchPlan
 from .request_limits import MAX_TOKEN_CHARS
 from .token_purpose import provider_key_shaped
 
@@ -72,6 +73,9 @@ class ExecutionSpec(StrictRequest):
     docker: DockerPlan | None = None
     sandbox: SandboxPlan | None = None
     egress: EgressPolicy | None = None
+    # ADR 0097: pinned public files the local worker supervisor fetches before the container
+    # starts (local-cpu only). Absent keeps every existing plan digest.
+    public_fetch: PublicFetchPlan | None = None
     network_enabled: Literal[False] = False
     # Outputs above 16 MiB use chunked large-artifact custody; the operator's
     # ArtifactLimits (default 8 GiB) bound what a package may actually request.
@@ -92,6 +96,8 @@ class ExecutionSpec(StrictRequest):
             value.pop("sandbox", None)
         if self.egress is None:
             value.pop("egress", None)
+        if self.public_fetch is None:
+            value.pop("public_fetch", None)
         return value
 
     @model_validator(mode="after")
@@ -102,6 +108,8 @@ class ExecutionSpec(StrictRequest):
             raise ValueError(
                 "Egress is supported only for the local-cpu and agent-sandbox profiles (ADR 0034)"
             )
+        if self.public_fetch is not None and (self.profile != "local-cpu" or self.egress):
+            raise ValueError("Public fetch is supported only for local-cpu without egress")
         if (self.profile == "ordinary-docker") != (self.docker is not None):
             raise ValueError("Docker profile requires its explicit approved target/resource pins")
         if (self.profile == "agent-sandbox") != (self.sandbox is not None):

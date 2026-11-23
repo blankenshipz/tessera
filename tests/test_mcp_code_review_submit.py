@@ -165,8 +165,10 @@ def test_registered_only_with_submit_scope(tmp_path):
 class _Fake:
     def __init__(self, tmp_path, response, fail=False):
         self.calls = []
+        self.keys = []
 
         def handler(request):
+            self.keys.append(request.headers.get("Idempotency-Key"))
             self.calls.append((request.url.path, json.loads(request.content)))
             if fail:
                 return httpx.Response(409)
@@ -237,3 +239,32 @@ def test_cli_bad_argparse_exits_2():
     with pytest.raises(SystemExit) as caught:
         review_cli.main(["submit", "--repo", "app"])
     assert caught.value.code == 2
+
+
+def test_default_idempotency_key_is_deterministic_so_a_retry_replays(tmp_path):
+    keys: list = []
+
+    def handler(request):
+        keys.append(request.headers["Idempotency-Key"])
+        return httpx.Response(201, json={"id": "j1"})
+
+    server = _server(tmp_path, handler, review_tools=True)
+    _call(server, ARGS)
+    _call(server, ARGS)
+    _call(server, {**ARGS, "head_sha": "b" * 40})
+    _call(server, {**ARGS, "previous_job_id": "j0", "recheck_findings": [1]})
+    assert keys[0] == keys[1] and keys[0].startswith("code-review-")
+    assert len({keys[0], keys[2], keys[3]}) == 3
+
+
+def test_cli_default_idempotency_key_is_deterministic(tmp_path):
+    keys: list = []
+    argv = [
+        "submit", "--repo", "app", "--branch", "feature/x", "--head", SHA,
+        "--tier", "sonnet", "--budget-cents", "50", "--test", "tests/test_a.py",
+    ]  # fmt: skip
+    for _ in range(2):
+        fake = _Fake(tmp_path, {"id": "j9", "state": "queued"})
+        assert review_cli.main(argv, client_factory=lambda f=fake: f.client) == 0
+        keys.extend(fake.keys)
+    assert keys[0] == keys[1] and keys[0].startswith("code-review-")

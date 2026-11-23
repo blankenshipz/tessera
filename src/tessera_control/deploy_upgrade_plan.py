@@ -25,6 +25,7 @@ from pydantic import (
 PLAN_SCHEMA = "tessera.deploy-upgrade-plan.v1"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _Path = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+_Revision = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{40}$")]
 _ServiceName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
 _Argv = Annotated[
     list[Annotated[str, StringConstraints(min_length=1, max_length=512)]],
@@ -95,6 +96,9 @@ class Service(_Closed):
     name: _ServiceName
     restart_argv: _Argv
     stop_argv: _Argv | None = None
+    # False only when the operator declares the service never writes the control database;
+    # otherwise a service without a stop_argv blocks execute (ADR 0099).
+    writes_state: bool = True
     health: Annotated[HealthFile | HealthHttp, Field(discriminator="kind")]
     health_wait_seconds: Annotated[int, Field(ge=5, le=900)] = 120
     command_timeout_seconds: Annotated[int, Field(ge=5, le=300)] = 60
@@ -111,14 +115,20 @@ class UpgradePlan(_Closed):
     backup_dir: _Path
     receipt_dir: _Path
     max_backup_bytes: int | None = None
-    source_revision: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{40}$")] | None = None
+    source_revision: _Revision | None = None
+    # Focused tests for the upgrade range (from_revision..source_revision), run in the preflight
+    # from the repository checkout at repo_root (default: the working directory).
+    from_revision: _Revision | None = None
+    focused_tests: bool = False
+    focused_tests_jobs: Annotated[int, Field(ge=1, le=4)] = 2
+    repo_root: _Path | None = None
     executor_configs: Annotated[list[_Path], Field(max_length=4)] = []
     live_configs: Annotated[list[_Path], Field(max_length=4)] = []
     providers_file: _Path | None = None
     services: Annotated[list[Service], Field(min_length=1, max_length=8)]
     smoke_cpu: bool = False
 
-    @field_validator("state_dir", "backup_dir", "receipt_dir", "providers_file")
+    @field_validator("state_dir", "backup_dir", "receipt_dir", "providers_file", "repo_root")
     @classmethod
     def _absolute_path(cls, value: str | None) -> str | None:
         return None if value is None else _absolute(value)
@@ -147,6 +157,12 @@ class UpgradePlan(_Closed):
         names = [service.name for service in self.services]
         if len(set(names)) != len(names):
             raise ValueError("service names must be distinct")
+        return self
+
+    @model_validator(mode="after")
+    def _focused_range(self) -> UpgradePlan:
+        if self.focused_tests and (self.from_revision is None or self.source_revision is None):
+            raise ValueError("focused_tests needs from_revision and source_revision")
         return self
 
     @property

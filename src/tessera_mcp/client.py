@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 import ssl
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -229,6 +229,12 @@ class ControlClient:
             key=idempotency_key,
         )
 
+    async def request_agent_loop_pause(self, project, body, key):
+        """POST the agent-loop pause request; `project` is an already-escaped path segment."""
+        return await self._request(
+            "POST", f"/projects/{project}/agent-loop/pause", body=body, key=key
+        )
+
     async def provider_trust(self):
         return await self._request("GET", "/admin/provider-trust")
 
@@ -237,6 +243,24 @@ class ControlClient:
 
     async def campaign(self, campaign_id):
         return await self._request("GET", "/campaigns/" + segment(campaign_id))
+
+    async def campaign_report(self, campaign_id, detail=False):
+        suffix = "?detail=true" if detail else ""
+        return await self._request("GET", f"/campaigns/{segment(campaign_id)}/report{suffix}")
+
+    async def campaign_window_report(self, since, until, detail=False, limit=100):
+        if not 1 <= limit <= 200:
+            raise ControlError("limit must be 1–200")
+        project = segment(self.config.project_id)
+        query = urlencode(
+            {
+                "since": since,
+                "until": until,
+                "limit": limit,
+                **({"detail": "true"} if detail else {}),
+            }
+        )
+        return await self._request("GET", f"/projects/{project}/campaign-report?{query}")
 
     async def list_campaigns(self, offset=0, limit=50):
         if not 0 <= offset or not 1 <= limit <= 200:

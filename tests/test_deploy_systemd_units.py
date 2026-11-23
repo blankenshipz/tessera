@@ -49,9 +49,34 @@ def test_service_shape_and_hardening(path):
     assert parse(path)["Install"]["WantedBy"] == "tessera.target"
 
 
+SUBMIT_RUNNER = UNIT_DIR / "tessera-submit-runner.service"
+
+
 def test_target_wants_every_service():
     wants = parse(UNIT_DIR / "tessera.target")["Unit"]["Wants"].split()
-    assert sorted(wants) == sorted(p.name for p in LONG_RUNNING)
+    assert sorted(wants) == sorted(p.name for p in [*LONG_RUNNING, SUBMIT_RUNNER])
+
+
+def test_the_submit_runner_starts_with_the_target_only_on_an_admitted_host():
+    unit = parse(SUBMIT_RUNNER)
+    assert unit["Install"]["WantedBy"] == "tessera.target"
+    assert unit["Unit"]["PartOf"] == "tessera.target"
+    # The human-set gates stay: the admission marker and the kill-switch marker.
+    assert unit["Unit"]["ConditionPathExists"] == "/etc/tessera/submit-runner.admitted"
+    exec_start = shlex.split(unit["Service"]["ExecStart"])
+    assert exec_start[exec_start.index("--kill-switch") + 1] == "/etc/tessera/submit-runner.kill"
+    assert unit["Service"]["RestartPreventExitStatus"] == "2 3"
+    for key, value in HARDENING.items():
+        assert unit["Service"][key] == value
+
+
+def test_the_poller_starts_the_fail_closed_stage_watcher():
+    words = shlex.split(
+        parse(UNIT_DIR / "tessera-development-poll.service")["Service"]["ExecStart"]
+    )
+    assert "--stage-watcher" in words
+    marker = words[words.index("--stage-watcher-kill-switch") + 1]
+    assert marker.startswith("/var/lib/tessera/")  # absolute, outside the workload's reach
 
 
 @pytest.mark.parametrize("path", LONG_RUNNING, ids=lambda p: p.name)

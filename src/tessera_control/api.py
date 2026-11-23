@@ -91,6 +91,7 @@ def create_app(
     campaign_stuck_scan_seconds: float = 300.0,
     review_single_owner: bool = False,
     storage_retention: bool = False,
+    code_review_git_remotes: Path | str | None = None,
 ) -> FastAPI:
     """Build a control API with an explicit serving profile around initialized state."""
 
@@ -246,8 +247,13 @@ def create_app(
     app.state.review_jobs = ReviewJobStore(state_dir)
     app.state.review_jobs.single_owner = review_single_owner
     app.state.review_policy = NoDestinationsPolicy()
-    # Operator git remotes for code review submit (ADR 0108); none: submit is refused.
+    # Operator git remotes for code review submit (ADR 0108); none: submit is refused. A
+    # malformed file raises ValueError/OSError here, so startup fails closed.
     app.state.code_review_git = None
+    if code_review_git_remotes is not None:
+        from .code_review_git import load_git_remotes
+
+        app.state.code_review_git = load_git_remotes(code_review_git_remotes)
     app.include_router(review_jobs_router)
     from .agent_loop_control import AgentLoopControlStore
     from .agent_loop_control_api import router as agent_loop_control_router
@@ -275,6 +281,8 @@ def create_app(
     from .dataset_staging_api import router as dataset_staging_router
     from .egress_journal import EgressJournalStore
     from .egress_journal_api import router as egress_journal_router
+    from .public_fetch_report import PublicFetchStore
+    from .public_fetch_report import router as public_fetch_router
     from .snapshot_chunks import ChunkedSnapshotStore
     from .snapshot_chunks_api import router as snapshot_chunks_router
     from .stage_watch import StageWatchStore
@@ -282,6 +290,7 @@ def create_app(
 
     app.state.egress_journal = EgressJournalStore(state_dir)
     app.state.stage_watch = StageWatchStore(state_dir)
+    app.state.public_fetch = PublicFetchStore(state_dir)
     app.state.dataset_staging = DatasetStagingStore(state_dir)
     app.state.chunked_snapshots = ChunkedSnapshotStore(state_dir)
     app.state.remote_execution = RemoteExecutionStore(state_dir)
@@ -294,6 +303,7 @@ def create_app(
     app.include_router(provider_inputs_router)
     app.include_router(egress_journal_router)
     app.include_router(stage_watch_router)
+    app.include_router(public_fetch_router)
     app.include_router(dataset_staging_router)
     app.include_router(snapshot_chunks_router)
     app.include_router(credential_lease_router)
@@ -582,22 +592,37 @@ def create_app(
 
         @asynccontextmanager
         async def runner_lifespan(application: FastAPI):
-            from . import campaign_runner, campaign_stuck
+            from . import campaign_runner
 
             handle = campaign_runner.start_background(
                 state_dir, campaign_runner_interval, scheduler=campaign_scheduler
-            )
-            scanner = campaign_stuck.start_background(
-                state_dir / "tessera.sqlite3", campaign_stuck_scan_seconds
             )
             try:
                 async with previous_lifespan(application) as state:
                     yield state
             finally:
-                scanner.stop()
                 handle.stop()
 
         app.router.lifespan_context = runner_lifespan
+
+    # The stuck-campaign scanner reads findings only and is independent of the runner: it runs
+    # whenever the service does (interval 0 disables it), including with --no-campaign-runner.
+    scanner_previous = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def scanner_lifespan(application: FastAPI):
+        from . import campaign_stuck
+
+        scanner = campaign_stuck.start_background(
+            state_dir / "tessera.sqlite3", campaign_stuck_scan_seconds
+        )
+        try:
+            async with scanner_previous(application) as state:
+                yield state
+        finally:
+            scanner.stop()
+
+    app.router.lifespan_context = scanner_lifespan
 
     if storage_retention:
         # Retention timer: reports (dry run) or, only when the operator's policy sets

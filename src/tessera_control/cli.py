@@ -222,6 +222,18 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
     digests.add_argument("--salad-campaign-profiles", required=True, type=Path)
     digests.add_argument("--campaign-id", required=True)
     digests.add_argument("--stage-key")
+    report = actions.add_parser(
+        "report",
+        help="plain-words report of one campaign or a time window (no internal ids unless asked)",
+    )
+    report.add_argument("--campaign-id", help="one campaign; or give --project-id with a window")
+    report.add_argument("--project-id", help="every campaign created in --since .. --until")
+    report.add_argument("--since", help="ISO-8601 UTC start (inclusive)")
+    report.add_argument("--until", help="ISO-8601 UTC end (exclusive)")
+    report.add_argument("--limit", type=int, default=100)
+    report.add_argument("--detail", action="store_true", help="include ids and digests")
+    report.add_argument("--format", choices=("text", "json"), default="text")
+    common(report, mutating=False)
     receipt = actions.add_parser("receipt", help="terminal campaign receipt")
     receipt.add_argument("--campaign-id", required=True)
     common(receipt, mutating=False)
@@ -432,6 +444,17 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
             call = ("GET", f"/campaigns/{campaign}", None, None)
         elif action == "receipt":
             call = ("GET", f"/campaigns/{campaign}/receipt", None, None)
+        elif action == "report":
+            flag = "true" if arguments.detail else "false"
+            if arguments.campaign_id and not (arguments.since or arguments.until):
+                call = ("GET", f"/campaigns/{campaign}/report?detail={flag}", None, None)
+            elif arguments.project_id and arguments.since and arguments.until and not campaign:
+                since = quote(arguments.since, safe="")
+                until = quote(arguments.until, safe="")
+                query = f"since={since}&until={until}&limit={int(arguments.limit)}&detail={flag}"
+                call = ("GET", f"/projects/{project}/campaign-report?{query}", None, None)
+            else:
+                raise ValueError("report needs --campaign-id, or --project-id with --since/--until")
         else:
             query = f"?offset={int(arguments.offset)}&limit={int(arguments.limit)}"
             call = ("GET", f"/projects/{project}/campaigns{query}", None, None)
@@ -451,6 +474,9 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
         print(json.dumps({"error": f"Invalid arguments: {type(error).__name__}"}), file=sys.stderr)
         return 2
     ok = 200 <= status < 300
+    if ok and action == "report" and arguments.format == "text" and isinstance(response, dict):
+        print(response.get("text", ""))
+        return 0
     print(json.dumps(response if ok else {"status": status, "body": response}, sort_keys=True))
     return 0 if ok else 1
 
@@ -476,6 +502,12 @@ def parser() -> argparse.ArgumentParser:
     from .deploy_upgrade_cli import add_parser as add_deploy_upgrade_command
 
     add_deploy_upgrade_command(subcommands)
+    from .deploy_upgrade_cli import add_rollback_parser
+
+    add_rollback_parser(subcommands)
+    from .focused_tests_cli import add_dev_commands
+
+    add_dev_commands(subcommands)
     from .provider_trust_cli import add_provider_trust_commands
 
     add_provider_trust_commands(subcommands)
@@ -616,6 +648,14 @@ def parser() -> argparse.ArgumentParser:
         help=(
             "single-owner deployment: let one person resolve review findings of jobs they "
             "submitted through another credential (recorded as single_owner_opt_in)"
+        ),
+    )
+    serve.add_argument(
+        "--code-review-git-remotes",
+        type=Path,
+        help=(
+            "JSON file mapping repository names to local bare repositories for code review "
+            "submit (env fallback TESSERA_CODE_REVIEW_GIT_REMOTES); default off"
         ),
     )
     return command
@@ -1030,10 +1070,18 @@ def main() -> int:
         from .provider_registration_cli import run as run_providers
 
         return run_providers(arguments)
+    if arguments.command == "deploy-rollback":
+        from .deploy_upgrade_cli import run_rollback
+
+        return run_rollback(arguments)
     if arguments.command == "deploy-upgrade":
         from .deploy_upgrade_cli import run as run_deploy_upgrade
 
         return run_deploy_upgrade(arguments)
+    if arguments.command == "dev":
+        from .focused_tests_cli import run_dev
+
+        return run_dev(arguments)
     if arguments.command == "deploy-check":
         from .deploy_check_cli import run as run_deploy_check
 
@@ -1126,6 +1174,21 @@ def main() -> int:
         if not 0.2 <= arguments.campaign_tick_seconds <= 60:
             print("serve configuration error: --campaign-tick-seconds is 0.2-60", file=sys.stderr)
             return 2
+        remotes_file = arguments.code_review_git_remotes
+        if remotes_file is None and os.environ.get("TESSERA_CODE_REVIEW_GIT_REMOTES"):
+            remotes_file = Path(os.environ["TESSERA_CODE_REVIEW_GIT_REMOTES"])
+        if remotes_file is not None:
+            from .code_review_git import load_git_remotes
+
+            try:
+                load_git_remotes(remotes_file)
+            except (ValueError, OSError):
+                print(
+                    "serve configuration error: code review git remotes file is unreadable "
+                    "or malformed",
+                    file=sys.stderr,
+                )
+                return 2
         runner_interval = None if arguments.no_campaign_runner else arguments.campaign_tick_seconds
         if arguments.agent_submissions and arguments.agent_submission_kill_switch is None:
             print(
@@ -1244,6 +1307,7 @@ def main() -> int:
                 campaign_stuck_scan_seconds=max(0.0, arguments.campaign_stuck_scan_seconds),
                 review_single_owner=arguments.review_single_owner,
                 storage_retention=True,
+                code_review_git_remotes=remotes_file,
             )
             # The state is initialized and current (create_app checked it): audit the load.
             record_at_start(_database_path(arguments.state_dir), trust_policy)
