@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -200,3 +201,44 @@ def test_rollback_names_a_write_failure_and_keeps_the_read_failure_message(tmp_p
     with pytest.raises(deploy_upgrade.RollbackRefused, match="cannot be read"):
         deploy_upgrade.rollback(plan, receipt, probe=probe)
     monkeypatch.setattr(deploy_upgrade, "_copy_private", real)
+
+
+@pytest.mark.parametrize(
+    ("step", "message"),
+    [
+        ("write", "could not be written"),
+        ("flush", "could not be flushed"),
+        ("close", "could not be closed"),
+    ],
+)
+def test_a_copy_failure_names_the_step_that_failed_without_paths(
+    tmp_path, monkeypatch, step, message
+):
+    source = tmp_path / "source-marker.bin"
+    source.write_bytes(b"x" * 100)
+    destination = tmp_path / "dest-marker.bin"
+    real_fdopen = os.fdopen
+
+    class _Failing:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def write(self, data):
+            if step == "write":
+                raise OSError(28, "no space left")
+            return self._inner.write(data)
+
+        def flush(self):
+            if step == "flush":
+                raise OSError(28, "no space left")
+            return self._inner.flush()
+
+        def close(self):
+            self._inner.close()
+            if step == "close":
+                raise OSError(5, "input/output error")
+
+    monkeypatch.setattr(os, "fdopen", lambda fd, mode: _Failing(real_fdopen(fd, mode)))
+    with pytest.raises(deploy_upgrade._CopyWriteError, match=message) as raised:
+        deploy_upgrade._copy_private(source, destination)
+    assert "marker" not in str(raised.value) and str(tmp_path) not in str(raised.value)

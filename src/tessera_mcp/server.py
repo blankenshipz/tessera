@@ -372,6 +372,8 @@ def register_campaign_tools(
         ``heavy_guard`` (present only when recorded) is the latest warning (a heavy stage placed
         on a local executor although a Salad profile is registered) or refusal (it waits for a
         remote candidate), with its mode, reasons, signals and whether it is still waiting.
+        ``pending_human_approval`` is a live list of what awaits a person (a spec approval or
+        re-approval, or a Salad plan or source-use review); it is empty when nothing does.
         """
         return await client.campaign(campaign_id)
 

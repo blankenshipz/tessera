@@ -74,3 +74,28 @@ def test_the_two_checks_share_one_helper():
     from tessera_worker import cpu, service
 
     assert cpu.check_private_auth_file is service.check_private_auth_file
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_refusal_messages_exclude_the_path_and_contents(kind, tmp_path, monkeypatch):
+    marker = "marker-7f3c91d2"
+    secret = "secret-content-4be8"
+    directory = tmp_path / marker
+    directory.mkdir()
+    moved = directory / "auth.json"
+    moved.write_text(secret)
+    moved.chmod(0o600)
+    _break(kind, directory, moved, monkeypatch)
+    errors = []
+    for call in (check_private_auth_file, private_registry_auth_file):
+        with pytest.raises(Exception) as raised:  # noqa: B017 - either closed refusal type
+            call(moved)
+        errors.append(raised.value)
+    for error in errors:
+        chain = []
+        while error is not None:
+            chain.append(error)
+            error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+        for link in chain:
+            for text in (str(link), repr(link)):
+                assert marker not in text and secret not in text

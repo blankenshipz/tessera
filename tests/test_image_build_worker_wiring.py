@@ -127,15 +127,55 @@ def _service(tmp_path, credential, auth):
 
 
 def test_a_private_auth_file_is_accepted_and_never_read(tmp_path, paths, monkeypatch):
+    import builtins
+    import io
+    import pathlib
+
     credential, auth = paths
     opened = []
-    real_open = os.open
-    monkeypatch.setattr(
-        os, "open", lambda p, *a, **k: (opened.append(str(p)), real_open(p, *a, **k))[1]
-    )
+    auth_fds = set()
+    reads = []
+
+    def guard(real):
+        def wrapper(target, *a, **k):
+            if isinstance(target, int) or os.fspath(target) != str(auth):
+                return real(target, *a, **k)
+            opened.append(str(target))
+            return real(target, *a, **k)
+
+        return wrapper
+
+    real_os_open = os.open
+
+    def spy_os_open(target, *a, **k):
+        fd = real_os_open(target, *a, **k)
+        if os.fspath(target) == str(auth):
+            opened.append(str(target))
+            auth_fds.add(fd)
+        return fd
+
+    real_read = os.read
+
+    def spy_read(fd, *a, **k):
+        if fd in auth_fds:
+            reads.append(fd)
+        return real_read(fd, *a, **k)
+
+    real_path_open = pathlib.Path.open
+
+    def path_open(self, *a, **k):
+        if str(self) == str(auth):
+            opened.append(str(self))
+        return real_path_open(self, *a, **k)
+
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(os, "read", spy_read)
+    monkeypatch.setattr(io, "open", guard(io.open))
+    monkeypatch.setattr(builtins, "open", guard(builtins.open))
+    monkeypatch.setattr(pathlib.Path, "open", path_open)
     service = _service(tmp_path, credential, auth)
     assert service.registry_auth_file == auth
-    assert str(auth) not in opened
+    assert opened == [] and reads == []
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o666])
@@ -331,3 +371,63 @@ def test_the_service_gives_the_runtime_the_auth_file_and_repositories(tmp_path, 
         service.run()
     assert captured[0]["registry_auth_file"] == auth
     assert captured[0]["build_repositories"] == REPOSITORIES
+
+
+def test_a_recovered_runtime_gets_the_same_validated_auth_file(tmp_path, paths, monkeypatch):
+    from tessera_worker import service as service_module
+
+    credential, auth = paths
+    seen = []
+
+    class _Runtime:
+        def __init__(self, *args, **keywords):
+            seen.append(keywords.get("registry_auth_file"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def recover(self, lease_id, epoch):
+            return {}
+
+        def start(self, lease_id, epoch):
+            return {}
+
+    monkeypatch.setattr(service_module, "DevelopmentCpuRuntime", _Runtime)
+    monkeypatch.setattr(
+        service_module.DevelopmentWorkerService, "_recovery_identity", lambda *_: ("l", 1, "w")
+    )
+    monkeypatch.setattr(
+        service_module.DevelopmentWorkerService, "_attach_stage_watch", lambda *_: None
+    )
+    monkeypatch.setattr(service_module.DevelopmentWorkerService, "_drive", lambda *_: {})
+    monkeypatch.setattr(service_module.DevelopmentWorkerService, "_heartbeat", lambda *_: None)
+    monkeypatch.setattr(
+        service_module.DevelopmentWorkerService,
+        "_lease_identity",
+        lambda *_: ("l", 1, "w"),
+    )
+    fresh_channel = type("C", (), {"post": lambda *a, **k: {}})()
+    config = _service_config(
+        tmp_path, credential, registry_auth_file=auth, build_repositories=REPOSITORIES
+    )
+    adapter = object()
+    recovering = DevelopmentWorkerService(config, channel=fresh_channel, adapter=adapter)
+    recovering._run()
+    monkeypatch.setattr(
+        service_module.DevelopmentWorkerService, "_recovery_identity", lambda *_: None
+    )
+    fresh = DevelopmentWorkerService(config, channel=fresh_channel, adapter=adapter)
+    fresh._run()
+    assert seen == [auth, auth]
+    # A loose-mode file never reaches a runtime, recovered or fresh.
+    auth.chmod(0o644)
+    seen.clear()
+    monkeypatch.setattr(
+        service_module.DevelopmentWorkerService, "_recovery_identity", lambda *_: ("l", 1, "w")
+    )
+    with pytest.raises(DevelopmentWorkerError, match="private regular file"):
+        DevelopmentWorkerService(config, channel=fresh_channel, adapter=adapter)
+    assert seen == []

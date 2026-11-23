@@ -202,38 +202,42 @@ def _other_tenant_agent(state, actions):
             ("org_other_agent", "Other tenant", "2026-01-01T00:00:00Z"),
         )
         connection.execute(
-            "INSERT INTO projects (id, org_id, name, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO projects (id, org_id, name, created_at) VALUES (?, ?, ?, ?)",
             ("project_other_agent", "org_other_agent", "other", "2026-01-01T00:00:00Z"),
         )
         # The other org's own owner root, then its agent issued under that root (the same
         # structure the real issuing path writes).
         connection.execute(
-            "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+            "INSERT OR IGNORE INTO principals "
+            "(id, org_id, role, token_hash, revoked_at, created_at) "
             "VALUES ('other_owner', 'org_other_agent', 'human', ?, NULL, ?)",
             (_token_hash("synthetic-other-org-owner-token-" + "x" * 30), "2026-01-01T00:00:00Z"),
         )
         connection.execute(
-            "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+            "INSERT OR IGNORE INTO credentials "
+            "(id, principal_id, kind, audience, project_id, parent_id, "
             "expires_at, revoked_at, created_at, created_by_principal_id) "
             "VALUES ('credential_other_owner', 'other_owner', 'local_owner', 'control', NULL, "
             "NULL, NULL, NULL, ?, 'other_owner')",
             ("2026-01-01T00:00:00Z",),
         )
         connection.execute(
-            "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+            "INSERT OR IGNORE INTO principals "
+            "(id, org_id, role, token_hash, revoked_at, created_at) "
             "VALUES (?, ?, 'agent', ?, NULL, ?)",
             ("other_agent", "org_other_agent", _token_hash(token), "2026-01-01T00:00:00Z"),
         )
         expires = (datetime.now(UTC) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         connection.execute(
-            "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+            "INSERT OR IGNORE INTO credentials "
+            "(id, principal_id, kind, audience, project_id, parent_id, "
             "expires_at, revoked_at, created_at, created_by_principal_id) "
             "VALUES ('credential_other_agent', 'other_agent', 'agent', 'control', "
             "'project_other_agent', 'credential_other_owner', ?, NULL, ?, 'other_owner')",
             (expires, datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")),
         )
         connection.execute(
-            "INSERT INTO external_agent_scopes VALUES ('credential_other_agent', ?, ?)",
+            "INSERT OR IGNORE INTO external_agent_scopes VALUES ('credential_other_agent', ?, ?)",
             (json.dumps(actions), "planner.local"),
         )
         connection.commit()

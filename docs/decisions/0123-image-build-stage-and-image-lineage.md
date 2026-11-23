@@ -79,7 +79,12 @@ A v2 stage with a `build` block builds an image and pushes it to a registry the 
 - The worker's registry auth file and `build_repositories` are set by the operator through
   `--registry-auth-file` / `--build-repository` or the poller config keys of the same names
   (both or neither; absent refuses every pushing build). The file is checked private and never
-  read by the worker.
+  read by the worker. One function (`check_private_auth_file` in
+  `src/tessera_worker/private_auth_file.py`) enforces the rule at worker startup and again when
+  the CPU runtime mounts the file: `lstat` without following a link (a symlink is refused), a
+  regular file owned by the worker user, a link count of 1, and no group or world permission bit
+  (so a 0644 file is refused; 0600 or 0400 pass). Each refusal carries a closed code and a
+  message that names neither the path nor any content.
 - The hardened container's `/work` is `noexec` and its output directory is owned by the
   supervisor, so a rootless build's `RUN` steps and the container user's right to write the result
   need checking against a real builder.

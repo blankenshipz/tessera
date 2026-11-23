@@ -15,7 +15,8 @@ worker path or a secret.
   approval of its spec digest.
 - ``salad_review``: in a non-terminal campaign, a Salad attempt in phase ``awaiting_review`` whose
   ``plan`` or ``source_use`` decision request is still ``pending`` and not past its
-  ``expires_at`` (a request the expiry sweep has not yet marked expired is already cleared here).
+  ``expires_at`` (a request the expiry sweep has not yet marked expired is already cleared here;
+  an unparsable ``expires_at`` fails closed to listing it).
   A pre-approval clears an item only by resolving that request: this view reads the request's own
   status and never looks at pre-approvals.
 """
@@ -31,14 +32,14 @@ from .store import _parse_utc
 _REVIEW_COLUMNS = (("plan", "plan_decision_id"), ("source_use", "source_decision_id"))
 
 
-def _still_open(expires_at: str, now: datetime) -> bool:
+def _still_open(expires_at: Any, now: datetime) -> bool:
     """A pending request past its expiry can no longer be approved (``resolve_decision`` refuses
     it) even before ``expire_decisions`` records it, so it is not awaited. An expiry that cannot
-    be read as a timestamp with an offset is refused the same way."""
+    be read as a timestamp with an offset fails closed: the request stays listed for a person."""
     try:
-        return _parse_utc(expires_at) > now
+        return _parse_utc(str(expires_at)) > now
     except (TypeError, ValueError):
-        return False
+        return True
 
 
 def pending_human_approval(

@@ -7,6 +7,7 @@ import errno
 import json
 import os
 import sys
+import types
 
 import pytest
 from test_credential_reenroll import (  # noqa: F401
@@ -307,3 +308,65 @@ def test_noreplace_unsupported_errnos_map_to_unsupported(tmp_path, monkeypatch):
     with pytest.raises(cr._NoReplaceUnsupported):
         cr._rename_noreplace(source, tmp_path / "b")
     assert source.exists()  # never a plain rename that could overwrite
+
+
+def _native_noreplace_supported():
+    return sys.platform.startswith("linux") or sys.platform == "darwin"
+
+
+@pytest.mark.skipif(not _native_noreplace_supported(), reason="no native no-replace rename")
+def test_rename_noreplace_real_end_to_end(tmp_path):
+    source = tmp_path / "src"
+    source.write_bytes(b"new")
+    target = tmp_path / "dst"
+    try:
+        cr._rename_noreplace(source, target)
+    except cr._NoReplaceUnsupported:
+        pytest.skip("filesystem does not support no-replace rename")
+    assert target.read_bytes() == b"new" and not source.exists()
+
+    # an existing target is refused and never replaced
+    other = tmp_path / "other"
+    other.write_bytes(b"other")
+    with pytest.raises(FileExistsError):
+        cr._rename_noreplace(other, target)
+    assert target.read_bytes() == b"new" and other.read_bytes() == b"other"
+
+    # a symlink target (even a dangling one) is refused, not followed or replaced
+    outside = tmp_path / "outside"
+    link = tmp_path / "link"
+    link.symlink_to(outside)
+    with pytest.raises(FileExistsError):
+        cr._rename_noreplace(other, link)
+    assert link.is_symlink() and not outside.exists() and other.exists()
+
+
+@pytest.mark.parametrize(
+    ("platform", "symbol", "flag"),
+    [("linux", "renameat2", cr._RENAME_NOREPLACE), ("darwin", "renamex_np", cr._RENAME_EXCL)],
+)
+def test_rename_noreplace_dispatches_by_platform(tmp_path, monkeypatch, platform, symbol, flag):
+    calls = []
+
+    def backend(name):
+        def call(*args):
+            calls.append((name, args))
+            return 0
+
+        call.argtypes = call.restype = None
+        return call
+
+    lib = types.SimpleNamespace(renameat2=backend("renameat2"), renamex_np=backend("renamex_np"))
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: lib)
+    monkeypatch.setattr(sys, "platform", platform)
+    cr._rename_noreplace(tmp_path / "a", tmp_path / "b")
+    assert [name for name, _ in calls] == [symbol]  # the other backend is never called
+    assert calls[0][1][-1] == flag
+
+
+def test_rename_noreplace_unknown_platform_is_unsupported(tmp_path, monkeypatch):
+    lib = types.SimpleNamespace(renameat2=lambda *a: 0, renamex_np=lambda *a: 0)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: lib)
+    monkeypatch.setattr(sys, "platform", "win32")
+    with pytest.raises(cr._NoReplaceUnsupported):
+        cr._rename_noreplace(tmp_path / "a", tmp_path / "b")

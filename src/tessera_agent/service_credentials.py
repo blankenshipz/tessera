@@ -388,6 +388,7 @@ def _append_receipt(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
         )
     body = {**record, "previous_hash": state["last_good_hash"]}
     body["hash"] = _receipt_hash(body)
+    created = not os.path.lexists(path)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         os.fchmod(fd, 0o600)
@@ -395,6 +396,11 @@ def _append_receipt(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
         os.fsync(fd)
     finally:
         os.close(fd)
+    if created:  # best effort: make the new directory entry durable
+        try:
+            _fsync_directory(path.parent)
+        except OSError:
+            pass
     return body
 
 
@@ -853,7 +859,9 @@ def _parser() -> argparse.ArgumentParser:
     install_cmd = commands.add_parser("install", help="read the secret from standard input")
     common(install_cmd, units=True)
     install_cmd.add_argument("--name", required=True)
-    install_cmd.add_argument("--owner", required=True, help="reference owner label")
+    install_cmd.add_argument(
+        "--owner", "--owner-label", dest="owner", required=True, help="reference owner label"
+    )
     install_cmd.add_argument("--reference", required=True, help="reference label")
     install_cmd.add_argument("--replace", action="store_true")
     install_cmd.add_argument("--receipts")
@@ -863,7 +871,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     common(withdraw_cmd)
     withdraw_cmd.add_argument("--name", required=True)
-    withdraw_cmd.add_argument("--owner-label", required=True, help="who withdraws (a label)")
+    withdraw_cmd.add_argument(
+        "--owner-label", "--owner", dest="owner_label", required=True, help="reference owner label"
+    )
     withdraw_cmd.add_argument("--reason", help="why (a label)")
     withdraw_cmd.add_argument("--receipts")
     check_cmd = commands.add_parser("check", help="re-validate the installed files and the unit")

@@ -374,7 +374,10 @@ left is the earliest of the campaign approval's expiry and the expiry of the app
 human's and the stage worker's credentials. A stage of the maximum 3600 s therefore needs
 at least 65 minutes (3900 s) of approval and credential life when it is dispatched; a
 one-hour credential can never start it. Each retry attempt is checked again when it is
-dispatched. Re-approval does not extend the campaign's total wall-clock bound. The receipt records the bound (`wall_clock`: `deadline_seconds`, `first_approved_at`, `bound_at`, the number of `approvals`, and `extended_by_reapproval: false`); it is absent for a campaign that was never approved.
+dispatched. Re-approval does not extend the campaign's total wall-clock bound. The receipt records
+the bound (`wall_clock`: `deadline_seconds`, `first_approved_at`, `bound_at`, the number of
+`approvals`, and `extended_by_reapproval: false`); it is absent for a campaign that was never
+approved.
 
 ## Receipt
 

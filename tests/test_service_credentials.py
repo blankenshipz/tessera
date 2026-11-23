@@ -481,3 +481,39 @@ def test_archive_broken_moves_the_chain_aside_and_starts_a_new_one(store, capsys
 def test_refusal_messages_are_fixed_text():
     for code, message in sc._MESSAGES.items():
         assert not re.search(r"sk-|\\x", message), code
+
+
+@pytest.mark.parametrize("spelling", ["--owner", "--owner-label"])
+def test_install_accepts_both_owner_spellings(spelling):
+    args = sc._parser().parse_args(
+        ["install", "--service", SERVICE, "--name", NAME, spelling, "o1", "--reference", "r"]
+    )
+    assert args.owner == "o1"
+
+
+def test_install_owner_help_says_reference_owner_label():
+    install_help = [
+        a for a in sc._parser()._subparsers._group_actions[0].choices["install"]._actions
+        if "--owner" in a.option_strings
+    ][0].help  # fmt: skip
+    assert install_help == "reference owner label"
+
+
+def test_append_receipt_fsyncs_file_and_new_directory(tmp_path, monkeypatch):
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(os.fstat(fd).st_mode), real(fd)))
+    path = tmp_path / "receipts.jsonl"
+    sc._append_receipt(path, {"event": "one"})
+    import stat
+
+    assert [stat.S_ISREG(m) for m in synced] == [True, False]  # file, then its directory
+    synced.clear()
+    sc._append_receipt(path, {"event": "two"})
+    assert [stat.S_ISREG(m) for m in synced] == [True]  # existing file: no directory sync
+
+
+def test_append_receipt_ignores_directory_fsync_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(sc, "_fsync_directory", lambda d: (_ for _ in ()).throw(OSError()))
+    body = sc._append_receipt(tmp_path / "receipts.jsonl", {"event": "one"})
+    assert body["event"] == "one"

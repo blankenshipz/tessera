@@ -121,18 +121,33 @@ def _copy_private(source: Path, destination: Path) -> str:
     try:
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except OSError:
-        raise _CopyWriteError("the destination cannot be written") from None
-    with open(source, "rb") as reader, os.fdopen(fd, "wb") as writer:
-        while chunk := reader.read(_CHUNK):
-            digest.update(chunk)
+        raise _CopyWriteError("the destination could not be opened") from None
+    try:
+        writer = os.fdopen(fd, "wb")
+    except OSError:
+        os.close(fd)
+        raise _CopyWriteError("the destination could not be opened") from None
+    done = False
+    try:
+        with open(source, "rb") as reader:
+            while chunk := reader.read(_CHUNK):
+                digest.update(chunk)
+                try:
+                    writer.write(chunk)
+                except OSError:
+                    raise _CopyWriteError("the destination could not be written") from None
             try:
-                writer.write(chunk)
+                writer.flush()
             except OSError:
-                raise _CopyWriteError("the destination cannot be written") from None
+                raise _CopyWriteError("the destination could not be flushed") from None
+        done = True
+    finally:
         try:
-            writer.flush()
+            writer.close()
         except OSError:
-            raise _CopyWriteError("the destination cannot be written") from None
+            # A close-time failure is the destination's; an earlier failure keeps its own step.
+            if done:
+                raise _CopyWriteError("the destination could not be closed") from None
     return digest.hexdigest()
 
 

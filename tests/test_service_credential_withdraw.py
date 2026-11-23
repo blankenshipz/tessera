@@ -315,3 +315,26 @@ def test_first_call_readiness_reports_the_credential_missing_after_withdraw(
     assert after["key"] == {"present": False, "size_ok": None}
     assert after["overall"] == "not_ready"  # the reference is gone too, so not just the key
     assert_no_secret(json.dumps(after))
+
+
+def test_withdraw_accepts_both_owner_spellings_and_help_text():
+    for spelling in ("--owner", "--owner-label"):
+        args = sc._parser().parse_args(
+            ["withdraw", "--service", SERVICE, "--name", NAME, spelling, "o1"]
+        )
+        assert args.owner_label == "o1"
+    action = [
+        a for a in sc._parser()._subparsers._group_actions[0].choices["withdraw"]._actions
+        if "--owner-label" in a.option_strings
+    ][0]  # fmt: skip
+    assert action.help == "reference owner label"
+
+
+def test_withdraw_cli_with_owner_alias(store, capsys):  # noqa: F811
+    directory, _ = store
+    code = sc.main(
+        ["withdraw", "--service", SERVICE, "--name", NAME, "--owner", "operator1",
+         "--credentials-dir", str(directory), "--user-store"]
+    )  # fmt: skip
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["owner_label"] == "operator1"

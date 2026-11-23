@@ -732,15 +732,16 @@ def test_a_lost_race_at_the_insert_is_a_clean_refusal(tmp_path, monkeypatch):
 
 def _other_org(env) -> dict:
     now = "2026-01-01T00:00:00Z"
-    env.execute("INSERT INTO organizations VALUES ('org_two','Two',?)", now)
+    env.execute("INSERT OR IGNORE INTO organizations VALUES ('org_two','Two',?)", now)
     env.execute(
-        "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+        "INSERT OR IGNORE INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
         "VALUES ('p_two','org_two','human',?,NULL,?)",
         "f" * 64,
         now,
     )
     env.execute(
-        "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+        "INSERT OR IGNORE INTO credentials "
+        "(id, principal_id, kind, audience, project_id, parent_id, "
         "expires_at, revoked_at, created_at, created_by_principal_id) "
         "VALUES ('c_two','p_two','local_owner','control',NULL,NULL,NULL,NULL,?,'p_two')",
         now,

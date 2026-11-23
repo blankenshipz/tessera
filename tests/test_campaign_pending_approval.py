@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from campaign_fixture import Env
 
 from tessera_control.campaign_pending_approval import pending_human_approval
@@ -41,9 +42,10 @@ def test_a_lapsed_approval_awaits_a_reapproval_and_it_clears_after_one(tmp_path)
     assert _view(env, campaign) == []
 
 
-def _salad_review(env, campaign, status="pending", expires_in=timedelta(hours=1)):
+def _salad_review(env, campaign, status="pending", expires_in=timedelta(hours=1), expires_at=None):
     """A Salad attempt waiting at its plan review, with a decision request in ``status``."""
-    expires_at = (datetime.now(UTC) + expires_in).isoformat().replace("+00:00", "Z")
+    if expires_at is None:
+        expires_at = (datetime.now(UTC) + expires_in).isoformat().replace("+00:00", "Z")
     db = sqlite3.connect(env.state / "tessera.sqlite3")  # foreign keys off: rows only
     try:
         db.execute(
@@ -86,6 +88,21 @@ def test_a_pending_salad_review_is_listed_and_clears_when_decided_or_refused(tmp
         assert _view(env, campaign) == [], decided
 
 
+@pytest.mark.parametrize(
+    ("expires_at", "listed"),
+    [
+        ("2000-01-01T00:00:00Z", 0),  # past: cleared
+        ("2999-01-01T00:00:00Z", 1),  # future: listed
+        ("not a time", 1),  # unparsable: fail closed to listing
+    ],
+)
+def test_a_pending_review_past_its_expiry_is_cleared(tmp_path, expires_at, listed):
+    env = Env(tmp_path)
+    campaign, _ = env.approved()
+    _salad_review(env, campaign, expires_at=expires_at)
+    assert len(_view(env, campaign)) == listed
+
+
 def test_the_derivation_reads_state_only_and_stores_nothing(tmp_path):
     env = Env(tmp_path)
     submitted = env.submit()
@@ -119,9 +136,10 @@ def test_view_only_a_pending_request_past_its_expiry_is_not_listed(tmp_path):
     assert _view(env, campaign) == []
 
 
-def test_an_unreadable_expiry_is_not_listed(tmp_path):
+def test_an_unreadable_expiry_stays_listed(tmp_path):
+    # Fail closed: an expiry that cannot be read keeps the request in front of a person.
     env = Env(tmp_path)
     campaign, _ = env.approved()
     _salad_review(env, campaign)
     env.execute("UPDATE decision_requests SET expires_at='later' WHERE id='dec1'")
-    assert _view(env, campaign) == []
+    assert [i["decision_request_id"] for i in _view(env, campaign)] == ["dec1"]

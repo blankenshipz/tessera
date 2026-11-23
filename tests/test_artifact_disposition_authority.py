@@ -24,16 +24,17 @@ def _other_tenant_headers(state: Path) -> dict[str, str]:
     value = token("other-tenant-human")
     with sqlite3.connect(state / "tessera.sqlite3") as connection:
         connection.execute(
-            "INSERT INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
             ("org_other", "Other tenant", "2026-01-01T00:00:00Z"),
         )
         connection.execute(
-            """INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at)
+            """INSERT OR IGNORE INTO principals
+            (id, org_id, role, token_hash, revoked_at, created_at)
             VALUES (?, ?, 'human', ?, NULL, ?)""",
             ("other_human", "org_other", _token_hash(value), "2026-01-01T00:00:00Z"),
         )
         connection.execute(
-            """INSERT INTO credentials
+            """INSERT OR IGNORE INTO credentials
             (id, principal_id, kind, audience, project_id, parent_id, expires_at,
              revoked_at, created_at, created_by_principal_id)
             VALUES (?, ?, 'local_owner', 'control', NULL, NULL, NULL, NULL, ?, ?)""",
