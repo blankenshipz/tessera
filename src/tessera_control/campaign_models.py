@@ -317,6 +317,9 @@ OutputKind = Literal[
 MAX_EVIDENCE_CELLS = 5000
 MAX_STAGES_V2 = 64
 MAX_INPUT_EDGES_V2 = 512
+# Data inputs per v2 stage. ADR 0121: the stage's ADR 0095 ``code_input`` (one pinned snapshot
+# input it names) is not a data input, so a stage that names one may hold one more input.
+MAX_STAGE_DATA_INPUTS = 8
 MAX_SPEC_BYTES_V2 = 1024 * 1024
 MAX_OUTPUT_BYTES = ABSOLUTE_MAX_ARTIFACT_BYTES
 
@@ -619,7 +622,8 @@ class StageV2(_Strict):
     grant_ttl_seconds: Annotated[int, Field(strict=True, ge=60, le=43200)] = 900
     retry: RetryPolicy = RetryPolicy()
     scratch_bytes: ScratchBytes | None = None
-    inputs: Annotated[list[StageInputV2], Field(min_length=1, max_length=8)]
+    # At most MAX_STAGE_DATA_INPUTS data inputs plus the code input (ADR 0121, ``_input_limit``).
+    inputs: Annotated[list[StageInputV2], Field(min_length=1, max_length=MAX_STAGE_DATA_INPUTS + 1)]
     outputs: Annotated[list[OutputSpec], Field(min_length=1, max_length=128)]
     metrics: Annotated[list[MetricSpec], Field(max_length=16)] = []
     stop_when: Annotated[list[StopRule], Field(max_length=8)] = []
@@ -661,6 +665,24 @@ class StageV2(_Strict):
         ):
             raise ValueError(
                 f"Stage {self.key} expected_duration_seconds exceeds its max_duration_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _input_limit(self) -> StageV2:
+        # ADR 0121: the one named code input sits outside the data-input limit; any other input
+        # beyond it is refused, so a stage holds at most one input more than the limit.
+        code = [
+            item
+            for item in self.inputs
+            if self.code_input is not None
+            and item.name == self.code_input
+            and item.kind == "snapshot"
+        ]
+        if len(self.inputs) - min(len(code), 1) > MAX_STAGE_DATA_INPUTS:
+            raise ValueError(
+                f"Stage {self.key} has more than {MAX_STAGE_DATA_INPUTS} data inputs (only a "
+                "code_input naming one of its pinned snapshot inputs is outside that limit)"
             )
         return self
 
@@ -1383,7 +1405,9 @@ def validate_structure(spec: NormalSpec) -> None:
                     f"Stage {stage.key}: candidate {item.provider} estimate exceeds the "
                     "stage's max_exposure_cents"
                 )
-    if sum(len(stage.inputs) for stage in spec.stages) > spec.max_edges:
+    # ADR 0121: a stage's code input is not a data edge, as it is outside the per-stage limit.
+    data_edges = sum(len(stage.inputs) - (stage.code_input is not None) for stage in spec.stages)
+    if data_edges > spec.max_edges:
         raise ValueError(f"Campaign declares more than {spec.max_edges} stage inputs in total")
     classes = stage_classes(spec)
     for stage in spec.stages:

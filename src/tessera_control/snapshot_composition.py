@@ -108,7 +108,8 @@ class ComposeSource(BaseModel):
 
 class ComposeSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    sources: list[ComposeSource] = Field(min_length=1, max_length=8)
+    # A campaign stage composes every input: up to 8 data inputs plus its code input (ADR 0121).
+    sources: list[ComposeSource] = Field(min_length=1, max_length=9)
     expected_snapshot_digest: Digest
 
     @model_validator(mode="after")

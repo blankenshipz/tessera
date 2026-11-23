@@ -190,7 +190,8 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
 - `max_exposure_cents` x `retry.max_attempts` may not exceed 5000 (the experiment budget
   ceiling) for any stage.
 - v1: at most 32 stages, 256 input edges and 8 inputs per stage. v2: 64 stages, 512 edges,
-  8 inputs per stage, 1 MiB of canonical JSON, 1..128 typed outputs per stage, and at most
+  8 data inputs per stage plus the stage's `code_input` when it names one (ADR 0121; the code
+  input is not counted as a data input or an edge), 1 MiB of canonical JSON, 1..128 typed outputs per stage, and at most
   16 MiB per declared output.
 - If an experiment budget's exposure is unknown the stage is `refused_budget` with reason
   `exposure_unknown` (not `budget_refused`); nothing is dispatched.
