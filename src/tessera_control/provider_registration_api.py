@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from . import provider_registration as registration
@@ -45,7 +45,8 @@ class ProviderRegistrationStore(ExternalAgentStore):
         super().__init__(state_dir)
         self.path = path
 
-    def read(self, principal) -> dict[str, Any]:
+    def _reader(self, principal) -> tuple[dict[str, Any], bool]:
+        """The live actor and whether it owns the deployment; refuses who may not read."""
         connection = _connect(self.database_path)
         try:
             actor = self._actor(connection, principal)
@@ -55,9 +56,29 @@ class ProviderRegistrationStore(ExternalAgentStore):
                 self._scope(connection, actor, "provider_trust:read")
             elif actor["role"] != "human":
                 raise Forbidden("A human or a provider_trust:read agent is required.")
-            root = self.deployment_owner(actor)
+            return actor, self.deployment_owner(actor)
         finally:
             connection.close()
+
+    def gpu_classes(self, principal, days: int) -> dict[str, Any]:
+        """Eligible Salad GPU classes of the caller's organization (read only, no secrets)."""
+        from . import salad_gpu_classes as gpu
+
+        actor, _root = self._reader(principal)
+        if self.path is None:
+            return {"configured": False, "reason": NOT_CONFIGURED}
+        try:
+            return gpu.list_gpu_classes(
+                gpu.load_profiles_from_file(self.path),
+                self.database_path,
+                org_id=actor["org_id"],
+                days=days,
+            )
+        except gpu.GpuClassListingError as error:
+            raise Conflict(str(error)) from None
+
+    def read(self, principal) -> dict[str, Any]:
+        actor, root = self._reader(principal)
         if self.path is None:
             return {"configured": False, "reason": NOT_CONFIGURED}
         try:
@@ -255,6 +276,14 @@ Registration = Annotated[ProviderRegistrationStore, Depends(registration_store)]
 def read_campaign_providers(actor: ExternalActor, store: Registration):
     """Entries (no secrets by construction), digest and recent audit of the providers file."""
     return store.read(actor)
+
+
+@router.get("/salad-gpu-classes")
+def read_salad_gpu_classes(
+    actor: ExternalActor, store: Registration, days: Annotated[int, Query(ge=1, le=90)] = 14
+):
+    """Eligible Salad GPU classes (from the operator's profiles) with recorded receipt data."""
+    return store.gpu_classes(actor, days)
 
 
 @router.post("")

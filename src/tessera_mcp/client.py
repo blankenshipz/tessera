@@ -213,6 +213,13 @@ class ControlClient:
     async def list_campaign_providers(self):
         return await self._request("GET", "/admin/campaign-providers")
 
+    async def list_salad_gpu_classes(self, days=14):
+        if type(days) is not int or not 1 <= days <= 90:
+            raise ControlError("days must be an integer from 1 to 90")
+        return await self._request(
+            "GET", f"/admin/campaign-providers/salad-gpu-classes?days={days}"
+        )
+
     async def deploy_check_report(self):
         return await self._request("GET", "/admin/deploy-check")
 

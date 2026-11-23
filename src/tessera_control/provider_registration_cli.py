@@ -22,6 +22,14 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
     for name in ("list", "audit"):
         item = actions.add_parser(name)
         item.add_argument("--file", type=Path, required=True, help="absolute providers file")
+    gpu = actions.add_parser(
+        "gpu-classes",
+        help="read-only: the Salad GPU classes the operator's profiles allow, with recorded data",
+    )
+    gpu.add_argument("--file", type=Path, required=True, help="absolute providers file")
+    gpu.add_argument("--state-dir", type=Path, help="control state dir (for recorded receipts)")
+    gpu.add_argument("--days", type=int, default=14, help="receipt window in days (1-90)")
+    gpu.add_argument("--format", choices=("json", "text"), default="json")
     for name in ("add", "update"):
         item = actions.add_parser(name)
         item.add_argument("--file", type=Path, required=True, help="absolute providers file")
@@ -54,11 +62,31 @@ def _entry(arguments: argparse.Namespace) -> dict:
     return value
 
 
+def _gpu_classes(arguments: argparse.Namespace, path: Path) -> int:
+    from . import salad_gpu_classes as gpu
+    from .store import _database_path
+
+    try:
+        database = None
+        if arguments.state_dir is not None:
+            database = _database_path(Path(arguments.state_dir))
+        listing = gpu.list_gpu_classes(
+            gpu.load_profiles_from_file(path), database, days=arguments.days
+        )
+    except gpu.GpuClassListingError as error:
+        print(json.dumps({"refused": str(error)[:500]}), file=sys.stderr)
+        return 2
+    print(gpu.render_text(listing) if arguments.format == "text" else json.dumps(listing, indent=2))
+    return 0
+
+
 def run(arguments: argparse.Namespace) -> int:
     path = Path(arguments.file)
     try:
         if not path.is_absolute():
             raise registration.RegistrationRefused("The providers file path must be absolute.")
+        if arguments.providers_action == "gpu-classes":
+            return _gpu_classes(arguments, path)
         if arguments.providers_action == "audit":
             print(json.dumps({"records": registration.read_audit(path)}, indent=2))
             return 0

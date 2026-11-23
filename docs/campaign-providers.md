@@ -349,6 +349,29 @@ entry's worker and what to merge into its trust entry; provider trust stays oper
 directory for API writes (otherwise they are refused; the offline command then edits the file).
 Profiles given through `--salad-campaign-profiles` are not editable here.
 
+### Listing the eligible Salad GPU classes
+
+Pick a class from the operator's own profiles instead of calling the provider by hand:
+
+```
+tessera providers gpu-classes --file /path/to/campaign-providers.json \
+    [--state-dir /path/to/state] [--days 14] [--format json|text]
+```
+
+The same read is `GET /admin/campaign-providers/salad-gpu-classes?days=N` (a person, or an agent
+with `provider_trust:read`, limited to its own organization's profiles) and the MCP tool
+`tessera_list_salad_gpu_classes` (registered with the `provider_trust:read` tools). Eligible means
+a GPU profile in the file's `salad_profiles` names the class; the provider's class catalog is read
+live at admission and is not copied locally. Per class the listing gives the id, the profiles that
+name it, the largest `max_run_cents`, the hourly rate the latest guardian record carried, and over
+a window of 1 to 90 days (default 14) the attempts with a guardian record, the pre-start re-binds
+and the attempts flagged `allocation_uncertain`. Names are never recorded locally and are `null`; a
+rate or count no receipt recorded is `null` with a `not_recorded` status, never zero. The receipt
+counts are read through a read-only database connection (without `--state-dir` the CLI reports
+`not_recorded`). A providers file or database that cannot be read fails closed with no listing. The
+output names profiles and class ids only, never credential references or custody hosts. It changes
+nothing and does not rank classes.
+
 ## Self-hosted provider
 
 1. Enroll a worker principal for the project that will run on the server (the same

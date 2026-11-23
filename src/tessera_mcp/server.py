@@ -1012,6 +1012,21 @@ def register_provider_trust_tools(server: FastMCP, client: ControlClient) -> Non
     @server.tool(
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
     )
+    async def tessera_list_salad_gpu_classes(days: int = 14) -> dict[str, Any]:
+        """List the Salad GPU classes the operator's profiles allow, with recorded data.
+
+        Read-only. Per class: its id, the profiles naming it, the largest per-run cap, the
+        last hourly rate a receipt recorded and recent allocation-instability counts (pre-start
+        re-binds, uncertain allocations) over a window of days (1-90). A name, price or count
+        that no receipt recorded is null with a not_recorded status, never a guess. Choose a
+        class by id from this list instead of calling the provider; it never lists a class the
+        profiles do not allow and changes nothing.
+        """
+        return await client.list_salad_gpu_classes(days)
+
+    @server.tool(
+        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+    )
     async def tessera_credential_health() -> dict[str, Any]:
         """Read the expiry state of each provider credential (metadata only, never a value).
 
