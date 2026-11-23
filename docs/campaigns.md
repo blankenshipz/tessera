@@ -700,7 +700,9 @@ report). The event holds only a short stable code, the step, the attempt number 
 message text, host, address, token or payload. The same attempt, step and code is not recorded again
 within 10 minutes, and a stage keeps at most 20 such events. Recording only records: the response and
 status are unchanged, and a recording failure never alters the refusal. A grant that belongs to no
-campaign attempt, or a worker that does not own the grant, records nothing.
+campaign attempt, or a worker that does not own the grant, records nothing. A worker that names
+another worker's grant (lease acquire) or lease (renewal, package, observation report) gets HTTP 404,
+the same response as for an id that does not exist, so the refusal does not reveal that it exists.
 `tessera_campaign_stage_status` shows it per stage as `rejections` (`latest`: attempt, step, code,
 `at`, `age_seconds`; and `counts` by code). Codes: `campaign_not_running`, `lease_already_held`,
 `worker_authority_expiring`, `stale_heartbeat`, `stale_epoch`, `lease_expired`,

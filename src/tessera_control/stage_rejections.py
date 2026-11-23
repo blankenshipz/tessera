@@ -131,7 +131,10 @@ def record(store: Any, worker: dict[str, Any], attempt_id: str, step: str, error
 
 
 def attempt_for(store: Any, worker: dict[str, Any], grant_id: str | None, lease_id: str | None):
-    """The campaign attempt id behind a grant or a lease of this worker, else None."""
+    """The campaign attempt id behind a grant or a lease of this worker, else None.
+
+    A lease counts only when this worker holds it, so a refusal on another worker's lease
+    (for example after its grant was reassigned) is never recorded against this attempt."""
     from .store import _connect
 
     connection = _connect(store.database_path)
@@ -140,8 +143,10 @@ def attempt_for(store: Any, worker: dict[str, Any], grant_id: str | None, lease_
             """SELECT a.id FROM campaign_stage_attempts a
             JOIN execution_grants g ON g.id = a.grant_id
             LEFT JOIN execution_leases l ON l.grant_id = g.id
-            WHERE g.worker_principal_id = ? AND (g.id = ? OR l.id = ?) LIMIT 1""",
-            (worker["id"], grant_id, lease_id),
+            WHERE g.worker_principal_id = ?
+              AND (g.id = ? OR (l.id = ? AND l.worker_principal_id = ?))
+            ORDER BY a.attempt DESC, a.created_at DESC, a.id DESC LIMIT 1""",
+            (worker["id"], grant_id, lease_id, worker["id"]),
         ).fetchone()
         return None if row is None else row["id"]
     finally:

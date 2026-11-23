@@ -144,15 +144,71 @@ def test_grant_without_a_campaign_attempt_writes_nothing(world):
     assert _events(env) == []
 
 
+def _other_worker(env):
+    from test_execution import _worker
+
+    return _worker(env.state, env.owner, env.project["id"], "other-worker-token")
+
+
+def _all_events(env):
+    return [tuple(r) for r in env.query("SELECT * FROM events ORDER BY cursor")]
+
+
 def test_worker_that_does_not_own_the_grant_writes_nothing(world):
-    env, _, client = world
-    other = env.query("SELECT id FROM principals WHERE id<>?", env.worker["id"])[0]["id"]
-    env.execute("UPDATE execution_grants SET worker_principal_id=?", other)
+    env, campaign, client = world
+    env.execute("UPDATE campaigns SET status='running' WHERE id=?", campaign["id"])
+    other = _other_worker(env)
+    env.execute("UPDATE execution_grants SET worker_principal_id=?", other["id"])
     with sqlite3.connect(env.state / "tessera.sqlite3") as db:
-        _lease(db, "grant_rej", other)
+        _lease(db, "grant_rej", other["id"])
+    before = _all_events(env)
+    missing = _post(client, "/worker/leases", {"grant_id": "grant_missing"}, key="k0")
     response = _post(client, "/worker/leases", {"grant_id": "grant_rej"})
-    assert response.status_code >= 400
+    # Identical to a grant that does not exist: the refusal never reveals the grant.
+    assert response.status_code == 404
+    assert (response.status_code, response.json()) == (missing.status_code, missing.json())
     assert _events(env) == []
+    assert _all_events(env) == before
+
+
+_FOREIGN_LEASE_STEPS = [
+    ("renew", "/worker/leases/renew", {"lease_id": "{lease}", "expected_epoch": 5}),
+    ("package", "/worker/leases/{lease}/package", {"expected_epoch": 5}),
+    (
+        "observe",
+        "/worker/observations",
+        {
+            "lease_id": "{lease}",
+            "expected_epoch": 5,
+            "observed_state": "running",
+            "observed_at": "2026-01-01T00:00:00Z",
+        },
+    ),
+]
+
+
+def _for_lease(path, body, lease):
+    return path.replace("{lease}", lease), {
+        k: (lease if v == "{lease}" else v) for k, v in body.items()
+    }
+
+
+@pytest.mark.parametrize(("step", "path", "body"), _FOREIGN_LEASE_STEPS)
+def test_lease_of_another_worker_is_not_found_and_writes_nothing(world, step, path, body):
+    env, campaign, client = world
+    env.execute("UPDATE campaigns SET status='running' WHERE id=?", campaign["id"])
+    other = _other_worker(env)
+    # The grant (and its campaign attempt) belong to the calling worker; only the lease
+    # belongs to another worker.
+    with sqlite3.connect(env.state / "tessera.sqlite3") as db:
+        _lease(db, "grant_rej", other["id"])
+    before = _all_events(env)
+    missing = _post(client, *_for_lease(path, body, "lease_missing"), key="k0")
+    response = _post(client, *_for_lease(path, body, "lease_rej"))
+    assert response.status_code == 404, response.text
+    assert (response.status_code, response.json()) == (missing.status_code, missing.json())
+    assert _events(env) == []
+    assert _all_events(env) == before
 
 
 @pytest.mark.parametrize(

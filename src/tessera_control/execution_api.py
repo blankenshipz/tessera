@@ -1,5 +1,6 @@
 """Typed control admission and separately authenticated worker authority routes."""
 
+from contextlib import contextmanager
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -92,18 +93,49 @@ def remote_workflows(request: Request) -> RemoteWorkflowStore:
 RemoteWorkflows = Annotated[RemoteWorkflowStore, Depends(remote_workflows)]
 
 
+def _owns_lease(store, worker, lease_id) -> bool:
+    """True when ``lease_id`` is a lease of this worker; any failure answers False."""
+    from .store import _connect
+
+    try:
+        connection = _connect(store.database_path)
+        try:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM execution_leases WHERE id = ? AND worker_principal_id = ?",
+                    (lease_id, worker["id"]),
+                ).fetchone()
+                is not None
+            )
+        finally:
+            connection.close()
+    except Exception:  # noqa: BLE001 - recording must never change the refusal
+        return False
+
+
+@contextmanager
 def _refusals(store, worker, step, *, grant_id=None, lease_id=None):
-    """Record a control refusal of a worker step on its stage (ADR-free, record-only)."""
+    """Record a control refusal of a worker step on its stage (ADR-free, record-only).
+
+    A lease of another worker records nothing, even when the lease's grant is this worker's:
+    its refusal is the same 404 as a lease that does not exist, and nothing is written.
+    """
     from .campaign_store import CampaignStore
     from .stage_rejections import recording
 
-    return recording(
-        CampaignStore(store.database_path.parent),
-        worker,
-        step,
-        grant_id=grant_id,
-        lease_id=lease_id,
-    )
+    try:
+        yield
+    except Exception:
+        if lease_id is not None and not _owns_lease(store, worker, lease_id):
+            raise
+        with recording(
+            CampaignStore(store.database_path.parent),
+            worker,
+            step,
+            grant_id=grant_id,
+            lease_id=lease_id,
+        ):
+            raise
 
 
 def result(value) -> JSONResponse:
@@ -444,6 +476,8 @@ def lifecycle_worker(
 def acquire_lease(
     body: AcquireExecutionLease, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
+    """Lease a grant of this worker. A grant of another worker answers 404, exactly as a
+    grant that does not exist, and records no stage rejection."""
     payload = body.model_dump(mode="json")
     with _refusals(store, worker, "lease", grant_id=body.grant_id):
         return result(
@@ -455,6 +489,8 @@ def acquire_lease(
 def renew_lease(
     body: RenewExecutionLease, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
+    """Renew a lease of this worker. A lease of another worker answers 404, exactly as a
+    lease that does not exist, and records no stage rejection."""
     payload = body.model_dump(mode="json")
     with _refusals(store, worker, "renew", lease_id=body.lease_id):
         return result(
@@ -468,6 +504,8 @@ def renew_lease(
 def report_observation(
     body: ReportExecutionObservation, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
+    """Report an observation on a lease of this worker. A lease of another worker answers
+    404, exactly as a lease that does not exist, and records no stage rejection."""
     payload = body.model_dump(mode="json")
     if payload.get("launch_error") is None:
         # Absent stays absent so an older client's replayed request keeps its digest.
@@ -567,6 +605,8 @@ def deliver_input_chunk(
 def execution_package(
     lease_id: str, body: PrepareExecutionPackage, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
+    """Package a lease of this worker. A lease of another worker answers 404, exactly as a
+    lease that does not exist, and records no stage rejection."""
     payload = body.model_dump(mode="json")
     with _refusals(store, worker, "package", lease_id=lease_id):
         return result(

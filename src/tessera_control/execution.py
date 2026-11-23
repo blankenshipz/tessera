@@ -1233,9 +1233,15 @@ class ExecutionStore(Store):
         grant_id: str,
         *,
         verify_retained: bool = True,
+        foreign_as_not_found: bool = False,
     ) -> sqlite3.Row:
         grant = self._grant(connection, worker, grant_id)
         if grant["worker_principal_id"] != worker["id"] or worker["kind"] != "worker":
+            if foreign_as_not_found:
+                # The grant id came from the request, not from a lease this worker holds:
+                # answer exactly as for a grant that does not exist, so a worker cannot
+                # learn that another worker's grant exists.
+                raise NotFound("Execution grant was not found.")
             raise Forbidden("Worker is not assigned to this execution grant.")
         from .workers import WorkerRegistryStore
 
@@ -1398,7 +1404,9 @@ class ExecutionStore(Store):
         def command(
             connection: sqlite3.Connection, worker: dict[str, Any]
         ) -> tuple[int, dict[str, Any]]:
-            grant = self._active_worker_grant(connection, worker, grant_id)
+            grant = self._active_worker_grant(
+                connection, worker, grant_id, foreign_as_not_found=True
+            )
             if connection.execute(
                 """SELECT 1 FROM campaign_stage_attempts a JOIN campaigns c
                 ON c.id = a.campaign_id WHERE a.grant_id = ? AND (c.status <> 'running'

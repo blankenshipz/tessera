@@ -432,6 +432,15 @@ def test_real_control_unregistered_worker_403_is_credential_class_not_permanent(
 
 def test_allowlisted_403_detail_is_exactly_what_real_control_returns(tmp_path):
     state, _, _, worker, grant = _unleased_delivery(tmp_path)
+    client = TestClient(create_app(state))
+    headers = {"Authorization": "Bearer worker-token"}
+    leased = client.post(
+        "/worker/leases",
+        json={"grant_id": grant["id"]},
+        headers=headers | {"Idempotency-Key": "l" * 8},
+    )
+    assert leased.status_code == 201, leased.text
+    lease = leased.json()
     with _connect(state / "tessera.sqlite3") as connection:
         other = connection.execute(
             "SELECT id FROM principals WHERE id != ? LIMIT 1", (grant["worker_principal_id"],)
@@ -439,14 +448,28 @@ def test_allowlisted_403_detail_is_exactly_what_real_control_returns(tmp_path):
         connection.execute(
             "UPDATE execution_grants SET worker_principal_id=? WHERE id=?", (other, grant["id"])
         )
-    client = TestClient(create_app(state))
+    # The worker still holds its lease, so the grant moving away is reported as authority gone.
     response = client.post(
-        "/worker/leases",
-        json={"grant_id": grant["id"]},
-        headers={"Authorization": "Bearer worker-token", "Idempotency-Key": "k" * 8},
+        "/worker/leases/renew",
+        json={"lease_id": lease["id"], "expected_epoch": lease["epoch"]},
+        headers=headers | {"Idempotency-Key": "k" * 8},
     )
     assert response.status_code == 403
     assert response.json()["detail"] == _GRANT_GONE and _GRANT_GONE in AUTHORITY_GONE_DETAILS
+    # Naming another worker's grant without a lease is answered exactly as a missing grant
+    # (404, also a permanent refusal for the worker), never revealing that the grant exists.
+    foreign = client.post(
+        "/worker/leases",
+        json={"grant_id": grant["id"]},
+        headers=headers | {"Idempotency-Key": "f" * 8},
+    )
+    missing = client.post(
+        "/worker/leases",
+        json={"grant_id": "grant_missing"},
+        headers=headers | {"Idempotency-Key": "m" * 8},
+    )
+    assert foreign.status_code == 404
+    assert foreign.json() == missing.json()
 
 
 def _forbidden(detail, *, raw=None):
