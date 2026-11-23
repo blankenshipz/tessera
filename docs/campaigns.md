@@ -703,6 +703,8 @@ status are unchanged, and a recording failure never alters the refusal. A grant 
 campaign attempt, or a worker that does not own the grant, records nothing. A worker that names
 another worker's grant (lease acquire) or lease (renewal, package, observation report) gets HTTP 404,
 the same response as for an id that does not exist, so the refusal does not reveal that it exists.
+Only those worker steps record: a refusal of any other worker route (an external-operation
+receipt, an output upload, a heartbeat) is not recorded.
 `tessera_campaign_stage_status` shows it per stage as `rejections` (`latest`: attempt, step, code,
 `at`, `age_seconds`; and `counts` by code). Codes: `campaign_not_running`, `lease_already_held`,
 `worker_authority_expiring`, `stale_heartbeat`, `stale_epoch`, `lease_expired`,

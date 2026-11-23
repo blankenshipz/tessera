@@ -5,8 +5,11 @@ Fakes only: nothing here builds an image, reads an auth file's content or touche
 
 from __future__ import annotations
 
+import builtins
+import io
 import json
 import os
+import pathlib
 
 import pytest
 
@@ -127,10 +130,6 @@ def _service(tmp_path, credential, auth):
 
 
 def test_a_private_auth_file_is_accepted_and_never_read(tmp_path, paths, monkeypatch):
-    import builtins
-    import io
-    import pathlib
-
     credential, auth = paths
     opened = []
     auth_fds = set()
@@ -431,3 +430,32 @@ def test_a_recovered_runtime_gets_the_same_validated_auth_file(tmp_path, paths, 
     with pytest.raises(DevelopmentWorkerError, match="private regular file"):
         DevelopmentWorkerService(config, channel=fresh_channel, adapter=adapter)
     assert seen == []
+
+
+def test_the_recovery_runtime_gets_the_auth_file_and_repositories_before_any_lease(
+    tmp_path, paths, monkeypatch
+):
+    import tessera_worker.service as service_module
+
+    credential, auth = paths
+    captured = []
+
+    class Stop(Exception):
+        pass
+
+    class Runtime:
+        def __init__(self, *args, **kwargs):
+            captured.append(kwargs)
+            raise Stop
+
+    monkeypatch.setattr(service_module, "DevelopmentCpuRuntime", Runtime)
+    service = _service(tmp_path, credential, auth)
+    service._recovery_identity = lambda runtime_dir: ("lease-1", 1, "worker-1")
+    service._heartbeat = lambda: pytest.fail("recovery must not heartbeat or lease first")
+    service._watch = type("W", (), {"post": lambda *a, **k: pytest.fail("no lease request")})()
+    service.adapter = object()
+    with pytest.raises(Stop):
+        service.run()
+    assert captured[0]["registry_auth_file"] == auth
+    assert captured[0]["build_repositories"] == REPOSITORIES
+    assert captured[0]["worker_id"] == "worker-1"

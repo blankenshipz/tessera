@@ -57,6 +57,13 @@ holds anything but pinned public bytes, or a path that carries bytes to the cont
    reclaimed. Before this, a container killed mid-copy (preemption, a deadline kill) left its
    `.<sha>.part`; every later store of that digest then failed with EEXIST, so the digest was never
    cached again, and the leftover bytes were outside the quota.
+   Residual race: the reclaimer compares the inode it locked with its earlier `lstat`, then removes
+   the part file by name. If the original writer finishes (renames and closes) after the reclaimer
+   opened the file but before it locked it, and a second writer then creates a fresh part file at
+   the same name, the reclaimer removes the new one. That needs a part file older than 60 seconds,
+   a writer finishing in that window and a second store of a digest that was just cached. The
+   cost is only a missed cache entry for that digest (the next store retries); it is not closed
+   and no test covers it.
 
 ## Consequences
 

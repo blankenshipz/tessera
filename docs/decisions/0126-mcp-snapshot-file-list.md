@@ -3,6 +3,9 @@
 Status: accepted. Addendum to ADR 0055 (MCP steering tools) and to the agent-reads work that
 added `tessera_list_snapshots` and the other metadata reads. No schema change.
 
+Numbering note: ADR numbers 0122 to 0125 are held by other work still in flight, so this record
+is numbered 0126.
+
 ## Context
 
 An agent holding `snapshot:read` could list a project's snapshots and see each one's id, digest,

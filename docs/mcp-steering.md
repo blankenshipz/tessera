@@ -71,7 +71,8 @@ Then the agent, over MCP only:
 7. A stage is not progressing: read `tessera_campaign_stage_status` before cancelling or steering
    placement, instead of reading service logs. It gives codes, ages and counts only (what the stage
    waited on, the latest attempt's phase and failure class, executor lease and heartbeat age with a
-   stale flag, and the latest control refusal of a worker step, from any provider, as a short code with counts).
+   stale flag, and the latest control refusal of a worker step, from any provider, as a short code with counts; only lease
+   acquire, renewal, package and observation refusals are recorded, not other worker routes).
 
 ## Smoke test on a running Tessera ($0, dry run by default)
 

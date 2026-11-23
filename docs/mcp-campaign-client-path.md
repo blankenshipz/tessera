@@ -98,7 +98,7 @@ sha256 with `tessera_campaign_outputs`.
   (paused, concurrency, exposure, limits, slot, release, placement), the latest attempt (phase,
   failure class, grant and spend-limit state, executor lease held or expired and its age, executor
   heartbeat age with a stale flag at the 60 s worker heartbeat maximum age) and failure counts by
-  class, and `rejections` (the latest control refusal of a worker step, from any provider: attempt, step, code, time
+  class, and `rejections` (the latest control refusal of a worker step, from any provider, for lease acquire, renewal, package and observation only: attempt, step, code, time
   and age, plus counts by code; see the Salad executor in [campaigns](campaigns.md)). Codes, ages and counts only: no failure detail or log text, no principal, credential or
   worker ids, no hosts or addresses; a free-text waiting reason is returned as `detail_withheld`.
   A caller in another organization gets the same 404 as for a missing campaign.
