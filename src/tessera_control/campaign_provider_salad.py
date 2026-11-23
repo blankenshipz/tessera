@@ -32,7 +32,7 @@ from .campaign_providers import (
     Settlement,
     get_provider,
     register_provider,
-    unregister_provider,
+    replace_provider,
 )
 from .campaign_salad import (
     SaladStageDriver,
@@ -624,11 +624,8 @@ def register_provider_instance(
     guardian_reader: Any = None,
 ) -> ComputeProvider:
     """Register (or replace, when this module registered it before) the ``salad`` provider."""
-    if _REGISTERED:
-        unregister_provider(PROVIDER_ID)
-    instance = register_provider(
-        SaladRouteProvider(profiles, credential_directory, guardian_reader)
-    )
+    candidate = SaladRouteProvider(profiles, credential_directory, guardian_reader)
+    instance = replace_provider(candidate) if _REGISTERED else register_provider(candidate)
     if not _REGISTERED:
         _REGISTERED.append(True)
     return instance

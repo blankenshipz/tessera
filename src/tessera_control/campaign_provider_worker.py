@@ -40,6 +40,7 @@ from .campaign_providers import (
     get_provider,
     register_provider,
     replace_provider,
+    validate_provider,
 )
 from .campaign_steps import StepFailed
 from .data_class import PUBLIC
@@ -614,34 +615,43 @@ def register_from_config(config: dict | None) -> None:
         else:
             if item.id not in _REGISTERED:
                 raise ValueError(f"Provider id {item.id!r} is already registered")
-    _replace(
-        LOCAL_DOCKER_PROVIDER,
-        WorkerGrantProvider(
-            _descriptor(
-                LOCAL_DOCKER_PROVIDER,
-                principal,
-                None,
-                local_slots,
-                local_scratch,
-                build_repositories=local_builds,
-            )
-        ),
-    )
-    for item in parsed.self_hosted:
-        _replace(
-            item.id,
+    # Build and check every instance before replacing any, so one bad entry changes nothing.
+    instances = [
+        (
+            LOCAL_DOCKER_PROVIDER,
             WorkerGrantProvider(
                 _descriptor(
-                    item.id,
-                    item.worker_principal_id,
-                    item.output_limits,
-                    item.worker_slots,
-                    item.max_scratch_bytes,
-                    frozenset(item.runtimes),
-                    tuple(item.build_repositories),
+                    LOCAL_DOCKER_PROVIDER,
+                    principal,
+                    None,
+                    local_slots,
+                    local_scratch,
+                    build_repositories=local_builds,
                 )
             ),
         )
+    ]
+    for item in parsed.self_hosted:
+        instances.append(
+            (
+                item.id,
+                WorkerGrantProvider(
+                    _descriptor(
+                        item.id,
+                        item.worker_principal_id,
+                        item.output_limits,
+                        item.worker_slots,
+                        item.max_scratch_bytes,
+                        frozenset(item.runtimes),
+                        tuple(item.build_repositories),
+                    )
+                ),
+            )
+        )
+    for _, instance in instances:
+        validate_provider(instance)
+    for provider_id, instance in instances:
+        _replace(provider_id, instance)
 
 
 try:
