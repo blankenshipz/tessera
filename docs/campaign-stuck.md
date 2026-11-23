@@ -76,8 +76,17 @@ registered only when the credential's live scopes allow them.
 `tessera_agent.stuck_work_source.StuckWorkSource` offers a project's open findings to the standing
 agent loop as candidate work, with the id `<finding id>:<occurrences>`. It only reads. Whether the
 loop does anything is decided by its own policy (tier, identity, budget, kill switch); acknowledged
-findings are not offered. It is available and tested but not yet wired into a running loop (the
-standing loop has no entry point yet).
+findings are not offered.
+
+## Offering findings to the agent loop
+
+`tessera-stuck-loop` ([ADR 0132](decisions/0132-stuck-loop-runner.md)) runs the standing loop on
+this source. It is disabled by default: the policy file must set `enabled`, the example unit needs
+an admission marker and starts by hand, and a kill-switch marker pauses it. It makes no model
+call and, for each open finding, appends a `stuck_offered` receipt to a 0600 journal. With
+`ack_on_offer` true (default false) it also acknowledges the finding. The credential needs
+`campaign:read`, plus `campaign:cancel` only for acknowledgement. It never resumes, cancels,
+approves, submits or changes settings; a person still acts. See `deploy/systemd/README.md`.
 
 ## Limits
 

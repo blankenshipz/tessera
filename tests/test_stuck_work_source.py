@@ -149,3 +149,24 @@ def test_the_standing_loop_starts_one_item_and_does_not_repeat_it(tmp_path):
     assert started[0]["kind"] == KIND and started[0]["code"] == "campaign_blocked"
     again = loop.tick()  # the same finding is finished work for the loop, not repeated
     assert again["started"] is None and len(started) == 1
+
+
+def test_every_code_the_detector_can_raise_is_offered_to_the_loop():
+    from tessera_agent.stuck_work_source import CODES
+    from tessera_control import campaign_stuck
+
+    # A code the detector raises but the source does not know is silently dropped: pin them equal.
+    assert set(campaign_stuck.CODES) == set(CODES)
+
+
+@pytest.mark.parametrize("code", ["heavy_stage_on_local", "heavy_stage_refused_local"])
+def test_heavy_stage_placement_findings_are_offered(code):
+    from tessera_control import campaign_stuck
+
+    action = campaign_stuck.CODES[code]
+    src, _ = source(
+        {"project_id": "project_1", "findings": [finding(7, code=code, suggested_action=action)]}
+    )
+    [item] = src.observe()
+    assert item["code"] == code
+    assert item["suggested_action"] == action

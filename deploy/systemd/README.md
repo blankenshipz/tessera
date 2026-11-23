@@ -12,6 +12,7 @@ generic placeholder: `/etc/tessera` (configuration), `/var/lib/tessera` (state),
 | `tessera-salad-guardian.service` | `python -m tessera_control.salad_safety_service --run` |
 | `tessera-submit-runner.service` | `tessera-submit-runner`: submits owner-approved campaign records on a schedule (in the target, started only on an admitted host) |
 | `tessera-reasoning.service` | not here: it lives in `deploy/remote-agent-platform/` (manual start only, admission marker required, no `[Install]`) |
+| `tessera-stuck-loop.service` | `tessera-stuck-loop`: offers stuck-campaign findings to a standing loop, read-only (disabled by default, manual start, not in the target) |
 | `tessera.target` | groups the four services |
 | `tessera-health-check@.service` + `tessera-health-check-*.timer` | optional freshness probes |
 
@@ -130,3 +131,39 @@ the watcher (it fails closed). Remove both flags from `ExecStart` to disable it.
 `unknown` until control is started with `tessera serve --salad-credential-directory DIR`
 (the absolute, owner-only directory that holds the Salad management credentials; it
 reads their metadata, never the secret). Add the flag to the `serve` command you run.
+
+## Stuck-loop runner (manual start)
+
+`tessera-stuck-loop.service` runs a standing agent loop whose only work source
+is the stuck-campaign findings
+([ADR 0132](../../docs/decisions/0132-stuck-loop-runner.md)). It runs no model
+and only reads: it offers at most one new open finding per tick and appends a
+`stuck_offered` receipt for it to its journal (with `tick`, `backoff`, `halted`
+and `runner_*` lines). Options: `--policy`, `--journal`, `--ledger`,
+`--kill-switch` (required; without it the program exits 2), `--interval-seconds`,
+`--once` and `--max-ticks`. It never resumes, cancels, approves, submits or changes settings.
+It is not part of `tessera.target` and has no `[Install]` section, so
+`systemctl enable` does nothing for it. Three gates keep it disabled by
+default:
+
+- Policy: `/etc/tessera/stuck-loop.json` (owner-only, strict JSON) must set
+  `"enabled": true`; otherwise the program prints `disabled` and exits 0.
+- Admission: it starts only if the marker `/etc/tessera/stuck-loop.admitted`
+  exists (`ConditionPathExists=`).
+- Kill switch: while `/etc/tessera/stuck-loop.kill` exists (or its state is
+  ambiguous, for example `/etc/tessera` is missing) it pauses and offers
+  nothing.
+
+The credential file (`/etc/tessera/credentials/stuck-loop-agent-token`, passed
+with `LoadCredential=`) must be enrolled with `campaign:read` only, plus
+`campaign:cancel` only when the policy sets `ack_on_offer` to true (the
+acknowledgement endpoint uses that scope; `ack_on_offer` defaults to false).
+The program refuses to start if `ANTHROPIC_API_KEY` is set (exit 2); exit 3
+means halted after repeated failures, and the unit restarts on neither. It
+writes only `/var/lib/tessera/stuck-loop` (journal and ledger).
+
+Admit and start: write the policy, `touch /etc/tessera/stuck-loop.admitted`,
+then `systemctl start tessera-stuck-loop.service`. Pause at once:
+`touch /etc/tessera/stuck-loop.kill`; remove it to resume. Withdraw: stop the
+service and remove the admission marker. Raising a cap or approval stays a
+human edit of the policy.

@@ -25,6 +25,9 @@ CODES = frozenset(
         "stale_execution_lease",
         "runner_lease_stale",
         "no_progress",
+        # ADR 0107: the heavy-stage placement guard's findings.
+        "heavy_stage_on_local",
+        "heavy_stage_refused_local",
     }
 )
 KIND = "campaign_stuck"

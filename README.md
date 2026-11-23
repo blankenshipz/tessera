@@ -129,7 +129,7 @@ flowchart LR
 
 Proposal/review records and the opt-in [direct Agent Sandbox adapter](docs/agent-sandbox.md)
 have isolated component tests. The adapter targets upstream **v1.0.6** one-shot,
-network-none Sandboxes (an opt-in allowlist egress-proxy profile exists, see ADR 0034); it does not replace batch Jobs. No live CRD/controller or
+network-none Sandboxes (an opt-in, off-by-default allowlist egress-proxy profile, [ADR 0034](docs/decisions/0034-governed-sandbox-egress-and-dataset-staging.md), is implemented for local Docker (phase 1) and, as a narrow exception, for the Agent Sandbox (phase 2), with default tests only and no live network or cluster run; Salad input delivery (phase 3) is design only); it does not replace batch Jobs. No live CRD/controller or
 Sandbox runtime acceptance is claimed. Warm pools, read-only source integration,
 input/reasoning credential delivery and a complete agent reasoning/critique loop
 are not available in this demonstrated journey. A service credential such as a model API key is installed as root-owned systemd credential files read from standard input (never an argument or environment variable), with a receipt that records only the reference and a fingerprint; the service's existing start-up checks admit or refuse it ([service credentials](docs/service-credentials.md), [ADR 0093](docs/decisions/0093-service-credential-install.md)).
@@ -415,8 +415,10 @@ no change past a configurable age) with a reason code, a suggested next action a
 shows them through `tessera_mcp` and to the standing agent loop as candidate work. The detector
 only records: it never cancels, resumes, resolves or retries anything, and a person or existing
 policy still decides ([ADR 0091](docs/decisions/0091-campaign-stuck-detector.md); the agent-loop
-work source is available and tested but not yet wired into a running loop; nothing here has run
-against a live deployment).
+work source is run by `tessera-stuck-loop`, a runner that is disabled by default and started by hand;
+it only reads findings and records a `stuck_offered` receipt for each, and a person still acts;
+[ADR 0132](docs/decisions/0132-stuck-loop-runner.md); nothing here has run against a live
+deployment).
 
 ## Quickstart
 
@@ -495,9 +497,12 @@ Console scripts installed by the package, one line each:
   `connection-tunnel`, plus lab setup commands (`minikube-provision`, `astra-*`).
   `tessera retention plan|apply|verify` prunes old backups and unreferenced artifacts by an
   operator policy: a dry run first, never the last restorable backup or anything a live
-  campaign, lineage or hold references, every deletion on a receipt (ADR 0089, `docs/recovery.md`).
+  campaign, lineage or hold references, every deletion on a receipt ([ADR 0094](docs/decisions/0094-storage-retention-policy.md), [recovery](docs/recovery.md)).
   `tessera db compact` reclaims free space in the control database while the service is
   stopped, keeping the previous database as a restorable backup ([recovery](docs/recovery.md)).
+  `tessera deploy-check` reports what a deploy still needs and applies the safe fixes with a receipt
+  ([deploy check](docs/deploy-check.md)); `tessera deploy-upgrade` runs the whole upgrade as one
+  dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)).
 - `tessera-worker` / `tessera-worker-daemon`: worker CLI (`development-poll`) and its
   supervised daemon.
   An optional stage watcher library (disabled by default; opt-in per run with `--stage-watcher` plus a kill-switch path, and the default worker is unchanged without it; an executor option covers Salad runs) observes and reports and never acts: it cannot stop, cancel, retry, resize or re-route anything. It may also file closed retry and resize *requests* that control records as advisory events and nobody admits ([ADR 0111](docs/decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md)). It is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.
@@ -512,6 +517,19 @@ Console scripts installed by the package, one line each:
   optional: OpenAI included ChatGPT OAuth through the OpenCode V2 harness,
   [ADR 0082](docs/decisions/0082-agent-loop-anthropic-destination.md)).
 - `tessera-a2a-peer`: A2A peer (frozen).
+- `tessera-reasoning-readiness`: read-only check that everything a first receipted reasoning call
+  needs is in place except the key value ([first-call readiness](docs/first-call-readiness.md),
+  [ADR 0109](docs/decisions/0109-reasoning-first-call-readiness.md)).
+- `tessera-review`: `submit` requests an advisory code review job for a branch of an
+  operator-mapped repository ([ADR 0108](docs/decisions/0108-code-review-submit.md),
+  [review jobs](docs/mcp-review-jobs.md)).
+- `tessera-submit-runner`: optional scheduled runner that turns approved, pending submission records
+  into campaigns; it never approves or widens anything
+  ([ADR 0093](docs/decisions/0093-agent-loop-submits-owner-approved-campaigns.md)).
+- `tessera-service-credential`: installs a service credential (such as a model API key) from standard
+  input as root-owned systemd credential files with a receipt that holds only a reference and a
+  fingerprint ([service credentials](docs/service-credentials.md),
+  [ADR 0093](docs/decisions/0093-service-credential-install.md)).
 
 ## Architecture
 
