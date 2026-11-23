@@ -88,6 +88,7 @@ def test_tools_are_opt_in_and_approval_is_not_exposed(tmp_path):
         "tessera_campaign_outputs",
         "tessera_campaign_logs",
         "tessera_campaign_stage_watch",
+        "tessera_campaign_stage_status",
         "tessera_campaign_budget",
         "tessera_campaign_retries",
         "tessera_campaign_standing_status",

@@ -230,6 +230,7 @@ class ControlPort(Protocol):
     def record_package(self, attempt_id: str, payload: dict[str, Any]) -> None: ...
     def operation(self, operation_id: str) -> dict[str, Any] | None: ...
     def heartbeat(self) -> None: ...
+    def record_rejection(self, attempt_id: str, step: str, error: BaseException) -> None: ...
     def renew(self, lease_id: str, epoch: int) -> None: ...
     def route(self, route_id: str) -> dict[str, Any]: ...
     def mark_executing(self, attempt_id: str) -> None: ...
@@ -336,6 +337,7 @@ class SaladCampaignExecutor:
         self._leases: dict[str, tuple[str, int]] = {}
         # Attempts whose lease renewal was refused: never retried past the fence.
         self.fenced: dict[str, str] = {}
+        self._step = "grant_poll"  # the control call in flight, named on a recorded refusal
         # Whether this pass already sent its pre-lease registry heartbeat.
         self._heartbeat_sent = False
         self.log: list[dict[str, Any]] = []
@@ -354,21 +356,37 @@ class SaladCampaignExecutor:
         for item in items:
             attempt = item["attempt_id"]
             try:
+                self._step = "grant_poll"
                 if item["phase"] == "awaiting_lease":
                     if pending is None:
                         pending = self.control.pending_grants()
                     self._lease_and_package(item, pending)
                 elif item["phase"] == "route_started":
+                    self._step = "renew"
                     self._keepalive(item)
+                    self._step = "execute"
                     self._execute(item)
                 elif item["phase"] == "executing":
+                    self._step = "execute"
                     self._resume(item)
                 elif item["phase"] in LEASE_HELD_PHASES:
+                    self._step = "renew"
                     self._keepalive(item)
             except Exception as error:
                 # Class name only: messages can carry identifiers from provider paths.
                 self._note("error", attempt, type(error).__name__)
+                self._record_rejection(attempt, error)
         return self.log[start:]
+
+    def _record_rejection(self, attempt_id: str, error: BaseException) -> None:
+        """Make a control refusal visible on the stage (a short code); never alters the pass."""
+        record = getattr(self.control, "record_rejection", None)
+        if record is None:
+            return
+        try:
+            record(attempt_id, self._step, error)
+        except Exception as failure:  # noqa: BLE001 - recording must not break the pass
+            self._note("rejection_unrecorded", attempt_id, type(failure).__name__)
 
     def _note(self, action: str, attempt_id: str | None, detail: str = "") -> None:
         self.log.append({"action": action, "attempt_id": attempt_id, "detail": detail})
@@ -393,14 +411,17 @@ class SaladCampaignExecutor:
             self._note("refused_budget", attempt, "plan_budget_above_profile")
             return
         if attempt not in self._leases:
+            self._step = "lease"
             self._heartbeat_before_lease(attempt)
             lease = self.control.acquire_lease(grant, _key("lease", attempt))
             self._leases[attempt] = (lease["id"], lease["epoch"])
         lease_id, epoch = self._leases[attempt]
+        self._step = "package"
         response = self.control.package(
             lease_id, epoch, item["admitted_attempt_id"], _key("package", attempt)
         )
         package = response["package"]
+        self._step = "record_package"
         self.control.record_package(
             attempt,
             dict(
@@ -820,6 +841,11 @@ class StoreControl:
         self.registry.heartbeat(
             self.worker, "salad-exec-worker-" + uuid.uuid4().hex, canonical_digest({}), {}
         )
+
+    def record_rejection(self, attempt_id, step, error):
+        from .stage_rejections import record
+
+        record(self.campaigns, self.worker, attempt_id, step, error)
 
     def renew(self, lease_id, epoch):
         import uuid

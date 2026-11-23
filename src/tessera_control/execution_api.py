@@ -92,6 +92,20 @@ def remote_workflows(request: Request) -> RemoteWorkflowStore:
 RemoteWorkflows = Annotated[RemoteWorkflowStore, Depends(remote_workflows)]
 
 
+def _refusals(store, worker, step, *, grant_id=None, lease_id=None):
+    """Record a control refusal of a worker step on its stage (ADR-free, record-only)."""
+    from .campaign_store import CampaignStore
+    from .stage_rejections import recording
+
+    return recording(
+        CampaignStore(store.database_path.parent),
+        worker,
+        step,
+        grant_id=grant_id,
+        lease_id=lease_id,
+    )
+
+
 def result(value) -> JSONResponse:
     status, body = value
     return JSONResponse(status_code=status, content=body)
@@ -431,9 +445,10 @@ def acquire_lease(
     body: AcquireExecutionLease, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
-    return result(
-        store.acquire_execution_lease(worker, body.grant_id, key, canonical_digest(payload))
-    )
+    with _refusals(store, worker, "lease", grant_id=body.grant_id):
+        return result(
+            store.acquire_execution_lease(worker, body.grant_id, key, canonical_digest(payload))
+        )
 
 
 @router.post("/worker/leases/renew")
@@ -441,11 +456,12 @@ def renew_lease(
     body: RenewExecutionLease, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
-    return result(
-        store.renew_execution_lease(
-            worker, body.lease_id, key, canonical_digest(payload), body.expected_epoch
+    with _refusals(store, worker, "renew", lease_id=body.lease_id):
+        return result(
+            store.renew_execution_lease(
+                worker, body.lease_id, key, canonical_digest(payload), body.expected_epoch
+            )
         )
-    )
 
 
 @router.post("/worker/observations")
@@ -458,11 +474,12 @@ def report_observation(
         payload.pop("launch_error", None)
     if payload.get("exit_code") is None:
         payload.pop("exit_code", None)
-    return result(
-        store.report_execution_observation(
-            worker, body.lease_id, key, canonical_digest(payload), payload
+    with _refusals(store, worker, "observe", lease_id=body.lease_id):
+        return result(
+            store.report_execution_observation(
+                worker, body.lease_id, key, canonical_digest(payload), payload
+            )
         )
-    )
 
 
 @router.post("/worker/external-operations/{operation_id}/receipt")
@@ -551,20 +568,21 @@ def execution_package(
     lease_id: str, body: PrepareExecutionPackage, worker: Worker, key: Key, store: Authority
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
-    return result(
-        RuntimePackageStore(store.database_path.parent).execution_package(
-            worker,
-            lease_id,
-            key,
-            canonical_digest(payload),
-            body.expected_epoch,
-            body.persistent_output_collection is True,
-            body.persistent_output_storage,
-            body.admitted_attempt_id,
-            body.restart_intent is True,
-            body.execution_adapter,
+    with _refusals(store, worker, "package", lease_id=lease_id):
+        return result(
+            RuntimePackageStore(store.database_path.parent).execution_package(
+                worker,
+                lease_id,
+                key,
+                canonical_digest(payload),
+                body.expected_epoch,
+                body.persistent_output_collection is True,
+                body.persistent_output_storage,
+                body.admitted_attempt_id,
+                body.restart_intent is True,
+                body.execution_adapter,
+            )
         )
-    )
 
 
 @router.post("/snapshots/{snapshot_id}/releases")

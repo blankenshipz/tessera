@@ -23,6 +23,7 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_campaign_outputs` | `GET /campaigns/{id}/outputs` | `artifact:read` |
 | `tessera_campaign_logs` | `GET /campaigns/{id}/logs` | `campaign:logs` |
 | `tessera_campaign_stage_watch` | `GET /campaigns/{id}/stage-watch` | `campaign:logs` |
+| `tessera_campaign_stage_status` | `GET /campaigns/{id}/stage-status` | `campaign:logs` |
 | `tessera_campaign_budget` | `GET /campaigns/{id}/budget` | `budget:read` |
 | `tessera_project_spend` | `GET /projects/{id}/agent-spend` | `budget:read` |
 | `tessera_campaign_retries` | `GET /campaigns/{id}/retries` | `campaign:read` |
@@ -92,6 +93,15 @@ sha256 with `tessera_campaign_outputs`.
 - `tessera_campaign_outputs` lists recorded output metadata only (name, sha256, size, class).
 - `tessera_campaign_logs` returns stage status and attempt diagnostics (status, exit code,
   failure class, bounded detail). Tessera retains no raw stdout/stderr.
+- `tessera_campaign_stage_status` (read-only) returns, per stage, the chosen provider and profile,
+  the recorded placement (candidates and skip reason codes), what the stage waited on with counts
+  (paused, concurrency, exposure, limits, slot, release, placement), the latest attempt (phase,
+  failure class, grant and spend-limit state, executor lease held or expired and its age, executor
+  heartbeat age with a stale flag at the 60 s worker heartbeat maximum age) and failure counts by
+  class, and `rejections` (the latest control refusal of a worker step, from any provider: attempt, step, code, time
+  and age, plus counts by code; see the Salad executor in [campaigns](campaigns.md)). Codes, ages and counts only: no failure detail or log text, no principal, credential or
+  worker ids, no hosts or addresses; a free-text waiting reason is returned as `detail_withheld`.
+  A caller in another organization gets the same 404 as for a missing campaign.
 - `budget:read` also unlocks the HTTP budget read of any campaign in the credential's
   project, for credentials enrolled for results roll-ups as well; MCP registration gating
   does not limit direct HTTP. The figures are the campaign ledger (cap, held, settled,

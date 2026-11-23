@@ -644,6 +644,24 @@ termination without reallocation, and records its outcome. A route directory und
 directory marks a route as attempted: it is never run twice. The executor never approves,
 starts a route, resolves a decision, records a charge or reconciles a grant.
 
+When the control service refuses a worker step, it records one `campaign.stage_rejection` event on
+the attempt's stage. This is provider-generic: the worker-facing control routes that every
+provider's worker uses (lease acquire, lease renewal, lease package and observation report) record
+through one shared helper, `stage_rejections.recording`, so a new provider or worker gets it without
+a change to the runner core. The Salad executor's steps are covered the same way (grant poll, lease,
+lease package, record package, renewal, execute, mark executing), as is `observe` (observation
+report). The event holds only a short stable code, the step, the attempt number and the time: no
+message text, host, address, token or payload. The same attempt, step and code is not recorded again
+within 10 minutes, and a stage keeps at most 20 such events. Recording only records: the response and
+status are unchanged, and a recording failure never alters the refusal. A grant that belongs to no
+campaign attempt, or a worker that does not own the grant, records nothing.
+`tessera_campaign_stage_status` shows it per stage as `rejections` (`latest`: attempt, step, code,
+`at`, `age_seconds`; and `counts` by code). Codes: `campaign_not_running`, `lease_already_held`,
+`worker_authority_expiring`, `stale_heartbeat`, `stale_epoch`, `lease_expired`,
+`capability_required`, `worker_unauthorized`, `refused_conflict`, `refused_forbidden`,
+`refused_not_found`, `refused`, and `unexpected_error` (anything that is not a store refusal; only
+the fact is recorded, never the text).
+
 After the live check and the exit report the executor reads the final guardian status
 through the existing read-only `SaladSafetyHTTPSClient.status`, projects only the recorded
 keys and passes them with the outcome; an unreadable status records `null` and the runner

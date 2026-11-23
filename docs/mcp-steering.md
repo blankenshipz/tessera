@@ -47,6 +47,7 @@ Then the agent, over MCP only:
    progress, stuck and failed reports, a page of reports and never-admitted retry or resize
    requests. They are unverified worker claims, with closed codes and integer counters only (no
    paths or worker text); they never decide cost or success.
+   `tessera_campaign_stage_status`, `tessera_campaign_grants` and `tessera_campaign_budget`.
 4. When the campaign finishes read `tessera_get_campaign_receipt` and
    `tessera_campaign_outputs`. A gate (standing approval with an unlock requirement) reads that
    receipt: `tessera_campaign_standing_status` shows the refusal reason while it holds
@@ -67,6 +68,10 @@ Then the agent, over MCP only:
    `steering` section. Each of these leaves an event (`campaign.budget_reduced`, `campaign.paused`, `campaign.resumed`,
    `campaign.concurrency_limited`, `campaign.stage_cancel_requested`, `campaign.cancel_requested`,
    `workspace.snapshot_release_revoked`) and the cancel ends in a terminal receipt.
+7. A stage is not progressing: read `tessera_campaign_stage_status` before cancelling or steering
+   placement, instead of reading service logs. It gives codes, ages and counts only (what the stage
+   waited on, the latest attempt's phase and failure class, executor lease and heartbeat age with a
+   stale flag, and the latest control refusal of a worker step, from any provider, as a short code with counts).
 
 ## Smoke test on a running Tessera ($0, dry run by default)
 

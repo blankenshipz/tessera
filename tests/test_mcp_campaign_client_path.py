@@ -109,6 +109,7 @@ def test_read_tools_hit_expected_routes(tmp_path):
     _call(server, "tessera_campaign_logs", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_stage_watch", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_stage_watch", {"campaign_id": "c1", "offset": 2, "limit": 5})
+    _call(server, "tessera_campaign_stage_status", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_budget", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_retries", {"campaign_id": "c1"})
     _call(server, "tessera_campaign_standing_status", {})
@@ -124,6 +125,7 @@ def test_read_tools_hit_expected_routes(tmp_path):
         ("GET", "/campaigns/c1/logs", ""),
         ("GET", "/campaigns/c1/stage-watch", "offset=0&limit=20"),
         ("GET", "/campaigns/c1/stage-watch", "offset=2&limit=5"),
+        ("GET", "/campaigns/c1/stage-status", ""),
         ("GET", "/campaigns/c1/budget", ""),
         ("GET", "/campaigns/c1/retries", ""),
         ("GET", "/projects/proj1/agent-standing-status", ""),
@@ -178,6 +180,7 @@ def test_tools_register_only_for_enrolled_scopes(tmp_path):
         "tessera_campaign_outputs",
         "tessera_campaign_logs",
         "tessera_campaign_stage_watch",
+        "tessera_campaign_stage_status",
         "tessera_campaign_grants",
         "tessera_campaign_budget",
     }
@@ -193,8 +196,10 @@ def test_mutating_annotations_and_catalog_isolation(tmp_path):
         "tessera_campaign_logs",
         "tessera_campaign_stage_watch",
         "tessera_get_snapshot",
+        "tessera_campaign_stage_status",
     ):
         assert tools[name].annotations.readOnlyHint is True
+        assert tools[name].annotations.destructiveHint is False
     # None of the optional tools may leak into the frozen harness catalog.
     assert not {n for n in tools if "campaign" in n or "snapshot" in n} & set(PERMITTED_TOOLS)
     # budget:read alone (a results-only credential) never switches campaign tools on.

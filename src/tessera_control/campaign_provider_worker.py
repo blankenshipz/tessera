@@ -39,7 +39,7 @@ from .campaign_providers import (
     Settlement,
     get_provider,
     register_provider,
-    unregister_provider,
+    replace_provider,
 )
 from .campaign_steps import StepFailed
 from .data_class import PUBLIC
@@ -578,8 +578,9 @@ _REGISTERED: set[str] = set()
 
 def _replace(provider_id: str, instance: WorkerGrantProvider) -> None:
     if provider_id in _REGISTERED:
-        unregister_provider(provider_id)
-    register_provider(instance)
+        replace_provider(instance)
+    else:
+        register_provider(instance)
     _REGISTERED.add(provider_id)
 
 

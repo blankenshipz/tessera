@@ -349,7 +349,15 @@ class ControlClient:
         )
 
     async def campaign_view(self, campaign_id, view):
-        if view not in {"outputs", "logs", "budget", "grants", "retries", "holdout"}:
+        if view not in {
+            "outputs",
+            "logs",
+            "budget",
+            "grants",
+            "retries",
+            "holdout",
+            "stage-status",
+        }:
             raise ControlError("Unknown campaign view")
         return await self._request("GET", f"/campaigns/{segment(campaign_id)}/{view}")
 

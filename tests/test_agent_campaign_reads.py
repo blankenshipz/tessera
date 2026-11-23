@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from campaign_fixture import Env
@@ -11,6 +13,7 @@ from test_artifact_disposition_authority import _other_tenant_headers
 
 from tessera_control import agent_campaign_reads
 from tessera_control.api import create_app
+from tessera_control.store import _token_hash
 
 DEST = {"X-Agent-Destination": "planner.local"}
 ALL = ["campaign:read", "snapshot:read", "artifact:read", "campaign:logs", "budget:read"]
@@ -353,3 +356,332 @@ def test_standing_status_subqueries_match_the_schema(world):
         "WHERE target_standing_approval_id=?",
         "none",
     )
+
+
+# ---- GET /campaigns/{id}/stage-status: placement, waiting, lease and heartbeat codes ----
+
+NOW = datetime.now(UTC)
+
+
+def _ts(seconds_ago=0, seconds_ahead=0):
+    moment = NOW - timedelta(seconds=seconds_ago) + timedelta(seconds=seconds_ahead)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _raw(env, sql, *args):
+    """Seed rows directly (foreign keys off) the way the runner and workers would write them."""
+    with sqlite3.connect(env.state / "tessera.sqlite3") as connection:
+        connection.execute(sql, args)
+
+
+def _event(env, campaign, event_type, payload, at):
+    org = env.query("SELECT org_id FROM projects WHERE id=?", env.project["id"])[0][0]
+    actor = env.query("SELECT id FROM principals WHERE role='human' LIMIT 1")[0][0]
+    _raw(
+        env,
+        "INSERT INTO events (org_id, project_id, event_type, resource_revision, "
+        "actor_principal_id, created_at, payload_json) VALUES (?, ?, ?, 1, ?, ?, ?)",
+        org,
+        env.project["id"],
+        event_type,
+        actor,
+        at,
+        json.dumps({"campaign_id": campaign["id"], **payload}),
+    )
+
+
+SECRET = "host.example.invalid 10.0.0.9 secret-token"
+
+
+def _seed_stage_status(env, campaign, *, heartbeat_ago=5, lease_ahead=120):
+    cid = campaign["id"]
+    worker = "worker_principal_secret_id"
+    _raw(
+        env,
+        "INSERT INTO worker_registry (id, org_id, project_id, worker_principal_id, credential_id, "
+        "approved_build_identifier, approved_build_digest, trust_class, region, lifecycle_state, "
+        "revision, registered_at, heartbeat_at, last_seen_at) VALUES ('wreg_secret', 'o', ?, ?, "
+        "'credential_secret_id', 'b', 'd', 't', 'r', 'ready', 1, ?, ?, ?)",
+        env.project["id"],
+        worker,
+        _ts(500),
+        _ts(heartbeat_ago),
+        _ts(heartbeat_ago),
+    )
+    _raw(
+        env,
+        "INSERT INTO execution_grants (id, project_id, task_id, task_revision, plan_digest, "
+        "worker_principal_id, snapshot_id, snapshot_digest, snapshot_release_id, "
+        "snapshot_release_expires_at, pinned_image, currency, max_exposure_cents, "
+        "acknowledges_unmeasured_infrastructure, status, revision, epoch, expires_at, created_at, "
+        "updated_at, created_by_principal_id, settlement_cents) VALUES ('grant1', ?, 't', 1, 'p', "
+        "?, 'sn', 'd', 'r', ?, 'img', 'USD', 7, 1, 'active', 1, 3, ?, ?, ?, 'creator', NULL)",
+        env.project["id"],
+        worker,
+        _ts(0, 900),
+        _ts(0, 900),
+        _ts(100),
+        _ts(100),
+    )
+    _raw(
+        env,
+        "INSERT INTO execution_leases (id, grant_id, worker_principal_id, epoch, issued_at, "
+        "expires_at, hard_expires_at, renewed_at) VALUES ('lease1', 'grant1', ?, 3, ?, ?, ?, ?)",
+        worker,
+        _ts(100),
+        _ts(0, lease_ahead),
+        _ts(0, 600),
+        _ts(10),
+    )
+    for ident, attempt, status, failure in (
+        ("at1", 1, "failed_transient", "infrastructure"),
+        ("at2", 2, "failed_transient", "infrastructure"),
+        ("at3", 3, "reserved", None),
+    ):
+        _raw(
+            env,
+            "INSERT INTO campaign_stage_attempts (id, campaign_id, stage_key, attempt, status, "
+            "hold_cents, settled_cents, grant_id, exit_code, failure_class, failure_detail, "
+            "revision, created_at, updated_at) "
+            "VALUES (?, ?, 's1', ?, ?, 4, 1, ?, ?, ?, ?, 1, ?, ?)",
+            ident,
+            cid,
+            attempt,
+            status,
+            "grant1" if attempt == 3 else None,
+            None if attempt == 3 else 1,
+            failure,
+            SECRET if failure else None,
+            _ts(60),
+            _ts(30),
+        )
+    _raw(
+        env,
+        "INSERT INTO campaign_salad_attempts (attempt_id, phase, waiting_reason, revision, "
+        "updated_at) VALUES ('at3', 'awaiting_lease', ?, 1, ?)",
+        "waiting on " + SECRET,
+        _ts(30),
+    )
+    _raw(
+        env,
+        "INSERT INTO campaign_salad_stages (campaign_id, stage_key, profile, revision, "
+        "updated_at) VALUES (?, 's1', 'gpu_small', 1, ?)",
+        cid,
+        _ts(30),
+    )
+    _event(
+        env,
+        campaign,
+        "campaign.stage_placed",
+        {
+            "stage_key": "s1",
+            "attempt": 3,
+            "candidates": ["local-docker", "salad"],
+            "provider_id": "local-docker",
+            "hold_cents": 4,
+            "skipped": [
+                {"provider_id": "salad", "reason": "no_free_slot", "detail": SECRET},
+                {"provider_id": "other", "reason": "free text " + SECRET, "detail": SECRET},
+            ],
+        },
+        _ts(40),
+    )
+    for n, (kind, match) in enumerate(
+        (("slot", 1), ("slot", 2), ("slot", 3), ("exposure", 1)), start=1
+    ):
+        _event(
+            env,
+            campaign,
+            f"campaign.stage_waiting_{kind}",
+            {"stage_key": "s1", "attempt": match},
+            _ts(50 - n),
+        )
+
+
+def _stage(client, campaign, name="full"):
+    response = _get(client, f"/campaigns/{campaign['id']}/stage-status", name)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    return body, next(s for s in body["stages"] if s["stage_key"] == "s1")
+
+
+def test_stage_status_needs_campaign_logs_and_the_human_owner_reads(world):
+    env, client, campaign = world
+    path = f"/campaigns/{campaign['id']}/stage-status"
+    assert _get(client, path, "reader").status_code == 403
+    assert _get(client, path, "plain").status_code == 403
+    assert _get(client, path, "full").status_code == 200
+    env.agent(["campaign:logs"], "logsonly")
+    assert _get(client, path, "logsonly").status_code == 200
+    human = {"Authorization": (env.state / "owner.header").read_text().strip().split(": ", 1)[1]}
+    assert client.get(path, headers=human).status_code == 200
+
+
+def _other_tenant_agent(state, actions):
+    """An enrolled agent (scopes + destination) that belongs to ANOTHER organization."""
+    token = "synthetic-other-org-agent-token-" + "x" * 30
+    created = _ts()
+    with sqlite3.connect(state / "tessera.sqlite3") as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
+            ("org_other_agent", "Other tenant", created),
+        )
+        connection.execute(
+            "INSERT INTO projects (id, org_id, name, created_at) VALUES (?, ?, ?, ?)",
+            ("project_other_agent", "org_other_agent", "other", created),
+        )
+        connection.execute(
+            "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+            "VALUES ('other_owner', 'org_other_agent', 'human', ?, NULL, ?)",
+            (_token_hash("synthetic-other-org-owner-token-" + "x" * 30), created),
+        )
+        connection.execute(
+            "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+            "expires_at, revoked_at, created_at, created_by_principal_id) "
+            "VALUES ('credential_other_owner', 'other_owner', 'local_owner', 'control', NULL, "
+            "NULL, NULL, NULL, ?, 'other_owner')",
+            (created,),
+        )
+        connection.execute(
+            "INSERT INTO principals (id, org_id, role, token_hash, revoked_at, created_at) "
+            "VALUES ('other_agent', 'org_other_agent', 'agent', ?, NULL, ?)",
+            (_token_hash(token), created),
+        )
+        connection.execute(
+            "INSERT INTO credentials (id, principal_id, kind, audience, project_id, parent_id, "
+            "expires_at, revoked_at, created_at, created_by_principal_id) "
+            "VALUES ('credential_other_agent', 'other_agent', 'agent', 'control', "
+            "'project_other_agent', 'credential_other_owner', ?, NULL, ?, 'other_owner')",
+            (_ts(0, 7200), created),
+        )
+        connection.execute(
+            "INSERT INTO external_agent_scopes VALUES ('credential_other_agent', ?, ?)",
+            (json.dumps(actions), "planner.local"),
+        )
+    return {"Authorization": f"Bearer {token}", **DEST}
+
+
+def test_stage_status_is_a_strict_404_for_an_agent_of_another_org(world):
+    env, client, campaign = world
+    other = _other_tenant_agent(env.state, ALL)
+    real = client.get(f"/campaigns/{campaign['id']}/stage-status", headers=other)
+    missing = client.get("/campaigns/campaign_missing/stage-status", headers=other)
+    assert real.status_code == 404
+    assert (real.status_code, real.json()) == (missing.status_code, missing.json())
+    human = _other_tenant_headers(env.state)
+    real = client.get(f"/campaigns/{campaign['id']}/stage-status", headers=human)
+    missing = client.get("/campaigns/campaign_missing/stage-status", headers=human)
+    assert real.status_code == 404
+    assert (real.status_code, real.json()) == (missing.status_code, missing.json())
+
+
+def test_stage_status_reports_placement_waiting_lease_and_fresh_heartbeat(world):
+    env, client, campaign = world
+    _seed_stage_status(env, campaign)
+    body, stage = _stage(client, campaign)
+    assert body["campaign_id"] == campaign["id"]
+    assert body["paused"] is False
+    assert body["heartbeat_max_age_seconds"] == 60
+    assert stage["profile"] == "gpu_small"
+    placement = stage["placement"]
+    assert (placement["attempt"], placement["chosen_provider"]) == (3, "local-docker")
+    assert placement["candidates"] == ["local-docker", "salad"]
+    assert placement["skipped"] == [
+        {"provider_id": "salad", "reason": "no_free_slot"},
+        {"provider_id": "other", "reason": "detail_withheld"},
+    ]
+    waiting = {w["reason"]: w["count"] for w in stage["waiting"]}
+    assert waiting == {"slot": 3, "exposure": 1}
+    assert stage["failure_counts"] == {"infrastructure": 2}
+    latest = stage["latest_attempt"]
+    assert (latest["attempt"], latest["status"], latest["phase"]) == (
+        3,
+        "reserved",
+        "awaiting_lease",
+    )
+    assert (latest["hold_cents"], latest["settled_cents"]) == (4, 1)
+    assert latest["waiting_reason"] == "detail_withheld"
+    assert 25 <= latest["age_seconds"] < 120
+    assert latest["grant"]["status"] == "active"
+    assert latest["grant"]["max_exposure_cents"] == 7
+    assert latest["grant"]["settlement_cents"] is None
+    assert latest["lease"]["held"] is True and latest["lease"]["expired"] is False
+    assert latest["lease"]["epoch"] == 3
+    assert 0 < latest["lease"]["expires_in_seconds"] <= 120
+    assert latest["executor"]["registered"] is True
+    assert latest["executor"]["lifecycle_state"] == "ready"
+    assert latest["executor"]["heartbeat_stale"] is False
+
+
+def test_stage_status_marks_an_expired_lease_and_stale_heartbeat(world):
+    env, client, campaign = world
+    _seed_stage_status(env, campaign, heartbeat_ago=600, lease_ahead=-30)
+    _, stage = _stage(client, campaign)
+    latest = stage["latest_attempt"]
+    assert latest["lease"]["held"] is False and latest["lease"]["expired"] is True
+    assert latest["executor"]["heartbeat_stale"] is True
+    assert latest["executor"]["heartbeat_age_seconds"] >= 590
+
+
+def test_stage_status_never_returns_free_text_or_identifiers(world):
+    env, client, campaign = world
+    _seed_stage_status(env, campaign)
+    body, stage = _stage(client, campaign)
+    text = json.dumps(body)
+    for forbidden in (
+        "host.example.invalid",
+        "10.0.0.9",
+        "secret-token",
+        "failure_detail",
+        "worker_principal_secret_id",
+        "credential_secret_id",
+        "wreg_secret",
+        "worker_principal_id",
+        "credential_id",
+        "grant1",
+        "lease1",
+    ):
+        assert forbidden not in text, forbidden
+    assert stage["latest_attempt"]["waiting_reason"] == "detail_withheld"
+
+
+def test_stage_status_with_no_rows_is_empty_not_an_error(world):
+    _, client, campaign = world
+    body, stage = _stage(client, campaign)
+    assert stage["placement"] is None and stage["waiting"] == []
+    assert stage["latest_attempt"] is None and stage["failure_counts"] == {}
+
+
+def test_stage_status_shows_the_latest_rejection_and_code_counts_without_free_text(world):
+    from tessera_control.stage_rejections import record
+    from tessera_control.store import Conflict, Forbidden
+
+    env, client, campaign = world
+    _seed_stage_status(env, campaign)
+    _, stage = _stage(client, campaign)
+    assert stage["rejections"] == {"latest": None, "counts": {}}
+    worker = {"id": "worker_principal_secret_id", "org_id": env.worker["org_id"]}
+    _raw(
+        env,
+        "UPDATE campaigns SET org_id=? WHERE id=?",
+        worker["org_id"],
+        campaign["id"],
+    )
+    assert record(
+        env.store, worker, "at3", "lease", Conflict("Worker heartbeat is stale " + SECRET)
+    )
+    assert record(env.store, worker, "at3", "package", Forbidden(SECRET))
+    assert not record(env.store, worker, "at3", "package", Forbidden(SECRET))
+    body, stage = _stage(client, campaign)
+    rejections = stage["rejections"]
+    assert rejections["counts"] == {"stale_heartbeat": 1, "refused_forbidden": 1}
+    latest = rejections["latest"]
+    assert (latest["attempt"], latest["step"], latest["code"]) == (
+        3,
+        "package",
+        "refused_forbidden",
+    )
+    assert 0 <= latest["age_seconds"] < 60
+    text = json.dumps(body)
+    for forbidden in ("host.example.invalid", "10.0.0.9", "secret-token"):
+        assert forbidden not in text

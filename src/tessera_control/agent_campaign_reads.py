@@ -169,6 +169,22 @@ class AgentCampaignReads(CampaignStore):
         finally:
             connection.close()
 
+    def campaign_stage_status(self, principal, campaign_id) -> dict[str, Any]:
+        """Where each stage landed and why it is not progressing (campaign:logs, read-only)."""
+        from .agent_stage_status import stage_status
+
+        connection = _connect(self.database_path)
+        try:
+            actor = self._reader(connection, principal, LOGS_SCOPE)
+            campaign = self._campaign(connection, actor, campaign_id)
+            view = stage_status(connection, campaign)
+            view["boundary"] = (
+                BOUNDARY + " Codes, ages and counts only; no log text, host or credential."
+            )
+            return view
+        finally:
+            connection.close()
+
     def campaign_grants(self, principal, campaign_id) -> dict[str, Any]:
         """Why a slot or release may still be held: each attempt's grant and data release.
 

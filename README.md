@@ -287,6 +287,8 @@ Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes 
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
 `tessera_get_campaign_receipt`, `tessera_campaign_report` (a plain-words read of one campaign or a time window, [ADR 0115](docs/decisions/0115-plain-words-campaign-report.md)), `tessera_list_snapshots`, `tessera_get_snapshot` (one snapshot's file list, [ADR 0126](docs/decisions/0126-mcp-snapshot-file-list.md)), `tessera_campaign_outputs`,
 `tessera_campaign_logs`, `tessera_campaign_budget` and `tessera_project_spend` (the operator's
+`tessera_get_campaign_receipt`, `tessera_campaign_report` (a plain-words read of one campaign or a time window, [ADR 0115](docs/decisions/0115-plain-words-campaign-report.md)), `tessera_list_snapshots`, `tessera_campaign_outputs`,
+`tessera_campaign_logs`, `tessera_campaign_stage_status` (per stage: placement, what it waited on, latest attempt and executor lease and heartbeat state and the latest control refusal of a worker step from any provider, as codes, ages and counts), `tessera_campaign_budget` and `tessera_project_spend` (the operator's
 project limits and campaign totals) read recorded state under separate
 scopes. Steering tools ([ADR 0055](docs/decisions/0055-mcp-steering-tools.md)) dry-run a spec
 (`tessera_validate_campaign_spec`), render a spec from a template plus values and validate or submit it (`tessera_render_campaign_spec`, `tessera_submit_rendered_campaign`), read the receipts and gate decisions of up to 20 campaigns at once (`tessera_campaign_wave_receipts`; [ADR 0124](docs/decisions/0124-mcp-operator-loop-tools.md)), build a retry spec for the stages that did not succeed

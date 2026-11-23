@@ -121,6 +121,16 @@ class FakeControl:
         # None: the registry never refuses; False: the worker's last heartbeat is stale and
         # lease authority is refused (as the store's ``require_ready_worker`` does) until one.
         self.worker_fresh = None
+        self.package_error = None
+        self.pending_error = None
+        self.rejections = []
+        self.rejection_error = None
+        self.acquire_error = None
+
+    def record_rejection(self, attempt_id, step, error):
+        self.rejections.append((attempt_id, step, type(error).__name__))
+        if self.rejection_error:
+            raise self.rejection_error
 
     def _c(self, name, *args):
         self.calls.append((name, *args))
@@ -129,6 +139,8 @@ class FakeControl:
         return list(self.items)
 
     def pending_grants(self):
+        if self.pending_error:
+            raise self.pending_error
         return set(self.pending)
 
     def plan(self, grant_id):
@@ -136,12 +148,16 @@ class FakeControl:
 
     def acquire_lease(self, grant_id, key):
         self._c("acquire", grant_id)
+        if self.acquire_error:
+            raise self.acquire_error
         if self.worker_fresh is False:
             raise Conflict("Worker is disconnected and cannot receive lease authority.")
         return dict(id="lease_1", epoch=3)
 
     def package(self, lease_id, epoch, admitted_attempt_id, key):
         self._c("package", lease_id, epoch, admitted_attempt_id)
+        if self.package_error:
+            raise self.package_error
         return dict(package=dict(operation_id=OPERATION), package_digest="d" * 64)
 
     def record_package(self, attempt_id, payload):
@@ -986,3 +1002,66 @@ def test_the_workload_name_never_reaches_the_custody_client_or_live_check_config
     assert module.CustodyConfig(**custody()).workload_name() == custody()["host"]
     with pytest.raises(ValueError):
         module.CustodyConfig(**custody(), workload_host="Not A Host")
+
+
+def _awaiting():
+    return [item("awaiting_lease", route_id=None, operation_id=None)]
+
+
+@pytest.mark.parametrize("step", ["grant_poll", "lease", "package"])
+def test_a_control_refusal_is_recorded_with_its_step_and_attempt(tmp_path, step):
+    h = Harness(tmp_path)
+    h.control.items = _awaiting()
+    if step == "grant_poll":
+        h.control.pending_error = Conflict("secret-token host.example.invalid")
+    elif step == "lease":
+        h.control.acquire_error = Conflict("secret-token host.example.invalid")
+    else:
+        h.control.package_error = Conflict("secret-token host.example.invalid")
+    actions = h.executor.run_once()
+    assert [(a["action"], a["detail"]) for a in actions][-1] == ("error", "Conflict")
+    assert h.control.rejections == [("att_1", step, "Conflict")]
+    assert "secret-token" not in json.dumps(actions)
+
+
+@pytest.mark.parametrize("step", ["lease", "package"])
+def test_a_non_store_exception_is_recorded_with_its_step(tmp_path, step):
+    h = Harness(tmp_path)
+    h.control.items = _awaiting()
+    boom = OSError("secret-token host.example.invalid")
+    if step == "lease":
+        h.control.acquire_error = boom
+    else:
+        h.control.package_error = boom
+    actions = h.executor.run_once()
+    assert [(a["action"], a["detail"]) for a in actions][-1] == ("error", "OSError")
+    assert h.control.rejections == [("att_1", step, "OSError")]
+    assert "secret-token" not in json.dumps(actions)
+
+
+def test_a_failing_rejection_recorder_never_breaks_the_pass(tmp_path):
+    h = Harness(tmp_path)
+    h.control.acquire_error = Conflict("refused")
+    h.control.rejection_error = RuntimeError("secret-token store down")
+    h.control.items = _awaiting() + [
+        item("awaiting_lease", attempt_id="att_2", route_id=None, operation_id=None)
+    ]
+    actions = h.executor.run_once()
+    assert [(a["action"], a["attempt_id"], a["detail"]) for a in actions] == [
+        ("error", "att_1", "Conflict"),
+        ("rejection_unrecorded", "att_1", "RuntimeError"),
+        ("error", "att_2", "Conflict"),
+        ("rejection_unrecorded", "att_2", "RuntimeError"),
+    ]
+    assert "secret-token" not in json.dumps(actions)
+
+
+def test_a_control_without_record_rejection_behaves_as_before(tmp_path):
+    class Plain(FakeControl):
+        record_rejection = None
+
+    h = Harness(tmp_path, Plain())
+    h.control.acquire_error = Conflict("refused")
+    h.control.items = _awaiting()
+    actions = h.executor.run_once()
+    assert [(a["action"], a["detail"]) for a in actions] == [("error", "Conflict")]

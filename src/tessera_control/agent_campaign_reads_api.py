@@ -33,6 +33,11 @@ def logs(campaign_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.campaign_logs(actor, campaign_id)
 
 
+@router.get("/campaigns/{campaign_id}/stage-status")
+def stage_status(campaign_id: str, request: Request, actor: Actor):
+    return request.app.state.agent_campaign_reads.campaign_stage_status(actor, campaign_id)
+
+
 @router.get("/campaigns/{campaign_id}/grants")
 def grants(campaign_id: str, request: Request, actor: Actor):
     return request.app.state.agent_campaign_reads.campaign_grants(actor, campaign_id)

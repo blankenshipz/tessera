@@ -270,6 +270,8 @@ def validate_descriptor(d: Any) -> None:
         raise ValueError(f"{bad} (billable and third_party must be booleans)")
     if d.billable and not d.third_party:
         raise ValueError(f"{bad} (a billable provider must declare third_party)")
+    if d.kind == "salad_route" and d.third_party is not True:
+        raise ValueError(f"{bad} (a salad_route provider must declare third_party=True)")
     limits = d.output_limits
     if not isinstance(limits, OutputLimits):
         raise ValueError(f"{bad} (output limits)")
@@ -335,17 +337,31 @@ def validate_provider_object(provider: Any) -> None:
         raise ValueError("Provider object is not a ComputeProvider: " + "; ".join(problems))
 
 
-def register_provider(provider: ComputeProvider) -> ComputeProvider:
+def validate_provider(provider: Any) -> Any:
+    """Run every registration check except the duplicate-id one; return the descriptor."""
     d = getattr(provider, "descriptor", None)
     validate_descriptor(d)
     validate_provider_object(provider)
-    if d.provider_id in _PROVIDERS:
-        raise ValueError(f"Provider already registered: {d.provider_id}")
     from .campaign_delegation import STEP_TABLE
 
     unknown = d.delegable_steps - frozenset(STEP_TABLE)
     if unknown:
         raise ValueError(f"Provider {d.provider_id} declares unknown steps: {sorted(unknown)}")
+    return d
+
+
+def register_provider(provider: ComputeProvider) -> ComputeProvider:
+    d = validate_provider(provider)
+    if d.provider_id in _PROVIDERS:
+        raise ValueError(f"Provider already registered: {d.provider_id}")
+    _PROVIDERS[d.provider_id] = provider
+    return provider
+
+
+def replace_provider(provider: ComputeProvider) -> ComputeProvider:
+    """Swap in a provider for its id; the replacement is fully validated first, so a refusal
+    leaves any existing provider registered and unchanged."""
+    d = validate_provider(provider)
     _PROVIDERS[d.provider_id] = provider
     return provider
 

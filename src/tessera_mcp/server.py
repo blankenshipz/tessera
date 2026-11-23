@@ -45,6 +45,7 @@ CAMPAIGN_TOOL_SCOPES = {
     "tessera_campaign_outputs": "artifact:read",
     "tessera_campaign_logs": "campaign:logs",
     "tessera_campaign_stage_watch": "campaign:logs",
+    "tessera_campaign_stage_status": "campaign:logs",
     "tessera_campaign_budget": "budget:read",
     "tessera_campaign_retries": "campaign:read",
     "tessera_campaign_standing_status": "campaign:read",
@@ -488,6 +489,19 @@ def register_campaign_tools(
         Paged: offset >= 0, limit 1-100. Read-only; no paths or worker text.
         """
         return await client.campaign_stage_watch(campaign_id, offset, limit)
+
+    async def tessera_campaign_stage_status(campaign_id: str) -> dict[str, Any]:
+        """Where each stage landed and why it is not progressing (campaign:logs, read-only).
+
+        Per stage: the chosen provider and profile, the recorded placement (candidates and
+        skip reason codes), what the stage has waited on (paused, concurrency, exposure,
+        limits, slot, release, placement) with counts, and the latest attempt with its phase,
+        failure class, grant and spend-limit state, whether an executor lease is held, the
+        lease age, the executor's heartbeat age and whether that heartbeat is stale, plus
+        failure counts by class. Codes, ages and counts only: no log text, host, address or
+        credential. Use it before cancelling or re-placing a stage that is not moving.
+        """
+        return await client.campaign_view(campaign_id, "stage-status")
 
     async def tessera_campaign_retries(campaign_id: str) -> dict[str, Any]:
         """Read a campaign's infrastructure-retry state (campaign:read).
@@ -933,6 +947,7 @@ def register_campaign_tools(
         tessera_campaign_outputs,
         tessera_campaign_logs,
         tessera_campaign_stage_watch,
+        tessera_campaign_stage_status,
         tessera_campaign_budget,
         tessera_campaign_retries,
         tessera_campaign_standing_status,
