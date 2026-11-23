@@ -175,9 +175,31 @@ class BoundedHTTPSConnection(http.client.HTTPSConnection):
 REQUEST_TIMEOUT_SECONDS = READ_DEADLINE_SECONDS
 
 
+FIELD_NAME = re.compile(r"[a-z][a-z_.\-]{0,47}")  # no digits: never a UUID or other value
+DETAIL_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
+
+
+def _field_name(name):
+    """A reviewed field name for a diagnostic, or None: never a value or a path."""
+    return name if type(name) is str and FIELD_NAME.fullmatch(name) else None
+
+
+def _mismatch(field, reason="identity_mismatch"):
+    return _Failure(reason, field=field)
+
+
+def _unexpected(error):
+    """The closed failure for an unexpected parsing error (a missing key names the key)."""
+    field = _field_name(error.args[0]) if isinstance(error, KeyError) and error.args else None
+    return _Failure("malformed_response", field=field)
+
+
 class _Failure(Exception):
-    def __init__(self, reason, observation=None):
+    def __init__(self, reason, observation=None, *, detail=None, field=None):
         self.reason = reason
+        # Closed diagnostics only (see ProxyResult.detail / .field); never values.
+        self.detail = detail if type(detail) is str and DETAIL_NAME.fullmatch(detail) else None
+        self.field = _field_name(field)
         # Non-secret diagnostics (state, pending change, instance-count keys), never a body.
         self.observation = observation
 
@@ -422,6 +444,7 @@ class SaladHTTPTransport:
         bounded summary; any other body for those statuses, and every other non-2xx,
         stays ``provider_unavailable``/``malformed_response``."""
         connection = None
+        self._request_kind = self._classify_request(method, path)
         try:
             # One deadline across request/headers/body. No inherited HTTP proxy.
             # ``total`` is READ_DEADLINE_SECONDS, or CREATE_DEADLINE_SECONDS for create.
@@ -499,7 +522,10 @@ class SaladHTTPTransport:
             if status == 202:
                 return status, None
             if status not in {200, 201}:
-                raise _Failure("provider_unavailable")
+                raise _Failure(
+                    "provider_unavailable",
+                    detail=f"non_2xx_{status // 100}xx" if 100 <= status < 600 else "non_2xx_other",
+                )
             data = json.loads(
                 raw,
                 object_pairs_hook=_object,
@@ -511,7 +537,11 @@ class SaladHTTPTransport:
         except _Failure:
             raise
         except (ValueError, UnicodeError):
-            raise _Failure("malformed_response") from None
+            raise _Failure("malformed_response", field="body") from None
+        except TimeoutError:
+            raise _Failure("provider_unavailable", detail="timeout") from None
+        except (OSError, http.client.HTTPException):
+            raise _Failure("provider_unavailable", detail="reset") from None
         except Exception:
             raise _Failure("provider_unavailable") from None
         finally:
@@ -521,11 +551,31 @@ class SaladHTTPTransport:
                 except Exception:
                     pass
 
+    def _classify_request(self, method, path):
+        """Closed kind of the provider request (never the path itself)."""
+        if method == "POST" and path.endswith("/availability/sce-gpu-availability"):
+            return "availability"
+        if method == "POST" and path == self._groups:
+            return "create"
+        if method != "GET":
+            return "other"
+        if path.endswith("/quotas"):
+            return "quotas"
+        if path.endswith("/gpu-classes"):
+            return "gpu_classes"
+        if path.endswith("/instances"):
+            return "read_instance"
+        if path == self._groups:
+            return "list"
+        if path == self._group:
+            return "read_group"
+        return "other"
+
     @staticmethod
     def _remaining(connection, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise _Failure("provider_unavailable")
+            raise _Failure("provider_unavailable", detail="timeout")
         if connection.sock is not None:
             connection.sock.settimeout(remaining)
 
@@ -533,13 +583,14 @@ class SaladHTTPTransport:
         p = self._selection.salad
         actual = _uuid(data["id"])
         if provider_id is not None and actual != provider_id:
-            raise _Failure("identity_mismatch")
-        if (
-            data["name"] != p.group
-            or data["organization_name"] != p.organization
-            or data["project_name"] != p.project
+            raise _mismatch("id")
+        for key, wanted in (
+            ("name", p.group),
+            ("organization_name", p.organization),
+            ("project_name", p.project),
         ):
-            raise _Failure("identity_mismatch")
+            if data[key] != wanted:
+                raise _mismatch(key)
         return actual
 
     def _group_observation(self, data, provider_id):
@@ -556,43 +607,43 @@ class SaladHTTPTransport:
             "scaling-actions",
         ):
             if type(data[key]) is not type(expected[key]) or data[key] != expected[key]:
-                raise _Failure("identity_mismatch")
-        if data["organization_name"] != p.organization or data["project_name"] != p.project:
-            raise _Failure("identity_mismatch")
+                raise _mismatch(key)
+        if data["organization_name"] != p.organization:
+            raise _mismatch("organization_name")
+        if data["project_name"] != p.project:
+            raise _mismatch("project_name")
         container = data["container"]
         for key in ("image", "command", "environment_variables"):
             # A missing field cannot establish the reviewed executable profile,
             # including the case where the approved environment is empty.
             if key not in container or container[key] != expected["container"][key]:
-                raise _Failure("identity_mismatch")
-        if data["priority"] != "high" or type(data["pending_change"]) is not bool:
-            raise _Failure("identity_mismatch")
+                raise _mismatch(f"container.{key}")
+        if data["priority"] != "high":
+            raise _mismatch("priority")
+        if type(data["pending_change"]) is not bool:
+            raise _mismatch("pending_change")
         for key, value in self._resources.items():
             found = container["resources"].get(key)
             if key == "gpu_classes" and value == [] and found in (None, []):
                 continue  # a CPU-only group: Salad may omit an empty GPU list
             if type(found) is not type(value) or found != value:
-                raise _Failure("identity_mismatch")
-        if any(
-            data.get(k) is not None
-            for k in (
-                "networking",
-                "queue_connection",
-                "queue_autoscaler",
-                "startup_probe",
-                "readiness_probe",
-                "liveness_probe",
-            )
+                raise _mismatch(f"container.resources.{key}")
+        for key in (
+            "networking",
+            "queue_connection",
+            "queue_autoscaler",
+            "startup_probe",
+            "readiness_probe",
+            "liveness_probe",
         ):
-            raise _Failure("identity_mismatch")
-        if (
-            container.get("logging") is not None
-            or container.get("registry_authentication") is not None
-        ):
-            raise _Failure("identity_mismatch")
+            if data.get(key) is not None:
+                raise _mismatch(key)
+        for key in ("logging", "registry_authentication"):
+            if container.get(key) is not None:
+                raise _mismatch(f"container.{key}")
         state = data["current_state"]["status"]
         if state not in {"pending", "running", "stopped", "succeeded", "failed", "deploying"}:
-            raise _Failure("malformed_response")
+            raise _mismatch("current_state.status", "malformed_response")
         counts, complete, keys = _instance_counts(
             data["current_state"].get("instance_status_counts")
         )
@@ -634,6 +685,9 @@ class SaladHTTPTransport:
         return ProxyResult(
             status="unknown",
             reason=error.reason,
+            detail=error.detail,
+            field=error.field,
+            request_kind=getattr(self, "_request_kind", None),
             observation=None
             if error.observation is None
             else dict(error.observation, selection_digest=self._digest, observed_at=utc_now()),
@@ -751,8 +805,8 @@ class SaladHTTPTransport:
             return self._result(self._read_gpu_class(secret), observed_at=observed_at)
         except _Failure as error:
             return self._failed(error)
-        except Exception:
-            return self._failed(_Failure("malformed_response"))
+        except Exception as error:
+            return self._failed(_unexpected(error))
 
     def preflight(self, selection, secret):
         """Four requests, each with a two-second timeout, not a two-second total.
@@ -805,8 +859,8 @@ class SaladHTTPTransport:
             )
         except _Failure as error:
             return self._failed(error)
-        except Exception:
-            return self._failed(_Failure("malformed_response"))
+        except Exception as error:
+            return self._failed(_unexpected(error))
 
     def inspect_stop(self, selection, provider_id, secret):
         """Server-only stop preflight: exact scope/name/bound UUID, no drift gate.
@@ -824,8 +878,8 @@ class SaladHTTPTransport:
             )
         except _Failure as error:
             return self._failed(error)
-        except Exception:
-            return self._failed(_Failure("malformed_response"))
+        except Exception as error:
+            return self._failed(_unexpected(error))
 
     def read_absence(self, selection, secret):
         """Server-only lost-create evidence for the exact reserved name. Not a proxy op.
@@ -868,8 +922,8 @@ class SaladHTTPTransport:
             return self._result(dict(group_not_found=True, list_read=list_read))
         except _Failure as error:
             return self._failed(error)
-        except Exception:
-            return self._failed(_Failure("malformed_response"))
+        except Exception as error:
+            return self._failed(_unexpected(error))
 
     def send(self, operation, selection, provider_id, secret):
         self._post_sent = None  # None: no create POST attempted in this call
@@ -929,7 +983,17 @@ class SaladHTTPTransport:
             if operation == "read_group":
                 return self._result(group)
             if operation == "read_instance":
-                _, data = self._request("GET", f"{self._group}/instances", secret)
+                # A group that was never started has no instance resource yet: a fully read
+                # 404 there, on a group whose exact read just passed identity and is not
+                # running, means "no instance yet" (the same as an empty list), never a
+                # failed read. Any other non-2xx, or a 404 for a running group, still fails.
+                status, data = self._request(
+                    "GET", f"{self._group}/instances", secret, absent_ok=True
+                )
+                if status == 404:
+                    if group["state"] == "running":
+                        raise _Failure("provider_unavailable")
+                    data = {"instances": []}
                 instances = data["instances"]
                 if type(instances) is not list or len(instances) > 1:
                     raise _Failure("reallocation_uncertain")
@@ -974,7 +1038,7 @@ class SaladHTTPTransport:
             if self._post_sent is False and not isinstance(error, _Rejected):
                 return self._failed(_not_sent())  # nothing reached the provider
             return self._failed(error)
-        except Exception:
+        except Exception as error:
             if self._post_sent is False:
                 return self._failed(_not_sent())
-            return self._failed(_Failure("malformed_response"))
+            return self._failed(_unexpected(error))

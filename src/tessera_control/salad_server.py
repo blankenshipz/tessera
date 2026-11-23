@@ -72,7 +72,19 @@ CREATE_RELEASE_REASONS = frozenset({"provider_rejected_request", "request_not_se
 
 
 class ProviderReadUnavailable(Conflict):
-    """A fresh provider read timed out or failed; nothing was changed (still a 409)."""
+    """A fresh provider read timed out or failed; nothing was changed (still a 409).
+
+    ``failure`` (alias ``reason``) is the transport's closed reason (e.g. identity_mismatch,
+    provider_unavailable) and ``detail`` / ``field`` its closed diagnostics (an HTTP status
+    class such as non_2xx_5xx, reset or timeout; the NAME of the mismatching field). Never a
+    value, body or path.
+    """
+
+    failure = None
+    reason = None
+    detail = None
+    field = None
+    request_kind = None
 
 
 class GuardianRefused(ValueError):
@@ -649,7 +661,13 @@ class TrustedSaladServer:
                     "read_group", proposal.selection, state["provider_id"], secret
                 )
         if result.status != "observed" or result.observation is None:
-            raise ProviderReadUnavailable("Fresh provider preflight unavailable.")
+            refusal = ProviderReadUnavailable("Fresh provider preflight unavailable.")
+            refusal.failure = result.reason
+            refusal.reason = result.reason
+            refusal.detail = result.detail
+            refusal.field = result.field
+            refusal.request_kind = result.request_kind
+            raise refusal
         observation = result.observation
         preflight = dict(
             observation,

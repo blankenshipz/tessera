@@ -38,11 +38,13 @@ from .remote_execution_models import (
 )
 from .salad_custody import CustodyBinding, SaladCustody, private_database
 from .salad_guardian import (
+    DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
     RECONCILE_OPERATOR,
     RECONCILE_PROVIDER,
     GuardianAssignment,
     ProviderObservation,
     SaladGuardian,
+    is_deterministic_read_failure,
 )
 from .salad_http import CREATE_DEADLINE_SECONDS, REQUEST_TIMEOUT_SECONDS, SaladHTTPTransport
 from .salad_input_delivery import GuardianInputs
@@ -163,6 +165,8 @@ PROVIDER_READ_WINDOW_KIND_NAMES = frozenset({"rate_read_failed", "provider_read_
 PROVIDER_READ_WINDOW_KINDS = len(PROVIDER_READ_WINDOW_KIND_NAMES)
 RATE_READ_KIND = "rate_read_failed"
 PROVIDER_READ_KIND = "provider_read_failed"
+# Companion event kind suffix: the closed transport diagnostics of the same read failure.
+READ_FAILURE_REASON_SUFFIX = "_reason"
 LOOP_PASS_ALLOWANCE_SECONDS = (
     PROVIDER_READ_WINDOW_KINDS * PROVIDER_READ_BUDGET_SECONDS + PROVIDER_READ_SECONDS + 1.0
 )
@@ -240,6 +244,29 @@ def log_unclosed_refusal(error, channel):
     """
     if refusal_code(error) in {"internal", "service_deadline"}:
         print(f"guardian {channel} refusal: {type(error).__name__}", file=sys.stderr, flush=True)
+
+
+class ProviderUnknown(ValueError):
+    """A provider reply that was not observed. Its text stays the closed ``provider_unknown``
+    (callers branch on that); ``reason`` / ``detail`` / ``field`` / ``request_kind`` carry the
+    transport's closed diagnostics (never a value, body or organization/project path). The
+    guardian reads them defensively, so an unlabeled failure is a generic transient one."""
+
+    def __init__(self, reason=None, detail=None, field=None, request_kind=None):
+        super().__init__("provider_unknown")
+        self.request_kind = request_kind
+        self.reason = reason
+        self.detail = detail
+        self.field = field
+
+
+def read_failure_diagnostics(error):
+    """Closed (reason, detail, field, request_kind) of a failed provider read (tokens or None)."""
+    if isinstance(error, TimeoutError):
+        return "timeout", "timeout", None, None
+    if isinstance(error, ProviderUnknown):
+        return error.reason, error.detail, error.field, error.request_kind
+    return None, None, None, None
 
 
 def refusal_code(error):
@@ -411,6 +438,7 @@ class SaladSafetyService:
         control_opener=None,
         max_open_billable_frames=1,
         max_prestart_rebinds=3,
+        prestart_read_deadline_seconds=DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
     ):
         # ADR 0041 resolved question 4b: concurrent billable frames need a later record that
         # covers total-cap races, partial stops and accrual interleaving, so only 1 is allowed.
@@ -515,6 +543,7 @@ class SaladSafetyService:
             clock=clock,
             custody_started=self._custody_started,
             max_prestart_rebinds=max_prestart_rebinds,
+            prestart_read_deadline_seconds=prestart_read_deadline_seconds,
         )
         self.loop_at = None
         # Real-time pacing for bounded rate-read retries (tests may replace both).
@@ -639,10 +668,15 @@ class SaladSafetyService:
             else:
                 result = transport.send(action, proposal.selection, provider_id, secret)
         if result.status not in {"observed", "pending"}:
-            raise ValueError("provider_unknown")
+            raise ProviderUnknown(
+                getattr(result, "reason", None),
+                getattr(result, "detail", None),
+                getattr(result, "field", None),
+                getattr(result, "request_kind", None),
+            )
         return result
 
-    def _record_read_failure(self, row, kind, code):
+    def _record_read_failure(self, row, kind, code, error=None):
         """Deduplicated (per code per minute) closed reason a provider read gave up with."""
         try:
             # Only bound runs: on a never-bound reservation a failed read is the expected
@@ -655,13 +689,41 @@ class SaladSafetyService:
                 "ORDER BY sequence DESC LIMIT 1",
                 (row["reservation"], kind, code),
             ).fetchone()
-            if last and 0 <= now - last[0] < WORKLOAD_REFUSAL_DEDUP_SECONDS:
+            reason, detail, field, request_kind = read_failure_diagnostics(error)
+            companion = (
+                None
+                if reason is None
+                else json.dumps(
+                    dict(reason=reason, detail=detail, field=field, request_kind=request_kind),
+                    sort_keys=True,
+                )
+            )
+            if (
+                last
+                and 0 <= now - last[0] < WORKLOAD_REFUSAL_DEDUP_SECONDS
+                and self._last_event_detail(row["reservation"], kind + READ_FAILURE_REASON_SUFFIX)
+                == companion
+            ):
                 return
             with self.db:
                 self.db.execute(
                     "INSERT INTO events(reservation,operation,at,kind,detail) VALUES(?,?,?,?,?)",
                     (row["reservation"], row.get("operation"), now, kind, code),
                 )
+                if companion is not None:
+                    # The transport's closed diagnostics for the same failure; the outward
+                    # code above stays provider_unknown.
+                    self.db.execute(
+                        "INSERT INTO events(reservation,operation,at,kind,detail) "
+                        "VALUES(?,?,?,?,?)",
+                        (
+                            row["reservation"],
+                            row.get("operation"),
+                            now,
+                            kind + READ_FAILURE_REASON_SUFFIX,
+                            companion,
+                        ),
+                    )
         except Exception:
             self.diagnostic_write_failures += 1
 
@@ -673,6 +735,21 @@ class SaladSafetyService:
             (reservation, kind),
         ).fetchone()
         return last[0] if last else None
+
+    def _read_failure_diagnostics(self, reservation, kind):
+        """Closed transport diagnostics of the latest ``kind`` failure (None when unknown)."""
+        raw = self._last_event_detail(reservation, kind + READ_FAILURE_REASON_SUFFIX)
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except ValueError:
+            parsed = {}
+        if type(parsed) is not dict:
+            parsed = {}
+        prefix = "last_" + kind.replace("_failed", "_failure")
+        return {
+            f"{prefix}_{name}": parsed.get(name)
+            for name in ("reason", "detail", "field", "request_kind")
+        }
 
     def _last_event_detail(self, reservation, kind):
         last = self.db.execute(
@@ -706,7 +783,9 @@ class SaladSafetyService:
                 try:
                     return read()
                 except (ValueError, TimeoutError) as error:
-                    transient = isinstance(error, TimeoutError) or str(error) == "provider_unknown"
+                    transient = (
+                        isinstance(error, TimeoutError) or str(error) == "provider_unknown"
+                    ) and not is_deterministic_read_failure(error)
                     backoff = (
                         PROVIDER_READ_BACKOFF_SECONDS[attempt]
                         if attempt < len(PROVIDER_READ_BACKOFF_SECONDS)
@@ -722,6 +801,7 @@ class SaladSafetyService:
                             row,
                             failure_kind,
                             "timeout" if isinstance(error, TimeoutError) else refusal_code(error),
+                            error,
                         )
                         if give_up is not None:
                             raise give_up from None
@@ -1015,6 +1095,7 @@ class SaladSafetyService:
             last_provider_read_failure_at=self._last_event_at(
                 row["reservation"], "provider_read_failed"
             ),
+            **self._read_failure_diagnostics(row["reservation"], "provider_read_failed"),
             diagnostic_write_failures=self.diagnostic_write_failures,
             exposure_unknown=True,
             exposure_pending=True,
@@ -2163,7 +2244,12 @@ class SaladSafetyService:
             except Exception:
                 # No failed observation/custody write is a confirmed stop.
                 pass
-            self.next_poll[reservation] = self.clock() + 5
+            # A pre-start read failure being retried across polls backs off (bounded).
+            try:
+                backoff = self.guardian.read_retry_backoff(row["operation"])
+            except Exception:
+                backoff = None
+            self.next_poll[reservation] = self.clock() + max(5, backoff or 0)
         self.loop_at = self.clock()
 
     def _input(self, row, body):
@@ -2838,6 +2924,9 @@ def main(argv=None):
             control_origin=cfg.get("control_origin"),
             max_open_billable_frames=cfg.get("max_open_billable_frames", 1),
             max_prestart_rebinds=cfg.get("max_prestart_rebinds", 3),
+            prestart_read_deadline_seconds=cfg.get(
+                "prestart_read_deadline_seconds", DEFAULT_PRESTART_READ_DEADLINE_SECONDS
+            ),
         )
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3

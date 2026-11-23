@@ -13,6 +13,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -37,6 +38,66 @@ PRESTART_REBIND_REASON = "prestart_reallocation"
 DEFAULT_MAX_PRESTART_REBINDS = 3
 MAX_PRESTART_REBINDS_LIMIT = 10
 _REBIND_ID_CAP = 96
+
+# A provider read that fails while the route is pre-start and unallocated (nothing ran,
+# no custody began, no billable instance placed: 0c) is retried across polls instead of
+# stopping the run at the first failure. Each attempt is one event whose kind carries a
+# closed JSON detail after this prefix; the window closes after the profile's deadline.
+PRESTART_READ_RETRY_PREFIX = "prestart_read_retry:"
+DEFAULT_PRESTART_READ_DEADLINE_SECONDS = 60.0
+MAX_PRESTART_READ_DEADLINE_SECONDS = 600.0
+# Seconds before the next poll after the n-th consecutive failed read (bounded backoff).
+PRESTART_READ_BACKOFF_SECONDS = (5.0, 10.0, 15.0)
+# Transport failure reasons that are deterministic or mean the group is gone: retrying
+# cannot change them, so they stop at once instead of burning the deadline. Readers get
+# the reason through an optional ``reason`` attribute on the raised error (absent: unknown,
+# treated as transient), never by parsing text.
+NON_RETRYABLE_READ_REASONS = frozenset(
+    {"identity_mismatch", "group_not_found", "group_gone", "provider_identity_changed"}
+)
+# identity_mismatch on one of these field names is a known provider normalization and may
+# be retried like any transient read. Empty: no normalization is accepted by the guardian;
+# a mismatch on any other (or unnamed) field stops immediately. Fields come from the
+# optional ``field`` attribute on the raised error.
+RETRYABLE_MISMATCH_FIELDS: frozenset[str] = frozenset()
+MAX_SHOWN_READ_RETRIES = 10
+_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _token(value):
+    return value if type(value) is str and _TOKEN.fullmatch(value) else None
+
+
+def read_failure_detail(error) -> tuple[str, str | None]:
+    """Closed (reason, field) of a failed provider read, read defensively.
+
+    ``reason`` and ``field`` are optional attributes of the raised error (the transport's
+    closed failure reason and the NAME, never a value, of a mismatching field); without
+    them the reason is the generic ``timeout`` or ``provider_unknown``.
+    """
+    if isinstance(error, TimeoutError):
+        return "timeout", None
+    return (
+        _token(getattr(error, "reason", None)) or _token(str(error)) or "provider_unknown",
+        _token(getattr(error, "field", None)),
+    )
+
+
+def is_deterministic_read_failure(error) -> bool:
+    """True for a read failure that retrying cannot fix (see NON_RETRYABLE_READ_REASONS)."""
+    reason, field = read_failure_detail(error)
+    if reason == "identity_mismatch" and field in RETRYABLE_MISMATCH_FIELDS:
+        return False
+    return reason in NON_RETRYABLE_READ_REASONS
+
+
+def is_transient_read_failure(error) -> bool:
+    """A timeout or a provider_unknown read that is not deterministic."""
+    if isinstance(error, TimeoutError):
+        return True
+    return isinstance(error, ValueError) and (
+        str(error) == "provider_unknown" and not is_deterministic_read_failure(error)
+    )
 
 
 @dataclass(frozen=True)
@@ -123,12 +184,21 @@ class SaladGuardian:
         clock=time.time,
         custody_started: Callable[[str], bool] | None = None,
         max_prestart_rebinds: int = DEFAULT_MAX_PRESTART_REBINDS,
+        prestart_read_deadline_seconds: float = DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
     ):
         if (
             type(max_prestart_rebinds) is not int
             or not 0 <= max_prestart_rebinds <= MAX_PRESTART_REBINDS_LIMIT
         ):
             raise ValueError("invalid_max_prestart_rebinds")
+        if (
+            type(prestart_read_deadline_seconds) not in {int, float}
+            or not math.isfinite(prestart_read_deadline_seconds)
+            or not 0 <= prestart_read_deadline_seconds <= MAX_PRESTART_READ_DEADLINE_SECONDS
+        ):
+            raise ValueError("invalid_prestart_read_deadline")
+        # 0 turns the cross-poll retry off: every failed read stops, as before.
+        self.prestart_read_deadline_seconds = float(prestart_read_deadline_seconds)
         # ``custody_started(operation)`` is the provider adapter's answer to "has any custody
         # begun for this operation" (an input fetched, an output written, a run observed). With
         # no callable the guardian cannot know, so it never re-binds: every change stops.
@@ -158,6 +228,8 @@ class SaladGuardian:
             self.db.execute("ALTER TABLE assignments ADD COLUMN assigned_allocation TEXT")
         if "first_running" not in columns:
             self.db.execute("ALTER TABLE assignments ADD COLUMN first_running REAL")
+        if "read_fail_since" not in columns:
+            self.db.execute("ALTER TABLE assignments ADD COLUMN read_fail_since REAL")
         # Every process recovery is stop-only, even if a prior owner died before
         # recording an effect. Never renew running authority from saved state.
         with self.db:
@@ -290,7 +362,59 @@ class SaladGuardian:
                 "count": len(rebinds),
                 "events": rebinds[-MAX_PRESTART_REBINDS_LIMIT:],
             }
+        retries = self._prestart_read_retries(operation)
+        if retries:
+            # Additive: absent unless a pre-start read failure was retried.
+            result["prestart_read_retries"] = retries
         return result
+
+    def read_retry_backoff(self, operation: str) -> float | None:
+        """Seconds to wait before the next poll while a pre-start read failure is being
+        retried (bounded, growing with each consecutive failure); None when none is."""
+        row = self.db.execute(
+            "SELECT read_fail_since,stopping FROM assignments WHERE operation=?", (operation,)
+        ).fetchone()
+        if not row or row[0] is None or row[1]:
+            return None
+        count = self.db.execute(
+            "SELECT count(*) FROM events WHERE operation=? AND substr(kind,1,?)=? AND at>=?",
+            (operation, len(PRESTART_READ_RETRY_PREFIX), PRESTART_READ_RETRY_PREFIX, row[0]),
+        ).fetchone()[0]
+        if count <= 0:
+            return None
+        return PRESTART_READ_BACKOFF_SECONDS[min(count, len(PRESTART_READ_BACKOFF_SECONDS)) - 1]
+
+    def _prestart_read_retries(self, operation: str) -> dict | None:
+        rows = self.db.execute(
+            "SELECT at,kind FROM events WHERE operation=? AND substr(kind,1,?)=? ORDER BY sequence",
+            (operation, len(PRESTART_READ_RETRY_PREFIX), PRESTART_READ_RETRY_PREFIX),
+        ).fetchall()
+        if not rows:
+            return None
+        attempts = []
+        for at, kind in rows:
+            try:
+                detail = json.loads(kind[len(PRESTART_READ_RETRY_PREFIX) :])
+            except ValueError:
+                continue
+            attempts.append(
+                {
+                    "at": at,
+                    "reason": _token(detail.get("reason")) or "provider_unknown",
+                    "field": _token(detail.get("field")),
+                }
+            )
+        if not attempts:
+            return None
+        return {
+            "count": len(attempts),
+            "first_at": attempts[0]["at"],
+            "last_at": attempts[-1]["at"],
+            "last_reason": attempts[-1]["reason"],
+            "last_field": attempts[-1]["field"],
+            "deadline_seconds": self.prestart_read_deadline_seconds,
+            "attempts": attempts[-MAX_SHOWN_READ_RETRIES:],
+        }
 
     def _prestart_rebinds(self, operation: str) -> list[dict]:
         rows = self.db.execute(
@@ -327,6 +451,34 @@ class SaladGuardian:
             return False  # cannot tell: fail closed, stop as before
         return self.rebinds_left(operation) > 0
 
+    def _may_retry_read(
+        self, operation, error, first_running, allocation, stopping, fail_since, now
+    ) -> bool:
+        """True when a failed provider read is retried at the next poll instead of stopping.
+
+        Only while the route is pre-start and unallocated: not already stopping, never seen
+        running, no allocation bound, and the provider adapter reports no custody begun
+        (no adapter or no answer: fail closed, stop as before). Only a transient read
+        failure qualifies; a deterministic one (identity mismatch, group gone) stops at
+        once. The window is bounded by the profile's deadline from the first consecutive
+        failure; the assignment's own deadline and heartbeat clocks still stop the run.
+        Post-allocation custody and charging are untouched."""
+        if (
+            stopping
+            or first_running is not None
+            or allocation != "unallocated"
+            or self.custody_started is None
+            or self.prestart_read_deadline_seconds <= 0
+            or not is_transient_read_failure(error)
+        ):
+            return False
+        try:
+            if self.custody_started(operation):
+                return False
+        except Exception:
+            return False
+        return fail_since is None or now - fail_since < self.prestart_read_deadline_seconds
+
     def rebinds_left(self, operation: str) -> int:
         """How many more pre-start re-binds the bound allows for this operation."""
         used = self.db.execute(
@@ -353,7 +505,7 @@ class SaladGuardian:
     def tick(self, operation: str) -> dict:
         row = self.db.execute(
             "SELECT assignment,heartbeat,last_poll,next_stop,stopping,status,allocation_uncertain,"
-            "assigned_allocation,first_running "
+            "assigned_allocation,first_running,read_fail_since "
             "FROM assignments WHERE operation=?",
             (operation,),
         ).fetchone()
@@ -381,8 +533,11 @@ class SaladGuardian:
         uncertain = bool(row[6])
         allocation = row[7] or a.allocation_id
         stop_safe = True
+        fail_since = row[9]
+        retry_detail = None
         try:
             o = self.observe(a)
+            fail_since = None  # a read answered: the failure window is over
             # Real callbacks finish after poll entry. Compare their receipt to
             # the completion clock, not the earlier frozen poll-start time.
             now = self.clock()
@@ -442,14 +597,34 @@ class SaladGuardian:
                     reason, stopping, uncertain = "allocation_changed", True, True
             else:
                 terminal = o.state == "stopped" and not uncertain
-        except Exception:
-            reason, stopping = "provider_unavailable", True
+        except Exception as error:
+            failed_at = self.clock()
+            if self._may_retry_read(
+                operation, error, first_running, allocation, stopping, fail_since, failed_at
+            ):
+                fail_since = failed_at if fail_since is None else fail_since
+                retry_detail = read_failure_detail(error)
+            else:
+                reason, stopping = "provider_unavailable", True
         with self.db:
             self.db.execute(
-                "UPDATE assignments SET last_poll=?,stopping=?,allocation_uncertain=? "
-                "WHERE operation=?",
-                (now, int(stopping), int(uncertain), operation),
+                "UPDATE assignments SET last_poll=?,stopping=?,allocation_uncertain=?,"
+                "read_fail_since=? WHERE operation=?",
+                (now, int(stopping), int(uncertain), fail_since, operation),
             )
+            if retry_detail is not None:
+                self.db.execute(
+                    "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                    (
+                        operation,
+                        now,
+                        PRESTART_READ_RETRY_PREFIX
+                        + json.dumps(
+                            {"reason": retry_detail[0], "field": retry_detail[1]},
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
             if stopping and not row[4] and reason:
                 # Durable cause of this guardian's own stop decision: the reason column
                 # is overwritten later (e.g. exact_terminal_and_sealed), this is not.

@@ -102,6 +102,27 @@ class ProxyResult(Frozen):
         "request_not_sent",
     ]
     observation: dict | None = None
+    # Closed diagnostic detail of a failed read, separate from the closed ``reason`` (which
+    # callers still branch on): a vocabulary token such as ``non_2xx_5xx`` or ``reset``,
+    # and for an identity/format failure the NAME of the offending reviewed field. Never a
+    # value, a body, a status text, or an organization/project/group path.
+    detail: Annotated[str | None, Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")] = None
+    field: Annotated[str | None, Field(pattern=r"^[a-z][a-z_.\-]{0,47}$")] = None
+    # Which provider request failed: list, quotas, gpu_classes, availability, read_group,
+    # read_instance, create or other (closed vocabulary; never a path).
+    request_kind: (
+        Literal[
+            "list",
+            "quotas",
+            "gpu_classes",
+            "availability",
+            "read_group",
+            "read_instance",
+            "create",
+            "other",
+        ]
+        | None
+    ) = None
 
 
 class ProviderCall(Frozen):

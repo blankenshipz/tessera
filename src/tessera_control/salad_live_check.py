@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import signal
@@ -15,6 +16,7 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -47,6 +49,20 @@ PRESTART_FAILURE_CLASSES = frozenset(
 )
 
 
+PRESTART_STEPS = (
+    "create",
+    "bound",
+    "settle",
+    "deliver_inputs",
+    "start_preflight",
+    "start",
+)
+
+
+def _wall_now():
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
 class PrestartStepError(Exception):
     """Carries a closed failure class out of a session step; never carries message text."""
 
@@ -61,6 +77,16 @@ def _exception_type_name(error):
     return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
 
 
+def _closed_token(value):
+    if value is None:
+        return None
+    return (
+        value
+        if type(value) is str and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value)
+        else "invalid_code"
+    )
+
+
 def _prestart_failure(error, default):
     if isinstance(error, TimeoutError):
         failure_class = "wall_bound_exceeded"
@@ -69,10 +95,21 @@ def _prestart_failure(error, default):
     else:
         failure_class = default if default in PRESTART_FAILURE_CLASSES else "prestart_unclassified"
     cause = error.__cause__ if isinstance(error, PrestartStepError) else None
-    return {
+    result = {
         "class": failure_class,
         "exception": _exception_type_name(cause if cause is not None else error),
     }
+    source = cause if cause is not None else error
+    failure = getattr(source, "failure", None)
+    if failure is not None:
+        # A refused provider read (start preflight): the transport's closed diagnostics.
+        result["provider_read"] = {
+            "reason": _closed_token(failure),
+            "detail": _closed_token(getattr(source, "detail", None)),
+            "field": _field(getattr(source, "field", None)),
+            "request_kind": _closed_token(getattr(source, "request_kind", None)),
+        }
+    return result
 
 
 @contextmanager
@@ -564,6 +601,17 @@ class SaladLiveSession:
             last_workload_refusal=_cause(status.get("last_workload_refusal")),
             last_rate_read_failure=_cause(status.get("last_rate_read_failure")),
             last_provider_read_failure=_cause(status.get("last_provider_read_failure")),
+            prestart_read_retries=_prestart_read_retries(status.get("prestart_read_retries")),
+            last_provider_read_failure_reason=_cause(
+                status.get("last_provider_read_failure_reason")
+            ),
+            last_provider_read_failure_detail=_cause(
+                status.get("last_provider_read_failure_detail")
+            ),
+            last_provider_read_failure_field=_field(status.get("last_provider_read_failure_field")),
+            last_provider_read_failure_request_kind=_cause(
+                status.get("last_provider_read_failure_request_kind")
+            ),
         )
         declared = self._multi_output(state)
         if declared is not None:
@@ -822,6 +870,39 @@ def _cause(value):
     return INVALID_CODE
 
 
+def _prestart_read_retries(value):
+    """Closed summary of the guardian's pre-start read retries, or None when there were none.
+
+    Counts, times and closed tokens only (reason and mismatching field NAME), never a body."""
+    if type(value) is not dict:
+        return None
+    count = _count(value.get("count"))
+    if not count:
+        return None
+
+    def at(key):
+        v = value.get(key)
+        return round(v, 3) if type(v) in {int, float} and math.isfinite(v) else None
+
+    return dict(
+        count=count,
+        first_at=at("first_at"),
+        last_at=at("last_at"),
+        last_reason=_cause(value.get("last_reason")),
+        last_field=_cause(value.get("last_field")),
+        deadline_seconds=at("deadline_seconds"),
+    )
+
+
+def _field(value):
+    """A reported field NAME (letters, dots, dashes, underscores; never a value or digits)."""
+    if value is None:
+        return None
+    if type(value) is str and re.fullmatch(r"[a-z][a-z_.\-]{0,47}", value):
+        return value
+    return INVALID_CODE
+
+
 def _count(value):
     """A small non-negative integer from the guardian, else None (never trusted further)."""
     return value if type(value) is int and 0 <= value <= 1_000_000 else None
@@ -930,6 +1011,10 @@ TRANSIENT_GUARDIAN_CODES = frozenset({"guardian_loop_unready", "workload_verifie
 # guardian keeps its own heartbeat and stop authority meanwhile, so it is skipped and
 # retried at the next interval, at most this many times in a row.
 MAX_TRANSIENT_OBSERVE_FAILURES = 3
+# Attempts at the start preflight's fresh provider read (the start POST is sent once, only
+# after a read observed the group) and the pauses between them.
+START_PREFLIGHT_ATTEMPTS = 4
+START_PREFLIGHT_BACKOFF_SECONDS = (2, 4, 8)
 
 
 def _guardian_code(error):
@@ -948,6 +1033,7 @@ def _drive(
     sleep,
     clock,
     watch_signals_file=None,
+    wall_clock=_wall_now,
 ):
     """Internal orchestration seam; isolated fake sessions prove only local behavior.
 
@@ -1005,12 +1091,39 @@ def _drive(
         # (timeout, provider_unknown, rate_stale, ...), if any.
         "guardian_last_rate_read_failure": None,
         "guardian_last_provider_read_failure": None,
+        # The transport's closed diagnostics for that failure (the outward code above stays
+        # provider_unknown): reason (e.g. identity_mismatch, malformed_response,
+        # provider_unavailable), detail (non_2xx_<class>xx, reset, timeout) and the NAME of the
+        # mismatching field. Never values, bodies or organization/project paths.
+        "guardian_last_provider_read_failure_reason": None,
+        "guardian_last_provider_read_failure_detail": None,
+        "guardian_last_provider_read_failure_field": None,
+        # Which provider request failed: list, quotas, gpu_classes, availability, read_group,
+        # read_instance, create or other.
+        "guardian_last_provider_read_failure_request_kind": None,
+        # UTC time each pre-start step finished (create, bound, settle, deliver_inputs,
+        # start_preflight, start); a step that did not run stays None. ``start_preflight``
+        # is the moment the start dispatch began (its fresh provider read runs inside it).
+        "prestart_timestamps": dict.fromkeys(PRESTART_STEPS),
         # Closed class of the pre-start step that failed ({"class", "exception"}: the
         # exception's type name only, never its text), or None. Diagnostic; it does not
         # change status or reason.
         "prestart_failure": None,
+        # Failed fresh reads of the start preflight that were retried before start (the
+        # start itself is sent once); and the guardian's pre-start read retries (closed
+        # summary, no values): see salad_guardian.PRESTART_READ_RETRY_PREFIX.
+        "start_preflight_retries": 0,
+        "guardian_prestart_read_retries": None,
     }
     step = {"name": None}
+
+    def stamp(name):
+        # Diagnostic only: a failing wall clock never changes the journey.
+        try:
+            receipt["prestart_timestamps"][name] = wall_clock()
+        except Exception:
+            pass
+
     deadline = clock() + max_seconds
     interval = min(POLL_INTERVAL_CAP_SECONDS, max(1, max_seconds / max_polls))
     launched = False
@@ -1019,6 +1132,31 @@ def _drive(
     def dispatch(action):
         receipt["dispatch_calls"] += 1
         return session.dispatch(route_id, action)
+
+    def dispatch_start():
+        """dispatch("start"), retrying a failed fresh read of the start preflight.
+
+        The start preflight is a read: when it fails nothing was sent or claimed, so a
+        transient failure (timeout, provider_unknown) is retried a few times within the
+        run bound, keeping the guardian heartbeat alive between attempts. A deterministic
+        failure (identity mismatch, group gone) is not retried; the last failure
+        propagates unchanged. The one start POST itself is never repeated."""
+        from .salad_guardian import is_deterministic_read_failure
+        from .salad_server import ProviderReadUnavailable
+
+        for attempt in range(START_PREFLIGHT_ATTEMPTS):
+            try:
+                return dispatch("start")
+            except ProviderReadUnavailable as error:
+                if (
+                    attempt == START_PREFLIGHT_ATTEMPTS - 1
+                    or is_deterministic_read_failure(error)
+                    or clock() >= deadline
+                ):
+                    raise
+                receipt["start_preflight_retries"] += 1
+                heartbeat()
+                sleep(min(START_PREFLIGHT_BACKOFF_SECONDS[attempt], max(0, deadline - clock())))
 
     beats = {"ok_at": None, "transient": 0}
     observes = {"failed": 0}
@@ -1101,6 +1239,7 @@ def _drive(
             launched = True  # lost create reply still requires exact stop/reconcile
             step["name"] = "create_failed"
             created = dispatch("create")
+            stamp("create")
             receipts = created.get("receipts") if isinstance(created, dict) else None
             created = receipts[-1] if isinstance(receipts, list) and receipts else {}
             rejected = isinstance(created, dict) and (
@@ -1126,6 +1265,8 @@ def _drive(
                 heartbeat()
                 state = observe() or state
                 polls += 1
+                if state.get("provider_id") and receipt["prestart_timestamps"]["bound"] is None:
+                    stamp("bound")
                 if state["provider_status"] == "stopped":
                     stopped_since = clock() if stopped_since is None else stopped_since
                     # The guardian's state always carries termination_confirmed (true only for
@@ -1147,6 +1288,7 @@ def _drive(
                 # send) spends the whole bound before every start; this makes that visible.
                 "waited_seconds": round(clock() - settle_started, 1),
             }
+            stamp("settle")
             if state["provider_status"] != "stopped":
                 raise ValueError("create unresolved")
             if receipt["input_expected"]:
@@ -1156,8 +1298,11 @@ def _drive(
                 step["name"] = "prestart_unclassified"
                 session.deliver_inputs(route_id)
                 receipt["input_delivered"] = True
+                stamp("deliver_inputs")
             step["name"] = "start_failed"
-            dispatch("start")
+            stamp("start_preflight")  # the start dispatch begins with its fresh provider read
+            dispatch_start()
+            stamp("start")
             step["name"] = None
         for _ in range(max_polls):
             if clock() >= deadline:
@@ -1174,11 +1319,24 @@ def _drive(
             receipt["financial"] = _financial(evidence.get("financial", {}))
             receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
             receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
+            receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
             receipt["guardian_stop_cause"] = evidence.get("stop_cause")
             receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
             receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
             receipt["guardian_last_provider_read_failure"] = evidence.get(
                 "last_provider_read_failure"
+            )
+            receipt["guardian_last_provider_read_failure_reason"] = evidence.get(
+                "last_provider_read_failure_reason"
+            )
+            receipt["guardian_last_provider_read_failure_detail"] = evidence.get(
+                "last_provider_read_failure_detail"
+            )
+            receipt["guardian_last_provider_read_failure_field"] = evidence.get(
+                "last_provider_read_failure_field"
+            )
+            receipt["guardian_last_provider_read_failure_request_kind"] = evidence.get(
+                "last_provider_read_failure_request_kind"
             )
             if evidence["output_retained"]:
                 break
@@ -1231,11 +1389,24 @@ def _drive(
                 receipt["financial"] = _financial(evidence.get("financial", {}))
                 receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
                 receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
+                receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
                 receipt["guardian_stop_cause"] = evidence.get("stop_cause")
                 receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
                 receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
                 receipt["guardian_last_provider_read_failure"] = evidence.get(
                     "last_provider_read_failure"
+                )
+                receipt["guardian_last_provider_read_failure_reason"] = evidence.get(
+                    "last_provider_read_failure_reason"
+                )
+                receipt["guardian_last_provider_read_failure_detail"] = evidence.get(
+                    "last_provider_read_failure_detail"
+                )
+                receipt["guardian_last_provider_read_failure_field"] = evidence.get(
+                    "last_provider_read_failure_field"
+                )
+                receipt["guardian_last_provider_read_failure_request_kind"] = evidence.get(
+                    "last_provider_read_failure_request_kind"
                 )
                 if evidence.get("provider_stop_confirmed"):
                     receipt["provider_stop_confirmed"] = True
@@ -1258,10 +1429,23 @@ def _drive(
         receipt["financial"] = _financial(evidence.get("financial", {}))
         receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
         receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
+        receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
         receipt["guardian_stop_cause"] = evidence.get("stop_cause")
         receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
         receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
         receipt["guardian_last_provider_read_failure"] = evidence.get("last_provider_read_failure")
+        receipt["guardian_last_provider_read_failure_reason"] = evidence.get(
+            "last_provider_read_failure_reason"
+        )
+        receipt["guardian_last_provider_read_failure_detail"] = evidence.get(
+            "last_provider_read_failure_detail"
+        )
+        receipt["guardian_last_provider_read_failure_field"] = evidence.get(
+            "last_provider_read_failure_field"
+        )
+        receipt["guardian_last_provider_read_failure_request_kind"] = evidence.get(
+            "last_provider_read_failure_request_kind"
+        )
         if not evidence["output_retained"] or not evidence["writers_quiescent"]:
             raise ValueError("custody unresolved")
         multi = evidence.get("outputs") is not None
