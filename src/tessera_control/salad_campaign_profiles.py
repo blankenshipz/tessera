@@ -43,6 +43,8 @@ _SaladName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,62}
 _Hex64 = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 _ImageDigest = Annotated[str, StringConstraints(pattern=r"^sha256:[a-f0-9]{64}$")]
 _GPU_CLASS = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+# Same shape as the CPU rates (``remote_execution_models.CpuRate``); positive.
+_GPU_HOUR_USD = r"^(?:0|[1-9][0-9]{0,3})(?:\.[0-9]{1,6})?$"
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 
@@ -56,11 +58,18 @@ class StageAdapterConfig(_Closed):
     Every field is optional (ADR 0077): the section's presence is the opt-in. ``program`` is the
     operator-authored program template of an adapted stage (absent: the generic default of
     ``campaign_salad_adapter``); ``max_input_bytes`` is a ceiling on the stage's input (absent:
-    only the profile's disk bounds it; the reviewed cap is the pinned input's exact size)."""
+    only the profile's disk bounds it; the reviewed cap is the pinned input's exact size).
+
+    ``gpu_hour_usd`` is required on, and only on, a GPU profile's section (ADR 0141 amendment
+    2026-11-23): the operator's USD/hour price for that GPU class, the rate a candidate's
+    full-duration estimate is computed from at submit. It is an estimate input like
+    ``cpu_rate``, never invoice or cost proof; the published GPU rate is still read and checked
+    against the candidate's per-run cap at admission (fails closed when higher)."""
 
     program: SaladProgramTemplate | None = None
     max_input_bytes: int | None = Field(default=None, ge=1, le=1 << 40)
     grant_ttl_seconds: int = Field(default=21600, ge=3600, le=43200)
+    gpu_hour_usd: Annotated[str, StringConstraints(pattern=_GPU_HOUR_USD)] | None = None
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -105,7 +114,8 @@ class SaladCampaignProfile(_Closed):
     # Narrowing only (ADR 0044): False ignores any approve-body review pre-approval for
     # stages of this profile. True never pre-approves anything by itself.
     preapprove_reviews: bool = True
-    # Present only on a CPU profile the operator opened to adapted local-docker stages (ADR 0076).
+    # Present only on a profile the operator opened to adapted local-docker stages (ADR 0076); on
+    # a GPU profile it also carries the operator's GPU price (ADR 0141 amendment 2026-11-23).
     stage_adapter: StageAdapterConfig | None = None
 
     @model_validator(mode="after")
@@ -119,8 +129,17 @@ class SaladCampaignProfile(_Closed):
             raise ValueError("max_task_cents must be at least max_run_cents")
         if (self.gpu_class is None) == (self.cpu_rate is None):
             raise ValueError("a profile names a gpu_class (GPU) or cpu_rate (CPU-only), not both")
-        if self.stage_adapter is not None and self.gpu:
-            raise ValueError("stage_adapter applies to a CPU-only profile")
+        adapter = self.stage_adapter
+        if adapter is not None and self.gpu and adapter.gpu_hour_usd is None:
+            raise ValueError(
+                "stage_adapter applies to a CPU-only profile, or to a GPU profile that names "
+                "its operator price in stage_adapter.gpu_hour_usd"
+            )
+        if adapter is not None and not self.gpu and adapter.gpu_hour_usd is not None:
+            raise ValueError("stage_adapter.gpu_hour_usd applies to a GPU profile only")
+        if adapter is not None and adapter.gpu_hour_usd is not None:
+            if Decimal(adapter.gpu_hour_usd) <= 0:
+                raise ValueError("stage_adapter.gpu_hour_usd must be positive")
         return self
 
     @property
@@ -138,6 +157,15 @@ class SaladCampaignProfile(_Closed):
             raise ValueError("only a CPU profile has a static rate")
         hourly = self.cpu_rate.hourly_usd(self.cpu_millicores, self.memory_mb)
         return hourly * Decimal(seconds) * 100 / 3600
+
+    def adapter_estimated_cents(self, seconds: int) -> Decimal:
+        """Estimate (cents) of an adapted stage running ``seconds`` on this profile: the CPU rates,
+        or the GPU price the operator set in ``stage_adapter.gpu_hour_usd``."""
+        if not self.gpu:
+            return self.estimated_cents(seconds)
+        if self.stage_adapter is None or self.stage_adapter.gpu_hour_usd is None:
+            raise ValueError("this GPU profile names no operator GPU price")
+        return Decimal(self.stage_adapter.gpu_hour_usd) * Decimal(seconds) * 100 / 3600
 
     def image_allowed(self, image: str) -> bool:
         return _image_digest(image) in self.allowed_image_digests

@@ -2,10 +2,12 @@
 
 Started by the runtime as ``python stage_argv.py WORK OUT -- ARGV...``. The argv is the stage's
 own, carried in the hash-pinned manifest. The local-docker worker mounts a stage's input at
-``/inputs`` and its outputs at ``/outputs``; here those are ``WORK/input`` and ``OUT``, so an
-argument that is exactly ``/inputs`` or ``/outputs``, starts with it plus ``/``, or is such a path
-after ``--name=`` is rewritten. Nothing else is touched and no environment is added. The child
-runs in WORK with no stdin; this exits with the child's exit code (1 when it died on a signal).
+``/inputs``, its pinned public files at ``/inputs-public/<input>/<name>`` (ADR 0097) and its
+outputs at ``/outputs``; here those are ``WORK/input``, ``WORK/files/<input>/<name>`` (where the
+runtime put the verified fetches) and ``OUT``, so an argument that is exactly one of them, starts
+with it plus ``/``, or is such a path after ``--name=`` is rewritten. Nothing else is touched and
+no environment is added. The child runs in WORK with no stdin; this exits with the child's exit
+code (1 when it died on a signal).
 Standard library only.
 """
 
@@ -27,7 +29,11 @@ def _map(value, mounts):
 
 def rewrite(argv, work, out_dir):
     """The argv with the container mount points replaced by this run's directories."""
-    mounts = (("/inputs", os.path.join(work, "input")), ("/outputs", out_dir))
+    mounts = (
+        ("/inputs", os.path.join(work, "input")),
+        ("/inputs-public", os.path.join(work, "files")),
+        ("/outputs", out_dir),
+    )
     mapped = []
     for token in argv:
         if token.startswith("--") and "=" in token:

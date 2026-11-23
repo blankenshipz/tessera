@@ -406,8 +406,15 @@ def check_gpu_runtime_manifest_rules(manifest, input_declared, redirect_hosts=()
         raise ValueError("gpu_runtime_v1 input item paths must be unique")
     if sum(1 for r in manifest["fetches"] if r.get("kind") == "entry") != 1:
         raise ValueError("gpu_runtime_v1 manifest needs exactly one entry")
-    if any(is_image_item(r) for r in manifest["fetches"]) and len(manifest["fetches"]) != 1:
-        raise ValueError("gpu_runtime_v1 image entry must be the manifest's only item")
+    if any(is_image_item(r) for r in manifest["fetches"]) and any(
+        not is_image_item(r) and (is_input_item(r) or r.get("kind") != "file")
+        for r in manifest["fetches"]
+    ):
+        # ADR 0097/0076: beside the image entry, only pinned public files the runtime fetches
+        # and verifies before the claim; no wheel, URL entry or input item.
+        raise ValueError(
+            "gpu_runtime_v1 image entry must be the manifest's only item besides pinned file items"
+        )
     return items
 
 

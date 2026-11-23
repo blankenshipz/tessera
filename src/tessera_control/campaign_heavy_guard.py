@@ -31,13 +31,23 @@ REMOTE_PROVIDER = "salad"
 # Extra heavy tag beyond ADR 0088's ``heavy`` and ``training`` (the class is not changed by it).
 EXTRA_HEAVY_TAGS = frozenset({"pretraining"})
 # Remote skip reasons that mean the remote side could not be reached or authorized right now.
-CREDENTIAL_REASONS = frozenset({"credential_expired", "credential_unusable", "safety_service_down"})
+CREDENTIAL_REASONS = frozenset(
+    {
+        "credential_unavailable",  # placement's skip when the provider's own check_stage says so
+        "credential_expired",
+        "credential_unusable",
+        "safety_service_down",
+    }
+)
+INFRA_PREFIX = "infra_"
 PROFILE_REASONS = frozenset({"not_enrolled", "provider_invalid"})
 STEERING_REASONS = frozenset({"excluded_by_steering", "not_pinned"})
 # Reason codes, in the order they are reported.
 REASON_ORDER = (
+    "no_remote_profile",
     "credential_unavailable",
     "no_fitting_profile",
+    "remote_failed_infra",
     "remote_skipped",
     "operator_override",
     "not_listed",
@@ -94,14 +104,17 @@ def heavy(
     """Whether the guard treats the stage as heavy, and the signals that decided it.
 
     ADR 0088's heavy signals (``declared_memory``, ``long_expected_runtime``, ``tag:heavy``,
-    ``tag:training``), plus ``tag:pretraining``, ``large_inputs`` (pinned inputs the store
-    records summing to at least the heavy threshold, read only with a connection) and
-    ``large_outputs`` (declared output ``max_bytes`` summing to at least it). A stage that
-    declares egress is never guarded: it cannot list rented capacity (ADR 0088)."""
+    ``tag:training``), a gpu requirement (``tag:gpu*``: the stage asks for hardware a local
+    provider rarely has), plus ``tag:pretraining``, ``large_inputs`` (pinned inputs the store
+    records summing to at least the heavy threshold, read only with a connection),
+    ``large_public_inputs`` (pinned public downloads, ADR 0097, whose ``max_bytes`` sum to at
+    least it) and ``large_outputs`` (declared output ``max_bytes`` summing to at least it). A
+    stage that declares free-form egress is never guarded: it cannot list rented capacity (ADR
+    0088). Pinned public downloads are not egress: the provider fetches them by digest."""
     cls, class_signals = preference.stage_class(stage)
     if cls == "egress_bound":
         return False, []
-    signals = [item for item in class_signals if not item.startswith("tag:gpu")]
+    signals = list(class_signals)
     signals += [f"tag:{tag}" for tag in sorted(EXTRA_HEAVY_TAGS & set(stage.placement_tags))]
     threshold = preference.heavy_bytes_threshold()
     if (
@@ -110,9 +123,22 @@ def heavy(
         and input_bytes(connection, campaign, stage) >= threshold
     ):
         signals.append("large_inputs")
+    if public_bytes(stage) >= threshold:
+        signals.append("large_public_inputs")
     if stage.max_output_bytes >= threshold:
         signals.append("large_outputs")
     return bool(signals), signals
+
+
+def public_bytes(stage: NormalStage) -> int:
+    """The summed ``max_bytes`` of the stage's pinned ``public_artifact`` files (ADR 0097): what
+    the executing provider downloads and verifies by digest. Pure; read from the spec only."""
+    return sum(
+        size
+        for item in stage.inputs
+        if item.kind == "public_artifact"
+        for _name, _url, _sha, size in item.public_files
+    )
 
 
 def salad_registered(connection: sqlite3.Connection, org_id: str, project_id: str) -> bool:
@@ -147,6 +173,8 @@ class Guard:
     signals: tuple[str, ...]
     mode: str
     kinds: Mapping[str, str]
+    # False: no usable Salad profile for the project; the guard then only records (warn).
+    registered: bool = True
 
     def is_local(self, provider_id: str) -> bool:
         return self.kinds.get(provider_id) == "local"
@@ -156,17 +184,23 @@ class Guard:
 
 
 def applies(
-    connection: sqlite3.Connection, campaign: Mapping[str, Any], stage: NormalStage
+    connection: sqlite3.Connection,
+    campaign: Mapping[str, Any],
+    stage: NormalStage,
+    heavy_result: tuple[bool, list[str]] | None = None,
 ) -> Guard | None:
-    """The guard for this stage, or None (not heavy, or no profile registered): then nothing
-    about the placement changes."""
-    if not salad_registered(connection, campaign["org_id"], campaign["project_id"]):
-        return None
-    is_heavy, signals = heavy(stage, connection, campaign)
+    """The guard for this stage, or None (not heavy): then nothing about the placement changes.
+
+    Without a usable Salad profile the guard only records (``no_remote_profile``) and always
+    in warn mode, even when the operator set ``refuse``: a stage never waits for capacity that
+    cannot exist, but the placement still carries the record and the event. ``heavy_result`` is
+    ``heavy(...)`` when the caller already computed it."""
+    registered = salad_registered(connection, campaign["org_id"], campaign["project_id"])
+    is_heavy, signals = heavy_result or heavy(stage, connection, campaign)
     if not is_heavy:
         return None
     kinds = {pid: preference.candidate_kind(stage, pid) for pid in stage.candidate_ids}
-    return Guard(tuple(signals), mode(), kinds)
+    return Guard(tuple(signals), mode() if registered else "warn", kinds, registered)
 
 
 def reasons(
@@ -176,14 +210,29 @@ def reasons(
     skipped: Iterable[Any],
     steering: Mapping[str, Any] | None,
     order_record: Mapping[str, Any] | None,
+    attempts: Iterable[Mapping[str, Any]] = (),
 ) -> tuple[list[str], list[dict[str, str]]]:
     """Why a heavy stage reached the local candidate ``local_id``: reason codes in
-    ``REASON_ORDER`` and each remote candidate's skip (provider id and reason code)."""
+    ``REASON_ORDER`` and each remote candidate's skip (provider id and reason code).
+    ``attempts`` are the stage's earlier attempts: a remote candidate whose attempt failed on
+    infrastructure is moved last by placement, which is ``remote_failed_infra`` (the provider
+    id and the failure class in ``detail``), not an untried remote."""
     skipped = list(skipped)
     remote = [pid for pid in base.candidate_ids if guard.is_remote(pid)]
     remote_skips = [item for item in skipped if guard.is_remote(item.provider_id)]
     detail = [{"provider_id": s.provider_id, "reason": s.reason} for s in remote_skips]
+    if not guard.registered:
+        return ["no_remote_profile"], detail
     found: set[str] = set()
+    infra_failed: dict[str, str] = {}
+    for attempt in attempts:
+        failure = str(attempt["failure_class"] or "")
+        pid = attempt["provider_id"] or base.provider
+        if failure.startswith(INFRA_PREFIX) and guard.is_remote(pid):
+            infra_failed[pid] = failure
+    for pid, failure in infra_failed.items():
+        found.add("remote_failed_infra")
+        detail.append({"provider_id": pid, "reason": failure})
     for item in remote_skips:
         if item.reason in CREDENTIAL_REASONS:
             found.add("credential_unavailable")
@@ -202,7 +251,7 @@ def reasons(
     if not remote:
         found.add("not_listed")
     else:
-        tried = {item.provider_id for item in remote_skips}
+        tried = {item.provider_id for item in remote_skips} | set(infra_failed)
         untried = [pid for pid in remote if pid not in tried]
         if untried:
             # A remote candidate came after the local one in the order used.

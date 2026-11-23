@@ -30,6 +30,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from .campaign_heavy_remote import HeavyRemoteCandidate
 from .campaign_models import MAX_PLACEMENT_TAGS, NormalStage, PlacementTag, ProviderId
 
 MAX_RULES = 8
@@ -111,6 +112,8 @@ class PlacementPreferences(_Closed):
     # ADR 0107: what a heavy stage placed on a local candidate while a remote profile is
     # registered does: ``warn`` (placed, with a recorded warning) or ``refuse`` (it waits).
     heavy_local_fallback: Literal["warn", "refuse"] = "warn"
+    # ADR 0141: the remote candidate submit adds to a heavy stage that lists none (absent: none).
+    heavy_remote_candidate: HeavyRemoteCandidate | None = None
 
     @model_validator(mode="after")
     def _distinct(self) -> PlacementPreferences:
@@ -228,11 +231,23 @@ _PREFER_KINDS = {
 }
 
 
-def default_order(stage: NormalStage) -> tuple[tuple[str, ...], dict[str, Any] | None]:
-    """The built-in default policy's order and its record (None: nothing to say)."""
+def default_order(
+    stage: NormalStage, guard_signals: Iterable[str] = ()
+) -> tuple[tuple[str, ...], dict[str, Any] | None]:
+    """The built-in default policy's order and its record (None: nothing to say).
+
+    ``guard_signals`` are the heavy signals the placement guard found (ADR 0107: it also counts
+    ``pretraining``, large pinned inputs and large declared outputs). They make a stage the
+    class function calls ``light`` heavy here, so ordering and the guard agree; they never
+    change an egress-bound or gpu stage."""
     spec_order = stage.candidate_ids
     placement = stage.placement_ids
     cls, signals = stage_class(stage)
+    extra = [item for item in guard_signals if item not in signals]
+    if cls == "light" and extra:
+        cls, signals = "heavy", extra
+    elif cls == "heavy":
+        signals = [*signals, *extra]
     if cls == "light":
         return spec_order, None  # no signal: the spec author's explicit order stands
     wanted = _PREFER_KINDS[cls]
@@ -265,14 +280,17 @@ def default_order(stage: NormalStage) -> tuple[tuple[str, ...], dict[str, Any] |
     return order, record
 
 
-def preferred_order(stage: NormalStage) -> tuple[tuple[str, ...], dict[str, Any] | None]:
+def preferred_order(
+    stage: NormalStage, guard_signals: Iterable[str] = ()
+) -> tuple[tuple[str, ...], dict[str, Any] | None]:
     """The stage's candidate list with the first matching operator rule applied, else the
     built-in default policy (ADR 0088), and the record of what ordered it (None when nothing
     did, and the list is then the spec's own order).
 
     Only the stage's own provider and ``alternate_providers`` move: the preferred ones that
     the stage lists come first, the rest keep the spec's order, and ``reroute_providers``-only
-    targets stay at the end (ADR 0058). A stage without alternates is never reordered."""
+    targets stay at the end (ADR 0058). A stage without alternates is never reordered.
+    ``guard_signals`` are passed to the default policy (see ``default_order``)."""
     spec_order = stage.candidate_ids
     if _ACTIVE is not None:
         for rule in _ACTIVE.rules:
@@ -295,7 +313,7 @@ def preferred_order(stage: NormalStage) -> tuple[tuple[str, ...], dict[str, Any]
                 "reordered": order != spec_order,
             }
     if default_enabled() and stage.alternates:
-        return default_order(stage)
+        return default_order(stage, guard_signals)
     return spec_order, None
 
 
@@ -311,11 +329,15 @@ def status_view(stages: Iterable[NormalStage]) -> dict[str, Any]:
     covered = []
     defaults = []
     if default_enabled():
+        from .campaign_heavy_guard import heavy as guard_heavy
+
         for stage in stages:
             if not stage.alternates:
                 continue
-            order, record = default_order(stage)
-            cls, signals = stage_class(stage)
+            # The store-derived ``large_inputs`` signal needs a connection and is not shown here.
+            order, record = default_order(stage, guard_heavy(stage)[1])
+            cls = record["class"] if record is not None else stage_class(stage)[0]
+            signals = record["signals"] if record is not None else stage_class(stage)[1]
             defaults.append(
                 {
                     "stage_key": stage.key,

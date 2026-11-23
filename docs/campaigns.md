@@ -111,6 +111,26 @@ revoking a delegation is a person's act; the MCP tools only read delegations and
 `tessera_delegated_approve_campaign`, `tessera_delegated_gate_decision`). Enroll an agent for it with
 `--allow-delegated-decisions`. Contract and limits:
 [ADR 0122](decisions/0122-owner-signed-approval-delegations.md).
+
+**Salad review stops under a delegation (ADR 0150).** A delegation may carry an optional
+`review_rule`: the review `kinds` it covers (`source_assessment`, `plan`, `source_use`),
+`max_attempt_cents` (at most the delegation's per-run cap), `max_duration_seconds`,
+`provider_classes` (`salad_gpu`, `salad_cpu`) and `source_use_intents` (program outcomes). Without one,
+a spec with a Salad stage is refused `spec_needs_human` as before; with one, every Salad candidate must
+sit inside it or the delegated approval is refused with the reason (`review_cap_exceeded`,
+`review_time_limit_exceeded`, `provider_class_not_allowed`, `source_use_intent_not_covered`). Nothing
+is pre-approved at approval: when the runner first reaches the stage's review stop (after `not_before`
+for a deferred campaign) it re-checks the delegation (active, unexpired, signer still live, stage
+inside the rule) and records an ordinary review pre-approval bound to the digests it derives from the
+approved spec, at the stage's own hold, expiring with the approval or the delegation
+(`campaign.review_preapproval_delegated` names the delegation and its terms digest). Each review is
+re-checked when it is resolved. Anything outside the delegation, a kind it does not cover, a revoked or
+expired delegation, or a signer no longer live leaves the review with a person, with the reason codes
+on `campaign.preapproval_declined` and on the campaign view's `salad_review` item
+(`delegation_declined`). Provider trust, data-class and licence-label checks still refuse what they
+refuse. The receipt's `preapprovals` entry names the delegation id and terms digest. A stage placed on
+a Salad alternate is not covered.
+
 **Provider-side cache.** A `public_artifact` source with `cache: true` lets the executing provider keep
 the verified bytes by digest: the local worker in its private cache directory, and the Salad runtime only
 when the provider supplies persistent storage ([ADR 0116](decisions/0116-provider-fetch-cache.md)). Every
@@ -251,15 +271,17 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   ([campaign providers](campaign-providers.md#placement-preference-by-resource-class)), which may
   reorder a stage's approved `alternate_providers` candidates; they name no destination.
 - **Heavy-stage placement guard (ADR 0107).** When a heavy stage (an ADR 0088 signal, a
-  `pretraining` tag, large pinned inputs, or large declared output limits) is placed on a local or
+  `pretraining` or gpu tag, large pinned inputs, or large declared output limits; placement ordering
+  uses the same signals) is placed on a local or
   self-hosted candidate while a Salad profile is registered for the project, the receipt attempt
   and the `campaign.stage_placed` event carry a `placement.heavy_guard` warning with signals and
   reasons, a `campaign.heavy_stage_local_fallback` event is recorded, and `tessera_get_campaign`
   shows a per-stage `heavy_guard`. The operator may set `placement_preferences.heavy_local_fallback`
   to `refuse`, so the stage waits (`heavy_local_refused`) instead of running locally; the default
   `warn` changes nothing else
-  ([campaign providers](campaign-providers.md#heavy-stage-placement-guard)). Other stages and
-  projects without a Salad profile are unaffected.
+  ([campaign providers](campaign-providers.md#heavy-stage-placement-guard)). Without a Salad
+  profile a heavy local placement records only `no_remote_profile` (as a warning, also in refuse mode); light stages are
+  unaffected.
 - **Grant lifetime and slots (ADR 0048).** A stage whose `grant_ttl_seconds` is shorter than
   `max_duration_seconds` plus 300 s is refused at submit and approval
   (`grant_shorter_than_stage_duration`). The runner issues a grant, and so starts its
@@ -364,7 +386,10 @@ approval the campaign stays `running` and reads as `waiting` with reason `not_be
 `waiting` key of the campaign read, the plain report and the MCP reads, with `seconds_remaining`);
 it is not failed or stuck. The approval's expiry (`deadline_seconds` from the first approval)
 still bounds the wait, so `deadline_seconds` must cover the wait plus the run, and approve is
-refused when `not_before` is not before that expiry. Recurring templates are a follow-up.
+refused when `not_before` is not before that expiry. A delegated approval makes the same comparison and also
+compares `not_before` with the delegation's own expiry: past either, it is not recorded (409 `outside_delegation`
+with `not_before_after_approval_expiry` and/or `not_before_after_delegation_expiry`), the campaign stays
+at its normal approval stop and the owner is asked. Recurring templates are a follow-up.
 
 ## Window requirement
 
@@ -497,8 +522,14 @@ expires, is replaced or is revoked stops all starts.
   (two arms, metric, split lock, partition, statistic, comparison, threshold, minimum
   pairs, allowed sources, allowed outcomes `pass`/`fail`). It is evaluated at the first
   approval and at every standing start (retries and follow-ons included), inside the
-  admission transaction. An `unlock` on an approval of a campaign that is not `submitted` is
-  refused (409), never ignored. Refusals read `unlock_not_satisfied:<index>:<code>`.
+  admission transaction. A forward re-approval of a lapsed (`paused_delegation_lapsed`)
+  campaign re-evaluates the first approval's requirements: a human re-approval restates the
+  first `unlock` exactly (matched by requirement digest; a missing, changed, added or
+  stricter set is refused with 409), a standing-started campaign reuses its standing
+  approval's stored `unlock`, and every re-evaluation is recorded on the receipt. An
+  `unlock` on a re-approval of a campaign first approved without one, or on a cleanup
+  re-approval, is refused (409), never ignored. Refusals read
+  `unlock_not_satisfied:<index>:<code>`.
 - A requirement may add `measurement` (`{stage, name, op, value}`): a fail-closed condition
   on one number in the named campaign's terminal receipt (the stage needs exactly one
   succeeded attempt with that measurement). It narrows the go or outcome and never replaces
@@ -516,8 +547,12 @@ expires, is replaced or is revoked stops all starts.
   trusts a stored group.
 - `tessera serve --program-budget FILE` (`tessera.program-budget.v1`, owner-only) caps the
   committed money across campaigns; every first approval and standing start counts against
-  it. It never replaces the guardian or campaign caps.
-- A receipt gains an `unlock` section when admission was conditional.
+  it. A forward re-approval of a lapsed campaign re-checks it without counting the campaign
+  twice (its cap is already committed, so the program must still admit the existing
+  commitment) and is refused when it no longer fits. Cleanup re-approvals are not checked.
+  It never replaces the guardian or campaign caps.
+- A receipt gains an `unlock` section when admission was conditional, with one entry per
+  requirement per admission (first approval and each forward re-approval), oldest first.
 
 ## Input releases of idle campaigns
 
@@ -542,8 +577,8 @@ does not refuse a new campaign, and the new release revokes it in the same trans
 ## Not implemented
 
 Bound gate outcomes without human-entered metric records (a human
-records every metric), a program budget recorded on events or re-read after startup,
-re-checking an unlock when a lapsed campaign is re-approved; multi-host runners; dynamic fan-out; more than 32
+records every metric), a program budget recorded on events or re-read after startup;
+multi-host runners; dynamic fan-out; more than 32
 stages in a v1 spec (v2 allows 64) or approvals past 7 days. Unexpired human releases of the same snapshot to the same worker
 block the runner (it records `step_refused` and never revokes the human release).
 An admitted attempt left unresolved after cancel or a T1 expiry keeps its experiment-level

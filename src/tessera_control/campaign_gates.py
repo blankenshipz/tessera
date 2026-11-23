@@ -246,6 +246,68 @@ def evaluate_unlock(
     return None, evaluations
 
 
+_STORED_INVALID = "Admission refused: unlock_not_satisfied:stored_requirements_invalid"
+
+
+def readmission_requirements(
+    connection: sqlite3.Connection,
+    campaign: Any,
+    supplied: list[UnlockRequirement] | None,
+) -> list[UnlockRequirement]:
+    """The unlock requirements a forward re-approval of ``campaign`` must re-evaluate.
+
+    They are the first approval's, identified by the digests it recorded (no requirement
+    text is stored for a human approval). A human re-approval restates them exactly; a
+    campaign started by a standing approval takes them from that approval's immutable
+    ``unlock_json`` unless restated. A missing, different, added or stricter set is refused
+    (409), never dropped or silently swapped: a re-approval re-checks the conditions the
+    campaign was admitted under, and only those."""
+    first = connection.execute(
+        """SELECT id FROM campaign_approvals WHERE campaign_id=?
+        ORDER BY rowid LIMIT 1""",
+        (campaign["id"],),
+    ).fetchone()
+    rows = (
+        []
+        if first is None
+        else connection.execute(
+            """SELECT requirement_index, requirement_digest, standing_approval_id
+            FROM campaign_unlock_evaluations WHERE campaign_id=? AND approval_id=?
+            ORDER BY requirement_index""",
+            (campaign["id"], first["id"]),
+        ).fetchall()
+    )
+    if not rows:
+        if supplied:
+            raise Conflict(
+                "An unlock applies to a campaign's first approval only; this campaign's "
+                "first approval had none."
+            )
+        return []
+    if [row["requirement_index"] for row in rows] != list(range(len(rows))):
+        raise Conflict(_STORED_INVALID)
+    requirements = list(supplied or [])
+    standing_id = rows[0]["standing_approval_id"]
+    if not requirements and standing_id is not None:
+        standing = connection.execute(
+            """SELECT unlock_json FROM campaign_standing_approvals
+            WHERE id=? AND org_id=? AND project_id=?""",
+            (standing_id, campaign["org_id"], campaign["project_id"]),
+        ).fetchone()
+        try:
+            requirements = parse_unlock_json(None if standing is None else standing[0])
+        except ValueError:
+            raise Conflict(_STORED_INVALID) from None
+    if [requirement_digest(item) for item in requirements] != [
+        row["requirement_digest"] for row in rows
+    ]:
+        raise Conflict(
+            "A forward re-approval must restate the first approval's unlock exactly "
+            f"({len(rows)} requirement(s)); it cannot drop, change or add one."
+        )
+    return requirements
+
+
 def record_evaluations(
     connection: sqlite3.Connection,
     *,
@@ -283,14 +345,16 @@ def record_evaluations(
 
 
 def unlock_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> dict[str, Any]:
-    """What admitted this campaign (an empty list when it was admitted unconditionally)."""
+    """What admitted this campaign: one entry per requirement per admission (a forward
+    re-approval re-evaluates the first approval's), oldest admission first; an empty list
+    when it was admitted unconditionally."""
     rows = connection.execute(
         """SELECT e.requirement_index, e.requirement_digest, e.named_campaign_id, e.basis_kind,
         e.gate_decision_id, e.outcome, e.result_digest, e.evaluated_at, e.standing_approval_id,
         g.decision_class AS gate_decision_class, g.delegation_id AS gate_delegation_id
         FROM campaign_unlock_evaluations e
         LEFT JOIN campaign_gate_decisions g ON g.id=e.gate_decision_id
-        WHERE e.campaign_id=? ORDER BY e.requirement_index, e.id""",
+        WHERE e.campaign_id=? ORDER BY e.rowid""",
         (campaign_id,),
     ).fetchall()
     items = []

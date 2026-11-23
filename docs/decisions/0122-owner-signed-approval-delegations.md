@@ -44,7 +44,8 @@ it, with the owner asked whenever a request falls outside it.
    settled, so cancelling a campaign that spent never frees its spend); the number of campaigns
    approved under it, cancelled ones included, is within `max_approvals`; every provider is allowed; the program covers the project; and the usual
    admission checks (spec references, trust, program budget) pass. It carries no unlock requirement and
-   no Salad review pre-approval, so a spec that needs a person for those is refused. The approval row
+   no Salad review pre-approval, so a spec that needs a person for those is refused (unless the
+   delegation carries the optional review rule of [ADR 0150](0150-deferred-launch-delegated-preclear.md)). The approval row
    records the signing person as the approver (the runner acts as, and only while, that person is live),
    the class `owner_delegated` and the delegation id; the decision events carry the same.
 4. **A delegated gate decision** (`POST /campaigns/{id}/delegated-gate-decision`) records a go or no-go

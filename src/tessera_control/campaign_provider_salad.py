@@ -66,7 +66,8 @@ OUTPUT_LIMITS = OutputLimits(
 # The step set is ADR 0038's table: Salad adds the study, decision, capability and route
 # steps to the core ones. The table is closed; a plugin never adds a step.
 # Salad stages carry their own bound program gate; the generic split-binding, metric and
-# evidence-row steps (ADR 0049, ADR 0052) are not delegated to them.
+# evidence-row steps (ADR 0049, ADR 0052) are not delegated to them. ``record_provider_fetch``
+# (ADR 0097) is: control reads a Salad stage's fetch rows from its retained output.json.
 DELEGABLE_STEPS = frozenset(STEP_TABLE) - {
     "bind_split",
     "record_gate_metric",
@@ -297,6 +298,11 @@ class SaladRouteProvider:
             raise ValueError(f"{label}: Salad stages have no exit code to classify as transient")
         if stage.max_exposure_cents < 1:
             raise ValueError(f"{label}: a Salad stage needs max_exposure_cents >= 1")
+        # The pins first (ADR 0097): a fetch row that is not a pin is refused with its closed
+        # reason, adapted or not.
+        refusal = public_artifact_refusal(stage, config)
+        if refusal is not None:
+            raise ValueError(f"{label}: {refusal}")
         if config.adapted:
             self._validate_adapted(label, stage, config)
         elif list(stage.argv) != [SALAD_COMMAND, *workload.argv_template]:
@@ -315,9 +321,6 @@ class SaladRouteProvider:
         # this duration, so it bounds the time humans have to resolve the attempt's reviews.
         if stage.max_duration_seconds > 3600 or (not config.adapted and len(stage.argv) > 32):
             raise ValueError(f"{label}: max_duration_seconds <= 3600 and at most 32 argv items")
-        refusal = public_artifact_refusal(stage, config)
-        if refusal is not None:
-            raise ValueError(f"{label}: {refusal}")
         if (
             public_pins(stage) is None
             and stage_has_nonpublic_input(stage)
@@ -334,24 +337,33 @@ class SaladRouteProvider:
 
         The stage's argv is the local-docker form; what runs on Salad is the contract's argv, whose
         manifest holds exactly the image entry with the stage's argv, so a person reviews one
-        and the other cannot differ."""
+        and the other cannot differ. Beside it the manifest holds exactly one ``file`` item per
+        ``public_artifact`` pin of the stage (ADR 0097), and the contract's fetch rows and redirect
+        hosts are exactly the pins: no other fetch, redirect host or env is declared. It may be a
+        GPU candidate (ADR 0141 amendment 2026-11-23): ``check_stage`` still requires a GPU profile
+        for it and a CPU-only one otherwise."""
+        from .campaign_salad_adapter import adapted_manifest, public_file_items
+
         workload = config.workload
-        if config.gpu:
-            raise ValueError(f"{label}: an adapted stage is CPU-only")
         try:
             if workload.runtime != GPU_RUNTIME_V1:
                 raise ValueError("the workload must use the gpu_runtime_v1 layout")
             manifest = check_gpu_runtime_inline_rules(workload)
             items = None if manifest is None else manifest["fetches"]
-            if (
-                not items
-                or len(items) != 1
-                or not is_image_item(items[0])
-                or items[0]["argv"] != list(stage.argv)
-            ):
+            if not items or not is_image_item(items[0]) or items[0]["argv"] != list(stage.argv):
                 raise ValueError("the manifest must be the stage's argv as its one image entry")
-            if workload.egress.fetches or workload.egress.redirect_hosts or workload.env:
-                raise ValueError("an adapted workload declares no fetch, redirect host or env")
+            files, hosts = public_file_items(stage)
+            if manifest != adapted_manifest(list(stage.argv), files, hosts):
+                raise ValueError(
+                    "the manifest must be the image entry plus exactly the stage's pinned files"
+                )
+            rows = sorted((f.url, f.sha256, f.max_bytes) for f in workload.egress.fetches)
+            pinned = sorted((f["url"], f["sha256"], f["max_bytes"]) for f in files)
+            if rows != pinned or list(workload.egress.redirect_hosts) != hosts or workload.env:
+                raise ValueError(
+                    "an adapted workload declares no fetch or redirect host beyond the stage's "
+                    "pins, and no env"
+                )
         except ValueError as error:
             raise ValueError(f"{label}: adapted stage: {error}") from None
 

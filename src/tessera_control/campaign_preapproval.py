@@ -247,6 +247,12 @@ def evaluate(
     now = _parse_utc(utc_now())
     if now >= min(_parse_utc(pre["expires_at"]), _parse_utc(approval["expires_at"])):
         return Verdict(EXPIRED, pre)
+    if _delegation_of(approval) is not None:
+        # ADR 0150: a pre-approval recorded under a delegation is only as good as the
+        # delegation is now: re-checked at every use, in the resolving transaction too.
+        refused = delegated_review_reasons(connection, campaign, approval, stage_key, kind, now)
+        if refused:
+            return Verdict(",".join(refused), pre)
     salad = connection.execute(
         "SELECT * FROM campaign_salad_stages WHERE campaign_id=? AND stage_key=?",
         (campaign_id, stage_key),
@@ -313,6 +319,143 @@ def evaluate(
         if used + cents > pre["max_total_cents"]:
             return Verdict(TOTAL_CAP, pre, digest, cents, attempt["attempt"])
     return Verdict(None, pre, digest, cents, attempt["attempt"])
+
+
+# -- review pre-approval under an owner-signed delegation (ADR 0150) -------------------
+
+# Bound in place of the digest of a review kind the delegation does not cover. Its preimage is
+# not a review core, so no review ever digests to it: an uncovered kind can never match.
+UNCOVERED_DIGEST = canonical_digest({"type": "delegated_review_kind_not_covered", "version": 1})
+NOT_SALAD_STAGE = "stage_provider_not_salad"
+
+
+def _delegation_of(approval: Any) -> str | None:
+    try:
+        return approval["delegation_id"]
+    except (KeyError, IndexError):
+        return None
+
+
+def delegated_review_reasons(
+    connection: sqlite3.Connection,
+    campaign: Any,
+    approval: Any,
+    stage_key: str,
+    kind: str,
+    now: Any,
+) -> list[str]:
+    """Why the delegation an approval was made under does not (any longer) cover this review
+    of this stage on its own provider; empty when it does. Fail closed."""
+    from .campaign_delegation import _normal_spec
+    from .delegation_rules import evaluate_review
+
+    delegation = connection.execute(
+        "SELECT * FROM approval_delegations WHERE id=? AND org_id=?",
+        (_delegation_of(approval), campaign["org_id"]),
+    ).fetchone()
+    if delegation is None:
+        return ["delegation_missing"]
+    try:
+        stage = _normal_spec(campaign).stage(stage_key)
+    except (StopIteration, ValueError, KeyError):
+        return [UNBOUND_SCOPE]
+    if _stage_exposure(connection, campaign, stage_key) is None:
+        return [NOT_SALAD_STAGE]
+    return list(evaluate_review(connection, delegation, campaign, stage, kind, now=now).reasons)
+
+
+def record_delegated_preapproval(
+    connection: sqlite3.Connection,
+    *,
+    campaign_id: str,
+    approval_id: str,
+    stage_key: str,
+    digests: dict[str, str],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Inside the runner's write transaction, at a stage's first review stop: record the review
+    pre-approval the delegation the campaign was approved under writes for this stage, or the
+    reasons it does not (nothing is written then).
+
+    The row is the same one an approve body records (ADR 0044) and is enforced by the same
+    exact-digest ``evaluate``: the digests are the ones the runner itself derives from the
+    approved spec and profile, a kind the rule does not cover binds ``UNCOVERED_DIGEST``, the
+    attempt cap is the stage's own hold (never the rule's larger cap), the total is the
+    smaller of the campaign's cap and the delegation's per-run cap, and it expires with the
+    approval or the delegation, whichever is first. Returns (row, []) or (None, reasons)."""
+    from .delegation_rules import parse_terms
+
+    campaign = connection.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    approval = connection.execute(
+        "SELECT * FROM campaign_approvals WHERE id=? AND campaign_id=?", (approval_id, campaign_id)
+    ).fetchone()
+    if campaign is None or approval is None or approval["status"] != "active":
+        return None, [APPROVAL_INACTIVE]
+    if _delegation_of(approval) is None:
+        return None, [NO_PREAPPROVAL]
+    existing = stage_preapproval(connection, approval_id, stage_key)
+    if existing is not None:
+        return existing, []
+    now = _parse_utc(utc_now())
+    covered = []
+    reasons: list[str] = []
+    for kind in KINDS:
+        found = delegated_review_reasons(connection, campaign, approval, stage_key, kind, now)
+        if not found:
+            covered.append(kind)
+        reasons += [code for code in found if code not in reasons]
+    if not covered:
+        return None, reasons
+    delegation = connection.execute(
+        "SELECT * FROM approval_delegations WHERE id=?", (approval["delegation_id"],)
+    ).fetchone()
+    terms = parse_terms(delegation)
+    exposure = _stage_exposure(connection, campaign, stage_key)
+    if terms is None or exposure is None:
+        return None, ["delegation_terms_invalid"]
+    total = min(int(campaign["budget_cap_cents"]), terms.per_run_cap_cents)
+    if exposure < 1 or total < exposure:
+        return None, ["review_cap_exceeded"]
+    expires = min(
+        (approval["expires_at"], delegation["expires_at"]), key=lambda value: _parse_utc(value)
+    )
+    bound = {
+        KIND_SOURCE: digests["source_assessment_digest"],
+        KIND_PLAN: digests["plan_digest"],
+        KIND_SOURCE_USE: digests["source_use_digest"],
+    }
+    row = {
+        "id": "preapproval_" + uuid.uuid4().hex,
+        "campaign_id": campaign_id,
+        "approval_id": approval_id,
+        "stage_key": stage_key,
+        "source_digest": bound[KIND_SOURCE] if KIND_SOURCE in covered else UNCOVERED_DIGEST,
+        "plan_digest": bound[KIND_PLAN] if KIND_PLAN in covered else UNCOVERED_DIGEST,
+        "source_use_digest": (
+            bound[KIND_SOURCE_USE] if KIND_SOURCE_USE in covered else UNCOVERED_DIGEST
+        ),
+        "max_attempt_cents": exposure,
+        "max_total_cents": total,
+        "expires_at": _utc(expires),
+        "created_at": utc_now(),
+    }
+    connection.execute(
+        """INSERT INTO campaign_review_preapprovals (id, campaign_id, approval_id,
+        stage_key, source_digest, plan_digest, source_use_digest, max_attempt_cents,
+        max_total_cents, expires_at, created_at) VALUES (:id,:campaign_id,:approval_id,
+        :stage_key,:source_digest,:plan_digest,:source_use_digest,:max_attempt_cents,
+        :max_total_cents,:expires_at,:created_at)""",
+        row,
+    )
+    row["covered_kinds"] = covered
+    row["delegation_id"] = delegation["id"]
+    row["terms_digest"] = delegation["terms_digest"]
+    return row, []
+
+
+def _utc(value: str) -> str:
+    from .store import _utc_string
+
+    return _utc_string(_parse_utc(value))
 
 
 def authorize_delegated(
@@ -396,10 +539,27 @@ def preapproval_summary(connection: sqlite3.Connection, campaign_id: str) -> lis
             FROM campaign_review_preapproval_uses WHERE preapproval_id=? ORDER BY created_at, id""",
             (row["id"],),
         ).fetchall()
+        # ADR 0150: a pre-approval the platform recorded under an owner-signed delegation names
+        # that delegation and its terms digest (never the person who signed it).
+        delegation = connection.execute(
+            """SELECT d.id, d.terms_digest FROM campaign_approvals a
+            JOIN approval_delegations d ON d.id = a.delegation_id WHERE a.id=?""",
+            (row["approval_id"],),
+        ).fetchone()
         result.append(
             {
                 "id": row["id"],
                 "approval_id": row["approval_id"],
+                **(
+                    {
+                        "delegation": {
+                            "id": delegation["id"],
+                            "terms_digest": delegation["terms_digest"],
+                        }
+                    }
+                    if delegation is not None
+                    else {}
+                ),
                 "stage_key": row["stage_key"],
                 "source_digest": row["source_digest"],
                 "plan_digest": row["plan_digest"],

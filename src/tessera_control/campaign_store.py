@@ -20,10 +20,17 @@ from typing import Any
 from pydantic import ValidationError
 
 from . import campaign_heavy_guard_readout as heavy_guard_readout
+from . import campaign_heavy_remote as heavy_remote
 from . import campaign_hold, campaign_placement, program_budget, provider_trust, smoke_credentials
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_comparison import ComparisonRefused, compare_arms
-from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
+from .campaign_gates import (
+    CampaignGateCommands,
+    evaluate_unlock,
+    readmission_requirements,
+    record_evaluations,
+)
+from .campaign_hold import not_before_reaches
 from .campaign_holdout import campaign_claims, check_unclaimed
 from .campaign_io import (
     refuse_submitted_lineage,
@@ -38,7 +45,6 @@ from .campaign_models import (
     CancelCampaign,
     SubmitCampaign,
     normalize,
-    parse_not_before,
     parse_spec,
     parse_spec_json,
     placement_candidates,
@@ -716,6 +722,15 @@ class CampaignStore(
                 used_predecessors,
                 rerun=lineage is not None,
             )
+            # ADR 0141: the operator's remote candidate for heavy stages, before the digest.
+            spec = heavy_remote.apply(
+                self,
+                connection,
+                live,
+                project_id,
+                spec,
+                self.adapter_entries(connection, live, project_id),
+            )
             normal_spec = normalize(spec)
             smoke_credentials.check_submission(connection, live, normal_spec)
             encoded_spec = json.dumps(spec.model_dump(mode="json"), sort_keys=True)
@@ -927,18 +942,29 @@ class CampaignStore(
                     connection, live, campaign["project_id"], spec, campaign_id=campaign["id"]
                 )
             unlock_evaluations: list[dict[str, Any]] = []
-            if body.unlock and campaign["status"] != "submitted":
+            if body.unlock and not forward:
                 # Never accept a stated condition and then drop it (ADR 0045).
                 raise Conflict("An unlock applies to a campaign's first approval only.")
-            if campaign["status"] == "submitted":
-                # First admission (ADR 0045): the program cap and any stated unlock
-                # requirement are checked in this transaction; a refusal writes nothing.
-                refusal = program_budget.check_admission(
-                    connection, campaign["project_id"], campaign["budget_cap_cents"]
+            if forward:
+                # Admission (ADR 0045): the program cap and the unlock requirements are
+                # checked in this transaction; a refusal writes nothing. A forward
+                # re-approval of a lapsed campaign re-checks both: the campaign is already
+                # counted as committed, so it must still fit with no new amount, and the
+                # first approval's requirements (restated exactly) must still hold.
+                first_admission = campaign["status"] == "submitted"
+                requirements = (
+                    list(body.unlock or [])
+                    if first_admission
+                    else readmission_requirements(connection, campaign, body.unlock)
                 )
-                if refusal is None and body.unlock:
+                refusal = program_budget.check_admission(
+                    connection,
+                    campaign["project_id"],
+                    campaign["budget_cap_cents"] if first_admission else 0,
+                )
+                if refusal is None and requirements:
                     refusal, unlock_evaluations = evaluate_unlock(
-                        connection, campaign["org_id"], campaign["project_id"], body.unlock
+                        connection, campaign["org_id"], campaign["project_id"], requirements
                     )
                 if refusal is not None:
                     raise Conflict(f"Admission refused: {refusal}")
@@ -973,8 +999,7 @@ class CampaignStore(
                     if bound <= now_dt:
                         raise Conflict("The campaign deadline has passed; submit a new campaign.")
                     expires_dt = min(expires_dt, bound)
-            held_until = parse_not_before(getattr(spec, "not_before", None))
-            if held_until is not None and held_until >= expires_dt:
+            if not_before_reaches(spec, expires_dt) is not None:
                 # The approval would lapse before the campaign may start, so it could never run.
                 raise Conflict(
                     "not_before is not before this approval's expiry "

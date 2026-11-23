@@ -279,6 +279,8 @@ def detect(
                 connection, project_id, cid, heavy_readout.FALLBACK_EVENT
             )
             if (e.get("mode") or "warn") == "warn"
+            # No Salad profile exists to check, so a live local attempt is not "stuck on local".
+            and list(e.get("reasons") or []) != ["no_remote_profile"]
         }
         for a in connection.execute(
             "SELECT id, stage_key, attempt, status FROM campaign_stage_attempts "

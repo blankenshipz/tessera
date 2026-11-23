@@ -524,6 +524,10 @@ def test_step_table_paths_match_the_store_methods():
             "gate_evidence_ingest.py",
             'f"/experiment-attempts/{attempt_id}/evidence-rows"',
         ),
+        "record_provider_fetch": (
+            "provider_fetch_record.py",
+            'f"/experiment-attempts/{attempt_id}/provider-fetch"',
+        ),
         "register_lineage_node": (
             "artifact_lineage.py",
             'path = f"/projects/{project_id}/artifact-lineage/nodes"',

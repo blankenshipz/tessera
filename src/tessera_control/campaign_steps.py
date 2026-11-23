@@ -47,6 +47,7 @@ from .gate_evidence_models import BindAttemptSplit, CreateSplitLock, RecordMetri
 from .interaction import InteractionStore
 from .interaction_models import CreateDecision, ResolveDecision
 from .models import ApproveTask, CreateTask, ReviseTaskPlan
+from .provider_fetch_record import RecordProviderFetch
 from .remote_execution import RemoteExecutionStore
 from .remote_execution_models import RemoteCommand, RemoteProposal, TargetPolicy
 from .research import ResearchStore
@@ -90,6 +91,7 @@ STEP_MODELS: dict[str, type] = {
     "bind_split": BindAttemptSplit,
     "record_gate_metric": RecordMetric,
     "ingest_evidence_rows": IngestEvidenceRows,
+    "record_provider_fetch": RecordProviderFetch,
     "register_lineage_node": LineageNodeRequest,
     "record_lineage_edge": LineageEdgeRequest,
     "create_study": CreateStudy,
@@ -315,6 +317,10 @@ def prepare(
             return stores.evidence.record_metric(principal, ids["attempt_id"], key, digest, payload)
         if step == "ingest_evidence_rows":
             return stores.experiments.ingest_evidence_rows(
+                principal, ids["attempt_id"], key, digest, payload
+            )
+        if step == "record_provider_fetch":
+            return stores.experiments.record_provider_fetch(
                 principal, ids["attempt_id"], key, digest, payload
             )
         if step == "register_lineage_node":

@@ -12,15 +12,16 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
 
 from . import program_budget
 from .campaign_gates import GATEABLE_STATUSES, _exposure_unresolved, effective_decision
+from .campaign_hold import not_before_reaches
 from .campaign_models import SALAD_PROVIDER, SALAD_RUNTIME, TERMINAL_CAMPAIGN, normalize
-from .delegation_terms import DelegationTerms, GateRule
+from .delegation_terms import DelegationTerms, GateRule, ReviewRule
 from .gate_evidence_paired import PairedRefused, compute_paired_delta, paired_outcome
 from .store import Forbidden, NotFound, Store, _parse_utc, canonical_digest
 
@@ -102,6 +103,22 @@ def _delegation_reasons(delegation: Delegation, now: datetime) -> list[str]:
     return reasons
 
 
+def _not_before_reasons(delegation: Delegation, spec: Any, now: datetime) -> list[str]:
+    """A deferred campaign that may not start until the approval, or the delegation, has lapsed
+    could never run (parity with a person's approval, which refuses the first)."""
+    reasons: list[str] = []
+    seconds = getattr(spec, "deadline_seconds", None)
+    if isinstance(seconds, int) and not_before_reaches(spec, now + timedelta(seconds=seconds)):
+        reasons.append("not_before_after_approval_expiry")
+    try:
+        delegation_expiry = _parse_utc(delegation["expires_at"])
+    except (ValueError, TypeError):
+        return reasons  # an unreadable expiry is already refused as delegation_expired
+    if not_before_reaches(spec, delegation_expiry) is not None:
+        reasons.append("not_before_after_delegation_expiry")
+    return reasons
+
+
 def _creator_reasons(
     connection: sqlite3.Connection, delegation: Delegation, creator: dict[str, Any] | None
 ) -> list[str]:
@@ -149,8 +166,8 @@ def _providers(spec: Any) -> set[str]:
 
 
 def _needs_human(spec: Any) -> bool:
-    """Money on a paid provider needs its per-stage human review pre-approval, which a
-    delegation can never supply."""
+    """Money on a paid provider needs its per-stage review pre-approval: a person's, or one the
+    runner records under a delegation's review rule (ADR 0150, ``_review_reasons``)."""
     for stage in normalize(spec).stages:
         if stage.provider == SALAD_PROVIDER or stage.runtime == SALAD_RUNTIME:
             return True
@@ -159,6 +176,96 @@ def _needs_human(spec: Any) -> bool:
         if any(item.runtime == SALAD_RUNTIME for item in stage.alternates):
             return True
     return any(getattr(stage, "salad", None) is not None for stage in spec.stages)
+
+
+def _salad_candidates(spec: Any) -> list[Any]:
+    """Every Salad candidate of every stage, as the stage would run on it."""
+    from .campaign_models import stage_candidates
+
+    return [
+        candidate
+        for stage in normalize(spec).stages
+        for candidate in stage_candidates(stage)
+        if candidate.provider == SALAD_PROVIDER or candidate.runtime == SALAD_RUNTIME
+    ]
+
+
+def review_stage_reasons(rule: ReviewRule, stage: Any) -> list[str]:
+    """Whether one Salad stage, as it runs on one candidate, sits inside the review rule
+    (ADR 0150): the run's hold, its time limit, the compute it buys and the outcome its source
+    is used for. Read from the approved spec only; never widened."""
+    from .campaign_models import SaladStageSpec
+
+    reasons: list[str] = []
+    if not 1 <= int(stage.max_exposure_cents) <= rule.max_attempt_cents:
+        reasons.append("review_cap_exceeded")
+    if int(stage.max_duration_seconds) > rule.max_duration_seconds:
+        reasons.append("review_time_limit_exceeded")
+    config = stage.provider_config
+    try:
+        salad = (
+            config
+            if isinstance(config, SaladStageSpec)
+            else SaladStageSpec.model_validate(config or {})
+        )
+    except (ValueError, TypeError, ValidationError):
+        return [*reasons, "review_stage_unreadable"]
+    if ("salad_gpu" if salad.gpu else "salad_cpu") not in rule.provider_classes:
+        reasons.append("provider_class_not_allowed")
+    if salad.program.outcome not in rule.source_use_intents:
+        reasons.append("source_use_intent_not_covered")
+    return reasons
+
+
+def _review_reasons(terms: DelegationTerms | None, spec: Any) -> list[str]:
+    """At a delegated approval: a spec with a Salad stage needs a person unless the delegation
+    carries a review rule that every Salad candidate sits inside (ADR 0150). Review kinds the
+    rule does not cover are not a refusal here: those reviews stop for a person at run time."""
+    if not _needs_human(spec):
+        return []
+    rule = None if terms is None else terms.review_rule
+    candidates = _salad_candidates(spec) if rule is not None else []
+    if rule is None or not candidates:
+        return ["spec_needs_human"]
+    reasons: list[str] = []
+    for candidate in candidates:
+        reasons += [code for code in review_stage_reasons(rule, candidate) if code not in reasons]
+    return reasons
+
+
+def evaluate_review(
+    connection: sqlite3.Connection,
+    delegation: Delegation,
+    campaign: Mapping[str, Any],
+    stage: Any,
+    kind: str,
+    *,
+    now: datetime,
+) -> Evaluation:
+    """At a Salad review stop (ADR 0150): may the platform resolve this review of this stage,
+    as placed, under the delegation the campaign was approved under? Every check again, under
+    the caller's write lock: the delegation is active and unexpired, its signer is still a live
+    human of the project with the same credential, the terms carry a review rule covering the
+    kind and the stage sits inside it. Never raises; any failure is a refusal."""
+    try:
+        reasons = _delegation_reasons(delegation, now)
+        terms = parse_terms(delegation)
+        if terms is None:
+            reasons.append("delegation_terms_invalid")
+        reasons += _creator_reasons(connection, delegation, None)
+        reasons += _scope_reasons(delegation, campaign)
+        rule = None if terms is None else terms.review_rule
+        if terms is not None and rule is None:
+            reasons.append("no_review_rule")
+        if rule is not None:
+            if kind not in rule.kinds:
+                reasons.append("review_kind_not_covered")
+            reasons += review_stage_reasons(rule, stage)
+            if not {stage.provider} <= set(terms.allowed_providers):  # type: ignore[union-attr]
+                reasons.append("provider_not_allowed")
+        return Evaluation(not reasons, tuple(reasons), {"reasons": list(reasons)})
+    except Exception:  # noqa: BLE001 - fail closed, never leak the cause
+        return Evaluation(False, ("evaluation_error",), {"reasons": ["evaluation_error"]})
 
 
 def _program_reasons(terms: DelegationTerms, project_id: str, connection) -> list[str]:
@@ -220,8 +327,8 @@ def _evaluate_approval(connection, delegation, campaign, spec, now, creator) -> 
         if not _providers(spec) <= set(terms.allowed_providers):
             reasons.append("provider_not_allowed")
         reasons += _program_reasons(terms, row["project_id"], connection)
-    if _needs_human(spec):
-        reasons.append("spec_needs_human")
+    reasons += _review_reasons(terms, spec)
+    reasons += _not_before_reasons(delegation, spec, now)
     details["reasons"] = list(reasons)
     return Evaluation(not reasons, tuple(reasons), details)
 

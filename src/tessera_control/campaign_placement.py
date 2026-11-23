@@ -369,8 +369,10 @@ def decide(
     each placement it orders."""
     with rt.connection() as connection:
         steering = steering_for(connection, ctx.campaign, base.key)
-        guard = campaign_heavy_guard.applies(connection, ctx.campaign, base)
-    ordered, preference = campaign_placement_preference.preferred_order(base)
+        heavy_result = campaign_heavy_guard.heavy(base, connection, ctx.campaign)
+        guard = campaign_heavy_guard.applies(connection, ctx.campaign, base, heavy_result)
+    # Ordering counts the guard's signals, so what is heavy for ordering is heavy for the guard.
+    ordered, preference = campaign_placement_preference.preferred_order(base, heavy_result[1])
     ids, excluded = candidate_order(base, list(attempts or ()), ordered)
     skipped: list[Skip] = []
     refusal: dict[str, Any] | None = None
@@ -387,7 +389,7 @@ def decide(
             # ADR 0107: a heavy stage reached a local candidate while a remote profile is
             # registered: record why (warn), or skip it so the stage waits (refuse).
             codes, detail = campaign_heavy_guard.reasons(
-                guard, base, pid, skipped, steering, preference
+                guard, base, pid, skipped, steering, preference, attempts or ()
             )
             if guard.mode == "refuse":
                 refusal = campaign_heavy_guard.record(guard, codes, detail, refused=True)

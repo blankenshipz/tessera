@@ -17,6 +17,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StringConstraints,
     TypeAdapter,
     ValidationError,
@@ -638,6 +639,40 @@ class ProviderCandidate(_Strict):
         return value
 
 
+# ADR 0141: what submit did about a heavy stage that listed no remote candidate. Tessera writes
+# it (a submitted value is discarded and recomputed); ``added`` with the reason
+# ``operator_heavy_remote_candidate`` means the first alternate is the candidate Tessera added,
+# otherwise ``reason`` says why none was added. It is part of the digest a person approves.
+HEAVY_REMOTE_ADDED = "operator_heavy_remote_candidate"
+ReasonCode = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+
+
+class HeavyRemoteRecord(_Strict):
+    added: StrictBool
+    reason: ReasonCode
+    provider: ProviderId
+    signals: Annotated[list[Annotated[str, StringConstraints(max_length=64)]], Field(max_length=16)]
+    profile: Key | None = None
+    max_exposure_cents: Cents | None = None
+    detail: Annotated[str, StringConstraints(max_length=500)] | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> HeavyRemoteRecord:
+        if self.added != (self.reason == HEAVY_REMOTE_ADDED):
+            raise ValueError("heavy_remote_candidate: added and reason disagree")
+        if self.added and (self.profile is None or self.max_exposure_cents is None):
+            raise ValueError("heavy_remote_candidate: an added candidate names its profile and cap")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler):
+        value = handler(self)
+        for name in ("profile", "max_exposure_cents", "detail"):
+            if getattr(self, name) is None:
+                value.pop(name, None)
+        return value
+
+
 # ADR 0123: a stage that BUILDS an image from a pinned, public build context and pushes it to a
 # registry the operator allows. The builder image is the stage's own (pinned) ``image``; the
 # provider derives the builder's arguments, so an author supplies no argv, env or egress.
@@ -753,6 +788,9 @@ class StageV2(_Strict):
     # ADR 0123: submit-time lineage of the image (request form and resolution record).
     image_from: ImageFromSource | None = None
     image_resolved_from: ImageLineage | None = None
+    # ADR 0141: set by submit only (see ``HeavyRemoteRecord``): a submitted value is discarded
+    # and recomputed there, never trusted. Absent keeps the digest.
+    heavy_remote_candidate: HeavyRemoteRecord | None = None
 
     @model_validator(mode="after")
     def _one_image(self) -> StageV2:
@@ -813,6 +851,8 @@ class StageV2(_Strict):
             value.pop("image_from", None)
         if self.image_resolved_from is None:
             value.pop("image_resolved_from", None)
+        if self.heavy_remote_candidate is None:
+            value.pop("heavy_remote_candidate", None)
         if self.evaluation is None:
             value.pop("evaluation", None)
         if self.send_classes is None:

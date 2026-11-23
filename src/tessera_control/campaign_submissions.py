@@ -36,6 +36,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, ValidationError, model_validator
 
+from . import campaign_heavy_remote as heavy_remote
 from . import program_budget, provider_trust
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_io import refuse_submitted_lineage
@@ -469,6 +470,15 @@ class CampaignSubmissionStore(CampaignStore):
                         "An approved submission cannot use receipt_output inputs: pin the value "
                         "with an artifact input (campaign_id, stage, output, sha256) instead."
                     )
+                # ADR 0141: the person approves the spec with the heavy-stage candidate.
+                spec = heavy_remote.apply(
+                    self,
+                    connection,
+                    live,
+                    project_id,
+                    spec,
+                    self.adapter_entries(connection, live, project_id),
+                )
             else:
                 source = self._campaign(connection, live, body.source_campaign_id)
                 if source["project_id"] != project_id:

@@ -144,8 +144,8 @@ last backup stale. Without ADR 0044 present, a version-only v67 → v68 step is 
 - A bound outcome needs metric records. Manual `record_metric` is human-only; a stage that
   declares `gate_evidence` has them recorded by the runner under the campaign approval
   ([ADR 0049](0049-campaign-gate-evidence.md)).
-- A first-admission check only: re-approving a lapsed campaign does not re-evaluate an
-  unlock.
+- Re-approving a lapsed campaign re-checks the program cap and re-evaluates the first
+  approval's unlock (amendment of 2026-11-23).
 - Program budget recording on events and re-reading the file at each admission are not
   implemented; the file is read once at `serve` startup.
 - An unlock evaluation or outcome is not scientific validation (`not_assessed`).
@@ -157,3 +157,33 @@ last backup stale. Without ADR 0044 present, a version-only v67 → v68 step is 
 - **An agent evaluates or reports the outcome:** it would choose data and threshold.
 - **Trust a stored outcome:** records and attempts change; admission recomputes.
 - **Reuse the study-level `go_no_go` review:** it is scoped to a study plan, not a campaign.
+
+## Amendment (2026-11-23): a forward re-approval re-checks admission
+
+A forward re-approval of a lapsed (`paused_delegation_lapsed`) campaign resumes spending, so
+it re-checks what the campaign was admitted under, in the same transaction, failing closed;
+a refusal writes nothing. Cleanup re-approvals (`cancel_requested`, `blocked`) are
+reduce-only and stay unchecked.
+
+- **Program cap.** The lapsed campaign is already counted as committed (§3 counts every
+  non-terminal admitted campaign at `max(budget_cap, held + settled)`), so the re-approval
+  checks `committed + 0 <= cap_cents`: the program must still admit the existing
+  commitment. Checking the campaign's cap again would count it twice; checking only an
+  "uncommitted remainder" is the same zero amount. A program narrowed after admission, or
+  an unusable program budget, refuses the re-approval (`program_budget_exhausted:<id>`,
+  `program_budget_unavailable`).
+- **Unlock.** No requirement text is stored for a human approval, only each requirement's
+  digest on `campaign_unlock_evaluations`, so no migration is needed: a human re-approval
+  restates the first approval's `unlock`, and the platform accepts it only when the
+  requirement digests equal the first approval's, in order. A campaign started by a
+  standing approval reuses that approval's immutable `unlock_json` (also digest-checked)
+  when none is restated. The requirements are then evaluated as at first admission
+  (`unlock_not_satisfied:<index>:<code>`), and the evaluations are recorded against the new
+  approval, so the receipt's `unlock` section lists every admission, oldest first.
+- **What an `unlock` on a re-approval means.** Only an identical restatement. A missing,
+  changed, added or stricter set is refused (409): admitting under different conditions
+  would make the record of what admitted the campaign ambiguous, and a stricter set can be
+  expressed by cancelling and submitting anew. An `unlock` on a re-approval of a campaign
+  first approved without one, or on a cleanup re-approval, stays refused.
+- A later `no_go` still does not stop a running campaign (§4); it blocks its resumption
+  after a lapse.

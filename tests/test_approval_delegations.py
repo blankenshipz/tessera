@@ -611,6 +611,7 @@ def _columns(path, table) -> list[str]:
 
 
 def test_version_is_registered_as_a_step():
+    # Later migrations may follow it; what is pinned is that version 86 is this one.
     assert APPROVAL_DELEGATION_SCHEMA_VERSION == 86 <= LATEST_SCHEMA_VERSION
     assert MIGRATIONS[85].__name__ == "migrate_approval_delegation_schema"
 

@@ -18,6 +18,7 @@ from typing import Annotated, Any
 
 from pydantic import Field, StringConstraints, ValidationError
 
+from . import campaign_heavy_remote as heavy_remote
 from . import smoke_credentials
 from .campaign_models import (
     TERMINAL_CAMPAIGN,
@@ -130,6 +131,15 @@ class CampaignSteeringCommands:
                 body.predecessors,
                 raw_spec,
                 used_predecessors,
+            )
+            # ADR 0141: the same heavy-stage candidate submit adds, so the digests agree.
+            spec = heavy_remote.apply(
+                self,
+                connection,
+                live,
+                project_id,
+                spec,
+                self.adapter_entries(connection, live, project_id),
             )
             normal = normalize(spec)
             smoke_credentials.check_submission(connection, live, normal)

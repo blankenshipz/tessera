@@ -8,7 +8,8 @@ the transaction, under the write lock, so a ceiling or a cap cannot be raced. A 
 the rule is recorded on a receipt that cites the delegation; anything else fails closed (a 409
 naming stable reason codes), is recorded as an ``escalated`` decision for the owner to see, and
 changes nothing. A delegated approval is only ever a campaign's first approval and carries no
-unlock requirement and no review pre-approval, so it cannot supply what a person must.
+unlock requirement and no review pre-approval of its own, so it cannot supply what a person must;
+a delegation's optional review rule lets the runner record one at the review stop (ADR 0150).
 """
 
 from __future__ import annotations

@@ -77,8 +77,10 @@ def test_heavy_keeps_the_adr_0088_signals_and_adds_pretraining(local_providers):
     assert guard.heavy(stage) == (True, ["tag:pretraining"])
 
 
-def test_a_gpu_tag_alone_is_not_a_heavy_signal(local_providers):
-    assert guard.heavy(_normal(placement_tags=["gpu"])) == (False, [])
+def test_a_gpu_tag_is_a_guard_signal_but_not_an_adr_0088_heavy_class(local_providers):
+    # Amendment 2026-11-23: a gpu requirement is a guard signal (the class is unchanged).
+    assert guard.heavy(_normal(placement_tags=["gpu"])) == (True, ["tag:gpu"])
+    assert preference.stage_class(_normal(placement_tags=["gpu"]))[0] == "gpu"
 
 
 def test_large_outputs_from_the_declared_output_limits(local_providers):
@@ -310,7 +312,7 @@ def test_a_light_stage_placement_is_unchanged(tmp_path, near):
     assert "heavy_guard" not in _receipt_entry(world)["placement"]
 
 
-def test_without_a_salad_profile_a_heavy_fallback_records_nothing_new(tmp_path, near):
+def test_without_a_salad_profile_a_heavy_fallback_records_only_no_remote_profile(tmp_path, near):
     world = _cpu_world(tmp_path, near, HEAVY)
     world.start()
     register_provider_instance(None)  # the operator restarted without Salad profiles
@@ -318,8 +320,11 @@ def test_without_a_salad_profile_a_heavy_fallback_records_nothing_new(tmp_path, 
     (placed,) = _placed(world)
     assert placed["provider_id"] == NEAR
     assert placed["skipped"][0]["reason"] == "not_enrolled"
-    assert "heavy_guard" not in placed and not _fallbacks(world)
+    # Amendment 2026-11-23: warn mode records the reason; the placement is otherwise unchanged.
+    assert placed["heavy_guard"]["reasons"] == ["no_remote_profile"]
+    assert len(_fallbacks(world)) == 1
     assert set(placed) == {
+        "heavy_guard",
         "campaign_id",
         "stage_key",
         "attempt",

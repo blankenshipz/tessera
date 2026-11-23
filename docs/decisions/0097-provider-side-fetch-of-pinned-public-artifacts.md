@@ -97,3 +97,47 @@ provider paths above, where the fetch precedes the delivery of private input.
 used only when the provider environment supplies persistent storage; it replaces the earlier note that
 a Salad-side cache was not covered. Every reuse is re-hashed, nothing cached reaches the control plane,
 and the receipt records hit or miss.
+
+## Amendment (2026-11-23): adapted Salad stages fetch their pins
+
+Owner decision (2026-11-22): large public inputs the control plane does not need are fetched inside
+the stage on the execution provider, Salad first. The stage adapter ([ADR 0076](0076-salad-cpu-stage-adapter-and-cpu-runtime.md))
+now generates the fetch rows, replacing the note above that adapter-built Salad stages do not: the
+derived contract's `egress.fetches` are exactly the stage's pins (url, sha256, `max_bytes`), its
+`egress.redirect_hosts` exactly the pins' redirect hosts, and the inline manifest holds the image entry
+plus one `file` item per pin (`dest` `<input>/<name>`, `cache` as the source asks). The runtime
+fetches and verifies them before the claim, so the ADR 0040 section 4 exemption above applies
+unchanged. The workload's reviewable destinations are therefore exactly the pinned and redirect hosts;
+uploads still go only to the registered custody host. The provider refuses an adapted workload whose
+fetch rows, redirect hosts or manifest differ from the pins in any way (`public_artifact_contract_mismatch`
+first, then the adapted-stage manifest check), and a stage with free-form `egress` stays refused by the
+adapter and recorded `egress_bound` by [ADR 0141](0141-heavy-stage-remote-candidate.md). The pins'
+`max_bytes` plus the staged input must fit the profile's `disk_mb`. The receipt is unchanged: it already
+carries per file the source host, digest, bytes (when reported), the provider and the hosts.
+
+Not changed: a `public_artifact` input carries the licence label `unknown-lineage` (ADR 0113 reads it
+as an input of unknown lineage), so every provider that receives such a stage must be listed in the
+trust file with no `allowed_license_labels` limit excluding it; whether pinned public data should carry
+its own licence declaration is open. Tests: `tests/test_heavy_download_on_provider.py`.
+
+## Amendment (2026-11-23): fetch evidence on the receipt
+
+Control records a provider-side stage's retained `fetched` rows as the same
+`execution.public_fetch_recorded` event a local worker produces, after validating each row
+against the stage's pins (url, sha256 and the pinned file). The rows are derived from the
+stage's retained output, never from a worker claim. Bytes, seconds and cache outcome then
+appear on the receipt's `public_fetch` files as `provider_reported`; a file with no validated
+row stays `declared_only` with null numbers, so the label is `provider_reported` only when a
+row exists.
+
+For a provider other than a local worker the `public_fetch` object also carries
+`egress_allowlist`: `hosts` (the sorted pinned and redirect hosts, equal to the entry's
+`hosts`), `declared: true`, `redirect_enforced: true`, `network_enforced: false` and a
+statement: "The hosts are the approved pinned sources and their redirect hosts. They are
+declared for review and the redirect set is enforced by the workload runtime; the provider's
+network does not restrict the stage to them." Salad's egress is provider-wide
+([ADR 0036](0036-generic-salad-gpu-workloads.md)), so the receipt never claims network enforcement. A stage without pins has no
+`public_fetch` object and so no allowlist.
+
+Limitation, a follow-up: contacted-host journaling (which redirect hosts were actually
+contacted during the fetch) is not recorded. Tests: `tests/test_public_fetch_receipt_allowlist.py`.

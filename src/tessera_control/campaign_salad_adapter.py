@@ -1,5 +1,9 @@
 """Stage adapter: a local-docker CPU stage as a Salad placement candidate (ADR 0076).
 
+The heavy-stage rule (ADR 0141, amendment 2026-11-23) also derives a GPU candidate for a
+``gpu``-tagged stage on a GPU profile the operator opened with a price; an explicit
+``{"adapt": ...}`` request still takes a CPU-only profile only.
+
 A v2 stage lists ``{"provider": "salad", "runtime": "salad-workload-v1", "provider_config":
 {"adapt": {"profile": NAME}}}`` among its ``alternate_providers``. ``expand_spec`` turns that
 request into the explicit ``salad`` block a hand-written candidate would carry, from the stage
@@ -8,9 +12,12 @@ the same stage and profile give the same bytes, nothing is read from the network
 and every refusal is a 409 that names the limit. The expanded candidate then passes the ordinary
 submit, approval and placement checks of the Salad provider; this module relaxes none of them.
 
-Nothing here adds an egress destination: the contract it builds declares no fetch and no redirect
-host, so the workload can reach only what every Salad stage already can (provider-wide egress,
-ADR 0036) and no new destination is reviewable or reachable (ADR 0047).
+The only fetches the contract it builds declares are the stage's own ``public_artifact`` pins
+(ADR 0097, amended 2026-11-23): one fetch row per pinned file (url, sha256, max_bytes), the pins'
+redirect hosts, and one ``file`` item per pin beside the image entry in the inline manifest, so the
+runtime downloads and verifies them before the claim. The reviewable destinations are therefore
+exactly the pinned hosts and their redirect hosts; a stage with free-form ``egress`` is refused,
+and a stage without pins declares no fetch and no redirect host (ADR 0036, ADR 0047).
 """
 
 from __future__ import annotations
@@ -40,7 +47,9 @@ from .salad_workload_contract import (
     IMAGE_ENTRIES,
     MAX_TOTAL_OUTPUT_BYTES,
     OUTPUT_NAME_RE,
+    REDIRECT_TOKEN_PREFIX,
     WorkloadContractV1,
+    redirect_hosts_digest,
 )
 from .snapshot_composition import composed_inventory
 from .store import Conflict
@@ -152,22 +161,75 @@ def _refuse(stage: Any, reason: str) -> Conflict:
     return Conflict(f"Stage {stage.key!r}: Salad stage adapter: {reason}.")
 
 
-def _manifest(argv: list[str]) -> bytes:
-    manifest = {
+def public_file_items(stage: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """The manifest ``file`` items and sorted redirect hosts of the stage's ``public_artifact``
+    pins (ADR 0097): one item per pinned file, fetched to ``files/<input>/<name>`` (the launcher
+    maps the local worker's ``/inputs-public/<input>/<name>`` there), flagged ``cache`` exactly
+    when its source asks. Reads the spec form (``files``) and the normal form (``public_files``),
+    so the adapter that builds and the provider that checks derive the same items."""
+    items: list[dict[str, Any]] = []
+    hosts: set[str] = set()
+    for source in getattr(stage, "inputs", ()):
+        if getattr(source, "kind", None) != "public_artifact":
+            continue
+        files = getattr(source, "public_files", None)
+        if files is None or (not files and getattr(source, "files", None)):
+            files = [(f.name, f.url, f.sha256, f.max_bytes) for f in source.files]
+        hosts |= set(source.redirect_hosts)
+        for name, url, sha256, max_bytes in files:
+            item = {
+                "url": url,
+                "sha256": sha256,
+                "max_bytes": max_bytes,
+                "kind": "file",
+                "dest": f"{source.name}/{name}",
+            }
+            if getattr(source, "cache", False):
+                item["cache"] = True
+            items.append(item)
+    return items, sorted(hosts)
+
+
+def adapted_manifest(argv: list[str], files: list[dict[str, Any]], hosts: list[str]) -> dict:
+    """The inline manifest of an adapted stage: the image entry, then the pinned files."""
+    manifest: dict[str, Any] = {
         "schema": GPU_RUNTIME_MANIFEST_SCHEMA,
-        "fetches": [{"kind": "entry", "source": "image", "path": LAUNCHER, "argv": argv}],
+        "fetches": [
+            {"kind": "entry", "source": "image", "path": LAUNCHER, "argv": argv},
+            *files,
+        ],
     }
+    if hosts:
+        manifest["redirect_hosts"] = list(hosts)
+    return manifest
+
+
+def _manifest(argv: list[str], files: list[dict[str, Any]], hosts: list[str]) -> bytes:
+    manifest = adapted_manifest(argv, files, hosts)
     return json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
 def derive_candidate_config(
-    stage: Any, profile: SaladCampaignProfile, entries: InputEntries | None = None
+    stage: Any,
+    profile: SaladCampaignProfile,
+    entries: InputEntries | None = None,
+    *,
+    gpu: bool = False,
 ) -> dict[str, Any]:
     """The full ``SaladStageSpec`` (as JSON) that runs ``stage`` on ``profile``, or Conflict.
 
-    ``stage`` is a ``StageV2`` without its adapter candidates."""
+    ``stage`` is a ``StageV2`` without its adapter candidates. ``gpu`` asks for a GPU candidate
+    (ADR 0141 amendment 2026-11-23: only the heavy-stage rule does, for a ``gpu``-tagged stage):
+    the profile must then be a GPU profile the operator opened to adapted stages with a GPU price,
+    and otherwise a CPU-only one, so neither kind is ever offered for the other."""
     adapter = profile.stage_adapter
-    if profile.gpu or adapter is None:
+    if gpu and (not profile.gpu or adapter is None or adapter.gpu_hour_usd is None):
+        raise _refuse(
+            stage,
+            f"profile {profile.name!r} is not a GPU profile with a stage_adapter section that "
+            "names gpu_hour_usd (the operator has not opened it to adapted GPU stages)",
+        )
+    if not gpu and (profile.gpu or adapter is None):
         raise _refuse(
             stage,
             f"profile {profile.name!r} is not a CPU-only profile with a stage_adapter section "
@@ -203,6 +265,15 @@ def derive_candidate_config(
         if value:
             raise _refuse(stage, f"{field} cannot be carried to Salad")
     plan = input_plan(stage, profile, entries)
+    files, redirect_hosts = public_file_items(stage)
+    fetched = sum(item["max_bytes"] for item in files)
+    disk = profile.disk_mb * MIB
+    if fetched and fetched + (0 if plan is None else plan[1]) > disk:
+        raise _refuse(
+            stage,
+            f"the pinned public files ({fetched} bytes) and inputs exceed profile "
+            f"{profile.name!r} disk_mb {profile.disk_mb} ({disk} bytes)",
+        )
     outputs = list(stage.outputs)
     if len(outputs) > MAX_SALAD_OUTPUTS:
         raise _refuse(stage, f"more than {MAX_SALAD_OUTPUTS} outputs")
@@ -213,7 +284,7 @@ def derive_candidate_config(
         )
     if sum(o.max_bytes for o in outputs) > MAX_TOTAL_OUTPUT_BYTES:
         raise _refuse(stage, f"outputs exceed {MAX_TOTAL_OUTPUT_BYTES} bytes in total")
-    raw = _manifest(list(stage.argv))
+    raw = _manifest(list(stage.argv), files, redirect_hosts)
     encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
     refs = [f"b64:{encoded[i : i + B64_CHUNK]}" for i in range(0, len(encoded), B64_CHUNK)]
     total = sum(o.max_bytes for o in outputs)
@@ -228,6 +299,11 @@ def derive_candidate_config(
         str(len(outputs)),
         hashlib.sha256(raw).hexdigest(),
         *([] if plan is None else [f"input:{plan[0]}:{plan[1]}"]),
+        *(
+            [f"{REDIRECT_TOKEN_PREFIX}{redirect_hosts_digest(redirect_hosts)}"]
+            if redirect_hosts
+            else []
+        ),
         *refs,
     ]
     if len(template) > MAX_TEMPLATE_TOKENS:
@@ -241,7 +317,13 @@ def derive_candidate_config(
                 "env": {},
                 "workload_seconds": seconds,
                 "outputs": [{"name": o.path, "max_bytes": o.max_bytes} for o in outputs],
-                "egress": {"kind": "provider_broad", "fetches": []},
+                "egress": {
+                    "kind": "provider_broad",
+                    "fetches": [
+                        {key: item[key] for key in ("url", "sha256", "max_bytes")} for item in files
+                    ],
+                    **({"redirect_hosts": redirect_hosts} if redirect_hosts else {}),
+                },
                 "custody_host": profile.custody_host,
                 **(
                     {}
@@ -267,15 +349,16 @@ def derive_candidate_config(
         workload=contract,
         program=adapter.program or default_program(stage),
         grant_ttl_seconds=adapter.grant_ttl_seconds,
-        gpu=False,
+        gpu=gpu,
         adapted=True,
     )
     return config.model_dump(mode="json")
 
 
 def candidate_estimate_cents(stage: Any, profile: SaladCampaignProfile) -> int:
-    """The whole stage duration at the profile's CPU rate, rounded up to a cent (at least 1)."""
-    worst = profile.estimated_cents(stage.max_duration_seconds)
+    """The whole stage duration at the profile's CPU rate (or, on a GPU profile, the operator's
+    ``stage_adapter.gpu_hour_usd``), rounded up to a cent (at least 1)."""
+    worst = profile.adapter_estimated_cents(stage.max_duration_seconds)
     cents = int(worst)
     return max(1, cents if cents == worst else cents + 1)
 

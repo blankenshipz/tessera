@@ -48,6 +48,7 @@ from .project_artifacts import (
     ProjectArtifactPlacement,
     ProjectArtifactStorageError,
 )
+from .provider_fetch_record import ProviderFetchRecordMixin
 from .store import Conflict, Forbidden, NotFound, Store, StoreError, _connect, _parse_utc, utc_now
 
 T = TypeVar("T", bound=BaseModel)
@@ -730,7 +731,7 @@ def create_experiment_evidence_retention_schema(connection: sqlite3.Connection) 
     create_v26_experiment_evidence_retention_schema(connection)
 
 
-class ExperimentStore(EvidenceIngestMixin, Store):
+class ExperimentStore(EvidenceIngestMixin, ProviderFetchRecordMixin, Store):
     """Commands for one bounded design, evidence chain, and human review."""
 
     def __init__(self, state_dir, backend=None) -> None:

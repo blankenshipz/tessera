@@ -28,6 +28,21 @@ def not_before_of(spec_json: str | dict[str, Any] | None) -> datetime | None:
         return None
 
 
+def not_before_reaches(spec: Any, instant: datetime) -> datetime | None:
+    """The spec's ``not_before`` when it is at or after ``instant`` (an expiry), else None.
+
+    The one comparison every approval path makes: a campaign that may not start until after the
+    approval (or the delegation behind it) has expired could never run, so it is refused when
+    approved, never accepted and stranded. An absent or unreadable ``not_before`` is never a
+    conflict."""
+    value = getattr(spec, "not_before", None)
+    try:
+        start = parse_not_before(value) if isinstance(value, str) else None
+    except (ValueError, TypeError):
+        return None
+    return start if start is not None and start >= instant else None
+
+
 def waiting(
     spec_json: str | dict[str, Any] | None, status: str, now: datetime
 ) -> dict[str, Any] | None:

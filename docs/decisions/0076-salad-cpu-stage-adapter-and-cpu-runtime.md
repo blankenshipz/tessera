@@ -137,3 +137,14 @@ entry, and the launcher's path rewriting and exit code.
 
 [ADR 0077](0077-campaign-prep-from-the-spec.md) extends the adapter to several pinned snapshot and
 artifact inputs and makes `stage_adapter` fields optional; the single-snapshot limit above is lifted.
+
+## Amendment (2026-11-23): pinned public files beside the image entry
+
+[ADR 0097](0097-provider-side-fetch-of-pinned-public-artifacts.md) (amendment 2026-11-23): an adapted
+stage with `public_artifact` inputs carries its pins. The image entry is no longer necessarily the
+manifest's only item: beside it the manifest may hold pinned `file` URL items only (no wheel, URL entry
+or input item), checked by the contract rules and by the runtime; an image older than this change
+refuses such a manifest before any fetch or claim. The derived contract's fetch rows and redirect
+hosts are exactly the pins, and the provider requires the manifest to equal the image entry plus one
+item per pin. The launcher also maps `/inputs-public` (the local worker's mount of the fetched files)
+to `WORK/files`. Free-form `egress` is still refused.

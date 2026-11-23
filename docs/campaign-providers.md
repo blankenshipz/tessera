@@ -72,8 +72,8 @@ Contract: [ADR 0076](decisions/0076-salad-cpu-stage-adapter-and-cpu-runtime.md).
 Submit (and `tessera_validate_campaign_spec`, which returns the result as `expanded_spec`) replaces
 the request with the explicit `salad` block, so the approver sees and approves the exact workload
 by digest and a later profile edit cannot change it. The block holds the profile and its worker, a
-`gpu_runtime_v1` contract whose manifest is the stage's own argv as one image entry (no fetch or
-redirect host, no env), one output per stage output, one `input` for the stage's snapshot, the
+`gpu_runtime_v1` contract whose manifest is the stage's own argv as one image entry (no env, and
+no fetch or redirect host other than the stage's `public_artifact` pins, below), one output per stage output, one `input` for the stage's snapshot, the
 profile's program template, and a cost estimate of the full duration at the profile's CPU rate. The
 ordinary submit, approval and placement checks then apply to it.
 
@@ -94,13 +94,42 @@ approved campaign's existing delegation and fails closed if its digest differs. 
 stage's output in the same campaign) has no digest at submit and is refused; an `artifact` input must
 already exist when the spec is submitted.
 
+**Pinned public downloads** (amendment 2026-11-23,
+[ADR 0097](decisions/0097-provider-side-fetch-of-pinned-public-artifacts.md)). A stage's
+`public_artifact` inputs (model weights, public datasets) are carried into the candidate: the
+contract's `egress.fetches` are exactly the pins (url, sha256, `max_bytes`), its
+`egress.redirect_hosts` exactly the pins' redirect hosts (with the argv `redirect-hosts:` token), and
+the inline manifest holds, beside the image entry, one `file` item per pin with `dest`
+`<input>/<name>` (and `cache: true` when the source asks). The in-container runtime downloads and
+verifies each file by sha256 and size before the claim, and fails closed on a mismatch; the
+control plane never sees the bytes. The reviewable destinations (`capability_network()`) are
+therefore exactly the pinned hosts and their redirect hosts on 443. On the local worker the same
+files are mounted at `/inputs-public/<input>/<name>`; the launcher maps that prefix to the fetched
+files, so the same argv runs on both. The pins' `max_bytes` plus the staged input must fit the
+profile's `disk_mb`. Free-form `egress` (an allowlist proxy policy) is still refused, and the
+provider refuses an adapted workload whose fetch rows, redirect hosts or manifest items are anything
+but the stage's pins (`public_artifact_contract_mismatch`, or the adapted-stage message for the
+manifest). Note that a `public_artifact` input carries the licence label `unknown-lineage`
+([ADR 0113](decisions/0113-license-placement-guard.md)), so each provider that receives the
+stage must be listed in the trust file without an `allowed_license_labels` limit that excludes it.
+
+The receipt's `public_fetch` object for a provider-side stage carries `egress_allowlist`: the
+sorted pinned and redirect `hosts`, `declared: true`, `redirect_enforced: true` and
+`network_enforced: false`, with a statement that the hosts are declared for review and the
+redirect set is enforced by the workload runtime while the provider's network does not restrict
+the stage to them (Salad egress is provider-wide, ADR 0036). Per-file `bytes`, `seconds` and
+`cache` are `provider_reported` only when control recorded validated fetched rows
+(`execution.public_fetch_recorded`, derived from retained output, never a worker claim), and
+`declared_only` otherwise. Which redirect hosts were actually contacted is not journaled yet.
+
 On Salad the argv runs with its working directory at the run's work directory; arguments at
-`/inputs` and `/outputs` (whole, or after `--name=`) are mapped to the staged input and the output
-directory. Refused with a message that names the limit or the fix: a profile that is not a CPU profile
+`/inputs`, `/inputs-public` and `/outputs` (whole, or after `--name=`) are mapped to the staged
+input, the fetched public files and the output directory. Refused with a message that names the limit or the fix: a profile that is not a CPU profile
 with a `stage_adapter`; an image outside the allowlist (the message gives the exact
 `"sha256:..."` entry and profile to add to `allowed_image_digests`); a duration above 3600 s (or under
 60); `env`, `egress`, `scratch_bytes` or `retry.transient_exit_codes`; a `stage` input; inputs larger
-than the profile's `disk_mb` or `max_input_bytes`; an output path that is not a flat Salad output
+than the profile's `disk_mb` or `max_input_bytes`; pinned public files that with the input exceed
+`disk_mb`; an output path that is not a flat Salad output
 name; outputs above 16 MiB or 16 files; an argv too large for the workload argv (about 4 KiB); and a
 stage `max_exposure_cents` below the estimate. When provider trust does not admit the Salad worker
 for the stage's data, the 409 says what to merge into the provider trust file (see
@@ -242,10 +271,19 @@ Heavy signals: ADR 0088's `declared_memory`, `long_expected_runtime`, `tag:heavy
 of the pinned input sizes the store knows for the campaign's organization and project (snapshot
 manifest sizes and artifact `size_bytes`); unknown sizes are ignored and stage-to-stage inputs are
 not counted. `large_outputs` is the stage's summed declared output `max_bytes` limits, which is a
-cap, not an estimate. The threshold is `heavy_memory_bytes` (default 1.5 GiB). A GPU tag alone is
-not heavy, and egress-bound stages are never guarded.
+cap, not an estimate. A GPU tag (`tag:gpu*`) is also a guard signal (amendment 2026-11-23).
+`large_public_inputs` (amendment 2026-11-23) is the summed `max_bytes` of the stage's pinned
+`public_artifact` files, which the executing provider downloads by digest; such a stage is not
+egress-bound. The
+threshold is `heavy_memory_bytes` (default 1.5 GiB). Egress-bound stages are never guarded. Placement
+ordering uses the same signals, so a stage heavy only by one of them is ordered Salad first.
 
-Reasons, in order: `credential_unavailable`, `no_fitting_profile`, `remote_skipped`,
+Reasons, in order: `no_remote_profile` (alone: the project has no usable Salad
+profile; recorded as a warning in both modes, because refuse mode never waits for capacity that
+cannot exist),
+`credential_unavailable`, `no_fitting_profile`, `remote_failed_infra` (a remote candidate's earlier
+attempt failed on infrastructure and the retry went local; `detail` names the provider and failure
+class), `remote_skipped`,
 `operator_override` (an operator rule put local first, the default policy is off, or a steering
 pin or exclusion), `not_listed`, `remote_not_tried` (a remote candidate is listed after the chosen
 local one with no operator action).
@@ -270,6 +308,58 @@ candidate qualifies; a single-provider stage in `refuse` mode waits until the op
 `tessera_get_campaign` shows per stage `heavy_guard {mode, reasons, signals, provider_id?, waiting,
 recorded_at}` only when an event exists. The [stuck detector](campaign-stuck.md) flags
 `heavy_stage_on_local` and `heavy_stage_refused_local`.
+
+### Heavy stages get a Salad candidate at submit
+
+Contract: [ADR 0141](decisions/0141-heavy-stage-remote-candidate.md). With
+
+```json
+"placement_preferences": {"heavy_remote_candidate": {"provider": "salad", "max_exposure_cents": 40}}
+```
+
+(optional `profile` names one Salad profile), submit, the approved-submission create and the
+validate dry run give every heavy stage (the guard's signals and `heavy_memory_bytes` threshold
+above) that lists no remote candidate an adapted Salad CPU candidate (the stage adapter above, on
+an adapter-enabled CPU profile registered for the project) as its **first alternate**, before the
+spec is digested, so a person or delegation approves it and placement then tries it first
+(heavy-first ordering). The stage gets a `heavy_remote_candidate` record in the stored spec and
+on its receipt stage entry: `{added: true, reason: "operator_heavy_remote_candidate", provider,
+profile, max_exposure_cents, signals}`, or `added: false` with why none was added:
+`egress_bound` (free-form `egress` only: a stage whose only reach is pinned `public_artifact`
+downloads gets the candidate, with the pins as its only fetches; amendment 2026-11-23),
+`no_gpu_profile` (a GPU stage and no GPU profile opened as below),
+`gpu_profile_unfit` (the adapter refused the GPU profile; `detail` says why),
+`forbidden_by_campaign`, `provider_unregistered`, `scratch_requested`, `runtime_not_adaptable`,
+`input_not_pinned` (an input is another stage's output), `alternates_full`,
+`no_fitting_profile`, `profile_unfit` (the adapter refused; `detail` says why),
+`over_operator_cap`, `over_stage_cap`, `over_campaign_budget`, `program_budget`,
+`candidate_refused` (a submit check such as trust refused it). The candidate's hold is its
+full-duration estimate and never exceeds the setting, the stage's `max_exposure_cents`, the
+campaign cap or what a program budget admits; no cap is raised and the submission is never
+refused for it. A submitted record is discarded and recomputed. Light stages, stages that already
+list a remote candidate and v1 specs are unchanged. Without the setting nothing is added, and a
+heavy local placement is the recorded ADR 0107 fallback (`not_listed`).
+
+A heavy stage tagged `gpu` gets a **GPU** candidate only, never a CPU one (ADR 0141 amendment
+2026-11-23). The operator opens a GPU profile to it by giving the profile a `stage_adapter`
+section that names the operator's price for its GPU class:
+
+```json
+"stage_adapter": {"gpu_hour_usd": "0.30"}
+```
+
+`gpu_hour_usd` (USD per hour, positive) is required on a GPU profile's `stage_adapter` and refused
+on a CPU profile's. The candidate is the stage adapter's derivation on the first such GPU profile
+registered for the project (or the setting's optional `gpu_profile`), with `gpu` set, and its
+`max_exposure_cents` is the full duration at `gpu_hour_usd`, rounded up, under the same operator,
+stage, campaign and program caps as a CPU candidate. That price is an estimate input set by the
+operator, never invoice or cost proof: Salad admission still reads the published GPU rate and
+refuses that attempt (`budget_insufficient`) when its run would exceed the candidate's cap at it,
+so a price set too low fails the Salad attempt rather than spending past the cap. Set
+`gpu_hour_usd` at or above the class's published rate. A GPU candidate skipped at placement
+(for example an expired credential) falls back to the local provider with its ADR 0107 reason. An explicit `{"adapt": {"profile": ...}}`
+request still takes a CPU-only profile only. CPU heavy stages are unchanged and never get a GPU
+profile.
 
 ## The provider file
 

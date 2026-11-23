@@ -281,7 +281,10 @@ A person can also sign a delegation (a program, a budget ceiling, a per-run cap,
 gate rules) under which the platform approves a submitted campaign or records a gate go or no-go for a
 human or an enrolled agent only when the written rule is met, each decision on a receipt that cites the
 delegation, and asks the owner for anything outside it
-([ADR 0122](docs/decisions/0122-owner-signed-approval-delegations.md)).
+([ADR 0122](docs/decisions/0122-owner-signed-approval-delegations.md)). A delegation that also
+carries a review rule lets the runner clear a Salad stage's review stops at start (a deferred
+campaign included) inside that rule, citing the delegation, and leaves anything outside it with a
+person ([ADR 0150](docs/decisions/0150-deferred-launch-delegated-preclear.md)).
 
 Clients direct campaigns through `tessera_mcp`: `tessera_submit_campaign` takes v1 and v2
 specs (providers, artifact inputs, chaining); `tessera_list_campaigns`,
@@ -389,7 +392,10 @@ provider needs a fresh approval and a fresh entry; an entry may name one of a st
 and ceilings ([ADR 0066](docs/decisions/0066-preapproval-covers-salad-alternates.md)); an
 operator profile can only narrow this
 (`preapprove_reviews: false`). Provider trust and the data-class guard still apply, and
-every delegated review is cited on the receipt with the approval id. A person is still
+every delegated review is cited on the receipt with the approval id. A campaign approved under
+an owner-signed delegation with a review rule gets the same exact-digest pre-approval recorded by
+the runner at the stage's first review stop, bound to and citing that delegation
+([ADR 0150](docs/decisions/0150-deferred-launch-delegated-preclear.md)). A person is still
 required for: approving each campaign digest (and each re-approval), staging inputs with
 their public declaration and code approval, gate go, conclusions, exports, publication and
 data classification (never pre-approvable), recording compute charges, reconciling orphans

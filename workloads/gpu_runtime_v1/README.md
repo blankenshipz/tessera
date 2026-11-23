@@ -440,8 +440,11 @@ commit. Wheels supplied as hash-verified items of the input snapshot are not imp
 ### Image entry
 
 A manifest may hold one item `{"kind":"entry","source":"image","path":"stage_argv.py","argv":[...]}`
-as its only item. It is resolved inside the image (`/tessera/lib/entries/`), is not a fetch, and
+as its only item, or beside pinned `file` URL items only (no wheel, URL entry or input item; ADR 0097
+amendment 2026-11-23: the stage's pinned public files, fetched and verified before the claim into
+`WORK/files/<dest>`). It is resolved inside the image (`/tessera/lib/entries/`), is not a fetch, and
 needs no declared input. The runtime runs `python -B stage_argv.py WORK OUT -- ARGV...`; the launcher
-rewrites arguments at `/inputs` and `/outputs` to `WORK/input` and `OUT`, runs the argv in `WORK`
+rewrites arguments at `/inputs`, `/inputs-public` and `/outputs` to `WORK/input`, `WORK/files` and
+`OUT`, runs the argv in `WORK`
 with no stdin, and exits with its code. An image older than this change refuses the item (exact key
 set). The stage adapter builds such a manifest; a hand-written contract may too.

@@ -17,6 +17,7 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -55,6 +56,45 @@ class GateRule(_Strict):
         return self
 
 
+ReviewKind = Literal["source_assessment", "plan", "source_use"]
+ProviderClass = Literal["salad_gpu", "salad_cpu"]
+MAX_REVIEW_INTENTS = 16
+MAX_REVIEW_SECONDS = 86_400
+
+
+class ReviewRule(_Strict):
+    """A written rule for the per-run Salad reviews (ADR 0150): which review kinds the platform
+    may resolve for a campaign approved under this delegation, and the bounds every reviewed
+    stage run must sit inside. Optional; absent, a delegation covers no review (ADR 0122)."""
+
+    # The review kinds covered; any other kind stays with a person.
+    kinds: Annotated[list[ReviewKind], Field(min_length=1, max_length=3)]
+    # The most one reviewed stage run may hold (its ``max_exposure_cents``); never above the
+    # delegation's ``per_run_cap_cents``.
+    max_attempt_cents: Cents
+    # The longest one reviewed stage run may last (its ``max_duration_seconds``).
+    max_duration_seconds: Annotated[int, Field(strict=True, ge=1, le=MAX_REVIEW_SECONDS)]
+    # The compute a reviewed stage run may buy: a Salad GPU or a Salad CPU-only container.
+    provider_classes: Annotated[list[ProviderClass], Field(min_length=1, max_length=2)]
+    # The program outcomes a source may be used for (the source-use review's ``outcome``).
+    source_use_intents: Annotated[
+        list[
+            Annotated[
+                str,
+                StringConstraints(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$"),
+            ]
+        ],
+        Field(min_length=1, max_length=MAX_REVIEW_INTENTS),
+    ]
+
+    @field_validator("kinds", "provider_classes", "source_use_intents")
+    @classmethod
+    def unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("review rule entries must be unique")
+        return value
+
+
 class DelegationTerms(_Strict):
     version: Literal[1] = TERMS_VERSION
     # A program the operator configured (program budgets); when set, the campaign's project must
@@ -69,6 +109,16 @@ class DelegationTerms(_Strict):
     allowed_providers: Annotated[list[Identifier], Field(min_length=1, max_length=MAX_PROVIDERS)]
     max_approvals: Annotated[int, Field(strict=True, ge=1, le=MAX_APPROVALS)] | None = None
     gate_rules: Annotated[list[GateRule], Field(max_length=MAX_GATE_RULES)] = []  # noqa: RUF012
+    # ADR 0150: the per-run Salad reviews this delegation may resolve. Absent from the
+    # canonical form (and so from the terms digest) when unset: existing digests are unchanged.
+    review_rule: ReviewRule | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_review_rule(self, handler):
+        value = handler(self)
+        if self.review_rule is None:
+            value.pop("review_rule", None)
+        return value
 
     @field_validator("allowed_providers")
     @classmethod
@@ -89,4 +139,9 @@ class DelegationTerms(_Strict):
     def per_run_within_ceiling(self) -> DelegationTerms:
         if self.per_run_cap_cents > self.budget_ceiling_cents:
             raise ValueError("per_run_cap_cents cannot exceed budget_ceiling_cents")
+        if self.review_rule is not None and (
+            self.review_rule.max_attempt_cents > self.per_run_cap_cents
+        ):
+            # A review rule only narrows: it never lets one run hold more than the delegation.
+            raise ValueError("review_rule.max_attempt_cents cannot exceed per_run_cap_cents")
         return self

@@ -819,14 +819,58 @@ class SaladStageDriver:
             return None
         with self.runner.store.runner_connection() as connection:
             found = campaign_preapproval.stage_preapproval(connection, ctx.approval["id"], key)
-        if found is None:
+        if found is None and not ctx.approval.get("delegation_id"):
             return None
         try:
             if not self.profile(self._spec(ctx, key)).preapprove_reviews:
                 return None
         except StepFailed:
             return None
-        return found
+        return found if found is not None else self._delegated_preapproval(ctx, key)
+
+    def _delegated_preapproval(self, ctx: _Ctx, key: str) -> dict[str, Any] | None:
+        """ADR 0150: at the stage's first review stop, record the review pre-approval the
+        owner-signed delegation this campaign was approved under writes for the stage, bound to
+        the digests this driver derives from the approved spec. Anything outside the
+        delegation records nothing and leaves the stop with a person, with the reasons on a
+        ``campaign.preapproval_declined`` event."""
+        assert ctx.approval is not None
+        delegation_id = ctx.approval["delegation_id"]
+        try:
+            digests = self.preview_review_digests(ctx, key)
+        except Exception:  # noqa: BLE001 - a stage the driver cannot preview is not covered
+            digests = None
+        if digests is None:
+            row, reasons = None, ["review_preview_failed"]
+        else:
+            with self.runner.store.runner_connection() as connection:
+                row, reasons = campaign_preapproval.record_delegated_preapproval(
+                    connection,
+                    campaign_id=ctx.campaign["id"],
+                    approval_id=ctx.approval["id"],
+                    stage_key=key,
+                    digests=digests,
+                )
+                if row is not None and "covered_kinds" in row:
+                    self.runner.store.record_runner_event(
+                        connection,
+                        ctx.campaign,
+                        "campaign.review_preapproval_delegated",
+                        {
+                            "campaign_id": ctx.campaign["id"],
+                            "stage_key": key,
+                            "preapproval_id": row["id"],
+                            "delegation_id": row["delegation_id"],
+                            "terms_digest": row["terms_digest"],
+                            "kinds": row["covered_kinds"],
+                            "max_attempt_cents": row["max_attempt_cents"],
+                            "max_total_cents": row["max_total_cents"],
+                            "expires_at": row["expires_at"],
+                        },
+                    )
+        if row is None:
+            self._declined(ctx, key, None, "delegated_review", delegation_id, ",".join(reasons))
+        return row
 
     def _declined(
         self, ctx: _Ctx, key: str, attempt: int | None, kind: str, subject: str, reason: str

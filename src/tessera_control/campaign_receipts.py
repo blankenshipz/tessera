@@ -10,6 +10,7 @@ from typing import Any
 
 from .campaign_gates import unlock_receipt_section
 from .campaign_heavy_guard import recorded as recorded_heavy_guards
+from .campaign_heavy_remote import records as heavy_remote_records
 from .campaign_holdout import receipt_section as holdout_receipt_section
 from .campaign_io import stage_io
 from .campaign_models import (
@@ -223,6 +224,24 @@ def cache_outcome(row: dict[str, Any]) -> str | None:
     return None
 
 
+EGRESS_ALLOWLIST_STATEMENT = (
+    "The hosts are the approved pinned sources and their redirect hosts. They are declared for "
+    "review and the redirect set is enforced by the workload runtime; the provider's network "
+    "does not restrict the stage to them."
+)
+
+
+def _rented_provider(provider_id: str | None) -> bool:
+    """True for a provider that is not a local worker-grant provider (ADR 0097 amendment): its
+    network egress is provider-wide (ADR 0036), so the allowlist is declared, not enforced."""
+    if not provider_id:
+        return False
+    try:
+        return stage_provider(provider_id).descriptor.kind != "worker_grant"
+    except (KeyError, AttributeError):
+        return False
+
+
 def public_fetch_entry(
     provider_id: str | None, spec_stage: Any, fetched: list[dict[str, Any]] | None = None
 ) -> dict[str, Any] | None:
@@ -231,7 +250,9 @@ def public_fetch_entry(
     The pin (host, sha256) always comes from the approved spec. ``bytes`` and ``seconds`` come
     only from the provider's own reported ``fetched`` rows (``url``, ``sha256``, ``bytes``,
     ``seconds``) for the same url and digest, marked ``provider_reported``; with none they are
-    null and the file is ``declared_only``. Only the host is printed, never the URL."""
+    null and the file is ``declared_only``. Only the host is printed, never the URL. For a provider
+    that is not a local worker, ``egress_allowlist`` states that the hosts are declared and the
+    redirect set enforced by the runtime, and that the provider's network is not restricted."""
     files: list[tuple[str, str, str]] = []
     hosts: set[str] = set()
     cache_requested = False
@@ -284,6 +305,14 @@ def public_fetch_entry(
         # The approved spec asked for the provider-side cache (ADR 0097): say so only then, so
         # the receipt of a stage that did not ask is unchanged.
         entry["cache_requested"] = True
+    if _rented_provider(provider_id):
+        entry["egress_allowlist"] = {
+            "hosts": entry["hosts"],
+            "declared": True,
+            "redirect_enforced": True,
+            "network_enforced": False,
+            "statement": EGRESS_ALLOWLIST_STATEMENT,
+        }
     return entry
 
 
@@ -721,6 +750,8 @@ def build_receipt(
         for item in recorded_placements(connection, current)
     }
     guards = recorded_heavy_guards(connection, current)
+    # ADR 0141: what submit did about each heavy stage's remote candidate (from the spec).
+    remote_candidates = heavy_remote_records(current["spec_json"])
     grants = {
         row["id"]: row["worker_principal_id"]
         for row in connection.execute(
@@ -779,6 +810,11 @@ def build_receipt(
                     if attempt["stage_key"] == stage["stage_key"]
                 ],
                 "stop_results": _json(stage["stop_results_json"], []),
+                **(
+                    {"heavy_remote_candidate": remote_candidates[stage["stage_key"]]}
+                    if stage["stage_key"] in remote_candidates
+                    else {}
+                ),
             }
         )
     reason = current["stop_reason"]

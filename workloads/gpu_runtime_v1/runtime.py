@@ -392,10 +392,15 @@ def validate_manifest(manifest):
     seen, entries, total = set(), 0, 0
     for item in manifest["fetches"]:
         if is_image_item(item):
-            # Only item of the manifest: the launcher runs the argv and nothing else is staged.
+            # Beside it only pinned public ``file`` items (ADR 0097): the launcher runs the argv,
+            # and nothing else (no wheel, URL entry or input item) is staged.
             _validate_image_item(item)
             entries += 1
-            if len(manifest["fetches"]) != 1:
+            if any(
+                not is_image_item(other) and (is_input_item(other) or other.get("kind") != "file")
+                for other in manifest["fetches"]
+                if isinstance(other, dict)
+            ) or not all(isinstance(other, dict) for other in manifest["fetches"]):
                 raise Failure("manifest")
             continue
         if is_input_item(item):

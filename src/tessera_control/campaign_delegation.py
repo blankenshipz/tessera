@@ -81,6 +81,9 @@ STEP_TABLE: dict[str, tuple[str, str]] = {
     "record_gate_metric": ("POST", "/experiment-attempts/{attempt_id}/metric-records"),
     # ADR 0052: ingest a stage's typed evidence rows; delegation-only (no human route).
     "ingest_evidence_rows": ("POST", "/experiment-attempts/{attempt_id}/evidence-rows"),
+    # ADR 0097: record a provider-run stage's public fetch rows, read by control from the
+    # attempt's retained output.json and checked against the frozen pins; delegation-only.
+    "record_provider_fetch": ("POST", "/experiment-attempts/{attempt_id}/provider-fetch"),
     "register_lineage_node": ("POST", "/projects/{project_id}/artifact-lineage/nodes"),
     "record_lineage_edge": ("POST", "/projects/{project_id}/artifact-lineage/edges"),
     # Salad GPU stages (ADR 0038 amendment). Never delegated: compute charges, budget bounds

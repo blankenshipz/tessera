@@ -24,7 +24,7 @@ from tessera_control.campaign_provider_salad import (
     PUBLIC_ARTIFACT_MISMATCH,
     register_provider_instance,
 )
-from tessera_control.campaign_receipts import public_fetch_entry
+from tessera_control.campaign_receipts import EGRESS_ALLOWLIST_STATEMENT, public_fetch_entry
 from tessera_control.store import Conflict
 
 URL = "https://models.example.com/w.bin"  # the fixture contract's one fetch row
@@ -211,6 +211,13 @@ def test_receipt_declared_only_without_retained_rows(world):
             }
         ],
         "via_control": False,
+        "egress_allowlist": {
+            "hosts": [CDN, HOST],
+            "declared": True,
+            "redirect_enforced": True,
+            "network_enforced": False,
+            "statement": EGRESS_ALLOWLIST_STATEMENT,
+        },
     }
 
 

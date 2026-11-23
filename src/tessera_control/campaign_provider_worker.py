@@ -52,7 +52,8 @@ from .store import Conflict, Forbidden, Store
 # Outputs above 16 MiB use chunked large-artifact custody; the operator limit applies.
 MAX_OUTPUT_TOTAL_BYTES = operator_limits().max_artifact_bytes
 SELF_HOSTED_FILE_SCHEMA = "tessera.campaign-providers.v1"
-# ADR 0038 section 2: every delegable step except the Salad-only ones.
+# ADR 0038 section 2: every delegable step except the Salad-only ones. A worker reports its own
+# public fetch rows (ADR 0097), so ``record_provider_fetch`` is not one of its steps.
 WORKER_STEPS = frozenset(
     {
         "create_task",

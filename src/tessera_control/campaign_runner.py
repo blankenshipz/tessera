@@ -111,6 +111,7 @@ from .execution import reconcile_grant_row
 from .experiment_budgets import budget_status
 from .external_operations import current_operation_reconciliation
 from .grant_release import campaign_actor, release_expired_terminal_grants
+from .provider_fetch_record import OUTPUT_NAME as PROVIDER_FETCH_OUTPUT
 from .remote_execution_models import TargetPolicy
 from .snapshot_composition import composed_inventory
 from .store import Conflict, Forbidden, NotFound, _parse_utc, _utc_string, canonical_digest
@@ -3497,6 +3498,7 @@ class CampaignRunner:
                     },
                 ),
             )
+            self._record_provider_fetch(ctx, key, spec_stage, attempt, by_path)
         measurements: list[dict[str, Any]] = []
         for index, metric in enumerate(spec_stage.metrics):
             artifact_id = by_path.get(metric.path)
@@ -3595,6 +3597,48 @@ class CampaignRunner:
             attempt["id"], status="measured", measurements_json=json.dumps(measurements)
         )
         return True
+
+    def _record_provider_fetch(
+        self,
+        ctx: _Ctx,
+        key: str,
+        spec_stage: NormalStage,
+        attempt: dict[str, Any],
+        by_path: dict[str, str],
+    ) -> None:
+        """ADR 0097: a provider-run stage with pinned public files has its fetch rows read by
+        control from the retained output.json and checked against the frozen pins. Only for a
+        provider that takes the step (a local worker reports its own); a refusal records
+        nothing, so the receipt stays ``declared_only`` and the passed stage is unaffected."""
+        if not any(getattr(s, "kind", None) == "public_artifact" for s in spec_stage.inputs):
+            return
+        artifact_id = by_path.get(PROVIDER_FETCH_OUTPUT)
+        if artifact_id is None:
+            return
+        try:
+            steps = self._provider(spec_stage).descriptor.delegable_steps
+        except KeyError:
+            return
+        if "record_provider_fetch" not in steps:
+            return
+        admitted = attempt["admitted_attempt_id"]
+        try:
+            self._step(
+                ctx,
+                key,
+                attempt["attempt"],
+                "record_provider_fetch",
+                0,
+                lambda: (
+                    {"attempt_id": admitted},
+                    {
+                        "expected_revision": self._admitted_revision(admitted),
+                        "artifact_id": artifact_id,
+                    },
+                ),
+            )
+        except StepFailed:
+            pass  # nothing recorded: the pins stay declared_only, never inferred
 
     def _do_reconcile(
         self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage, attempt: dict[str, Any]

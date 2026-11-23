@@ -18,7 +18,9 @@ worker path or a secret.
   ``expires_at`` (a request the expiry sweep has not yet marked expired is already cleared here;
   an unparsable ``expires_at`` fails closed to listing it).
   A pre-approval clears an item only by resolving that request: this view reads the request's own
-  status and never looks at pre-approvals.
+  status and never looks at pre-approvals. For a campaign approved under an owner-signed
+  delegation (ADR 0150), an item also carries ``delegation_declined``: the stable reason codes
+  of the latest recorded decline (why the delegation did not clear it); absent otherwise.
 """
 
 from __future__ import annotations
@@ -67,6 +69,14 @@ def pending_human_approval(
     if status in {"cancelled", "succeeded", "stopped", "failed"}:
         return items
     now = datetime.now(UTC)
+    delegated = (
+        connection.execute(
+            """SELECT 1 FROM campaign_approvals WHERE campaign_id=? AND status='active'
+            AND delegation_id IS NOT NULL""",
+            (campaign["id"],),
+        ).fetchone()
+        is not None
+    )
     rows = connection.execute(
         """SELECT a.stage_key, a.attempt, s.plan_decision_id, s.source_decision_id
         FROM campaign_salad_attempts s JOIN campaign_stage_attempts a ON a.id = s.attempt_id
@@ -84,6 +94,11 @@ def pending_human_approval(
                 (decision_id,),
             ).fetchone()
             if pending is not None and _still_open(pending["expires_at"], now):
+                declined = (
+                    _delegation_declined(connection, campaign["id"], row["stage_key"], decision_id)
+                    if delegated
+                    else None
+                )
                 items.append(
                     {
                         "kind": "salad_review",
@@ -92,6 +107,28 @@ def pending_human_approval(
                         "review": review,
                         "awaiting": f"a person's decision on the {review.replace('_', ' ')} review",
                         "decision_request_id": decision_id,
+                        **({"delegation_declined": declined} if declined else {}),
                     }
                 )
     return items
+
+
+def _delegation_declined(
+    connection: sqlite3.Connection, campaign_id: str, stage_key: str, decision_id: str
+) -> list[str] | None:
+    """ADR 0150: why the owner-signed delegation this campaign was approved under did not
+    clear this review (stable reason codes, never an id), from the latest decline recorded for
+    the request or for the stage's delegated pre-approval; None when none was recorded."""
+    found = connection.execute(
+        """SELECT json_extract(payload_json, '$.reason') AS reason FROM events
+        WHERE event_type='campaign.preapproval_declined'
+        AND json_extract(payload_json, '$.campaign_id')=?
+        AND json_extract(payload_json, '$.stage_key')=?
+        AND (json_extract(payload_json, '$.subject_id')=?
+             OR json_extract(payload_json, '$.kind')='delegated_review')
+        ORDER BY cursor DESC LIMIT 1""",
+        (campaign_id, stage_key, decision_id),
+    ).fetchone()
+    if found is None or not found["reason"]:
+        return None
+    return sorted(set(str(found["reason"]).split(",")))

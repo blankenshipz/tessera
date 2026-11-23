@@ -133,3 +133,36 @@ Focused tests only, no live calls.
   (`test_a_running_heavy_attempt_with_a_warning_is_stuck_on_local`,
   `test_a_refused_waiting_stage_is_stuck_only_after_the_grace`,
   `test_a_refused_stage_that_was_placed_since_is_not_stuck`).
+
+## Amendment (2026-11-23)
+
+Owner rule: heavy stages are placed on Salad first; local is only a fallback, recorded on the
+receipt with an accurate reason. This amends Decisions 1-3 and 5; nothing else changes.
+
+- **One definition of heavy.** Placement ordering (ADR 0088's default policy) now receives the
+  guard's signals (`campaign_heavy_guard.heavy`, computed once in `campaign_placement.decide`), so a
+  `[local, salad]` stage that is heavy only by `tag:pretraining`, `large_inputs` or `large_outputs`
+  is ordered Salad first and its preference record is `class: heavy` with those signals. Egress-bound
+  and gpu classes are unchanged, and light stages (no signal) keep the spec's order. The
+  read-only inspection shows the spec-derived signals only (`large_inputs` needs the store).
+- **A gpu requirement is a guard signal** (Decision 1 no longer says a GPU tag alone is not heavy for
+  the guard): `tag:gpu*` is a signal, so a gpu-tagged stage placed locally while a Salad profile
+  exists records the warning. ADR 0088's class names are unchanged.
+- **`credential_unavailable`** (the skip placement emits when the provider's own `check_stage`
+  reports a credential state) is now a credential reason, not `remote_skipped`.
+- **`remote_failed_infra`** (new, after `no_fitting_profile`): a remote candidate's earlier attempt
+  failed on infrastructure, so ADR 0060 moved it last and the retry went local. `detail` carries
+  `{provider_id, reason: <failure class>}`; the reason no longer reads `remote_not_tried` or
+  `operator_override`.
+- **`no_remote_profile`** (new, listed first and alone): a heavy stage placed local while the project
+  has no usable Salad profile. Recorded with warn semantics in both modes (placement unchanged, once
+  per attempt, same event and receipt block, `mode: warn`). In `refuse` mode the guard downgrades to
+  warn without a profile: it records but never waits, since capacity that cannot exist cannot arrive. The stuck detector does not report
+  `heavy_stage_on_local` for this reason alone.
+- **Not changed:** the single-provider warning event is still written in its own transaction before
+  reservation: that path has no `campaign.stage_placed` transaction, and the attempt row is created
+  in `_reserve_hold`. The event is keyed by `(stage_key, attempt)` and is written once, so a crash
+  between the two repeats nothing; Decision 4's "same transaction" holds for placed stages only.
+
+Tests: `tests/test_heavy_stage_placement_reasons.py`. `tests/test_heavy_stage_guard.py` changed two
+tests for the contract (gpu is a guard signal; no profile records `no_remote_profile`).
