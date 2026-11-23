@@ -27,6 +27,7 @@ from .campaign_models import (
     StageSpec,
     stage_on_candidate,
 )
+from .campaign_salad_adapter import bind_workload, is_late_bound
 from .campaign_settlement import apply_late_charge, confirm_settlement
 from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
@@ -135,6 +136,43 @@ def salad_config(spec_stage: Any) -> SaladStageSpec:
     if not found:
         raise StepFailed("salad", "step_refused", "salad_config_missing")
     return SaladStageSpec.model_validate(found)
+
+
+# Late-bound stage-output inputs (``campaign_salad_adapter.late_bind_key``). The event records,
+# per bound snapshot, each resolved input the Salad stage receives; the refusal codes are closed:
+# the resolver's own codes (``late_bound_inputs.REFUSAL_CODES``) or one of these.
+LATE_BOUND_EVENT = "campaign.salad_late_bound_inputs"
+LATE_BIND_REFUSED_EVENT = "campaign.salad_late_bind_refused"
+LATE_BIND_UNRESOLVED = "late_bound_input_unresolved"  # no composed input snapshot recorded
+LATE_BIND_MISSING = "late_bound_input_missing"  # a resolved output is not in the snapshot
+LATE_BIND_MISMATCH = "late_bound_input_digest_mismatch"  # snapshot bytes differ from receipt
+LATE_BIND_OVER_CAP = "late_bound_input_over_cap"  # over the reviewed contract max_bytes
+LATE_BIND_RESOLVER = "late_bound_resolver_unavailable"  # the core resolver is not installed
+LATE_BIND_CODES = frozenset(
+    {
+        LATE_BIND_UNRESOLVED,
+        LATE_BIND_MISSING,
+        LATE_BIND_MISMATCH,
+        LATE_BIND_OVER_CAP,
+        LATE_BIND_RESOLVER,
+    }
+)
+
+
+def stage_workload(stage: dict[str, Any], spec_stage: Any) -> Any:
+    """The workload contract the stage's route carries.
+
+    An adapted stage whose inputs include another stage's output declares its input by the
+    late-bind key; once the runner has composed the input snapshot, the contract carries that
+    snapshot's digest instead (``bind_workload``), so the route's ``manifests.data``, the
+    contract's input and the argv ``input:`` token are one digest. Before composition the
+    reviewed contract is returned unchanged, which never matches a route's data digest."""
+    salad = salad_config(spec_stage)
+    contract = salad.workload
+    if not salad.adapted or not is_late_bound(spec_stage, contract):
+        return contract
+    digest = stage.get("input_snapshot_digest")
+    return bind_workload(contract, str(digest)) if digest else contract
 
 
 def _waiting() -> type[Exception]:
@@ -384,7 +422,7 @@ class SaladStageDriver:
     ) -> ExecutionSelection:
         return derive_selection(
             self.profile(spec_stage),
-            salad_config(spec_stage).workload,
+            stage_workload(stage, spec_stage),
             operation_id=row["operation_id"],
             epoch=row["epoch"],
             snapshot_digest=stage_data_digest(stage, spec_stage),
@@ -509,8 +547,12 @@ class SaladStageDriver:
     def experiment_ready(self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec) -> bool:
         """Study variant and split lock for the stage experiment; False after a step ran."""
         key = stage["stage_key"]
+        refusal = self._late_bound_refusal(ctx, stage, spec_stage)
+        if refusal is not None:
+            self._refuse_late_bound(ctx, key, refusal)
+            return False
         row = self._stage_row(ctx, key)
-        contract = salad_config(spec_stage).workload
+        contract = stage_workload(stage, spec_stage)
         if row["study_variant_id"] is None:
             code = derived_digests(self.profile(spec_stage), contract, spec_stage.image)
             result = self.runner._step(
@@ -550,6 +592,115 @@ class SaladStageDriver:
             self._set_stage_row(ctx, key, split_lock_id=result.response["id"])
             return False
         return True
+
+    # -- late-bound stage-output inputs ------------------------------------------------
+
+    def _late_bound_refusal(
+        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec
+    ) -> str | None:
+        """None when the stage has no late-bound input or every one checks out, else a closed
+        refusal code. Runs once the runner has composed the input snapshot and before any
+        study step, review or route, so nothing reaches Salad for a refused input.
+
+        Each stage-output input is resolved by the core resolver from the upstream stage's
+        recorded, settled outputs; the provider instance must admit each resolved output's
+        recorded data class and inherited licence labels (ADR 0040 section 4, re-checked after
+        resolution); and the composed snapshot the route will name must hold exactly the
+        resolved bytes (same sha256 and size at ``<input>/<path>``) within the reviewed
+        ``max_bytes``. On success the resolved inputs are recorded once per bound snapshot."""
+        salad = salad_config(spec_stage)
+        if not salad.adapted or not is_late_bound(spec_stage, salad.workload):
+            return None
+        key = stage["stage_key"]
+        snapshot_id, digest = stage.get("input_snapshot_id"), stage.get("input_snapshot_digest")
+        if not snapshot_id or not digest:
+            return LATE_BIND_UNRESOLVED
+        try:
+            from . import late_bound_inputs as resolver
+        except ImportError:  # pragma: no cover - the core module ships with the runner
+            return LATE_BIND_RESOLVER
+        campaign = ctx.campaign
+        with self.runner.store.runner_connection() as connection:
+            try:
+                earlier = resolver.bound_inputs(connection, campaign, key)
+                resolved = resolver.resolve_stage_inputs(
+                    connection,
+                    campaign["id"],
+                    spec_stage,
+                    org_id=campaign["org_id"],
+                    project_id=campaign["project_id"],
+                    expected={(item.name, item.output): item.digest for item in earlier},
+                )
+                resolver.check_resolved_routing(
+                    connection,
+                    spec_stage,
+                    resolved,
+                    worker=salad.worker_principal_id,
+                    approval_digest=(ctx.approval or {}).get("trust_policy_digest"),
+                )
+            except resolver.LateBindRefused as error:
+                return error.code
+            snapshot = connection.execute(
+                "SELECT digest, manifest_json FROM source_snapshots WHERE id=? AND project_id=?",
+                (snapshot_id, campaign["project_id"]),
+            ).fetchone()
+        if snapshot is None or snapshot["digest"] != digest:
+            return LATE_BIND_MISMATCH
+        files = {
+            entry["relative_path"]: entry
+            for entry in json.loads(snapshot["manifest_json"])["entries"]
+        }
+        wanted = {
+            f"{item.name}/{path}"
+            for item in spec_stage.inputs
+            if getattr(item, "kind", None) == "stage"
+            for path in item.paths
+        }
+        seen: set[str] = set()
+        for item in resolved:
+            path = f"{item.name}/{item.path}"
+            entry = files.get(path)
+            if entry is None:
+                return LATE_BIND_MISSING
+            if entry["sha256"] != item.digest or int(entry["size"]) != item.bytes:
+                return LATE_BIND_MISMATCH
+            seen.add(path)
+        if wanted - seen:
+            return LATE_BIND_MISSING
+        total = sum(int(entry["size"]) for entry in files.values())
+        if total > salad.workload.input.max_bytes:
+            return LATE_BIND_OVER_CAP
+        self.runner.emit_once(
+            ctx,
+            LATE_BOUND_EVENT,
+            {"stage_key": key, "snapshot_digest": digest},
+            {
+                "snapshot_bytes": total,
+                "max_bytes": salad.workload.input.max_bytes,
+                "inputs": [
+                    {
+                        "name": item.name,
+                        "source_stage": item.source_stage,
+                        "output": item.output,
+                        "digest": item.digest,
+                        "bytes": item.bytes,
+                        "data_class": item.data_class,
+                        "license_labels": list(item.license_labels),
+                    }
+                    for item in resolved
+                ],
+            },
+        )
+        return None
+
+    def _refuse_late_bound(self, ctx: _Ctx, key: str, code: str) -> None:
+        """Fail the stage with the closed code: no unstarted attempt keeps its reservation and
+        no step, review or route is made for it."""
+        for attempt in self.runner._attempts(ctx, key):
+            if attempt["status"] == "reserved" and attempt["grant_id"] is None:
+                self.runner._cancel_unstarted(ctx, attempt)
+        self.runner.emit_once(ctx, LATE_BIND_REFUSED_EVENT, {"stage_key": key}, {"code": code})
+        self.runner._stage_failed(ctx, key, code)
 
     # -- attempt lifecycle ------------------------------------------------------------
 
@@ -601,7 +752,7 @@ class SaladStageDriver:
         profile = self.profile(spec_stage)
         template = salad.program
         selection = self._selection(ctx, stage, spec_stage, row)
-        digests = derived_digests(profile, salad.workload, spec_stage.image)
+        digests = derived_digests(profile, stage_workload(stage, spec_stage), spec_stage.image)
         max_seconds = selection.resources.max_seconds
         gate = template.gate
         return {
@@ -1034,7 +1185,7 @@ class SaladStageDriver:
         salad_row = self._stage_row(ctx, key)
         profile = self.profile(spec_stage)
         declaration = capability_declaration(
-            profile, salad_config(spec_stage).workload, spec_stage.image
+            profile, stage_workload(stage, spec_stage), spec_stage.image
         )
         digest = canonical_digest(declaration)
         existing = (

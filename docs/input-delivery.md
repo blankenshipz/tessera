@@ -71,6 +71,16 @@ Not done: staging does not authorize worker transfer; a human still issues the s
 `ReleaseSnapshot`, and a later plan names the digest in `input_snapshot_digest`. There
 are no typed lineage edges until artifact lineage covers staged inputs, and Salad receives no bytes.
 
+## Stage outputs inside one campaign (ADR 0140)
+
+A campaign stage that reads an earlier stage's declared outputs (`kind: stage`) does not need
+a human staging step: when the stage starts, the runner binds each output to the digest and
+size its producing attempt recorded (the attempt must have succeeded and settled, and the
+custody manifest must agree), re-checks the provider's trust for the resolved data class and
+licence labels, and composes the input snapshot from exactly those digests. Any mismatch fails
+closed with a closed refusal code, and the dependent stage's receipt lists the binding under
+`input.late_bound_inputs`. See [campaigns](campaigns.md).
+
 ## Chunked snapshots (ADR 0037)
 
 Chunk bounds are operator limits (default 8 GiB per snapshot and 32 GiB per project, see

@@ -60,9 +60,9 @@ def test_a_public_only_stage_has_no_input_plan():
     assert input_plan(stage(public_item()), profile(), None) is None
 
 
-def test_another_stages_output_is_still_refused_beside_a_public_input():
+def test_an_unknown_input_kind_is_still_refused_beside_a_public_input():
     other = SimpleNamespace(kind="stage_output", name="up")
-    with pytest.raises(Conflict, match="another stage's output"):
+    with pytest.raises(Conflict, match="cannot be carried to Salad"):
         input_plan(stage(other, public_item()), profile(), None)
 
 

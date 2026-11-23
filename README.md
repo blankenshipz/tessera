@@ -250,7 +250,7 @@ recorded with unknown bytes rather than missing, [ADR 0057](docs/decisions/0057-
 `code_input`, so private code reaches any provider as a digest-pinned input in a generic deps-only image
 instead of being baked into an image pushed to a registry, and the receipt records the code and image
 digests and the delivery ([ADR 0095](docs/decisions/0095-stage-code-as-input-artifacts.md)); the code input does not count toward a stage's limit of 8 data inputs ([ADR 0121](docs/decisions/0121-code-input-outside-stage-input-limit.md)). A stage input is a snapshot, the
-declared output of an earlier stage (any provider), or an `artifact` pinned by campaign,
+declared output of an earlier stage (any provider; bound to its recorded digest when the dependent stage starts, with data-class and licence routing re-checked on the resolved artifact and closed refusal codes, [ADR 0140](docs/decisions/0140-late-bound-stage-output-inputs.md)), or an `artifact` pinned by campaign,
 stage, output and sha256 from an earlier campaign (or a `receipt_output` reference to a value on a succeeded campaign's receipt, resolved and pinned at submit, [ADR 0080](docs/decisions/0080-campaign-inputs-from-a-predecessor-receipt.md)); every input and output is indexed in
 `campaign_stage_io`. A stage may also list ordered `alternate_providers`; the runner then places
 each attempt on the first candidate that is registered, enrolled for the project, trusted for the

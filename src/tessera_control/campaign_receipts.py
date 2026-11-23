@@ -650,6 +650,16 @@ def _license_section(
     return {}
 
 
+def _bound_section(connection: sqlite3.Connection, campaign: Any, stage_key: str) -> dict[str, Any]:
+    """The stage-output inputs bound when the stage started (ADR 0140): per input the source
+    stage, output name, resolved digest, bytes, data class and licence labels (the lineage
+    edge). Absent for a stage that bound none, so existing receipts keep their bytes."""
+    from .late_bound_inputs import LAUNCH_INPUTS_KEY, bound_inputs
+
+    bound = bound_inputs(connection, campaign, stage_key)
+    return {LAUNCH_INPUTS_KEY: [item.to_json() for item in bound]} if bound else {}
+
+
 def steering_receipt_section(connection: sqlite3.Connection, campaign_id: str) -> dict[str, Any]:
     """Pause, concurrency limit and stage cancels (ADR 0061); empty for an unsteered campaign,
     so existing receipts keep their shape and digest."""
@@ -796,6 +806,7 @@ def build_receipt(
                     **_license_section(
                         connection, current, normal, spec_stage, stage["provider_id"]
                     ),
+                    **_bound_section(connection, current, stage["stage_key"]),
                 },
                 **({} if code_info is None else {"code": code_info}),
                 "output_data_class": stage["output_data_class"],

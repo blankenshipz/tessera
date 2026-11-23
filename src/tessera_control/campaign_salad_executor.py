@@ -828,9 +828,9 @@ class StoreControl:
         worker: dict[str, Any],
         guardian_status: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
-        from .artifact_manifests import ArtifactManifestStore
         from .campaign_store import CampaignStore
         from .execution import ExecutionStore
+        from .project_artifact_store import ProjectArtifactStore
         from .remote_execution import RemoteExecutionStore
         from .runtime_packages import RuntimePackageStore
         from .worker_grants import WorkerGrantStore
@@ -844,7 +844,11 @@ class StoreControl:
         self.packages = RuntimePackageStore(self.state_dir)
         self.registry = WorkerRegistryStore(self.state_dir)
         self.routes = RemoteExecutionStore(self.state_dir)
-        self.artifacts = ArtifactManifestStore(self.state_dir)
+        # The worker-facing artifact store with project placement (a subclass of the manifest
+        # store): outputs are committed under the project's storage binding before the manifest,
+        # exactly as a worker-grant host does, so a project whose earlier stage ran on such a
+        # host (and so has a binding) still accepts the Salad stage's manifest.
+        self.artifacts = ProjectArtifactStore(self.state_dir)
 
     def _read(self, sql: str, args: tuple) -> list[Any]:
         from .store import _connect
@@ -967,6 +971,18 @@ class StoreControl:
                     size=len(data),
                 )
             )
+        placement = dict(
+            expected_epoch=epoch,
+            operation_id=operation_id,
+            artifacts=[{name: item[name] for name in ("id", "sha256", "size")} for item in entries],
+        )
+        self.artifacts.commit_project_artifacts(
+            self.worker,
+            lease_id,
+            _key("placement", operation_id),
+            canonical_digest(placement),
+            placement,
+        )
         payload = dict(expected_epoch=epoch, operation_id=operation_id, artifacts=entries)
         return self.artifacts.create_manifest(
             self.worker,

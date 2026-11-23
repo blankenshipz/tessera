@@ -21,7 +21,18 @@ A spec (`version: 1`) with `name`, `budget_cap_cents` (0..5000, USD), `deadline_
 `inputs`: a retained project snapshot (`kind: snapshot`, with digest and `data_class`) or
 the declared outputs of earlier stages (`kind: stage`). A stage with one snapshot input
 sees it at `/inputs/`; any other stage sees each input at `/inputs/<name>/`, built by a
-composed snapshot. Submitting grants nothing and spends nothing. A v2 stage may also pin
+composed snapshot. A `kind: stage` input is bound when the dependent stage starts
+([ADR 0140](decisions/0140-late-bound-stage-output-inputs.md)): the runner resolves each
+referenced output to the sha256 and size the upstream stage's succeeded, settled attempt
+recorded, checks it against the custody manifest, re-checks the provider trust setting
+against the resolved data class and inherited licence labels, and pins those digests for
+composition. A refusal is a closed code (`upstream_missing`, `upstream_not_succeeded`,
+`upstream_not_settled`, `output_missing`, `digest_mismatch`, `data_class_refused`,
+`license_refused`, `campaign_not_found`) recorded as `campaign.stage_input_bind_refused`; the
+stage fails as `late_bind_refused:<code>`. The binding is the event
+`campaign.stage_inputs_bound` and the receipt's `input.late_bound_inputs` (source stage,
+output, digest, bytes, data class, labels); providers read it through
+`RunnerServices.bound_inputs` and receive resolved digests only. Submitting grants nothing and spends nothing. A v2 stage may also pin
 another campaign's output (`kind: artifact`); that resolves through the source campaign's
 v2 receipt and its stage I/O index, so a campaign that finished before schema v65 cannot be
 an artifact source.

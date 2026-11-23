@@ -34,6 +34,7 @@ from . import campaign_hold, provider_trust
 from . import campaign_holdout as holdout
 from . import campaign_placement as placement
 from . import execution_frames as frames
+from . import late_bound_inputs as late_bound
 from .campaign_autoreconcile import (
     MAX_AUTO_REQUEUES,
     NOT_STARTED,
@@ -668,6 +669,12 @@ class CampaignRunner:
 
     def step(self, ctx, key, attempt, step, ordinal, build, route_policy=None):
         return self._step(ctx, key, attempt, step, ordinal, build, route_policy)
+
+    def bound_inputs(self, ctx: _Ctx, key: str) -> tuple[late_bound.ResolvedStageInput, ...]:
+        """The stage-output inputs bound when the stage started (ADR 0140): only resolved
+        digests, sizes, classes and labels, never a reference a provider must resolve."""
+        with self.store.runner_connection() as connection:
+            return late_bound.bound_inputs(connection, ctx.campaign, key)
 
     def set_stage(self, ctx: _Ctx, key: str, **fields: Any) -> None:
         self._set_stage(ctx, key, **fields)
@@ -2420,6 +2427,60 @@ class CampaignRunner:
         self._stage_failed(ctx, key, "input_not_admitted")
         return True
 
+    def _bind_stage_outputs(
+        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage
+    ) -> tuple[late_bound.ResolvedStageInput, ...] | None:
+        """ADR 0140: bind every in-campaign stage-output input to its recorded digest when the
+        stage starts, re-check routing for the resolved artifacts and record the binding (the
+        lineage edge the receipt shows) in the same transaction. A refusal is a closed code: the
+        stage fails, nothing unstarted stays reserved, and None is returned."""
+        key = stage["stage_key"]
+        worker = self._provider(spec_stage).grant_request(self, ctx, spec_stage).worker_principal_id
+        try:
+            with self.store.runner_connection() as connection:
+                earlier = late_bound.bound_inputs(connection, ctx.campaign, key)
+                resolved = late_bound.resolve_stage_inputs(
+                    connection,
+                    ctx.campaign["id"],
+                    spec_stage,
+                    org_id=ctx.campaign["org_id"],
+                    project_id=ctx.campaign["project_id"],
+                    expected={(item.name, item.output): item.digest for item in earlier},
+                )
+                late_bound.check_resolved_routing(
+                    connection,
+                    spec_stage,
+                    resolved,
+                    worker=worker,
+                    approval_digest=(ctx.approval or {}).get("trust_policy_digest"),
+                )
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    late_bound.BOUND_EVENT,
+                    {"stage_key": key},
+                    {"provider": spec_stage.provider, **late_bound.launch_payload(resolved)},
+                )
+        except late_bound.LateBindRefused as error:
+            for attempt in self._attempts(ctx, key):
+                if attempt["status"] == "reserved" and attempt["grant_id"] is None:
+                    self._cancel_unstarted(ctx, attempt)
+            self.emit_once(
+                ctx,
+                late_bound.REFUSED_EVENT,
+                {"stage_key": key},
+                {
+                    "code": error.code,
+                    "input": error.input_name,
+                    "provider": spec_stage.provider,
+                    "worker_principal_id": worker,
+                    "reason": error.detail,
+                },
+            )
+            self._stage_failed(ctx, key, f"late_bind_refused:{error.code}")
+            return None
+        return resolved
+
     def _input_ready(
         self,
         ctx: _Ctx,
@@ -2557,6 +2618,12 @@ class CampaignRunner:
         custody = custody_inputs(spec_stage)
         if not custody:
             return self._input_ready_public(ctx, stage, spec_stage, attempt)
+        pinned: dict[tuple[str, str], str] = {}
+        if any(item.kind == "stage" for item in custody):
+            bound = self._bind_stage_outputs(ctx, stage, spec_stage)
+            if bound is None:
+                return True
+            pinned = {(item.name, item.path): item.digest for item in bound}
         if not needs_composition(spec_stage):
             source = custody[0]
             return self._input_ready(
@@ -2592,6 +2659,11 @@ class CampaignRunner:
                     if missing:
                         raise StepFailed(
                             "compose_snapshot", "step_refused", "declared output was not produced"
+                        )
+                    if any(listed[p]["sha256"] != pinned.get((item.name, p)) for p in item.paths):
+                        # ADR 0140: composition uses exactly the digests bound at stage start.
+                        raise StepFailed(
+                            "compose_snapshot", "step_refused", "late-bound input digest changed"
                         )
                     sources.append(
                         {

@@ -216,18 +216,25 @@ def test_more_than_one_input_needs_the_platform_to_size_it(tmp_path, near):
     refusal(world, "cannot be sized here", inputs=[first, {**first, "name": "second"}])
 
 
-def test_an_input_from_another_stage_is_refused(tmp_path, near):
+def test_an_input_from_another_stage_is_late_bound_with_its_declared_bound(tmp_path, near):
+    from tessera_control.campaign_salad_adapter import late_bind_key, upstream_outputs
+
     world = cpu_world(tmp_path, near)
     inputs = [{"kind": "stage", "name": "up", "stage": "upstream", "outputs": ["output"]}]
-    spec = salad_spec_v2(
-        world.env,
-        [
-            stage(world.env, key="upstream", alternate_providers=None),
-            stage(world.env, inputs=inputs),
-        ],
+    spec = parse_spec(
+        salad_spec_v2(
+            world.env,
+            [
+                stage(world.env, key="upstream", alternate_providers=None),
+                stage(world.env, inputs=inputs),
+            ],
+        )
     )
-    with pytest.raises(Conflict, match="another stage's output"):
-        expand_spec(parse_spec(spec), world.profiles, tenant=None)
+    (item,) = expand_spec(spec, world.profiles, tenant=None).stages[1].alternate_providers
+    work = SaladStageSpec.model_validate(item.provider_config).workload
+    # The reviewed contract names the late-bind key and the upstream output's declared bound.
+    assert work.input.snapshot_digest == late_bind_key(spec.stages[1], upstream_outputs(spec))
+    assert work.input.max_bytes == 4096
 
 
 def test_a_profile_that_is_not_opened_to_adapted_stages_is_refused(tmp_path, near):

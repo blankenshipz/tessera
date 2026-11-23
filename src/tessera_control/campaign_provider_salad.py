@@ -35,11 +35,13 @@ from .campaign_providers import (
     replace_provider,
 )
 from .campaign_salad import (
+    LATE_BOUND_EVENT,
     SaladStageDriver,
     credential_blocked,
     credential_message,
     salad_config,
 )
+from .campaign_salad_adapter import CUSTODY_KINDS, bind_workload, is_late_bound
 from .campaign_store import SALAD_REFUSAL
 from .models import ExecutionSpec
 from .salad_campaign_profiles import (
@@ -162,7 +164,7 @@ def public_artifact_refusal(stage: Any, config: SaladStageSpec) -> str | None:
     if contract_rows != pins[0] or sorted(egress.redirect_hosts) != pins[1]:
         return PUBLIC_ARTIFACT_MISMATCH
     sources = [getattr(s, "kind", None) for s in stage.inputs]
-    if config.workload.input is not None and "snapshot" not in sources:
+    if config.workload.input is not None and not set(sources) & set(CUSTODY_KINDS):
         return PUBLIC_ARTIFACT_DELIVERY  # a snapshot the contract expects is never delivered
     if stage_has_nonpublic_input(stage) and config.workload.runtime == GPU_RUNTIME_V1:
         # Private data is pulled only after begin-once; a manifest read from that input would
@@ -470,11 +472,14 @@ class SaladRouteProvider:
         """The task plan's execution spec: the base plan contract only, because the
         workload contract declares Salad's provider-wide egress."""
         config = _salad_config(stage)
-        argv = (
-            [SALAD_COMMAND, *config.workload.argv_template]
-            if config is not None and config.adapted
-            else list(stage.argv)
-        )
+        argv = list(stage.argv)
+        if config is not None and config.adapted:
+            workload = config.workload
+            if is_late_bound(stage, workload):
+                # The stage-output inputs are composed now: the plan carries the bound argv,
+                # the same one the route's contract carries (``bind_workload``).
+                workload = bind_workload(workload, input_digest)
+            argv = [SALAD_COMMAND, *workload.argv_template]
         return ExecutionSpec(
             argv=argv,
             input_snapshot_digest=input_digest,
@@ -622,6 +627,9 @@ class SaladRouteProvider:
         if termination is not None:
             # ADR 0149: only on a reallocated route, so every other receipt keeps its shape.
             fields["salad_termination"] = termination
+        bound = self._late_bound_inputs(connection, attempt)
+        if bound is not None:
+            fields["late_bound_inputs"] = bound
         return fields
 
     @staticmethod
@@ -648,6 +656,47 @@ class SaladRouteProvider:
         view = reading.as_dict()
         view["hold_released"] = attempt.get("settled_cents") is not None
         return view
+
+    @staticmethod
+    def _late_bound_inputs(
+        connection: sqlite3.Connection, attempt: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """The stage-output inputs the driver resolved and checked for this attempt's stage
+        (source stage, output name, sha256, bytes), with the composed snapshot digest the
+        route named; None for a stage without late-bound inputs. Read from the recorded event,
+        scoped to the campaign's project."""
+        campaign = connection.execute(
+            "SELECT project_id FROM campaigns WHERE id=?", (attempt["campaign_id"],)
+        ).fetchone()
+        if campaign is None:
+            return None
+        found = connection.execute(
+            """SELECT payload_json FROM events WHERE project_id=? AND event_type=?
+            AND json_extract(payload_json, '$.campaign_id') = ?
+            AND json_extract(payload_json, '$.stage_key') = ?
+            ORDER BY cursor DESC LIMIT 1""",
+            (
+                campaign["project_id"],
+                LATE_BOUND_EVENT,
+                attempt["campaign_id"],
+                attempt["stage_key"],
+            ),
+        ).fetchone()
+        if found is None:
+            return None
+        payload = json.loads(found["payload_json"])
+        return {
+            "snapshot_digest": payload.get("snapshot_digest"),
+            "snapshot_bytes": payload.get("snapshot_bytes"),
+            "max_bytes": payload.get("max_bytes"),
+            "inputs": [
+                {
+                    name: item.get(name)
+                    for name in ("name", "source_stage", "output", "digest", "bytes", "data_class")
+                }
+                for item in payload.get("inputs", [])
+            ],
+        }
 
     @staticmethod
     def _translate(call):

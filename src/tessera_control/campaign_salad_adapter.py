@@ -18,6 +18,11 @@ redirect hosts, and one ``file`` item per pin beside the image entry in the inli
 runtime downloads and verifies them before the claim. The reviewable destinations are therefore
 exactly the pinned hosts and their redirect hosts; a stage with free-form ``egress`` is refused,
 and a stage without pins declares no fetch and no redirect host (ADR 0036, ADR 0047).
+
+A stage that reads another stage's output is accepted with a late-bound input: the contract
+declares the input by a late-bind key and a cap from the upstream outputs' declared
+``max_bytes``. Its bytes still arrive only as the staged input snapshot the runner composes, and
+the Salad driver checks them against the resolved upstream records before anything is proposed.
 """
 
 from __future__ import annotations
@@ -102,31 +107,112 @@ def default_program(stage: Any) -> dict[str, Any]:
     }
 
 
+# A stage-output input (``kind: stage``) is produced by another stage of the same campaign, so
+# its bytes and the digest of the snapshot the runner composes are known only once that stage
+# has succeeded. The contract then carries a late-bind key in place of the snapshot digest: a
+# digest of the stage's custody input declarations (which upstream stage, which output paths),
+# so the reviewed contract names exactly what will be bound. At stage start the Salad driver
+# checks the resolved inputs and replaces the key with the composed snapshot's digest
+# (``bind_workload``); the reviewed ``max_bytes`` cap stays. Upstream sizes are the upstream
+# outputs' declared ``max_bytes``: an output without a declared bound is refused.
+LATE_BIND_SCHEMA = "tessera.salad.late-bound-input.v1"
+CUSTODY_KINDS = ("snapshot", "artifact", "stage")
+
+# The (path, max_bytes) of each output a ``stage`` input names, from the upstream stage's
+# declared outputs; None when an output cannot be found or carries no bound.
+UpstreamOutputs = Callable[[Any], "list[tuple[str, int]] | None"]
+
+
+def _custody(stage: Any) -> list[Any]:
+    return [s for s in stage.inputs if getattr(s, "kind", None) != "public_artifact"]
+
+
+def late_bind_key(stage: Any, upstream: UpstreamOutputs | None = None) -> str | None:
+    """The late-bind key of a stage with a ``stage`` input (else None).
+
+    Computed from the spec form (``outputs`` names resolved through ``upstream``) at submit
+    and from the normal form (resolved ``paths``) at start; both give the same digest."""
+    rows: list[list[Any]] = []
+    late = False
+    for source in _custody(stage):
+        kind = getattr(source, "kind", None)
+        if kind == "stage":
+            late = True
+            paths = list(getattr(source, "paths", None) or ())
+            if not paths:
+                found = None if upstream is None else upstream(source)
+                if not found:
+                    return None
+                paths = [path for path, _size in found]
+            rows.append([source.name, kind, source.stage, sorted(paths)])
+        elif kind == "snapshot":
+            rows.append([source.name, kind, source.digest, []])
+        else:
+            rows.append([source.name, str(kind), "", []])
+    if not late:
+        return None
+    body = {"schema": LATE_BIND_SCHEMA, "inputs": sorted(rows)}
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def is_late_bound(stage: Any, contract: Any) -> bool:
+    """Whether ``contract`` declares the stage's input by its late-bind key (ADR 0076 note)."""
+    declared = getattr(contract, "input", None)
+    if declared is None:
+        return False
+    key = late_bind_key(stage)
+    return key is not None and declared.snapshot_digest == key
+
+
+def bind_workload(contract: WorkloadContractV1, snapshot_digest: str) -> WorkloadContractV1:
+    """``contract`` with its declared input digest (and the argv ``input:`` token) replaced by
+    the composed snapshot's ``snapshot_digest``. The reviewed ``max_bytes`` cap is unchanged,
+    and the result is validated as a contract of its own."""
+    declared = contract.input
+    if declared is None:
+        raise ValueError("the workload contract declares no input to bind")
+    old = f"input:{declared.snapshot_digest}:{declared.max_bytes}"
+    data = contract.model_dump(mode="json")
+    data["input"]["snapshot_digest"] = snapshot_digest
+    data["argv_template"] = [
+        f"input:{snapshot_digest}:{declared.max_bytes}" if token == old else token
+        for token in contract.argv_template
+    ]
+    return WorkloadContractV1.model_validate(data)
+
+
 def input_plan(
-    stage: Any, profile: SaladCampaignProfile, entries: InputEntries | None
+    stage: Any,
+    profile: SaladCampaignProfile,
+    entries: InputEntries | None,
+    upstream: UpstreamOutputs | None = None,
 ) -> tuple[str, int] | None:
     """(snapshot digest, byte cap) of the one snapshot the stage's inputs become on Salad.
 
     One pinned snapshot is itself. Several snapshot and pinned-artifact inputs are the snapshot the
     runner composes before staging, whose digest is a pure function of the sources' file digests, so
     it is known now and the runner's own composition must reproduce it exactly (a changed source
-    fails closed). An input produced by another stage of the same campaign has no digest yet.
+    fails closed). An input produced by another stage of the same campaign (``kind: stage``) has
+    no digest yet: the plan is then the late-bind key and a cap of the known sizes plus the
+    upstream outputs' declared ``max_bytes`` (see ``late_bind_key``).
 
     A ``public_artifact`` input is fetched by the provider and is never part of the snapshot
     (ADR 0097): it is ignored here, and a stage with no other input has no snapshot (None)."""
     adapter = profile.stage_adapter
-    sources = [s for s in stage.inputs if getattr(s, "kind", None) != "public_artifact"]
+    sources = _custody(stage)
     if not sources:
         return None
-    other = [s.name for s in sources if s.kind not in ("snapshot", "artifact")]
+    other = [s for s in sources if getattr(s, "kind", None) not in CUSTODY_KINDS]
     if other:
         raise _refuse(
             stage,
-            f"input {other[0]!r} is another stage's output, whose digest is not known when the "
-            "spec is submitted; pin it as an artifact of a finished campaign or as a snapshot",
+            f"input {other[0].name!r} of kind {getattr(other[0], 'kind', None)!r} cannot be "
+            "carried to Salad",
         )
+    late = [s for s in sources if s.kind == "stage"]
     single = len(sources) == 1 and sources[0].kind == "snapshot"
-    if entries is None:
+    if entries is None and not late:
         if not single or adapter.max_input_bytes is None:
             raise _refuse(
                 stage, "the input cannot be sized here (needs the platform's recorded inputs)"
@@ -135,12 +221,31 @@ def input_plan(
     rows: list[tuple[str, str, int, str]] = []
     total = 0
     for source in sources:
+        if source.kind == "stage":
+            found = None if upstream is None else upstream(source)
+            if not found or any(type(size) is not int or size < 1 for _path, size in found):
+                raise _refuse(
+                    stage,
+                    f"input {source.name!r} reads outputs of stage {source.stage!r} that have no "
+                    "declared max_bytes here, so its size cannot be bounded",
+                )
+            total += sum(size for _path, size in found)
+            continue
+        if entries is None:
+            raise _refuse(
+                stage, "the input cannot be sized here (needs the platform's recorded inputs)"
+            )
         for path, sha, size in entries(source):
             total += size
             rows.append(
                 (path if single else f"{source.name}/{path}", sha, size, "imported_unverified")
             )
-    digest = sources[0].digest if single else inventory_digest(composed_inventory(rows))
+    if late:
+        digest = late_bind_key(stage, upstream)
+        if digest is None:  # pragma: no cover - every stage input was bounded above
+            raise _refuse(stage, "the stage-output inputs cannot be bound")
+    else:
+        digest = sources[0].digest if single else inventory_digest(composed_inventory(rows))
     disk = profile.disk_mb * MIB
     if total > disk:
         raise _refuse(
@@ -155,6 +260,24 @@ def input_plan(
             f"{adapter.max_input_bytes}",
         )
     return digest, max(1, total)
+
+
+def upstream_outputs(spec: Any) -> UpstreamOutputs:
+    """``UpstreamOutputs`` read from the declared outputs of ``spec``'s stages."""
+    declared = {
+        stage.key: {o.name: o for o in getattr(stage, "outputs", ()) or ()} for stage in spec.stages
+    }
+
+    def find(source: Any) -> list[tuple[str, int]] | None:
+        outputs = declared.get(source.stage)
+        if outputs is None:
+            return None
+        picked = [outputs.get(name) for name in getattr(source, "outputs", ()) or ()]
+        if not picked or any(o is None or getattr(o, "max_bytes", None) is None for o in picked):
+            return None
+        return [(o.path, o.max_bytes) for o in picked]
+
+    return find
 
 
 def _refuse(stage: Any, reason: str) -> Conflict:
@@ -213,6 +336,7 @@ def derive_candidate_config(
     stage: Any,
     profile: SaladCampaignProfile,
     entries: InputEntries | None = None,
+    upstream: UpstreamOutputs | None = None,
     *,
     gpu: bool = False,
 ) -> dict[str, Any]:
@@ -264,7 +388,7 @@ def derive_candidate_config(
     ):
         if value:
             raise _refuse(stage, f"{field} cannot be carried to Salad")
-    plan = input_plan(stage, profile, entries)
+    plan = input_plan(stage, profile, entries, upstream)
     files, redirect_hosts = public_file_items(stage)
     fetched = sum(item["max_bytes"] for item in files)
     disk = profile.disk_mb * MIB
@@ -422,7 +546,7 @@ def expand_spec(
                     profile = None
             if profile is None:
                 raise _refuse(stage, f"unknown profile {request.adapt.profile!r}")
-            config = derive_candidate_config(base, profile, entries)
+            config = derive_candidate_config(base, profile, entries, upstream_outputs(spec))
             estimate = (
                 item.max_exposure_cents
                 if item.max_exposure_cents is not None
