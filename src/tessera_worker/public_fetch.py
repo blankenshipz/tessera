@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 import urllib.error
 import urllib.parse
@@ -109,15 +110,6 @@ def _open_chain(url: str, allowed: frozenset[str], opener: Opener, max_hops: int
     raise PublicFetchError("too_many_redirects", urllib.parse.urlsplit(url).hostname)
 
 
-def _hash_file(path: Path) -> tuple[str, int]:
-    digest, size = hashlib.sha256(), 0
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(_CHUNK), b""):
-            digest.update(chunk)
-            size += len(chunk)
-    return digest.hexdigest(), size
-
-
 def _validate_pin(pin: dict[str, Any]) -> None:
     name = pin.get("name")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name) or ".." in name:
@@ -132,23 +124,56 @@ def _validate_pin(pin: dict[str, Any]) -> None:
 
 
 def _from_cache(cache: Path, pin: dict[str, Any], final: Path) -> int | None:
-    entry = cache / pin["sha256"]
-    if not entry.is_file():
-        return None
+    """Copy a verified cache entry to ``final``; return bytes served, or None for a miss.
+
+    The entry is read once: the same bytes are hashed and written to a temp file, which only
+    replaces ``final`` after the digest equals the pin. The entry is deleted only when the whole
+    file was read and its sha256 differs; an I/O error, a non-regular or symlinked entry or a
+    size above this pin's cap is a miss that leaves the entry in place.
+    """
+    entry, tmp = cache / pin["sha256"], final.with_name(final.name + ".cachetmp")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        digest, size = _hash_file(entry)
+        fd = os.open(entry, flags)
     except OSError:
-        digest, size = "", -1
-    if digest != pin["sha256"] or size > pin["max_bytes"]:
-        entry.unlink(missing_ok=True)  # never trusted: corrupt entries are dropped and refetched
         return None
+    digest, size, mismatch, opened = hashlib.sha256(), 0, False, None
     try:
-        shutil.copyfile(entry, final)  # a copy, never a link: the mount accepts one link only
-        os.chmod(final, 0o444)
+        with os.fdopen(fd, "rb") as src:
+            opened = os.fstat(src.fileno())
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size > pin["max_bytes"]:
+                return None
+            tmp.unlink(missing_ok=True)
+            out_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(out_fd, "wb") as out:
+                while chunk := src.read(_CHUNK):
+                    size += len(chunk)
+                    if size > pin["max_bytes"]:
+                        tmp.unlink(missing_ok=True)
+                        return None
+                    digest.update(chunk)
+                    out.write(chunk)
+            mismatch = digest.hexdigest() != pin["sha256"]
+            if not mismatch:
+                os.chmod(tmp, 0o444)
+                os.replace(tmp, final)  # a copy, never a link: the mount accepts one link only
+                return size
     except OSError:
+        tmp.unlink(missing_ok=True)
         final.unlink(missing_ok=True)
-        raise PublicFetchError("io_error") from None
-    return size
+        return None
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.unlink(missing_ok=True)
+    if mismatch and opened is not None:  # confirmed fingerprint mismatch: drop the same file
+        try:
+            now = entry.lstat()
+            if (now.st_ino, now.st_dev) == (opened.st_ino, opened.st_dev):
+                entry.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return None
 
 
 def _download(

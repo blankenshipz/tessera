@@ -345,3 +345,123 @@ def test_a_bad_receipt_or_backup_directory_blocks_before_any_service_is_stopped(
         assert document["failed_step"] == "preflight"
         assert fakes.calls == [] and document["backup"] is None
         assert field.split("_")[0] in " ".join(document["preflight"]["blocking"])
+
+
+# -- who migrated, in the receipt -------------------------------------------------------------
+
+
+def _migrating_runner(fakes, state, on):
+    """A service runner that also migrates the database when it runs ``on`` (a stand-in for
+    anything else that opens the state with the new release and brings its schema forward)."""
+    from tessera_control.store import migrate_state
+
+    original = fakes.runner
+
+    def runner(argv, timeout):
+        if list(argv) == [on]:
+            migrate_state(state)
+        return original(argv, timeout)
+
+    fakes.runner = runner
+    return fakes
+
+
+def test_the_migrate_step_says_it_migrated_and_the_trace_shows_every_boundary(tmp_path):
+    plan, _path, _state = make_plan(tmp_path, with_config=False)
+    document = run(plan, Fakes(), execute=True)
+    step = next(s for s in document["steps"] if s["step"] == "migrate")
+    previous = LATEST_SCHEMA_VERSION - 1
+    assert step["detail"] == (
+        f"migrated schema v{previous} to v{LATEST_SCHEMA_VERSION} in this step"
+    )
+    assert document["schema_trace"] == {
+        "preflight": previous,
+        "after_stop": previous,
+        "backup_snapshot": previous,
+        "before_migrate": previous,
+        "after_migrate": LATEST_SCHEMA_VERSION,
+    }
+    assert "early_migration" not in document and "warnings" not in document
+    assert [f["fix"] for f in document["fixes"]] == ["migrate"]
+    assert document["backup"]["kind"] == "pre-migration-snapshot"
+
+
+@pytest.mark.parametrize(
+    ("trigger", "window", "between", "snapshot_is_old"),
+    [
+        (
+            "stop-executor",
+            "while the services were being stopped",
+            ["preflight", "after_stop"],
+            False,
+        ),
+        ("backup", "during the backup step", ["after_stop", "backup_snapshot"], False),
+        (
+            "after-backup",
+            "between the backup and the migrate step",
+            ["backup_snapshot", "before_migrate"],
+            True,
+        ),
+    ],
+)
+def test_a_migration_made_by_something_else_is_not_credited_to_the_migrate_step(
+    tmp_path, trigger, window, between, snapshot_is_old
+):
+    from tessera_control.store import migrate_state
+
+    plan, _path, state = make_plan(tmp_path, with_config=False)
+    fakes = Fakes()
+    taker = deploy_upgrade.take_backup
+    if trigger == "stop-executor":
+        _migrating_runner(fakes, state, "stop-executor")
+        backup = taker
+    elif trigger == "backup":
+
+        def backup(state_dir, output, **kw):
+            migrate_state(state_dir)  # the schema moves just before the snapshot is read
+            return taker(state_dir, output, **kw)
+    else:
+
+        def backup(state_dir, output, **kw):
+            made = taker(state_dir, output, **kw)  # the snapshot is of the old schema
+            migrate_state(state_dir)
+            return made
+
+    document = run(plan, fakes, execute=True, backup=backup)
+    assert document["result"] == "ok", document["steps"]
+    step = next(s for s in document["steps"] if s["step"] == "migrate")
+    assert step["detail"].startswith("not migrated by this step")
+    assert window in step["detail"]
+    assert document["early_migration"]["changed_between"] == between
+    assert document["early_migration"]["changed"] == window
+    assert document["fixes"] == []  # no migrate receipt: this step did not apply one
+    assert document["warnings"] and window in document["warnings"][0]
+    old = LATEST_SCHEMA_VERSION - 1
+    snapshot = document["backup"]["schema_version"]
+    assert (snapshot == old) is snapshot_is_old
+    assert document["schema_version"]["after"] == LATEST_SCHEMA_VERSION
+
+
+def test_a_database_already_current_is_reported_as_nothing_to_migrate(tmp_path):
+    plan, _path, _state = make_plan(tmp_path, behind=False, with_config=False)
+    document = run(plan, Fakes(), execute=True)
+    step = next(s for s in document["steps"] if s["step"] == "migrate")
+    assert step["detail"] == (
+        f"nothing to migrate: the schema was already v{LATEST_SCHEMA_VERSION} when the run began"
+    )
+    assert "early_migration" not in document and document["fixes"] == []
+
+
+def test_the_command_prints_the_warning(tmp_path, capsys, monkeypatch):
+    from tessera_control.deploy_upgrade_cli import _text
+
+    text = _text(
+        {
+            "mode": "execute",
+            "result": "ok",
+            "steps": [{"step": "migrate", "ok": True, "seconds": 0.1, "detail": "d"}],
+            "warnings": ["the schema moved before the backup"],
+            "duration_seconds": 1,
+        }
+    )
+    assert "warning: the schema moved before the backup" in text

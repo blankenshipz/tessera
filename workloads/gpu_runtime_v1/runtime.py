@@ -32,6 +32,7 @@ read-only input tree.
 
 import base64
 import binascii
+import fcntl
 import hashlib
 import http.client
 import json
@@ -71,6 +72,11 @@ INPUT_ITEM_KEYS = {"kind", "source", "path"}
 INPUT_ITEM_KINDS = ("entry", "file")
 # An entry shipped in this image (ADR 0076): ``{"kind":"entry","source":"image","path":NAME,
 # "argv":[...]}``. NAME must be one of IMAGE_ENTRIES; the file lives under IMAGE_ENTRY_DIR.
+URL_ITEM_KEYS = {"url", "sha256", "max_bytes", "kind", "dest"}
+# Provider-side cache (an OPTIONAL persistent directory the provider mounts into the container).
+CACHE_DIR_ENV = "TESSERA_FETCH_CACHE_DIR"
+CACHE_MAX_BYTES_ENV = "TESSERA_FETCH_CACHE_MAX_BYTES"
+_HEX64 = re.compile(r"[a-f0-9]{64}")
 IMAGE_SOURCE = "image"
 IMAGE_ENTRIES = ("stage_argv.py",)
 IMAGE_ENTRY_DIR = "/tessera/lib/entries"
@@ -405,13 +411,10 @@ def validate_manifest(manifest):
                 raise Failure("manifest")
             seen.add((INPUT_SOURCE, path))
             continue
-        if not isinstance(item, dict) or set(item) != {
-            "url",
-            "sha256",
-            "max_bytes",
-            "kind",
-            "dest",
-        }:
+        if not isinstance(item, dict) or set(item) not in (
+            URL_ITEM_KEYS,
+            URL_ITEM_KEYS | {"cache"},
+        ):
             raise Failure("manifest")
         url, digest, cap, kind, dest = (
             item[k] for k in ("url", "sha256", "max_bytes", "kind", "dest")
@@ -432,6 +435,11 @@ def validate_manifest(manifest):
         ):
             raise Failure("manifest")
         if kind == "wheel" and ("/" in dest or not dest.endswith(".whl")):
+            raise Failure("manifest")
+        if "cache" in item and (
+            type(item["cache"]) is not bool or (item["cache"] and kind == "entry")
+        ):
+            # The provider-side cache holds verified public data and wheels, never an entry.
             raise Failure("manifest")
         if kind == "entry":
             entries += 1
@@ -604,17 +612,261 @@ def _unlink(path):
         pass
 
 
+# A part file younger than this is never reclaimed: its writer may not have locked it yet.
+STALE_PART_MIN_AGE_SECONDS = 60
+_PART_NAME = re.compile(r"\.[a-f0-9]{64}\.part")
+
+
+class _FetchCache:
+    """A digest-keyed cache of verified public bytes on provider-persistent storage.
+
+    The key is the item's pinned sha256 (never a manifest-chosen name). Every reuse streams the
+    entry through sha256 while copying it (copies, never links), so nothing unverified is ever
+    used: a mismatch or wrong size deletes the entry and the item is fetched normally. The
+    directory is outside the work tree, so cached bytes can never become an output or a staged
+    input. Storing is best effort and bounded by the quota; a failure never fails the run.
+    """
+
+    def __init__(self, directory, quota):
+        self.directory, self.quota = directory, quota
+
+    def _entry(self, digest):
+        return os.path.join(self.directory, digest)
+
+    def hit(self, item, target, deadline):
+        """Copy a verified entry to ``target`` (0444) and return the row, else None.
+
+        An entry is deleted only on a confirmed fingerprint mismatch: it was streamed to its end
+        within this pin's size bound and its digest differs. Every other failure (I/O error, a
+        size above this pin's bound, a non-regular or hard-linked entry, a size that changed under
+        the reader) is a miss for this call and leaves the entry in place.
+        """
+        entry = self._entry(item["sha256"])
+        part = target + ".part"
+        started = time.monotonic()
+        try:
+            info = os.lstat(entry)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size > item["max_bytes"]
+            ):
+                return None
+            fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        digest, total = hashlib.sha256(), 0
+        mismatch = False
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        try:
+            with os.fdopen(fd, "rb") as source, open(part, "wb") as out:
+                opened = os.fstat(source.fileno())
+                if opened.st_size != info.st_size or (opened.st_ino, opened.st_dev) != (
+                    info.st_ino,
+                    info.st_dev,
+                ):
+                    _unlink(part)
+                    return None
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise Failure("deadline")
+                    chunk = source.read(_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > item["max_bytes"]:
+                        _unlink(part)
+                        return None  # above this pin's bound: not a fingerprint verdict
+                    digest.update(chunk)
+                    out.write(chunk)
+                mismatch = digest.hexdigest() != item["sha256"]
+        except Failure:
+            _unlink(part)
+            raise
+        except OSError:
+            _unlink(part)
+            return None
+        if mismatch:
+            _unlink(part)
+            self._discard(entry, opened)
+            return None
+        try:
+            os.chmod(part, 0o444)
+            os.replace(part, target)
+        except OSError:
+            _unlink(part)
+            return None
+        try:
+            os.utime(entry)  # recency for eviction
+        except OSError:
+            pass
+        seconds = round(time.monotonic() - started, 3)
+        return {"url": item["url"], "sha256": item["sha256"], "bytes": total, "seconds": seconds}
+
+    @staticmethod
+    def _discard(entry, opened=None):
+        """Delete a confirmed-mismatching entry, unless it was replaced since it was opened."""
+        if opened is not None:
+            try:
+                now = os.lstat(entry)
+            except OSError:
+                return
+            if (now.st_ino, now.st_dev) != (opened.st_ino, opened.st_dev):
+                return
+        _unlink(entry)
+
+    def _judge_part(self, name):
+        """Classify one ``.<sha256>.part`` file: reclaim it when stale, else report it.
+
+        Returns None when the file is gone, symlink/dir or was reclaimed (not counted), else the
+        size of a live or unjudgeable partial (counted, never evicted). A writer holds an
+        exclusive flock on its part file until it renames or removes it; the kernel drops the
+        lock when the writer dies, so a lockable old file is an abandoned one.
+        """
+        path = os.path.join(self.directory, name)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None  # never follow or delete anything that is not a regular file
+        if (
+            info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or time.time() - info.st_mtime < STALE_PART_MIN_AGE_SECONDS
+        ):
+            return info.st_size
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return info.st_size
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return info.st_size  # a writer holds the lock: live
+            opened = os.fstat(fd)
+            if (opened.st_ino, opened.st_dev) != (info.st_ino, info.st_dev):
+                return info.st_size
+            _unlink(path)  # while holding the lock
+            return None
+        except OSError:
+            return info.st_size
+        finally:
+            os.close(fd)
+
+    def store(self, item, source_path, size):
+        """Best effort: keep a freshly verified file when the quota allows; never raise."""
+        try:
+            if self.quota <= 0 or size > self.quota:
+                return
+            own_part = "." + item["sha256"] + ".part"
+            entries, live = [], 0
+            for name in os.listdir(self.directory):
+                if _PART_NAME.fullmatch(name):
+                    kept = self._judge_part(name)
+                    if name == own_part and kept is not None:
+                        return  # another process is storing this digest
+                    live += kept or 0
+                    continue
+                if not _HEX64.fullmatch(name) or name == item["sha256"]:
+                    continue
+                info = os.lstat(os.path.join(self.directory, name))
+                if stat.S_ISREG(info.st_mode):
+                    entries.append((info.st_mtime, name, info.st_size))
+            entries.sort()
+            used = live + sum(e[2] for e in entries)
+            while entries and used + size > self.quota:
+                _mtime, name, length = entries.pop(0)
+                _unlink(os.path.join(self.directory, name))
+                used -= length
+            if used + size > self.quota:
+                return
+            temp = os.path.join(self.directory, own_part)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    os.close(fd)
+                    fd = None
+                    _unlink(temp)
+                    return
+                with open(source_path, "rb") as source, os.fdopen(fd, "wb") as out:
+                    fd = None
+                    shutil.copyfileobj(source, out, _CHUNK)
+                    out.flush()
+                    os.fsync(out.fileno())
+                    os.replace(temp, self._entry(item["sha256"]))  # lock held until close
+            except BaseException:
+                if fd is not None:
+                    os.close(fd)
+                _unlink(temp)
+                raise
+        except Exception:
+            return
+
+
+def _open_cache(work):
+    """The usable cache, or None (``unavailable``): an absolute, real (no symlink in the path)
+    directory owned by this uid with mode 0700 that neither contains nor lies inside the work
+    tree. The directory comes only from this process's environment."""
+    path = os.environ.get(CACHE_DIR_ENV, "")
+    try:
+        if not path or not os.path.isabs(path) or path != os.path.normpath(path):
+            return None
+        current = "/"
+        for part in path.split("/")[1:]:
+            current = os.path.join(current, part)
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode):
+                return None
+        info = os.lstat(path)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            return None
+        real, root = os.path.realpath(path), os.path.realpath(work)
+        if real == root or real.startswith(root + os.sep) or root.startswith(real + os.sep):
+            return None
+        raw = os.environ.get(CACHE_MAX_BYTES_ENV, "0")
+        quota = int(raw) if raw.isdigit() and len(raw) <= 15 else 0
+    except (OSError, ValueError):
+        return None
+    return _FetchCache(path, quota)
+
+
 def fetch_all(manifest, work, deadline, opener=None):
     """Download+verify every URL item. Returns (paths-by-kind, fetched record list).
 
-    Input-sourced items are not fetched; resolve_input_items checks them later.
+    Input-sourced items are not fetched; resolve_input_items checks them later. Each row carries
+    ``cache``: ``off`` (item not flagged), ``unavailable`` (flagged, no usable cache directory),
+    ``hit`` (served from the verified cache) or ``miss`` (fetched, then stored when allowed).
     """
     paths = {k: [] for k in KINDS}
     fetched = []
     hosts = redirect_hosts_of(manifest)  # bound to the argv token when loaded
+    cache = False  # not yet looked at
     for item in url_items(manifest):
         target = os.path.join(work, _KIND_DIR[item["kind"]], item["dest"])
-        fetched.append(fetch_one(item, target, deadline, opener, hosts))
+        if item.get("cache") is not True:
+            row = fetch_one(item, target, deadline, opener, hosts) | {"cache": "off"}
+        else:
+            if cache is False:
+                cache = _open_cache(work)
+            row = None if cache is None else cache.hit(item, target, deadline)
+            if row is not None:
+                row = row | {"cache": "hit"}
+            else:
+                row = fetch_one(item, target, deadline, opener, hosts)
+                if cache is None:
+                    row = row | {"cache": "unavailable"}
+                else:
+                    cache.store(item, target, row["bytes"])
+                    row = row | {"cache": "miss"}
+        fetched.append(row)
         paths[item["kind"]].append(target)
     return paths, fetched
 

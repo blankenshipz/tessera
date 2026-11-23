@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from . import smoke_credentials as grants
+from .state_dir_resolution import StateDirRefused, resolve_state_dir
 
 FILES = ("agent.token", "approver.token", "smoke-grant.json")
 
@@ -35,7 +36,17 @@ def add_dev_commands(subcommands: argparse._SubParsersAction) -> None:
     revoke.add_argument("--grant-id", required=True)
     actions.add_parser("list", help="list grants (never tokens)")
     for sub in actions.choices.values():
-        sub.add_argument("--state-dir", required=True, type=Path)
+        sub.add_argument(
+            "--state-dir",
+            type=Path,
+            help="the control state directory; when omitted it is resolved from "
+            "TESSERA_CONTROL_STATE_DIR or --plan (see state_dir_resolution)",
+        )
+        sub.add_argument(
+            "--plan",
+            type=Path,
+            help="this host's deploy plan (absolute, owner-only); its state_dir is used",
+        )
 
 
 def _write_new(path: Path, text: str) -> None:
@@ -66,19 +77,22 @@ def run(arguments: argparse.Namespace) -> int:
     from .store import StoreError
 
     try:
+        state_dir = resolve_state_dir(arguments.state_dir, plan=arguments.plan)
+    except StateDirRefused as error:
+        print(f"smoke-credentials failed: {error}", file=sys.stderr)
+        return 1
+    try:
         if arguments.smoke_action == "list":
-            print(json.dumps({"grants": grants.list_grants(arguments.state_dir)}, sort_keys=True))
+            print(json.dumps({"grants": grants.list_grants(state_dir)}, sort_keys=True))
             return 0
         if arguments.smoke_action == "revoke":
-            print(
-                json.dumps(grants.revoke(arguments.state_dir, arguments.grant_id), sort_keys=True)
-            )
+            print(json.dumps(grants.revoke(state_dir, arguments.grant_id), sort_keys=True))
             return 0
         created = not arguments.out_dir.expanduser().exists()
         out_dir = _prepare_out_dir(arguments.out_dir)
         try:
             issued = grants.issue(
-                arguments.state_dir,
+                state_dir,
                 arguments.project_id,
                 arguments.destination,
                 ttl_minutes=arguments.ttl_minutes,
@@ -97,6 +111,8 @@ def run(arguments: argparse.Namespace) -> int:
             "approver_credential_id": issued["approver_credential_id"],
             "providers": issued["providers"],
             "max_budget_cents": 0,
+            "snapshot_id": issued["snapshot_id"],
+            "snapshot_digest": issued["snapshot_digest"],
             "control_url": None,
         }
         written: list[Path] = []
@@ -110,7 +126,7 @@ def run(arguments: argparse.Namespace) -> int:
                 written.append(out_dir / name)
         except OSError:
             # Never leave live credentials nobody can use: end the grant and remove the files.
-            grants.revoke(arguments.state_dir, issued["grant_id"])
+            grants.revoke(state_dir, issued["grant_id"])
             for path in written:
                 path.unlink(missing_ok=True)
             raise

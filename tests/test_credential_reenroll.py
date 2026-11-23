@@ -1,6 +1,5 @@
 """Owner credential re-enrollment: fakes only, no network, synthetic secrets never surface."""
 
-import contextlib
 import io
 import json
 import os
@@ -347,8 +346,10 @@ def test_a_revocation_during_validation_is_not_undone_by_the_enrollment(store, m
 def test_the_installed_entry_point_never_echoes_an_unknown_argument(monkeypatch, capsys, words):
     # The installed `tessera` calls main() with no argument and reads sys.argv itself.
     monkeypatch.setattr(sys, "argv", ["tessera", *words])
-    with contextlib.suppress(SystemExit):
+    try:
         code = cli.main()
-        assert code == 2
+    except SystemExit as stopped:
+        code = stopped.code  # argparse exits instead of returning
+    assert code == 2
     seen = capsys.readouterr()
     assert "LEAKED" not in seen.out + seen.err

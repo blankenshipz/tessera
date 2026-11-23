@@ -12,6 +12,10 @@ UMask=0077
 StateDirectory=tessera-control
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/tessera-control
+# The value owner-run commands resolve (for example `tessera dev smoke-credentials`): this sets
+# it for the service process only, so an owner shell exports the same value (or passes --plan);
+# keep it equal to --state-dir below.
+Environment=TESSERA_CONTROL_STATE_DIR=/var/lib/tessera-control
 ExecStart=/opt/tessera/venv/bin/tessera serve --state-dir /var/lib/tessera-control --bind-host 127.0.0.1 --port 8765
 Restart=on-failure
 RestartSec=5

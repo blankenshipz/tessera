@@ -48,7 +48,12 @@ smoke, and note what happened. Each step could be done out of order or forgotten
    backup (name, kind, bytes, digest, bound), the fixes applied with their receipt digests, each
    service step, the smoke result, every step's seconds and the total. It records no path and no
    value.
-7. **Failure and rollback.** A failed backup restarts the services this run stopped only when no
+7. **The receipt attributes the migration.** It records the stored schema version at each boundary
+   (`schema_trace`). The migrate step reports what it did itself (a migration applied in the step, or
+   nothing to migrate); when the version had already moved before it began, the receipt names the
+   window and warns instead of crediting the step, because something else (a service started with the
+   new release, a health probe, a hook) brought the schema forward.
+8. **Failure and rollback.** A failed backup restarts the services this run stopped only when no
    migration is pending; with one pending the installed release would start against the old schema
    and fail, so they stay stopped and the receipt says so (start the previous release). After the
    migration the services stay as they are and the receipt names the backup. A failure step records

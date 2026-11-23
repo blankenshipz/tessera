@@ -203,6 +203,24 @@ def _scratch(connection: sqlite3.Connection, attempt: sqlite3.Row, spec_stage: A
     return {"requested_bytes": requested, "granted_bytes": granted}
 
 
+CACHE_OUTCOMES = frozenset({"hit", "miss", "unavailable", "off"})
+
+
+def cache_outcome(row: dict[str, Any]) -> str | None:
+    """What the provider reported about its cache for one fetched file, from a closed set.
+
+    A runtime reports ``cache`` (``hit``, ``miss``, ``unavailable`` when it has no usable
+    persistent storage, ``off`` when the file was not flagged); a local worker reports a boolean
+    ``cached``. Anything else is not trusted and reads as unknown (``None``)."""
+    value = row.get("cache")
+    if isinstance(value, str) and value in CACHE_OUTCOMES:
+        return value
+    cached = row.get("cached")
+    if isinstance(cached, bool) and "cache" not in row:
+        return "hit" if cached else "miss"
+    return None
+
+
 def public_fetch_entry(
     provider_id: str | None, spec_stage: Any, fetched: list[dict[str, Any]] | None = None
 ) -> dict[str, Any] | None:
@@ -214,11 +232,13 @@ def public_fetch_entry(
     null and the file is ``declared_only``. Only the host is printed, never the URL."""
     files: list[tuple[str, str, str]] = []
     hosts: set[str] = set()
+    cache_requested = False
     for source in getattr(spec_stage, "inputs", ()):
         if getattr(source, "kind", None) != "public_artifact":
             continue
         files += [(name, url, sha) for name, url, sha, _size in source.public_files]
         hosts |= set(source.redirect_hosts)
+        cache_requested = cache_requested or bool(getattr(source, "cache", False))
     if not files:
         return None
     reported = {
@@ -237,33 +257,90 @@ def public_fetch_entry(
             isinstance(seconds, bool) or not isinstance(seconds, (int, float))
         ):
             seconds = None
-        entries.append(
-            {
-                "name": name,
-                "source_host": host,
-                "sha256": sha,
-                "bytes": size,
-                "seconds": seconds,
-                "evidence": "declared_only" if row is None else "provider_reported",
-            }
-        )
-    return {
+        outcome = None if row is None else cache_outcome(row)
+        item = {
+            "name": name,
+            "source_host": host,
+            "sha256": sha,
+            "bytes": size,
+            "seconds": seconds,
+            "evidence": "declared_only" if row is None else "provider_reported",
+        }
+        if cache_requested or outcome is not None:
+            # Unknown is null when the spec asked for the cache; a file whose spec never asked
+            # and whose provider said nothing keeps the receipt shape it always had.
+            item["cache"] = outcome
+        entries.append(item)
+    entry = {
         "provider": provider_id,
         "placement": "provider_side",
         "hosts": sorted(hosts),
         "files": entries,
         "via_control": False,
     }
+    if cache_requested:
+        # The approved spec asked for the provider-side cache (ADR 0097): say so only then, so
+        # the receipt of a stage that did not ask is unchanged.
+        entry["cache_requested"] = True
+    return entry
 
 
-def _retained_fetched(connection: sqlite3.Connection, provider_id: str, attempt: Any):
+def _local_fetched(
+    connection: sqlite3.Connection, attempt: Any, spec_stage: Any
+) -> list[dict[str, Any]] | None:
+    """A local worker's recorded fetch rows (ADR 0097) as ``fetched`` rows keyed by the pin's
+    url and digest, or None. Only rows that match a pinned file are used; the files themselves
+    never reach the control plane, only these rows."""
+    operation_id = attempt["operation_id"]
+    if not operation_id:
+        return None
+    row = connection.execute(
+        """SELECT payload_json FROM events WHERE event_type = 'execution.public_fetch_recorded'
+        AND json_extract(payload_json, '$.operation_id') = ? ORDER BY rowid LIMIT 1""",
+        (operation_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        recorded = json.loads(row["payload_json"]).get("files")
+    except ValueError:
+        return None
+    pins = {
+        (source.name, name): (url, sha)
+        for source in getattr(spec_stage, "inputs", ())
+        if getattr(source, "kind", None) == "public_artifact"
+        for name, url, sha, _size in source.public_files
+    }
+    rows = []
+    for item in recorded if isinstance(recorded, list) else ():
+        pin = pins.get((item.get("input"), item.get("name"))) if isinstance(item, dict) else None
+        if pin is None or item.get("sha256") != pin[1]:
+            continue
+        rows.append(
+            {
+                "url": pin[0],
+                "sha256": pin[1],
+                "bytes": item.get("bytes"),
+                "seconds": item.get("seconds"),
+                "cached": item.get("cached"),
+            }
+        )
+    return rows or None
+
+
+def _retained_fetched(
+    connection: sqlite3.Connection, provider_id: str, attempt: Any, spec_stage: Any = None
+):
     """The provider's retained ``fetched`` rows for the attempt, or None when the provider has
-    no way to reach them from the database (the file bytes live in custody storage, not here)."""
+    no way to reach them from the database (the file bytes live in custody storage, not here).
+    A local worker's rows come from its recorded fetch event instead."""
     try:
         reader = getattr(stage_provider(provider_id), "retained_fetched", None)
     except KeyError:
         return None
-    return None if reader is None else reader(connection, dict(attempt))
+    if reader is None:
+        return None if spec_stage is None else _local_fetched(connection, attempt, spec_stage)
+    return reader(connection, dict(attempt))
 
 
 def _placed_runtime(spec_stage: Any, provider_id: str | None) -> str:
@@ -360,7 +437,7 @@ def _attempt_entry(
             "approval_digest": None if granted is None else granted.get("approval_digest"),
         }
     public = public_fetch_entry(
-        provider_id, spec_stage, _retained_fetched(connection, provider_id, attempt)
+        provider_id, spec_stage, _retained_fetched(connection, provider_id, attempt, spec_stage)
     )
     if public is not None:
         entry["public_fetch"] = public

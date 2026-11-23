@@ -72,6 +72,8 @@ class Grant:
     expires_at: str
     agent_token_file: Path
     approver_token_file: Path
+    snapshot_id: str | None = None
+    snapshot_digest: str | None = None
 
 
 def _parse_time(value: Any) -> datetime:
@@ -124,6 +126,14 @@ def load_grant(directory: str, now: datetime | None = None) -> Grant:
     expires = _parse_time(data.get("expires_at"))
     if expires <= (now or datetime.now(UTC)):
         raise GrantRefused("the smoke grant has expired: issue a new one")
+    snapshot = {}
+    for key in ("snapshot_id", "snapshot_digest"):
+        value = data.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise GrantRefused(f"the grant's {key} is not a string")
+        snapshot[key] = value
+    if (snapshot["snapshot_id"] is None) != (snapshot["snapshot_digest"] is None):
+        raise GrantRefused("the grant needs both snapshot_id and snapshot_digest, or neither")
     return Grant(
         text["grant_id"],
         text["project_id"],
@@ -131,6 +141,8 @@ def load_grant(directory: str, now: datetime | None = None) -> Grant:
         data["expires_at"],
         files["agent.token"],
         files["approver.token"],
+        snapshot["snapshot_id"],
+        snapshot["snapshot_digest"],
     )
 
 
@@ -226,6 +238,7 @@ def run_smoke(
     *,
     image: str,
     snapshot_id: str | None = None,
+    snapshot_digest: str | None = None,
     grant_id: str | None = None,
     wait_seconds: float = 120.0,
     poll_seconds: float = 2.0,
@@ -238,6 +251,12 @@ def run_smoke(
 
     status = agent("tessera_status")
     snapshot = pick_snapshot(agent("tessera_list_snapshots"), snapshot_id)
+    if snapshot_digest is not None:
+        # The grant's own snapshot: it must be listed as public with the digest the grant names.
+        _need(
+            snapshot["data_class"] == "public" and snapshot["digest"] == snapshot_digest,
+            "the grant's snapshot is not listed as public with the digest the grant names",
+        )
     spec = smoke_spec(image, snapshot)
     checked = agent("tessera_validate_campaign_spec", spec=spec)
     _need(bool(checked), "the control plane did not accept the spec")
@@ -493,13 +512,16 @@ def main(argv: list[str] | None = None) -> int:
     agent = _build_caller(arguments, agent_file, campaign_tools=True, campaign_actions=None)
     agent_approve = _build_caller(arguments, agent_file, approval_tool=True)
     person = _build_caller(arguments, person_file, approval_tool=True)
+    # An explicit --snapshot-id wins; otherwise the grant's own synthetic public snapshot.
+    from_grant = grant is not None and grant.snapshot_id and not arguments.snapshot_id
     try:
         document = run_smoke(
             agent,
             person,
             agent_approve,
             image=arguments.image,
-            snapshot_id=arguments.snapshot_id,
+            snapshot_id=grant.snapshot_id if from_grant else arguments.snapshot_id,
+            snapshot_digest=grant.snapshot_digest if from_grant else None,
             grant_id=grant.grant_id if grant else None,
             wait_seconds=arguments.wait_seconds,
         )

@@ -84,15 +84,39 @@ def take_backup(state_dir: Path, output: Path, *, max_bytes: int | None = None) 
     finally:
         source.close()
     os.chmod(destination, 0o600)
-    data = destination.read_bytes()
+    digest, length = _hash_file(destination)
     manifest = {
         "kind": "pre-migration-snapshot",
         "schema_version": current,
-        "bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": length,
+        "sha256": digest,
     }
     deploy_check.write_private_json(output / SNAPSHOT_MANIFEST, manifest)
     return manifest
+
+
+_CHUNK = 1024 * 1024
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    """SHA-256 and size of a file, read in bounded chunks (never the whole file at once)."""
+    digest, total = hashlib.sha256(), 0
+    with open(path, "rb") as file:
+        while chunk := file.read(_CHUNK):
+            digest.update(chunk)
+            total += len(chunk)
+    return digest.hexdigest(), total
+
+
+def _copy_private(source: Path, destination: Path) -> str:
+    """Copy a file owner-only in bounded chunks and return its SHA-256."""
+    digest = hashlib.sha256()
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with open(source, "rb") as reader, os.fdopen(fd, "wb") as writer:
+        while chunk := reader.read(_CHUNK):
+            digest.update(chunk)
+            writer.write(chunk)
+    return digest.hexdigest()
 
 
 def _stamp(moment: datetime) -> str:
@@ -317,6 +341,14 @@ def _reason_counts(selection: Any) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _observed_version(plan: Any) -> int | None:
+    """The schema version stored right now, read-only; None when it cannot be read."""
+    try:
+        return deploy_state._read_schema_version(Path(plan.state_dir))
+    except (ValueError, OSError):
+        return None
+
+
 def _schema(finding_list: list[deploy_check.Finding]) -> dict[str, Any]:
     for item in finding_list:
         if item.check_id == "state.schema":
@@ -404,11 +436,8 @@ def _backup_configs(plan: Any, directory: Path) -> list[dict[str, Any]]:
     directory.mkdir(mode=0o700)
     rows = []
     for index, path in enumerate(paths):
-        data = path.read_bytes()
         copy = directory / f"config-{index}.json"
-        copy.write_bytes(data)
-        os.chmod(copy, 0o600)
-        rows.append({"index": index, "sha256": hashlib.sha256(data).hexdigest()})
+        rows.append({"index": index, "sha256": _copy_private(path, copy)})
     return rows
 
 
@@ -475,6 +504,10 @@ def run_upgrade(
         "before": before.get("current"),
         "latest": before.get("latest"),
     }
+    # The stored version at each boundary of the run, so a change made by anything other than
+    # the migrate step is placed in the window where it happened (see the migrate step).
+    trace: dict[str, int | None] = {"preflight": before.get("current")}
+    run.document["schema_trace"] = trace
     run.document["preflight"] = {
         "counts": deploy_check.build_report(findings)["counts"],
         "blocking": blocking,
@@ -503,6 +536,7 @@ def run_upgrade(
     if stop_failed:
         run.step("abort", False, "a service did not stop; nothing was changed")
         return run.finish()
+    trace["after_stop"] = _observed_version(plan)
 
     def restore_services(reason: str) -> None:
         """Nothing was changed yet: bring back the services this run stopped."""
@@ -544,6 +578,8 @@ def run_upgrade(
         "max_backup_bytes": plan.max_backup_bytes,
     }
     run.step("backup", True, name, began)
+    trace["backup_snapshot"] = made.get("schema_version")
+    trace["before_migrate"] = _observed_version(plan)
 
     # -- migrate, then config fixes ----------------------------------------------------------
     receipt_dir = Path(plan.receipt_dir)
@@ -566,7 +602,9 @@ def run_upgrade(
         )
     after = deploy_state.check_schema(Path(plan.state_dir))
     run.document["schema_version"]["after"] = after.detail.get("current")
-    run.step("migrate", after.status == "ok", after.summary, began)
+    trace["after_migrate"] = after.detail.get("current")
+    detail = _migrate_detail(run, trace, receipt, after)
+    run.step("migrate", after.status == "ok", detail, began)
     if after.status != "ok":
         return run.finish()
 
@@ -623,6 +661,52 @@ def run_upgrade(
         began,
     )
     return run.finish()
+
+
+_TRACE_ORDER = ("preflight", "after_stop", "backup_snapshot", "before_migrate")
+_WINDOWS = {
+    ("preflight", "after_stop"): "while the services were being stopped",
+    ("after_stop", "backup_snapshot"): "during the backup step",
+    ("backup_snapshot", "before_migrate"): "between the backup and the migrate step",
+    ("preflight", "backup_snapshot"): "before the backup was taken",
+    ("preflight", "before_migrate"): "before the migrate step began",
+}
+
+
+def _migrate_detail(run: Any, trace: dict[str, Any], receipt: Any, after: Any) -> str:
+    """What the migrate step did, in words, and whether something else changed the schema first.
+
+    The step's own work is known: it applied a migration (a receipt exists) or it found nothing
+    to do. If the stored version had already moved when the step began, the receipt says so and
+    names the window, instead of crediting this step or hiding the change."""
+    seen = [(key, trace.get(key)) for key in _TRACE_ORDER if trace.get(key) is not None]
+    first = seen[0] if seen else None
+    moved = next(
+        ((a, b) for (a, va), (b, vb) in zip(seen, seen[1:], strict=False) if va != vb), None
+    )
+    current = after.detail.get("current")
+    if receipt is not None:
+        return (
+            f"migrated schema v{receipt.get('schema_before')} to v{receipt.get('schema_after')}"
+            " in this step"
+        )
+    if moved is not None and first is not None:
+        window = _WINDOWS.get(moved, "between two steps")
+        run.document["early_migration"] = {
+            "from": first[1],
+            "to": trace.get(moved[1]),
+            "changed": window,
+            "changed_between": list(moved),
+            "backup_schema_version": trace.get("backup_snapshot"),
+        }
+        held = "the backup holds" if trace.get("backup_snapshot") == current else "the backup was"
+        note = (
+            f"not migrated by this step: the schema moved from v{first[1]} to v{current} {window}"
+            f" ({held} schema v{trace.get('backup_snapshot')})"
+        )
+        run.document["warnings"] = [*run.document.get("warnings", []), note]
+        return note
+    return f"nothing to migrate: the schema was already v{current} when the run began"
 
 
 def _planned(plan: Any, findings: list[deploy_check.Finding]) -> list[str]:
@@ -740,11 +824,10 @@ def rollback(
     directory = Path(plan.backup_dir) / name
     snapshot = directory / SNAPSHOT_NAME
     try:
-        data = snapshot.read_bytes()
+        digest, _size = _hash_file(snapshot)
         manifest = json.loads((directory / SNAPSHOT_MANIFEST).read_bytes())
     except (OSError, ValueError):
         raise RollbackRefused("the snapshot or its manifest cannot be read") from None
-    digest = hashlib.sha256(data).hexdigest()
     if not (digest == backup.get("sha256") == manifest.get("sha256")):
         raise RollbackRefused("the snapshot digest does not match the receipt")
     for service in plan.services:
@@ -764,8 +847,18 @@ def rollback(
         raise RollbackRefused("the receipt directory is not writable") from None
 
     staged = state_dir / (DATABASE_NAME + ".rollback-new")
-    staged.write_bytes(data)
-    os.chmod(staged, 0o600)
+    staged.unlink(missing_ok=True)
+    try:
+        # Copied in bounded chunks, and the copy is re-hashed: what is put in place is what was
+        # verified, even if the snapshot file changed between the check and the copy.
+        if _copy_private(snapshot, staged) != digest:
+            raise RollbackRefused("the snapshot digest does not match the receipt")
+    except OSError:
+        staged.unlink(missing_ok=True)
+        raise RollbackRefused("the snapshot or its manifest cannot be read") from None
+    except RollbackRefused:
+        staged.unlink(missing_ok=True)
+        raise
     if database.exists():
         os.replace(database, aside)
     for suffix in ("-wal", "-shm"):
@@ -781,15 +874,16 @@ def rollback(
         index = row.get("index")
         if not isinstance(index, int) or not 0 <= index < len(paths):
             continue
-        try:
-            original = (copies / f"config-{index}.json").read_bytes()
-        except OSError:
-            continue
-        if hashlib.sha256(original).hexdigest() != row.get("sha256"):
-            continue
         tmp = paths[index].with_name(paths[index].name + ".rollback-new")
-        tmp.write_bytes(original)
-        os.chmod(tmp, 0o600)
+        tmp.unlink(missing_ok=True)
+        try:
+            copied = _copy_private(copies / f"config-{index}.json", tmp)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            continue
+        if copied != row.get("sha256"):
+            tmp.unlink(missing_ok=True)
+            continue
         os.replace(tmp, paths[index])
         restored_configs.append(index)
 

@@ -117,6 +117,14 @@ version; its id is the digest's first 32 digits and its time the `backup-<stamp>
 config copies are listed with, counted in the size of, and removed with their backup. The keep-last
 floor and the "never the last restorable backup" rule apply across both formats.
 
+Config copies are only a backup's companion when the backup is named `backup-<stamp>` and the
+`<name>-configs` directory is a plain directory holding nothing but regular `config-<n>.json`
+files; any other directory is never touched with the backup (it is reported). A snapshot is
+opened read-only and immutable, so checking it never writes `-wal` or `-shm` files into the backup,
+and a snapshot whose schema is newer than this release supports is not restorable. If the config
+copies cannot be removed after the backup is deleted, the receipt row says so (`companion: not
+removed: ...`) and counts only the bytes actually freed.
+
 Verification of a bundle now happens in place. Restore copies a backup into a temporary
 directory before it trusts it; doing that for every retention check staged ~5.7 GB deploy
 backups into the temporary filesystem, which filled and raised `OSError`, so restorable backups

@@ -411,6 +411,13 @@ because an execution grant binds a snapshot; a stage whose only inputs are `publ
 closed on a worker-grant provider with `public_only_stage_needs_a_snapshot_input` and runs
 on Salad.
 
+On Salad, `cache` is honoured by the in-container runtime only when the provider environment mounts a
+persistent directory and names it with `TESSERA_FETCH_CACHE_DIR` (and a store quota with
+`TESSERA_FETCH_CACHE_MAX_BYTES`) in the reviewed contract `env` or the image
+([ADR 0116](decisions/0116-provider-fetch-cache.md)). Tessera creates no storage; without it the flag is
+a no-op recorded as `unavailable`. Entries are keyed by sha256 and re-hashed on every reuse, and cached
+bytes never go to the control plane.
+
 `docker_network_pool` (optional, with `docker_network_prefix_length`, default 24; also
 `--docker-network-pool` / `--docker-network-prefix-length` on `development-poll` and
 `development-run`) gives the Docker networks Tessera creates their own address block.

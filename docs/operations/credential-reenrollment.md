@@ -44,7 +44,8 @@ Run as the user that owns the private credential directory, in a terminal you co
    but its receipt file could not be written (the receipt is printed on stdout instead), 1 means
    unexpected.
 4. The receipt records the provider, reference, version and expiry metadata. It never contains the
-   secret.
+   secret. The receipt file is written atomically (a temporary file in the same directory, synced, then
+   linked into place without overwriting), so a failed write leaves no partial receipt.
 5. Replacing the key here does NOT revoke the old one at the provider: after the services have
    restarted and use the new version, delete the previous key in the provider's console (the
    command reminds you).

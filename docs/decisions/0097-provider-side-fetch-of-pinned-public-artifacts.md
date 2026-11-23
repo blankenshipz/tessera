@@ -41,6 +41,11 @@ instead of inventing numbers.
   bytes are kept by digest so a rerun does not refetch. A cache hit is re-hashed and verified
   on every use; a corrupt entry is discarded and refetched; nothing is cached before it
   verifies. Salad containers are ephemeral, so the cache is a local-worker feature.
+  The entry is read once: the same bytes are hashed and copied to a temp file, which replaces
+  the served file only after the digest equals the pin, so the verified bytes are the served
+  bytes. An entry is deleted only when the whole file was read and its digest differs; an I/O
+  error, a symlinked or non-regular entry, or a size above this pin's `max_bytes` is a miss that
+  leaves the entry in place.
 
 ### Egress
 
@@ -83,5 +88,12 @@ provider paths above, where the fetch precedes the delivery of private input.
   the campaign receipt (still `declared_only`); fetched files stay under the worker's public root
   after a successful run until the operator clears it; the receipt does not say whether a fetch
   succeeded; each input's fetch may use the hosts of every input in the stage.
-- Not covered: fetching on other providers (they need a pre-stage hook), signed or
-  authenticated sources, and a Salad-side cache.
+- Not covered: fetching on other providers (they need a pre-stage hook) and signed or
+  authenticated sources.
+
+## Amendment: a provider-side cache
+
+[ADR 0116](0116-provider-fetch-cache.md) adds an optional cache by digest inside the Salad runtime,
+used only when the provider environment supplies persistent storage; it replaces the earlier note that
+a Salad-side cache was not covered. Every reuse is re-hashed, nothing cached reaches the control plane,
+and the receipt records hit or miss.

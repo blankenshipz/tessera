@@ -281,6 +281,31 @@ Success prints `{"schema":"tessera.gpu-runtime-status.v1","status":"retained",
 `{"schema":"tessera.gpu-runtime-status.v1","status":"failed","reason":<closed code>}`;
 no exception text or provider detail.
 
+## Provider-side cache
+
+A `file` or `wheel` URL item may carry an optional boolean `"cache": true` (an `entry` may not; an
+absent key means off). The cache is only useful where the provider mounts persistent storage into
+the container: a Salad container is otherwise ephemeral, so without it every flagged item reports
+`cache: "unavailable"` and is fetched as usual.
+
+- **Where.** The directory comes only from the runtime's own environment: `TESSERA_FETCH_CACHE_DIR`
+  (set by the image or by the reviewed contract `env`) and optionally `TESSERA_FETCH_CACHE_MAX_BYTES`
+  (decimal; default 0 means never store, lookups still work). The directory must be absolute, a real
+  directory with no symlink in its path, owned by the runtime's uid, mode 0700, and neither inside nor
+  containing the work directory. Anything else reads as `unavailable`.
+- **Key and verification.** An entry is `<dir>/<sha256>`: the pinned digest is the key, never a name from
+  the manifest. Every reuse re-hashes the whole entry while copying it (copies, never links; a regular
+  single-link file only, within the item's `max_bytes`). A mismatch or wrong size deletes the entry and
+  the item is fetched normally, so nothing unverified is ever used. A verified fresh fetch is stored
+  atomically (0600) when it fits the quota, evicting the oldest entries first; a storing failure never
+  fails the run.
+- **Never an output.** The cache directory is outside the work tree, so cached bytes cannot be staged
+  or uploaded; the control plane never receives them.
+- **Row.** Each retained `fetched` row gains `cache`: `hit`, `miss`, `unavailable` or `off`. A hit's
+  `bytes` is the size read and `seconds` the local copy time.
+- **Older images** refuse the extra `cache` key (the exact key set), before the claim for an inline
+  manifest, so a reviewed contract with a cache flag cannot run on an image that does not know it.
+
 ## Staged input
 
 The expected digest and byte cap come only from the reviewed argv. The runtime

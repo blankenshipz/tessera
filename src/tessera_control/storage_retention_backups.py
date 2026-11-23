@@ -4,11 +4,12 @@ Backups are the `tessera backup` bundle (manifest.json) and the deploy-upgrade c
 pre-migration snapshot (snapshot-manifest.json, an older schema that `restore` refuses; its
 config copies in a sibling `<name>-configs` directory are listed and removed with it).
 
-Only bundles that `tessera restore` would accept (its own validation, including object
-digests and the declared layout) count: an unrestorable bundle is skipped and reported, so it
-never uses up the keep-last floor nor protects itself at the cost of a restorable one. Only
-complete, verified `tessera backup` bundles that are direct, non-symlink
-children of the backup root are ever listed as candidates. Deletion re-verifies the
+Only backups that are restorable count: a `tessera backup` bundle `tessera restore` would
+accept (its own validation, including object digests and the declared layout), or a
+pre-migration snapshot whose size, digest and schema check out. An unrestorable backup is
+skipped and reported, so it never uses up the keep-last floor nor protects itself at the cost of
+a restorable one. Only complete, verified backups that are direct, non-symlink children of the
+backup root are ever listed as candidates. Deletion re-verifies the
 bundle immediately before removing it and never follows symlinks.
 """
 
@@ -28,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from tessera_control.migrations import LATEST_SCHEMA_VERSION
 from tessera_control.storage_retention_models import MIN_KEEP, Candidate, RetentionPolicy
 
 MANIFEST_NAME = "manifest.json"
@@ -181,7 +183,11 @@ def _verify_snapshot(directory: Path, manifest: dict[str, Any]) -> None:
         raise BackupRetentionError("snapshot does not match its manifest")
     try:
         connection = sqlite3.connect(
-            (directory / SNAPSHOT_NAME).absolute().as_uri() + "?mode=ro", uri=True, timeout=1
+            # immutable: a snapshot taken from a WAL-mode database keeps the WAL header, and a
+            # plain read-only open would create -wal/-shm files inside the backup (breaking it).
+            (directory / SNAPSHOT_NAME).absolute().as_uri() + "?mode=ro&immutable=1",
+            uri=True,
+            timeout=1,
         )
         try:
             if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
@@ -195,16 +201,41 @@ def _verify_snapshot(directory: Path, manifest: dict[str, Any]) -> None:
         ) from error
     if rows != [(manifest["schema_version"],)]:
         raise BackupRetentionError("snapshot schema version does not match its manifest")
+    if manifest["schema_version"] > LATEST_SCHEMA_VERSION:
+        raise BackupRetentionError("snapshot schema is newer than this release supports")
 
 
-def _companion(root: Path, name: str) -> Path | None:
-    """The config-copies directory beside a backup, when it is a plain direct child."""
-    path = root / (name + COMPANION_SUFFIX)
+_COMPANION_CONTENT = re.compile(r"^config-\d+\.json$")
+
+
+def _plain_dir(path: Path) -> bool:
     try:
         info = path.lstat()
     except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+
+def _companion(root: Path, name: str) -> Path | None:
+    """The config-copies directory the deploy-upgrade command keeps beside a backup, else None.
+
+    Only for a backup named ``backup-<stamp>``, and only a plain directory (no symlink) that holds
+    nothing but regular ``config-<n>.json`` files: anything else is not touched with the backup."""
+    if not _SNAPSHOT_STAMP.fullmatch(name):
         return None
-    return path if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) else None
+    path = root / (name + COMPANION_SUFFIX)
+    try:
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            return None
+        with os.scandir(path) as entries:
+            for entry in entries:
+                item = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(item.st_mode) or not _COMPANION_CONTENT.fullmatch(entry.name):
+                    return None
+    except OSError:
+        return None
+    return path
 
 
 def _tree_bytes(directory: Path) -> int:
@@ -251,7 +282,8 @@ def list_backups(
             continue
         if not stat.S_ISDIR(info.st_mode):
             continue
-        if name.endswith(COMPANION_SUFFIX) and (root / name[: -len(COMPANION_SUFFIX)]).is_dir():
+        base = name[: -len(COMPANION_SUFFIX)]
+        if name.endswith(COMPANION_SUFFIX) and _companion(root, base) and _plain_dir(root / base):
             continue  # config copies kept beside a backup: listed and removed with it
         try:
             manifest = _manifest(child)
@@ -362,15 +394,23 @@ def delete_backup(root: Path, candidate: Candidate) -> dict[str, Any]:
     except (OSError, ValueError) as error:
         raise BackupRetentionError(f"backup no longer verifies: {_why(error)}") from error
     companion = _companion(root, name)
+    companion_bytes = _tree_bytes(companion) if companion is not None else 0
     shutil.rmtree(directory)  # does not follow symlinks
-    if companion is not None:
-        shutil.rmtree(companion)  # the config copies kept beside this backup go with it
-    return {
+    result = {
         "ref": candidate.ref,
         "path": name,
         "size_bytes": candidate.size_bytes,
         "sha256": candidate.sha256,
     }
+    if companion is not None:
+        # The backup is gone whatever happens next: say so, and say what happened to the copies.
+        try:
+            shutil.rmtree(companion)  # the config copies kept beside this backup go with it
+            result["companion"] = "removed"
+        except OSError as error:
+            result["companion"] = f"not removed: {_why(error)}"
+            result["size_bytes"] = max(0, candidate.size_bytes - companion_bytes)
+    return result
 
 
 def verify_candidate(root: Path, candidate: Candidate) -> None:

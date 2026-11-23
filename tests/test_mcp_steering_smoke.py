@@ -206,6 +206,68 @@ def test_grant_directory_fills_the_options(tmp_path):
     assert grant.approver_token_file == root / "approver.token"
 
 
+def test_grant_snapshot_ids_are_loaded_and_optional(tmp_path):
+    assert smoke.load_grant(str(_grant_dir(tmp_path))).snapshot_id is None
+    (tmp_path / "x").mkdir()
+    root = _grant_dir(tmp_path / "x", snapshot_id="snapshot_1", snapshot_digest="d" * 64)
+    grant = smoke.load_grant(str(root))
+    assert (grant.snapshot_id, grant.snapshot_digest) == ("snapshot_1", "d" * 64)
+
+
+def test_grant_with_half_a_snapshot_is_refused(tmp_path, capsys):
+    root = _grant_dir(tmp_path, snapshot_id="snapshot_1")
+    assert smoke.main(_grant_args(root)) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+def test_smoke_uses_the_grants_snapshot_unless_one_is_given(tmp_path, monkeypatch):
+    root = _grant_dir(tmp_path, snapshot_id="snapshot_g", snapshot_digest="d" * 64)
+    seen = []
+    monkeypatch.setattr(
+        smoke, "run_smoke", lambda *a, **kw: seen.append(kw) or {"ok": True, "steps": []}
+    )
+    monkeypatch.setattr(smoke, "_build_caller", lambda *a, **kw: None)
+    assert smoke.main(_grant_args(root)) == 0
+    assert (seen[0]["snapshot_id"], seen[0]["snapshot_digest"]) == ("snapshot_g", "d" * 64)
+    assert smoke.main(_grant_args(root, "--snapshot-id", "snapshot_x")) == 0
+    assert (seen[1]["snapshot_id"], seen[1]["snapshot_digest"]) == ("snapshot_x", None)
+
+
+def _listing(data_class, digest="d" * 64):
+    return {"snapshots": [{"id": "snapshot_g", "digest": digest, "data_class": data_class}]}
+
+
+@pytest.mark.parametrize(
+    ("data_class", "digest", "fails"),
+    [
+        ("public", "d" * 64, False),
+        ({"data_class": "public"}, "d" * 64, False),
+        ("private_derived", "d" * 64, True),
+        ("public", "e" * 64, True),
+    ],
+)
+def test_smoke_refuses_a_catalog_that_does_not_show_the_grants_snapshot_public(
+    data_class, digest, fails
+):
+    calls = []
+
+    def agent(name, **_kwargs):
+        calls.append(name)
+        if name == "tessera_list_snapshots":
+            return _listing(data_class, digest)
+        return {"actions": []}
+
+    kwargs = {"image": "r.example/i@sha256:" + "a" * 64, "snapshot_id": "snapshot_g"}
+    if fails:
+        with pytest.raises(smoke.SmokeFailure, match="grant's snapshot"):
+            smoke.run_smoke(agent, agent, agent, snapshot_digest="d" * 64, **kwargs)
+        assert "tessera_validate_campaign_spec" not in calls
+    else:
+        with pytest.raises(Exception) as caught:  # passes the check, then the stub stops it
+            smoke.run_smoke(agent, agent, agent, snapshot_digest="d" * 64, **kwargs)
+        assert "grant's snapshot" not in str(caught.value)
+
+
 def test_grant_dry_run_prints_id_and_expiry_but_no_token(tmp_path, capsys):
     root = _grant_dir(tmp_path)
     assert smoke.main(["--smoke-credentials-dir", str(root)]) == 0

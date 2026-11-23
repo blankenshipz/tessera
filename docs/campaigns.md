@@ -94,6 +94,13 @@ verified and the fetched bytes are not public: nothing upgrades their class. A d
 Salad stage on these outputs needs the operator trust binding of ADR 0040; no Salad run is
 covered by that test.
 
+**Provider-side cache.** A `public_artifact` source with `cache: true` lets the executing provider keep
+the verified bytes by digest: the local worker in its private cache directory, and the Salad runtime only
+when the provider supplies persistent storage ([ADR 0116](decisions/0116-provider-fetch-cache.md)). Every
+reuse is re-hashed and a bad entry is refetched; cached bytes never go to the control plane. The receipt's
+`public_fetch` per-file entry records `cache` (`hit`, `miss`, `unavailable` or `off`) and the byte count,
+and the object carries `cache_requested: true` only when a source asked for it.
+
 ## The one human approval
 
 A human approves the exact digest and revision

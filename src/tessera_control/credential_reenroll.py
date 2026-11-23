@@ -214,12 +214,36 @@ def _write_receipt(directory: Path, receipt: dict[str, Any]) -> Path:
     path = (
         directory / f"credential-reenroll-{receipt['provider']}-{slug}-v{receipt['version']}.json"
     )
+    payload = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+    temp = directory / f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    created = False
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            stream.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        try:
+            fd = os.open(temp, flags, 0o600)
+            created = True
+            with os.fdopen(fd, "w") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # link() refuses to replace an existing receipt (FileExistsError).
+            os.link(temp, path)
+        finally:
+            if created:  # never remove a name this call did not create
+                try:
+                    os.unlink(temp)
+                except FileNotFoundError:
+                    pass
     except OSError:
         raise ReenrollRefused("receipt_unwritable") from None
+    try:  # best effort: make the new directory entry durable
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
     return path
 
 

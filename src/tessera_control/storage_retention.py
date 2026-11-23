@@ -231,6 +231,7 @@ def run(
                         "sha256": removed.get("sha256", candidate.sha256),
                         "reasons": candidate.reasons,
                         "deleted_at": _now().isoformat(),
+                        **({"companion": removed["companion"]} if "companion" in removed else {}),
                     }
                 )
                 receipt["bytes_freed"] += int(receipt["deleted"][-1]["size_bytes"])

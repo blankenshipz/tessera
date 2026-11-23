@@ -279,6 +279,10 @@ def issue(
         {"actions": list(SMOKE_ACTIONS), "destination": destination.strip()}
     )
     store, owner = _owner(state_dir)
+    from .smoke_snapshot import ensure_public_snapshot
+
+    # Owner authority, before the grant: a refused adoption leaves no grant and no credentials.
+    snapshot = ensure_public_snapshot(state_dir, owner, project_id)
     issued_at = now or datetime.now(UTC)
     expires_at = _utc_string(issued_at + timedelta(minutes=ttl_minutes))
     created_at = _utc_string(issued_at)
@@ -345,6 +349,7 @@ def issue(
                 "providers": list(PROVIDERS),
                 "max_budget_cents": 0,
                 "expires_at": expires_at,
+                "snapshot_id": snapshot["snapshot_id"],
             },
             project_id=project_id,
         )
@@ -367,6 +372,8 @@ def issue(
         "providers": list(PROVIDERS),
         "max_budget_cents": 0,
         "actions": list(scope.actions),
+        "snapshot_id": snapshot["snapshot_id"],
+        "snapshot_digest": snapshot["digest"],
         **ids,
         "agent_token": agent_token,
         "approver_token": approver_token,

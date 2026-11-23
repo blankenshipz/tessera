@@ -77,12 +77,19 @@ The smoke needs an agent credential enrolled for a destination and a person-side
 the approval, and neither can be hand-issued. The owner of the state directory issues a scoped,
 short-lived pair instead ([ADR 0120](decisions/0120-scoped-smoke-credentials.md)):
 
-    tessera dev smoke-credentials issue --state-dir STATE --project-id PROJECT \
+    tessera dev smoke-credentials issue --project-id PROJECT \
         --destination DESTINATION --out-dir /abs/DIR [--ttl-minutes 30]
     scripts/mcp_steering_smoke.py --execute --confirm mcp-steering-smoke-local-docker \
         --control-url https://CONTROL --smoke-credentials-dir /abs/DIR \
         --image REGISTRY/IMAGE@sha256:DIGEST --receipt-file /abs/new-report.json
-    tessera dev smoke-credentials revoke --state-dir STATE --grant-id GRANT_ID
+    tessera dev smoke-credentials revoke --grant-id GRANT_ID
+
+The commands find the control state directory themselves. They take, in order, `--state-dir`, the
+`TESSERA_CONTROL_STATE_DIR` environment variable (the shipped control unit sets it for the service only,
+so an owner shell exports the same value; keep it equal to the unit's `--state-dir`), or `--plan FILE` (this host's deploy plan, whose `state_dir` is used). If
+more than one is given and they name different directories, or none is given, or the directory has no
+control database, the command refuses and names which sources it looked at, never a path. There is
+deliberately no built-in default path. Run them as the user that owns the state directory.
 
 `--smoke-credentials-dir` reads `smoke-grant.json` and refuses an expired grant, a grant that is
 not local-docker only with a zero budget, or files that are not owner-only; it fills in the
@@ -90,12 +97,40 @@ project, destination and token files unless you pass them explicitly. The dry ru
 id and expiry (never a token), and the report records `smoke_grant_id`. The campaign spec is $0
 (`budget_cap_cents` 0, stage `max_exposure_cents` 0).
 
+`issue` also makes sure the project holds a tiny synthetic public snapshot (fixed bytes, `CC0-1.0`,
+adopted by the owner with the `smoke-credentials` automation label; reused if it is already there)
+and records its `snapshot_id` and `snapshot_digest` in `smoke-grant.json`. The smoke then uses that
+snapshot, after checking the catalog lists it as public with that digest, so no human staging step
+is needed; an explicit `--snapshot-id` still wins. See the amendment in ADR 0120.
+
 The agent credential needs the campaign scopes (submit, read, cancel), `snapshot:read` and
 `budget:read`; the image must be one the local docker provider allows. The campaign is paused
 right after approval and cancelled straight after the resume, so at most a local zero-cost
 container is reserved. It needs the campaign runner running to reach the terminal receipt and
 fails loudly if the campaign is not terminal within `--wait-seconds`. Its own test is
 `tests/test_mcp_steering_smoke.py` (an in-process control plane and a fake worker).
+
+### Steering a running campaign (end-to-end check)
+
+`scripts/mcp_steering_running_check.py` is the companion check where the campaign actually runs:
+it submits a two-stage $0 `local-docker` campaign, has the person-side credential approve the digest,
+waits until stage one is live, reads the plain-words report (`tessera_campaign_report`), PAUSES while
+the stage runs, proves the running stage finishes but no new stage starts while paused, resumes,
+lets the campaign succeed, reads any gate decision (`tessera_campaign_gate_decisions`: with no gate
+configured it records that there is none) and checks the terminal receipt records the pause and the
+approval and that nothing was settled. Every agent act is an MCP tool call; a gate's go is a human
+act and has no tool. Like the smoke it is a dry run by default and takes the same owner-issued
+credentials:
+
+    scripts/mcp_steering_running_check.py --execute \
+        --confirm mcp-steering-running-check-local-docker \
+        --smoke-credentials-dir /abs/DIR --control-url https://CONTROL \
+        --image REGISTRY/IMAGE@sha256:DIGEST --receipt-file /abs/new-report.json
+
+Stage one sleeps a few seconds (`--stage-seconds`, default 8) so it can be caught running; if it
+finishes first the check fails and says so. It needs the campaign runner and the local docker poller
+running. Its test, `tests/test_mcp_steering_running_check.py`, runs the whole flow in process,
+including a gate (a standing approval and an owner go) that starts a follow-on campaign.
 
 ## Where a person or operator CLI is still required
 

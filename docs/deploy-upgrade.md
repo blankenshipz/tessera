@@ -78,6 +78,22 @@ verifies the digests, keeps the replaced database as `tessera.sqlite3.pre-rollba
 configs the upgrade rewrote, writes a receipt and starts nothing), then start the release that
 wrote the snapshot. `tessera restore` does not take it.
 
+**Who migrated.** The receipt records the stored schema version at each boundary (`schema_trace`: at
+preflight, after the services stop, in the backup snapshot, just before the migrate step and after
+it). The migrate step says what it did: "migrated schema vN to vM in this step", or "nothing to
+migrate" when the schema was current from the start. If the version moved before the step began, the
+step is not credited: its detail and `warnings` name the window (while the services stopped, during
+the backup, or between the backup and the migrate step), `early_migration` records it, and the backup's
+own schema version shows whether the snapshot holds the old schema.
+
+**Who migrated.** The receipt records the stored schema version at each boundary (`schema_trace`: at
+preflight, after the services stop, in the backup snapshot, just before the migrate step and after
+it). The migrate step says what it did: "migrated schema vN to vM in this step", or "nothing to
+migrate" when the schema was current from the start. If the version moved before the step began, the
+step is not credited: its detail and `warnings` name the window (while the services stopped, during
+the backup, or between the backup and the migrate step), `early_migration` records it, and the backup's
+own schema version shows whether the snapshot holds the old schema.
+
 **On failure** the run stops at that step and the receipt says which. Config keys are dropped only after the
 migrate succeeds. A failed backup restarts the stopped services unless a migration is pending (the
 new release would fail against the old schema), in which case they stay stopped; after the migration they are left as they are and the receipt names the backup.

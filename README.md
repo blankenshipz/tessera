@@ -305,7 +305,8 @@ record, not proof the loop stopped. A human still
 approves the digest and stages snapshots; an operator may enable `tessera_approve_campaign` on a
 separate `--approval-tool` server that holds a person's own session credential (the control API
 still refuses any agent credential and applies every admission check and cap). A $0 end-to-end smoke of this steering path against a running Tessera (dry run by default;
-`scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md).
+`scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md); its owner-run credential command also ensures a tiny synthetic public snapshot, so the smoke needs no human staging step, and it finds the control state directory from `TESSERA_CONTROL_STATE_DIR` or the host's deploy plan instead of a typed path.
+`scripts/mcp_steering_smoke.py`) is described in [docs/mcp-steering.md](docs/mcp-steering.md), with a companion check that steers a RUNNING campaign (report, pause while a stage runs, resume, a gate decision) through the same tools (`scripts/mcp_steering_running_check.py`).
 See
 [docs/mcp-campaign-client-path.md](docs/mcp-campaign-client-path.md).
 

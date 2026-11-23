@@ -365,7 +365,9 @@ def _bundle_entries(database: Path, start: float) -> tuple[list[dict[str, Any]],
             r.state,project.org_id FROM project_artifact_placements p
             JOIN projects project ON project.id=p.project_id
             LEFT JOIN project_artifact_retention r ON r.artifact_id=p.artifact_id
-            ORDER BY p.tenant_namespace,p.project_namespace,p.object_key,p.artifact_id"""
+            ORDER BY p.tenant_namespace,p.project_namespace,p.object_key,p.artifact_id
+            LIMIT ?""",
+            (MAX_BACKUP_OBJECTS + 1,),  # one past the cap: enough to refuse, never the whole table
         ).fetchall()
         if len(rows) > MAX_BACKUP_OBJECTS:
             raise StoreError("Backup exceeds its project artifact object count limit.")
@@ -409,7 +411,8 @@ def _bundle_entries(database: Path, start: float) -> tuple[list[dict[str, Any]],
             row[0]
             for row in connection.execute(
                 """SELECT a.id FROM artifacts a LEFT JOIN project_artifact_placements p
-                ON p.artifact_id=a.id WHERE p.artifact_id IS NULL ORDER BY a.id"""
+                ON p.artifact_id=a.id WHERE p.artifact_id IS NULL ORDER BY a.id LIMIT ?""",
+                (MAX_BACKUP_OBJECTS + 1,),
             )
         ]
         if len(legacy) > MAX_BACKUP_OBJECTS or any(

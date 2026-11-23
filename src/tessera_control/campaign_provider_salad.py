@@ -82,6 +82,8 @@ def _salad_config(stage: Any) -> SaladStageSpec | None:
 
 PUBLIC_ARTIFACT_MISMATCH = "public_artifact_contract_mismatch"
 PUBLIC_ARTIFACT_DELIVERY = "public_artifact_input_delivery"
+PUBLIC_ARTIFACT_CACHE = "public_artifact_cache_mismatch"
+PUBLIC_ARTIFACT_CACHE_INLINE = "public_artifact_cache_needs_inline_manifest"
 
 
 def public_pins(stage: Any) -> tuple[list[tuple[str, str, int]], list[str]] | None:
@@ -103,6 +105,50 @@ def public_pins(stage: Any) -> tuple[list[tuple[str, str, int]], list[str]] | No
     return (sorted(rows), sorted(hosts)) if found else None
 
 
+def public_cache_flags(stage: Any) -> dict[tuple[str, str, int], bool]:
+    """Whether the approved spec asks the provider to cache each pinned file (ADR 0097), by
+    ``(url, sha256, max_bytes)``. The flag is per source and applies to every file of it."""
+    flags: dict[tuple[str, str, int], bool] = {}
+    for source in getattr(stage, "inputs", ()):
+        if getattr(source, "kind", None) != "public_artifact":
+            continue
+        files = getattr(source, "public_files", None)
+        if files is None or (not files and getattr(source, "files", None)):
+            files = [(f.name, f.url, f.sha256, f.max_bytes) for f in source.files]
+        for _name, url, sha, size in files:
+            flags[(url, sha, size)] = bool(getattr(source, "cache", False))
+    return flags
+
+
+def _cache_refusal(stage: Any, config: SaladStageSpec) -> str | None:
+    """The provider-side cache is something a person approves with the spec and sees in the
+    reviewed manifest: the manifest's per-file ``cache`` flag must equal the spec source's, in
+    both directions. A manifest read from the input cannot be inspected at plan time, so a spec
+    that asks for caching needs an inline manifest."""
+    wanted = public_cache_flags(stage)
+    workload = config.workload
+    if getattr(workload, "runtime", None) != GPU_RUNTIME_V1:
+        return PUBLIC_ARTIFACT_CACHE_INLINE if any(wanted.values()) else None
+    try:
+        manifest = gpu_runtime_inline_manifest(workload)
+    except ValueError:
+        manifest = None
+    if manifest is None:
+        return PUBLIC_ARTIFACT_CACHE_INLINE if any(wanted.values()) else None
+    seen: set[tuple[str, str, int]] = set()
+    for item in manifest["fetches"]:
+        if not isinstance(item, dict) or "url" not in item:
+            continue
+        key = (item.get("url"), item.get("sha256"), item.get("max_bytes"))
+        flag = item.get("cache", False)
+        if type(flag) is not bool or flag != wanted.get(key, False):
+            return PUBLIC_ARTIFACT_CACHE
+        seen.add(key)
+    if any(flag and key not in seen for key, flag in wanted.items()):
+        return PUBLIC_ARTIFACT_CACHE  # a cached pin the reviewed manifest does not carry
+    return None
+
+
 def public_artifact_refusal(stage: Any, config: SaladStageSpec) -> str | None:
     """Closed reason when the workload contract does not carry exactly the spec's pinned
     public files and redirect hosts, else None (ADR 0097). The contract's fetch rows are what
@@ -122,7 +168,7 @@ def public_artifact_refusal(stage: Any, config: SaladStageSpec) -> str | None:
         # fetch after the private snapshot is materialized. Only an inline manifest fetches first.
         if gpu_runtime_inline_manifest(config.workload) is None:
             return PUBLIC_ARTIFACT_MISMATCH
-    return None
+    return _cache_refusal(stage, config)
 
 
 def _hosts_declared(config: SaladStageSpec) -> bool:

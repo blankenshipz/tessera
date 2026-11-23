@@ -370,9 +370,19 @@ def check_gpu_runtime_manifest_rules(manifest, input_declared, redirect_hosts=()
                 raise ValueError(reason)
             continue
         if not is_input_item(row):
-            if set(row) != URL_ITEM_KEYS or row["kind"] not in URL_ITEM_KINDS:
+            if (
+                set(row) not in (URL_ITEM_KEYS, URL_ITEM_KEYS | {"cache"})
+                or row["kind"] not in URL_ITEM_KINDS
+            ):
                 raise ValueError(
                     "gpu_runtime_v1 URL item must be exactly {url, sha256, max_bytes, kind, dest}"
+                    " with an optional boolean cache"
+                )
+            if "cache" in row and (
+                type(row["cache"]) is not bool or (row["cache"] and row["kind"] == "entry")
+            ):
+                raise ValueError(
+                    "gpu_runtime_v1 cache is a boolean allowed only on file and wheel items"
                 )
             continue
         path = row.get("path")

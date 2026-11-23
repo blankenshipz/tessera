@@ -66,6 +66,8 @@ def _text(document: dict) -> str:
         lines.append(f"[{mark}] {step['step']}: {step['detail']} ({step['seconds']}s)")
     for planned in document.get("planned", []):
         lines.append(f"  would: {planned}")
+    for warning in document.get("warnings", []):
+        lines.append(f"warning: {warning}")
     if document.get("failed_step"):
         lines.append(f"failed at: {document['failed_step']}")
         if document.get("backup"):

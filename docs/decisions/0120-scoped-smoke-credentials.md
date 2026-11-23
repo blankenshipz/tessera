@@ -78,3 +78,34 @@ widens what an agent may decide in production and never counts as a general pers
 - Not available to agents or over the network: owner-run only, on the state directory.
 - Does not prove an experiment ran; the smoke's receipt records steering and a zero settled
   budget only.
+
+## Amendment: synthetic public snapshot
+
+The smoke needs a public snapshot as its stage input, and only a human can declare one public.
+`issue` therefore also makes sure the project holds one tiny synthetic public snapshot, so the
+smoke needs no human step. This is acceptable because:
+
+- the bytes are fixed constants in `smoke_snapshot.SMOKE_FILES` (two short ASCII files, clearly
+  marked synthetic, under 1 KiB); nothing is read from the owner's data or the environment;
+- it is owner-run only, on the state directory, with the root owner's authority, through the
+  ordinary `adopt_snapshot` path and its atomic public declaration (`CC0-1.0`, source
+  `https://tessera.invalid/smoke-synthetic-v1`); the data-class record is immutable, as always;
+- the decision is recorded: the data-class provenance carries the decision class
+  `owner_automation_labelled` and the automation label `smoke-credentials` (the label grants no
+  authority, it marks the decision), and the usual `workspace.snapshot_adopted` event is written;
+  the `smoke_credentials.issued` event adds the `snapshot_id`;
+- there is still no agent path to declare anything public: the agent credential and the smoke
+  approver are unchanged, and [ADR 0039](0039-data-class-guard.md) is untouched.
+
+What it stores and where: two files in the project's snapshot store, in the state directory's
+database, like any adopted snapshot. The inventory digest includes the root path, so it is computed
+over the fixed logical root `/tessera-smoke-synthetic-v1` instead of the temporary directory the
+bytes are written to; the digest is the same on every run and machine. A second `issue` finds the
+project's snapshot by digest and reuses it (one row). If the same bytes are already held as a
+non-public snapshot, `issue` refuses with `smoke_snapshot_digest_not_public`, because a data class
+cannot be changed. The snapshot is adopted before the grant, so a refused adoption creates no grant
+or credential; a later failure leaves only the harmless public snapshot, reused next time.
+`smoke-grant.json` (still `tessera.smoke-credentials.v1`) gains the optional `snapshot_id` and
+`snapshot_digest`; the smoke uses that snapshot unless `--snapshot-id` is given, and fails if the
+catalog does not list it as public with that digest. Older grant files without these keys behave
+as before.

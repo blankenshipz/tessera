@@ -153,3 +153,104 @@ def test_only_the_snapshot_and_its_manifest_are_in_a_fresh_deploy_snapshot(tmp_p
     snapshot = make_snapshot(tmp_path, 2, configs=False)
     assert sorted(os.listdir(snapshot)) == ["snapshot-manifest.json", "snapshot.sqlite3"]
     assert datetime.now(UTC) > NOW - timedelta(days=3)  # sanity: the stamp is in the past
+
+
+# --- review follow-ups -------------------------------------------------------------------------
+
+
+def make_wal_snapshot(root: Path, age_days: float) -> Path:
+    """A deploy snapshot taken from a database in WAL mode (it keeps the WAL header)."""
+    scratch = Path(tempfile.mkdtemp(prefix="tessera-deploy-state-"))
+    initialize_state(scratch / "state")
+    database = scratch / "state" / "tessera.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("UPDATE schema_meta SET schema_version=70")
+    connection.commit()
+    connection.close()
+    name = "backup-" + (NOW - timedelta(days=age_days)).strftime("%Y%m%dT%H%M%SZ")
+    deploy_upgrade.take_backup(scratch / "state", root / name)
+    shutil.rmtree(scratch)
+    return root / name
+
+
+def test_checking_a_wal_mode_snapshot_writes_nothing_into_the_backup(tmp_path):
+    snapshot = make_wal_snapshot(tmp_path, 3)
+    before = sorted(os.listdir(snapshot))
+    assert before == ["snapshot-manifest.json", "snapshot.sqlite3"]
+    for _ in range(3):  # a second pass used to find -wal/-shm files and reject it
+        entries, skipped = sb.list_backups(tmp_path)
+        assert [e.path for e in entries] == [snapshot.name] and skipped == []
+        assert sorted(os.listdir(snapshot)) == before
+    assert sb.verify_all(tmp_path)["restorable"] == 1
+
+
+def test_a_snapshot_schema_newer_than_this_release_is_not_restorable(tmp_path):
+    make_snapshot(tmp_path, 3, schema=10_000, configs=False)
+    entries, skipped = sb.list_backups(tmp_path)
+    assert entries == [] and "newer than this release" in skipped[0]["reason"]
+
+
+def test_a_config_directory_with_unexpected_contents_is_not_removed_with_the_backup(tmp_path):
+    snapshot = make_snapshot(tmp_path, 90)
+    make_snapshot(tmp_path, 1)
+    companion = tmp_path / (snapshot.name + "-configs")
+    (companion / "notes.txt").write_text("something an operator kept here")
+    entries, skipped = sb.list_backups(tmp_path)
+    assert [s["path"] for s in skipped] == [companion.name]  # reported, not hidden
+    old = next(e for e in entries if e.path == snapshot.name)
+    sb.delete_backup(tmp_path, old)
+    assert not snapshot.exists() and companion.exists()  # never touched
+
+
+def test_a_bundle_named_like_a_config_directory_is_not_hidden_or_removed(tmp_path):
+    make_bundle(tmp_path, 1, 1)
+    bundle = make_bundle(tmp_path, 2, 2)
+    renamed = bundle.rename(tmp_path / "backup-20260101T000000Z-configs")
+    make_snapshot_dir = make_snapshot(tmp_path, 400, configs=False)
+    sibling = tmp_path / "backup-20260101T000000Z"
+    sibling.mkdir()
+    shutil.copy(make_snapshot_dir / "snapshot.sqlite3", sibling / "snapshot.sqlite3")
+    shutil.copy(make_snapshot_dir / "snapshot-manifest.json", sibling / "snapshot-manifest.json")
+    entries, _ = sb.list_backups(tmp_path)
+    assert renamed.name in {e.path for e in entries}  # a real bundle, listed and countable
+    snap = next(e for e in entries if e.path == sibling.name)
+    sb.delete_backup(tmp_path, snap)
+    assert renamed.exists()  # its name does not make it the snapshot's config copies
+
+
+def test_a_symlinked_config_directory_is_not_followed(tmp_path):
+    snapshot = make_snapshot(tmp_path, 90, configs=False)
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside.mkdir()
+    (outside / "config-0.json").write_text("{}")
+    (tmp_path / (snapshot.name + "-configs")).symlink_to(outside, target_is_directory=True)
+    make_snapshot(tmp_path, 1)
+    entries, skipped = sb.list_backups(tmp_path)
+    assert any(s["reason"] == "symlink" for s in skipped)
+    sb.delete_backup(tmp_path, next(e for e in entries if e.path == snapshot.name))
+    assert (outside / "config-0.json").exists()
+    shutil.rmtree(outside)
+
+
+def test_a_failed_config_removal_is_reported_honestly_after_the_backup_is_gone(
+    tmp_path, monkeypatch
+):
+    snapshot = make_snapshot(tmp_path, 90)
+    make_snapshot(tmp_path, 1)
+    entries, _ = sb.list_backups(tmp_path)
+    old = next(e for e in entries if e.path == snapshot.name)
+    real = shutil.rmtree
+
+    def flaky(path, *args, **kwargs):
+        if str(path).endswith("-configs"):
+            raise OSError(errno.EACCES, "denied", str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(sb.shutil, "rmtree", flaky)
+    result = sb.delete_backup(tmp_path, old)
+    assert not snapshot.exists()  # the backup is gone
+    assert result["companion"] == "not removed: PermissionError EACCES"
+    assert result["size_bytes"] < old.size_bytes  # only what was actually freed
+    assert (tmp_path / (snapshot.name + "-configs")).exists()
+    assert "/" not in result["companion"]

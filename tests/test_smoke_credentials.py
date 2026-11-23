@@ -28,6 +28,7 @@ from tessera_control.store import (
     Forbidden,
     NotFound,
     Store,
+    _connect,
     canonical_digest,
     initialize_state,
 )
@@ -443,6 +444,12 @@ def test_cli_end_to_end(tmp_path, monkeypatch, capsys):
     assert agent_token not in json.dumps(description) and approver_token not in json.dumps(
         description
     )
+    assert description["snapshot_id"].startswith("snapshot_")
+    assert len(description["snapshot_digest"]) == 64
+    with _connect(state / "tessera.sqlite3") as connection:
+        assert [r["id"] for r in connection.execute("SELECT id FROM source_snapshots")] == [
+            description["snapshot_id"]
+        ]
     assert store.authenticate(agent_token)["kind"] == "agent"
     assert store.authenticate(approver_token)["kind"] == "human_session"
     # never overwritten
