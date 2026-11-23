@@ -519,12 +519,32 @@ expires, is replaced or is revoked stops all starts.
   it. It never replaces the guardian or campaign caps.
 - A receipt gains an `unlock` section when admission was conditional.
 
+## Input releases of idle campaigns
+
+A campaign's runner holds one active release per input snapshot and worker for its
+attempts, and while it is active a second campaign on the same snapshot is refused with
+`step_refused`. When a campaign becomes terminal (`succeeded`, `stopped`, `failed`,
+`cancelled`), blocked or paused, every release it used is revoked in the same transaction as
+that state change, provided nothing still needs it: no attempt of any campaign that uses it is
+in flight, `unknown` or unsettled, and no execution grant issued against it is unresolved.
+Each revocation writes a `campaign.release_freed` event (`released_by: system`, `trigger`,
+`reason` = the campaign status, `campaign_id`, `snapshot_id`, `snapshot_digest`,
+`release_id`). A blocked campaign whose last live attempt settles later, and a campaign that
+went idle before this rule existed, are freed by a bounded reconcile sweep on every runner
+tick (so at the first tick after a restart). While the holder still has a live attempt the
+refusal stays, and names the holding campaign and the release expiry to the same
+organization only (another organization learns only that the snapshot is held and until
+when). A person's own release, which no campaign attempt used, is never revoked by the runner.
+A release whose `expires_at` has passed is never treated as active, whoever holds it: it
+does not refuse a new campaign, and the new release revokes it in the same transaction with a
+`workspace.snapshot_release_expired` event (`release_id`, `expired_at`, `replaced_by`).
+
 ## Not implemented
 
 Bound gate outcomes without human-entered metric records (a human
 records every metric), a program budget recorded on events or re-read after startup,
 re-checking an unlock when a lapsed campaign is re-approved; multi-host runners; dynamic fan-out; more than 32
-stages in a v1 spec (v2 allows 64) or approvals past 7 days. Human releases of the same snapshot to the same worker
+stages in a v1 spec (v2 allows 64) or approvals past 7 days. Unexpired human releases of the same snapshot to the same worker
 block the runner (it records `step_refused` and never revokes the human release).
 An admitted attempt left unresolved after cancel or a T1 expiry keeps its experiment-level
 budget reservation pending: resolving the attempt does not free it, only a recorded charge does.

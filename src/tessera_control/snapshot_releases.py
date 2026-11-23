@@ -163,13 +163,38 @@ class SnapshotReleaseStore(SnapshotStore):
             for identity in (live, worker):
                 if identity["expires_at"] and expiry > _parse_utc(identity["expires_at"]):
                     raise StoreError("Snapshot release cannot outlive its identities.")
-            if connection.execute(
-                """SELECT 1 FROM snapshot_releases WHERE snapshot_id = ?
+            previous = connection.execute(
+                """SELECT * FROM snapshot_releases WHERE snapshot_id = ?
                 AND worker_principal_id = ? AND status='active'""",
                 (snapshot_id, worker["id"]),
-            ).fetchone():
+            ).fetchone()
+            if previous is not None and _parse_utc(previous["expires_at"]) > now:
                 raise Conflict("Revoke the previous release before replacing it.")
             ident, timestamp = "release_" + uuid.uuid4().hex, utc_now()
+            if previous is not None:
+                # An expired release is never active: lapse it in this transaction, with an
+                # event, so it cannot block the new one through the unique active index.
+                connection.execute(
+                    """UPDATE snapshot_releases SET status='revoked', revision=revision+1,
+                    revoked_at=? WHERE id=? AND status='active' AND revision=?""",
+                    (timestamp, previous["id"], previous["revision"]),
+                )
+                self._event(
+                    connection,
+                    live,
+                    snapshot["project_id"],
+                    None,
+                    "workspace.snapshot_release_expired",
+                    previous["revision"] + 1,
+                    {
+                        "release_id": previous["id"],
+                        "snapshot_id": snapshot_id,
+                        "worker_principal_id": worker["id"],
+                        "expired_at": previous["expires_at"],
+                        "replaced_by": ident,
+                        "automatic": True,
+                    },
+                )
             # Derived, not stored: the classification says how the data may be used; a
             # "public" release of a snapshot that also carries owner-approved private code
             # is labelled so no consumer mistakes that code for public data.

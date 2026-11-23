@@ -85,6 +85,11 @@ from .campaign_providers import (
     provider_ids,
 )
 from .campaign_receipts import CODE_GRANTED_EVENT, build_receipt, code_delivery, code_summary
+from .campaign_release_scope import (
+    free_idle_campaign_releases,
+    holder_refusal,
+    idle_holders,
+)
 from .campaign_settlement import (
     BASES,
     FrameSettlement,
@@ -255,6 +260,7 @@ class CampaignRunner:
                 ids = [row["id"] for row in self.store.runnable_campaigns(connection)]
         try:
             self._release_expired_grants()
+            self._free_idle_releases()
         except _LeaseLost:
             self._actions.append("lease_lost")
             return TickReport(tuple(self._actions), len(ids))
@@ -316,6 +322,34 @@ class CampaignRunner:
             return
         for item in released:
             self._actions.append(f"grant_released:{item['grant_id']}")
+
+    def _free_idle_releases(self) -> None:
+        """Reconcile sweep: free releases still held by idle campaigns (every tick, bounded).
+
+        Covers campaigns that went idle before releases were freed at the transition, and a
+        blocked campaign whose last live attempt has since settled."""
+        try:
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                for campaign_id in idle_holders(connection):
+                    self._free_campaign_releases(connection, campaign_id, "reconcile_sweep")
+        except sqlite3.OperationalError as error:
+            if not _is_busy(error):
+                raise
+
+    def _free_campaign_releases(
+        self, connection: sqlite3.Connection, campaign_id: str, trigger: str
+    ) -> None:
+        """Free, in the caller's transaction, the releases an idle campaign no longer needs."""
+        freed = free_idle_campaign_releases(
+            connection,
+            campaign_id,
+            trigger=trigger,
+            now=_iso(self.now()),
+            record_event=self.store.record_runner_event,
+        )
+        for item in freed:
+            self._actions.append(f"release_freed:{item['release_id']}")
 
     def _schedule(self) -> int:
         """Start standing-approval campaigns that are due (ADR 0042); returns the count."""
@@ -480,6 +514,7 @@ class CampaignRunner:
                 self.store.record_runner_event(
                     connection, ctx.campaign, "campaign.delegation_lapsed", {"reason": reason}
                 )
+                self._free_campaign_releases(connection, ctx.campaign["id"], "campaign_paused")
         self._actions.append(f"paused:{ctx.campaign['id']}:{reason}")
 
     # -- step plumbing --------------------------------------------------------------
@@ -1154,6 +1189,7 @@ class CampaignRunner:
                 self.store.record_runner_event(
                     connection, campaign, "campaign.blocked", {"reason": "settlement_mismatch"}
                 )
+                self._free_campaign_releases(connection, campaign["id"], "campaign_blocked")
 
     def _block_unknown_basis(self, attempt: Mapping[str, Any]) -> None:
         self._set_attempt(
@@ -1941,6 +1977,7 @@ class CampaignRunner:
                     "campaign.blocked",
                     {"stage_key": key, **({"reason": reason} if reason else {})},
                 )
+                self._free_campaign_releases(connection, ctx.campaign["id"], "campaign_blocked")
         self._actions.append(f"blocked:{key}")
         return False
 
@@ -2773,30 +2810,35 @@ class CampaignRunner:
             AND status='active'""",
             (stage["input_snapshot_id"], worker),
         )
+        owned = None
         if active is not None:
             owned = self._one(
                 "SELECT 1 FROM campaign_stage_attempts WHERE campaign_id=? AND release_id=?",
                 (ctx.campaign["id"], active["id"]),
             )
-            if owned is None:
-                # A release_snapshot that committed before the attempt row recorded it is ours.
-                # Read outside the transaction below: it opens its own.
-                slot = self._release_ordinal(ctx, key, attempt)
-                with self.store.runner_connection() as connection:
-                    done = self.steps.completed(
-                        connection,
-                        ctx.campaign["id"],
-                        key,
-                        attempt["attempt"],
-                        "release_snapshot",
-                        slot,
-                    )
-                if done is not None and done.response.get("id") == active["id"]:
-                    self._set_attempt(attempt["id"], release_id=active["id"])
-                    return True
-                raise StepFailed(
-                    "release_snapshot", "step_refused", "a human release of this snapshot is active"
+        if active is not None and owned is None:
+            # A release_snapshot that committed before the attempt row recorded it is ours.
+            # Read outside the transaction below: it opens its own.
+            slot = self._release_ordinal(ctx, key, attempt)
+            with self.store.runner_connection() as connection:
+                done = self.steps.completed(
+                    connection,
+                    ctx.campaign["id"],
+                    key,
+                    attempt["attempt"],
+                    "release_snapshot",
+                    slot,
                 )
+            if done is not None and done.response.get("id") == active["id"]:
+                self._set_attempt(attempt["id"], release_id=active["id"])
+                return True
+            # An expired release is never active, whoever held it: it does not refuse this
+            # campaign, and release_snapshot lapses it in the new release's transaction.
+            if _parse_utc(active["expires_at"]) > self.now():
+                with self.store.runner_connection() as connection:
+                    detail = holder_refusal(connection, active, ctx.campaign["org_id"])
+                raise StepFailed("release_snapshot", "step_refused", detail)
+        elif active is not None:
             if (
                 _parse_utc(active["expires_at"]) >= need_until
                 and active["classification"] == classification
@@ -4299,6 +4341,9 @@ class CampaignRunner:
                         status="failed_permanent",
                     )
                     self._settle(connection, attempt["id"], cents, basis)
+                    self._free_campaign_releases(
+                        connection, ctx.campaign["id"], "attempt_settled_while_blocked"
+                    )
                 self._set_stage(ctx, attempt["stage_key"], status="failed")
                 with self.store.runner_connection() as connection:
                     connection.execute(
@@ -4392,6 +4437,7 @@ class CampaignRunner:
                 "updated_at=? WHERE id=?",
                 (status, reason, stamp, campaign["id"]),
             )
+            self._free_campaign_releases(connection, campaign["id"], "campaign_terminal_transition")
             # ADR 0068: a claim the campaign never scored stays claimed, as spent.
             holdout.spend_open_claims(connection, campaign["id"], stamp)
             receipt, digest = build_receipt(connection, current, status)

@@ -1791,6 +1791,9 @@ class SaladStageDriver:
                 self.runner.store.record_runner_event(
                     connection, campaign, "campaign.blocked", {"reason": "estimated_overrun"}
                 )
+                self.runner._free_campaign_releases(
+                    connection, attempt["campaign_id"], "campaign_blocked"
+                )
 
     def _await_charge(self, attempt: dict[str, Any]) -> None:
         row = self.row(attempt["id"])
@@ -2010,4 +2013,7 @@ class SaladStageDriver:
                     if blocked:
                         self.runner.store.record_runner_event(
                             connection, campaign, "campaign.blocked", {"reason": "budget_overrun"}
+                        )
+                        self.runner._free_campaign_releases(
+                            connection, campaign_id, "campaign_blocked"
                         )
