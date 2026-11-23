@@ -4,9 +4,10 @@ Submission grants nothing: approval is a human-only store check, and cancel is
 reduce-only. Authorization lives in CampaignStore, not in these routes.
 """
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .api import idempotency_key
@@ -240,6 +241,48 @@ def get_campaign_window_report(
 @router.get("/campaigns/{campaign_id}/receipt")
 def get_campaign_receipt(campaign_id: str, actor: Actor, store: Campaigns) -> dict[str, Any]:
     return store.get_campaign_receipt(actor, campaign_id)
+
+
+@router.get("/campaigns/{campaign_id}/comparison")
+def get_campaign_comparison(
+    campaign_id: str,
+    actor: Actor,
+    store: Campaigns,
+    baseline: Annotated[str, Query(min_length=1, max_length=200)],
+    intervention: Annotated[list[str], Query(max_length=8)],
+    metric: Annotated[list[str], Query(max_length=16)] = [],  # noqa: B006
+    evaluation_input: Annotated[list[str], Query(max_length=8)] = [],  # noqa: B006
+    validation_metric: Annotated[list[str], Query(max_length=16)] = [],  # noqa: B006
+    test_metric: Annotated[list[str], Query(max_length=16)] = [],  # noqa: B006
+    validation_input: Annotated[list[str], Query(max_length=8)] = [],  # noqa: B006
+    test_input: Annotated[list[str], Query(max_length=8)] = [],  # noqa: B006
+    select_by: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    select_direction: Annotated[Literal["max", "min"] | None, Query()] = None,
+) -> dict[str, Any]:
+    """Recorded-number deltas between a baseline stage and intervention stages (read-only).
+
+    With select_by the intervention arm is chosen on validation metrics only; test metrics
+    are reported for the baseline and the selected arm alone.
+    """
+    if select_by is None and not (metric and evaluation_input):
+        missing = "metric" if not metric else "evaluation_input"
+        raise RequestValidationError(
+            [{"type": "missing", "loc": ("query", missing), "msg": "Field required", "input": None}]
+        )
+    return store.get_campaign_comparison(
+        actor,
+        campaign_id,
+        baseline=baseline,
+        interventions=intervention,
+        metrics=metric,
+        evaluation_inputs=evaluation_input,
+        validation_metrics=validation_metric,
+        test_metrics=test_metric,
+        validation_inputs=validation_input,
+        test_inputs=test_input,
+        select_by=select_by,
+        select_direction=select_direction,
+    )
 
 
 # Standing approvals (ADR 0042): human-only routes.

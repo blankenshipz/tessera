@@ -395,6 +395,38 @@ and it disappears the moment the decision is made, refused or expired, or the ca
 empty list means nothing awaits a person.
 Do not report a campaign as run without reading its receipt.
 
+**Comparing arms (ADR 0131).** `GET /campaigns/{id}/comparison` (404 until terminal) compares
+stages of the receipt as a baseline and one or more interventions. Query parameters:
+`baseline` (a stage key), `intervention` (a stage key, repeatable, at most 8), `metric` (a
+measurement name, repeatable, at most 16) and `evaluation_input` (an input name, repeatable, at
+least one). Each arm must have exactly one succeeded attempt, and each named evaluation input must
+have the same identity (sha256, or the snapshot identity) in every arm. The check is not limited to
+what the caller names: it also reads the approved spec the receipt's digest names, and the arms must
+declare the same `gate_evidence.split_lock_id` and consume the same held-out input
+(`evaluation.holdout.input`) with the same identity. The result gives each
+metric's baseline value and each intervention's value and delta (intervention minus baseline),
+with the receipt digests, and no decision or verdict (`scientific_validity` is `not_assessed`).
+Refusals are 409 (`comparison_refused:<code>`), one stable reason code each (missing or over-long query lists are a 422): `arms_not_distinct`, `too_many_arms`,
+`too_many_metrics`, `no_intervention`, `no_metric`, `stage_missing`, `arm_attempt_not_unique`,
+`evaluation_inputs_unnamed`, `evaluation_input_missing`, `evaluation_inputs_differ`,
+`split_lock_differs`, `spec_unavailable`, `metric_not_recorded` or `metric_not_numeric`. See
+[ADR 0131](decisions/0131-campaign-result-baseline-vs-intervention-comparison.md).
+
+**Selecting an arm on validation data (ADR 0133).** The same route has a selection mode, on when
+`select_by` is given. Metrics are split by role: `validation_metric` and `validation_input` for
+validation data, and `test_metric` and `test_input` for held-out data. `select_by` names one
+validation metric and `select_direction` is `max` or `min`. The best intervention by that metric
+is the selected arm; the baseline is the reference and is never a candidate. Validation metrics are
+reported for every arm, test metrics only for the baseline and the selected arm, and each metric
+item carries its `split_role`. The plain `metric` parameter is refused in this mode. The ADR 0131
+checks still apply: every arm must declare the same split lock, and a held-out input the approved
+spec declares (`evaluation.holdout.input`) is always a test-role input, checked across arms even
+when unnamed and refused (`validation_equals_test`) if named as validation data. Refusals are
+409 with a reason code: `split_role_missing`, `split_role_conflict`, `selection_reads_test_metric`,
+`selection_direction_missing`, `validation_equals_test` and `selection_tie` (two interventions tie
+for the best value). Selection is read-only and records nothing; it is not a decision or a gate.
+See [ADR 0133](decisions/0133-campaign-comparison-selection-split-guard.md).
+
 ## Code as an input
 
 A stage's own code is a content-addressed input, not part of an image

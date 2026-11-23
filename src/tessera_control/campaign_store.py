@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from . import campaign_heavy_guard_readout as heavy_guard_readout
 from . import campaign_hold, campaign_placement, program_budget, provider_trust, smoke_credentials
 from .approval_trust import decision_provenance, require_decision_actor
+from .campaign_comparison import ComparisonRefused, compare_arms
 from .campaign_gates import CampaignGateCommands, evaluate_unlock, record_evaluations
 from .campaign_holdout import campaign_claims, check_unclaimed
 from .campaign_io import (
@@ -1335,6 +1336,52 @@ class CampaignStore(
             }
         finally:
             connection.close()
+
+    def get_campaign_comparison(
+        self,
+        principal,
+        campaign_id,
+        *,
+        baseline,
+        interventions,
+        metrics,
+        evaluation_inputs,
+        **roles,
+    ) -> dict:
+        """Baseline-versus-intervention arithmetic on the terminal receipt (read-only).
+
+        What each arm declared (its split lock and held-out input) is read from the approved
+        spec the receipt's digest names, never from the caller."""
+        receipt = self.get_campaign_receipt(principal, campaign_id)
+        connection = _connect(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT spec_json, spec_digest FROM campaigns WHERE id=?", (campaign_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        stages = None
+        if row is not None and row["spec_digest"] == (receipt.get("receipt") or {}).get(
+            "spec_digest"
+        ):
+            try:
+                stages = json.loads(row["spec_json"]).get("stages")
+            except (ValueError, AttributeError):
+                stages = None
+        if not isinstance(stages, list):
+            raise ComparisonRefused(
+                "spec_unavailable", "The approved spec the receipt names could not be read."
+            )
+        declared = {s["key"]: s for s in stages if isinstance(s, dict) and "key" in s}
+        return compare_arms(
+            receipt,
+            baseline=baseline,
+            interventions=interventions,
+            metrics=metrics,
+            evaluation_inputs=evaluation_inputs,
+            declared=declared,
+            **roles,
+        )
 
     def get_campaign_report(self, principal, campaign_id, *, detail: bool = False) -> dict:
         """The plain-words report of one campaign, from its receipt data (campaign:read)."""
