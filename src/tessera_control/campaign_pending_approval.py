@@ -14,15 +14,31 @@ worker path or a secret.
 - ``campaign_reapproval``: the campaign is ``paused_delegation_lapsed`` and waits for a fresh
   approval of its spec digest.
 - ``salad_review``: in a non-terminal campaign, a Salad attempt in phase ``awaiting_review`` whose
-  ``plan`` or ``source_use`` decision request is still ``pending``.
+  ``plan`` or ``source_use`` decision request is still ``pending`` and not past its
+  ``expires_at`` (a request the expiry sweep has not yet marked expired is already cleared here).
+  A pre-approval clears an item only by resolving that request: this view reads the request's own
+  status and never looks at pre-approvals.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from typing import Any
 
+from .store import _parse_utc
+
 _REVIEW_COLUMNS = (("plan", "plan_decision_id"), ("source_use", "source_decision_id"))
+
+
+def _still_open(expires_at: str, now: datetime) -> bool:
+    """A pending request past its expiry can no longer be approved (``resolve_decision`` refuses
+    it) even before ``expire_decisions`` records it, so it is not awaited. An expiry that cannot
+    be read as a timestamp with an offset is refused the same way."""
+    try:
+        return _parse_utc(expires_at) > now
+    except (TypeError, ValueError):
+        return False
 
 
 def pending_human_approval(
@@ -49,6 +65,7 @@ def pending_human_approval(
         )
     if status in {"cancelled", "succeeded", "stopped", "failed"}:
         return items
+    now = datetime.now(UTC)
     rows = connection.execute(
         """SELECT a.stage_key, a.attempt, s.plan_decision_id, s.source_decision_id
         FROM campaign_salad_attempts s JOIN campaign_stage_attempts a ON a.id = s.attempt_id
@@ -62,10 +79,10 @@ def pending_human_approval(
             if decision_id is None:
                 continue
             pending = connection.execute(
-                "SELECT 1 FROM decision_requests WHERE id=? AND status='pending'",
+                "SELECT expires_at FROM decision_requests WHERE id=? AND status='pending'",
                 (decision_id,),
             ).fetchone()
-            if pending is not None:
+            if pending is not None and _still_open(pending["expires_at"], now):
                 items.append(
                     {
                         "kind": "salad_review",

@@ -156,9 +156,10 @@ Agents with the external scopes `campaign:submit|read|cancel` may submit, read a
 `tessera-mcp`: registered by default only when the credential's live scopes include
 `campaign:*`, forced with `--campaign-tools` or `--no-campaign-tools`). They cannot approve.
 `campaign:read` covers every campaign in the credential's project, not only the caller's own;
-cancel stays submitter-only, and so do the steering tools (budget reduction, release revoke,
-pause, resume, concurrency limit, stage cancel, placement steering): they act only on a campaign
-an agent caller submitted, while a human may steer any campaign in their tenant. The v2 spec, receipt, list, snapshot, output, log and budget
+for an agent, cancel stays submitter-only, and so do the steering tools (budget reduction, release revoke,
+pause, resume, concurrency limit, stage cancel, placement steering): for an agent caller they act only on a
+campaign that agent itself submitted, while a person (human principal) may cancel or steer any campaign in
+their tenant. The v2 spec, receipt, list, snapshot, output, log and budget
 tools and their scopes are in [mcp-campaign-client-path.md](mcp-campaign-client-path.md).
 Never give campaign scopes to an OpenCode harness credential: the pinned tool catalog would
 then block with `catalog_inventory_changed`.

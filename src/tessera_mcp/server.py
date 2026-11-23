@@ -359,7 +359,11 @@ def register_campaign_tools(
         cap, what the tree has committed (settled spend plus the caps of unfinished
         campaigns) and what is left for another re-run. The receipt is a separate record: use
         tessera_get_campaign_receipt once the campaign is terminal. Status is recorded
-        platform state, not evidence of a scientific result. ``placement`` lists, for each
+        platform state, not evidence of a scientific result. ``pending_human_approval`` lists
+        what a person must still decide (a campaign approval or re-approval of its spec
+        digest, or a Salad plan or source-use review) and is empty when nothing is awaited; it
+        is derived live from recorded state, so this view, not the receipt, is the
+        human-approval surface. ``placement`` lists, for each
         stage with alternate_providers, the candidate each attempt was placed on, why every
         other candidate was skipped, any steering and, while it waits, the reasons.
         ``placement_preference`` shows the operator's rules for heavy stages and, per stage a

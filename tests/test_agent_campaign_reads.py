@@ -120,7 +120,9 @@ def test_snapshot_detail_is_scoped_and_tenant_checked(world):
     missing = f"/projects/{env.project['id']}/agent-snapshots/snap_missing"
     assert _get(client, missing, "full").status_code == 404
     outsider = _other_tenant_headers(env.state)
-    assert client.get(path, headers={**outsider, **DEST}).status_code in (403, 404)
+    assert client.get(path, headers={**outsider, **DEST}).status_code == 404
+    other_agent = _other_tenant_agent(env.state, ALL)
+    assert client.get(path, headers=other_agent).status_code == 404
 
 
 def test_snapshot_detail_says_when_the_file_list_is_cut(world, monkeypatch):
@@ -128,12 +130,28 @@ def test_snapshot_detail_says_when_the_file_list_is_cut(world, monkeypatch):
     manifest = json.loads(
         env.query("SELECT manifest_json FROM source_snapshots WHERE id=?", env.snapshot_id)[0][0]
     )
-    monkeypatch.setattr(agent_campaign_reads, "_ROW_CAP", 1)
     path = f"/projects/{env.project['id']}/agent-snapshots/{env.snapshot_id}"
+    # Give the snapshot more files than the cap so the truncated branch really runs.
+    first = manifest["entries"][0]
+    manifest["entries"] = [
+        {**first, "relative_path": f"extra/file_{i}.txt"} for i in range(3)
+    ] + manifest["entries"]
+    env.execute(
+        "UPDATE source_snapshots SET manifest_json=? WHERE id=?",
+        json.dumps(manifest),
+        env.snapshot_id,
+    )
+    total = len(manifest["entries"])
+    assert total > 1
+    uncut = _get(client, path, "full").json()
+    assert uncut["truncated"] is False and len(uncut["files"]) == total
+    cap = 1
+    assert total > cap
+    monkeypatch.setattr(agent_campaign_reads, "_ROW_CAP", cap)
     body = _get(client, path, "full").json()
-    assert len(body["files"]) == 1
-    assert body["file_count"] == len(manifest["entries"])
-    assert body["truncated"] is (len(manifest["entries"]) > 1)
+    assert body["truncated"] is True
+    assert len(body["files"]) == cap
+    assert body["file_count"] == total
 
 
 def test_destination_header_is_required_for_external_agents(world):

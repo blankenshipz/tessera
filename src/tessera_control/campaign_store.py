@@ -1233,6 +1233,12 @@ class CampaignStore(
                     (campaign_id,),
                 )
             ]
+            if self._external_scope(connection, actor):
+                # An agent sees what was approved (digest, class, expiry, delegation) but not
+                # who approved it: the same projection the gate decisions use. The receipt
+                # (the owner's audit record, one digest) is unchanged.
+                for approval in approvals:
+                    approval.pop("approving_principal_id", None)
             stages = [
                 dict(row)
                 for row in connection.execute(

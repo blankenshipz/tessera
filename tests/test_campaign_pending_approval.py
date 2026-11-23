@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 from campaign_fixture import Env
 
@@ -40,8 +41,9 @@ def test_a_lapsed_approval_awaits_a_reapproval_and_it_clears_after_one(tmp_path)
     assert _view(env, campaign) == []
 
 
-def _salad_review(env, campaign, status="pending"):
+def _salad_review(env, campaign, status="pending", expires_in=timedelta(hours=1)):
     """A Salad attempt waiting at its plan review, with a decision request in ``status``."""
+    expires_at = (datetime.now(UTC) + expires_in).isoformat().replace("+00:00", "Z")
     db = sqlite3.connect(env.state / "tessera.sqlite3")  # foreign keys off: rows only
     try:
         db.execute(
@@ -58,8 +60,8 @@ def _salad_review(env, campaign, status="pending"):
             "INSERT INTO decision_requests (id, org_id, project_id, kind, scope_json, "
             "scope_digest, reviewer_principal_id, requester_principal_id, status, revision, "
             "expires_at, priority, created_at) VALUES ('dec1', 'o', 'p', 'spending', '{}', 'd', "
-            "'r', 'q', ?, 1, 'later', 1, 'now')",
-            (status,),
+            "'r', 'q', ?, 1, ?, 1, 'now')",
+            (status, expires_at),
         )
         db.commit()
     finally:
@@ -79,7 +81,7 @@ def test_a_pending_salad_review_is_listed_and_clears_when_decided_or_refused(tmp
         "awaiting": "a person's decision on the plan review",
         "decision_request_id": "dec1",
     }
-    for decided in ("approved", "rejected", "expired"):
+    for decided in ("approved", "rejected"):
         env.execute("UPDATE decision_requests SET status=? WHERE id='dec1'", decided)
         assert _view(env, campaign) == [], decided
 
@@ -95,3 +97,31 @@ def test_the_derivation_reads_state_only_and_stores_nothing(tmp_path):
         first = pending_human_approval(connection, row)
         assert first == pending_human_approval(connection, row)  # stable, no side effects
     assert env.query("SELECT count(*) AS n FROM sqlite_master")[0]["n"] == before
+
+
+def test_a_pending_request_with_a_future_expiry_is_listed(tmp_path):
+    env = Env(tmp_path)
+    campaign, _ = env.approved()
+    _salad_review(env, campaign, expires_in=timedelta(minutes=5))
+    assert [i["decision_request_id"] for i in _view(env, campaign)] == ["dec1"]
+
+
+def test_view_only_a_pending_request_past_its_expiry_is_not_listed(tmp_path):
+    # View-only check on a hand-built row (no real project/org). The real
+    # InteractionStore.expire_decisions sweep is exercised in
+    # test_campaign_pending_approval_runner.py against rows the runner wrote.
+    env = Env(tmp_path)
+    campaign, _ = env.approved()
+    _salad_review(env, campaign, expires_in=timedelta(minutes=-1))
+    assert env.query("SELECT status FROM decision_requests WHERE id='dec1'")[0]["status"] == (
+        "pending"
+    )
+    assert _view(env, campaign) == []
+
+
+def test_an_unreadable_expiry_is_not_listed(tmp_path):
+    env = Env(tmp_path)
+    campaign, _ = env.approved()
+    _salad_review(env, campaign)
+    env.execute("UPDATE decision_requests SET expires_at='later' WHERE id='dec1'")
+    assert _view(env, campaign) == []
