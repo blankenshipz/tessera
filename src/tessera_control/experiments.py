@@ -2506,6 +2506,29 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             command,
         )
 
+    @staticmethod
+    def _cited_attempt_state(
+        connection: sqlite3.Connection, attempt_id: str, admitted: bool
+    ) -> dict[str, Any]:
+        """Operational outcome (None = unresolved) and result assessment of one attempt."""
+        table = (
+            "research_experiment_admitted_attempts" if admitted else "research_experiment_attempts"
+        )
+        row = connection.execute(
+            f"SELECT outcome FROM {table} WHERE id=?", (attempt_id,)
+        ).fetchone()
+        assessment = None
+        if admitted:
+            found = connection.execute(
+                "SELECT assessment FROM research_attempt_result_assessments WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            assessment = found["assessment"] if found is not None else None
+        return {
+            "outcome": row["outcome"] if row is not None else None,
+            "result_assessment": assessment,
+        }
+
     def _validate_evidence(
         self, connection: sqlite3.Connection, experiment_id: str, evidence: list[dict[str, Any]]
     ) -> list[tuple[str, str, str | None, str | None, bool, str | None]]:
@@ -2522,6 +2545,16 @@ class ExperimentStore(EvidenceIngestMixin, Store):
             ).fetchone()
             if legacy is None and admitted is None:
                 raise NotFound("Cited attempt was not found.")
+            if citation.get("stance") in ("supports", "opposes"):
+                state = self._cited_attempt_state(
+                    connection, citation["attempt_id"], admitted is not None
+                )
+                if state["outcome"] != "succeeded" or state["result_assessment"] == "inconclusive":
+                    raise Conflict(
+                        "A failed, cancelled, unknown, unresolved or inconclusive run is not "
+                        "evidence for or against the idea: cite it without a stance as context, "
+                        "or cite a succeeded run (assessed positive or negative)."
+                    )
             artifact_table = (
                 "research_admitted_attempt_artifacts"
                 if admitted is not None
@@ -2927,16 +2960,30 @@ class ExperimentStore(EvidenceIngestMixin, Store):
         self, connection: sqlite3.Connection, row: dict[str, Any]
     ) -> dict[str, Any]:
         result = dict(row)
+        # attempt_kind/attempt_outcome/result_assessment/run_failed keep a failed run
+        # distinct from a valid negative result.  result_assessment is the bare string
+        # (positive|negative|inconclusive) for admitted attempts, else None.  An
+        # admitted attempt_outcome of None means the run is unresolved.
         result["evidence"] = [
             dict(item)
             for item in connection.execute(
-                """SELECT attempt_id,artifact_id,measurement_id,stance FROM research_conclusion_evidence
-                WHERE conclusion_id=? UNION ALL SELECT attempt_id,artifact_id,measurement_id,stance
-                FROM research_admitted_conclusion_evidence WHERE conclusion_id=?
+                """SELECT ce.attempt_id,ce.artifact_id,ce.measurement_id,ce.stance,
+                  'legacy' AS attempt_kind,a.outcome AS attempt_outcome,NULL AS result_assessment
+                FROM research_conclusion_evidence ce
+                LEFT JOIN research_experiment_attempts a ON a.id=ce.attempt_id
+                WHERE ce.conclusion_id=?
+                UNION ALL SELECT ce.attempt_id,ce.artifact_id,ce.measurement_id,ce.stance,
+                  'admitted' AS attempt_kind,a.outcome AS attempt_outcome,ra.assessment
+                FROM research_admitted_conclusion_evidence ce
+                LEFT JOIN research_experiment_admitted_attempts a ON a.id=ce.attempt_id
+                LEFT JOIN research_attempt_result_assessments ra ON ra.attempt_id=ce.attempt_id
+                WHERE ce.conclusion_id=?
                 ORDER BY attempt_id,artifact_id,measurement_id""",
                 (row["id"], row["id"]),
             )
         ]
+        for item in result["evidence"]:
+            item["run_failed"] = item["attempt_outcome"] in ("failed", "cancelled", "unknown")
         result["scientific_validity"] = "not_assessed"
         result["design_snapshot"] = (
             self._design_response(connection, row["experiment_id"], row["design_revision"])

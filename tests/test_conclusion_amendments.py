@@ -39,7 +39,7 @@ def _reviewed_conclusion(tmp_path: Path) -> tuple[Path, dict, ExperimentStore, d
             "expected_variant_revision": baseline["revision"],
             "provenance_kind": "human_reported_observation",
             "human_observation": "A human recorded the bounded comparison observation.",
-            "outcome": "inconclusive",
+            "outcome": "succeeded",
             "reason": "The reviewed interpretation remains conditional.",
         },
     )
