@@ -386,6 +386,53 @@ def test_cancel_before_any_claim_settles_zero(tmp_path):
     )
 
 
+def test_the_executor_sees_and_renews_its_lease_through_review_and_route_approval(tmp_path):
+    from test_execution import _worker
+
+    from tessera_control.campaign_salad_executor import LEASE_HELD_PHASES, StoreControl
+
+    world = SaladWorld(tmp_path)
+    world.to_awaiting_review()
+    control = StoreControl(world.env.state, world.worker)
+    attempt = world.attempt()["id"]
+    row = world.salad()
+    lease = (row["lease_id"], row["epoch"])
+
+    def listed():
+        return [(w["attempt_id"], w["phase"]) for w in control.work()]
+
+    def expires_at():
+        return world.row("SELECT expires_at FROM execution_leases WHERE id=?", lease[0])[
+            "expires_at"
+        ]
+
+    # The real store renews the lease while the human reviews are open.
+    assert listed() == [(attempt, "awaiting_review")]
+    before = expires_at()
+    world.env.execute("UPDATE execution_leases SET renewed_at='marker' WHERE id=?", lease[0])
+    control.heartbeat()
+    control.renew(*lease)
+    assert expires_at() >= before
+    renewed = world.row("SELECT renewed_at FROM execution_leases WHERE id=?", lease[0])
+    assert renewed["renewed_at"] != "marker"
+    # Every phase in which the executor holds the lease is listed to it.
+    for phase in sorted(LEASE_HELD_PHASES) + ["route_started", "executing"]:
+        world.env.execute(
+            "UPDATE campaign_salad_attempts SET phase=? WHERE attempt_id=?", phase, attempt
+        )
+        assert listed() == [(attempt, phase)]
+    # ... never a finished one, and never to another worker principal.
+    world.env.execute(
+        "UPDATE campaign_salad_attempts SET phase='outcome_recorded' WHERE attempt_id=?", attempt
+    )
+    assert listed() == []
+    world.env.execute(
+        "UPDATE campaign_salad_attempts SET phase='awaiting_review' WHERE attempt_id=?", attempt
+    )
+    other = _worker(world.env.state, world.env.owner, world.env.project["id"], "other-worker")
+    assert StoreControl(world.env.state, other).work() == []
+
+
 def test_a_salad_grant_is_leasable_only_while_it_awaits_a_lease(tmp_path):
     from test_execution import _worker
 

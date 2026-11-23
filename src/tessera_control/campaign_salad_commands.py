@@ -276,7 +276,11 @@ class SaladWorkerCommands:
         )
 
     def list_salad_work(self, worker) -> list[dict[str, Any]]:
-        """Read-only: this worker's attempts awaiting a lease or holding a started route."""
+        """Read-only: this worker's attempts awaiting a lease, holding one, or executing.
+
+        Every phase in which the executor holds the lease is listed (review and route approval
+        included) so it can keep the lease renewed until the route has run.
+        """
         connection = _connect(self.database_path)
         try:
             rows = connection.execute(
@@ -290,7 +294,8 @@ class SaladWorkerCommands:
                   ON ss.campaign_id = a.campaign_id AND ss.stage_key = a.stage_key
                 JOIN execution_grants g ON g.id = a.grant_id
                 WHERE c.org_id = ? AND g.worker_principal_id = ?
-                AND sa.phase IN ('awaiting_lease','leased','route_started','executing')
+                AND sa.phase IN ('awaiting_lease','leased','awaiting_review','reviewed',
+                    'capability_ready','route_proposed','route_started','executing')
                 AND c.status IN ('running','stopping','cancel_requested')
                 ORDER BY sa.updated_at, sa.attempt_id""",
                 (worker["org_id"], worker["id"]),

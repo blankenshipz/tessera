@@ -27,6 +27,7 @@ from tessera_control.campaign_salad_executor import (
 )
 from tessera_control.salad_campaign_profiles import SaladCampaignProfile, derive_selection
 from tessera_control.salad_workload_contract import WorkloadContractV1
+from tessera_control.store import Conflict
 
 WORKER = "principal_w"
 PLAN = {"budget_cents": 100, "max_duration_seconds": 600}
@@ -116,6 +117,10 @@ class FakeControl:
         self.uploaded = None
         self.final = None
         self.final_error = None
+        self.heartbeat_error = None
+        # None: the registry never refuses; False: the worker's last heartbeat is stale and
+        # lease authority is refused (as the store's ``require_ready_worker`` does) until one.
+        self.worker_fresh = None
 
     def _c(self, name, *args):
         self.calls.append((name, *args))
@@ -131,6 +136,8 @@ class FakeControl:
 
     def acquire_lease(self, grant_id, key):
         self._c("acquire", grant_id)
+        if self.worker_fresh is False:
+            raise Conflict("Worker is disconnected and cannot receive lease authority.")
         return dict(id="lease_1", epoch=3)
 
     def package(self, lease_id, epoch, admitted_attempt_id, key):
@@ -145,6 +152,10 @@ class FakeControl:
 
     def heartbeat(self):
         self._c("heartbeat")
+        if self.heartbeat_error:
+            raise self.heartbeat_error
+        if self.worker_fresh is False:
+            self.worker_fresh = True
 
     def renew(self, lease_id, epoch):
         self._c("renew", lease_id, epoch)
@@ -247,6 +258,7 @@ def test_lease_package_and_record_for_a_pending_grant(tmp_path):
     actions = h.executor.run_once()
     assert [a["action"] for a in actions] == ["packaged"]
     assert h.control.calls == [
+        ("heartbeat",),
         ("acquire", "grant_1"),
         ("package", "lease_1", 3, "adm_1"),
         (
@@ -255,6 +267,55 @@ def test_lease_package_and_record_for_a_pending_grant(tmp_path):
             dict(operation_id=OPERATION, lease_id="lease_1", epoch=3, package_digest="d" * 64),
         ),
     ]
+
+
+def test_a_stale_worker_heartbeats_once_before_its_first_lease(tmp_path):
+    h = Harness(tmp_path)
+    h.control.worker_fresh = False
+    h.control.items = [
+        item("awaiting_lease", route_id=None, operation_id=None),
+        item("awaiting_lease", attempt_id="att_2", route_id=None, operation_id=None),
+    ]
+    assert [a["action"] for a in h.executor.run_once()] == ["packaged", "packaged"]
+    # One heartbeat per pass, sent before lease authority is asked for.
+    assert h.names() == ["heartbeat", "acquire", "package", "record_package"] + [
+        "acquire",
+        "package",
+        "record_package",
+    ]
+
+
+def test_a_heartbeat_failure_is_noted_and_does_not_end_the_pass(tmp_path):
+    h = Harness(tmp_path)
+    h.control.heartbeat_error = RuntimeError("registry /private/path down")
+    h.control.items = [item("awaiting_lease", route_id=None, operation_id=None)]
+    assert [(a["action"], a["detail"]) for a in h.executor.run_once()] == [
+        ("heartbeat_failed", "RuntimeError"),
+        ("packaged", OPERATION),
+    ]
+    # A stale worker is still refused by the store; the refusal is noted, nothing faked.
+    h = Harness(tmp_path / "b")
+    h.control.worker_fresh = False
+    h.control.heartbeat_error = RuntimeError("down")
+    h.control.items = [item("awaiting_lease", route_id=None, operation_id=None)]
+    assert [(a["action"], a["detail"]) for a in h.executor.run_once()] == [
+        ("heartbeat_failed", "RuntimeError"),
+        ("error", "Conflict"),
+    ]
+    assert h.names() == ["heartbeat", "acquire"]
+    # The next pass heartbeats again and leases.
+    h.control.heartbeat_error = None
+    assert [a["action"] for a in h.executor.run_once()] == ["packaged"]
+
+
+def test_a_leased_attempt_keeps_its_keepalive_beside_a_new_lease(tmp_path):
+    h = Harness(tmp_path)
+    h.control.items = [
+        item("leased"),
+        item("awaiting_lease", attempt_id="att_2", route_id=None, operation_id=None),
+    ]
+    h.executor.run_once()
+    assert h.names() == ["heartbeat", "renew", "heartbeat", "acquire", "package", "record_package"]
 
 
 def test_no_lease_when_grant_is_not_pending_or_plan_budget_exceeds_profile(tmp_path):
@@ -439,6 +500,59 @@ def test_leased_attempt_is_kept_alive_each_pass(tmp_path):
     h.executor.run_once()
     h.executor.run_once()
     assert h.names() == ["heartbeat", "renew"] * 2
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["leased", "awaiting_review", "reviewed", "capability_ready", "route_proposed"],
+)
+def test_every_phase_holding_the_lease_before_the_route_is_kept_alive(tmp_path, phase):
+    h = Harness(tmp_path)
+    h.control.items = [item(phase, route_id=None)]
+    assert h.executor.run_once() == []
+    assert h.control.calls == [("heartbeat",), ("renew", "lease_1", 3)]
+    assert h.runs == []
+
+
+def test_a_route_started_attempt_is_kept_alive_before_it_runs(tmp_path):
+    h = Harness(tmp_path)
+    h.control.items = [item("route_started")]
+    h.executor.run_once()
+    assert h.names()[:2] == ["heartbeat", "renew"]
+    assert len(h.runs) == 1
+
+
+@pytest.mark.parametrize("phase", ["awaiting_review", "route_proposed"])
+def test_a_refused_renewal_during_review_fences_once_and_never_runs(tmp_path, phase):
+    h = Harness(tmp_path)
+    h.control.renew_error = Conflict("Remote execution lease/epoch is fenced.")
+    h.control.items = [item(phase, route_id=None)]
+    assert [(a["action"], a["detail"]) for a in h.executor.run_once()] == [
+        ("lease_renewal_refused", "Conflict")
+    ]
+    h.executor.run_once()
+    assert h.names().count("renew") == 1
+    # The fence holds when the runner moves the attempt on to a started route.
+    h.control.items = [item("route_started")]
+    assert [a["action"] for a in h.executor.run_once()] == ["fenced_no_run"]
+    assert h.names().count("renew") == 1 and h.runs == []
+
+
+def test_a_lease_held_through_a_multi_pass_review_wait_is_renewed_every_pass(tmp_path):
+    h = Harness(tmp_path)
+    h.control.items = [item("awaiting_lease", route_id=None, operation_id=None)]
+    assert [a["action"] for a in h.executor.run_once()] == ["packaged"]
+    phases = ["leased"] + ["awaiting_review"] * 4 + ["reviewed", "capability_ready"]
+    phases += ["route_proposed"] * 2
+    for phase in phases:
+        h.control.items = [item(phase, route_id=None)]
+        h.executor.run_once()
+    renewals = [c for c in h.control.calls if c[0] == "renew"]
+    assert renewals == [("renew", "lease_1", 3)] * len(phases)
+    assert h.executor.fenced == {}
+    h.control.items = [item("route_started")]
+    h.executor.run_once()
+    assert len(h.runs) == 1
 
 
 def test_executing_attempt_after_restart_finishes_only_from_a_receipt_on_disk(tmp_path):

@@ -263,6 +263,14 @@ def read_receipt(receipt_dir: Path) -> dict[str, Any] | None:
     return value
 
 
+# Phases after packaging and before the route starts: the executor holds the lease while the
+# runner gathers reviews and the route approval, so each pass keeps it alive (``_keepalive``).
+# ``route_started`` is kept alive too, before it runs; ``executing`` goes to ``_resume``.
+LEASE_HELD_PHASES = frozenset(
+    {"leased", "awaiting_review", "reviewed", "capability_ready", "route_proposed"}
+)
+
+
 def _key(step: str, attempt_id: str) -> str:
     return f"salad-exec-{step}-{hashlib.sha256(attempt_id.encode()).hexdigest()[:40]}"
 
@@ -298,12 +306,15 @@ class SaladCampaignExecutor:
         self._leases: dict[str, tuple[str, int]] = {}
         # Attempts whose lease renewal was refused: never retried past the fence.
         self.fenced: dict[str, str] = {}
+        # Whether this pass already sent its pre-lease registry heartbeat.
+        self._heartbeat_sent = False
         self.log: list[dict[str, Any]] = []
 
     # -- one pass ---------------------------------------------------------------------------
 
     def run_once(self) -> list[dict[str, Any]]:
         start = len(self.log)
+        self._heartbeat_sent = False
         try:
             items = self.control.work()
         except Exception as error:
@@ -322,7 +333,7 @@ class SaladCampaignExecutor:
                     self._execute(item)
                 elif item["phase"] == "executing":
                     self._resume(item)
-                elif item["phase"] == "leased":
+                elif item["phase"] in LEASE_HELD_PHASES:
                     self._keepalive(item)
             except Exception as error:
                 # Class name only: messages can carry identifiers from provider paths.
@@ -352,6 +363,7 @@ class SaladCampaignExecutor:
             self._note("refused_budget", attempt, "plan_budget_above_profile")
             return
         if attempt not in self._leases:
+            self._heartbeat_before_lease(attempt)
             lease = self.control.acquire_lease(grant, _key("lease", attempt))
             self._leases[attempt] = (lease["id"], lease["epoch"])
         lease_id, epoch = self._leases[attempt]
@@ -369,6 +381,22 @@ class SaladCampaignExecutor:
             ),
         )
         self._note("packaged", attempt, package["operation_id"])
+
+    def _heartbeat_before_lease(self, attempt_id: str) -> None:
+        """At most one registry heartbeat per pass, sent only right before asking for a lease.
+
+        The store gives lease authority only to a worker seen within its heartbeat window, and
+        ``_keepalive`` heartbeats only for attempts already leased, so a fresh or long-idle
+        executor would otherwise be refused every pass. A failure is noted (class name only) and
+        is not fatal: the lease request still goes out and the store decides.
+        """
+        if self._heartbeat_sent:
+            return
+        self._heartbeat_sent = True
+        try:
+            self.control.heartbeat()
+        except Exception as error:
+            self._note("heartbeat_failed", attempt_id, type(error).__name__)
 
     def _lease_for(self, item: dict[str, Any]) -> tuple[str, int] | None:
         attempt = item["attempt_id"]
