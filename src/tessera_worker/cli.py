@@ -212,7 +212,13 @@ def _poll(arguments: argparse.Namespace) -> int:
     )
     print(
         json.dumps(
-            {"cycles": cycles, "errors": poller.errors, "grants": poller.grants_run},
+            {
+                "abandoned": poller.abandoned,
+                "cycles": cycles,
+                "errors": poller.errors,
+                "grants": poller.grants_run,
+                "refused": poller.refusals,
+            },
             sort_keys=True,
         )
     )

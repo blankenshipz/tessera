@@ -379,6 +379,15 @@ one unanswered request cannot lapse the lease (the worker refuses a larger value
 `renew_after_seconds` lowers the ceiling accordingly). Each observation report is also capped by
 the lease time left minus one renewal interval, never below 1 s.
 
+A grant the poller is recovering (an interrupted run, or one whose runtime descriptor is on
+disk) that control permanently refuses (an HTTP 4xx other than 401/403/408/425/429, such as a
+409 for a grant control already reconciled) is retried after `poll_seconds` doubling up to
+15 minutes, with jitter, not every cycle. After 5 such refusals in a row an admitted grant gets a
+local `abandoned.json` (reason `control_refused_recovery`, the HTTP status and timestamps) and is
+no longer recovered; this is not a result and records no outcome. Delete the marker to resume
+recovery. Transient failures (no status, 5xx, 408/425/429) are retried without a bound. The
+poller's exit summary counts `refused` and `abandoned`.
+
 `memory_bytes` and `scratch_bytes` are optional, operator-owned limits applied to every
 container this poller runs (memory, with swap equal to it, and the `/work` tmpfs). A plan
 cannot raise them. Unset keeps the defaults of 256 MiB and 16 MiB; accepted ranges are

@@ -116,7 +116,20 @@ class FakeService:
         return {"state": "collected", "quarantined": True}
 
 
-def _poller(tmp_path, grants, *, max_grants=None, fail=None):
+class FakeClock:
+    """Monotonic clock advanced only by the poller's own sleep."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def _poller(tmp_path, grants, *, max_grants=None, fail=None, clock=None):
     credential = tmp_path / "cred"
     credential.write_text("worker-token")
     credential.chmod(0o600)
@@ -134,7 +147,8 @@ def _poller(tmp_path, grants, *, max_grants=None, fail=None):
         config,
         channel=channel,
         service_factory=lambda cfg: FakeService(cfg, log, fail),
-        sleep=lambda _: None,
+        sleep=clock.sleep if clock else lambda _: None,
+        **({"clock": clock, "jitter": lambda: 0.0} if clock else {}),
     )
     return poller, log, channel
 
@@ -240,10 +254,88 @@ def test_poller_resumes_leased_grant_absent_from_listing_without_descriptor(tmp_
 
 
 def test_poller_permanent_refusal_of_resumed_grant_gives_up(tmp_path):
-    poller, log, _ = _poller(tmp_path, [], fail=ControlChannelError("conflict", 409))
+    clock = FakeClock()
+    poller, log, _ = _poller(tmp_path, [], fail=ControlChannelError("conflict", 409), clock=clock)
     directory = tmp_path / "ws" / "grants" / "gl"
     directory.mkdir(parents=True)
     directory.chmod(0o700)
     DevelopmentGrantPoller._remember_image(directory, IMAGE)
-    report = poller.run(max_cycles=10)
-    assert len(log) == 5 and report["errors"] == 5
+    report = poller.run(max_cycles=60)
+    assert len(log) == 5 and report["errors"] == 5 and report["refused"] == 5
+    # Without a descriptor the existing failure bound applies; no abandoned marker.
+    assert report["abandoned"] == 0 and not (directory / "abandoned.json").exists()
+
+
+def _descriptor_grant(tmp_path, grant_id="gd"):
+    directory = tmp_path / "ws" / "grants" / grant_id
+    (directory / "workspace" / "runtime").mkdir(parents=True)
+    directory.chmod(0o700)
+    (directory / "workspace").chmod(0o700)
+    (directory / "workspace" / "runtime" / "runtime.json").write_text("{}")
+    DevelopmentGrantPoller._remember_image(directory, IMAGE)
+    return directory
+
+
+def test_poller_backs_off_and_abandons_descriptor_grant_control_refuses(tmp_path):
+    # Control already reconciled the grant and answers 409 on the package path.
+    clock = FakeClock()
+    refusal = ControlChannelError("control rejected request", 409)
+    poller, log, _ = _poller(tmp_path, [], clock=clock)
+    directory = _descriptor_grant(tmp_path)
+    attempts_at = []
+
+    def service(cfg):
+        attempts_at.append(clock.now)
+        return FakeService(cfg, log, refusal)
+
+    poller.service_factory = service
+
+    report = poller.run(max_cycles=7)  # 12 s of 2 s cycles: attempts at 0, 2 and 6 s
+    assert len(log) == 3, "a refused grant is not retried every cycle"
+    assert report["refused"] == 3 and report["errors"] == 3 and report["abandoned"] == 0
+    assert "grant_id" not in json.dumps({k: report[k] for k in ("refused", "abandoned")})
+
+    report = poller.run(max_cycles=200)
+    assert len(log) == 5 and report["refused"] == 2 and report["abandoned"] == 1
+    gaps = [later - earlier for earlier, later in zip(attempts_at, attempts_at[1:], strict=False)]
+    assert gaps == [2.0, 4.0, 8.0, 16.0]
+    marker = json.loads((directory / "abandoned.json").read_text())
+    assert marker["reason"] == "control_refused_recovery" and marker["control_status"] == 409
+    assert marker["refusals"] == 5 and marker["first_refused_at"] <= marker["abandoned_at"]
+    assert stat.S_IMODE((directory / "abandoned.json").stat().st_mode) == 0o600
+    assert not (directory / "result.json").exists(), "no fabricated outcome"
+    assert poller._recoverable() == []
+
+
+def test_refusal_backoff_is_capped_and_jittered(tmp_path):
+    clock = FakeClock()
+    poller, _, _ = _poller(tmp_path, [], clock=clock)
+    poller.jitter = lambda: 1.0
+    directory = _descriptor_grant(tmp_path)
+    for _ in range(3):
+        poller._refused(directory, "gd", 409)
+    assert poller._retry_at["gd"] == clock.now + 8.0 * 1.25
+    poller._refusals["gd"] = (20, "t")
+    (directory / "workspace" / "runtime" / "runtime.json").unlink()
+    poller._refused(directory, "gd", 409)
+    assert poller._retry_at["gd"] == clock.now + 900.0
+
+
+def test_transient_failure_of_descriptor_grant_is_retried_without_bound(tmp_path):
+    clock = FakeClock()
+    poller, log, _ = _poller(
+        tmp_path, [], fail=ControlChannelError("control rejected request", 503), clock=clock
+    )
+    directory = _descriptor_grant(tmp_path)
+    report = poller.run(max_cycles=12)
+    assert len(log) == 12 and report["refused"] == 0 and report["abandoned"] == 0
+    assert not (directory / "abandoned.json").exists()
+    assert poller._recoverable() == ["gd"]
+
+
+def test_abandoned_grant_is_never_recovered_or_listed(tmp_path):
+    poller, log, _ = _poller(tmp_path, [_grant("gd")])
+    directory = _descriptor_grant(tmp_path)
+    (directory / "abandoned.json").write_text("{}")
+    report = poller.run(max_cycles=3)
+    assert log == [] and report["grants"] == [] and poller._recoverable() == []

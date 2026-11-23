@@ -9,22 +9,26 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import scratch_limits as limits
 from .control_channel import (
     DEFAULT_TIMEOUT_SECONDS,
+    ControlChannelError,
     HttpControlChannel,
     classify_control_failure,
     validate_operator_timeout,
 )
 from .cpu import CpuError, _docker
+from .daemon import backoff_delay
 from .docker_network_pool import DEFAULT_PREFIX_LENGTH, DockerNetworkPool
 from .service import (
     DevelopmentWorkerConfig,
@@ -40,6 +44,13 @@ from .supervisor import SupervisorError
 
 _GRANT_ID = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _MAX_CONSECUTIVE_FAILURES = 5
+# A recovering grant that control permanently refuses (an HTTP 4xx other than
+# 401/403/408/425/429, or an authority-gone 403) waits poll_seconds doubling up to this cap,
+# with jitter, before the next attempt; after _MAX_CONSECUTIVE_FAILURES such refusals in a
+# row an admitted (descriptor) grant is marked abandoned locally and no longer recovered.
+_REFUSAL_BACKOFF_MAX_SECONDS = 900.0
+ABANDONED_MARKER = "abandoned.json"
+ABANDONED_SCHEMA = "tessera.worker.grant-abandoned.v1"
 LIST_PATH = "/worker/execution-grants"
 
 
@@ -259,6 +270,8 @@ class DevelopmentGrantPoller:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         prune_networks: Callable[[DockerNetworkPool], list[str]] | None = None,
+        jitter: Callable[[], float] = random.random,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.config = config
         self.root = _private_dir(Path(config.workspace_root))
@@ -274,13 +287,20 @@ class DevelopmentGrantPoller:
         self.service_factory = service_factory or self._default_service
         self.sleep = sleep
         self.clock = clock
+        self.jitter = jitter
+        self.wall_clock = wall_clock
         # grant id -> clock time before which its undelivered observation is not retried
         # (ADR 0054). In memory only: the durable backoff lives in the runtime's outbox, so a
         # restarted poller starts here empty and the outbox still refuses an early resend.
         self._retry_at: dict[str, float] = {}
         self._failures: dict[str, int] = {}
+        # grant id -> (consecutive permanent control refusals, wall time of the first one).
+        # In memory only: a restarted poller counts again, still with backoff.
+        self._refusals: dict[str, tuple[int, str]] = {}
         self.grants_run = 0
         self.errors = 0
+        self.refusals = 0
+        self.abandoned = 0
         self.pruned_networks: list[str] = []
         self._network_pool = network_pool_from_config(
             config.docker_network_pool, config.docker_network_prefix_length
@@ -338,7 +358,16 @@ class DevelopmentGrantPoller:
             )
             if not transient:
                 self._failures[grant_id] = self._failures.get(grant_id, 0) + 1
-            return {"state": "error", "detail": safe_error_detail(error, self.root)}
+            failure: dict[str, Any] = {
+                "state": "error",
+                "detail": safe_error_detail(error, self.root),
+            }
+            if isinstance(error, ControlChannelError) and (
+                classify_control_failure(error) == "permanent"
+            ):
+                failure.update(self._refused(directory, grant_id, error.status))
+            return failure
+        self._refusals.pop(grant_id, None)
         if outcome.get("delivery_pending") is True:
             # An undelivered observation is not a verdict: record no result, so the grant is
             # recovered after the backoff and the same observation is delivered.
@@ -349,15 +378,56 @@ class DevelopmentGrantPoller:
         self._failures.pop(grant_id, None)
         return outcome
 
+    def _refused(self, directory: Path, grant_id: str, status: int | None) -> dict[str, Any]:
+        """Back off a permanent control refusal; abandon an admitted grant after the bound.
+
+        Control refusing the lease/package path (e.g. 409 for a grant it already
+        reconciled) is not a verdict on the operation, so no ``result.json`` is written.
+        After the bound, an admitted grant gets a local ``abandoned.json`` marker that
+        only stops this worker's recovery; a grant without a descriptor is already
+        bounded by ``_failures``.
+        """
+        count, first = self._refusals.get(grant_id, (0, ""))
+        count += 1
+        now = self.wall_clock().isoformat()
+        first = first or now
+        self._refusals[grant_id] = (count, first)
+        descriptor = (directory / "workspace" / "runtime" / "runtime.json").exists()
+        if descriptor and count >= _MAX_CONSECUTIVE_FAILURES:
+            self._write_marker(
+                directory,
+                ABANDONED_MARKER,
+                {
+                    "schema": ABANDONED_SCHEMA,
+                    "reason": "control_refused_recovery",
+                    "control_status": status,
+                    "refusals": count,
+                    "first_refused_at": first,
+                    "abandoned_at": now,
+                },
+            )
+            self._refusals.pop(grant_id, None)
+            self._retry_at.pop(grant_id, None)
+            return {"refused": True, "control_status": status, "abandoned": True}
+        delay = backoff_delay(
+            count, self.config.poll_seconds, _REFUSAL_BACKOFF_MAX_SECONDS, self.jitter()
+        )
+        self._retry_at[grant_id] = self.clock() + delay
+        return {"refused": True, "control_status": status}
+
     @staticmethod
     def _write_result(directory: Path, outcome: dict[str, Any]) -> None:
-        temporary = directory / "result.json.tmp"
+        DevelopmentGrantPoller._write_marker(directory, "result.json", outcome)
+
+    @staticmethod
+    def _write_marker(directory: Path, name: str, document: dict[str, Any]) -> None:
+        temporary = directory / f"{name}.tmp"
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w") as target:
-            json.dump(outcome, target, sort_keys=True)
+            json.dump(document, target, sort_keys=True)
             target.flush()
             os.fsync(target.fileno())
-        os.replace(temporary, directory / "result.json")
+        os.replace(temporary, directory / name)
 
     def _recoverable(self) -> list[str]:
         base = self.root / "grants"
@@ -370,9 +440,11 @@ class DevelopmentGrantPoller:
                 and entry.is_dir()
                 and not entry.is_symlink()
                 and not (entry / "result.json").exists()
+                and not (entry / ABANDONED_MARKER).exists()
                 and self._retry_at.get(entry.name, 0.0) <= self.clock()
                 and (
-                    # An admitted operation is always reconciled; a leased grant that
+                    # An admitted operation is reconciled until control permanently
+                    # refuses it enough times (then abandoned.json); a leased grant that
                     # never reached its descriptor (control outage) is resumed until
                     # control gives a permanent refusal enough times.
                     (entry / "workspace" / "runtime" / "runtime.json").exists()
@@ -399,7 +471,13 @@ class DevelopmentGrantPoller:
             return None
 
     def run(self, max_cycles: int | None = None) -> dict[str, Any]:
-        report: dict[str, Any] = {"cycles": 0, "grants": [], "errors": 0}
+        report: dict[str, Any] = {
+            "cycles": 0,
+            "grants": [],
+            "errors": 0,
+            "refused": 0,
+            "abandoned": 0,
+        }
         while max_cycles is None or report["cycles"] < max_cycles:
             report["cycles"] += 1
             self._cycle(report)
@@ -419,11 +497,19 @@ class DevelopmentGrantPoller:
         Counters (``grants_run``, ``errors``) are the only state kept across cycles.
         """
         self._prune_orphan_networks()
-        report: dict[str, Any] = {"cycles": 0, "grants": [], "errors": 0}
+        report: dict[str, Any] = {
+            "cycles": 0,
+            "grants": [],
+            "errors": 0,
+            "refused": 0,
+            "abandoned": 0,
+        }
         report["cycles"] += 1
         self._cycle(report)
         self.grants_run += len(report["grants"])
         self.errors += report["errors"]
+        self.refusals += report["refused"]
+        self.abandoned += report["abandoned"]
         return [
             {"service": "development-poll", "grant_id": item["grant_id"], "grant_run": True}
             for item in report["grants"]
@@ -455,6 +541,11 @@ class DevelopmentGrantPoller:
             report.setdefault("pending", []).append(grant_id)  # neither a verdict nor an error
         elif outcome is not None and outcome.get("state") == "error":
             report["errors"] += 1
+            # Counts only: no grant ids, paths or control detail in these fields.
+            if outcome.get("refused") is True:
+                report["refused"] = report.get("refused", 0) + 1
+            if outcome.get("abandoned") is True:
+                report["abandoned"] = report.get("abandoned", 0) + 1
         else:
             report["grants"].append({"grant_id": grant_id, "outcome": outcome})
 
@@ -488,6 +579,7 @@ class DevelopmentGrantPoller:
                 or not _GRANT_ID.fullmatch(grant_id)
                 or image not in self.config.allowed_images
                 or (self.root / "grants" / grant_id / "result.json").exists()
+                or (self.root / "grants" / grant_id / ABANDONED_MARKER).exists()
                 or self._retry_at.get(grant_id, 0.0) > self.clock()
                 or self._failures.get(grant_id, 0) >= _MAX_CONSECUTIVE_FAILURES
             ):
