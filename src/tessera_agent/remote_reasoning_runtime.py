@@ -6,6 +6,20 @@ the optional operator-pinned OpenCode V2 harness for OpenAI included OAuth. The 
 runtime may run a multi-turn loop over an exact allowlist of Tessera MCP tools (deny by
 default); every model turn and every tool call is receipted by digest. No permission
 replies, shell execution, human approval or generic HTTP tool proxy.
+
+Exit codes of ``run`` (a one-shot supervisor: each run identity runs once):
+
+- 0 the run completed, or the run identity was already completed before this start (a closed
+  line is logged; nothing is sent, reserved or rerun).
+- 1 an unexpected crash (Python's default); the journal makes a restart resume without replay.
+- 2 the run ended without completing: a fence or block halted it (its code is the receipt's
+  ``reason``) or it was stopped; also an already-closed run identity that did not complete.
+- 77 refused: another supervisor holds the state directory, or the run identity is bound to a
+  different profile/prompt (a new run needs a new run identity).
+- 78 configuration error: unreadable or invalid profile or prompt, missing manager credential
+  directory or agent-token variable.
+
+``report`` exits 0 when provenance delivery is complete and 2 otherwise.
 """
 
 from __future__ import annotations
@@ -19,6 +33,7 @@ import math
 import os
 import re
 import signal
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +74,14 @@ from .remote_reasoning_store import (
 )
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+EXIT_COMPLETED = 0
+EXIT_CRASH = 1  # Never returned: an uncaught exception exits 1.
+EXIT_BLOCKED = 2
+EXIT_REFUSED = 77
+EXIT_CONFIG = 78
+# A run in one of these states is closed: a later start never resumes or reruns it.
+CLOSED_STATES = frozenset({"completed", "failed", "stop_acknowledged", "stop_unknown"})
 
 
 class RuntimeBlocked(Exception):
@@ -1328,7 +1351,7 @@ class ReasoningSupervisor:
         # run totals and the day's ledger, becomes its uncertain receipt; never resent.
         calls_interrupted = self.store.model_calls_interrupted(run_id, self.clock())
         self._reserved.pop(run_id, None)
-        if row["state"] in {"completed", "failed", "stop_acknowledged", "stop_unknown"}:
+        if row["state"] in CLOSED_STATES:
             return self.store.get(run_id) if calls_interrupted else row
         if interrupted or calls_interrupted:
             # Before any restore or resume: a parked loop's private file is deleted.
@@ -1587,14 +1610,74 @@ def _refresh_report_spend(store, profile: dict, found, control=None) -> None:
         return
 
 
+class _Exit(Exception):
+    """A closed exit: an exit code plus a sanitized reason code (never a value or secret)."""
+
+    def __init__(self, code: int, reason: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason if _REASON.fullmatch(reason) else "startup_refused"
+
+
+def _log(message: str) -> None:
+    print(f"tessera-reasoning: {message}", file=sys.stderr, flush=True)
+
+
+def _closed_run(store, run_id: str) -> dict | None:
+    """The journal row when ``run_id`` already ended (one-shot), else None."""
+    try:
+        row = store.get(run_id)
+    except ValueError:  # Unknown run: a fresh request.
+        return None
+    return row if row["state"] in CLOSED_STATES else None
+
+
+def _receipt(store, row: dict, run_id: str) -> str:
+    receipt = {k: row[k] for k in ("id", "state", "reason", "tokens", "cost")}
+    receipt["provenance"] = store.provenance_coverage(run_id)
+    receipt["model_calls"] = store.model_calls(run_id, every=True)
+    receipt["tool_calls"] = store.tool_calls(run_id)
+    receipt["loop_parks"] = store.loop_parks(run_id)
+    receipt["loop_resumes"] = store.loop_resumes(run_id)
+    receipt["rate_limit"] = store.latest_rate_limit(run_id)
+    # Reservations still open (an uncertain call is never replayed, and its worst case
+    # keeps counting against the ledger's caps until an operator resolves it).
+    receipt["spend_ledger"] = store.spend_rows(run_id)
+    return json.dumps(receipt)
+
+
 def main(argv=None):
+    """Run one command; see the module docstring for the exit-code table."""
+    try:
+        return _main(argv)
+    except _Exit as stop:
+        kind = "refused" if stop.code == EXIT_REFUSED else "configuration error"
+        _log(f"{kind} ({stop.reason})")
+        return stop.code
+
+
+def _main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "stop", "report", "catalog"))
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path)
+    parser.add_argument(
+        "--run-id",
+        help="Run identity for this request; defaults to the profile's run_id.",
+    )
     args = parser.parse_args(argv)
-    profile = json.loads(private_file(args.profile, credentials_dir=manager_credentials_dir()))
+    try:
+        profile = json.loads(private_file(args.profile, credentials_dir=manager_credentials_dir()))
+    except (OSError, ValueError):
+        raise _Exit(EXIT_CONFIG, "profile_unreadable") from None
+    if not isinstance(profile, dict):
+        raise _Exit(EXIT_CONFIG, "profile_invalid")
+    if args.run_id is not None:
+        # A fresh request names its own run identity; the profile's stays the default.
+        if not _ID.fullmatch(args.run_id):
+            raise _Exit(EXIT_CONFIG, "run_id_invalid")
+        profile["run_id"] = args.run_id
     if args.command == "catalog":
         # Obtaining the pin is the point: only a missing/placeholder pin is tolerated here.
         pin = profile.get("tool_catalog_sha256")
@@ -1607,12 +1690,18 @@ def main(argv=None):
             checked["tool_catalog_sha256"] = _CATALOG_PLACEHOLDER
         validate_profile(checked)
         return catalog(profile)
-    validate_profile(profile)
+    try:
+        validate_profile(profile)
+    except (KeyError, TypeError, ValueError):
+        raise _Exit(EXIT_CONFIG, "profile_invalid") from None
     found = destination(profile["model"]["providerID"], profile["account_mode"])
     credentials_dir = None
     if args.command == "run" and found.runtime == RUNTIME_ANTHROPIC_MESSAGES:
         # The API key is read only from the manager-provided credential directory.
-        credentials_dir = _manager_credentials_dir()
+        try:
+            credentials_dir = _manager_credentials_dir()
+        except RuntimeBlocked as error:
+            raise _Exit(EXIT_CONFIG, str(error)) from None
     store = ReasoningStore(args.state_dir)
     lock = None
     bridge = None
@@ -1632,14 +1721,35 @@ def main(argv=None):
             lock = os.open(
                 args.state_dir / "supervisor.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
             )
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            text = (
-                private_file(args.prompt_file, credentials_dir=manager_credentials_dir()).decode()
-                if args.prompt_file
-                else None
-            )
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise _Exit(EXIT_REFUSED, "supervisor_already_running") from None
+            closed = _closed_run(store, profile["run_id"])
+            if closed is not None:
+                # One-shot: a closed run identity is never resumed or rerun. No harness,
+                # control-plane, ledger or model call; the journal's receipt is printed as is.
+                print(_receipt(store, closed, profile["run_id"]), flush=True)
+                _log(
+                    f"run {profile['run_id']} already closed (state {closed['state']});"
+                    " not rerun, no model call. Start a new run with a new run identity."
+                )
+                return EXIT_COMPLETED if closed["state"] == "completed" else EXIT_BLOCKED
+            try:
+                text = (
+                    private_file(
+                        args.prompt_file, credentials_dir=manager_credentials_dir()
+                    ).decode()
+                    if args.prompt_file
+                    else None
+                )
+            except (OSError, ValueError):
+                raise _Exit(EXIT_CONFIG, "prompt_unreadable") from None
             if text is not None and (not text.strip() or len(text.encode()) > 8192):
-                raise ValueError("Prompt must contain 1..8192 bytes.")
+                raise _Exit(EXIT_CONFIG, "prompt_invalid")
+            variable = profile.get("agent_token_env")
+            if not isinstance(variable, str) or os.environ.get(variable) is None:
+                raise _Exit(EXIT_CONFIG, "agent_token_missing")
             binding = {
                 k: profile[k]
                 for k in (
@@ -1655,7 +1765,11 @@ def main(argv=None):
             binding["profile_sha256"] = hashlib.sha256(
                 private_file(args.profile, credentials_dir=manager_credentials_dir())
             ).hexdigest()
-            store.bind(profile["run_id"], binding, time.time())
+            try:
+                store.bind(profile["run_id"], binding, time.time())
+            except ValueError:
+                # The same run identity with another profile/prompt: never rebound.
+                raise _Exit(EXIT_REFUSED, "run_identity_rebind_refused") from None
             control = JsonEndpoint(
                 profile["control_url"],
                 os.environ[profile["agent_token_env"]],
@@ -1731,20 +1845,14 @@ def main(argv=None):
                     store.drain_provenance(profile["run_id"], collector, profile["project_id"])
         if args.command in {"run", "report"}:
             _refresh_report_spend(store, profile, found, control if args.command == "run" else None)
-        receipt = {k: row[k] for k in ("id", "state", "reason", "tokens", "cost")}
-        receipt["provenance"] = store.provenance_coverage(profile["run_id"])
-        receipt["model_calls"] = store.model_calls(profile["run_id"], every=True)
-        receipt["tool_calls"] = store.tool_calls(profile["run_id"])
-        receipt["loop_parks"] = store.loop_parks(profile["run_id"])
-        receipt["loop_resumes"] = store.loop_resumes(profile["run_id"])
-        receipt["rate_limit"] = store.latest_rate_limit(profile["run_id"])
-        # Reservations still open (an uncertain call is never replayed, and its worst case
-        # keeps counting against the ledger's caps until an operator resolves it).
-        receipt["spend_ledger"] = store.spend_rows(profile["run_id"])
-        print(json.dumps(receipt))
+        printed = _receipt(store, row, profile["run_id"])
+        print(printed)
         if args.command == "report":
-            return 0 if receipt["provenance"]["delivery_complete"] else 2
-        return 0 if row["state"] == "completed" else 2
+            delivered = json.loads(printed)["provenance"]["delivery_complete"]
+            return EXIT_COMPLETED if delivered else EXIT_BLOCKED
+        if args.command == "run" and row["state"] != "completed":
+            _log(f"run {profile['run_id']} ended {row['state']} ({row['reason'] or 'no reason'})")
+        return EXIT_COMPLETED if row["state"] == "completed" else EXIT_BLOCKED
     finally:
         if bridge is not None:
             bridge.close()

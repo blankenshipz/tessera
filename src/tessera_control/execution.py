@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .approval_trust import require_decision_actor
+from .concurrency_ceiling import HARD_PROJECT_CONCURRENCY_CAP, operator_concurrency_ceiling
 from .execution_models import (
     CONTAINER_ABSENT,
     PROVIDER_GROUP_STOPPED,
@@ -47,6 +48,23 @@ MAX_GRANT_LIFETIME = timedelta(hours=24)
 MAX_CENTS = 2**63 - 1
 MAX_OBSERVATION_FUTURE_SKEW = timedelta(seconds=5)
 UNRESOLVED_GRANT_STATUSES = ("active", "cancel_requested")
+# The project limits table. Its CHECK is the hard cap, not the operator's ceiling (ADR 0171);
+# schema 89 rebuilds older tables, whose CHECK was 1 to 8, from this same statement.
+PROJECT_LIMITS_TABLE_SQL = f"""CREATE TABLE execution_project_limits (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        currency TEXT NOT NULL CHECK (currency GLOB '[A-Z][A-Z][A-Z]'),
+        monetary_limit_cents INTEGER NOT NULL CHECK (monetary_limit_cents >= 0),
+        max_concurrency INTEGER NOT NULL
+            CHECK (max_concurrency BETWEEN 1 AND {HARD_PROJECT_CONCURRENCY_CAP}),
+        held_cents INTEGER NOT NULL DEFAULT 0 CHECK (held_cents >= 0),
+        settled_cents INTEGER NOT NULL DEFAULT 0 CHECK (settled_cents >= 0),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )"""
+
+
+class ConcurrencyAboveCeiling(StoreError):
+    """A requested project concurrency is above the operator's ceiling (HTTP 422)."""
 
 
 def _only_unconfirmed_worker_unknown(connection: sqlite3.Connection, operation_id: str) -> bool:
@@ -82,18 +100,7 @@ def _only_unconfirmed_worker_unknown(connection: sqlite3.Connection, operation_i
 
 def create_execution_schema(connection: sqlite3.Connection) -> None:
     """Install authority and accounting records without any execution tables."""
-    connection.execute(
-        """CREATE TABLE execution_project_limits (
-        project_id TEXT PRIMARY KEY REFERENCES projects(id),
-        revision INTEGER NOT NULL CHECK (revision >= 1),
-        currency TEXT NOT NULL CHECK (currency GLOB '[A-Z][A-Z][A-Z]'),
-        monetary_limit_cents INTEGER NOT NULL CHECK (monetary_limit_cents >= 0),
-        max_concurrency INTEGER NOT NULL CHECK (max_concurrency BETWEEN 1 AND 8),
-        held_cents INTEGER NOT NULL DEFAULT 0 CHECK (held_cents >= 0),
-        settled_cents INTEGER NOT NULL DEFAULT 0 CHECK (settled_cents >= 0),
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        )"""
-    )
+    connection.execute(PROJECT_LIMITS_TABLE_SQL)
     connection.execute(
         """CREATE TABLE execution_task_epochs (
         task_id TEXT PRIMARY KEY REFERENCES tasks(id),
@@ -612,6 +619,14 @@ class ExecutionStore(Store):
         ) -> tuple[int, dict[str, Any]]:
             self._require_human(actor)
             self._project(connection, actor, project_id)
+            # The operator's ceiling (default 8) bounds the request; nothing in it can raise it.
+            ceiling = operator_concurrency_ceiling()
+            if payload["max_concurrency"] > ceiling.value:
+                raise ConcurrencyAboveCeiling(
+                    f"max_concurrency {payload['max_concurrency']} is above this installation's "
+                    f"project concurrency ceiling of {ceiling.value}; only the operator can "
+                    "raise the ceiling."
+                )
             current = connection.execute(
                 "SELECT * FROM execution_project_limits WHERE project_id = ?", (project_id,)
             ).fetchone()
@@ -690,7 +705,9 @@ class ExecutionStore(Store):
                     "monetary_limit_cents": row["monetary_limit_cents"],
                     "max_concurrency": row["max_concurrency"],
                     "operational_only": True,
-                },
+                }
+                # Only when the operator set the ceiling; absent means the default 8.
+                | ceiling.evidence(),
             )
             return status, self._limit_response(row)
 
@@ -827,7 +844,8 @@ class ExecutionStore(Store):
                 WHERE project_id = ? AND status IN ('active', 'cancel_requested')""",
                 (project_id,),
             ).fetchone()[0]
-            if unresolved >= limits["max_concurrency"]:
+            # A stored limit above a since-lowered operator ceiling admits only up to the ceiling.
+            if unresolved >= operator_concurrency_ceiling().admits(limits["max_concurrency"]):
                 raise Conflict("Grant would exceed the project execution concurrency limit.")
             if connection.execute(
                 """SELECT 1 FROM execution_grants WHERE task_id = ?

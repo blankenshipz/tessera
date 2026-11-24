@@ -113,6 +113,22 @@ Roles: **root** is the host operator; **person** is a human credential on the co
 6. **Make the one call (root).** `sudo systemctl start tessera-reasoning.service`. Do **not**
    `enable` it: the unit has no `[Install]` section on purpose. A start-up refusal exits 78 and is
    not restarted; read the sanitized reason with `sudo journalctl -u tessera-reasoning.service`.
+   The unit is one-shot. A completed run exits 0 and the unit goes inactive, not failed. Starting
+   it again with the same run identity runs nothing: it logs `run <id> already closed (state
+   completed); not rerun, no model call` and exits 0. Exit codes:
+
+   | Exit | Meaning | Unit restarts it |
+   | --- | --- | --- |
+   | 0 | The run completed, or this run identity had already completed before this start (logged `run <id> already closed (state completed); not rerun, no model call`). | No |
+   | 1 | Unexpected crash (Python's default exit). The journal lets the restart resume without replaying a call. | Yes (`Restart=on-failure`) |
+   | 2 | The run ended without completing: a fence or block halted it (the receipt's `reason`, e.g. `budget_exhausted`, `grant_revoked`, `tool_catalog_changed`) or it was stopped. Also a start of a run identity that had already ended that way. | No |
+   | 77 | Refused: another supervisor holds the state directory (`supervisor_already_running`), or the run identity is already bound to another profile or prompt (`run_identity_rebind_refused`). | No |
+   | 78 | Configuration error: unreadable or invalid profile or prompt, invalid `--run-id`, missing manager credential directory or agent-token variable; also every refusal of `service_startup` before the runtime starts (API-key variable present, missing or mismatched credential files). | No |
+
+   Only exit 1 (a crash) is restarted (`Restart=on-failure`, `RestartPreventExitStatus=2 77 78`,
+   at most 3 starts in 120 seconds). For a second call, request a new run:
+   `sudo tessera reasoning install --apply --new-run` writes a fresh generated `run_id` (and the
+   installed prompt's digest) into the profile; then start the unit again.
 
 7. **Read the receipt (operator).**
 

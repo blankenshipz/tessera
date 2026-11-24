@@ -693,7 +693,9 @@ class DevelopmentWorkerService:
                 if runtime.operation is not None:
                     runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
                 if self._is_report_failure(result):
-                    return self._cancel_unresolved(runtime, "receipt_report_failure")
+                    return self._cancel_unresolved(
+                        runtime, "receipt_report_failure", report_exit=True
+                    )
                 try:
                     self._report(runtime, result)
                 except Exception as error:
@@ -705,7 +707,7 @@ class DevelopmentWorkerService:
                     outcome["container_created"] = False
                 return outcome
             if self._is_report_failure(result):
-                return self._cancel_unresolved(runtime, "receipt_report_failure")
+                return self._cancel_unresolved(runtime, "receipt_report_failure", report_exit=True)
             try:
                 self._report(runtime, result)
             except Exception as error:
@@ -739,7 +741,9 @@ class DevelopmentWorkerService:
                     self._heartbeat()
                     self._renew(runtime)
                 except Exception:
-                    return self._cancel_unresolved(runtime, "heartbeat_or_renewal_failure")
+                    return self._cancel_unresolved(
+                        runtime, "heartbeat_or_renewal_failure", report_exit=True
+                    )
                 renewed_at = now  # measured before the request, so the interval never stretches
             # Never sleep past the next renewal: a long poll interval cannot outlast the lease.
             assert renewed_at is not None  # the first pass always renews
@@ -876,18 +880,66 @@ class DevelopmentWorkerService:
         return result.reason is not None and result.reason.endswith("report_unconfirmed")
 
     @staticmethod
-    def _cancel_unresolved(runtime: DevelopmentCpuRuntime, reason: str) -> dict[str, Any]:
-        """Cancellation must not depend on a control/reporting round trip succeeding."""
+    def _cancel_unresolved(
+        runtime: DevelopmentCpuRuntime, reason: str, *, report_exit: bool = False
+    ) -> dict[str, Any]:
+        """Cancellation must not depend on a control/reporting round trip succeeding.
 
+        With ``report_exit`` (the run ended for a reason of the worker's own, such as a failed
+        renewal, not because control refused an observation), a cancel the provider confirmed
+        with an integer exit code is reported like any other confirmed exit, through the
+        durable outbox (ADR 0054). Without it control would keep seeing ``running`` and could
+        never resolve the attempt (ADR 0053). An undelivered report ends the run as
+        ``report_pending`` without a recorded result, so the poller recovers the grant and
+        delivers it. An uncertain or unconfirmed cancel, or one without an exit code, reports
+        nothing new.
+        """
+
+        cancelled: DriverResult | None
         try:
-            runtime.cancel(reason=reason)
+            cancelled = runtime.cancel(reason=reason)
         except Exception:
             # Both the local supervisor journal and any provider-dispatch intent
             # remain durable; do not convert this uncertain state into success.
-            pass
+            cancelled = None
         if runtime.operation is not None:
             runtime.development_outputs.mark_unknown(runtime.operation.operation_id)
-        return {"state": "unknown", "quarantined": False, "reason": reason}
+        outcome: dict[str, Any] = {"state": "unknown", "quarantined": False, "reason": reason}
+        if (
+            report_exit
+            and cancelled is not None
+            and cancelled.phase == "terminal"
+            and cancelled.observation.state == "exited"
+            and cancelled.observation.termination_confirmed
+            and type(cancelled.observation.exit_code) is int
+        ):
+            try:
+                runtime.report(cancelled)
+            except ObservationDeliveryPending as error:
+                # Keep the cause; delivery_pending is what makes the poller recover it.
+                return {**DevelopmentWorkerService._pending_outcome(error), "reason": reason}
+            except Exception:
+                # Refused or aged out (journaled in the outbox, never reposted), or a
+                # follow-up report failed after the exit was delivered: as before.
+                pass
+        return outcome
+
+    @staticmethod
+    def _pending_outcome(error: ObservationDeliveryPending) -> dict[str, Any]:
+        pending: dict[str, Any] = {
+            "state": "report_pending",
+            "quarantined": False,
+            "reason": "observation_delivery_pending",
+            "delivery_pending": True,
+            "retry_after_seconds": round(error.retry_after_seconds, 3),
+        }
+        if error.auth:
+            # A rejected credential: the operator must renew it; the observation waits in
+            # the outbox and is delivered after the restart (exit code 3, as before).
+            pending["credential_rejected"] = True
+            if type(error.status) is int:
+                pending["control_status"] = error.status
+        return pending
 
     def _report_failed(
         self, runtime: DevelopmentCpuRuntime, error: Exception, *, running: bool = False
@@ -914,20 +966,7 @@ class DevelopmentWorkerService:
             else "observation_report_failure",
         )
         if isinstance(error, ObservationDeliveryPending):
-            pending: dict[str, Any] = {
-                "state": "report_pending",
-                "quarantined": False,
-                "reason": "observation_delivery_pending",
-                "delivery_pending": True,
-                "retry_after_seconds": round(error.retry_after_seconds, 3),
-            }
-            if error.auth:
-                # A rejected credential: the operator must renew it; the observation waits in
-                # the outbox and is delivered after the restart (exit code 3, as before).
-                pending["credential_rejected"] = True
-                if type(error.status) is int:
-                    pending["control_status"] = error.status
-            return pending
+            return self._pending_outcome(error)
         return outcome
 
     @staticmethod

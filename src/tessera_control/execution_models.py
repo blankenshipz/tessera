@@ -7,6 +7,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
+from .concurrency_ceiling import HARD_PROJECT_CONCURRENCY_CAP
+
 
 class ExecutionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -25,7 +27,9 @@ class ConfigureProjectExecution(ExecutionRequest):
     expected_revision: CreationRevision
     currency: Currency
     monetary_limit_cents: Cents
-    max_concurrency: Annotated[int, Field(strict=True, ge=1, le=8)]
+    # Statically bounded by the hard cap only; the store refuses a value above the operator's
+    # ceiling (default 8, ``concurrency_ceiling``) when it accepts the request (ADR 0171).
+    max_concurrency: Annotated[int, Field(strict=True, ge=1, le=HARD_PROJECT_CONCURRENCY_CAP)]
 
 
 class IssueExecutionGrant(ExecutionRequest):

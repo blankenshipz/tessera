@@ -282,14 +282,21 @@ def test_disconnect_while_reporting_attempts_cancellation_and_retains_the_report
     result = service.run()
     # A running observation that could not be delivered no longer stops the container (ADR
     # 0054): the run went on, and it was the renewal that then failed over the same lost
-    # connection (authority is proven by renewals), which cancels. The observation stays in
-    # the durable outbox for the poller to redeliver.
+    # connection (authority is proven by renewals), which cancels. The cancel's confirmed exit
+    # is queued in the durable outbox for the poller to redeliver, and it supersedes the stale
+    # undelivered running observation: control must never see an old running after the exit.
+    # (Before, the exit was dropped and the stale running stayed pending, so control could not
+    # resolve the attempt.)
     assert result["reason"] == "heartbeat_or_renewal_failure"
     assert adapter.calls.count("cancel") == 1
     with _connect(tmp_path / "worker" / "runtime" / "runtime-observations.sqlite3") as connection:
-        assert tuple(
-            connection.execute("SELECT completed, attempts, abandoned FROM reports").fetchone()
-        ) == (0, 1, 0)
+        rows = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT observed_state, completed, abandoned FROM reports ORDER BY id"
+            )
+        ]
+    assert rows == [("running", 0, 1), ("exited", 0, 0)]
     assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
 
 

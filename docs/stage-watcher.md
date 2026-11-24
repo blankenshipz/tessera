@@ -103,6 +103,13 @@ The body is closed: `lease_id`, `expected_epoch`, `kind` (`heartbeat`, `progress
 `failed`), `observed_at`, `seq`, `counters` (`elapsed_s`, `silent_s`, `mem_bytes`, `cpu_ms`,
 `output_bytes`, `restarts`, `refused_reports`, `dropped_reports`; integers only), `kill_switch_engaged`, and `contract_digest`.
 
+A `failed` report may also carry the optional closed `exit` object, `{"exit_code": 0..255,
+"oom_killed": bool}`. It is present only when the probe read the container as definitively
+`exited` with an integer code, never for an unknown or absent probe, a passed deadline or an exit
+with no code. Control refuses it on any other kind. A report without it is unchanged. It is the
+only watch evidence that can ever close an attempt, and only under the fenced rule of
+[ADR 0158](decisions/0158-exited-without-report-closes-attempt.md).
+
 It never contains log lines, prompts, credentials or any free text.
 
 `refused_reports` and `dropped_reports` are the watcher's own count of reports control refused

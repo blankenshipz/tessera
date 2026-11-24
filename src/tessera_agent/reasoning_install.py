@@ -81,8 +81,11 @@ LoadCredential=model-credential:@REFERENCE@
 LoadCredential=anthropic-api-key:@KEY@
 ExecStart=@PYTHON@ -m tessera_agent.service_startup reasoning --state-dir @STATE@
 ExecStop=@PYTHON@ -m tessera_agent.service_startup reasoning-stop --state-dir @STATE@
+# One-shot: exit 0 is a completed run (or a run identity already completed), so it is never
+# restarted. Only a crash (exit 1, a signal) restarts, to resume the journal without replay;
+# 2 (halted, blocked or stopped), 77 (refused) and 78 (configuration error) never restart.
 Restart=on-failure
-RestartPreventExitStatus=2 78
+RestartPreventExitStatus=2 77 78
 RestartSec=5
 TimeoutStopSec=40
 KillMode=control-group
@@ -126,6 +129,9 @@ class Options:
     control_url: str | None = None
     project_id: str | None = None
     replace: bool = False
+    # A fresh run request: a newly generated run_id (and the installed prompt's digest) is written
+    # into the profile, so the next manual start is a new one-shot run. The old run stays closed.
+    new_run: bool = False
 
     @property
     def reference_path(self) -> Path:
@@ -514,7 +520,7 @@ def _prompt_bytes(ctx: _Context) -> tuple[bytes | None, bytes | None]:
 
 
 def _desired_profile(ctx: _Context, prompt_final: bytes) -> tuple[dict, dict | None, dict]:
-    """(profile to hold, the existing profile or None, numeric cap changes)."""
+    """(profile to hold, the existing profile or None, cap and new-run changes)."""
     options = ctx.options
     path = _real(options, options.profile_path)
     _check_ancestors(options, path)
@@ -530,8 +536,11 @@ def _desired_profile(ctx: _Context, prompt_final: bytes) -> tuple[dict, dict | N
             if limits.get(key) != value:
                 changes[key] = {"from": limits.get(key), "to": value}
                 limits[key] = value
+        if options.new_run:
+            _new_run(desired, prompt_final)
+            changes["run_id"] = {"from": "current", "to": "new"}
         if changes:
-            _validate(desired, "the profile with the requested caps")
+            _validate(desired, "the profile with the requested changes")
         return desired, current, changes
     if options.profile_template is None:
         raise InstallRefused(
@@ -550,20 +559,30 @@ def _desired_profile(ctx: _Context, prompt_final: bytes) -> tuple[dict, dict | N
     if absent:
         raise InstallRefused("the profile template has no spend caps: supply " + ", ".join(absent))
     desired["prompt_sha256"] = hashlib.sha256(prompt_final).hexdigest()
+    if options.new_run:
+        _new_run(desired, prompt_final)
     _validate(desired, "the profile built from the template")
     return desired, None, {k: {"from": None, "to": v} for k, v in caps.items()}
+
+
+def _new_run(profile: dict, prompt_final: bytes) -> None:
+    """Point the profile at a new run identity bound to the installed prompt (never printed)."""
+    profile["run_id"] = "run-" + secrets.token_hex(8)
+    profile["prompt_sha256"] = hashlib.sha256(prompt_final).hexdigest()
 
 
 def _profile_item(
     ctx: _Context, profile: dict, existing: dict | None, changes: dict, prompt_matches: bool
 ) -> _Item:
-    """The profile: new from the template, or an existing one where only the caps may change."""
+    """The profile: new from the template, or an existing one where only the caps change (and,
+    with ``new_run``, the run identity and prompt digest)."""
     virtual = ctx.options.profile_path
     path = _real(ctx.options, virtual)
     detail = {
         "path": str(virtual),
         "mode": "0600",
-        "caps": changes,
+        "caps": {key: value for key, value in changes.items() if key in CAP_KEYS},
+        "new_run": "run_id" in changes,
         "prompt_sha256_matches_prompt": prompt_matches,
     }
     content = _serialize(profile)
@@ -581,7 +600,10 @@ def _profile_item(
             write(content),
         )
     if changes:
-        action = "update only " + ", ".join(f"limits.{key}" for key in changes)
+        action = "update only " + ", ".join(
+            f"limits.{key}" if key in CAP_KEYS else "run_id and prompt_sha256 (a new run)"
+            for key in changes
+        )
         return _Item(Step("profile", "differs", action, detail), write(content))
     info = _lstat(path, want="file")
     if _same_meta(ctx, path, info, 0o600, (0, 0)):

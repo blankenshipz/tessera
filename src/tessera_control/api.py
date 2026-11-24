@@ -19,6 +19,7 @@ from .approval_trust import (
     DELEGATION_KEY,
     valid_automation_label,
 )
+from .concurrency_ceiling import operator_concurrency_ceiling
 from .deployment import DeploymentConfig, backend_status
 from .models import (
     ApproveTask,
@@ -135,7 +136,7 @@ def create_app(
     from .dataset_ingestion import DatasetIngestionStore
     from .dataset_ingestion_api import router as dataset_ingestion_router
     from .deploy_check_api import router as deploy_check_router
-    from .execution import ExecutionStore
+    from .execution import ConcurrencyAboveCeiling, ExecutionStore
     from .execution_api import router as execution_router
     from .execution_run_receipt_api import router as execution_run_receipt_router
     from .experiments import ExperimentStore
@@ -161,6 +162,8 @@ def create_app(
     from .snapshots import SnapshotStore
     from .storage_retention_api import router as storage_retention_router
 
+    # A malformed or out-of-range operator concurrency ceiling stops startup (ADR 0171).
+    operator_concurrency_ceiling()
     deployment = deployment or DeploymentConfig.local()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(RequestLimitsMiddleware)
@@ -426,6 +429,8 @@ def create_app(
             status = 409
         elif isinstance(error, Forbidden):
             status = 403
+        elif isinstance(error, ConcurrencyAboveCeiling):
+            status = 422
         else:
             status = 400
         return JSONResponse(status_code=status, content={"detail": str(error)})

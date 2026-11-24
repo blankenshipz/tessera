@@ -372,6 +372,17 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   (a trickle of bytes cannot hold a slot for the upload's own 24 hours).
   An attempt with no such evidence stays `unknown` for a person. It is shown on the receipt as
   `exit_resolved`, never as a pass or a measurement.
+- **Exited without a report (ADR 0158, proposed).** When the executor's exit observation never
+  arrives, an `admitted` or `running` attempt on a non-billable worker-grant provider is closed
+  from the stage watcher's `failed` report only if that report carries the closed `exit` field (a
+  definitive container exit with an exit code; never an unknown, absent or deadline failure), for
+  the operation's own lease and epoch. The close also needs every lease of the grant expired, no
+  confirmed exit, no run receipt, no later observation and no upload still arriving. It waits
+  `exit_report_grace_seconds` (default 300 s, at most 900 s) after control recorded the report. The
+  attempt becomes `failed_transient` / `exited_without_report` with an exit class (`killed`, `oom`,
+  `error`), settled at zero, with its grant and slot released, and the stage's retry policy decides
+  what follows. The watcher's code never makes a failure permanent. The receipt's `exit_resolved`
+  names the closed reason, the exit class and the watch event.
 - **Refused launches (ADR 0046).** An unknown attempt whose worker reported a refused
   launch is reconciled by the runner itself, with no person: the report is a closed
   `launch_error` class on an unknown observation with no provider identity (the development
@@ -665,6 +676,16 @@ reports the guardian's confirmed stop of the route's exact group
 (`termination_evidence: provider_group_stopped`). The paths above then settle the grant; any
 doubt (no recorded identity, another container, a container that may still run, Docker not
 answering) holds it, with the reason in the grant's local `termination-evidence.json`.
+
+A paused campaign (steering pause or delegation lapsed) also gives back a grant no worker ever
+took, even a live one (ADR 0167): no lease row, no operation, no recorded attempt operation, a
+registered worker-grant provider and no holdout. The attempt is settled at zero as
+`not_started` and consumes no scientific retry. Resuming places a new attempt that waits for a
+project slot in first-come order and records `campaign.slot_reacquired` when it gets one. The
+line counts any earlier waiter for the project, including one that is itself stuck on a
+provider slot, so such a waiter can delay later attempts for other providers. A pause between
+grant issue and the worker's lease voids that attempt (amends ADR 0061: only a leased attempt
+is in flight).
 
 ## Not implemented
 

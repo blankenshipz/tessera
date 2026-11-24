@@ -859,11 +859,11 @@ def test_main_refuses_anthropic_without_credentials_directory(tmp_path, monkeypa
     monkeypatch.setattr(
         rr, "AnthropicMessagesReasoning", lambda *a, **k: pytest.fail("adapter built")
     )
-    with pytest.raises(RuntimeBlocked, match="missing_manager_credential_directory"):
-        rr.main(
-            ["run", "--profile", str(path), "--state-dir", str(tmp_path / "state"),
-             "--prompt-file", str(prompt)]
-        )  # fmt: skip
+    code = rr.main(
+        ["run", "--profile", str(path), "--state-dir", str(tmp_path / "state"),
+         "--prompt-file", str(prompt)]
+    )  # fmt: skip
+    assert code == rr.EXIT_CONFIG  # missing_manager_credential_directory: never restarted
     assert not (tmp_path / "state").exists()
 
 

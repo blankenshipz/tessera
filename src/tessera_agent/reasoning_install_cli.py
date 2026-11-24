@@ -61,6 +61,11 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
     install.add_argument(
         "--replace", action="store_true", help="replace a managed file that differs"
     )
+    install.add_argument(
+        "--new-run",
+        action="store_true",
+        help="write a fresh generated run_id (and the installed prompt's digest) into the profile",
+    )
     install.add_argument("--control-state-dir", type=Path)
     install.add_argument("--control-url")
     install.add_argument("--project-id")
@@ -87,6 +92,7 @@ def _options(arguments: argparse.Namespace):
         daily_cost_cap_cents=arguments.daily_cost_cap_cents,
         daily_token_cap=arguments.daily_token_cap,
         replace=arguments.replace,
+        new_run=arguments.new_run,
         control_state_dir=arguments.control_state_dir,
         control_url=arguments.control_url,
         project_id=arguments.project_id,

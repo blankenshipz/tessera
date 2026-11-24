@@ -225,9 +225,14 @@ Creating the marker is an operator readiness assertion, **not** human grant issu
 or billing proof. It cannot bypass runtime/MCP grant, epoch, expiry or quota checks.
 Do not `enable` this unit or add it to a boot target. A completed/failed/fenced run
 retains its journal. An OS/process failure can resume acknowledged sessions under
-`Restart=on-failure`; pending/uncertain calls cannot be replayed. Exit 2 (fenced
-run) and 78 (invalid startup references) suppress automatic restart. No automatic
-new run identity/profile or replacement inference is created.
+`Restart=on-failure`; pending/uncertain calls cannot be replayed. The supervisor is
+one-shot: exit 0 is a completed run (or a run identity already completed before this
+start, logged as already closed with no model call), 1 a crash (the only exit that is
+restarted), 2 a fenced or stopped run, 77 a refusal (supervisor already running,
+run identity bound to another profile) and 78 invalid startup references; 2, 77 and 78
+suppress automatic restart. No automatic new run identity/profile or replacement
+inference is created: `tessera reasoning install --apply --new-run` writes a fresh
+run identity for the next manual start.
 
 ### A2A profile
 

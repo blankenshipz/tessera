@@ -29,8 +29,11 @@ LoadCredential=model-credential:/etc/tessera/credentials/reasoning-model-credent
 LoadCredential=anthropic-api-key:/etc/tessera/credentials/reasoning-anthropic-api-key
 ExecStart=/opt/tessera/venv/bin/python -m tessera_agent.service_startup reasoning --state-dir /var/lib/tessera-reasoning
 ExecStop=/opt/tessera/venv/bin/python -m tessera_agent.service_startup reasoning-stop --state-dir /var/lib/tessera-reasoning
+# One-shot: exit 0 is a completed run (or a run identity already completed), so it is never
+# restarted. Only a crash (exit 1, a signal) restarts, to resume the journal without replay;
+# 2 (halted, blocked or stopped), 77 (refused) and 78 (configuration error) never restart.
 Restart=on-failure
-RestartPreventExitStatus=2 78
+RestartPreventExitStatus=2 77 78
 RestartSec=5
 TimeoutStopSec=40
 KillMode=control-group

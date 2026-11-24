@@ -45,6 +45,8 @@ from .campaign_autoreconcile import (
     repeat_count,
 )
 from .campaign_delegation import approver_is_live
+from .campaign_exit_without_report import EXIT_REPORT_GRACE_SECONDS
+from .campaign_exit_without_report import assess as assess_unreported_exit
 from .campaign_exited_resolve import (
     UploadProgress,
     exit_recorded_at,
@@ -110,12 +112,17 @@ from .campaign_settlement import (
 from .campaign_slot_reclaim import (
     EXPIRED_UNCLAIMED_GRANT,
     NOT_STARTED_EVIDENCE,
+    PAUSED_RELEASE_DETAIL,
+    PAUSED_UNLEASED_GRANT,
+    SLOT_REACQUIRED_EVENT,
     STUCK_CAMPAIGN,
     idle_slot_holders,
     record_freed_slots,
     record_slot_freed,
+    releasable_paused_grant,
     unclaimed_candidates,
     unclaimed_expired_grant,
+    waiters_ahead,
 )
 from .campaign_steps import (
     DelegationLapsed,
@@ -237,6 +244,10 @@ def _approval_expiry(ctx: _Ctx) -> datetime | None:
 
 
 class CampaignRunner:
+    # ADR 0158: control-clock seconds after a watcher-reported exit before the attempt may be
+    # closed without a run report (validated against the closed bounds on every use).
+    exit_report_grace_seconds: int = EXIT_REPORT_GRACE_SECONDS
+
     def __init__(
         self,
         state_dir: Path,
@@ -523,6 +534,8 @@ class CampaignRunner:
             # Reduce-only (ADR 0153): an expired grant no worker ever claimed cannot run, so a
             # stuck campaign stops holding its project slot; it needs no live approval.
             self._reclaim_unclaimed_grants(ctx)
+        if self._paused_for_release(ctx):
+            self._release_paused_grants(ctx)
         if ctx.approval is None:
             return
         status = ctx.campaign["status"]
@@ -532,6 +545,7 @@ class CampaignRunner:
         else:
             # Reduce-only and evidence-based (ADR 0053).
             self._resolve_exited_attempts(ctx)
+        self._close_unreported_exits(ctx)  # ADR 0158: after ADR 0053, which always wins
         if status == "paused_delegation_lapsed":
             return
         now = self.now()
@@ -555,6 +569,104 @@ class CampaignRunner:
         except DelegationLapsed:
             if status in {"running", "stopping"}:
                 self._pause(ctx, "approver_not_live")
+
+    def _paused_for_release(self, ctx: _Ctx) -> bool:
+        """The campaign is paused: delegation lapsed, or an agent's or person's pause (ADR 0061)."""
+        status = ctx.campaign["status"]
+        if status == "paused_delegation_lapsed":
+            return True
+        if status != "running":
+            return False
+        steering = self._one(
+            "SELECT paused FROM campaign_steering WHERE campaign_id=?", (ctx.campaign["id"],)
+        )
+        return bool(steering and steering["paused"])
+
+    def _release_paused_grants(self, ctx: _Ctx) -> None:
+        """A paused campaign gives back each grant no worker ever took (ADR 0167).
+
+        Reduce-only and fail closed. A grant with any lease, operation, a recorded attempt
+        operation or ``cancel_requested`` status is kept, as is any grant of a holdout stage
+        or of a provider that is not a registered worker-grant provider. The release is the
+        shared reconcile accounting (hold moved to settled at zero); the attempt ends
+        ``failed_transient``/``not_started``, so it uses an attempt number but no scientific
+        retry (ADR 0046). Resuming places a new attempt through the normal admission path."""
+        with self.store.runner_connection() as connection:
+            candidates = unclaimed_candidates(connection, ctx.campaign["id"])
+        for attempt_id in candidates:
+            attempt = self._attempt(attempt_id)
+            try:
+                spec_stage = self._spec_stage(ctx, attempt["stage_key"])
+                kind = self._provider(spec_stage).descriptor.kind
+            except KeyError:
+                continue  # unregistered provider: fail closed, the grant stays
+            if kind != "worker_grant" or spec_stage.holdout is not None:
+                continue
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                campaign = connection.execute(
+                    "SELECT * FROM campaigns WHERE id=?", (ctx.campaign["id"],)
+                ).fetchone()
+                steering = connection.execute(
+                    "SELECT paused FROM campaign_steering WHERE campaign_id=?",
+                    (campaign["id"],),
+                ).fetchone()
+                paused = campaign["status"] == "paused_delegation_lapsed" or (
+                    campaign["status"] == "running" and bool(steering and steering["paused"])
+                )
+                if not paused:
+                    return
+                grant = releasable_paused_grant(connection, attempt_id)
+                if grant is None:
+                    continue
+                now = _iso(self.now())
+                actor = self._actor_principal(connection, campaign["id"])
+                if (
+                    reconcile_grant_row(
+                        connection, grant, settlement_cents=0, principal_id=actor, now=now
+                    )
+                    is None
+                ):
+                    continue  # the reservation ledger cannot cover it: a person reconciles
+                self._touch(
+                    connection,
+                    "campaign_stage_attempts",
+                    "id=?",
+                    (attempt_id,),
+                    status="failed_transient",
+                    failure_class=NOT_STARTED,
+                    failure_detail=PAUSED_RELEASE_DETAIL,
+                )
+                self._settle(connection, attempt_id, 0, "unclaimed_zero")
+                released = connection.execute(
+                    "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt_id,)
+                ).fetchone()
+                self.store.record_runner_event(
+                    connection,
+                    campaign,
+                    "execution.paused_unleased_grant_released",
+                    {
+                        "grant_id": grant["id"],
+                        "lease_count": 0,
+                        "operation_count": 0,
+                        "settlement_cents": 0,
+                        "consumed_scientific_retry": False,
+                        "provider_termination_inferred": False,
+                        "operational_only": True,
+                        "automatic": True,
+                    },
+                    task_id=grant["task_id"],
+                )
+                record_slot_freed(
+                    connection,
+                    campaign,
+                    released,
+                    reason=PAUSED_UNLEASED_GRANT,
+                    trigger="paused_campaign_release",
+                    record_event=self.store.record_runner_event,
+                    grant_id=grant["id"],
+                )
+            self._actions.append(f"slot_freed:{attempt_id}:{PAUSED_UNLEASED_GRANT}")
 
     def _reclaim_unclaimed_grants(self, ctx: _Ctx) -> None:
         """Reconcile at zero each expired grant of a stuck campaign that no worker claimed.
@@ -3327,22 +3439,30 @@ class CampaignRunner:
         self._set_attempt(attempt["id"], release_id=result.response["id"])
         return True
 
-    def _limits_allow(self, project_id: str, hold: int) -> bool:
+    def _limits_allow(
+        self, project_id: str, hold: int, attempt: dict[str, Any] | None = None
+    ) -> bool:
+        """The project limits admit one more grant, behind every attempt queued earlier
+        (fair FIFO: a freed slot goes to the longest waiter, never to a newcomer)."""
         with self.store.runner_connection() as connection:
-            return placement.project_limits_allow(connection, project_id, hold)
+            ahead = 0 if attempt is None else waiters_ahead(connection, project_id, attempt)
+            return placement.project_limits_allow(connection, project_id, hold, ahead)
 
-    def _note_waiting_limits(self, ctx: _Ctx, key: str, hold: int) -> None:
-        """One event per stage when project limits keep it from getting a grant."""
+    def _note_waiting_limits(self, ctx: _Ctx, key: str, hold: int, attempt: dict[str, Any]) -> None:
+        """One event per attempt when project limits keep it from getting a grant; it also
+        puts the attempt in the FIFO line (``waiters_ahead``)."""
         with self.store.runner_connection() as connection:
             seen = connection.execute(
                 """SELECT 1 FROM events WHERE project_id=? AND event_type=?
                 AND json_extract(payload_json, '$.campaign_id')=?
-                AND json_extract(payload_json, '$.stage_key')=? LIMIT 1""",
+                AND json_extract(payload_json, '$.stage_key')=?
+                AND json_extract(payload_json, '$.attempt_id')=? LIMIT 1""",
                 (
                     ctx.campaign["project_id"],
                     "campaign.stage_waiting_limits",
                     ctx.campaign["id"],
                     key,
+                    attempt["id"],
                 ),
             ).fetchone()
             if seen is None:
@@ -3350,7 +3470,12 @@ class CampaignRunner:
                     connection,
                     ctx.campaign,
                     "campaign.stage_waiting_limits",
-                    {"stage_key": key, "hold_cents": hold},
+                    {
+                        "stage_key": key,
+                        "hold_cents": hold,
+                        "attempt": attempt["attempt"],
+                        "attempt_id": attempt["id"],
+                    },
                 )
 
     def _issue_grant(
@@ -3366,9 +3491,9 @@ class CampaignRunner:
         # holds, and its anchor stays fixed so the request rebuilds identically.
         fresh = existing is None and self._no_issue_intent(ctx, key, attempt)
         if fresh and not self._limits_allow(
-            ctx.campaign["project_id"], spec_stage.max_exposure_cents
+            ctx.campaign["project_id"], spec_stage.max_exposure_cents, attempt
         ):
-            self._note_waiting_limits(ctx, key, spec_stage.max_exposure_cents)
+            self._note_waiting_limits(ctx, key, spec_stage.max_exposure_cents, attempt)
             raise _Waiting
         provider = self._provider(spec_stage)
         slot_free = getattr(provider, "slot_free", None)
@@ -3446,7 +3571,41 @@ class CampaignRunner:
                 {"stage_key": stage["stage_key"], "attempt": attempt["attempt"]},
                 provenance,
             )
+            self._record_slot_reacquired(connection, ctx, key, attempt, result.response["id"])
         return True
+
+    def _record_slot_reacquired(
+        self,
+        connection: sqlite3.Connection,
+        ctx: _Ctx,
+        key: str,
+        attempt: dict[str, Any],
+        grant_id: str,
+    ) -> None:
+        """A grant issued after a paused-campaign release (ADR 0167) is the slot re-acquired:
+        one event on the receipt, in the grant's own transaction."""
+        previous = connection.execute(
+            """SELECT id, attempt FROM campaign_stage_attempts WHERE campaign_id=?
+            AND stage_key=? AND attempt<? AND failure_class=? AND failure_detail=?
+            ORDER BY attempt DESC LIMIT 1""",
+            (ctx.campaign["id"], key, attempt["attempt"], NOT_STARTED, PAUSED_RELEASE_DETAIL),
+        ).fetchone()
+        if previous is None or previous["attempt"] != attempt["attempt"] - 1:
+            return
+        self.store.record_runner_event(
+            connection,
+            ctx.campaign,
+            SLOT_REACQUIRED_EVENT,
+            {
+                "stage_key": key,
+                "attempt": attempt["attempt"],
+                "attempt_id": attempt["id"],
+                "previous_attempt_id": previous["id"],
+                "grant_id": grant_id,
+                "released_by": "system",
+                "automatic": True,
+            },
+        )
 
     def _record_code_grant_in(
         self,
@@ -4823,6 +4982,148 @@ class CampaignRunner:
                     grant_id=grant["id"],
                 )
         self._actions.append(f"exit_resolved:{key}:{attempt['attempt']}:{verdict.failure_class}")
+        return True
+
+    # -- exited without a report (ADR 0158) -----------------------------------------
+
+    def _close_unreported_exits(self, ctx: _Ctx) -> None:
+        """Close admitted or running attempts whose container the stage watcher saw exit and
+        whose executor never reported (``campaign_exit_without_report``)."""
+        rows = self._rows(
+            "SELECT * FROM campaign_stage_attempts WHERE campaign_id=? AND status IN "
+            "('admitted','running') AND settled_cents IS NULL AND grant_id IS NOT NULL "
+            "AND operation_id IS NOT NULL",
+            (ctx.campaign["id"],),
+        )
+        for attempt in rows:
+            try:
+                self._close_unreported_exit(ctx, attempt)
+            except (sqlite3.IntegrityError, Conflict):
+                log.error("unreported-exit close rolled back for attempt %s", attempt["id"])
+
+    def _close_unreported_exit(self, ctx: _Ctx, attempt: dict[str, Any]) -> bool:
+        """Close one attempt, settle it at zero and release its grant and slot in one transaction.
+
+        Re-assessed inside the transaction under the runner lease and guarded on the grant's
+        revision (``release_grant``), exactly like ``_resolve_exited``: a second closer (ADR 0053,
+        ADR 0048, a human reconcile, a second sweep) raises ``Conflict`` and rolls this back."""
+        key = attempt["stage_key"]
+        try:
+            stage = self._spec_stage(ctx, key)
+            descriptor = self._provider(stage).descriptor
+        except KeyError:
+            return False
+        free = descriptor.kind == "worker_grant" and not descriptor.billable
+        with self.store.runner_connection() as connection:
+            fresh = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+            ).fetchone()
+            if fresh is None:
+                return False
+            verdict = assess_unreported_exit(
+                connection,
+                fresh,
+                now=self.now(),
+                free_worker_grant=free,
+                transient_codes=frozenset(stage.retry.transient_exit_codes),
+                grace=self.exit_report_grace_seconds,
+                progress=self.upload_progress,
+                approval_expires=_approval_expiry(ctx),
+            )
+            if verdict is None:
+                return False
+            self._hold_lease(connection)
+            status, failure_class, detail = verdict.status, verdict.failure_class, verdict.detail
+            if (
+                verdict.exit_class in ("killed", "oom")
+                and stage.retry.infra_retries > 0
+                and verdict.exit_code in stage.retry.infra_exit_codes
+            ):
+                # ADR 0058: with infrastructure retries on, a kill spends the infra bound, not a
+                # scientific retry. Once that bound is spent the close stays failed_transient /
+                # exited_without_report (never permanent on the watcher's word) and the stage's
+                # own max_attempts ends it.
+                infra = self._infra_failure(
+                    ctx,
+                    key,
+                    stage,
+                    fresh,
+                    verdict.exit_code,
+                    "failed_permanent",
+                    "undeclared_exit_code",
+                    connection,
+                )
+                if infra is not None:
+                    status, failure_class = infra[0], infra[1]
+                    detail = f"{infra[2]}; {verdict.detail}"[:500]
+            now = _iso(self.now())
+            grant = connection.execute(
+                "SELECT * FROM execution_grants WHERE id=?", (fresh["grant_id"],)
+            ).fetchone()
+            actor = self._actor_principal(connection, ctx.campaign["id"])
+            if (
+                release_grant(connection, grant, cents=verdict.cents, principal_id=actor, now=now)
+                is None
+            ):
+                return False
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=? AND settled_cents IS NULL AND status IN ('admitted','running')",
+                (attempt["id"],),
+                status=status,
+                failure_class=failure_class,
+                failure_detail=detail,
+            )
+            evidence = {"evidence_digest": verdict.digest, **verdict.evidence}
+            self._settle(
+                connection, attempt["id"], verdict.cents, verdict.basis, {"exit_resolved": evidence}
+            )
+            payload = {
+                "grant_id": grant["id"],
+                "operation_id": verdict.evidence["operation_id"],
+                "settlement_cents": verdict.cents,
+                "released_hold_cents": verdict.evidence["hold_cents"],
+                "observation_cursor": None,
+                "watch_event_cursor": verdict.evidence["watch_event_cursor"],
+                "provider_termination_inferred": False,
+                "operational_only": True,
+            }
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "execution.exited_grant_reconciled",
+                payload,
+                task_id=grant["task_id"],
+            )
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "campaign.attempt_exit_resolved",
+                {
+                    "stage_key": key,
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "outcome": status,
+                    "failure_class": failure_class,
+                    "closed_reason": verdict.failure_class,
+                    "exit_class": verdict.exit_class,
+                    "exit_code": verdict.exit_code,
+                    "watch_event_cursor": verdict.evidence["watch_event_cursor"],
+                    "evidence_digest": verdict.digest,
+                    "was_status": verdict.evidence["was_status"],
+                    "automatic": True,
+                    "is_evidence": False,
+                    **{
+                        k: payload[k]
+                        for k in ("grant_id", "settlement_cents", "released_hold_cents")
+                    },
+                },
+                task_id=grant["task_id"],
+            )
+        self._actions.append(
+            f"exited_without_report:{key}:{attempt['attempt']}:{verdict.exit_class}"
+        )
         return True
 
     # -- blocked --------------------------------------------------------------------

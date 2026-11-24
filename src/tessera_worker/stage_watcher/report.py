@@ -1,8 +1,10 @@
 """Closed watch reports and the control sink that delivers them.
 
 A report carries ids, a kind from a closed set, an ISO 8601 time, integer counters from a
-closed key set, the kill-switch state and the contract digest. It never carries free text, a
-log line, a prompt, a destination or a credential.
+closed key set, the kill-switch state and the contract digest. A ``failed`` report about a
+container the probe read as definitively exited (an integer exit code) may also carry the
+optional closed ``exit`` object ``{exit_code, oom_killed}`` (ADR 0158); no other report ever
+does. It never carries free text, a log line, a prompt, a destination or a credential.
 """
 
 from __future__ import annotations
@@ -49,6 +51,10 @@ BODY_KEYS: frozenset[str] = frozenset(
         "contract_digest",
     }
 )
+# Optional body keys: present only when set. ``exit`` is only ever on a ``failed`` report.
+OPTIONAL_BODY_KEYS: frozenset[str] = frozenset({"exit"})
+EXIT_KEYS: frozenset[str] = frozenset({"exit_code", "oom_killed"})
+MAX_EXIT_CODE = 255
 MAX_IDEMPOTENCY_KEY_CHARS = 128
 MAX_COUNTER = 2**53  # the control route accepts counters up to 2**53
 
@@ -63,6 +69,35 @@ def _non_negative_int(name: str, value: object) -> None:
 
 
 @dataclass(frozen=True)
+class WatchExit:
+    """What the probe read for a definitively exited container: its integer exit code and
+    whether the kernel's out-of-memory killer ended it. Never built for an unknown, absent or
+    deadline failure, nor for an exit with no code."""
+
+    exit_code: int
+    oom_killed: bool
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.exit_code, bool)
+            or not isinstance(self.exit_code, int)
+            or not 0 <= self.exit_code <= MAX_EXIT_CODE
+        ):
+            raise ValueError("exit_code must be an integer in 0..255.")
+        if not isinstance(self.oom_killed, bool):
+            raise ValueError("oom_killed must be a bool.")
+
+    def to_body(self) -> dict[str, Any]:
+        return {"exit_code": self.exit_code, "oom_killed": self.oom_killed}
+
+    @classmethod
+    def from_body(cls, body: object) -> WatchExit:
+        if not isinstance(body, Mapping) or set(body) != EXIT_KEYS:
+            raise ValueError("exit must have exactly the closed key set.")
+        return cls(exit_code=body["exit_code"], oom_killed=body["oom_killed"])
+
+
+@dataclass(frozen=True)
 class WatchReport:
     operation_id: str
     lease_id: str
@@ -73,6 +108,7 @@ class WatchReport:
     counters: Mapping[str, int]
     kill_switch_engaged: bool
     contract_digest: str
+    exit: WatchExit | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation_id, str) or not _OPERATION_ID.fullmatch(self.operation_id):
@@ -97,14 +133,19 @@ class WatchReport:
             raise ValueError("kill_switch_engaged must be a bool.")
         if not isinstance(self.contract_digest, str) or not _DIGEST.fullmatch(self.contract_digest):
             raise ValueError("contract_digest must be a sha256 hex digest.")
+        if self.exit is not None:
+            if not isinstance(self.exit, WatchExit):
+                raise ValueError("exit must be None or a WatchExit.")
+            if self.kind != "failed":
+                raise ValueError("only a failed report may carry an exit.")
 
     @property
     def idempotency_key(self) -> str:
         return idempotency_key(self.operation_id, self.seq)
 
     def to_body(self) -> dict[str, Any]:
-        """The closed JSON body for the control watch-reports route."""
-        return {
+        """The closed JSON body for the control watch-reports route (``exit`` only when set)."""
+        body: dict[str, Any] = {
             "lease_id": self.lease_id,
             "expected_epoch": self.epoch,
             "kind": self.kind,
@@ -114,10 +155,17 @@ class WatchReport:
             "kill_switch_engaged": self.kill_switch_engaged,
             "contract_digest": self.contract_digest,
         }
+        if self.exit is not None:
+            body["exit"] = self.exit.to_body()
+        return body
 
     @classmethod
     def from_body(cls, operation_id: str, body: Mapping[str, Any]) -> WatchReport:
-        if not isinstance(body, Mapping) or set(body) != BODY_KEYS:
+        if (
+            not isinstance(body, Mapping)
+            or set(body) - OPTIONAL_BODY_KEYS != BODY_KEYS
+            or not set(body) <= BODY_KEYS | OPTIONAL_BODY_KEYS
+        ):
             raise ValueError("report body must have exactly the closed key set.")
         observed_at = body["observed_at"]
         if not isinstance(observed_at, str):
@@ -132,6 +180,7 @@ class WatchReport:
             counters=body["counters"],
             kill_switch_engaged=body["kill_switch_engaged"],
             contract_digest=body["contract_digest"],
+            exit=WatchExit.from_body(body["exit"]) if "exit" in body else None,
         )
 
 

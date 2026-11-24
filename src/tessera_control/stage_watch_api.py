@@ -45,6 +45,10 @@ def report_stage_watch(
     operation_id: str, body: ReportStageWatch, worker: Worker, key: Key, store: Store
 ) -> JSONResponse:
     payload = body.model_dump(mode="json")
+    if payload.get("exit") is None:
+        # The optional ``exit`` (ADR 0158) is left out when absent, so a report without it keeps
+        # the exact body and idempotency digest it had before the field existed.
+        payload.pop("exit", None)
     try:
         status, response = store.report_stage_watch(
             worker, operation_id, key, canonical_digest(payload), payload

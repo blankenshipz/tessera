@@ -34,6 +34,7 @@ from . import (
 )
 from .campaign_infra_retry import INFRA_PREFIX
 from .campaign_models import NormalStage, _validate_provider, stage_on_candidate, stage_provider
+from .concurrency_ceiling import operator_concurrency_ceiling
 from .store import Conflict
 
 PLACED_EVENT = "campaign.stage_placed"
@@ -178,8 +179,11 @@ def allowed_after_steering(
 # -- capacity --------------------------------------------------------------------------------
 
 
-def project_limits_allow(connection: sqlite3.Connection, project_id: str, hold: int) -> bool:
-    """The project's concurrency and monetary limits admit one more grant of ``hold``."""
+def project_limits_allow(
+    connection: sqlite3.Connection, project_id: str, hold: int, ahead: int = 0
+) -> bool:
+    """The project's concurrency and monetary limits admit one more grant of ``hold``,
+    after the ``ahead`` attempts queued before it (fair FIFO, ``waiters_ahead``)."""
     limits = connection.execute(
         "SELECT * FROM execution_project_limits WHERE project_id=?", (project_id,)
     ).fetchone()
@@ -191,7 +195,7 @@ def project_limits_allow(connection: sqlite3.Connection, project_id: str, hold: 
         (project_id,),
     ).fetchone()
     return bool(
-        unresolved["n"] < limits["max_concurrency"]
+        unresolved["n"] + ahead < operator_concurrency_ceiling().admits(limits["max_concurrency"])
         and limits["held_cents"] + limits["settled_cents"] + hold <= limits["monetary_limit_cents"]
     )
 
@@ -309,6 +313,8 @@ def _check(
                 return Skip(pid, "program_budget", refusal)
             if exposure_open(connection):
                 return Skip(pid, "exposure_open", "an attempt's provider exposure is unresolved")
+        # A pre-filter, not an admission: it ignores the FIFO line (``ahead``). The grant is
+        # admitted only by the runner's ``issue_grant`` check, which counts earlier waiters.
         if not project_limits_allow(connection, campaign["project_id"], hold):
             return Skip(pid, "project_limits", "project concurrency or monetary limit")
     slots = free_slots(rt, ctx, provider, stage)

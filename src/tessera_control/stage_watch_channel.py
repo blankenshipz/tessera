@@ -97,6 +97,10 @@ class InProcessWatchChannel:
             payload = ReportStageWatch.model_validate(json.loads(encoded)).model_dump(mode="json")
         except ValidationError:
             raise _refused(422) from None
+        if payload.get("exit") is None:
+            # As the route does (ADR 0158): an absent ``exit`` is left out, so both paths hash
+            # the same body and a replay across them is not a key conflict.
+            payload.pop("exit", None)
         try:
             _status, response = self._store.report_stage_watch(
                 self._worker, operation_id, key, canonical_digest(payload), payload

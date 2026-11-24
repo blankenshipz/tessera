@@ -629,6 +629,17 @@ def _attempt_entry(
             "evidence_digest": seen.get("evidence_digest"),
             "is_evidence": False,
         }
+        if seen.get("closed_reason") is not None:
+            # ADR 0158: closed on a watcher-reported exit with no run report; the closed reason,
+            # the exit class and the watch event it was based on (older entries keep their shape).
+            entry["exit_resolved"].update(
+                {
+                    "closed_reason": seen["closed_reason"],
+                    "exit_class": seen.get("exit_class"),
+                    "exit_code": seen.get("exit_code"),
+                    "watch_event_cursor": seen.get("watch_event_cursor"),
+                }
+            )
     return {**entry, **extra}
 
 

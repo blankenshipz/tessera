@@ -3,6 +3,9 @@
 A stage watch report is an operational, unverified worker assertion about a running
 stage: a heartbeat, progress, a stuck or a failed signal with a few bounded counters.
 It never carries free text, so nothing a stage prints can reach the control plane.
+
+A ``failed`` report may carry the optional closed ``exit`` object (ADR 0158): the exit code and
+OOM flag the probe read for a definitively exited container. Reports without it stay valid.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from .egress_models import Identifier, Sha256
 from .execution_models import ExecutionRequest, ReportExecutionObservation
@@ -35,6 +38,13 @@ class WatchCounters(ExecutionRequest):
     dropped_reports: Counter | None = None
 
 
+class WatchExit(ExecutionRequest):
+    """A definitive container exit as the watcher's probe read it: no other keys."""
+
+    exit_code: Annotated[int, Field(strict=True, ge=0, le=255)]
+    oom_killed: bool
+
+
 class ReportStageWatch(ExecutionRequest):
     lease_id: Identifier
     expected_epoch: Annotated[int, Field(strict=True, ge=0)]
@@ -44,6 +54,13 @@ class ReportStageWatch(ExecutionRequest):
     counters: WatchCounters
     kill_switch_engaged: bool
     contract_digest: Sha256
+    exit: WatchExit | None = None
+
+    @model_validator(mode="after")
+    def exit_only_on_failed(self) -> ReportStageWatch:
+        if self.exit is not None and self.kind != "failed":
+            raise ValueError("only a failed report may carry an exit")
+        return self
 
     @field_validator("observed_at", mode="before")
     @classmethod

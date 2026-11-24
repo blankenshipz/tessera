@@ -81,9 +81,11 @@ from .killswitch import KillSwitch
 from .outbox import WatchOutbox
 from .probe import ComputeProbe, ProbeSample
 from .report import (
+    MAX_EXIT_CODE,
     TRANSIENT,
     DeliveryResult,
     ReportKind,
+    WatchExit,
     WatchReport,
     WatchReportSink,
     settles,
@@ -107,6 +109,22 @@ def _result(value: object) -> DeliveryResult:
     if value is True:
         return DeliveryResult("delivered")
     return TRANSIENT
+
+
+def _definite_exit(kind: ReportKind, sample: ProbeSample) -> WatchExit | None:
+    """The ``exit`` a ``failed`` report carries (ADR 0158): only for a sample the probe read as
+    definitively ``exited`` with an integer exit code in 0..255. A failure from an unknown or
+    absent probe, a passed deadline, or an exit with no code carries none."""
+    code = sample.exit_code
+    if (
+        kind != "failed"
+        or sample.state != "exited"
+        or isinstance(code, bool)
+        or not isinstance(code, int)
+        or not 0 <= code <= MAX_EXIT_CODE
+    ):
+        return None
+    return WatchExit(exit_code=code, oom_killed=sample.oom_killed)
 
 
 def _check_budget(max_posts: int | None) -> None:
@@ -467,6 +485,7 @@ class StageWatcher:
             counters=counters,
             kill_switch_engaged=engaged,
             contract_digest=self._digest,
+            exit=_definite_exit(kind, sample),
         )
         self._outbox.record(report)  # record BEFORE any delivery attempt
         if kind in TERMINAL_KINDS:

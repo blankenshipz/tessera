@@ -100,18 +100,30 @@ def _admit(world, cid):
 def _gave_up_while_running(world, cid):
     """The container ran and control accepted its ``running`` observation (with the container
     id); the lease renewal then failed, the service gave up (``result.json`` unknown) and no
-    exit was ever reported."""
+    exit was ever reported.
+
+    The give-up cancel could not confirm termination (the container may still run): a cancel
+    the provider confirms with an exit code is reported by the worker itself (ADR 0158), and
+    termination evidence is only needed when that report never happened."""
     _admit(world, cid)
     original = world.channel.post
+    factory = world.poller.service_factory
 
     def cut(path, body, key):
         if "/worker/leases/renew" in path:
             raise ConnectionError("synthetic renewal loss")
         return original(path, body, key)
 
+    def unconfirmed_cancel(config):
+        service = factory(config)
+        service.adapter.cancel_unknown = True
+        return service
+
     world.channel.post = cut
+    world.poller.service_factory = unconfirmed_cancel
     world.poller.run(max_cycles=1)
     world.channel.post = original
+    world.poller.service_factory = factory
     attempt = world.attempts(cid)[-1]
     grant_dir = world.tmp / "worker-root" / "grants" / attempt["grant_id"]
     result = json.loads((grant_dir / "result.json").read_text())

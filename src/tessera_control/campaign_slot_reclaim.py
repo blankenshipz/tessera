@@ -37,6 +37,10 @@ SLOT_FREED_EVENT = "campaign.slot_freed"
 PLACED_NOT_GRANTED = "placed_not_granted"
 EXPIRED_UNCLAIMED_GRANT = "expired_unclaimed_grant"
 NOT_STARTED_EVIDENCE = "not_started_evidence"
+PAUSED_UNLEASED_GRANT = "paused_unleased_grant"
+SLOT_REACQUIRED_EVENT = "campaign.slot_reacquired"
+# Marks an attempt closed by the paused-campaign release; the re-acquire event looks for it.
+PAUSED_RELEASE_DETAIL = "grant released while the campaign was paused (paused_slot_release)"
 # Non-terminal statuses in which the runner issues no grant and drives no attempt forward.
 STUCK_CAMPAIGN = ("blocked", "paused_delegation_lapsed")
 # Events after which a campaign may be running again; a later freeing is a new spell.
@@ -201,3 +205,56 @@ def idle_slot_holders(
         )
     ]
     return ids, (ids[-1] if ids and len(ids) >= limit else None)
+
+
+def releasable_paused_grant(connection: sqlite3.Connection, attempt_id: str) -> sqlite3.Row | None:
+    """The attempt's grant when a paused campaign may give it back, else None (fail closed).
+
+    Unlike ``unclaimed_expired_grant`` the grant may still be live: a paused campaign starts
+    nothing, so a grant nobody ever took cannot be used by the campaign. The evidence is that
+    no worker ever took a lease on it, no external operation exists for it and the attempt
+    has recorded no operation of its own. The store refuses a lease on a reconciled grant,
+    and the caller re-reads all of this inside the write transaction. A grant in
+    ``cancel_requested``, with any lease row (even an expired one) or with any operation is
+    never released here."""
+    attempt = connection.execute(
+        """SELECT * FROM campaign_stage_attempts WHERE id=? AND grant_id IS NOT NULL
+        AND status IN ('granted','admitted') AND settled_cents IS NULL
+        AND operation_id IS NULL""",
+        (attempt_id,),
+    ).fetchone()
+    if attempt is None:
+        return None
+    return connection.execute(
+        """SELECT * FROM execution_grants g WHERE g.id=? AND g.status='active'
+        AND NOT EXISTS (SELECT 1 FROM execution_leases l WHERE l.grant_id=g.id)
+        AND NOT EXISTS (SELECT 1 FROM external_operations o WHERE o.grant_id=g.id)""",
+        (attempt["grant_id"],),
+    ).fetchone()
+
+
+def waiters_ahead(
+    connection: sqlite3.Connection, project_id: str, attempt: Mapping[str, Any]
+) -> int:
+    """Attempts of the project queued for a grant before ``attempt`` (fair FIFO).
+
+    A waiter is a reserved attempt with no grant and no grant request, of a campaign the
+    runner is driving and that is not paused, that was refused for the project limits
+    (``campaign.stage_waiting_limits`` carries its ``attempt_id``). Order is the attempt's
+    creation time, then id: a resumed campaign's new attempt joins the back of the line."""
+    row = connection.execute(
+        """SELECT count(*) AS n FROM campaign_stage_attempts w
+        JOIN campaigns wc ON wc.id=w.campaign_id
+        WHERE wc.project_id=? AND wc.status IN ('running','stopping')
+        AND w.status='reserved' AND w.grant_id IS NULL AND w.id<>?
+        AND (w.created_at < ? OR (w.created_at = ? AND w.id < ?))
+        AND NOT EXISTS (SELECT 1 FROM campaign_steering s
+            WHERE s.campaign_id=w.campaign_id AND s.paused=1)
+        AND NOT EXISTS (SELECT 1 FROM campaign_step_intents i WHERE i.campaign_id=w.campaign_id
+            AND i.stage_key=w.stage_key AND i.attempt=w.attempt AND i.step='issue_grant')
+        AND EXISTS (SELECT 1 FROM events e WHERE e.project_id=wc.project_id
+            AND e.event_type='campaign.stage_waiting_limits'
+            AND json_extract(e.payload_json, '$.attempt_id')=w.id)""",
+        (project_id, attempt["id"], attempt["created_at"], attempt["created_at"], attempt["id"]),
+    ).fetchone()
+    return int(row["n"])

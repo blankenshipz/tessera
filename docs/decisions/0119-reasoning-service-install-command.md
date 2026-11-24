@@ -78,3 +78,31 @@ did each by hand, and any slip (a wrong owner, mode or reference) surfaced only 
 `tests/test_reasoning_install.py` (the plan writes nothing, apply builds the exact tree with modes and
 owners, a second apply is a no-op, caps change only the limits, refusals, the key and token are never
 touched, the unit equals the shipped file) and `tests/test_reasoning_install_cli.py` (the command).
+
+## Amendment (2026-11-23): one-shot exit codes, restart policy and a fresh run request
+
+The supervisor is one-shot: each run identity runs once. A completed run must leave the manual unit
+inactive, not failed, and a start that finds its run identity already closed must not count as a
+failure or loop into the start limit.
+
+- **Exit codes of `run`.** 0 completed; 1 crash (uncaught, the interpreter's default); 2 ended
+  without completing (a fence or block, its code on the receipt, or a stop); 77 refused (supervisor
+  lock held, `supervisor_already_running`; run identity bound to another profile or prompt,
+  `run_identity_rebind_refused`); 78 configuration error (profile, prompt, `--run-id`, manager
+  credential directory or agent-token variable). `service_startup` keeps 78 for every refusal
+  before the runtime starts. Each refusal logs one sanitized line with a closed code.
+- **A closed run is never rerun.** When the journal shows the run identity completed, failed or
+  stopped, `run` makes no harness, control-plane, grant, ledger or model call; it prints the
+  journal's receipt, logs `run <id> already closed (state <state>); not rerun, no model call` and
+  exits 0 when the run completed, 2 otherwise. Uncertain calls stay as they were for the operator.
+- **Unit.** `Restart=on-failure` stays so a crash resumes from the journal without replay;
+  `RestartPreventExitStatus=2 77 78`; exit 0 is the only success (`SuccessExitStatus` is not set);
+  `StartLimitBurst=3` in 120 seconds and no `[Install]` section as before.
+- **A fresh run request.** The profile's `run_id` stays the default run identity, so a restart
+  after a crash resumes the same run. A new run gets a new identity from the request: `run --run-id
+  ID` (CLI), or `tessera reasoning install --apply --new-run`, which writes a generated `run-<16
+  hex>` identity and the installed prompt's digest into the profile (never printed in the plan).
+  Grant, epoch, expiry, budget, spend ledger, caps, kill switch and the API-key refusal apply to
+  every new run as to the first.
+
+Tests: `tests/test_reasoning_oneshot_exit.py`.

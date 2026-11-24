@@ -481,9 +481,28 @@ python -m tessera_agent.remote_reasoning_runtime stop \
 ```
 
 Run under an operator-installed systemd/launchd service, on the authorized host,
-as a dedicated user with private state. Use `Restart=on-failure` and a credentials
-delivery mechanism rather than inline service-file token values. A nonzero exit
-after a fenced run does not restart reasoning: terminal journal states are retained.
+as a dedicated user with private state. Use `Restart=on-failure` with
+`RestartPreventExitStatus=2 77 78` and a credentials delivery mechanism rather than inline
+service-file token values. A nonzero exit after a fenced run does not restart reasoning:
+terminal journal states are retained.
+
+The supervisor is one-shot: a run identity runs once. Exit codes of `run`:
+
+| Exit | Meaning | Unit restarts it |
+| --- | --- | --- |
+| 0 | The run completed, or this run identity had already completed before this start (logged `run <id> already closed (state completed); not rerun, no model call`). | No |
+| 1 | Unexpected crash (Python's default exit). The journal lets the restart resume without replaying a call. | Yes (`Restart=on-failure`) |
+| 2 | The run ended without completing: a fence or block halted it (the receipt's `reason`, e.g. `budget_exhausted`, `grant_revoked`, `tool_catalog_changed`) or it was stopped. Also a start of a run identity that had already ended that way. | No |
+| 77 | Refused: another supervisor holds the state directory (`supervisor_already_running`), or the run identity is already bound to another profile or prompt (`run_identity_rebind_refused`). | No |
+| 78 | Configuration error: unreadable or invalid profile or prompt, invalid `--run-id`, missing manager credential directory or agent-token variable; also every refusal of `service_startup` before the runtime starts (API-key variable present, missing or mismatched credential files). | No |
+
+A closed run (completed, failed or stopped) is never resumed or rerun: a later start with the
+same run identity makes no harness, control-plane, grant, ledger or model call, prints the
+journal's receipt and exits 0 (completed) or 2 (otherwise). `report` exits 0 when provenance
+delivery is complete and 2 otherwise. For the next run, give it a new run identity: `run
+--run-id ID` (also accepted by `status`, `stop` and `report`) overrides the profile's `run_id`
+for that request, and for the installed unit `tessera reasoning install --apply --new-run` writes
+a freshly generated `run_id`, bound to the installed prompt's digest, into the profile.
 Closing Electron does not affect this process. Hard host-supervisor-loss and
 independent-host proof still require the actual host test; no laptop-off result is
 claimed from Python unit tests.

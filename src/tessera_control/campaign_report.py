@@ -42,6 +42,8 @@ _FAILURES = {
     "not_started": "it was never started",
     "exit_confirmed_unresolved": "the program was confirmed to have exited but its result could "
     "not be resolved",
+    "exited_without_report": "the program's container was seen to exit but the worker never "
+    "reported the result",
     "cancelled": "it was cancelled",
     "holdout_already_claimed": "the held-out data had already been used",
     "sealed_partition": "it needed data from a sealed partition",
@@ -341,7 +343,15 @@ def _stage_report(
         notes.append("the worker has not sent a run receipt for every attempt")
     for attempt in attempts:
         if attempt.get("exit_resolved"):
-            notes.append("the result was resolved from the worker's confirmed exit, not measured")
+            if attempt["exit_resolved"].get("closed_reason"):
+                notes.append(
+                    "the attempt was closed after its container was seen to exit with no run "
+                    "report; nothing was measured"
+                )
+            else:
+                notes.append(
+                    "the result was resolved from the worker's confirmed exit, not measured"
+                )
             break
     egress = _egress(attempts)
     last_provider = attempts[-1].get("provider_id") if attempts else stage.get("provider_id")

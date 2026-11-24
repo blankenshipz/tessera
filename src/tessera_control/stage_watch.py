@@ -7,6 +7,11 @@ execution observations, external operations, budget, hold or settlement, custody
 attempt state, so it cannot affect money, custody or whether a stage succeeded. No table
 is added: the record is an event, and the bounds below are read back from the events.
 
+ADR 0158 amends this for one case only: a ``failed`` event carrying a definitive ``exit``
+may, much later and only when every fenced guard in ``campaign_exit_without_report`` holds,
+let the campaign runner close an attempt whose executor never reported (never as a pass,
+always settled at zero). Recording the report itself still writes nothing but the event.
+
 Bounds, all per operation and failing closed (numbers in ``stage_watch_limits``, shared
 with the worker's stage contract):
 
@@ -197,6 +202,12 @@ class StageWatchStore(ExecutionStore):
                 "operational_only": True,
                 "observation_proof": OBSERVATION_PROOF,
             }
+            if payload.get("exit") is not None:
+                # ADR 0158: the closed exit the probe read; only ever on a ``failed`` report.
+                event["exit"] = {
+                    "exit_code": payload["exit"]["exit_code"],
+                    "oom_killed": payload["exit"]["oom_killed"],
+                }
             self._event(
                 connection,
                 worker,

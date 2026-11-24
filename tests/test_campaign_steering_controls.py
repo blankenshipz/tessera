@@ -60,10 +60,20 @@ class Steer:
         return [e for e in self.env.events(event_type) if e["payload"]["campaign_id"] == self.cid]
 
 
+def _leased(s: Steer) -> bool:
+    attempts = s.attempts("s1")
+    return bool(
+        attempts
+        and attempts[0]["grant_id"]
+        and s.world.row("SELECT 1 FROM execution_leases WHERE grant_id=?", attempts[0]["grant_id"])
+    )
+
+
 def test_pause_stops_new_reservations_and_leaves_the_running_attempt(tmp_path):
     s = Steer(tmp_path)
     w = s.world
-    w.tick_until(lambda: s.attempts("s1") and s.attempts("s1")[0]["grant_id"], worker=False)
+    # ADR 0061: the attempt is in flight once the worker took the lease (ADR 0167).
+    w.tick_until(lambda: _leased(s))
     paused = s.call("pause_campaign", reason="look first")
     assert paused["paused"] is True and s.events("campaign.paused")
     for _ in range(40):  # the running s1 attempt completes; s2 must not be reserved
@@ -90,6 +100,43 @@ def test_pause_stops_new_reservations_and_leaves_the_running_attempt(tmp_path):
         "max_concurrent_stages": None,
         "stage_cancels": [],
     }
+
+
+def test_pause_before_the_worker_leases_releases_the_grant_and_resume_places_a_new_attempt(
+    tmp_path,
+):
+    """ADR 0167 amends ADR 0061: a granted but unleased attempt is not in flight, so a pause
+    gives its grant back; the attempt uses an attempt number but no retry; resume re-places it."""
+    s = Steer(tmp_path)
+    w = s.world
+    w.tick_until(lambda: s.attempts("s1") and s.attempts("s1")[0]["grant_id"], worker=False)
+    first = s.attempts("s1")[0]
+    assert not w.row("SELECT 1 FROM execution_leases WHERE grant_id=?", first["grant_id"])
+    s.call("pause_campaign", reason="look first")
+    for _ in range(6):
+        w.runner.tick()
+    (released,) = s.attempts("s1")
+    assert released["status"] == "failed_transient" and released["failure_class"] == "not_started"
+    assert released["settled_cents"] == 0
+    grant = w.row("SELECT status FROM execution_grants WHERE id=?", first["grant_id"])
+    assert grant["status"] == "reconciled"
+    assert [
+        e
+        for e in s.events("campaign.slot_freed")
+        if e["payload"]["reason"] == ("paused_unleased_grant")
+    ]
+    assert w.status(s.cid) == "running" and not s.events("campaign.slot_reacquired")
+    s.call("resume_campaign", reason="continue")
+    w.tick_all(s.cid)
+    assert w.status(s.cid) == "succeeded", dump(w, s.cid)
+    assert [a["attempt"] for a in s.attempts("s1")] == [1, 2]
+    assert s.attempts("s1")[1]["status"] == "succeeded"
+    (again,) = s.events("campaign.slot_reacquired")
+    assert again["payload"]["previous_attempt_id"] == released["id"]
+    retries = w.row(
+        "SELECT attempts_used FROM campaign_stages WHERE campaign_id=? AND stage_key='s1'", s.cid
+    )
+    assert retries["attempts_used"] == 2  # an attempt number, not a scientific retry
 
 
 def test_a_campaign_nobody_steered_has_no_steering_receipt_section(tmp_path):

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (GRANT_MODEL_SPEND_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 88
+# Literal: must equal the highest registered constant (PROJECT_CONCURRENCY_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 89
 LOCAL_ORG_ID = "org_local"
 
 
@@ -1974,3 +1974,67 @@ def migrate_grant_model_spend_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(GRANT_MODEL_SPEND_SCHEMA_VERSION - 1, migrate_grant_model_spend_schema)
+
+
+# The project concurrency ceiling (ADR 0171, schema 89): rebuild execution_project_limits so its
+# CHECK is the hard cap (1 to 64) instead of 1 to 8; the operator's ceiling (default 8) is enforced
+# where a request is accepted. Rows are copied unchanged. Reserved as 102 on its branch; the
+# registry requires a contiguous chain, so it takes the next free version (89). If another change
+# owns it when branches merge, raise PROJECT_CONCURRENCY_SCHEMA_VERSION, LATEST_SCHEMA_VERSION (the
+# literal near the top) and the fresh-database INSERT in store.py.
+PROJECT_CONCURRENCY_SCHEMA_VERSION = 89
+
+
+def migrate_project_concurrency_schema(connection: sqlite3.Connection) -> None:
+    from .execution import PROJECT_LIMITS_TABLE_SQL
+    from .store import StoreError
+
+    current = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='execution_project_limits'"
+    ).fetchone()
+    if current is None:
+        connection.execute(PROJECT_LIMITS_TABLE_SQL)
+    elif current[0] != PROJECT_LIMITS_TABLE_SQL:
+        before = connection.execute(
+            "SELECT * FROM execution_project_limits ORDER BY project_id"
+        ).fetchall()
+        fk_before = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+        columns = (
+            "project_id,revision,currency,monetary_limit_cents,max_concurrency,"
+            "held_cents,settled_cents,created_at,updated_at"
+        )
+        connection.execute("DROP TABLE IF EXISTS temp._project_limits_old")
+        connection.execute(
+            f"CREATE TEMP TABLE _project_limits_old AS SELECT {columns} "
+            "FROM execution_project_limits"
+        )
+        connection.execute("DROP TABLE execution_project_limits")
+        connection.execute(PROJECT_LIMITS_TABLE_SQL)
+        connection.execute(
+            f"INSERT INTO execution_project_limits ({columns}) "
+            f"SELECT {columns} FROM temp._project_limits_old"
+        )
+        connection.execute("DROP TABLE temp._project_limits_old")
+        after = connection.execute(
+            "SELECT * FROM execution_project_limits ORDER BY project_id"
+        ).fetchall()
+        fk_after = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+        if [tuple(row) for row in after] != [tuple(row) for row in before] or fk_after > fk_before:
+            raise StoreError(
+                "Cannot migrate project execution limits to schema 89 safely. Nothing was "
+                "changed. File-copy the whole state directory (the database and its -wal/-shm "
+                "files) first, then report this error with that copy."
+            )
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (PROJECT_CONCURRENCY_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(PROJECT_CONCURRENCY_SCHEMA_VERSION - 1, migrate_project_concurrency_schema)

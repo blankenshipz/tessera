@@ -95,9 +95,34 @@ hundredths (`*_cents`); there is no exchange-rate conversion or provider invoice
 integration. Held plus settled amounts cannot exceed the limit when admitting new
 work. The same check applies to cumulative settled costs for the task across all
 plan revisions, plus its held/new reservations, against the current approved task
-budget. A plan revision does not reset spent money. Concurrency is 1–8 unresolved
-grants per project, with at most one unresolved grant per task. Currency cannot
-change while exposure or unresolved grants remain.
+budget. A plan revision does not reset spent money. Concurrency is 1 up to the
+installation's project concurrency ceiling (default 8) unresolved grants per project,
+with at most one unresolved grant per task. Currency cannot change while exposure or
+unresolved grants remain.
+
+### Project concurrency ceiling
+
+The ceiling is an operator setting
+([ADR 0171](decisions/0171-project-concurrency-ceiling.md)):
+
+| Setting | Default | Range | Where |
+| --- | --- | --- | --- |
+| `TESSERA_MAX_PROJECT_CONCURRENCY` | 8 | 1 to 64 (the hard cap) | control environment, read once at startup |
+
+Only the operator's environment sets it. No API field, MCP tool, campaign spec or
+stage input can raise it, and the route that sets a project's `max_concurrency`
+stays human-only. A value that is not plain ASCII digits, or lies outside 1 to 64,
+stops the control service at start with a clear error; it never falls back to
+another value. An empty value counts as unset. `PUT /projects/{id}/execution-limits`
+refuses a `max_concurrency` above the ceiling with 422 and a message naming the
+ceiling (above the hard cap 64, the request is invalid as before). If the operator
+later lowers the ceiling, a project whose stored limit is higher admits new grants
+(and campaign placement) only up to the ceiling; grants already issued are not
+touched. When the operator set the variable, the `execution.limits_configured`
+event records it as `concurrency_ceiling`; the field is absent when the setting is
+unset, which means the default 8, so existing events and responses are unchanged.
+Schema 89 rebuilds `execution_project_limits` so its database CHECK is the hard cap
+(1 to 64) instead of 1 to 8; rows are copied unchanged.
 
 Local CPU infrastructure cost is unmeasured. A grant therefore requires explicit
 acknowledgement of that exposure; the recorded monetary reservation is not a

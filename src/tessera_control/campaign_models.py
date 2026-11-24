@@ -1968,6 +1968,7 @@ FAILURE_CLASSES = (
     "infra_resource_limit",
     "not_started",
     "exit_confirmed_unresolved",
+    "exited_without_report",
     "cancelled",
     "holdout_already_claimed",
     "sealed_partition",
