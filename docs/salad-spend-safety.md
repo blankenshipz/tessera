@@ -247,6 +247,21 @@ set `route_state_unreadable`, `create_failed`, `group_unsettled`, `ticket_mint_f
 `prestart_unclassified`; `exception` is the exception's type name only, never its text.
 It is `null` when no pre-start step failed (and absent from older receipts).
 
+Settle read: each exact observe of the new group during the pre-start settle wait is retried
+only when it fails transiently (a timeout, or a failed fresh provider read that is not
+deterministic and carries a 5xx or no HTTP status), at most `SETTLE_READ_ATTEMPTS` (3)
+attempts with pauses `SETTLE_READ_BACKOFF_SECONDS` (2 s, 4 s), never past the run deadline,
+heartbeating the guardian in between. A route conflict, a 3xx/4xx refusal, a deterministic
+read failure or any other error is not retried. The last failure still ends the run before
+start (`group_unsettled`, or `wall_bound_exceeded` for a timed-out bounded operation; status
+stays `inconclusive`, exact cancel and stop follow), so a group that cannot be read settled is
+never started. The receipt then adds `prestart_settle_read: {"call", "reason",
+"http_status_class", "attempts", "outcome"}` with `call` `observe` or `keepalive`, `reason`
+one of `read_unavailable`, `conflict_state`, `timeout`, `other`, `http_status_class` one of
+`2xx`, `3xx`, `4xx`, `5xx`, `none` (the class only), the attempt count, and `outcome`
+`failed` or `recovered` (a read that succeeded on retry). No exception text, body, URL or
+header is recorded. The field is absent when no settle read or heartbeat failed.
+
 Release: the trusted server sends admin `create_rejected` with the summary. The
 guardian re-validates it (closed keys, status 400/422, or 0 for a create that was never
 sent, bounded printable text).

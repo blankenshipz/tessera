@@ -1015,6 +1015,43 @@ MAX_TRANSIENT_OBSERVE_FAILURES = 3
 # after a read observed the group) and the pauses between them.
 START_PREFLIGHT_ATTEMPTS = 4
 START_PREFLIGHT_BACKOFF_SECONDS = (2, 4, 8)
+# Attempts at one pre-start settle read (an exact observe of the new group) and the pauses
+# between them. Only a transient failure is retried: a timeout, or a failed fresh provider
+# read that is not deterministic and carries a 5xx or no HTTP status class. A route conflict,
+# a 3xx/4xx refusal, a deterministic read failure or any other error fails at once. Every
+# retry also stops at the run deadline, and the guardian is heartbeat between attempts.
+SETTLE_READ_ATTEMPTS = 3
+SETTLE_READ_BACKOFF_SECONDS = (2, 4)
+# Closed vocabulary of the receipt's ``prestart_settle_read`` block.
+SETTLE_READ_CALLS = frozenset({"observe", "keepalive"})
+SETTLE_READ_REASONS = frozenset({"read_unavailable", "conflict_state", "timeout", "other"})
+HTTP_STATUS_CLASSES = frozenset({"2xx", "3xx", "4xx", "5xx", "none"})
+
+
+def _settle_read_failure(error):
+    """(reason, http_status_class, transient) of a failed settle step; closed values only.
+
+    Reads only the error's class and the transport's closed ``detail`` token; never its
+    message text, body, URL or headers."""
+    from .salad_guardian import is_deterministic_read_failure
+    from .salad_server import ProviderReadUnavailable
+    from .store import Conflict
+
+    status_class = "none"
+    if isinstance(error, ProviderReadUnavailable):
+        detail = getattr(error, "detail", None)
+        match = re.fullmatch(r"non_2xx_([2-5])xx", detail) if type(detail) is str else None
+        if match:
+            status_class = match.group(1) + "xx"
+        reason = "timeout" if detail == "timeout" else "read_unavailable"
+        transient = status_class in {"5xx", "none"} and not is_deterministic_read_failure(error)
+    elif isinstance(error, TimeoutError):
+        reason, transient = "timeout", True
+    elif isinstance(error, Conflict):
+        reason, transient = "conflict_state", False
+    else:
+        reason, transient = "other", False
+    return reason, status_class, transient
 
 
 def _guardian_code(error):
@@ -1114,6 +1151,11 @@ def _drive(
         # summary, no values): see salad_guardian.PRESTART_READ_RETRY_PREFIX.
         "start_preflight_retries": 0,
         "guardian_prestart_read_retries": None,
+        # Added only when a pre-start settle read or heartbeat failed (absent otherwise, so
+        # receipts without such a failure keep their digests): ``prestart_settle_read`` is
+        # {"call": observe|keepalive, "reason": read_unavailable|conflict_state|timeout|
+        # other, "http_status_class": 2xx|3xx|4xx|5xx|none, "attempts": n, "outcome":
+        # recovered|failed} for the latest such failure. Closed values only.
     }
     step = {"name": None}
 
@@ -1214,6 +1256,51 @@ def _drive(
             return
         beats["ok_at"], beats["transient"] = started, 0
 
+    def note_settle(call, error, attempts):
+        reason, status_class, transient = _settle_read_failure(error)
+        receipt["prestart_settle_read"] = {
+            "call": call,
+            "reason": reason,
+            "http_status_class": status_class,
+            "attempts": attempts,
+            "outcome": "failed",
+        }
+        return transient
+
+    def settle_beat():
+        """heartbeat() during the settle wait; a failure that escapes it is recorded."""
+        try:
+            heartbeat()
+        except Exception as error:
+            note_settle("keepalive", error, 1)
+            raise
+
+    def settle_read():
+        """One exact observe of the new group during the settle wait.
+
+        A transient failure (see SETTLE_READ_ATTEMPTS) is retried at most that many times
+        in all, never past the run deadline, heartbeating the guardian in between; anything
+        else, or the last failure, propagates unchanged (the run then fails closed as
+        group_unsettled and the group is never treated as settled). Each failure leaves its
+        closed reason on the receipt; a read that succeeded after a retry is marked
+        recovered."""
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                observed = dispatch("observe")
+            except Exception as error:
+                transient = note_settle("observe", error, attempts)
+                if not transient or attempts >= SETTLE_READ_ATTEMPTS or clock() >= deadline:
+                    raise
+                settle_beat()
+                pause = SETTLE_READ_BACKOFF_SECONDS[attempts - 1]
+                sleep(min(pause, max(0, deadline - clock())))
+                continue
+            if attempts > 1:
+                receipt["prestart_settle_read"].update(attempts=attempts, outcome="recovered")
+            return observed
+
     try:
         # This is a read of the durable record, not a new admission. A rerun or
         # reconnect with existing effects never reaches create/start.
@@ -1262,8 +1349,8 @@ def _drive(
             stopped_since = None
             settle_started = clock()
             for _ in range(max_polls):
-                heartbeat()
-                state = observe() or state
+                settle_beat()
+                state = settle_read()
                 polls += 1
                 if state.get("provider_id") and receipt["prestart_timestamps"]["bound"] is None:
                     stamp("bound")
