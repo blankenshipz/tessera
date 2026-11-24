@@ -28,12 +28,12 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-from tessera_agent.standing_loop import CallNotStarted
-from tessera_agent.stuck_loop_control import StuckControlError
+from tessera_agent.standing_loop import CallNotStarted, KillSwitchEngaged
+from tessera_agent.stuck_loop_control import FINDING_ID, StuckControlError
 from tessera_agent.stuck_work_source import CODES, KIND
 
 NO_MODEL = "none"
-_ITEM_ID = re.compile(r"(?P<fid>[A-Za-z0-9][A-Za-z0-9._:-]{0,127}):(?P<n>[1-9][0-9]*)\Z")
+_ITEM_ID = re.compile(rf"(?P<fid>{FINDING_ID}):(?P<n>[1-9][0-9]*)\Z")
 _SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 _ACTION = re.compile(r"[a-z0-9_]{1,100}\Z")
@@ -78,7 +78,7 @@ class StuckOfferHandler:
         self, item: dict, *, model: str, tier: str, identity_ref: str, policy_digest: str
     ) -> None:
         if self.kill_switch.engaged():
-            raise CallNotStarted("kill_switch")
+            raise KillSwitchEngaged("kill_switch")
         if model != NO_MODEL or tier != NO_MODEL:
             raise CallNotStarted("model_not_allowed")
         fields = self._fields(item)

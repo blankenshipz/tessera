@@ -17,6 +17,7 @@ from .campaign_image_pull import SECTION as IMAGE_PULL_SECTION
 from .campaign_image_pull import recorded as recorded_image_pulls
 from .campaign_io import stage_io
 from .campaign_models import (
+    PUBLIC_FETCH_UNREPORTED,
     normalize,
     parse_spec_json,
     public_fetch_host,
@@ -255,17 +256,18 @@ def public_fetch_entry(
 
     The pin (host, sha256) always comes from the approved spec. ``bytes`` and ``seconds`` come
     only from the provider's own reported ``fetched`` rows (``url``, ``sha256``, ``bytes``,
-    ``seconds``) for the same url and digest, marked ``provider_reported``; with none they are
-    null and the file is ``declared_only``. Only the host is printed, never the URL. For a provider
-    that is not a local worker, ``egress_allowlist`` states that the hosts are declared and the
-    redirect set enforced by the runtime, and that the provider's network is not restricted."""
-    files: list[tuple[str, str, str]] = []
+    ``seconds``) for the same url and digest whose byte count is within the pin's ``max_bytes``,
+    marked ``provider_reported``; with none they are null and the file is ``declared_only``. Only
+    the host is printed, never the URL. For a provider that is not a local worker,
+    ``egress_allowlist`` states that the hosts are declared and the redirect set enforced by the
+    runtime, and that the provider's network is not restricted."""
+    files: list[tuple[str, str, str, int]] = []
     hosts: set[str] = set()
     cache_requested = False
     for source in getattr(spec_stage, "inputs", ()):
         if getattr(source, "kind", None) != "public_artifact":
             continue
-        files += [(name, url, sha) for name, url, sha, _size in source.public_files]
+        files += list(source.public_files)
         hosts |= set(source.redirect_hosts)
         cache_requested = cache_requested or bool(getattr(source, "cache", False))
     if not files:
@@ -274,13 +276,14 @@ def public_fetch_entry(
         (row.get("url"), row.get("sha256")): row for row in fetched or () if isinstance(row, dict)
     }
     entries = []
-    for name, url, sha in files:
+    for name, url, sha, max_bytes in files:
         host = public_fetch_host(url)
         hosts.add(host)
         row = reported.get((url, sha))
         size = None if row is None else row.get("bytes")
         seconds = None if row is None else row.get("seconds")
-        if not isinstance(size, int) or isinstance(size, bool):
+        if not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= max_bytes:
+            # A count the pin could not have produced contradicts it: not evidence of anything.
             row, size, seconds = None, None, None
         if seconds is not None and (
             isinstance(seconds, bool) or not isinstance(seconds, (int, float))
@@ -561,6 +564,13 @@ def _attempt_entry(
         provider_id, spec_stage, _retained_fetched(connection, provider_id, attempt, spec_stage)
     )
     if public is not None:
+        if attempt["failure_class"] == PUBLIC_FETCH_UNREPORTED:
+            # ADR 0097: the attempt failed closed because the worker's fetch report never
+            # arrived; its files stay declared_only and the receipt says why.
+            public["refused"] = {
+                "code": PUBLIC_FETCH_UNREPORTED,
+                "reason": attempt["failure_detail"],
+            }
         entry["public_fetch"] = public
     seen_image = _image_provenance(connection, attempt)
     if seen_image is not None:

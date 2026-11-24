@@ -12,7 +12,7 @@ generic placeholder: `/etc/tessera` (configuration), `/var/lib/tessera` (state),
 | `tessera-salad-guardian.service` | `python -m tessera_control.salad_safety_service --run` |
 | `tessera-submit-runner.service` | `tessera-submit-runner`: submits owner-approved campaign records on a schedule (in the target, started only on an admitted host) |
 | `tessera-reasoning.service` | not here: it lives in `deploy/remote-agent-platform/` (manual start only, admission marker required, no `[Install]`) |
-| `tessera-stuck-loop.service` | `tessera-stuck-loop`: offers stuck-campaign findings to a standing loop, read-only (disabled by default, manual start, not in the target) |
+| `tessera-stuck-loop.service` | `tessera-stuck-loop`: offers stuck-campaign findings to a standing loop; reads findings only unless `ack_on_offer` is on (disabled by default, manual start, not in the target) |
 | `tessera.target` | groups the four services |
 | `tessera-health-check@.service` + `tessera-health-check-*.timer` | optional freshness probes |
 
@@ -137,7 +137,9 @@ reads their metadata, never the secret). Add the flag to the `serve` command you
 `tessera-stuck-loop.service` runs a standing agent loop whose only work source
 is the stuck-campaign findings
 ([ADR 0132](../../docs/decisions/0132-stuck-loop-runner.md)). It runs no model
-and only reads: it offers at most one new open finding per tick and appends a
+and only reads findings unless the policy enables `ack_on_offer`, in which case it
+also acknowledges an offered finding (a write that needs the `campaign:cancel`
+scope). It offers at most one new open finding per tick and appends a
 `stuck_offered` receipt for it to its journal (with `tick`, `backoff`, `halted`
 and `runner_*` lines). Options: `--policy`, `--journal`, `--ledger`,
 `--kill-switch` (required; without it the program exits 2), `--interval-seconds`,
@@ -167,3 +169,19 @@ then `systemctl start tessera-stuck-loop.service`. Pause at once:
 `touch /etc/tessera/stuck-loop.kill`; remove it to resume. Withdraw: stop the
 service and remove the admission marker. Raising a cap or approval stays a
 human edit of the policy.
+
+### Recovering from exit 3 or an uncertain offer
+
+Stop the service first (recovery refuses with exit 2 while the loop holds the
+ledger lock). Then run the same program with the same `--policy`, `--journal`,
+`--ledger` and `--kill-switch`, plus one of:
+
+- `--reset` clears the halt and the failure count after you have fixed the cause.
+- `--resolve ITEM_ID --outcome succeeded` closes an uncertain offer for good
+  (you checked that the acknowledgement landed); `--outcome not_started` makes it
+  retryable once (you checked that it did not).
+
+Each prints one line, exits 0, makes no call and needs no network, and appends
+an `operator_reset` or `uncertain_resolved` line to the journal. The per-finding
+ledger rows are kept, so an offered finding is never offered again. Do not
+delete the ledger: that would forget what was already offered.

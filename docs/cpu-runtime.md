@@ -210,7 +210,11 @@ a substring, and the body is never echoed or stored):
 - `Worker is not assigned to this execution grant.` (the grant now belongs to
   another worker) and `Worker is retired.` mean the authority is gone and a new
   credential cannot restore it. These are permanent: recorded durably, terminal,
-  exit 2.
+  exit 2. Routes where the worker names a grant (lease acquire) or reaches it to
+  fetch or upload data (inputs, artifacts, credential access, harness bindings,
+  Kubernetes dispatch claims) answer another worker's grant with the same 404
+  `Execution grant was not found.` as a missing one, so they reveal nothing; that
+  404 is also permanent.
 - Any other 403 (for example `Worker is not registered.`, `Worker is not registered
   for this project.`, `Worker is not authorized for this project.`), a body that is
   not JSON, is too large, or has a different `detail`, is treated as the

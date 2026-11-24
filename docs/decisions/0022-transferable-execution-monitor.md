@@ -67,3 +67,5 @@ CRI/cgroup/filesystem behavior. Salad status replies alone cannot prove native
 termination, artifact custody or billing. Deployment enrollment, TLS server/service
 integration, native sensors, real package issuance/global claims and full enforcing
 adapter conformance remain production gates. See the [runbook](../execution-monitor.md).
+Update: [ADR 0127](0127-execution-monitor-receiver-in-service.md) adds opt-in operator
+enrollment and a TLS listener inside the control service; assignment issuance remains open.

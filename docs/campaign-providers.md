@@ -610,7 +610,11 @@ sha256, and mounts it read-only at `/inputs-public/<input>` in a container that 
 none. Both are operator-owned directories, created `0700` if missing and refused when a symlink,
 owned by another user or accessible to group or world; the cache is used only for inputs that set
 `cache`. Without `public_root` a plan carrying a public fetch is refused with a message naming the
-flag. The local fallback currently supports stages that also have a snapshot input (mixed stages),
+flag. The fetch ignores proxy environment variables (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, ...)
+and connects directly; to use a proxy, set `public_fetch_proxy` (`--public-fetch-proxy`) to
+`http://host:port` with a public host name (no credentials or path). It is used only when that host
+is one of the stage's allowed hosts (its pinned hosts plus redirect hosts); otherwise the fetch fails
+closed with `proxy_not_allowed`, and a malformed value is refused at startup (`proxy_invalid`). The local fallback currently supports stages that also have a snapshot input (mixed stages),
 because an execution grant binds a snapshot; a stage whose only inputs are `public_artifact` fails
 closed on a worker-grant provider with `public_only_stage_needs_a_snapshot_input` and runs
 on Salad.
@@ -810,7 +814,9 @@ and the executor re-derives the same value from the stage. Two refusals apply ev
   and artifact inputs always count as non-public, and so does a `send_classes` beyond
   `public`.
 - Provider trust is checked again at ticket issue and at each pull, so narrowing the setting
-  stops later pulls.
+  stops later pulls. The stage's own `send_classes` and its licence-label rule are re-checked
+  there too (found through the attempt's grant, so the first ticket is already narrowed), and
+  a label added to the input after release stops later pulls.
 
 ## Termination after a Salad reallocation (ADR 0149)
 

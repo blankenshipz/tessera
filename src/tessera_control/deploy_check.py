@@ -120,13 +120,13 @@ def render_text(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_private_json(path: Path, document: Mapping[str, Any]) -> None:
-    """Atomically write ``document`` to ``path`` as an owner-only (0600) file."""
+def write_private_json(path: Path, document: Mapping[str, Any], *, mode: int = 0o600) -> None:
+    """Atomically write ``document`` to ``path`` as an owner-only (default 0600) file."""
     data = (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".deploy-check-")
     try:
         with os.fdopen(descriptor, "wb") as handle:
-            os.fchmod(handle.fileno(), 0o600)
+            os.fchmod(handle.fileno(), mode & 0o700)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())

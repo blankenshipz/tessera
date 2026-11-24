@@ -16,7 +16,7 @@ its action; `--campaign-tools` / `--no-campaign-tools` force the whole family on
 | `tessera_submit_campaign` (v1 or v2 spec) | `POST /projects/{p}/campaigns` | `campaign:submit` |
 | `tessera_get_campaign` | `GET /campaigns/{id}` | `campaign:read` |
 | `tessera_list_campaigns` | `GET /projects/{p}/campaigns` | `campaign:read` |
-| `tessera_get_campaign_receipt` | `GET /campaigns/{id}/receipt` | `campaign:read` |
+| `tessera_get_campaign_receipt` | `GET /campaigns/{id}/receipt` (agent view: approver and pre-approval identifiers removed, `view: agent_redacted`) | `campaign:read` |
 | `tessera_cancel_campaign` | `POST /campaigns/{id}/cancel` | `campaign:cancel` |
 | `tessera_list_snapshots` | `GET /projects/{p}/agent-snapshots` | `snapshot:read` |
 | `tessera_get_snapshot` | `GET /projects/{p}/agent-snapshots/{id}` | `snapshot:read` |

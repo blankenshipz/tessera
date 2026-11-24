@@ -47,6 +47,7 @@ _FAILURES = {
     "cancelled": "it was cancelled",
     "holdout_already_claimed": "the held-out data had already been used",
     "sealed_partition": "it needed data from a sealed partition",
+    "public_fetch_unreported": "the worker never reported fetching its pinned public files",
 }
 
 _STATUS_WORDS = {

@@ -6,6 +6,12 @@ within the pinned cap. A failed file leaves nothing in the destination. Only the
 receipt rows (source host, digest, bytes, timing) are meant to travel back to the control plane.
 
 Error messages carry a closed code and a host, never a URL query string or credential.
+
+Proxies: environment proxy variables (HTTPS_PROXY, ALL_PROXY, ...) are always ignored. A proxy is
+used only when the worker operator configures one explicitly (``proxy``, from the worker's
+``--public-fetch-proxy`` / ``public_fetch_proxy`` setting) and its host is on this fetch's egress
+allowlist (the pinned hosts plus the redirect hosts); otherwise the fetch is refused before any
+request (``proxy_invalid`` for a malformed value, ``proxy_not_allowed`` for a host off the list).
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +44,8 @@ CODES = frozenset(
         "size_mismatch",
         "digest_mismatch",
         "io_error",
+        "proxy_invalid",
+        "proxy_not_allowed",
     }
 )
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -62,11 +71,62 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # redirects are followed manually, host by host
 
 
-def http_open(url: str) -> tuple[int, dict[str, str], Iterator[bytes]]:
-    """One GET without automatic redirects: (status, headers, iterator of chunks)."""
-    request = urllib.request.Request(url, headers={"User-Agent": "tessera-public-fetch/1"})
+def parse_proxy(value: Any) -> tuple[str, str]:
+    """Validate an operator proxy setting: ``(canonical host, "host:port")``.
+
+    Only ``http://host[:port]`` (an https request tunnels through it with CONNECT, so TLS stays
+    end to end): a public fully qualified host under the same rule as the pins, no credentials,
+    path, query or fragment. Anything else raises ``proxy_invalid`` without echoing the value.
+    """
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise PublicFetchError("proxy_invalid")
     try:
-        response = urllib.request.build_opener(_NoRedirect).open(request, timeout=120)
+        parsed = urllib.parse.urlsplit(value)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise PublicFetchError("proxy_invalid") from None
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or port == 0
+    ):
+        raise PublicFetchError("proxy_invalid")
+    canonical = canonical_public_host(host)
+    if canonical is None:
+        raise PublicFetchError("proxy_invalid")
+    return canonical, f"{canonical}:{port or 80}"
+
+
+class _ExplicitProxy(urllib.request.BaseHandler):
+    """Tunnel every https request through one operator proxy (CONNECT). Unlike ProxyHandler it
+    reads no environment (not even ``no_proxy``), so the configured proxy is the only route."""
+
+    handler_order = 100  # before the https handler, as ProxyHandler
+
+    def __init__(self, hostport: str):
+        self.hostport = hostport
+
+    def https_open(self, request: urllib.request.Request) -> None:
+        request.set_proxy(self.hostport, "http")
+        return None  # the https handler opens the tunnelled connection
+
+
+def http_open(url: str, *, proxy: str | None = None) -> tuple[int, dict[str, str], Iterator[bytes]]:
+    """One GET without automatic redirects: (status, headers, iterator of chunks).
+
+    Environment proxies are never read (an empty ProxyHandler replaces the default one); ``proxy``
+    is the ``host:port`` of the explicit operator proxy, already checked by ``fetch_public_files``.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "tessera-public-fetch/1"})
+    handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({}), _NoRedirect()]
+    if proxy is not None:
+        handlers.append(_ExplicitProxy(proxy))
+    try:
+        response = urllib.request.build_opener(*handlers).open(request, timeout=120)
     except urllib.error.HTTPError as err:
         return err.code, dict(err.headers), iter(())
     return response.status, dict(response.headers), iter(lambda: response.read(_CHUNK), b"")
@@ -239,15 +299,26 @@ def fetch_public_files(
     dest: str | Path,
     redirect_hosts: Iterable[str] = (),
     cache_dir: str | Path | None = None,
-    opener: Opener = http_open,
+    opener: Opener | None = None,
     clock: Callable[[], float] = time.monotonic,
     max_hops: int = 3,
+    proxy: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch and verify every pinned file into ``dest``; return one receipt row per file."""
+    """Fetch and verify every pinned file into ``dest``; return one receipt row per file.
+
+    ``proxy`` is the operator's explicit proxy (None: direct, environment proxies ignored); it
+    is refused unless its host is on the allowlist. ``opener`` replaces the network (tests)."""
     for pin in files:
         _validate_pin(pin)
     named = [urllib.parse.urlsplit(pin["url"]).hostname for pin in files] + list(redirect_hosts)
     allowed = frozenset(h for h in map(canonical_public_host, named) if h is not None)
+    proxy_hostport = None
+    if proxy is not None:
+        proxy_host, proxy_hostport = parse_proxy(proxy)
+        if proxy_host not in allowed:
+            raise PublicFetchError("proxy_not_allowed", proxy_host)
+    if opener is None:
+        opener = partial(http_open, proxy=proxy_hostport)
     dest_dir = Path(dest)
     cache = Path(cache_dir) if cache_dir is not None else None
     try:

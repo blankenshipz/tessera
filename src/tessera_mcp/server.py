@@ -505,7 +505,9 @@ def register_campaign_tools(
         """Read the campaign receipt (campaign:read): the recorded evidence of what ran.
 
         Absent until the campaign is terminal. Per-attempt run receipts are summarized in
-        it. The receipt is recorded evidence to critique, not a validity judgement.
+        it. The receipt is recorded evidence to critique, not a validity judgement. An agent
+        reads the agent view ("view": "agent_redacted"): approver, pre-approval and resolved
+        request identifiers are removed; receipt_digest names the stored receipt.
         """
         return await client.campaign_receipt(campaign_id)
 

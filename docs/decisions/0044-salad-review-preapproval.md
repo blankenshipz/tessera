@@ -166,6 +166,15 @@ id, intent id, digest, hold cents) and each decline with its reason code. A dele
 review is labelled `campaign_delegated`; a recorded approval remains evidence of
 authorization, not of execution.
 
+Addendum (agent receipt view): the stored receipt keeps this section unchanged and a person
+reads it whole. An external-scope agent credential reads the receipt through
+`tessera_control.receipt_agent_view`, which drops each entry's id and three digests and each
+resolution's `subject_id` and `review_digest` (with the approver's principal id), and keeps the
+stage, caps, expiry and each resolution's kind, attempt, cents and class, so the agent can act
+inside the pre-approval without learning who approved it or which request was resolved. The
+response is marked `agent_redacted`; its `receipt_digest` names the stored receipt and does not
+verify the projection. Platform readers (chaining, gates, unlock, report) read the stored row.
+
 ## Deadline fit
 
 Today `_issue_grant` and the snapshot release silently clamp the grant expiry to the

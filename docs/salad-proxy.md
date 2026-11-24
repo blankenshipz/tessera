@@ -625,6 +625,8 @@ TLS CA is a referenced reviewed file, not embedded configuration bytes.
 | `max_seconds`, `max_polls` | 1–900 seconds, 1–90 polls (route window incl. allocation and image pull); profile runtime must fit |
 | `source_revision` | Git source reference plus observed installed package inventory: `40hex+sha256:64hex` |
 
+The campaign executor config's `source_revision` must be this same pin for the source installed now: the executor refuses to load any other value (missing pin, wrong shape or a stale digest), and `tessera deploy-check --executor-config FILE --apply refresh_source_pin --source-commit <40hex> --receipt-dir DIR` (or `deploy-upgrade`'s config fixes, with the plan's `source_revision`) rewrites it in place, atomically and with a receipt, refusing when the installed source cannot be measured.
+
 After package writers are paused, obtain the inventory digest locally without
 network/credentials using
 `.venv/bin/python -c 'from tessera_control.salad_live_check import source_digest; print(source_digest())'`.

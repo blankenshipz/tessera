@@ -706,6 +706,15 @@ def parser() -> argparse.ArgumentParser:
             "submit (env fallback TESSERA_CODE_REVIEW_GIT_REMOTES); default off"
         ),
     )
+    serve.add_argument(
+        "--monitor-enrollments",
+        type=Path,
+        help=(
+            "owner-only execution-monitor enrollment file (tessera.monitor-enrollments.v1): "
+            "opt in to the pinned mutual-TLS monitor receiver listener; without it no "
+            "listener starts (ADR 0127)"
+        ),
+    )
     return command
 
 
@@ -1272,6 +1281,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"serve failed: {error}", file=sys.stderr)
             return 1
         owner = None
+        monitor_service = None
         if not 0.2 <= arguments.campaign_tick_seconds <= 60:
             print("serve configuration error: --campaign-tick-seconds is 0.2-60", file=sys.stderr)
             return 2
@@ -1368,6 +1378,12 @@ def main(argv: list[str] | None = None) -> int:
                 sandbox_backend = load_agent_sandbox_backend(
                     arguments.agent_sandbox_config, arguments.agent_sandbox_sha256
                 )
+            if arguments.monitor_enrollments is not None:
+                from .monitor_service import MonitorService, load_enrollments
+
+                # Refuse a malformed file before any effect; start() re-validates it.
+                load_enrollments(arguments.monitor_enrollments)
+                monitor_service = MonitorService(arguments.monitor_enrollments, arguments.state_dir)
             if arguments.runtime_owner_config is not None or arguments.runtime_owner_sha256:
                 from .runtime_composition import load_runtime_owner
 
@@ -1452,6 +1468,24 @@ def main(argv: list[str] | None = None) -> int:
                             raise RuntimeError("runtime owner shutdown failed") from None
 
                 app.router.lifespan_context = owner_lifespan
+            if monitor_service is not None:
+                monitored_lifespan = app.router.lifespan_context
+
+                @asynccontextmanager
+                async def monitor_lifespan(application):
+                    # The opt-in listener runs only while the app is serving.
+                    async with monitored_lifespan(application) as state:
+                        try:
+                            monitor_service.start()
+                        except Exception as error:
+                            print(f"serve monitor listener blocked: {error}", file=sys.stderr)
+                            raise
+                        try:
+                            yield state
+                        finally:
+                            monitor_service.stop()
+
+                app.router.lifespan_context = monitor_lifespan
             try:
                 service_lock = maintenance_lock.shared(arguments.state_dir)
                 service_lock.__enter__()
@@ -1469,6 +1503,8 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             # Also cover app construction, startup/bind failures and runners that
             # never entered lifespan. RuntimeOwnerComposition.close is one-shot.
+            if monitor_service is not None:
+                monitor_service.stop()
             close_owner()
         return 78 if cleanup_failed else 0
     raise AssertionError("unreachable")

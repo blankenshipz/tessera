@@ -17,7 +17,7 @@ from tessera_control.campaign_delegation import (
     write_intent,
 )
 from tessera_control.campaign_store import CampaignStore
-from tessera_control.store import Store, _connect, canonical_digest
+from tessera_control.store import Store, _connect, _token_hash, canonical_digest
 
 
 def declare_snapshot_public(state: Path, snapshot_id: str) -> None:
@@ -130,6 +130,75 @@ class Env:
             actor = {**actor, "agent_destination": "planner.local"}
         self._actors[name] = actor
         return actor
+
+    def _other_org_owner(self) -> dict[str, Any]:
+        """The other organization's root owner and its one project (idempotent, unique ids)."""
+        org, stamp = "org_other_agents", "2026-01-01T00:00:00Z"
+        owner_token = "synthetic-other-org-owner-token-" + "x" * 30
+        with _connect(self.state / "tessera.sqlite3") as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
+                (org, "Other tenant", stamp),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO projects (id, org_id, name, created_at) VALUES (?, ?, ?, ?)",
+                ("project_other_org", org, "other", stamp),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO principals (id, org_id, role, token_hash, revoked_at, "
+                "created_at) VALUES ('principal_other_org_owner', ?, 'human', ?, NULL, ?)",
+                (org, _token_hash(owner_token), stamp),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO credentials (id, principal_id, kind, audience, project_id, "
+                "parent_id, expires_at, revoked_at, created_at, created_by_principal_id) VALUES "
+                "('credential_other_org_owner', 'principal_other_org_owner', 'local_owner', "
+                "'control', NULL, NULL, NULL, NULL, ?, 'principal_other_org_owner')",
+                (stamp,),
+            )
+        return self.plain.authenticate(owner_token)
+
+    def _issue_other_org(self, name: str, body: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        owner = self._other_org_owner()
+        token = f"synthetic-{name}-token-" + "x" * 30
+        self.plain.issue_credential(owner, f"cred-{name}", canonical_digest(body), body, token)
+        return self.plain.authenticate(token), token
+
+    def other_org_agent(
+        self, actions: list[str] | None = None, name: str = "other-org-agent"
+    ) -> dict[str, Any]:
+        """An agent of ANOTHER organization, bound to that organization's own project, issued
+        through the real ``Store.issue_credential``. The result carries its ``token``."""
+        key = ("other-org-agent", name)
+        if key not in self._actors:
+            body: dict[str, Any] = {
+                "kind": "agent",
+                "audience": "control",
+                "project_id": "project_other_org",
+                "expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            }
+            if actions is not None:
+                body["external_agent"] = {"actions": actions, "destination": "planner.local"}
+            actor, token = self._issue_other_org(name, body)
+            if actions is not None:
+                actor = {**actor, "agent_destination": "planner.local"}
+            self._actors[key] = {**actor, "token": token}
+        return self._actors[key]
+
+    def other_org_human(self, name: str = "other-org-human") -> dict[str, Any]:
+        """A ``human_session`` of ANOTHER organization. Its credential has ``project_id`` NULL
+        (the only unbound principal the issuing path allows besides a root owner), so no
+        project binding can refuse it first: the org filter in ``Store._project`` alone does."""
+        key = ("other-org-human", name)
+        if key not in self._actors:
+            body = {
+                "kind": "human_session",
+                "audience": "control",
+                "expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            }
+            actor, token = self._issue_other_org(name, body)
+            self._actors[key] = {**actor, "token": token}
+        return self._actors[key]
 
     def spec(self, **overrides: Any) -> dict[str, Any]:
         stage1 = {

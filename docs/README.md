@@ -19,7 +19,8 @@ references, not claims of a supported production deployment.
   supplies Salad profiles.
 - **Supervise an agent:** [Supervised loop](supervised-loop.md) for propose, approve,
   run, observe and critique with one local owner and one MCP-enrolled agent.
-- **Monitor and stop:** [Execution monitor](execution-monitor.md) and
+- **Monitor and stop:** [Execution monitor](execution-monitor.md) (an opt-in,
+  operator-enrolled mTLS listener inside the control service; off by default) and
   [desktop execution procedure](../desktop/EXECUTION.md) for attempt/output
   inspection and stop boundaries; requested cancellation is not confirmed termination.
 - **Review and decide:** [Research records](research-human-records.md) for linked

@@ -142,7 +142,9 @@ all three classes. Each id is a placeholder for an enrolled principal.
 Approving a third-party provider for `private_derived` means outputs of earlier stages
 and any non-public input may leave the deployment for that vendor. Decide it per
 provider, and narrow per campaign with a stage's `send_classes` or the spec's
-`forbid_providers` when a campaign needs less.
+`forbid_providers` when a campaign needs less. A stage's `send_classes` and the licence-label
+rule apply at release and again at ticket issue and at every pull; they only narrow this
+setting, never widen it.
 
 ## Stable executor (route setups that mint principals)
 

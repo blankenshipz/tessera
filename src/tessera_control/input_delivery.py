@@ -42,8 +42,14 @@ class InputDeliveryStore(ExecutionStore):
             raise Conflict("Execution lease expiry is invalid.") from error
         if lease["epoch"] != epoch or expiry <= self._now():
             raise Conflict("Execution lease is no longer current.")
+        # A lease whose grant now belongs to another worker is answered exactly as a grant
+        # that does not exist (404, same body), and the refusal records nothing.
         grant = self._active_worker_grant(
-            connection, worker, lease["grant_id"], verify_retained=verify_retained
+            connection,
+            worker,
+            lease["grant_id"],
+            verify_retained=verify_retained,
+            foreign_as_not_found=True,
         )
         if grant["epoch"] != epoch:
             raise Conflict("Execution grant epoch is no longer current.")

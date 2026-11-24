@@ -1246,6 +1246,22 @@ class ExecutionStore(Store):
 
         return command(connection, actor)
 
+    @staticmethod
+    def _require_grant_worker(
+        grant: sqlite3.Row, worker: dict[str, Any], *, foreign_as_not_found: bool = False
+    ) -> None:
+        """The one check that ``grant`` is assigned to the calling ``worker``.
+
+        With ``foreign_as_not_found`` a grant of another worker is answered exactly as a
+        grant that does not exist (404, same body), so a worker cannot learn that it exists;
+        a NotFound also records no denial. Without it the refusal stays the 403 that worker
+        clients treat as authority gone.
+        """
+        if grant["worker_principal_id"] != worker["id"] or worker["kind"] != "worker":
+            if foreign_as_not_found:
+                raise NotFound("Execution grant was not found.")
+            raise Forbidden("Worker is not assigned to this execution grant.")
+
     def _active_worker_grant(
         self,
         connection: sqlite3.Connection,
@@ -1256,13 +1272,7 @@ class ExecutionStore(Store):
         foreign_as_not_found: bool = False,
     ) -> sqlite3.Row:
         grant = self._grant(connection, worker, grant_id)
-        if grant["worker_principal_id"] != worker["id"] or worker["kind"] != "worker":
-            if foreign_as_not_found:
-                # The grant id came from the request, not from a lease this worker holds:
-                # answer exactly as for a grant that does not exist, so a worker cannot
-                # learn that another worker's grant exists.
-                raise NotFound("Execution grant was not found.")
-            raise Forbidden("Worker is not assigned to this execution grant.")
+        self._require_grant_worker(grant, worker, foreign_as_not_found=foreign_as_not_found)
         from .workers import WorkerRegistryStore
 
         WorkerRegistryStore.require_ready_worker(connection, worker, grant["project_id"])

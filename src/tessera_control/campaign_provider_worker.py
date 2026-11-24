@@ -22,6 +22,7 @@ from .campaign_models import (
     BUILD_RUNTIME,
     DOCKER_CPU_RUNTIME,
     LOCAL_DOCKER_PROVIDER,
+    PUBLIC_FETCH_UNREPORTED,
     NormalStage,
     build_policy,
     public_fetch_policy,
@@ -82,6 +83,37 @@ WORKER_STEPS = frozenset(
     }
 )
 _RESERVED_IDS = frozenset({LOCAL_DOCKER_PROVIDER, "salad"})
+
+
+def public_fetch_reported(rt: RunnerServices, attempt: Mapping[str, Any]) -> bool:
+    """Whether a worker-grant attempt carries the fetch report its stage's pins require.
+
+    True for a stage without ``public_artifact`` inputs (nothing is required). Otherwise the
+    attempt's operation must have a recorded ``execution.public_fetch_recorded`` event, in the
+    campaign's own project, written before its run receipt event (ADR 0097). The event exists
+    only when control accepted rows covering exactly the frozen plan's pins, so its presence is
+    the check; requiring it before the receipt keeps the answer stable once the attempt exited
+    (a report arriving later cannot turn a failed attempt into a pass)."""
+    if public_fetch_policy(rt.stage_for(attempt)) is None:
+        return True
+    operation_id = attempt["operation_id"]
+    if not operation_id:
+        return False
+    row = rt.one(
+        """SELECT 1 FROM events f
+        WHERE f.event_type = 'execution.public_fetch_recorded'
+        AND f.project_id = (SELECT project_id FROM campaigns WHERE id = ?)
+        AND json_extract(f.payload_json, '$.operation_id') = ?
+        AND NOT EXISTS (
+            SELECT 1 FROM events r
+            WHERE r.event_type = 'worker.execution_run_receipt_recorded'
+            AND r.project_id = f.project_id
+            AND json_extract(r.payload_json, '$.operation_id') = ?
+            AND r.cursor < f.cursor)
+        LIMIT 1""",
+        (attempt["campaign_id"], operation_id, operation_id),
+    )
+    return row is not None
 
 
 class WorkerGrantProvider:
@@ -298,6 +330,17 @@ class WorkerGrantProvider:
         }
         if code is None:
             return Observation("unknown", "observed_unknown", "no exit code recorded")
+        if not public_fetch_reported(rt, attempt):
+            # ADR 0097: the worker posts its fetch report before it uploads outputs or its run
+            # receipt, so an exited attempt whose stage declares pins and has no report recorded
+            # before the receipt fails closed, whatever its exit code.
+            return Observation(
+                "failed_permanent",
+                PUBLIC_FETCH_UNREPORTED,
+                "public_fetch_unreported: the stage declares public_artifact pins and no "
+                "public fetch report was recorded before the run receipt",
+                **evidence,
+            )
         if code == 0:
             return Observation("succeeded", **evidence)
         detail = f"exit_code:{code}"

@@ -244,9 +244,13 @@ def _other_tenant_agent(state, actions):
     return {"Authorization": f"Bearer {token}", **DEST}
 
 
+def _headers(actor):
+    return {"Authorization": f"Bearer {actor['token']}", **DEST}
+
+
 def test_an_agent_of_another_org_gets_a_strict_404_identical_to_a_missing_id(world):
     env, client, campaign = world
-    other = _other_tenant_agent(env.state, ALL)
+    other = _headers(env.other_org_agent(ALL))
     # Sanity: the same credential shape works for the owning org's agent.
     assert _get(client, f"/campaigns/{campaign['id']}/outputs", "full").status_code == 200
     for suffix in (
@@ -275,6 +279,51 @@ def test_an_agent_of_another_org_gets_a_strict_404_identical_to_a_missing_id(wor
         missing = client.get(f"/projects/project_missing/{path}", headers=other)
         assert real.status_code == 404, (path, real.status_code)
         assert (real.status_code, real.json()) == (missing.status_code, missing.json()), path
+
+
+PROJECT_PATHS = (
+    "agent-snapshots",
+    "campaigns",
+    "holdout-claims",
+    "agent-spend",
+    "agent-standing-status",
+)
+
+
+def test_an_other_org_principal_with_no_project_binding_is_refused_by_the_org_filter_alone(world):
+    """The credential has project_id NULL, so no cross-project check can refuse it: the
+    organization filter in ``Store._project`` is the only thing between it and the project.
+    Removing that filter makes this test fail."""
+    env, client, _campaign = world
+    actor = env.other_org_human()
+    own_org = env.query("SELECT org_id FROM projects WHERE id=?", env.project["id"])[0][0]
+    assert actor["project_id"] is None and actor["org_id"] != own_org
+    other = {"Authorization": f"Bearer {actor['token']}"}
+    project = env.project["id"]
+    for path in PROJECT_PATHS:
+        real = client.get(f"/projects/{project}/{path}", headers=other)
+        missing = client.get(f"/projects/project_missing/{path}", headers=other)
+        assert real.status_code == 404, (path, real.status_code)
+        assert (real.status_code, real.json()) == (missing.status_code, missing.json()), path
+
+
+def test_the_other_org_helpers_use_the_real_issuing_path_and_are_idempotent(world):
+    env, _client, _campaign = world
+    first, second = env.other_org_agent(ALL, "one"), env.other_org_agent(ALL, "two")
+    human = env.other_org_human()
+    assert len({first["id"], second["id"], human["id"]}) == 3
+    assert first["org_id"] == second["org_id"] == human["org_id"]
+    assert env.other_org_agent(ALL, "one") is first and env.other_org_human() is human
+    kinds = {
+        r["kind"]: r["project_id"]
+        for r in env.query(
+            "SELECT kind, project_id FROM credentials WHERE principal_id IN (?, ?, ?)",
+            first["id"],
+            second["id"],
+            human["id"],
+        )
+    }
+    assert kinds == {"agent": "project_other_org", "human_session": None}
 
 
 def test_no_cross_project_or_cross_tenant_reads(world):
@@ -642,6 +691,17 @@ def test_stage_status_marks_an_expired_lease_and_stale_heartbeat(world):
     assert latest["lease"]["held"] is False and latest["lease"]["expired"] is True
     assert latest["executor"]["heartbeat_stale"] is True
     assert latest["executor"]["heartbeat_age_seconds"] >= 590
+
+
+def test_stage_status_does_not_call_a_lease_held_once_its_grant_is_reconciled(world):
+    env, client, campaign = world
+    _seed_stage_status(env, campaign)
+    _, stage = _stage(client, campaign)
+    assert stage["latest_attempt"]["lease"]["held"] is True
+    _raw(env, "UPDATE execution_grants SET status='reconciled' WHERE id='grant1'")
+    _, stage = _stage(client, campaign)
+    lease = stage["latest_attempt"]["lease"]
+    assert lease["held"] is False and lease["expired"] is False
 
 
 def test_stage_status_never_returns_free_text_or_identifiers(world):

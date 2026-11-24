@@ -11,7 +11,7 @@ from typing import Any
 from . import deploy_check
 from .deploy_check import Finding
 
-AUTOMATIC_FIXES = ("drop_removed_keys", "migrate")
+AUTOMATIC_FIXES = ("drop_removed_keys", "refresh_source_pin", "migrate")
 
 
 def add_parser(subcommands: argparse._SubParsersAction) -> None:
@@ -57,6 +57,10 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
         "--backup-confirmed",
         action="store_true",
         help="with --apply migrate: you have taken a backup of the state directory",
+    )
+    command.add_argument(
+        "--source-commit",
+        help="with --apply refresh_source_pin: the 40-hex commit of the installed release",
     )
     command.add_argument(
         "--receipt-dir", type=Path, help="existing absolute directory for fix receipts (--apply)"
@@ -120,6 +124,15 @@ def _apply(arguments: argparse.Namespace) -> list[dict[str, Any]]:
             receipt = deploy_config.apply_drop_removed_keys(path, arguments.receipt_dir)
             if receipt is not None:
                 applied.append(receipt)
+    if "refresh_source_pin" in wanted:
+        from . import deploy_config
+
+        for path in arguments.executor_config:
+            receipt = deploy_config.apply_refresh_source_pin(
+                path, arguments.receipt_dir, arguments.source_commit
+            )
+            if receipt is not None:
+                applied.append(receipt)
     if "migrate" in wanted:
         if arguments.state_dir is None:
             raise ValueError("--apply migrate needs --state-dir.")
@@ -133,6 +146,28 @@ def _apply(arguments: argparse.Namespace) -> list[dict[str, Any]]:
     return applied
 
 
+def _require_commit_at_checkout(commit: str) -> None:
+    """Refuse a ``--source-commit`` that is not the checkout's head, when a checkout is at hand.
+
+    Only the pin's digest is measured from the install; the commit is operator-asserted. When the
+    working directory is a repository checkout (``tests/`` and ``src/``) whose head git can name,
+    the commit is held to it as ``deploy-upgrade`` holds the plan's ``source_revision``. Without
+    a checkout nothing can be compared and nothing is refused."""
+    from pathlib import Path
+
+    from .deploy_upgrade import checkout_head
+
+    root = Path.cwd()
+    if not (root / "tests").is_dir() or not (root / "src").is_dir():
+        return
+    head = checkout_head(root)
+    if head is not None and head != commit:
+        raise ValueError(
+            "--source-commit is not the commit checked out in the working directory "
+            f"({head}); run from a checkout at that commit or pass its commit"
+        )
+
+
 def run(arguments: argparse.Namespace) -> int:
     try:
         # Everything that can refuse is checked before any fix changes anything.
@@ -142,6 +177,13 @@ def run(arguments: argparse.Namespace) -> int:
             if arguments.receipt_dir is None:
                 raise ValueError("--apply needs --receipt-dir (an existing absolute directory).")
             deploy_check.require_writable_directory(arguments.receipt_dir, "receipt directory")
+        if "refresh_source_pin" in arguments.apply:
+            from .salad_live_check import installed_source_pin
+
+            if arguments.source_commit is None:
+                raise ValueError("--apply refresh_source_pin needs --source-commit.")
+            installed_source_pin(arguments.source_commit)  # refuses before any fix
+            _require_commit_at_checkout(arguments.source_commit)  # likewise
         applied = _apply(arguments)
         report = deploy_check.build_report(_gather(arguments), applied)
         if arguments.report_file is not None:

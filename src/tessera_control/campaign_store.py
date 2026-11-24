@@ -79,6 +79,7 @@ from .campaign_steering import CampaignSteeringCommands
 from .data_class import DataClassRefused, snapshot_data_class
 from .execution import ExecutionStore
 from .external_agents import ExternalAgentStore
+from .receipt_agent_view import agent_receipt_response
 from .snapshots import SnapshotStore
 from .store import (
     Conflict,
@@ -1378,12 +1379,17 @@ class CampaignStore(
             ).fetchone()
             if row is None:
                 raise NotFound("Campaign receipt was not found.")
-            return {
+            stored = {
                 "campaign_id": campaign_id,
                 "receipt": json.loads(row["receipt_json"]),
                 "receipt_digest": row["receipt_digest"],
                 "created_at": row["created_at"],
             }
+            if self._external_scope(connection, actor):
+                # An agent gets the approver-hiding view (receipt_agent_view); the stored row
+                # and what a person reads are unchanged. receipt_digest stays the stored one.
+                return agent_receipt_response(stored)
+            return stored
         finally:
             connection.close()
 

@@ -68,8 +68,11 @@ provider paths above, where the fetch precedes the delivery of private input.
   with `public_only_stage_needs_a_snapshot_input`, on every provider, because an execution
   grant binds a snapshot; the supported shape is a stage with a snapshot input plus public
   files (the intended use). The Salad receipt carries `bytes` and `seconds` only when the
-  provider's retained `fetched` rows are readable by control; today it records the pins as
-  `declared_only`. Adapter-built Salad stages do not generate fetch rows yet (the contract
+  provider's retained `fetched` rows are readable by control and platform-authored; today it
+  records the pins as `declared_only`. Readability alone is not enough on Salad: the stage entry
+  runs in the runtime's container with the runtime's identity and network, so it can upload its own
+  `output.json` through the same custody channel. Upgrading the evidence needs the entry separated
+  from the runtime or rows the runtime attests with a key the entry cannot reach. Adapter-built Salad stages do not generate fetch rows yet (the contract
   must carry them, and a mismatch is refused). A mixed stage on a worker without the
   operator's `--public-root` is refused at run time, not at submit.
 - The plan carried to a worker is validated with the same host rules as the spec (public fully
@@ -84,10 +87,27 @@ provider paths above, where the fetch precedes the delivery of private input.
   parsing them, and internal names (`localhost`, `*.local`, `*.internal`, `*.lan`,
   `*.localdomain`, `*.home.arpa`, single labels). Not covered: a public name that resolves to a
   private address (DNS rebinding); the fetch's own https request is the only network use.
-- Follow-ups from review: local-worker fetch rows are recorded as an event but not yet read into
-  the campaign receipt (still `declared_only`); fetched files stay under the worker's public root
-  after a successful run until the operator clears it; the receipt does not say whether a fetch
-  succeeded; each input's fetch may use the hosts of every input in the stage.
+- Fetch report required on the worker-grant path: the local worker posts its fetch rows before
+  it uploads outputs or posts its run receipt, and control accepts only rows covering exactly
+  the frozen plan's pins. An exited worker-grant attempt whose stage declares `public_artifact`
+  pins and has no report recorded (in the campaign's project) before its run receipt fails
+  closed as `failed_permanent` with failure class `public_fetch_unreported`, whatever its exit
+  code; its receipt keeps the files `declared_only` and adds `public_fetch.refused` with that
+  code and the reason. A report arriving after the receipt does not count, so the outcome is
+  stable once the attempt exited. A contradicting report is refused as before (no event; the
+  worker stops before outputs or a receipt). Stages without pins are unchanged. Salad has no
+  fetch report channel (the report endpoint accepts local-cpu operations only): its attempts
+  are judged by their own verdict, the requirement does not apply, and its receipt evidence
+  stays runtime-reported or `declared_only`.
+- The local worker's fetch ignores proxy environment variables. Its only proxy is the operator's
+  explicit `--public-fetch-proxy http://host:port` (`public_fetch_proxy`), used only when that host
+  is on the stage's allowlist (pinned plus redirect hosts), else `proxy_not_allowed`
+  (`proxy_invalid` for a malformed value). An explicit proxy host must itself be on the stage
+  allowlist (there is no operator-registered proxy), so in practice the fetch is direct-only and
+  fails closed otherwise; the Salad in-container fetch is always direct (`ProxyHandler({})`).
+- Follow-ups from review: fetched files stay under the worker's public root after a successful
+  run until the operator clears it; a Salad receipt without retained rows does not say whether
+  the fetch succeeded; each input's fetch may use the hosts of every input in the stage.
 - Not covered: fetching on other providers (they need a pre-stage hook) and signed or
   authenticated sources.
 

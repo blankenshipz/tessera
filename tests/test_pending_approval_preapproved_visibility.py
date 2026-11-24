@@ -234,9 +234,11 @@ def _by_design(name: str, body: dict) -> tuple[dict, dict]:
       delegation but, for an agent, WITHOUT ``approving_principal_id`` (the person who approved,
       and so who created the pre-approval): the agent projection hides approver identity, as
       the gate decisions do;
-    - the campaign receipt carries ``approval.approving_principal_id`` and, by ADR 0044 section
-      7, the ``preapprovals`` section (id, the three digests, caps and each delegated
-      resolution). The receipt is digest-bound and has no per-caller projection.
+    - the stored campaign receipt carries ``approval.approving_principal_id`` and, by ADR 0044
+      section 7, the ``preapprovals`` section (id, the three digests, caps and each delegated
+      resolution); an agent reads the marked ``agent_redacted`` view of it
+      (``receipt_agent_view``), which keeps the caps, expiry and resolved kinds and drops the
+      approver, the pre-approval id and digests and the resolved request ids.
     Everything else must carry none of the secrets."""
     body = json.loads(json.dumps(body))
     taken: dict = {}
@@ -244,22 +246,21 @@ def _by_design(name: str, body: dict) -> tuple[dict, dict]:
         assert "approving_principal_id" not in body["approval"]
         assert all("approving_principal_id" not in a for a in body["approvals"])
     if name in {"receipt", "tessera_get_campaign_receipt"}:
-        receipt = body["receipt"]
-        taken["approval"] = receipt["approval"].pop("approving_principal_id")
-        taken["preapprovals"] = receipt.pop("preapprovals")
+        assert body["view"] == body["receipt"]["view"] == "agent_redacted"
+        assert "approving_principal_id" not in body["receipt"]["approval"]
+        taken["preapprovals"] = body["receipt"]["preapprovals"]
     return body, taken
 
 
 def _check_by_design(world, taken: dict, secrets: dict[str, str]) -> None:
     if "preapprovals" in taken:
-        assert taken["approval"] == world.human["id"]
+        # The agent keeps what it needs to act inside the pre-approval, no identifier of it.
         [entry] = taken["preapprovals"]
-        assert entry["id"] == secrets["preapproval.id"]
-        assert entry["plan_digest"] == secrets["preapproval.plan_digest"]
+        assert "id" not in entry and "plan_digest" not in entry
+        assert entry["max_total_cents"] == 50
         kinds = sorted(r["kind"] for r in entry["resolutions"])
         assert kinds == ["plan", "source_assessment", "source_use"]
-        # The receipt names who approved, never a credential.
-        assert secrets["human.credential_id"] not in json.dumps(taken)
+        assert all("subject_id" not in r for r in entry["resolutions"])
 
 
 def _agent_leaks(world, bodies: dict[str, dict], secrets: dict[str, str]) -> dict[str, list]:
@@ -304,7 +305,14 @@ def test_a_preapproved_review_is_never_pending_and_reaches_the_agent_only_by_con
     world.run_to_outcome(guardian_final=CLEAN)
     world.tick_until(lambda: world.status() == "succeeded")
     agent, human = check(terminal=True)
-    assert agent["receipt"] == human["receipt"]
+    # A person reads the stored receipt whole; the agent the marked view of it, same digest.
+    assert human["receipt"]["receipt"]["approval"]["approving_principal_id"] == world.human["id"]
+    [stored] = human["receipt"]["receipt"]["preapprovals"]
+    assert stored["id"] == secrets["preapproval.id"]
+    assert stored["plan_digest"] == secrets["preapproval.plan_digest"]
+    assert secrets["human.credential_id"] not in json.dumps(human["receipt"])
+    assert agent["receipt"]["receipt_digest"] == human["receipt"]["receipt_digest"]
+    assert agent["receipt"]["receipt"] != human["receipt"]["receipt"]
     # The pending list was never the place a delegated review shows up, for anyone.
     for body in (agent["campaign"], human["campaign"]):
         assert _leaks(body["pending_human_approval"], secrets) == []

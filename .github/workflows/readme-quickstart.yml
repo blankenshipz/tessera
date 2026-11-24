@@ -1,0 +1,20 @@
+name: README quickstart
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned uv
+        run: python -m pip install uv==0.12.10
+      - name: Run the documented local setup (init, serve, health, backup, deploy-check)
+        run: python scripts/check_readme_quickstart.py

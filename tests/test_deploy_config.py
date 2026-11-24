@@ -42,7 +42,7 @@ def executor_document(base):
             "certificate_sha256": "b" * 64,
         },
         "work_directory": str(base / "work"),
-        "source_revision": "a" * 40,
+        "source_revision": salad_live_check.installed_source_pin("a" * 40),
         "poll_seconds": 5,
     }
 
@@ -64,7 +64,10 @@ def receipts(tmp_path):
 
 def test_clean_config_is_ok(tmp_path):
     findings = check_config(write(tmp_path, executor_document(tmp_path)), label="1")
-    assert [(f.check_id, f.status) for f in findings] == [("config.1.keys", "ok")]
+    assert [(f.check_id, f.status) for f in findings] == [
+        ("config.1.keys", "ok"),
+        ("config.1.source_pin", "ok"),
+    ]
 
 
 def test_removed_key_is_detected_with_the_automatic_fix(tmp_path):
@@ -113,11 +116,11 @@ def test_validation_errors_report_locations_only(tmp_path):
     document["poll_seconds"] = 9999
     document["guardian_uid"] = "SECRET-VALUE"
     findings = check_config(write(tmp_path, document))
-    assert [f.status for f in findings] == ["ok", "fail"]
-    detail = findings[1].detail["errors"]
+    assert [f.status for f in findings] == ["ok", "ok", "fail"]
+    detail = findings[2].detail["errors"]
     assert {e["loc"] for e in detail} == {"poll_seconds", "guardian_uid"}
     assert all(set(e) == {"loc", "type"} for e in detail)
-    assert "SECRET-VALUE" not in json.dumps(findings[1].payload())
+    assert "SECRET-VALUE" not in json.dumps(findings[2].payload())
 
 
 def test_apply_removes_only_the_removed_key(tmp_path, receipts):
@@ -160,7 +163,7 @@ def test_fixed_executor_config_loads_with_the_real_loader(tmp_path, receipts):
         load_config(path)
     apply_drop_removed_keys(path, receipts)
     assert load_config(path).profile == "gpu-main"
-    assert [f.status for f in check_config(path)] == ["ok"]
+    assert [f.status for f in check_config(path)] == ["ok", "ok"]
 
 
 def test_live_config_removed_key_is_handled(tmp_path, receipts):

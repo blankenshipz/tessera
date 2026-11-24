@@ -54,7 +54,11 @@ Then the agent, over MCP only:
    (`no_human_go`, `measurement_condition_false`, ...) and `tessera_campaign_gate_decisions` shows
    the recorded go. For a chain of waves, `tessera_campaign_wave_receipts` returns up to 20
    campaigns' status, receipt and gate decisions in one read (a null receipt for one that has not
-   finished; one unreadable id does not fail the rest).
+   finished; one unreadable id does not fail the rest). Both receipt tools return the agent
+   view of the receipt (`"view": "agent_redacted"`): no approving principal, pre-approval id or
+   digest, or resolved decision-request id; caps, expiry and resolved kinds stay. A person reads
+   the stored receipt whole; `receipt_digest` names that stored receipt (see
+   [campaigns](campaigns.md#receipt)).
 5. A stage failed: `tessera_prepare_stage_retry` builds a new spec (reads only), pinning
    succeeded outputs by digest. Validate it, submit it, and a person approves the new digest.
 6. Spend control: `tessera_reduce_campaign_budget` lowers the cap (never below held plus

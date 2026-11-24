@@ -334,14 +334,21 @@ class InteractionStore:
         return delivery
 
     def _require_current_harness_binding_authority(
-        self, conn: sqlite3.Connection, live: dict[str, Any], binding: dict[str, Any]
+        self,
+        conn: sqlite3.Connection,
+        live: dict[str, Any],
+        binding: dict[str, Any],
+        *,
+        foreign_as_not_found: bool = True,
     ) -> dict[str, Any]:
         """Apply the lease predicate, then fence every immutable session binding.
 
         A queued message is not cached execution authority.  This deliberately
         shares ``ExecutionStore._active_worker_grant`` with lease acquisition so
         lifecycle, grant expiry, task basis, issuer, limits, and releases cannot
-        diverge at the OpenCode boundary.
+        diverge at the OpenCode boundary.  A grant that names another worker is
+        answered to the worker exactly as a missing grant; a human enqueuing for the
+        binding's worker passes ``foreign_as_not_found=False`` and keeps the 403.
         """
         if (
             binding["adapter_profile"] != "opencode-v1.18.30-context-only"
@@ -350,7 +357,7 @@ class InteractionStore:
         ):
             raise Conflict("Harness session binding authority is no longer current.")
         grant = ExecutionStore(self.store.database_path.parent)._active_worker_grant(
-            conn, live, binding["grant_id"]
+            conn, live, binding["grant_id"], foreign_as_not_found=foreign_as_not_found
         )
         lease = conn.execute(
             "SELECT * FROM execution_leases WHERE id=?", (binding["lease_id"],)
@@ -524,7 +531,9 @@ class InteractionStore:
                 raise NotFound("Operation harness session binding was not found.")
             binding = dict(binding_row)
             worker = self._binding_worker(conn, binding)
-            operation = self._require_current_harness_binding_authority(conn, worker, binding)
+            operation = self._require_current_harness_binding_authority(
+                conn, worker, binding, foreign_as_not_found=False
+            )
             task_id = operation["task_id"]
             if thread["task_id"] is not None and thread["task_id"] != task_id:
                 raise Conflict("Thread task does not match the operation harness session binding.")

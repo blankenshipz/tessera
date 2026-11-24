@@ -42,7 +42,16 @@ def _code(value: str | None) -> str | None:
     return value if _CODE.fullmatch(value) else "detail_withheld"
 
 
-def _lease(connection: sqlite3.Connection, grant_id: str | None, now: datetime):
+# A grant in any other state (reconciled) no longer lets its lease run anything.
+_LIVE_GRANT = frozenset({"active", "cancel_requested"})
+
+
+def _lease(
+    connection: sqlite3.Connection,
+    grant_id: str | None,
+    now: datetime,
+    grant_status: str | None = None,
+):
     if grant_id is None:
         return None, None
     row = connection.execute(
@@ -58,7 +67,9 @@ def _lease(connection: sqlite3.Connection, grant_id: str | None, now: datetime):
     except ValueError:
         expired, remaining = True, None
     lease = {
-        "held": not expired,
+        # Held only while the lease is unexpired and its grant is still live (a reconciled grant
+        # keeps its old lease row, which no longer holds anything).
+        "held": not expired and (grant_status is None or grant_status in _LIVE_GRANT),
         "epoch": row["epoch"],
         "renewed_age_seconds": _age(row["renewed_at"], now),
         "expires_in_seconds": remaining,
@@ -88,7 +99,9 @@ def _attempt_view(connection: sqlite3.Connection, row: Mapping[str, Any], now: d
             (row["grant_id"],),
         ).fetchone()
         grant = None if g is None else dict(g)
-    lease, executor = _lease(connection, row["grant_id"], now)
+    lease, executor = _lease(
+        connection, row["grant_id"], now, None if grant is None else grant["status"]
+    )
     return {
         "attempt": row["attempt"],
         "status": row["status"],

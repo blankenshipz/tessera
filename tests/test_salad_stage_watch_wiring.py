@@ -772,7 +772,7 @@ def test_load_config_accepts_the_block_and_refuses_a_bad_one(tmp_path):
         "guardian_uid": 1000,
         "custody": dict(custody(), token_file=str(tmp_path / "t"), ca_file=str(tmp_path / "ca")),
         "work_directory": str(tmp_path / "work"),
-        "source_revision": "a" * 40,
+        "source_revision": live.installed_source_pin("a" * 40),
         "poll_seconds": 5,
     }
     path = tmp_path / "config.json"

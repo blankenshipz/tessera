@@ -26,6 +26,7 @@ from tessera_control.campaign_salad_executor import (
     subprocess_route_runner,
 )
 from tessera_control.salad_campaign_profiles import SaladCampaignProfile, derive_selection
+from tessera_control.salad_live_check import installed_source_pin
 from tessera_control.salad_workload_contract import WorkloadContractV1
 from tessera_control.store import Conflict
 
@@ -630,7 +631,7 @@ def test_config_is_closed_and_private(tmp_path):
         "guardian_uid": 1000,
         "custody": dict(custody(), token_file=str(tmp_path / "t"), ca_file=str(tmp_path / "ca")),
         "work_directory": str(tmp_path / "work"),
-        "source_revision": "a" * 40,
+        "source_revision": installed_source_pin("a" * 40),
         "poll_seconds": 5,
     }
 

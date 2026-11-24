@@ -27,6 +27,7 @@ from .deploy_check import (
     write_private_json,
     write_receipt,
 )
+from .salad_live_check import SOURCE_PIN_SHAPE, installed_source_pin, is_source_pin
 
 AREA = "config"
 MAX_CONFIG_BYTES = 65536
@@ -177,19 +178,44 @@ def check_config(path: Path, *, label: str | None = None) -> list[Finding]:
         )
     findings = [Finding(check_id, AREA, "ok", "The config names only keys this release knows.")]
     if schema == CONFIG_SCHEMA:
-        try:
-            ExecutorConfig.model_validate(document)
-        except ValidationError as error:
+        pin = check_source_pin(document, name)
+        findings.append(pin)
+        errors = _model_errors(document, refreshable=pin.fix is REFRESH_SOURCE_PIN)
+        if errors:
             findings.append(
                 Finding(
                     f"config.{name}.valid",
                     AREA,
                     "fail",
                     "The config does not validate against the executor config model.",
-                    {"errors": _validation_detail(error)},
+                    {"errors": errors},
                 )
             )
     return findings
+
+
+# A well-formed pin that stands in for a refreshable source_revision, so the rest of the config
+# (field and model-level checks the pin's error would otherwise hide) is still validated.
+_PLACEHOLDER_PIN = "0" * 40 + "+sha256:" + "0" * 64
+
+
+def _model_errors(document: dict[str, Any], *, refreshable: bool) -> list[dict[str, str]]:
+    """The executor config model's errors. When the source pin finding already carries the
+    refresh fix, an error on ``source_revision`` alone is left to that finding; every other
+    error, alone or alongside it, is still reported and still blocks."""
+    try:
+        ExecutorConfig.model_validate(document)
+    except ValidationError as error:
+        errors = _validation_detail(error)
+    else:
+        return []
+    if not refreshable or any(item["loc"] != "source_revision" for item in errors):
+        return errors
+    try:
+        ExecutorConfig.model_validate(dict(document, source_revision=_PLACEHOLDER_PIN))
+    except ValidationError as rest:
+        return errors + _validation_detail(rest)
+    return []
 
 
 def apply_drop_removed_keys(path: Path, receipt_dir: Path) -> dict[str, Any] | None:
@@ -217,5 +243,75 @@ def apply_drop_removed_keys(path: Path, receipt_dir: Path) -> dict[str, Any] | N
             "before_sha256": sha256_hex(raw),
             "after_sha256": sha256_hex(after),
             "notes": {key: table[key] for key in removed},
+        },
+    )
+
+
+REFRESH_SOURCE_PIN = Fix(
+    "refresh_source_pin",
+    "Pin source_revision to the installed source (receipted).",
+    automatic=True,
+    command="tessera deploy-check --apply refresh_source_pin --source-commit <40-hex commit>",
+)
+
+
+def check_source_pin(document: dict[str, Any], name: str) -> Finding:
+    """Whether the executor's ``source_revision`` is the pin the live check accepts now: the
+    exact shape and the digest of the installed source. Values are never reported."""
+    check_id = f"config.{name}.source_pin"
+    value = document.get("source_revision")
+    if not is_source_pin(value):
+        return Finding(
+            check_id,
+            AREA,
+            "fail",
+            "source_revision is not the pin the live check requires; every route would stop "
+            "at the live-check start.",
+            {"required_shape": SOURCE_PIN_SHAPE},
+            REFRESH_SOURCE_PIN,
+        )
+    try:
+        current = installed_source_pin(value.split("+sha256:")[0])
+    except ValueError as error:
+        return Finding(check_id, AREA, "fail", str(error))
+    if value != current:
+        return Finding(
+            check_id,
+            AREA,
+            "fail",
+            "source_revision does not pin the installed source; every route would stop at the "
+            "live-check start.",
+            {},
+            REFRESH_SOURCE_PIN,
+        )
+    return Finding(check_id, AREA, "ok", "source_revision pins the installed source.")
+
+
+def apply_refresh_source_pin(
+    path: Path, receipt_dir: Path, commit: str, *, root: Path | None = None
+) -> dict[str, Any] | None:
+    """Rewrite an executor config's ``source_revision`` to ``commit`` pinned to the installed
+    source (``root`` defaults to it), atomically and owner-only, with a receipt. Refuses a
+    source that cannot be measured before anything is written; ``None`` when already pinned."""
+    require_writable_directory(receipt_dir, "receipt directory")
+    pin = installed_source_pin(commit, root)
+    raw = _read(path, owner_only=True)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    document = _parse(raw)
+    if document.get("schema") != CONFIG_SCHEMA:
+        raise ValueError("refresh_source_pin applies only to an executor config.")
+    if document.get("source_revision") == pin:
+        return None
+    result = dict(document, source_revision=pin)
+    write_private_json(path, result, mode=mode)
+    after = (json.dumps(result, sort_keys=True, indent=2) + "\n").encode()
+    return write_receipt(
+        receipt_dir,
+        "refresh_source_pin",
+        {
+            "config_schema": CONFIG_SCHEMA,
+            "before_sha256": sha256_hex(raw),
+            "after_sha256": sha256_hex(after),
+            "source_revision": pin,
         },
     )

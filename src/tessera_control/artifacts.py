@@ -21,7 +21,6 @@ from .migrations import plan_digest, plan_payload
 from .models import ExecutionSpec
 from .store import (
     Conflict,
-    Forbidden,
     NotFound,
     Store,
     StoreError,
@@ -185,18 +184,18 @@ class ArtifactStore(Store):
         ).fetchone()
         if lease is None or lease["worker_principal_id"] != worker["id"]:
             raise NotFound("Execution lease was not found.")
+        from .execution import ExecutionStore
+
+        # A grant outside the worker's project, or of another worker, is answered exactly as
+        # a grant that does not exist: same 404 and body, and no denial is recorded.
         grant = connection.execute(
             """SELECT g.* FROM execution_grants g JOIN projects p ON p.id = g.project_id
-            WHERE g.id = ? AND p.org_id = ?""",
-            (lease["grant_id"], worker["org_id"]),
+            WHERE g.id = ? AND p.org_id = ? AND g.project_id = ?""",
+            (lease["grant_id"], worker["org_id"], worker.get("project_id")),
         ).fetchone()
         if grant is None:
             raise NotFound("Execution grant was not found.")
-        if (
-            grant["worker_principal_id"] != worker["id"]
-            or worker.get("project_id") != grant["project_id"]
-        ):
-            raise Forbidden("Worker is not assigned to this execution grant.")
+        ExecutionStore._require_grant_worker(grant, worker, foreign_as_not_found=True)
         return lease, grant
 
     @staticmethod

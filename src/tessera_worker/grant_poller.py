@@ -30,6 +30,7 @@ from .control_channel import (
 from .cpu import CpuError, _docker
 from .daemon import backoff_delay
 from .docker_network_pool import DEFAULT_PREFIX_LENGTH, DockerNetworkPool
+from .public_fetch import PublicFetchError, parse_proxy
 from .service import (
     DevelopmentWorkerConfig,
     DevelopmentWorkerError,
@@ -94,6 +95,9 @@ class GrantPollerConfig:
     # both unset refuses every pushing image build. See ``DevelopmentWorkerConfig``.
     registry_auth_file: Path | None = None
     build_repositories: tuple[str, ...] = ()
+    # Optional explicit proxy (http://host:port) for that fetch, used only when its host is on the
+    # stage's egress allowlist. None: direct; proxy environment variables are always ignored.
+    public_fetch_proxy: str | None = None
     # HTTP timeout for every control request, seconds (1 to 120, default 15). A slow answer is a
     # transient failure that is retried; it never stops a healthy run (ADR 0054).
     control_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
@@ -141,6 +145,13 @@ class GrantPollerConfig:
             raise DevelopmentWorkerError("Grant poller configuration is invalid.")
         _check_container_user(self.container_user, self.allow_root_container_user)
         check_build_registry_shape(self.registry_auth_file, self.build_repositories)
+        if self.public_fetch_proxy is not None:
+            try:
+                parse_proxy(self.public_fetch_proxy)
+            except PublicFetchError as error:  # code only; the value is never echoed
+                raise DevelopmentWorkerError(
+                    f"Grant poller configuration is invalid: public_fetch_proxy {error.code}."
+                ) from None
         if self.scratch_bytes is not None and not limits.scratch_fits_memory(
             self.scratch_bytes, self.memory_bytes
         ):
@@ -191,6 +202,7 @@ _CONFIG_KEYS = {
     "stage_watcher",
     "registry_auth_file",
     "build_repositories",
+    "public_fetch_proxy",
 }
 
 
@@ -257,6 +269,7 @@ def load_poller_config(path: Path) -> GrantPollerConfig:
             stage_watch=stage_watch,
             registry_auth_file=_optional_path(document.get("registry_auth_file")),
             build_repositories=_repository_list(document.get("build_repositories")),
+            public_fetch_proxy=document.get("public_fetch_proxy"),
         )
     except (KeyError, TypeError, ValueError, DevelopmentWorkerError) as error:
         raise refused from error
@@ -396,6 +409,7 @@ class DevelopmentGrantPoller:
                 public_cache_dir=self.config.public_cache_dir,
                 registry_auth_file=self.config.registry_auth_file,
                 build_repositories=self.config.build_repositories,
+                public_fetch_proxy=self.config.public_fetch_proxy,
                 poll_seconds=self.config.poll_seconds,
             )
         )

@@ -160,7 +160,12 @@ class CredentialAccessLeaseStore(ExecutionStore):
         return row
 
     def _current(
-        self, connection: sqlite3.Connection, worker: dict[str, Any], row: sqlite3.Row
+        self,
+        connection: sqlite3.Connection,
+        worker: dict[str, Any],
+        row: sqlite3.Row,
+        *,
+        foreign_as_not_found: bool = False,
     ) -> sqlite3.Row:
         if (
             worker["kind"] != "worker"
@@ -192,7 +197,9 @@ class CredentialAccessLeaseStore(ExecutionStore):
                 raise Conflict("Execution lease has expired.")
         except ValueError as error:
             raise Conflict("Execution lease expiry is invalid.") from error
-        grant = self._active_worker_grant(connection, worker, row["grant_id"])
+        grant = self._active_worker_grant(
+            connection, worker, row["grant_id"], foreign_as_not_found=foreign_as_not_found
+        )
         if (
             grant["project_id"] != row["project_id"]
             or grant["task_id"] != row["task_id"]
@@ -418,7 +425,9 @@ class CredentialAccessLeaseStore(ExecutionStore):
         try:
             live = self._live_principal(connection, worker, audience="worker")
             row = self._record(connection, live, lease_id)
-            self._current(connection, live, row)
+            # The calling worker's grant moved to another worker: answered exactly as a
+            # grant that does not exist (404, same body).
+            self._current(connection, live, row, foreign_as_not_found=True)
             expiry = min(
                 _parse_utc(row["expires_at"]), datetime.now(UTC) + timedelta(seconds=HANDLE_SECONDS)
             )
@@ -441,7 +450,9 @@ class CredentialAccessLeaseStore(ExecutionStore):
         try:
             live = self._live_principal(connection, worker, audience="worker")
             row = self._record(connection, live, lease_id)
-            self._current(connection, live, row)
+            # The calling worker's grant moved to another worker: answered exactly as a
+            # grant that does not exist (404, same body).
+            self._current(connection, live, row, foreign_as_not_found=True)
             return True
         except (Conflict, Forbidden, NotFound, ValueError):
             return False

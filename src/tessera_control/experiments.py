@@ -1572,8 +1572,10 @@ class ExperimentStore(EvidenceIngestMixin, ProviderFetchRecordMixin, Store):
             # issuer eligibility, snapshot/skill releases and project limits.
             from .execution import ExecutionStore
 
+            # The dispatch is this worker's, but its grant may name another worker:
+            # answer exactly as for a missing grant so no claim reveals it exists.
             active_grant = ExecutionStore(self.database_path.parent)._active_worker_grant(
-                connection, worker, dispatch["grant_id"]
+                connection, worker, dispatch["grant_id"], foreign_as_not_found=True
             )
             operation = connection.execute(
                 "SELECT * FROM external_operations WHERE operation_id=?",

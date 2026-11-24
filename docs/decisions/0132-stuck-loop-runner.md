@@ -54,8 +54,18 @@ running never sees them.
 - **Polling inside `serve`.** Rejected: it would tie an agent identity and its credential to the
   control process, and the gates could not be separated from it.
 
+## Operator recovery
+
+A halt (exit 3) or an uncertain offer needs a person. `--reset` and
+`--resolve ITEM_ID --outcome succeeded|not_started` open the same ledger under the
+same refusals and exclusive locks (so they refuse while the loop runs), call the
+loop's `reset()` or `resolve_uncertain()`, append an `operator_reset` or
+`uncertain_resolved` receipt, print one line and exit 0. They start no call, need no
+network, never clear the per-finding rows, and cannot be combined with ticking.
+Deleting the ledger is not a recovery path: it would discard the once-per-finding record.
+
 ## Open questions
 
 - Whether a receipt per finding is enough noise control for a very large backlog, or the journal
   needs rotation.
-- How a person should be told when the runner halts (exit 3) beyond the unit failing.
+- How a person should be told when the runner halts (exit 3) beyond the unit failing (recovery itself is the operator procedure above).

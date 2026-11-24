@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
@@ -55,6 +56,19 @@ class QuotaExceeded(Exception):
 
 class CallNotStarted(Exception):
     """May be raised by the model-call callable: the call definitely did not start (retryable)."""
+
+
+class KillSwitchEngaged(CallNotStarted):
+    """The kill switch engaged after the loop's check: nothing started; not a failure."""
+
+
+_SAFE_REASON = re.compile(r"[a-z0-9_]{1,64}\Z")
+
+
+def _safe_reason(exc: Exception) -> str | None:
+    """The refusal reason if it is a short snake_case token, else None (never free text)."""
+    text = str(exc)
+    return text if _SAFE_REASON.fullmatch(text) else None
 
 
 class LedgerNotDurable(ValueError):
@@ -607,17 +621,26 @@ class StandingLoop:
                 {"event": "backoff", "until": self._backoff_until, "reason": "quota_exceeded"}
             )
             return {"state": "backing_off", "started": item_id, "skipped": None}
+        except KillSwitchEngaged as exc:
+            self._set_ledger(item_id, "failed_before_start")
+            event = {"event": "call_finished", "item_id": item_id, "outcome": "kill_switch"}
+            if (reason := _safe_reason(exc)) is not None:
+                event["reason"] = reason
+            self.record(event)
+            self._save_state()
+            return {"state": self.state, "started": item_id, "skipped": None}
         except CallNotStarted as exc:
             self._set_ledger(item_id, "failed_before_start")
             self._failures += 1
-            self.record(
-                {
-                    "event": "call_finished",
-                    "item_id": item_id,
-                    "outcome": "failed",
-                    "error": type(exc).__name__,
-                }
-            )
+            event = {
+                "event": "call_finished",
+                "item_id": item_id,
+                "outcome": "failed",
+                "error": type(exc).__name__,
+            }
+            if (reason := _safe_reason(exc)) is not None:
+                event["reason"] = reason
+            self.record(event)
             if self._failures >= p.max_consecutive_failures:
                 self.state = "halted"
             self._save_state()

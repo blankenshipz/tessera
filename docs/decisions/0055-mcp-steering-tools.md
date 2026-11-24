@@ -61,3 +61,13 @@ reduce-only, release rules, grant view), `tests/test_mcp_steering.py` (paths, sc
 registration, destructive annotation, no approve or raise tool, the retry builder and its refusals),
 `tests/test_stage_retry_end_to_end.py` (a real failed chain through the builder, validate and submit,
 and the custody dependency) and `tests/test_steering_cancel_race.py`.
+
+## Addendum: the stage status read
+
+`tessera_campaign_stage_status` is a read-only steering input, not a steering action: one bounded
+record per stage from rows the platform already keeps (placement decision and skip codes, waiting
+events, latest attempt with its grant, executor lease and heartbeat age, failure and rejection
+counts). It returns codes, ages and counts only; a free-text waiting reason is withheld unless it is a
+short code, and no principal, credential, worker name or address is returned. It needs the campaign
+log scope, answers another organization with a plain 404, and changes nothing. A lease reads as held
+only while it is unexpired and its grant is still `active` or `cancel_requested`.

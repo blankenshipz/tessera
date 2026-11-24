@@ -457,6 +457,20 @@ recorded state: `campaign_approval` (submitted, awaiting a person's approval of 
 source-use review, with the stage, attempt and decision request). Each item names what is awaited,
 and it disappears the moment the decision is made, refused or expired, or the campaign ends; an
 empty list means nothing awaits a person.
+
+The stored receipt is the owner's audit record and a person reads it whole. An external-scope
+agent credential (the receipt route, `tessera_get_campaign_receipt`,
+`tessera_campaign_wave_receipts`) reads a marked projection instead (`"view": "agent_redacted"`
+on the response and the receipt body, and `redacted`, the field paths removed), the same
+approver-hiding rule as the live campaign view and the gate decisions: it drops
+`approval.approving_principal_id` and `approval.smoke_grant_id`, each pre-approval's `id`,
+`source_digest`, `plan_digest` and `source_use_digest`, each delegated resolution's `subject_id`
+(the decision request or source) and `review_digest`, and the submission section's
+`approved_by_principal_id` and per-decision `actor_principal_id`. It keeps the spec digest, the
+approval's id, class and expiry, the delegation, and each pre-approval's stage, caps, expiry and
+resolved kinds, attempts and cents. Its `receipt_digest` is the stored receipt's digest, naming
+the record it is a view of; the projection itself is not digest-verifiable. Chaining
+(`receipt_output`), gate and unlock evaluation and the plain-words report read the stored receipt.
 Do not report a campaign as run without reading its receipt.
 
 **Comparing arms (ADR 0131).** `GET /campaigns/{id}/comparison` (404 until terminal) compares

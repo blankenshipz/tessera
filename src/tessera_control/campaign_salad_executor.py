@@ -41,6 +41,7 @@ from pydantic import (
     Field,
     StringConstraints,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -66,6 +67,14 @@ KEEPALIVE_PHASES = ("leased", "route_started", "executing")
 _IDENT = re.compile(r"[a-zA-Z0-9_-]{1,200}\Z")
 _Path = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
 _ProfileName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
+SOURCE_PIN_ERROR = (
+    "source_revision must be '<40 lowercase hex commit>+sha256:<64 lowercase hex installed "
+    "source digest>' (refresh it with: tessera deploy-check --apply refresh_source_pin)"
+)
+_CONFIG_ERROR = (
+    f"Executor config must be an owner-only absolute {CONFIG_SCHEMA} JSON file "
+    "whose referenced files and directories are private."
+)
 
 
 class _Closed(BaseModel):
@@ -167,9 +176,9 @@ class ExecutorConfig(_Closed):
     guardian_uid: Annotated[int, Field(ge=0, le=2**31 - 1)]
     custody: CustodyConfig
     work_directory: _Path
-    source_revision: Annotated[
-        str, StringConstraints(pattern=r"^[a-f0-9]{40}(?:\+sha256:[a-f0-9]{64})?$")
-    ]
+    # Exactly the pin ``salad_live_check.run`` requires; refused here so a bad one stops the
+    # executor at start instead of every route at the live-check start.
+    source_revision: str
     poll_seconds: Annotated[int, Field(ge=2, le=30)]
     # The guardian may not have reached ``stopped`` right after the exit: re-read a few
     # times, a short fixed delay apart, before the runner falls back to a human charge.
@@ -183,6 +192,15 @@ class ExecutorConfig(_Closed):
     stage_watcher: StageWatcherBlock | None = None
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
+
+    @field_validator("source_revision")
+    @classmethod
+    def _live_check_source_pin(cls, value: str) -> str:
+        from .salad_live_check import is_source_pin
+
+        if not is_source_pin(value):
+            raise ValueError(SOURCE_PIN_ERROR)
+        return value
 
     @model_validator(mode="after")
     def _one_profile_field(self) -> ExecutorConfig:
@@ -198,8 +216,11 @@ class ExecutorConfig(_Closed):
 
 
 def load_config(path: Path | str) -> ExecutorConfig:
-    """Closed, owner-only (0600) absolute config file; every referenced path is checked."""
-    from .salad_live_check import _private_bytes, _private_path
+    """Closed, owner-only (0600) absolute config file; every referenced path is checked.
+
+    ``source_revision`` must be the pin ``salad_live_check.run`` accepts for the source
+    installed now; a missing, malformed or stale pin is refused here with its own message."""
+    from .salad_live_check import _private_bytes, _private_path, installed_source_pin
     from .salad_workload_jwt import strict_json
 
     try:
@@ -218,11 +239,16 @@ def load_config(path: Path | str) -> ExecutorConfig:
         socket_path = Path(config.guardian_socket)
         if not socket_path.is_absolute() or ".." in socket_path.parts:
             raise ValueError("guardian socket")
-    except (OSError, ValueError, ValidationError):
-        raise ValueError(
-            f"Executor config must be an owner-only absolute {CONFIG_SCHEMA} JSON file "
-            "whose referenced files and directories are private."
-        ) from None
+    except ValidationError as error:
+        if any(item["loc"] == ("source_revision",) for item in error.errors()):
+            raise ValueError(SOURCE_PIN_ERROR) from None
+        raise ValueError(_CONFIG_ERROR) from None
+    except (OSError, ValueError):
+        raise ValueError(_CONFIG_ERROR) from None
+    # The live check refuses a pin whose digest is not the installed source's.
+    commit = config.source_revision.split("+sha256:")[0]
+    if config.source_revision != installed_source_pin(commit):
+        raise ValueError("source_revision does not pin the installed source; " + SOURCE_PIN_ERROR)
     return config
 
 

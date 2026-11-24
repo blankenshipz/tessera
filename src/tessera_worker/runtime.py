@@ -99,6 +99,7 @@ class CpuRuntime:
         provider: Provider | None = None,
         public_root: Path | None = None,
         public_cache_dir: Path | None = None,
+        public_fetch_proxy: str | None = None,
         public_fetcher: Callable[..., list[dict[str, Any]]] = fetch_public_files,
         registry_auth_file: Path | None = None,
         build_repositories: tuple[str, ...] = (),
@@ -118,6 +119,8 @@ class CpuRuntime:
         ):
             raise SupervisorError("Runtime public inputs require private 0700 supervisor custody.")
         self.public_cache_dir = Path(public_cache_dir) if public_cache_dir is not None else None
+        # Optional explicit operator proxy; None fetches directly (environment proxies ignored).
+        self.public_fetch_proxy = public_fetch_proxy
         self._public_fetcher = public_fetcher
         # ADR 0123: the operator's registry auth file, mounted read-only into a pushing build.
         self.registry_auth_file = (
@@ -406,6 +409,7 @@ class CpuRuntime:
         self._discard_public(directory)
         directory.mkdir(mode=0o700)
         cache = self.public_cache_dir if plan["cache"] else None
+        proxy = {"proxy": self.public_fetch_proxy} if self.public_fetch_proxy is not None else {}
         rows: list[dict[str, Any]] = []
         try:
             for name in sorted({item["input"] for item in plan["files"]}):
@@ -419,6 +423,7 @@ class CpuRuntime:
                     dest=directory / name,
                     redirect_hosts=tuple(plan["hosts"]),
                     cache_dir=cache,
+                    **proxy,
                 )
                 rows += [{"input": name} | dict(row) for row in fetched]
             expected = {(row["input"], row["name"]) for row in rows}

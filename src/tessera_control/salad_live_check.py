@@ -840,10 +840,14 @@ class SaladLiveSession:
         return SaladLiveSession(self.config_file)
 
 
-def source_digest():
-    """Observed installed Python package-input inventory, not an inferred git state."""
-    root = Path(__file__).parent.parent
+def source_digest(root=None):
+    """Observed installed Python package-input inventory, not an inferred git state.
+
+    ``root`` defaults to the directory this package is installed in; an empty inventory
+    cannot be measured and is refused."""
+    root = Path(__file__).parent.parent if root is None else Path(root)
     digest = hashlib.sha256()
+    count = 0
     for package in ("tessera_control", "tessera_worker"):
         for path in sorted((root / package).rglob("*.py")):
             if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
@@ -851,7 +855,35 @@ def source_digest():
             data = path.read_bytes()
             digest.update(str(path.relative_to(root)).encode() + b"\0")
             digest.update(hashlib.sha256(data).digest())
+            count += 1
+    if not count:
+        raise ValueError("source inventory empty")
     return digest.hexdigest()
+
+
+# The one shape ``run`` accepts for ``source_revision``: the git commit, then the observed
+# installed source digest. The executor config loader refuses anything else with this check.
+SOURCE_PIN_PATTERN = re.compile(r"[0-9a-f]{40}\+sha256:[0-9a-f]{64}")
+SOURCE_PIN_SHAPE = "<40 lowercase hex commit>+sha256:<64 lowercase hex installed source digest>"
+
+
+def is_source_pin(value):
+    """True when ``value`` has the exact shape ``run`` requires (the digest is not compared)."""
+    return type(value) is str and SOURCE_PIN_PATTERN.fullmatch(value) is not None
+
+
+def installed_source_pin(commit, root=None):
+    """``commit`` pinned to the installed source as measured now: the value ``run`` accepts.
+
+    Refuses a commit that is not 40 lowercase hex and a source tree that cannot be measured
+    (missing, empty, unreadable or holding a symlink)."""
+    if type(commit) is not str or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("source commit must be 40 lowercase hex characters")
+    try:
+        digest = source_digest(root)
+    except (OSError, ValueError):
+        raise ValueError("the installed source cannot be measured") from None
+    return f"{commit}+sha256:{digest}"
 
 
 INVALID_CODE = "invalid_code"
@@ -1617,7 +1649,7 @@ def run(session, *, route_id, source_revision, receipt_directory, max_seconds=30
         or session.dispatcher.worker != session.server.worker
     ):
         raise ValueError("exact dispatcher binding required")
-    if not re.fullmatch(r"[0-9a-f]{40}\+sha256:[0-9a-f]{64}", source_revision) or not (
+    if not is_source_pin(source_revision) or not (
         type(max_seconds) is int
         and 1 <= max_seconds <= MAX_ROUTE_SECONDS
         and type(max_polls) is int

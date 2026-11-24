@@ -28,7 +28,14 @@ at ``max_backoff_seconds``) before the next tick, and an uncertain offer is neve
 journal is a 0600, locked, fsynced JSONL file of ids, codes, digests and reasons, one timestamped
 line per event.
 
-Exit codes: 0 stopped (or disabled), 2 configuration error or refusal, 3 the loop is halted.
+Recovery: ``--reset`` (un-halt) and ``--resolve ITEM_ID --outcome succeeded|not_started`` (decide
+an uncertain offer) open the same ledger under the same refusals and exclusive locks, never start
+a call or touch the network, never clear the per-finding rows, append an ``operator_reset`` or
+``uncertain_resolved`` receipt to the journal, print one line and exit 0. They cannot be combined
+with ticking.
+
+Exit codes: 0 stopped (or disabled, or recovered), 2 configuration error or refusal, 3 the loop is
+halted.
 """
 
 from __future__ import annotations
@@ -384,7 +391,46 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--interval-seconds", type=float, default=60)
     p.add_argument("--max-ticks", type=int, default=None)
     p.add_argument("--once", action="store_true", help="run one tick (same as --max-ticks 1)")
+    p.add_argument("--reset", action="store_true", help="un-halt the loop, then exit (no tick)")
+    p.add_argument("--resolve", metavar="ITEM_ID", help="resolve an uncertain offer, then exit")
+    p.add_argument("--outcome", choices=("succeeded", "not_started"), help="with --resolve")
     return p
+
+
+def _no_call(*_: Any, **__: Any) -> Any:
+    raise RuntimeError("operator recovery never starts a call")
+
+
+def _recover(
+    args: argparse.Namespace,
+    ledger: SqliteCallLedger,
+    journal: RunnerJournal,
+    kill: Any,
+    policy: StuckLoopPolicy,
+    env: Mapping[str, str],
+    clock: Callable[[], float],
+) -> int:
+    """Operator reset/resolve through the loop's own methods; no source, no call, no network."""
+    try:
+        loop = StandingLoop(
+            policy.loop_policy(), kill, lambda: [], _no_call, journal.write_event, clock,
+            ledger=ledger, environ=env,
+        )  # fmt: skip
+        if args.reset:
+            was = loop.state
+            loop.reset()
+            journal.write_event(
+                {"event": "operator_reset", "was": was, "policy_digest": policy.digest}
+            )
+            print(f"reset: loop was {was}, now {loop.state}")
+        else:
+            loop.resolve_uncertain(args.resolve, args.outcome)
+            print(f"resolved: {args.resolve} as {args.outcome}")
+    except ApiKeyPresent:
+        return _refuse("a direct API key variable is set; refusing to start")
+    except ValueError as error:
+        return _refuse(f"recovery refused: {error}")
+    return EXIT_STOPPED
 
 
 def _refuse(message: str) -> int:
@@ -401,7 +447,16 @@ def main(
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Console entry point. ``control`` (a ``StuckControl``-like object) is for tests only."""
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    recovery = args.reset or args.resolve is not None
+    if args.reset and args.resolve is not None:
+        parser.error("--reset and --resolve are mutually exclusive")
+    if (args.outcome is None) == (args.resolve is not None):
+        if args.resolve is not None or args.outcome is not None:
+            parser.error("--resolve and --outcome go together")
+    if recovery and (args.once or args.max_ticks is not None):
+        parser.error("--reset/--resolve cannot be combined with --once or --max-ticks")
     env = os.environ if environ is None else environ
     present = [name for name in _FORBIDDEN if name in env]
     if present:
@@ -418,6 +473,19 @@ def main(
         return _refuse("no --kill-switch given; treating the kill switch as engaged")
     if args.journal is None or args.ledger is None:
         return _refuse("--journal and --ledger are required when enabled")
+    if recovery:
+        kill = KillSwitch(args.kill_switch)
+        try:
+            journal = RunnerJournal(args.journal, clock)
+        except (ValueError, OSError, JournalInUse) as error:
+            return _refuse(f"journal unavailable: {type(error).__name__}")
+        with journal:
+            try:
+                ledger = SqliteCallLedger(args.ledger)
+            except (ValueError, OSError, LedgerInUse) as error:
+                return _refuse(f"ledger unavailable: {type(error).__name__}")
+            with ledger:
+                return _recover(args, ledger, journal, kill, policy, env, clock)
     if not 1 <= args.interval_seconds <= 3600:
         return _refuse("--interval-seconds must be between 1 and 3600")
     max_ticks = 1 if args.once else args.max_ticks

@@ -1972,4 +1972,9 @@ FAILURE_CLASSES = (
     "cancelled",
     "holdout_already_claimed",
     "sealed_partition",
+    "public_fetch_unreported",
 )
+# ADR 0097: a worker-grant attempt whose stage declares public_artifact pins exited without a
+# fetch report recorded before its run receipt; it fails closed instead of succeeding with
+# every file ``declared_only``.
+PUBLIC_FETCH_UNREPORTED = "public_fetch_unreported"

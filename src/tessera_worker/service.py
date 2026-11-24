@@ -43,6 +43,7 @@ from .docker_network_pool import DEFAULT_PREFIX_LENGTH, DockerNetworkPool
 from .outputs import OutputCollectionError, worker_output_limit
 from .private_auth_file import AuthFileRefused, check_private_auth_file
 from .provider import Provider
+from .public_fetch import PublicFetchError, parse_proxy
 from .runtime import MAX_DESCRIPTOR_BYTES, ObservationDeliveryPending, ObservationRefused
 from .supervisor import DriverResult, SupervisorError
 
@@ -155,6 +156,9 @@ class DevelopmentWorkerConfig:
     # without the other is a configuration error. Never from a plan or control.
     registry_auth_file: Path | None = None
     build_repositories: tuple[str, ...] = ()
+    # Optional explicit proxy (http://host:port) for that fetch; used only when its host is on the
+    # stage's egress allowlist, else the fetch fails closed. None: direct, environment ignored.
+    public_fetch_proxy: str | None = None
     output_capacity_inodes: int = 256
     poll_seconds: float = 1.0
     max_ticks: int = 90_000
@@ -511,6 +515,13 @@ class DevelopmentWorkerService:
             if config.registry_auth_file is not None
             else None
         )
+        if config.public_fetch_proxy is not None:
+            try:
+                parse_proxy(config.public_fetch_proxy)  # syntax now; the host check is per stage
+            except PublicFetchError as error:  # code only; the value is never echoed
+                raise DevelopmentWorkerError(
+                    f"Development worker configuration is invalid: public_fetch_proxy {error.code}."
+                ) from None
         self.token = read_private_credential(config.credential_file)
         self.channel = channel or HttpControlChannel(
             config.control_url, self.token, timeout_seconds=config.control_timeout_seconds
@@ -603,6 +614,7 @@ class DevelopmentWorkerService:
                 public_cache_dir=self.public_cache_dir,
                 registry_auth_file=self.registry_auth_file,
                 build_repositories=self.config.build_repositories,
+                public_fetch_proxy=self.config.public_fetch_proxy,
             ) as runtime:
                 self._attach_stage_watch(runtime, adapter)
                 result = runtime.recover(lease_id, epoch)
@@ -627,6 +639,7 @@ class DevelopmentWorkerService:
             public_cache_dir=self.public_cache_dir,
             registry_auth_file=self.registry_auth_file,
             build_repositories=self.config.build_repositories,
+            public_fetch_proxy=self.config.public_fetch_proxy,
         ) as runtime:
             self._attach_stage_watch(runtime, adapter)
             result = runtime.start(lease_id, epoch)

@@ -79,8 +79,11 @@ Remote `connect_tls` uses explicit IP, CA/hostname checking, TLS 1.3, client
 certificate and exact server certificate hash; it never uses an ambient Docker,
 Kubernetes, proxy or cloud configuration. A deployment-owned TLS listener must
 authenticate/pin the client and select the already enrolled receiver **before**
-calling `receive_one(channel, receiver, authorized=...)`. The receiver loop is a
-library integration seam, not an installed server or new HTTP API route. Local
+calling `receive_one(channel, receiver, authorized=...)`. The control service
+provides that listener only when started with `--monitor-enrollments FILE` (see
+[Operator enrollment](#operator-enrollment-opt-in-listener) and
+[decision 0127](decisions/0127-execution-monitor-receiver-in-service.md)); there
+is no new HTTP API route. Local
 conformance uses a private inherited socket with HMAC instead of certificates.
 
 Frames are length-prefixed and capped at 64 KiB with absolute read deadlines.
@@ -229,3 +232,66 @@ call or live Docker/Kubernetes/Salad workload was performed. The only initial ne
 test failure was a historical upload acknowledgement that incorrectly rejected an
 older exact receipt; it now safely leaves the durable cursor unchanged, and upload
 replay/recovery tests pass.
+
+## Operator enrollment (opt-in listener)
+
+`tessera-control serve --monitor-enrollments FILE` starts an mTLS listener inside
+the control service for the receiver above. Without the flag nothing starts and no
+port opens. The file must be owner-only; startup validates it and refuses on any
+problem. Keys are referenced by path (three 32-byte key files), never inline.
+
+```json
+{
+  "schema": "tessera.monitor-enrollments.v1",
+  "listener": {
+    "bind_ip": "192.0.2.10",
+    "port": 9443,
+    "server_cert": "/etc/tessera/monitor/server.pem",
+    "server_key": "/etc/tessera/monitor/server.key",
+    "client_ca": "/etc/tessera/monitor/client-ca.pem"
+  },
+  "monitors": [
+    {
+      "monitor": "monitor-example-1",
+      "tenant": "tenant-example",
+      "project": "project-example",
+      "assignment": "/etc/tessera/monitor/example-1/assignment.sealed",
+      "authority_key": "/etc/tessera/monitor/example-1/authority.key",
+      "channel_key": "/etc/tessera/monitor/example-1/channel.key",
+      "evidence_key": "/etc/tessera/monitor/example-1/evidence.key",
+      "client_cert_sha256": "<64 lowercase hex characters>",
+      "worker_credential_id": "cred-example",
+      "active": true
+    }
+  ]
+}
+```
+
+The file must be exactly 0600, not a symlink, with absolute paths; `bind_ip` is a
+numeric IP; the server key and the three key files are owner-private; the three
+keys are distinct 32-byte keys, and a channel or evidence key may not be reused by
+another entry (one authority key may sign several assignments). Each sealed
+assignment must open under its authority key and name the entry's tenant, project
+and monitor.
+
+A connection is accepted only over TLS 1.3 from a client certificate whose SHA-256
+matches an entry; that entry selects the receiver, and each monitor has its own
+durable journal under `<state dir>/execution-monitors/<monitor>/`. At most 8
+connections run at once, one per monitor, each bounded by handshake and frame
+deadlines and a 10-minute lifetime. Artifact evidence is still refused (no custody
+integration yet), and `status()` stays `activation: blocked`. A monitor id keeps one
+assignment for the life of its journal: enrol a new id for a new assignment.
+
+**Interim authority.** Until control issues monitor assignments itself, operator
+enrollment is the authority for "continue". It is answered only while the entry is
+present and active in the file (re-read at each check), the assignment is unexpired
+and byte-identical, and the worker's control credential is live; anything else
+answers "revoke". To revoke, remove the entry or set `"active": false`, revoke the
+worker credential, or let the assignment expire (an expired assignment's challenge is
+refused as stale and the connection closes: never "continue", though not a signed
+"revoke"). The file is re-read and fully re-validated at every check, so an invalid
+edit anywhere makes every monitor answer "revoke" until it is fixed; new or changed
+entries take effect after a restart. Evidence uploads keep being accepted after
+revocation, so stop and recovery receipts still reach the journal. Nothing here
+issues assignments, broker receipts or global claims, and there is still no
+self-enrollment endpoint.

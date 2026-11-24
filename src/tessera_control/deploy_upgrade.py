@@ -8,7 +8,9 @@ The steps a deploy took by hand, in order, each recorded in one receipt:
 2. *stop*: the services that name a ``stop_argv``, last to first.
 3. *backup*: a capped, SQLite-consistent backup of the state directory into the plan's backup
    directory (a new directory per run).
-4. *config fixes*: the removed keys dropped, each with the deploy-check receipt.
+4. *config fixes*: the removed keys dropped and each executor's ``source_revision`` re-pinned to
+   the installed source with the plan's ``source_revision`` commit, each with the deploy-check
+   receipt.
 5. *migrate*: the existing explicit migration; the backup above is the confirmation it needs.
 6. *start*: the services in plan order, each restarted and waited on until healthy.
 7. *smoke*: the fixed cheap set: a second deploy check must be ready (schema current, configs
@@ -44,7 +46,7 @@ from .store import DATABASE_NAME
 
 RECEIPT_SCHEMA = "tessera.deploy-receipt.v1"
 # Fixes this command makes itself; every other failing check blocks the upgrade.
-SELF_FIXED = {"migrate", "drop_removed_keys"}
+SELF_FIXED = {"migrate", "drop_removed_keys", "refresh_source_pin"}
 
 
 SNAPSHOT_NAME = "snapshot.sqlite3"
@@ -181,10 +183,12 @@ def preflight(plan: Any, *, smoke: bool) -> tuple[list[deploy_check.Finding], li
         max_backup_bytes=plan.max_backup_bytes,
         smoke=smoke,
     )
+    # The pin is refreshed only with the plan's commit; without one a stale pin blocks.
+    fixed = SELF_FIXED if plan.source_revision is not None else SELF_FIXED - {"refresh_source_pin"}
     blocking = [
         item.check_id
         for item in findings
-        if item.status == "fail" and (item.fix is None or item.fix.fix_id not in SELF_FIXED)
+        if item.status == "fail" and (item.fix is None or item.fix.fix_id not in fixed)
     ]
     return findings, blocking
 
@@ -653,6 +657,12 @@ def run_upgrade(
                 run.document["fixes"].append(
                     {"fix": receipt["fix"], "receipt_sha256": receipt["receipt_sha256"]}
                 )
+        for path in _paths(plan.executor_configs) if plan.source_revision is not None else []:
+            receipt = config_fixes.apply_refresh_source_pin(path, receipt_dir, plan.source_revision)
+            if receipt is not None:
+                run.document["fixes"].append(
+                    {"fix": receipt["fix"], "receipt_sha256": receipt["receipt_sha256"]}
+                )
     except (ValueError, OSError) as error:
         run.step(
             "config-fixes",
@@ -769,6 +779,8 @@ def _planned(plan: Any, findings: list[deploy_check.Finding]) -> list[str]:
         steps.append(f"migrate schema {schema.get('current')} -> {schema.get('latest')}")
     if any(i.fix is not None and i.fix.fix_id == "drop_removed_keys" for i in findings):
         steps.append("after the migrate: drop removed config keys (receipted; originals kept)")
+    if any(i.fix is not None and i.fix.fix_id == "refresh_source_pin" for i in findings):
+        steps.append("after the migrate: pin executor source_revision to the installed source")
     steps.append("start in order, waiting for health: " + ", ".join(s.name for s in plan.services))
     steps.append("smoke: deploy check ready" + (", CPU smoke" if plan.smoke_cpu else ""))
     steps.append("write the deploy receipt")

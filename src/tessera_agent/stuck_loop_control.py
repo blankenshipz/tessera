@@ -25,12 +25,14 @@ import re
 from typing import Any
 
 _PID = r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}"
+# One finding-id shape for the whole loop: exactly what the control mints ("stuck_" + 32 hex).
+FINDING_ID = r"stuck_[a-f0-9]{32}"
 _LIST = re.compile(
     rf"/projects/(?P<pid>{_PID})/campaign-stuck"
     r"(?:\?status=(?P<status>open|acknowledged|resolved|all)&limit=(?P<limit>[1-9][0-9]{0,2}))?\Z"
 )
 _ACK = re.compile(
-    rf"/projects/(?P<pid>{_PID})/campaign-stuck/(?P<fid>[A-Za-z0-9][A-Za-z0-9._-]{{0,127}})"
+    rf"/projects/(?P<pid>{_PID})/campaign-stuck/(?P<fid>{FINDING_ID})"
     r"/acknowledge\Z"
 )
 _HTTP_STATUS = re.compile(r"\(HTTP (\d{3})\)")

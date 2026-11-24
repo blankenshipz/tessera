@@ -57,6 +57,7 @@ from .model_destinations import (
     DestinationRefused,
     destination,
     model_tier,
+    refuse_api_key_environment,
     require_tier_admitted,
     validate_credential_ref,
 )
@@ -1698,6 +1699,7 @@ def _main(argv=None):
     credentials_dir = None
     if args.command == "run" and found.runtime == RUNTIME_ANTHROPIC_MESSAGES:
         # The API key is read only from the manager-provided credential directory.
+        refuse_api_key_environment(dict(os.environ))
         try:
             credentials_dir = _manager_credentials_dir()
         except RuntimeBlocked as error:

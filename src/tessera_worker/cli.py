@@ -94,6 +94,10 @@ _BUILD_REPOSITORY_HELP = (
     "needs --registry-auth-file; none registered refuses every pushing build"
 )
 _PUBLIC_CACHE_HELP = "optional private 0700 download cache, used only for cache-enabled inputs"
+_PUBLIC_PROXY_HELP = (
+    "optional explicit http://host:port proxy for that fetch; used only when the host is on the "
+    "stage's egress allowlist, else the fetch is refused (proxy environment variables are ignored)"
+)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -126,6 +130,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--build-repository", action="append", default=None, help=_BUILD_REPOSITORY_HELP
     )
+    run.add_argument("--public-fetch-proxy", default=None, help=_PUBLIC_PROXY_HELP)
     run.add_argument("--container-user", default=None, help="numeric uid:gid for containers")
     run.add_argument("--allow-root-container-user", action="store_true")
     run.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
@@ -159,6 +164,7 @@ def parser() -> argparse.ArgumentParser:
     poll.add_argument(
         "--build-repository", action="append", default=None, help=_BUILD_REPOSITORY_HELP
     )
+    poll.add_argument("--public-fetch-proxy", default=None, help=_PUBLIC_PROXY_HELP)
     poll.add_argument("--container-user", default=None, help="numeric uid:gid for containers")
     poll.add_argument("--allow-root-container-user", action="store_true")
     poll.add_argument("--docker-network-pool", default=None, help=_POOL_HELP)
@@ -191,6 +197,7 @@ def _poll_config(arguments: argparse.Namespace) -> GrantPollerConfig:
         public_cache_dir=arguments.public_cache_dir,
         registry_auth_file=arguments.registry_auth_file,
         build_repositories=tuple(arguments.build_repository or ()),
+        public_fetch_proxy=arguments.public_fetch_proxy,
         container_user=arguments.container_user,
         allow_root_container_user=arguments.allow_root_container_user,
         docker_network_pool=arguments.docker_network_pool,
@@ -270,6 +277,7 @@ def main() -> int:
             public_cache_dir=arguments.public_cache_dir,
             registry_auth_file=arguments.registry_auth_file,
             build_repositories=tuple(arguments.build_repository or ()),
+            public_fetch_proxy=arguments.public_fetch_proxy,
             container_user=arguments.container_user,
             allow_root_container_user=arguments.allow_root_container_user,
             docker_network_pool=arguments.docker_network_pool,

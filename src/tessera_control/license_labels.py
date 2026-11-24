@@ -261,6 +261,10 @@ def _stage_union(
         inner = path | {marker}
         if item.kind == "snapshot":
             result[item.name] = snapshot_labels(connection, item.snapshot_id)
+        elif item.kind == "public_artifact":
+            # Pinned public files are fetched by the provider (ADR 0097) and carry no operator
+            # label: the implicit ``unlabelled``, never an unresolved lineage.
+            result[item.name] = frozenset({UNLABELLED})
         elif item.kind == "stage":
             if not any(s.key == item.stage for s in spec.stages):
                 result[item.name] = _UNRESOLVED

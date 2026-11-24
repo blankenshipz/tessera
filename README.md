@@ -422,7 +422,8 @@ shows them through `tessera_mcp` and to the standing agent loop as candidate wor
 only records: it never cancels, resumes, resolves or retries anything, and a person or existing
 policy still decides ([ADR 0091](docs/decisions/0091-campaign-stuck-detector.md); the agent-loop
 work source is run by `tessera-stuck-loop`, a runner that is disabled by default and started by hand;
-it only reads findings and records a `stuck_offered` receipt for each, and a person still acts;
+it reads findings and records a `stuck_offered` receipt for each (with the opt-in `ack_on_offer` it also
+acknowledges an offered finding, a write that needs the `campaign:cancel` scope), and a person still acts;
 [ADR 0132](docs/decisions/0132-stuck-loop-runner.md); nothing here has run against a live
 deployment).
 
@@ -511,7 +512,7 @@ Console scripts installed by the package, one line each:
   dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)).
 - `tessera-worker` / `tessera-worker-daemon`: worker CLI (`development-poll`) and its
   supervised daemon.
-  An optional stage watcher library (disabled by default; opt-in per run with `--stage-watcher` plus a kill-switch path, and the default worker is unchanged without it; an executor option covers Salad runs) observes and reports and never acts: it cannot stop, cancel, retry, resize or re-route anything. It may also file closed retry and resize *requests* that control records as advisory events and nobody admits ([ADR 0111](docs/decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md)). It is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.
+  An optional stage watcher library (disabled by default; opt-in per run with `--stage-watcher` plus a kill-switch path, and the default worker is unchanged without it; an executor option covers Salad runs) observes and reports and never acts: it cannot stop, cancel, retry, resize or re-route anything. It may also file closed retry and resize *requests* (no shipped caller files them yet) that control records as advisory events and nobody admits ([ADR 0111](docs/decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md)). It is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.
 - `tessera-mcp`: MCP server for agent clients.
 - `tessera-salad-operator` / `tessera-salad-cleanup`: human-only Salad setup and cleanup.
 - `tessera-salad-executor` / `tessera-salad-guardian`: supervised Salad campaign executor and spend guardian (units in `deploy/systemd/`, launchd templates in `deploy/launchd/`).

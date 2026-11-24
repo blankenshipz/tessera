@@ -573,14 +573,83 @@ def require_public_provider_input(
 ) -> Any:
     """Provider input tickets (issue and every pull): the provider of the route's target,
     bound to the operation's worker principal, must be trusted for the input. Route-less
-    operations receive ``public`` only. Returns the AdmittedInput plus the instance."""
+    operations receive ``public`` only. A campaign stage's own ``send_classes`` and its
+    licence-label rule apply here exactly as at release. Returns the AdmittedInput plus
+    the instance."""
     target = route_target_for_operation(connection, org_id, operation_id)
     worker = operation_worker_principal(connection, operation_id)
-    narrowed, approval_digest = campaign_input_narrowing(connection, operation_id)
+    attempts = _campaign_attempts_for_operation(connection, operation_id)
+    narrowed, approval_digest = _campaign_narrowing(connection, attempts)
     admitted = admit_provider_input(
         connection, target, snapshot_id, worker, narrowed=narrowed, approval_digest=approval_digest
     )
-    return admitted, provider_for_target(target), worker
+    provider_id = provider_for_target(target)
+    _require_campaign_licence_labels(connection, attempts, snapshot_id, provider_id)
+    return admitted, provider_id, worker
+
+
+def _campaign_attempts_for_operation(
+    connection: sqlite3.Connection, operation_id: str
+) -> list[sqlite3.Row | tuple[Any, ...]]:
+    """The campaign stage attempt(s) whose grant this external operation runs.
+
+    The stage's narrowing is stored durably in the approved campaign spec (immutable and
+    bound to the approval by its digest); this finds the attempt that links the operation
+    to it. The attempt's ``operation_id`` is recorded only once the runner observes the
+    operation, after the worker may already have asked for a ticket, so the link is, in
+    order: the attempt's grant (recorded when the runner issues it, before any lease) or
+    operation id; else the snapshot release the grant delivers (recorded on the attempt
+    before the grant is requested), which covers a crash between issuing the grant and
+    recording it. A release shared by several stages of one campaign yields every one of
+    them and their narrowings intersect. An operation that no campaign attempt links to
+    (a human grant, or anything recorded outside a campaign) returns nothing and keeps
+    the deployment trust check alone, exactly as before stage narrowing was re-checked.
+    """
+    link = connection.execute(
+        """SELECT o.grant_id, g.snapshot_release_id FROM external_operations o
+        LEFT JOIN execution_grants g ON g.id = o.grant_id WHERE o.operation_id = ?""",
+        (operation_id,),
+    ).fetchone()
+    grant_id, release_id = (None, None) if link is None else (link[0], link[1])
+    select = """SELECT a.campaign_id, a.stage_key, a.provider_id, c.spec_json, c.org_id,
+        c.project_id FROM campaign_stage_attempts a JOIN campaigns c ON c.id = a.campaign_id
+        WHERE """
+    rows = connection.execute(
+        select + "a.operation_id = ? OR (? IS NOT NULL AND a.grant_id = ?)",
+        (operation_id, grant_id, grant_id),
+    ).fetchall()
+    if not rows and release_id is not None:
+        rows = connection.execute(select + "a.release_id = ?", (release_id,)).fetchall()
+    return rows
+
+
+def _campaign_narrowing(
+    connection: sqlite3.Connection, attempts: list[Any]
+) -> tuple[frozenset[str] | None, str | None]:
+    if not attempts:
+        return None, None
+    campaign_ids = {row[0] for row in attempts}
+    if len(campaign_ids) != 1:  # a release is owned by one campaign; anything else: public
+        return frozenset({"public"}), None
+    approval = connection.execute(
+        """SELECT trust_policy_digest FROM campaign_approvals WHERE campaign_id = ?
+        ORDER BY (status='active') DESC, approved_at DESC, id DESC LIMIT 1""",
+        (next(iter(campaign_ids)),),
+    ).fetchone()
+    digest = None if approval is None else approval[0]
+    narrowed: frozenset[str] | None = None
+    for row in attempts:
+        try:
+            from .campaign_models import parse_spec_json
+
+            stage = next(item for item in parse_spec_json(row[3]).stages if item.key == row[1])
+        except Exception:  # noqa: BLE001 - unreadable campaign context grants nothing beyond public
+            return frozenset({"public"}), digest
+        classes = getattr(stage, "send_classes", None)
+        if classes:
+            # Only narrows: the result is intersected with the deployment trust setting.
+            narrowed = frozenset(classes) if narrowed is None else narrowed & frozenset(classes)
+    return narrowed, digest
 
 
 def campaign_input_narrowing(
@@ -593,27 +662,62 @@ def campaign_input_narrowing(
     a campaign returns ``(None, None)``. A campaign operation whose stored spec cannot be
     read fails closed to ``public`` only.
     """
-    row = connection.execute(
-        """SELECT a.campaign_id, a.stage_key, c.spec_json FROM campaign_stage_attempts a
-        JOIN campaigns c ON c.id = a.campaign_id WHERE a.operation_id = ?""",
-        (operation_id,),
-    ).fetchone()
-    if row is None:
-        return None, None
-    approval = connection.execute(
-        """SELECT trust_policy_digest FROM campaign_approvals WHERE campaign_id = ?
-        ORDER BY (status='active') DESC, approved_at DESC, id DESC LIMIT 1""",
-        (row[0],),
-    ).fetchone()
-    digest = None if approval is None else approval[0]
-    try:
-        from .campaign_models import parse_spec_json
+    return _campaign_narrowing(
+        connection, _campaign_attempts_for_operation(connection, operation_id)
+    )
 
-        stage = next(item for item in parse_spec_json(row[2]).stages if item.key == row[1])
-    except Exception:  # noqa: BLE001 - unreadable campaign context grants nothing beyond public
-        return frozenset({"public"}), digest
-    classes = getattr(stage, "send_classes", None)
-    return (frozenset(classes) if classes else None), digest
+
+def _require_campaign_licence_labels(
+    connection: sqlite3.Connection,
+    attempts: list[Any],
+    snapshot_id: str,
+    route_provider_id: str | None,
+) -> None:
+    """The campaign licence-label rule (``license_labels``) again at ticket issue and pull.
+
+    Labels are add-only, so a label added after release (or a provider restricted since)
+    stops later pulls. The labels are the stage's effective labels, computed as at release,
+    plus any label recorded on the delivered snapshot itself. Checked against the route's
+    provider and the provider the attempt recorded. Outside a campaign nothing changes.
+    """
+    if not attempts:
+        return
+    from . import license_labels
+    from .provider_trust import current_policy
+
+    policy = current_policy(connection)
+    providers = sorted({p for p in (route_provider_id, *(row[2] for row in attempts)) if p})
+    restricted = [p for p in providers if policy.allowed_license_labels(p) is not None]
+    if not restricted:
+        return
+    try:
+        from .campaign_models import normalize, parse_spec_json
+
+        labels: set[str] = set()
+        for row in attempts:
+            labels |= license_labels.stage_labels(
+                connection,
+                normalize(parse_spec_json(row[3])),
+                row[1],
+                org_id=row[4],
+                project_id=row[5],
+            )
+        explicit = connection.execute(
+            "SELECT 1 FROM snapshot_license_labels WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()
+        if explicit is not None:
+            labels |= license_labels.snapshot_labels(connection, snapshot_id)
+    except sqlite3.OperationalError:
+        raise
+    except Exception:  # noqa: BLE001 - undeterminable labels are a refusal, never an admit
+        raise DataClassRefused(
+            "the licence labels of the campaign stage's input cannot be determined for "
+            f"provider(s) {restricted}; refused (fail closed)"
+        ) from None
+    for provider_id in restricted:
+        reason = license_labels.license_refusal(provider_id, labels, policy)
+        if reason:
+            raise DataClassRefused(reason)
 
 
 def operation_input_data_class(connection: sqlite3.Connection, operation_id: str) -> DataClass:

@@ -96,6 +96,21 @@ def spec_of(env, stages):
     )
 
 
+def pub(name):
+    return NormalInput(
+        kind="public_artifact",
+        name=name,
+        public_files=(("w", "https://models.example.com/w.bin", "c" * 64, 10),),
+    )
+
+
+def spec_with_public(env, items):
+    """A v1 spec cannot spell a public_artifact, so swap the normalized inputs in directly."""
+    spec = spec_of(env, [stage("s1", [snap(env, "code", env.snapshot_id)])])
+    stage_one = dataclasses.replace(spec.stages[0], inputs=tuple(items))
+    return dataclasses.replace(spec, stages=(stage_one,))
+
+
 def labels_of(env, spec, key):
     with connect(env) as db:
         return ll.effective_labels(
@@ -335,6 +350,31 @@ def test_unlabelled_and_unknown_lineage_data_is_refused_unless_allowed():
     assert ll.license_refusal(
         "remote", {ll.UNLABELLED, ll.UNKNOWN_LINEAGE}, policy(["cc-by", ll.UNLABELLED])
     )
+
+
+def test_a_pinned_public_input_is_unlabelled_not_unknown_lineage_and_never_hides_a_label(env):
+    # A pinned public artifact is fetched by the provider and carries no operator label.
+    spec = spec_with_public(env, [pub("weights")])
+    assert labels_of(env, spec, "s1") == {"weights": {ll.UNLABELLED}}
+    rule = policy([ll.UNLABELLED])
+    assert (
+        ll.license_refusal("remote", set().union(*labels_of(env, spec, "s1").values()), rule)
+        is None
+    )
+    # Beside a labelled snapshot it adds nothing: the restricted label is still refused.
+    add(env, env.snapshot_id, ["non-commercial"])
+    mixed = spec_with_public(
+        env,
+        [
+            spec_of(env, [stage("s1", [snap(env, "code", env.snapshot_id)])]).stages[0].inputs[0],
+            pub("weights"),
+        ],
+    )
+    carried = set().union(*labels_of(env, mixed, "s1").values())
+    assert "non-commercial" in carried and ll.UNKNOWN_LINEAGE not in carried
+    assert ll.license_refusal("remote", carried, rule) is not None
+    # Downstream of a labelled snapshot the label still propagates past a public input.
+    assert ll.license_refusal("remote", carried, policy(["cc-by", ll.UNLABELLED]))
 
 
 # -- migration -----------------------------------------------------------------------------

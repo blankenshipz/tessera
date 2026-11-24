@@ -11,15 +11,20 @@ from tessera_control.data_class import campaign_input_narrowing
 def _db(spec_json: str | None, operation_id: str | None = "op1") -> sqlite3.Connection:
     connection = sqlite3.connect(":memory:")
     connection.executescript(
-        """CREATE TABLE campaigns (id TEXT, spec_json TEXT);
-        CREATE TABLE campaign_stage_attempts (campaign_id TEXT, stage_key TEXT, operation_id TEXT);
+        """CREATE TABLE campaigns (id TEXT, spec_json TEXT, org_id TEXT, project_id TEXT);
+        CREATE TABLE campaign_stage_attempts (campaign_id TEXT, stage_key TEXT, operation_id TEXT,
+            grant_id TEXT, release_id TEXT, provider_id TEXT);
+        CREATE TABLE external_operations (operation_id TEXT, grant_id TEXT);
+        CREATE TABLE execution_grants (id TEXT, snapshot_release_id TEXT);
         CREATE TABLE campaign_approvals (campaign_id TEXT, trust_policy_digest TEXT,
             status TEXT, approved_at TEXT, id TEXT);"""
     )
     if spec_json is not None:
-        connection.execute("INSERT INTO campaigns VALUES ('c1', ?)", (spec_json,))
+        connection.execute("INSERT INTO campaigns (id, spec_json) VALUES ('c1', ?)", (spec_json,))
         connection.execute(
-            "INSERT INTO campaign_stage_attempts VALUES ('c1','s1',?)", (operation_id,)
+            "INSERT INTO campaign_stage_attempts (campaign_id, stage_key, operation_id) "
+            "VALUES ('c1','s1',?)",
+            (operation_id,),
         )
         connection.execute(
             "INSERT INTO campaign_approvals VALUES ('c1','d' ,'active','2026-01-01T00:00:00Z','a1')"
