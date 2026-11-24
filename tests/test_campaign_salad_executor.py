@@ -1070,3 +1070,74 @@ def test_a_control_without_record_rejection_behaves_as_before(tmp_path):
     h.control.items = _awaiting()
     actions = h.executor.run_once()
     assert [(a["action"], a["detail"]) for a in actions] == [("error", "Conflict")]
+
+
+def _fake_live_check(monkeypatch, stdout, stderr=b"", receipt_dir=None):
+    def fake_run(command, **kwargs):
+        if receipt_dir is not None:
+            target = Path(receipt_dir) / module.RECEIPT_NAME
+            target.write_text(json.dumps(RECEIPT))
+            target.chmod(0o600)
+        return subprocess.CompletedProcess(command, 2, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+
+def _no_receipt_detail(tmp_path):
+    receipts = tmp_path / "r"
+    receipts.mkdir(mode=0o700, exist_ok=True)
+    with pytest.raises(module.RouteExitedWithoutReceipt) as raised:
+        subprocess_route_runner(tmp_path / "c.json", receipts, 5)
+    return raised.value.detail
+
+
+def test_runner_reports_only_status_and_reason_when_no_receipt(tmp_path, monkeypatch, caplog):
+    out = (
+        b"noise /opt/x/secret token=abc\n"
+        b'{"status": "inconclusive", "reason": "source_pin_malformed", "path": "/p/q"}\n'
+    )
+    _fake_live_check(monkeypatch, out, stderr=b"Traceback secret")
+    with caplog.at_level("WARNING"):
+        detail = _no_receipt_detail(tmp_path)
+    assert detail == "inconclusive:source_pin_malformed"
+    assert "source_pin_malformed" in caplog.text
+    assert "secret" not in caplog.text and "/p/q" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"",
+        b"not json at all /opt/x\n",
+        b'{"status": "x", "reason": "has spaces and /paths"}\n',
+        b'{"status": "inconclusive", "reason": "' + b"a" * 5000 + b'"}\n',
+        b"x" * 500000,
+        b"[1, 2]\n",
+    ],
+)
+def test_runner_uses_fixed_code_for_garbage_or_oversized_output(tmp_path, monkeypatch, stdout):
+    _fake_live_check(monkeypatch, stdout)
+    assert _no_receipt_detail(tmp_path) == "live_check_exited_without_receipt"
+
+
+def test_runner_with_receipt_is_unchanged(tmp_path, monkeypatch):
+    receipts = tmp_path / "r"
+    receipts.mkdir(mode=0o700)
+    _fake_live_check(monkeypatch, b'{"status": "passed"}\n', receipt_dir=receipts)
+    assert subprocess_route_runner(tmp_path / "c.json", receipts, 5) == RECEIPT
+
+
+def test_executor_records_the_reason_when_the_live_check_leaves_no_receipt(tmp_path):
+    def runner(config_path, receipt_dir, timeout):
+        raise module.RouteExitedWithoutReceipt("inconclusive:source_pin_malformed")
+
+    h = Harness(tmp_path, runner=runner)
+    h.control.items = [item("route_started")]
+    notes = h.executor.run_once()
+    # The reason is noted, then the terminal no-receipt report goes to control (this fake has
+    # no ``record_no_receipt``; its failure is recorded, never fatal).
+    assert [(n["action"], n["detail"]) for n in notes] == [
+        ("no_receipt", "inconclusive:source_pin_malformed"),
+        ("no_receipt_report_failed", "AttributeError"),
+    ]
+    assert "record_outcome" not in h.names()

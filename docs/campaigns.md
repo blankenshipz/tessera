@@ -879,6 +879,14 @@ receipt, an output upload, a heartbeat) is not recorded.
 `capability_required`, `worker_unauthorized`, `refused_conflict`, `refused_forbidden`,
 `refused_not_found`, `refused`, and `unexpected_error` (anything that is not a store refusal; only
 the fact is recorded, never the text).
+When the live check exits on its own with no receipt, the executor reports only that
+(`live_check_no_receipt`; never after a timeout or a restart). If control then holds no
+provider create or start claim and the route records no create or start effect, the runner
+ends the attempt through the existing unclaimed unwind: it cancels the route, revokes the
+grant and reconciles it at 0 with the store's own no-claim proof, so the attempt becomes
+`failed_transient`/`t1_salad_unclaimed` with detail `live_check_no_receipt`, settled at 0
+with its hold released. Any claim or effect keeps the wait, and the silent-executor rule
+above still applies.
 
 After the live check and the exit report the executor reads the final guardian status
 through the existing read-only `SaladSafetyHTTPSClient.status`, projects only the recorded

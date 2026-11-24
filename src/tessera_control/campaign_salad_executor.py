@@ -20,6 +20,7 @@ import argparse
 import base64
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -254,6 +255,7 @@ class ControlPort(Protocol):
         observed_at: str,
     ) -> None: ...
     def record_outcome(self, attempt_id: str, payload: dict[str, Any]) -> None: ...
+    def record_no_receipt(self, attempt_id: str, route_id: str) -> None: ...
     def guardian_final(self, route_id: str) -> dict[str, Any] | None: ...
 
 
@@ -266,10 +268,49 @@ class RouteTimeout(Exception):
     """The live-check subprocess outlived its bound; no outcome is recorded."""
 
 
+class RouteExitedWithoutReceipt(Exception):
+    """The live check exited without a receipt; ``detail`` is a bounded closed-form reason."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+LIVE_CHECK_NO_RECEIPT = "live_check_exited_without_receipt"
+_REPORT_TOKEN = re.compile(r"[a-z0-9_]{1,64}")
+_REPORT_SCAN_BYTES = 65536
+_LOG = logging.getLogger(__name__)
+
+
+def live_check_exit_detail(stdout: bytes | None) -> str:
+    """``status:reason`` from the live check's last JSON report line, else a fixed code.
+
+    Only two short lowercase tokens are ever taken from the output; anything else (other
+    fields, other lines, stderr, odd characters, oversized output) is dropped.
+    """
+    for line in reversed((stdout or b"")[-_REPORT_SCAN_BYTES:].splitlines()):
+        try:
+            report = json.loads(line)
+        except ValueError:
+            continue
+        if type(report) is not dict:
+            continue
+        status, reason = report.get("status"), report.get("reason")
+        if (
+            type(status) is str
+            and type(reason) is str
+            and _REPORT_TOKEN.fullmatch(status)
+            and _REPORT_TOKEN.fullmatch(reason)
+        ):
+            return f"{status}:{reason}"
+        break
+    return LIVE_CHECK_NO_RECEIPT
+
+
 def subprocess_route_runner(config_path: Path, receipt_dir: Path, timeout: int):
     """Run the unchanged live driver in a fresh interpreter; return its receipt, if any."""
     try:
-        subprocess.run(
+        completed = subprocess.run(
             [
                 sys.executable,
                 "-I",
@@ -287,7 +328,12 @@ def subprocess_route_runner(config_path: Path, receipt_dir: Path, timeout: int):
         )
     except subprocess.TimeoutExpired:
         raise RouteTimeout from None
-    return read_receipt(receipt_dir)
+    receipt = read_receipt(receipt_dir)
+    if receipt is None:
+        detail = live_check_exit_detail(completed.stdout)
+        _LOG.warning("live check exited without a receipt: %s", detail)
+        raise RouteExitedWithoutReceipt(detail)
+    return receipt
 
 
 def read_receipt(receipt_dir: Path) -> dict[str, Any] | None:
@@ -408,6 +454,9 @@ class SaladCampaignExecutor:
         # Attempts whose lease renewal was refused: never retried past the fence.
         self.fenced: dict[str, str] = {}
         self._step = "grant_poll"  # the control call in flight, named on a recorded refusal
+        # Attempts whose live check exited on its own with no receipt, until control has the
+        # report (a failed report is re-sent on the next pass of this process only).
+        self.no_receipt: set[str] = set()
         # Whether this pass already sent its pre-lease registry heartbeat.
         self._heartbeat_sent = False
         # ADR 0160: failed group-stop reports per attempt; bounded, in memory only.
@@ -690,14 +739,34 @@ class SaladCampaignExecutor:
         except RouteTimeout:
             self._note("route_timeout", attempt)
             return
+        except RouteExitedWithoutReceipt as error:
+            # The live check exited on its own with no receipt (never after a timeout): the same
+            # terminal report as a runner that returns None, carrying the status:reason note.
+            self._note("no_receipt", attempt, error.detail)
+            self.no_receipt.add(attempt)
+            self._report_no_receipt(item)
+            return
         finally:
             config_path.unlink(missing_ok=True)
             if signals is not None:
                 watch.end(item["operation_id"])
         if receipt is None:
             self._note("no_receipt", attempt)
+            self.no_receipt.add(attempt)
+            self._report_no_receipt(item)
             return
         self._finish(item, receipt)
+
+    def _report_no_receipt(self, item: dict[str, Any]) -> None:
+        """Tell control the live check exited without a receipt (no effect is asserted)."""
+        attempt = item["attempt_id"]
+        try:
+            self.control.record_no_receipt(attempt, item["route_id"])
+        except Exception as error:
+            self._note("no_receipt_report_failed", attempt, type(error).__name__)
+            return
+        self.no_receipt.discard(attempt)
+        self._note("no_receipt_reported", attempt)
 
     def _watch_begin(self, watch: Any, item: dict[str, Any], derived: Any) -> Path | None:
         """Start the descriptive watch for this route; None (no watch) on any failure."""
@@ -726,6 +795,8 @@ class SaladCampaignExecutor:
         if receipt is not None:
             self._finish(item, receipt)
             return
+        if item["attempt_id"] in self.no_receipt:
+            self._report_no_receipt(item)
         self._report_group_stop(item)
 
     def _report_group_stop(self, item: dict[str, Any]) -> None:
@@ -1172,6 +1243,11 @@ class StoreControl:
     def record_outcome(self, attempt_id, payload):
         self.campaigns.record_salad_outcome(
             self.worker, attempt_id, _key("outcome", attempt_id), payload
+        )
+
+    def record_no_receipt(self, attempt_id, route_id):
+        self.campaigns.record_salad_no_receipt(
+            self.worker, attempt_id, _key("no-receipt", attempt_id), {"route_id": route_id}
         )
 
     def guardian_final(self, route_id):

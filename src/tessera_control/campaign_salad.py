@@ -28,6 +28,7 @@ from .campaign_models import (
     stage_on_candidate,
 )
 from .campaign_salad_adapter import bind_workload, is_late_bound
+from .campaign_salad_commands import LIVE_CHECK_NO_RECEIPT
 from .campaign_settlement import apply_late_charge, confirm_settlement
 from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
@@ -1409,6 +1410,17 @@ class SaladStageDriver:
         row: dict[str, Any],
     ) -> bool:
         state = self.route_state(row["route_id"])
+        if (
+            row["phase"] == "executing"
+            and row["waiting_reason"] == LIVE_CHECK_NO_RECEIPT
+            and state is not None
+            and not any(e.get("action") in {"create", "start"} for e in state["effects"])
+            and not self.claimed(ctx, row["operation_id"])
+        ):
+            # The live check exited with no receipt and control holds no create/start claim
+            # or route effect: the existing unclaimed unwind (cancel route, revoke, reconcile
+            # at 0 with the store's own no-claim proof) ends it. Anything else waits as before.
+            return self._abandon(ctx, stage, spec_stage, attempt, LIVE_CHECK_NO_RECEIPT)
         window = (
             state["proposal"]["selection"]["resources"]["max_seconds"]
             if state

@@ -100,6 +100,14 @@ class _SaladOutcome(BaseModel):
     guardian_final: _GuardianFinal | None = None
 
 
+LIVE_CHECK_NO_RECEIPT = "live_check_no_receipt"
+
+
+class _SaladNoReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    route_id: _Ident
+
+
 def _salad_attempt(
     connection: sqlite3.Connection, worker: Mapping[str, Any], attempt_id: str
 ) -> sqlite3.Row:
@@ -228,6 +236,43 @@ class SaladWorkerCommands:
             "POST",
             f"/worker/campaign-salad/{attempt_id}/executing",
             canonical_digest({"attempt_id": attempt_id}),
+            command,
+            audience="worker",
+        )
+
+    def record_salad_no_receipt(self, worker, attempt_id, key, payload):
+        """The live check exited on its own without a receipt; the route stays ``executing``.
+
+        Only a marker: the executor asserts nothing about effects. The runner decides from
+        control's own records (no create/start claim, no route effect) whether the attempt
+        ends as unclaimed; any claim or effect keeps today's wait-then-unknown path."""
+        try:
+            body = _SaladNoReceipt.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+
+        def command(connection, live):
+            row = _salad_attempt(connection, live, attempt_id)
+            if row["phase"] != "executing":
+                raise Conflict("Salad attempt has no executing route.")
+            if row["route_id"] != body.route_id:
+                raise Conflict("Report names a route this attempt did not start.")
+            return 200, _salad_move(
+                self,
+                connection,
+                live,
+                row,
+                {"waiting_reason": LIVE_CHECK_NO_RECEIPT},
+                "campaign.salad_no_receipt",
+                {"route_id": body.route_id, "reason": LIVE_CHECK_NO_RECEIPT},
+            )
+
+        return self._mutate(
+            worker,
+            key,
+            "POST",
+            f"/worker/campaign-salad/{attempt_id}/no-receipt",
+            canonical_digest(dict(payload)),
             command,
             audience="worker",
         )
