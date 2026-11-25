@@ -232,6 +232,21 @@ def _decision(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+_SIGNER_KEYS = ("created_by_principal_id", "created_credential_id", "revoked_by_principal_id")
+
+
+def _agent_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """An external-scope agent acts on a delegation's terms, never on who signed or revoked it."""
+    return {k: v for k, v in summary.items() if k not in _SIGNER_KEYS}
+
+
+def _agent_decision(decision: dict[str, Any], caller_id: str) -> dict[str, Any]:
+    """Drop the acting principal unless it is the reading agent itself (a person may have acted)."""
+    if decision.get("actor_principal_id") == caller_id:
+        return decision
+    return {k: v for k, v in decision.items() if k != "actor_principal_id"}
+
+
 def _invalid(error: ValidationError) -> StoreError:
     first = error.errors()[0] if error.errors() else {}
     location = ".".join(str(part) for part in first.get("loc", ()))[:200]
@@ -422,7 +437,10 @@ class ApprovalDelegationCommands(CampaignStore):
                 (project_id, actor["org_id"], status, status, limit, offset),
             ).fetchall()
             now = _parse_utc(utc_now())
-            return {"approval_delegations": [_summary(r, now) for r in rows]}
+            summaries = [_summary(r, now) for r in rows]
+            if self._external_scope(connection, actor):
+                summaries = [_agent_summary(x) for x in summaries]
+            return {"approval_delegations": summaries}
         finally:
             connection.close()
 
@@ -447,10 +465,15 @@ class ApprovalDelegationCommands(CampaignStore):
                 if reads_every_campaign(actor)
                 else {"withheld": "usage sums campaigns other principals submitted"}
             )
+            summary = _summary(row)
+            decisions = [_decision(r) for r in latest]
+            if self._external_scope(connection, actor):
+                summary = _agent_summary(summary)
+                decisions = [_agent_decision(d, actor["id"]) for d in decisions]
             return {
-                **_summary(row),
+                **summary,
                 "usage": usage,
-                "decisions": [_decision(r) for r in latest],
+                "decisions": decisions,
             }
         finally:
             connection.close()
@@ -471,7 +494,10 @@ class ApprovalDelegationCommands(CampaignStore):
                 ORDER BY d.created_at, d.rowid LIMIT ? OFFSET ?""",
                 (row["id"], *args, limit, offset),
             ).fetchall()
-            return {"decisions": [_decision(r) for r in rows]}
+            decisions = [_decision(r) for r in rows]
+            if self._external_scope(connection, actor):
+                decisions = [_agent_decision(d, actor["id"]) for d in decisions]
+            return {"decisions": decisions}
         finally:
             connection.close()
 

@@ -169,6 +169,27 @@ class DataClassConflict(Conflict):
         self.data_class = data_class
 
 
+def _verified_spec_stages(spec_json: str, stored_digest: str) -> list | None:
+    """The stages of a stored spec, only if the text still hashes to ``stored_digest``.
+
+    The digest is recomputed exactly as at submit and approval (parse, then ``spec_digest``).
+    A spec that was edited after approval is refused by name (``spec_digest_mismatch``) and
+    never read. A spec that cannot be parsed cannot be verified: ``None`` (the caller refuses it
+    as ``spec_unavailable``). The stages come from the verified parsed model, not from the raw
+    text, so a field the model would drop is not read either."""
+    try:
+        parsed = parse_spec_json(spec_json)
+        recomputed = spec_digest(parsed)
+    except (ValueError, TypeError):
+        return None
+    if recomputed != stored_digest:
+        raise ComparisonRefused(
+            "spec_digest_mismatch",
+            "The stored spec no longer matches the digest the receipt names.",
+        )
+    return parsed.model_dump(mode="json").get("stages")
+
+
 class CampaignStore(
     CampaignGateCommands,
     CampaignSteeringCommands,
@@ -1461,10 +1482,7 @@ class CampaignStore(
         if row is not None and row["spec_digest"] == (receipt.get("receipt") or {}).get(
             "spec_digest"
         ):
-            try:
-                stages = json.loads(row["spec_json"]).get("stages")
-            except (ValueError, AttributeError):
-                stages = None
+            stages = _verified_spec_stages(row["spec_json"], row["spec_digest"])
         if not isinstance(stages, list):
             raise ComparisonRefused(
                 "spec_unavailable", "The approved spec the receipt names could not be read."

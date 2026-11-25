@@ -12,7 +12,7 @@ from test_execution import _setup
 
 from tessera_control.api import create_app
 from tessera_control.campaign_comparison import ComparisonRefused, compare_arms
-from tessera_control.store import Conflict, _connect
+from tessera_control.store import Conflict, _connect, canonical_digest
 
 SPLIT_A = "a" * 64
 SPLIT_B = "b" * 64
@@ -262,6 +262,10 @@ def _write_receipt(database_path, campaign_id, doc, stages=None):
         ).fetchone()
         doc["receipt"]["spec_digest"] = row["spec_digest"]
         if stages is not None:
+            # Stub stages are not a valid spec, so a test that passes them must also call
+            # ``_read_stub_stages`` (the comparison otherwise refuses the stored spec, because
+            # it verifies spec_json against spec_digest on read: see
+            # test_campaign_comparison_spec_digest.py for the real verification tests).
             spec = json.loads(row["spec_json"])
             spec["stages"] = stages
             connection.execute(
@@ -273,7 +277,9 @@ def _write_receipt(database_path, campaign_id, doc, stages=None):
             (
                 campaign_id,
                 json.dumps(doc["receipt"]),
-                doc["receipt_digest"],
+                # Every receipt reader verifies this digest (campaign_receipt_read), so the row
+                # carries the real one the store writes, not the pure-function fixture's.
+                canonical_digest(doc["receipt"]),
                 "2026-01-01T00:00:00Z",
             ),
         )
@@ -286,11 +292,12 @@ QUERY = (
 
 def test_route_returns_comparison_for_a_receipt(web):
     client, headers, cid, database = web
-    _write_receipt(database, cid, _good())
+    doc = _good()
+    _write_receipt(database, cid, doc)
     response = client.get(f"/campaigns/{cid}/comparison?{QUERY}", headers=headers)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["campaign_id"] == cid and body["receipt_digest"] == "d" * 64
+    assert body["campaign_id"] == cid and body["receipt_digest"] == canonical_digest(doc["receipt"])
     assert body["scientific_validity"] == "not_assessed"
     assert body["evaluation_inputs"]["eval"]["sha256"] == SPLIT_A
     acc = next(m for m in body["metrics"] if m["name"] == "acc")
@@ -324,6 +331,19 @@ def _arms(**per_stage):
     ]
 
 
+@pytest.fixture
+def stub_stages(monkeypatch):
+    """Wiring tests inject bare stage stubs ({"key": ..., "gate_evidence": ...}) that are not a
+    valid spec, so the stored text cannot pass digest verification. These tests are about how the
+    declared split lock / held-out input reach the comparison, so only the loader is replaced;
+    the real verification is covered end to end in test_campaign_comparison_spec_digest.py."""
+    monkeypatch.setattr(
+        "tessera_control.campaign_store._verified_spec_stages",
+        lambda spec_json, stored_digest: json.loads(spec_json).get("stages"),
+    )
+
+
+@pytest.mark.usefixtures("stub_stages")
 def test_route_refuses_arms_with_different_split_locks_even_if_the_named_input_matches(web):
     client, headers, cid, database = web
     stages = _arms(
@@ -337,6 +357,7 @@ def test_route_refuses_arms_with_different_split_locks_even_if_the_named_input_m
     assert "split_lock_differs" in response.json()["detail"]
 
 
+@pytest.mark.usefixtures("stub_stages")
 def test_route_refuses_a_split_lock_on_one_arm_only(web):
     client, headers, cid, database = web
     stages = _arms(int2={"gate_evidence": {"split_lock_id": "lock-a"}})
@@ -345,6 +366,7 @@ def test_route_refuses_a_split_lock_on_one_arm_only(web):
     assert response.status_code == 409 and "split_lock_differs" in response.json()["detail"]
 
 
+@pytest.mark.usefixtures("stub_stages")
 def test_route_refuses_when_an_unnamed_held_out_input_differs(web):
     """The caller names only `code`; the approved spec declares `heldout` as the holdout input
     and the arms consumed different bytes there. Naming a matching input must not hide that."""
@@ -370,6 +392,7 @@ def test_route_refuses_when_an_unnamed_held_out_input_differs(web):
     assert "evaluation_inputs_differ" in response.json()["detail"]
 
 
+@pytest.mark.usefixtures("stub_stages")
 def test_route_accepts_matching_declared_split_lock_and_held_out_input(web):
     client, headers, cid, database = web
     holdout = {
@@ -401,9 +424,11 @@ def test_route_refuses_when_the_receipt_names_a_spec_that_is_not_the_stored_one(
         )
         stored["spec_digest"] = "e" * 64
         connection.execute("DROP TRIGGER IF EXISTS campaign_receipts_no_update")
+        # Re-sealed with its own digest, so the row passes receipt verification and the
+        # route reaches the spec check this test is about.
         connection.execute(
-            "UPDATE campaign_receipts SET receipt_json=? WHERE campaign_id=?",
-            (json.dumps(stored), cid),
+            "UPDATE campaign_receipts SET receipt_json=?, receipt_digest=? WHERE campaign_id=?",
+            (json.dumps(stored), canonical_digest(stored), cid),
         )
     response = client.get(f"/campaigns/{cid}/comparison?{QUERY}", headers=headers)
     assert response.status_code == 409 and "spec_unavailable" in response.json()["detail"]
@@ -422,3 +447,18 @@ def test_pure_declared_checks_are_required_and_derive_from_the_record():
             metrics=["acc"],
             evaluation_inputs=["eval"],
         )
+
+
+def test_route_refuses_a_receipt_whose_stored_digest_was_tampered(web):
+    # Policy check (receipt digest verification): a stored receipt whose digest no longer
+    # matches is refused by name before any comparison is computed.
+    client, headers, cid, database = web
+    _write_receipt(database, cid, _good())
+    with _connect(database) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS campaign_receipts_no_update")
+        connection.execute(
+            "UPDATE campaign_receipts SET receipt_digest=? WHERE campaign_id=?", ("e" * 64, cid)
+        )
+    response = client.get(f"/campaigns/{cid}/comparison?{QUERY}", headers=headers)
+    assert response.status_code == 409, response.text
+    assert "receipt_digest_mismatch" in response.text

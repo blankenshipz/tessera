@@ -126,7 +126,7 @@ revoking a delegation is a person's act; the MCP tools only read delegations and
 (`tessera_list_approval_delegations`, `tessera_get_approval_delegation`, `tessera_delegation_escalations`,
 `tessera_delegated_approve_campaign`, `tessera_delegated_gate_decision`). Enroll an agent for it with
 `--allow-delegated-decisions`. Contract and limits:
-[ADR 0122](decisions/0122-owner-signed-approval-delegations.md).
+An agent reading delegations or their decisions through these tools never sees who signed or revoked a delegation (`created_by_principal_id`, `created_credential_id`, `revoked_by_principal_id`) or which person acted (`actor_principal_id`, shown only when it is the reading agent itself); a person reading them gets the full rows. [ADR 0122](decisions/0122-owner-signed-approval-delegations.md).
 
 **Salad review stops under a delegation (ADR 0150).** A delegation may carry an optional
 `review_rule`: the review `kinds` it covers (`source_assessment`, `plan`, `source_use`),
@@ -498,7 +498,8 @@ with the receipt digests, and no decision or verdict (`scientific_validity` is `
 Refusals are 409 (`comparison_refused:<code>`), one stable reason code each (missing or over-long query lists are a 422): `arms_not_distinct`, `too_many_arms`,
 `too_many_metrics`, `no_intervention`, `no_metric`, `stage_missing`, `arm_attempt_not_unique`,
 `evaluation_inputs_unnamed`, `evaluation_input_missing`, `evaluation_inputs_differ`,
-`split_lock_differs`, `spec_unavailable`, `metric_not_recorded` or `metric_not_numeric`. See
+`split_lock_differs`, `spec_unavailable`, `spec_digest_mismatch` (the stored spec no longer hashes
+to the digest the receipt names), `metric_not_recorded` or `metric_not_numeric`. See
 [ADR 0131](decisions/0131-campaign-result-baseline-vs-intervention-comparison.md).
 
 **Selecting an arm on validation data (ADR 0133).** The same route has a selection mode, on when

@@ -36,14 +36,23 @@ the two arms were scored on the same evaluation data.
    `too_many_arms` (more than 8 interventions), `too_many_metrics` (more than 16), `no_intervention`,
    `no_metric`, `stage_missing`, `arm_attempt_not_unique`, `evaluation_inputs_unnamed`,
    `evaluation_input_missing`, `evaluation_inputs_differ`, `split_lock_differs`,
-   `spec_unavailable`, `metric_not_recorded`, `metric_not_numeric`. A repeated metric name is
+   `spec_unavailable`, `spec_digest_mismatch`, `metric_not_recorded`, `metric_not_numeric`. A repeated metric name is
    refused as `too_many_metrics`.
 6. **The check does not trust the caller's list.** The route also reads the approved spec whose
    digest the receipt carries (the receipt must name the stored spec, else `spec_unavailable`) and
    adds what each arm declares: every arm must have the same `gate_evidence.split_lock_id` (one arm
    with a lock and another without counts as different: `split_lock_differs`), and the held-out
    input an arm declares (`evaluation.holdout.input`) is compared across all arms like a named one,
-   so two arms cannot be made to look comparable by naming only an input that matches.
+   so two arms cannot be made to look comparable by naming only an input that matches. The
+   stored spec is verified on read: the receipt's digest must equal the stored `spec_digest`
+   column, and the stored `spec_json` is parsed and re-hashed exactly as at submission and
+   approval, which must give that digest. A spec that no longer hashes to it is refused as
+   `spec_digest_mismatch` and never read; one that cannot be parsed cannot be verified and is
+   refused as `spec_unavailable`. What each arm declares comes from the verified parsed spec, not
+   from the raw text. This guards the comparison only. The database does not stop an edit (the
+   schema has no trigger on `campaigns`), and other readers of `spec_json` do not yet verify it
+   on read; the platform itself writes the spec columns once at submission and no code path
+   updates them afterwards.
 7. The result carries the campaign id and receipt digest, a plain-words statement of the method,
    each arm's stage key, attempt, evidence kind and digest and run receipt digest, the named
    evaluation inputs with their identical identity and the arms that used them, and per metric the
