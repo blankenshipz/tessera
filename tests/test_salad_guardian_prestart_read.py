@@ -159,12 +159,18 @@ def test_a_non_provider_unknown_error_still_stops(world):
     assert poll(guardian, clock)["stop_cause"] == "provider_unavailable" and len(stops) == 1
 
 
-def test_started_custody_or_no_adapter_or_zero_deadline_stops_as_before(world):
+def test_started_custody_is_not_a_prestart_read_but_gets_the_short_poststart_retry(world):
     guardian, clock, seen, started, stops, make = world
     seen["fail"] = Unknown()
     started[0] = True  # custody begun: not a pre-start read any more
-    assert poll(guardian, clock)["stop_cause"] == "provider_unavailable"
-    assert len(stops) == 1
+    status = poll(guardian, clock)
+    assert stops == [] and "prestart_read_retries" not in status
+    assert status["poststart_read_retries"]["count"] == 1  # q-2505; see its own test file
+
+
+def test_no_adapter_or_zero_deadline_stops_as_before(world):
+    guardian, clock, seen, started, stops, make = world
+    seen["fail"] = Unknown()
     for name, extra in {
         "none.db": dict(custody_started=None, prestart_read_deadline_seconds=30),
         "off.db": dict(prestart_read_deadline_seconds=0),
@@ -179,14 +185,15 @@ def test_started_custody_or_no_adapter_or_zero_deadline_stops_as_before(world):
         other.close()
 
 
-def test_an_allocated_or_running_route_stops_on_the_first_failed_read(world):
+def test_an_allocated_or_running_route_gets_the_poststart_retry_not_the_prestart_one(world):
     guardian, clock, seen, started, stops, _ = world
     seen["state"], seen["allocation"] = "running", "alloc-a"
     poll(guardian, clock)  # bound and seen running: post-allocation custody rules apply
     seen["fail"] = Unknown()
     status = poll(guardian, clock)
-    assert status["stop_cause"] == "provider_unavailable" and len(stops) == 1
+    assert stops == [] and status["stop_cause"] is None
     assert "prestart_read_retries" not in status
+    assert status["poststart_read_retries"]["count"] == 1
 
 
 @pytest.mark.parametrize("value", [-1, float("nan"), 601, "30", None])

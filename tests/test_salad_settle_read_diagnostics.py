@@ -110,7 +110,11 @@ def test_each_closed_reason_is_recorded_and_fails_closed(error, reason, status_c
 def test_the_smoke_failure_shape_now_carries_a_closed_reason():
     # A plain Conflict at the settle read (the live smoke's exception class).
     session, receipt = run([Conflict("Remote observation budget exhausted")])
-    assert receipt["prestart_failure"] == {"class": "group_unsettled", "exception": "Conflict"}
+    assert receipt["prestart_failure"] == {
+        "class": "group_unsettled",
+        "exception": "Conflict",
+        "reason": "conflict",  # closed settle-conflict reason (ADR 0174)
+    }
     assert receipt["prestart_settle_read"]["reason"] == "conflict_state"
     assert receipt["prestart_settle_read"]["attempts"] == 1
 

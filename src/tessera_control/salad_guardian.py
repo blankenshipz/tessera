@@ -44,10 +44,23 @@ _REBIND_ID_CAP = 96
 # stopping the run at the first failure. Each attempt is one event whose kind carries a
 # closed JSON detail after this prefix; the window closes after the profile's deadline.
 PRESTART_READ_RETRY_PREFIX = "prestart_read_retry:"
-DEFAULT_PRESTART_READ_DEADLINE_SECONDS = 60.0
+# Overall window, not a per-request timeout: each read has its own short transport deadline
+# (salad_http.READ_DEADLINE_SECONDS) and idempotent reads are retried inside this window. Salad
+# can answer slowly for minutes while a new group is placed; a $0 pre-start wait is cheap.
+DEFAULT_PRESTART_READ_DEADLINE_SECONDS = 300.0
 MAX_PRESTART_READ_DEADLINE_SECONDS = 600.0
 # Seconds before the next poll after the n-th consecutive failed read (bounded backoff).
 PRESTART_READ_BACKOFF_SECONDS = (5.0, 10.0, 15.0)
+# After the run began (custody started, an allocation bound, or the instance seen running) a
+# transient read failure is retried at the next poll too, but only briefly: at most
+# POSTSTART_READ_RETRY_LIMIT consecutive failures (the last one stops) and only within
+# POSTSTART_READ_WINDOW_SECONDS of the first. The window equals the safety service's
+# UNSEEN_RUN_GAP_SECONDS (asserted there), the margin every admission already adds to billed
+# time, so the spend caps are unchanged. The assignment's deadline, heartbeat and stop clocks
+# are not extended: a retry is only taken while the guardian is not already stopping.
+POSTSTART_READ_RETRY_PREFIX = "poststart_read_retry:"
+POSTSTART_READ_RETRY_LIMIT = 3
+POSTSTART_READ_WINDOW_SECONDS = 45.0
 # Transport failure reasons that are deterministic or mean the group is gone: retrying
 # cannot change them, so they stop at once instead of burning the deadline. Readers get
 # the reason through an optional ``reason`` attribute on the raised error (absent: unknown,
@@ -366,6 +379,12 @@ class SaladGuardian:
         if retries:
             # Additive: absent unless a pre-start read failure was retried.
             result["prestart_read_retries"] = retries
+        post = self._read_retries(operation, POSTSTART_READ_RETRY_PREFIX)
+        if post:
+            # Additive: absent unless a read failure after the run began was retried.
+            post["window_seconds"] = POSTSTART_READ_WINDOW_SECONDS
+            post["limit"] = POSTSTART_READ_RETRY_LIMIT
+            result["poststart_read_retries"] = post
         return result
 
     def read_retry_backoff(self, operation: str) -> float | None:
@@ -376,25 +395,35 @@ class SaladGuardian:
         ).fetchone()
         if not row or row[0] is None or row[1]:
             return None
-        count = self.db.execute(
-            "SELECT count(*) FROM events WHERE operation=? AND substr(kind,1,?)=? AND at>=?",
-            (operation, len(PRESTART_READ_RETRY_PREFIX), PRESTART_READ_RETRY_PREFIX, row[0]),
-        ).fetchone()[0]
+        count = sum(
+            self._retries_since(operation, prefix, row[0])
+            for prefix in (PRESTART_READ_RETRY_PREFIX, POSTSTART_READ_RETRY_PREFIX)
+        )
         if count <= 0:
             return None
         return PRESTART_READ_BACKOFF_SECONDS[min(count, len(PRESTART_READ_BACKOFF_SECONDS)) - 1]
 
+    def _retries_since(self, operation: str, prefix: str, since: float | None) -> int:
+        """Retry events with this prefix at or after ``since`` (None: all of them)."""
+        return self.db.execute(
+            "SELECT count(*) FROM events WHERE operation=? AND substr(kind,1,?)=? AND at>=?",
+            (operation, len(prefix), prefix, -1 if since is None else since),
+        ).fetchone()[0]
+
     def _prestart_read_retries(self, operation: str) -> dict | None:
+        return self._read_retries(operation, PRESTART_READ_RETRY_PREFIX)
+
+    def _read_retries(self, operation: str, prefix: str) -> dict | None:
         rows = self.db.execute(
             "SELECT at,kind FROM events WHERE operation=? AND substr(kind,1,?)=? ORDER BY sequence",
-            (operation, len(PRESTART_READ_RETRY_PREFIX), PRESTART_READ_RETRY_PREFIX),
+            (operation, len(prefix), prefix),
         ).fetchall()
         if not rows:
             return None
         attempts = []
         for at, kind in rows:
             try:
-                detail = json.loads(kind[len(PRESTART_READ_RETRY_PREFIX) :])
+                detail = json.loads(kind[len(prefix) :])
             except ValueError:
                 continue
             attempts.append(
@@ -453,31 +482,43 @@ class SaladGuardian:
 
     def _may_retry_read(
         self, operation, error, first_running, allocation, stopping, fail_since, now
-    ) -> bool:
-        """True when a failed provider read is retried at the next poll instead of stopping.
+    ) -> str | None:
+        """The event prefix to record when a failed provider read is retried at the next poll
+        instead of stopping, or None to stop as before.
 
-        Only while the route is pre-start and unallocated: not already stopping, never seen
-        running, no allocation bound, and the provider adapter reports no custody begun
-        (no adapter or no answer: fail closed, stop as before). Only a transient read
-        failure qualifies; a deterministic one (identity mismatch, group gone) stops at
-        once. The window is bounded by the profile's deadline from the first consecutive
-        failure; the assignment's own deadline and heartbeat clocks still stop the run.
-        Post-allocation custody and charging are untouched."""
-        if (
-            stopping
-            or first_running is not None
-            or allocation != "unallocated"
-            or self.custody_started is None
-            or self.prestart_read_deadline_seconds <= 0
-            or not is_transient_read_failure(error)
-        ):
-            return False
-        try:
-            if self.custody_started(operation):
-                return False
-        except Exception:
-            return False
-        return fail_since is None or now - fail_since < self.prestart_read_deadline_seconds
+        Pre-start (unallocated, never seen running, adapter reports no custody begun): bounded
+        by the profile's deadline from the first consecutive failure (no adapter or no answer:
+        fail closed). After the run began (custody started, an allocation bound or the instance
+        seen running): bounded by POSTSTART_READ_RETRY_LIMIT consecutive failures within
+        POSTSTART_READ_WINDOW_SECONDS of the first. Only a transient read failure qualifies, and
+        never while the guardian is already stopping, so the assignment's deadline, heartbeat and
+        stop clocks are not extended and a deterministic failure (identity mismatch, group gone)
+        stops at once. Charging is the safety service's own reservation (running window plus the
+        unseen-run gap, which this window equals); a retry only delays the stop within it."""
+        if stopping or not is_transient_read_failure(error):
+            return None
+        started = first_running is not None or allocation != "unallocated"
+        if not started and self.custody_started is not None:
+            try:
+                started = bool(self.custody_started(operation))
+            except Exception:
+                return None  # cannot tell: fail closed, stop as before
+        if started:
+            if fail_since is not None and now - fail_since >= POSTSTART_READ_WINDOW_SECONDS:
+                return None
+            # Consecutive failures including this one; a first failure has no earlier retries.
+            earlier = (
+                0
+                if fail_since is None
+                else self._retries_since(operation, POSTSTART_READ_RETRY_PREFIX, fail_since)
+            )
+            failures = 1 + earlier
+            return POSTSTART_READ_RETRY_PREFIX if failures < POSTSTART_READ_RETRY_LIMIT else None
+        if self.custody_started is None or self.prestart_read_deadline_seconds <= 0:
+            return None
+        if fail_since is None or now - fail_since < self.prestart_read_deadline_seconds:
+            return PRESTART_READ_RETRY_PREFIX
+        return None
 
     def rebinds_left(self, operation: str) -> int:
         """How many more pre-start re-binds the bound allows for this operation."""
@@ -535,6 +576,7 @@ class SaladGuardian:
         stop_safe = True
         fail_since = row[9]
         retry_detail = None
+        retry_prefix = None
         try:
             o = self.observe(a)
             fail_since = None  # a read answered: the failure window is over
@@ -599,10 +641,13 @@ class SaladGuardian:
                 terminal = o.state == "stopped" and not uncertain
         except Exception as error:
             failed_at = self.clock()
-            if self._may_retry_read(
+            retry_prefix = self._may_retry_read(
                 operation, error, first_running, allocation, stopping, fail_since, failed_at
-            ):
-                fail_since = failed_at if fail_since is None else fail_since
+            )
+            if retry_prefix is not None:
+                # The window opens at this poll's start, the same instant its retry event is
+                # stamped with, so every retry of the window counts from fail_since.
+                fail_since = now if fail_since is None else fail_since
                 retry_detail = read_failure_detail(error)
             else:
                 reason, stopping = "provider_unavailable", True
@@ -618,7 +663,7 @@ class SaladGuardian:
                     (
                         operation,
                         now,
-                        PRESTART_READ_RETRY_PREFIX
+                        retry_prefix
                         + json.dumps(
                             {"reason": retry_detail[0], "field": retry_detail[1]},
                             separators=(",", ":"),

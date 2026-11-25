@@ -781,17 +781,30 @@ def test_one_transient_group_read_failure_is_retried_not_stopped(service_case):
     assert "stop" not in provider.calls
 
 
+def _more_failed_polls(s, b, clock, waits=(5, 10)):
+    """The run already began, so the first failed poll is retried (q-2505, ADR 0181) and the
+    third consecutive failed poll stops it: advance by the guardian's growing backoff."""
+    for wait in waits:
+        s.admin(dict(operation="heartbeat", reservation=b["reservation"]))
+        clock[0] += wait
+        s.loop()
+    return s.admin(dict(operation="status", reservation=b["reservation"]))
+
+
 def test_group_reads_failing_every_attempt_stop_and_record_the_cause(service_case):
     s, b, request, token, clock, provider, *_ = service_case
     slept = []
     s.retry_sleep = slept.append
     s.admin(dict(operation="heartbeat", reservation=b["reservation"]))
-    provider.read_failures = 3
+    provider.read_failures = 9  # three attempts on each of three consecutive polls
     clock[0] += 5
     s.loop()
     status = s.admin(dict(operation="status", reservation=b["reservation"]))
-    assert status["status"] == "unknown" and status["stop_cause"] == "provider_unavailable"
+    assert status["status"] == "armed" and status["stop_cause"] is None  # retried, post-start
     assert status["provider_read_retries"] == 2 and slept == [0.2, 0.4]
+    assert "stop" not in provider.calls
+    status = _more_failed_polls(s, b, clock)
+    assert status["status"] == "unknown" and status["stop_cause"] == "provider_unavailable"
     assert "stop" in provider.calls
 
 
@@ -881,8 +894,9 @@ def test_a_group_read_that_gives_up_records_timeout(service_case):
     s.loop()
     status = s.admin(dict(operation="status", reservation=b["reservation"]))
     assert status["provider_read_retries"] == 1  # its own window allowed one retry
-    assert status["stop_cause"] == "provider_unavailable"
     assert status["last_provider_read_failure"] == "timeout"
+    assert status["stop_cause"] is None  # the first failed poll after start is retried
+    assert _more_failed_polls(s, b, clock)["stop_cause"] == "provider_unavailable"
 
 
 def test_worst_case_loop_pass_stays_inside_the_allowance(service_case):
@@ -956,9 +970,10 @@ def test_worst_case_loop_pass_with_the_instance_read_stays_inside_the_allowance(
     status = s.admin(dict(operation="status", reservation=b["reservation"]))
     assert "read_instance" in actions
     assert status["provider_read_retries"] == 1
-    assert status["stop_cause"] == "provider_unavailable"
     assert status["last_provider_read_failure"] == "timeout"
     assert elapsed[0] <= LOOP_PASS_ALLOWANCE_SECONDS - 1.0
+    assert status["stop_cause"] is None  # the first failed poll after start is retried
+    assert _more_failed_polls(s, b, clock)["stop_cause"] == "provider_unavailable"
 
 
 def test_group_and_instance_reads_share_the_pinned_window_kinds():

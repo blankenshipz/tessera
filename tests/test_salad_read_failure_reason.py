@@ -235,7 +235,16 @@ def test_provider_read_failed_records_closed_reason_and_field(service_case, reas
     assert status["last_provider_read_failure_detail"] == detail
     assert status["last_provider_read_failure_field"] == field
     assert status["last_provider_read_failure_request_kind"] == "read_instance"
-    assert status["stop_cause"] == "provider_unavailable"  # retry/stop behavior untouched
+    # A transient failure after start is retried at the next poll (q-2505); the third
+    # consecutive one (or a deterministic one at once) stops the run as before.
+    for wait in (5, 10):
+        if status["stop_cause"] is not None:
+            break
+        s.admin(dict(operation="heartbeat", reservation=b["reservation"]))
+        service_case[4][0] += wait
+        s.loop()
+        status = _status(s, b)
+    assert status["stop_cause"] == "provider_unavailable"
     events = s.db.execute(
         "SELECT kind, detail FROM events WHERE reservation=? AND kind LIKE 'provider_read_failed%'",
         (b["reservation"],),

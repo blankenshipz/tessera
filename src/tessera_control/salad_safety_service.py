@@ -16,6 +16,7 @@ import http.client
 import json
 import math
 import os
+import random
 import re
 import signal
 import socket
@@ -39,6 +40,7 @@ from .remote_execution_models import (
 from .salad_custody import CustodyBinding, SaladCustody, private_database
 from .salad_guardian import (
     DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
+    POSTSTART_READ_WINDOW_SECONDS,
     RECONCILE_OPERATOR,
     RECONCILE_PROVIDER,
     GuardianAssignment,
@@ -136,6 +138,9 @@ PRE_START = frozenset({"allocating", "downloading", "creating"})
 # all three plus one worst-case loop pass (LOOP_PASS_ALLOWANCE_SECONDS, below):
 # 2 + 10 + 20 + 12 = 44 <= 45; asserted below from the constants.
 UNSEEN_RUN_GAP_SECONDS = 45
+# The guardian's post-start read-retry window is part of the same unseen gap, so retrying a
+# transient status read never lets billed time exceed what admission already counted.
+assert POSTSTART_READ_WINDOW_SECONDS == UNSEEN_RUN_GAP_SECONDS
 # Provider reads (published rate, group/instance): one fast transient failure (a Salad
 # 5xx or reset, reported as provider_unknown) is retried, still fail-closed. At most
 # len(BACKOFF) + 1 attempts per read; a retry starts only if another full read (the
@@ -172,6 +177,8 @@ LOOP_PASS_ALLOWANCE_SECONDS = (
 )
 # A read that failed by timing out (a full PROVIDER_READ_SECONDS) still gets one retry.
 assert 2 * PROVIDER_READ_SECONDS + PROVIDER_READ_BACKOFF_SECONDS[0] <= PROVIDER_READ_BUDGET_SECONDS
+# The per-request timeout is separate from, and far shorter than, the pre-start deadline.
+assert PROVIDER_READ_SECONDS * 10 <= DEFAULT_PRESTART_READ_DEADLINE_SECONDS
 # Exact provider read that may close an uncertain orphan, at most this often.
 CLOSE_CHECK_SECONDS = 15
 UNIX_ADMIN_FRAME_SECONDS = 2
@@ -547,7 +554,10 @@ class SaladSafetyService:
         )
         self.loop_at = None
         # Real-time pacing for bounded rate-read retries (tests may replace both).
-        self.retry_sleep, self.retry_monotonic = time.sleep, time.monotonic
+        # Idempotent-read retries sleep a jittered share of the backoff (never longer than it,
+        # so the window arithmetic above still holds); tests replace ``retry_sleep`` to see
+        # the exact backoff.
+        self.retry_sleep, self.retry_monotonic = self._jittered_sleep, time.monotonic
         # Per loop pass: read kind -> start of that kind's retry window (None outside a pass).
         self.retry_windows = None
         # Diagnostic writes (read failures, workload refusals) that themselves failed.
@@ -758,6 +768,11 @@ class SaladSafetyService:
             (reservation, kind),
         ).fetchone()
         return last[0] if last else None
+
+    @staticmethod
+    def _jittered_sleep(backoff):
+        """Sleep 50-100% of ``backoff`` so concurrent readers do not retry in lockstep."""
+        time.sleep(backoff * (0.5 + 0.5 * random.random()))
 
     def _retrying_read(self, row, column, read, *, give_up=None, failure_kind):
         """Run ``read`` with a bounded retry of fast transient provider failures.

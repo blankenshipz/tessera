@@ -87,6 +87,27 @@ def _closed_token(value):
     )
 
 
+# Closed reasons a refused pre-start dispatch/observe (a store Conflict) carries on the receipt.
+CONFLICT_REASONS = frozenset({"route_revision_changed", "provider_read_unavailable", "conflict"})
+# Only these are retried (once): the route moved under the read; the next read sees the new state.
+TRANSIENT_CONFLICT_REASONS = frozenset({"route_revision_changed"})
+
+
+def conflict_reason(error):
+    """Closed reason of a store Conflict, or None for any other error (never its text)."""
+    from .remote_execution import RouteRevisionChanged
+    from .salad_server import ProviderReadUnavailable
+    from .store import Conflict
+
+    if not isinstance(error, Conflict):
+        return None
+    if isinstance(error, RouteRevisionChanged):
+        return "route_revision_changed"
+    if isinstance(error, ProviderReadUnavailable):
+        return "provider_read_unavailable"
+    return "conflict"
+
+
 def _prestart_failure(error, default):
     if isinstance(error, TimeoutError):
         failure_class = "wall_bound_exceeded"
@@ -100,6 +121,9 @@ def _prestart_failure(error, default):
         "exception": _exception_type_name(cause if cause is not None else error),
     }
     source = cause if cause is not None else error
+    reason = conflict_reason(source)
+    if reason is not None:
+        result["reason"] = reason
     failure = getattr(source, "failure", None)
     if failure is not None:
         # A refused provider read (start preflight): the transport's closed diagnostics.
@@ -1183,6 +1207,8 @@ def _drive(
         # summary, no values): see salad_guardian.PRESTART_READ_RETRY_PREFIX.
         "start_preflight_retries": 0,
         "guardian_prestart_read_retries": None,
+        # Settle-step observes retried once after a transient Conflict (route revision race).
+        "settle_conflict_retries": 0,
         # Added only when a pre-start settle read or heartbeat failed (absent otherwise, so
         # receipts without such a failure keep their digests): ``prestart_settle_read`` is
         # {"call": observe|keepalive, "reason": read_unavailable|conflict_state|timeout|
@@ -1380,9 +1406,20 @@ def _drive(
             polls = 0
             stopped_since = None
             settle_started = clock()
+            settle_retried = False
             for _ in range(max_polls):
                 settle_beat()
-                state = settle_read()
+                try:
+                    state = settle_read()
+                except Exception as error:
+                    if settle_retried or conflict_reason(error) not in TRANSIENT_CONFLICT_REASONS:
+                        raise
+                    # Known transient: the route advanced under the read. Observe is a read;
+                    # retry it once. Anything else (or a second conflict) fails closed.
+                    settle_retried = True
+                    receipt["settle_conflict_retries"] += 1
+                    sleep(min(1, max(0, deadline - clock())))
+                    continue
                 polls += 1
                 if state.get("provider_id") and receipt["prestart_timestamps"]["bound"] is None:
                     stamp("bound")

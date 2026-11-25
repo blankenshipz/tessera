@@ -28,6 +28,10 @@ from .remote_execution_models import (
 from .store import Conflict, Forbidden, NotFound, _connect, _parse_utc, canonical_digest, utc_now
 
 
+class RouteRevisionChanged(Conflict):
+    """Another writer advanced the route between evaluation and dispatch (a transient race)."""
+
+
 def _admit_workload(db, project_id, selection, worker_principal_id=None, *, create_shape=True):
     """Workload_v1 admission bounds (disk, staged input, input-carried manifest), and
     the Salad create-shape limits unless ``create_shape`` is False (start).
@@ -502,7 +506,7 @@ class RemoteExecutionStore(CapabilityStore):
             if live["id"] != op["worker_principal_id"]:
                 raise Forbidden("Wrong dispatcher worker.")
             if expected_revision is not None and state["revision"] != expected_revision:
-                raise Conflict("Route changed since it was evaluated.")
+                raise RouteRevisionChanged("Route changed since it was evaluated.")
             if state.get("dispatch_id") is not None:
                 raise Conflict(
                     "Kubernetes route uses the claimed dispatch outbox, not route effects."
