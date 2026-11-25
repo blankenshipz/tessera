@@ -11,7 +11,11 @@ Reason codes and suggested actions:
 
 * ``campaign_blocked``: the campaign is ``blocked`` (evidence names the stop reason).
 * ``delegation_lapsed``: ``paused_delegation_lapsed``.
-* ``attempt_outcome_unknown``: an attempt is ``unknown`` or a stage is ``blocked_unknown``.
+* ``attempt_outcome_unknown``: an attempt is ``unknown`` or a stage is ``blocked_unknown``. A
+  Salad stage held because it may not move to another profile (ADR 0169) adds
+  ``salad_profile_decision`` to the evidence: the closed outcome (``post_start_switch_refused``
+  after a possible start, or ``profile_not_approved``), the attempt number and ``started``; the
+  retry decision is a person's (or an approved delegation's).
 * ``stale_execution_lease``: a live grant's latest lease expired more than the grace ago.
 * ``runner_lease_stale``: the runner lease expired more than the grace ago while campaigns are
   active (one finding per affected campaign).
@@ -286,6 +290,8 @@ def detect(
             if s["stage_key"] in unknown_stages:
                 continue
             explained.add(cid)
+            # ADR 0169: a stage held for an explicit retry decision says so (closed codes).
+            decision = _profile_decision(connection, org_id, project_id, cid, s["stage_key"])
             found.append(
                 _finding(
                     cid,
@@ -294,6 +300,7 @@ def detect(
                     s["stage_key"],
                     {
                         "stage_status": "blocked_unknown",
+                        **({} if decision is None else {"salad_profile_decision": decision}),
                         "age_seconds": _age(now, s["updated_at"]),
                     },
                 )
@@ -424,6 +431,35 @@ def detect(
                 )
             )
     return sorted(found, key=lambda f: f["id"])
+
+
+def _profile_decision(
+    connection: sqlite3.Connection, org_id: str, project_id: str, campaign_id: str, key: str
+) -> dict[str, Any] | None:
+    """The closed outcome and attempt of the stage's latest Salad profile stop, when it is one
+    that holds the stage (ADR 0151, strict rule of ADR 0169); else None."""
+    from .campaign_salad_fallback import HOLDING, STOP_EVENT
+
+    row = connection.execute(
+        """SELECT payload_json FROM events WHERE event_type=? AND org_id=? AND project_id=?
+        AND json_extract(payload_json,'$.campaign_id')=?
+        AND json_extract(payload_json,'$.stage_key')=? ORDER BY cursor DESC LIMIT 1""",
+        (STOP_EVENT, org_id, project_id, campaign_id, key),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        body = json.loads(row["payload_json"])
+    except ValueError:
+        return None
+    if body.get("outcome") not in HOLDING:
+        return None
+    attempt = body.get("attempt")
+    return {
+        "outcome": body["outcome"],
+        "attempt": attempt if isinstance(attempt, int) else None,
+        "started": body.get("started") if isinstance(body.get("started"), bool) else None,
+    }
 
 
 def _row(row: sqlite3.Row) -> dict[str, Any]:

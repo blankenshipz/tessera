@@ -37,7 +37,7 @@ the cost estimate (`estimate_not_invoice`) and the overrun block, so the *estima
 worker-reported; only the verdict is guardian-attested. `settle_frame` itself still demands a
 verdict digest only for ambiguous billable frames; the Salad driver is what requires the read for
 every bounded-hold settlement. Receipts carry the read as `guardian_record` with
-`verdict_source: guardian_read`. The guardian's `max_open_billable_frames` setting (§7.2, Q4) now exists: default 1, any other value refuses startup, the reserve fence counts open billable frames under that name, and a refusal is recorded in the guardian's `fence_refusals` table. The original record follows. It generalizes the
+`verdict_source: guardian_read`. The guardian's `max_open_billable_frames` setting (§7.2, Q4) now exists: default 1, an operator setting 1 to 4 (ADR 0191; any other value refuses startup), the reserve fence counts open billable frames under that name, and a refusal is recorded in the guardian's `fence_refusals` table. The original record follows. It generalizes the
 create-rejection change (commit 0f05f46, since merged) and amends the settlement
 contract of ADR 0038 (`0038-campaign-specs-and-platform-campaign-runner.md`, on the campaign runner track) and the
 provider interface of ADR 0040 (`0040-multi-stage-multi-vendor-campaigns.md`, on the campaign runner track). The guardian
@@ -399,9 +399,9 @@ and migration, a guardian change under the ADR 0033 exception, and one new settl
       `stopped`, `reconciled` or proven absent, whether or not the provider's create is
       inert. An inert create in an unknown state still counts. The inert-create exposure
       release is withdrawn.
-   b. `max_open_billable_frames` defaults to 1, and the guardian refuses any other value at
-      startup. Concurrent billable frames need a later record that covers total-cap races,
-      partial stops and accrual interleaving.
+   b. `max_open_billable_frames` defaults to 1. (Amended by [ADR 0191](0191-salad-cpu-fallback-and-concurrent-frames.md):
+      it is an operator setting, an integer 1 to 4; the total-cap race, partial stops and accrual interleaving
+      are covered there.)
 
 Effect on §8: stage 6 is removed. Effect on §9: add tests for adoption inside the deadline
 (started exactly once), adoption after the deadline (stopped, never started, settled at the

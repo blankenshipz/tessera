@@ -17,7 +17,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_serializer,
+    model_validator,
+)
 
 from .campaign_image_pull import (
     DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES,
@@ -40,6 +47,25 @@ MAX_PROFILES_BYTES = 262144
 # Same ceilings salad_live_setup applies to one owner-approved route.
 MAX_RUN_CENTS = 5000
 MAX_TASK_CENTS = 10000
+# Operator capacity fallback (``fallback_profiles``): at most this many names per profile.
+MAX_FALLBACK_PROFILES = 3
+# Fields a fallback profile must share with the profile that lists it: the same tenant, worker,
+# account and the same derived workload (custody, watchdog, monitor, capability environment,
+# destinations, adapter section), so moving a stage to it changes only where and on what
+# hardware it runs, never who runs it or what runs (ADR 0151's exact-substitution rule).
+FALLBACK_SHARED_FIELDS = (
+    "org_id",
+    "project_id",
+    "worker_principal_id",
+    "salad_organization",
+    "capability_environment_id",
+    "artifact_destination",
+    "checkpoint_destination",
+    "monitor_profile",
+    "watchdog_profile",
+    "custody_host",
+    "stage_adapter",
+)
 
 _Key = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
 _Identifier = Annotated[str, StringConstraints(min_length=1, max_length=200)]
@@ -136,6 +162,16 @@ class SaladCampaignProfile(_Closed):
         default=DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES, ge=1, le=MAX_IMAGE_PULL_BYTES
     )
     strict_image_pull: bool = False
+    # Operator capacity fallback (CPU-only profiles): other profiles of this file a stage that
+    # runs on this one may move to, in order, after the stage's own approved
+    # ``alternate_profiles`` are used up, and ONLY before any possible start (an attempt proven
+    # never started that settled at exactly zero, ADR 0169). Operator config, not spec: an
+    # approved spec and its digest never change. Each move is still bounded by the stage's
+    # ``retry.max_class_fallbacks`` and re-checked at move time against the stage's approved hold
+    # (``campaign_salad_fallback``). Absent (never null or ``[]`` in a document) by default.
+    fallback_profiles: (
+        Annotated[list[_Key], Field(min_length=1, max_length=MAX_FALLBACK_PROFILES)] | None
+    ) = None
     # Operator-recorded compressed pull sizes by allowed image digest (bytes); an image with
     # no entry has an unknown size.
     image_pull_sizes: dict[_ImageDigest, Annotated[int, Field(ge=0, le=MAX_IMAGE_PULL_BYTES)]] = (
@@ -170,7 +206,22 @@ class SaladCampaignProfile(_Closed):
             raise ValueError("image_pull_sizes names a digest that is not allowed")
         if not set(self.image_capabilities) <= set(self.allowed_image_digests):
             raise ValueError("image_capabilities names an image not in allowed_image_digests")
+        fallbacks = self.fallback_profiles
+        if fallbacks is not None:
+            if self.gpu:
+                raise ValueError("fallback_profiles applies to a CPU-only profile")
+            if len(set(fallbacks)) != len(fallbacks):
+                raise ValueError("fallback_profiles must be distinct")
+            if self.name in fallbacks:
+                raise ValueError("fallback_profiles must not name the profile itself")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_fallbacks(self, handler):
+        value = handler(self)
+        if self.fallback_profiles is None:
+            value.pop("fallback_profiles", None)
+        return value
 
     @property
     def gpu(self) -> bool:
@@ -221,10 +272,61 @@ class SaladCampaignProfiles(_Closed):
             raise ValueError("unsupported profile file schema")
         if len({p.name for p in self.profiles}) != len(self.profiles):
             raise ValueError("duplicate profile names")
+        _check_fallback_graph(self.profiles)
         return self
 
     def get(self, name: str) -> SaladCampaignProfile | None:
         return next((p for p in self.profiles if p.name == name), None)
+
+    def fallback_chain(self, name: str) -> tuple[str, ...]:
+        """The operator fallback chain of profile ``name``: its ``fallback_profiles`` in order,
+        each followed by its own chain (depth first), without repeats and without ``name``.
+        Empty for an unknown profile or one without fallbacks. The load-time checks guarantee
+        the graph is acyclic and every name resolves, so this always terminates."""
+        found: list[str] = []
+
+        def visit(current: str) -> None:
+            profile = self.get(current)
+            for item in (profile.fallback_profiles or ()) if profile is not None else ():
+                if item != name and item not in found:
+                    found.append(item)
+                    visit(item)
+
+        visit(name)
+        return tuple(found)
+
+
+def _check_fallback_graph(profiles: list[SaladCampaignProfile]) -> None:
+    """File-level checks of ``fallback_profiles``: every name resolves to a profile of this
+    file, of the same (CPU) kind and sharing ``FALLBACK_SHARED_FIELDS``, and the graph is
+    acyclic. A refusal fails the whole file (closed)."""
+    by_name = {p.name: p for p in profiles}
+    for profile in profiles:
+        for name in profile.fallback_profiles or ():
+            other = by_name.get(name)
+            if other is None:
+                raise ValueError(f"profile {profile.name!r} falls back to an unknown profile")
+            if other.gpu != profile.gpu:
+                raise ValueError(f"profile {profile.name!r} falls back to another kind")
+            for field in FALLBACK_SHARED_FIELDS:
+                if getattr(other, field) != getattr(profile, field):
+                    raise ValueError(
+                        f"profile {profile.name!r} falls back to {name!r}, whose {field} differs"
+                    )
+    state: dict[str, int] = {}  # 1: on the current path, 2: done
+
+    def visit(name: str) -> None:
+        state[name] = 1
+        for item in by_name[name].fallback_profiles or ():
+            if state.get(item) == 1:
+                raise ValueError("fallback_profiles form a cycle")
+            if item not in state:
+                visit(item)
+        state[name] = 2
+
+    for profile in profiles:
+        if profile.name not in state:
+            visit(profile.name)
 
 
 def load_profiles(path: Path | str) -> SaladCampaignProfiles:

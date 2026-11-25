@@ -47,12 +47,14 @@ from .campaign_salad import (
 from .campaign_salad_adapter import CUSTODY_KINDS, bind_workload, is_late_bound
 from .campaign_store import SALAD_REFUSAL
 from .models import ExecutionSpec
+from .salad_alternate_profiles import operator_chain, profile_order
 from .salad_campaign_profiles import (
     PROFILES_SCHEMA,
     SaladCampaignProfile,
     SaladCampaignProfiles,
     stage_has_nonpublic_input,
 )
+from .salad_live_check import PRESTART_FAILURE_CLASSES
 from .salad_unclaimed import CLAIMS, PROOF, unclaimed_proof
 from .salad_workload_contract import COMMAND as SALAD_COMMAND
 from .salad_workload_contract import (
@@ -197,6 +199,20 @@ class CredentialBlocked(Conflict):
     def __init__(self, message: str, state: dict[str, Any]) -> None:
         super().__init__(message)
         self.credential_state = state
+
+
+def _check_fallbacks_reach_profiles(stage: Any, order: tuple[str, ...]) -> None:
+    """A move to the next listed profile happens only before any possible start and is bounded
+    by ``retry.max_class_fallbacks`` (ADR 0060 addendum, strict rule): it never spends a
+    scientific attempt. A stage that lists alternates with that bound at 0 could never reach
+    them, so it is refused at submit instead of approving profiles nothing can use."""
+    retry = getattr(stage, "retry", None)
+    if len(order) > 1 and retry is not None and retry.max_class_fallbacks < 1:
+        raise Conflict(
+            f"Salad stage lists {len(order) - 1} alternate profile(s) but "
+            "retry.max_class_fallbacks is 0: set it to at least 1 (a move to the next profile "
+            "happens only after an attempt that provably never started and spent nothing)."
+        )
 
 
 class SaladRouteProvider:
@@ -438,12 +454,39 @@ class SaladRouteProvider:
     def check_stage(self, connection: sqlite3.Connection, project_id: str, stage: Any) -> None:
         """Operator profile ceilings for one Salad stage; every refusal is a 409.
 
-        Input admission (data class and trust) is the core's ``check_stage_inputs``."""
+        Input admission (data class and trust) is the core's ``check_stage_inputs``; it is
+        provider-level (the Salad provider's trust setting and the stage's worker), so it holds
+        for every profile of the stage alike.
+
+        ADR 0151: each of the stage's ``alternate_profiles`` passes exactly the checks of its
+        own profile (registered, this organization and project, the stage's worker, GPU/CPU
+        kind, credential, image allowlist, per-run and per-task ceilings, CPU worst case) with
+        the stage's unchanged ``max_exposure_cents``; a refusal names the alternate."""
         profiles = self.profiles
         if profiles is None or not profiles.profiles:
             raise Conflict(SALAD_REFUSAL)
         config = _salad_config(stage)
-        profile = profiles.get(config.profile)
+        self._check_profile(connection, project_id, stage, config, config.profile)
+        order = profile_order(config)
+        _check_fallbacks_reach_profiles(stage, order)
+        for name in order[1:]:
+            try:
+                self._check_profile(connection, project_id, stage, config, name)
+            except CredentialBlocked:
+                raise  # its message already names the profile
+            except Conflict as error:
+                raise Conflict(f"Salad stage alternate profile {name!r}: {error}") from None
+
+    def _check_profile(
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+        stage: Any,
+        config: SaladStageSpec,
+        name: str,
+    ) -> None:
+        """``check_stage`` for one listed profile of the stage."""
+        profile = self.profiles.get(name)
         if profile is None:
             raise Conflict("Salad stage names an unknown operator profile.")
         project = connection.execute(
@@ -501,14 +544,10 @@ class SaladRouteProvider:
                     "Salad stage's estimated CPU cost for its full duration exceeds its "
                     "max_exposure_cents."
                 )
-        # Every attempt holds its own exposure, an enabled infrastructure retry (ADR 0058)
-        # included: the operator's billable per-task ceiling counts them all.
-        # A pre-custody reallocation retry (ADR 0179) is one more attempt with its own hold.
-        attempts = (
-            stage.retry.max_attempts
-            + stage.retry.infra_retries
-            + stage.retry.max_reallocation_retries
-        )
+        # Every attempt holds its own exposure, an enabled infrastructure retry (ADR 0058), a
+        # pre-custody reallocation retry (ADR 0179) or class fallback (ADR 0060 addendum)
+        # included: the per-task ceiling counts them all.
+        attempts = stage.retry.hold_attempts
         if stage.max_exposure_cents * attempts > profile.max_task_cents:
             raise Conflict("Salad stage worst-case hold exceeds the profile's per-task ceiling.")
 
@@ -764,9 +803,225 @@ class SaladRouteProvider:
             (stamp, attempt_id),
         )
 
+    # -- class fallback (ADR 0060 addendum) ------------------------------------------------
+
+    def fallback_classes(self, stage: Any) -> int:
+        """The stage's profile and its ``alternate_profiles`` (ADR 0151), then the operator
+        ``fallback_profiles`` chain of those profiles (none unless the operator file names
+        one): one class each. Moves stay bounded by ``retry.max_class_fallbacks``."""
+        config = _salad_config(stage)
+        if config is None:
+            return 1
+        return len(profile_order(config)) + len(operator_chain(config, self.profiles))
+
+    def operator_fallback_refusal(
+        self, connection: sqlite3.Connection, project_id: str, stage: Any
+    ) -> str | None:
+        """A closed code when ``stage`` (the approved stage on an operator fallback profile,
+        ``stage_on_operator_profile``) may not run there, else None. Read-only; fails closed.
+
+        The cost bound first: the stage's approved per-run hold (``max_exposure_cents``) must be
+        within the profile's ``max_run_cents`` (``over_run_cap``); for a CPU profile the operator
+        rate over the stage's whole ``max_duration_seconds`` (the CPU worst case ``check_stage``
+        computes) must be within that hold, and the hold of every attempt the approved worst case
+        allows (``retry.hold_attempts``) within the profile's ``max_task_cents``
+        (``fallback_over_hold``). Then every other check an approved profile passes at submit
+        (``_check_profile``: tenant, worker, kind, credential, input trust and public-artifact
+        guards, image allowlist): any refusal is ``fallback_refused``."""
+        config = _salad_config(stage)
+        profiles = self.profiles
+        profile = None if config is None or profiles is None else profiles.get(config.profile)
+        if profile is None:
+            return "profile_unavailable"
+        try:
+            hold = int(stage.max_exposure_cents)
+            if hold > profile.max_run_cents:
+                return "over_run_cap"
+            if config.gpu or profile.gpu:
+                return "fallback_refused"  # operator fallbacks are CPU-only (static rates)
+            if profile.estimated_cents(int(stage.max_duration_seconds)) > hold:
+                return "fallback_over_hold"
+            if hold * int(stage.retry.hold_attempts) > profile.max_task_cents:
+                return "fallback_over_hold"
+            self._check_profile(connection, project_id, stage, config, config.profile)
+        except Conflict:
+            return "fallback_refused"
+        except Exception:  # noqa: BLE001 - anything unreadable is not covered
+            return "fallback_refused"
+        return None
+
+    def prestart_failure(
+        self, connection: sqlite3.Connection, attempt: Mapping[str, Any]
+    ) -> str | None:
+        """A closed reason when this attempt provably never started, else None.
+
+        Proof, all from control's own records: the attempt's route (read within the campaign's
+        own organization and project) carries no ``start`` effect (an effect is committed as
+        an intent before the provider is called, so none means the start call never happened)
+        and was never reallocated, and the executor's live receipt did not pass and names the
+        pre-start step that failed (or the provider's create rejection)."""
+        row = connection.execute(
+            "SELECT route_id, live_receipt_json FROM campaign_salad_attempts WHERE attempt_id=?",
+            (attempt["id"],),
+        ).fetchone()
+        if row is None or row["route_id"] is None or row["live_receipt_json"] is None:
+            return None
+        found = connection.execute(
+            """SELECT e.payload_json FROM events e JOIN campaigns c ON c.id=?
+            WHERE e.event_type='remote_execution.state' AND e.org_id=c.org_id
+            AND e.project_id=c.project_id AND json_extract(e.payload_json,'$.id')=?
+            ORDER BY e.cursor DESC LIMIT 1""",
+            (attempt["campaign_id"], row["route_id"]),
+        ).fetchone()
+        if found is None:
+            return None
+        state = json.loads(found["payload_json"])
+        effects = state.get("effects")
+        if (
+            not isinstance(effects, list)
+            or state.get("reallocated")
+            or any(not isinstance(e, dict) or e.get("action") == "start" for e in effects)
+        ):
+            return None
+        receipt = json.loads(row["live_receipt_json"])
+        if not isinstance(receipt, dict) or receipt.get("status") == "passed":
+            return None
+        if receipt.get("create_rejection") is not None:
+            return "create_rejected"
+        failure = receipt.get("prestart_failure")
+        code = failure.get("class") if isinstance(failure, dict) else None
+        return code if code in PRESTART_FAILURE_CLASSES else None
+
+    def cpu_profile(self, stage: Any) -> bool:
+        """True only when ``stage``'s Salad block and its operator profile are both CPU (no
+        GPU class); anything unreadable is False. Read-only."""
+        try:
+            config = _salad_config(stage)
+            profile = (
+                None
+                if config is None or self.profiles is None
+                else (self.profiles.get(config.profile))
+            )
+            return profile is not None and not config.gpu and not profile.gpu
+        except Exception:  # noqa: BLE001 - unreadable is not a CPU profile
+            return False
+
+    def allocation_timeout_evidence(
+        self, connection: sqlite3.Connection, attempt: Mapping[str, Any], stage: Any
+    ) -> dict[str, Any] | None:
+        """Closed evidence that this attempt's started group never got an instance and accrued
+        nothing, else None. Read-only; every missing, malformed or ambiguous record is None.
+
+        ``stage`` is the approved stage on the profile the attempt ran on. All of, from
+        control's own records (the one exception to ADR 0169 point 3 reads only these):
+
+        - the stage runs on a CPU profile (``cpu_profile``; GPU stages keep the strict rule);
+        - the attempt's verdict is ``failed`` and it settled under ``guardian_bounded_hold``,
+          which the settlement path records only after control's own guardian read said
+          ``stopped`` (``SaladStageDriver._read_verdict``), and its frame carries that read's
+          verdict digest;
+        - the executor's recorded guardian final validates (``_GuardianFinal``), carries the
+          guardian's own ``allocation_timeout`` (its deadline fired: by the guardian's rules no
+          instance, allocation or running time was ever seen), status ``stopped``, no orphan,
+          uncertain allocation, pending escalation, budget fence or unknown rate, no billed
+          cost, and an estimate that parses to exactly zero;
+        - the attempt's route (read within the campaign's own organization and project) was
+          never reallocated, and the executor's live receipt did not pass."""
+        from decimal import Decimal, InvalidOperation
+
+        from pydantic import ValidationError
+
+        from . import execution_frames as frames
+        from .campaign_salad_commands import _GuardianFinal
+
+        if not self.cpu_profile(stage):
+            return None
+        if attempt.get("salad_verdict") != "failed":
+            return None
+        if attempt.get("settlement_basis") != "guardian_bounded_hold":
+            return None
+        if type(attempt.get("settled_cents")) is not int:
+            return None
+        row = connection.execute(
+            """SELECT sa.route_id, sa.live_receipt_json, sa.guardian_final_json, c.org_id,
+            c.project_id FROM campaign_salad_attempts sa
+            JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
+            JOIN campaigns c ON c.id = a.campaign_id
+            WHERE sa.attempt_id=? AND a.campaign_id=?""",
+            (attempt["id"], attempt["campaign_id"]),
+        ).fetchone()
+        if (
+            row is None
+            or row["route_id"] is None
+            or row["live_receipt_json"] is None
+            or row["guardian_final_json"] is None
+        ):
+            return None
+        try:
+            final = _GuardianFinal.model_validate_json(row["guardian_final_json"])
+            estimate = Decimal(final.estimated_exposure_cents or "")
+        except (ValidationError, ValueError, InvalidOperation):
+            return None
+        timeout = final.allocation_timeout
+        if (
+            timeout is None
+            or final.status != "stopped"
+            or final.orphan
+            or final.allocation_uncertain
+            or final.escalation_pending
+            or final.budget_fenced
+            or final.rate_unknown
+            or final.actual_billed_cost_cents is not None
+            or not estimate.is_finite()
+            or estimate != 0
+        ):
+            return None
+        frame = frames.frame_for_attempt(
+            connection, attempt["id"], frames.Tenant(row["org_id"], row["project_id"])
+        )
+        if frame is None or frame.get("guardian_verdict_digest") is None:
+            return None
+        found = connection.execute(
+            """SELECT payload_json FROM events WHERE event_type='remote_execution.state'
+            AND org_id=? AND project_id=? AND json_extract(payload_json,'$.id')=?
+            ORDER BY cursor DESC LIMIT 1""",
+            (row["org_id"], row["project_id"], row["route_id"]),
+        ).fetchone()
+        if found is None:
+            return None
+        try:
+            state = json.loads(found["payload_json"])
+            receipt = json.loads(row["live_receipt_json"])
+        except ValueError:
+            return None
+        if not isinstance(state, dict) or state.get("reallocated", False) is not False:
+            return None
+        if not isinstance(receipt, dict) or receipt.get("status") in (None, "passed"):
+            return None
+        return {
+            "route_id": row["route_id"],
+            "guardian_status": final.status,
+            "guardian_verdict_digest": frame["guardian_verdict_digest"],
+            "allocation_timeout": {
+                "elapsed_seconds": timeout.elapsed_seconds,
+                "deadline_seconds": timeout.deadline_seconds,
+            },
+        }
+
     def placement_capability(self, stage: Any) -> PlacementCapability:
         """Rented capacity; CPU or GPU as the stage's own Salad block says (ADR 0088)."""
         return PlacementCapability("remote", "gpu" if salad_config(stage).gpu else "cpu")
+
+    def allocation_class(self, stage: Any) -> str | None:
+        """The GPU class this stage's operator profile requests (ADR 0148), or None for a CPU
+        profile, an unknown profile or no profiles. Read-only; never raises."""
+        if self.profiles is None:
+            return None
+        try:
+            profile = self.profiles.get(salad_config(stage).profile)
+        except Exception:  # noqa: BLE001 - a malformed stage block has no class
+            return None
+        return None if profile is None else profile.gpu_class
 
     def sweep(self, rt: RunnerServices) -> None:
         """Confirm bounded-hold settlements of terminal campaigns (events only)."""

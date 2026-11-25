@@ -261,6 +261,10 @@ class ProviderHooks(Protocol):
     ``sweep(rt)``: tick-level upkeep. ``on_settled(connection, attempt_id, cents, stamp)``:
     bookkeeping that commits in the settlement transaction. ``experiment_ready(rt, ctx,
     stage, spec_stage)``: scaffolding before a hold (False after it ran a step).
+    ``prestart_failure(connection, attempt)``: a closed reason from
+    ``campaign_class_fallback.REASONS`` only when the provider's own records prove the failed
+    attempt never started (no start effect), else None; without it a stage never moves to its
+    next candidate after a pre-start failure (ADR 0060 addendum).
     ``image_pull_size_bytes(spec_stage)``: total compressed layer bytes of the stage image, or
     None; read outside the grant transaction under a time bound, for the receipt only.
     ``image_pull_limits(stage)``: the stage's ceiling on the image's compressed pull size and

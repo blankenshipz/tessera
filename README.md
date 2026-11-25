@@ -129,7 +129,7 @@ flowchart LR
 
 Proposal/review records and the opt-in [direct Agent Sandbox adapter](docs/agent-sandbox.md)
 have isolated component tests. The adapter targets upstream **v1.0.6** one-shot,
-network-none Sandboxes (an opt-in, off-by-default allowlist egress-proxy profile, [ADR 0034](docs/decisions/0034-governed-sandbox-egress-and-dataset-staging.md), is implemented for local Docker (phase 1) and, as a narrow exception, for the Agent Sandbox (phase 2), with default tests only and no live network or cluster run; Salad input delivery (phase 3) is design only); it does not replace batch Jobs. No live CRD/controller or
+network-none Sandboxes. An opt-in, off-by-default allowlist egress-proxy profile ([ADR 0034](docs/decisions/0034-governed-sandbox-egress-and-dataset-staging.md)) is implemented for local Docker (phase 1) and, as a narrow exception, for the Agent Sandbox (phase 2), with default tests only and no live network or cluster run. Salad input delivery (phase 3) is design only. The adapter does not replace batch Jobs. No live CRD/controller or
 Sandbox runtime acceptance is claimed. Warm pools, read-only source integration,
 input/reasoning credential delivery and a complete agent reasoning/critique loop
 are not available in this demonstrated journey. A service credential such as a model API key is installed as root-owned systemd credential files read from standard input (never an argument or environment variable), with a receipt that records only the reference and a fingerprint; the service's existing start-up checks admit or refuse it ([service credentials](docs/service-credentials.md), [ADR 0093](docs/decisions/0093-service-credential-install.md)).
@@ -267,7 +267,21 @@ a single-provider stage would; it never picks a provider the approved spec does 
 and each skipped candidate's reason are on the receipt and in `tessera_get_campaign`, and
 `tessera_steer_campaign_placement` can pin or exclude candidates. ADR 0058's reroute targets
 are part of the same list, used only for an infrastructure retry ([ADR
-0060](docs/decisions/0060-capacity-aware-stage-placement.md)). An operator rule in the provider file
+0060](docs/decisions/0060-capacity-aware-stage-placement.md)). An attempt that provably never
+started on its candidate (no start effect on its route) and settled at exactly zero moves the
+stage to the next eligible class (a Salad stage's `alternate_profiles`, one GPU class each) or
+candidate, with every check re-run, at most `retry.max_class_fallbacks` times (off by default; each
+move's hold counts in the approved worst case, and no scientific retry is used), each move a
+`campaign.salad_profile_switched` event (from and to profile, closed reason, attempt id, `started`
+and `spent` false) on the timeline and the receipt; when none is left the stage fails closed as
+`class_fallback_exhausted`. A Salad CPU profile may also list operator `fallback_profiles` (other country or size, same worker
+and tenant, checked at load; [ADR 0191](docs/decisions/0191-salad-cpu-fallback-and-concurrent-frames.md)): after the spec's own alternates the
+stage moves to the first one whose worst-case hold fits the stage's approved hold, only under the same pre-start rule and only up to
+`retry.max_class_fallbacks`, each move receipted with its `source`. Anything that may have started or been billed keeps the failed or
+unknown path and never changes class: a stage whose run ended unstable is held for a person's
+retry decision (`post_start_switch_refused`, named as `salad_profile_decision` in the stuck
+view's evidence), and a paired gate comparison never pairs attempts that ran on different classes (ADR 0060
+addendum, [ADR 0169](docs/decisions/0169-salad-profile-fallback-policy.md)). An operator rule in the provider file
 can put a preferred provider (a Salad CPU or GPU profile) first for long, large-scratch or
 `heavy`-tagged stages, among the candidates the spec already lists, with the host as fallback
 ([ADR 0070](docs/decisions/0070-salad-first-placement-preference.md)). With no matching rule, a built-in default policy orders a stage's approved alternates by what the stage declares (heavy work, by declared memory, expected runtime or tag, tries a remote CPU candidate first, GPU a remote GPU one, internet-fetching work keeps remote candidates last, and a stage with no such signal keeps the order its spec wrote), only among destinations the spec already lists, with every check intact and the decision on the receipt; the operator can turn it off ([ADR 0088](docs/decisions/0088-default-placement-by-stage-class.md)). Each attempt is settled once through
@@ -544,7 +558,7 @@ Console scripts installed by the package, one line each:
   needs is in place except the key value ([first-call readiness](docs/first-call-readiness.md),
   [ADR 0109](docs/decisions/0109-reasoning-first-call-readiness.md)).
 - `tessera-review`: `submit` requests an advisory code review job for a branch of an
-  operator-mapped repository ([ADR 0108](docs/decisions/0108-code-review-submit.md),
+  operator-mapped repository (ADR 0108 (proposed): [decision](docs/decisions/0108-code-review-submit.md),
   [review jobs](docs/mcp-review-jobs.md)).
 - `tessera-submit-runner`: optional scheduled runner that turns approved, pending submission records
   into campaigns; it never approves or widens anything

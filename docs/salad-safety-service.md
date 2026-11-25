@@ -46,9 +46,11 @@ admin `input_ticket` are refused.
 refuses any reservation whose per-run cap, added to every other reservation's
 committed estimate, would exceed it (see below). Omitted means no total cap.
 
-`max_open_billable_frames` is optional and must be `1` (the default); the service refuses to
-start with any other value, because concurrent billable frames need a record that covers
-total-cap races, partial stops and accrual interleaving (ADR 0041 resolved question 4b).
+`max_open_billable_frames` is optional: an integer from 1 (the default) to 4. The service
+refuses to start with anything else (0, 5, a bool, a string, a float or null). With more than
+one frame allowed, every per-frame rule below holds for each frame and the total cap holds in
+aggregate (see **Open billable frames**); the unseen-run gap each admission charges grows with
+the setting (ADR 0041 section 7.2, resolved question 4b).
 
 The admin token is an independently provisioned random bearer credential of at
 least 32 bytes, never the Salad management credential. Trusted clients pin the
@@ -268,6 +270,13 @@ else `max(accrued, per-run cap)`, plus this reservation's `max_cost_cents`;
 `status` adds `total_cap_cents`, `total_committed_cents` and
 `total_remaining_cents` (null without a cap), plus `first_running_at`.
 
+**Per-frame isolation and the lost-create hold (ADR 0191).** Each open frame runs in its own guarded step of the loop pass. If it
+raises, the service records an event and a frame note of kind `loop_frame_failed` (the exception type name only), fails that frame closed
+(recovery, budget fence, stop) and carries on with the other frames; the aggregate total-cap check still runs at the end of every pass. A
+frame closed as a *lost create* (resolved `automatic` or `operator`) keeps its hold counted against `total_cap_cents` for the 24 h
+late-resource watch, so a late group that reopens it cannot push the total past the cap; its open-frame slot is freed at once. A create
+proven absent after Salad's own clean rejection frees its hold immediately.
+
 **Open billable frames.** A `reserve` is refused (wire code `single_operation_orphan_exposure`)
 while the number of other frames that may still bill is at `max_open_billable_frames`. A frame
 counts until its status is `stopped` or `reconciled` (a create proven absent reconciles); an
@@ -275,7 +284,30 @@ ambiguous create with no provider id still counts. A stopped, reconciled or abse
 slot at once, with no wait. Each refusal writes a `fence_refusals` row in the service database (the
 reservation and operation refused, the open count and the limit; no other frame's ids), apart from `events`. The
 total-cap refusal is checked first and is not recorded as a fence refusal. Admin `status` adds
-`max_open_billable_frames`.
+`max_open_billable_frames` and `unseen_run_gap_seconds`.
+
+With `max_open_billable_frames` above 1 the guardian keeps these rules:
+
+- *Aggregate total cap.* The total-cap sum, the open-frame count and the insert run in one
+  `BEGIN IMMEDIATE` transaction, so a reserve sees every other frame's hold. Each frame is
+  accounted on its own rate, start time and ledger row; one frame's accrual never offsets
+  another frame's hold. After every loop pass the guardian recomputes the total. If an
+  overshoot or a cap lowered across a restart puts it over `total_cap_cents`, every frame
+  that may still bill is fenced and stopped (event `total_cap_breached`), not only the one
+  that overshot.
+- *Per-frame stops.* A frame's own cap breach, rate change, deadline, heartbeat loss or
+  reallocation fences and stops that frame only. Stopping or settling one frame frees one
+  slot. An ambiguous create still counts.
+- *Distinct provider groups.* A reserve naming the same organization, project and group as
+  another open frame is refused (`provider_group_in_use`). The guardian also refuses to bind
+  a provider group that another open frame already holds (`provider_identity_in_use`).
+- *Longer unseen gap.* One loop pass reads every open frame. Beyond the first frame, each
+  can add up to 8 provider requests (rate, group, instance, observe, stop and close check),
+  each bounded by the 2 s transport deadline. So the unseen-run gap is
+  `45 + (N - 1) * 16` seconds: 45, 61, 77 or 93. Admission, accrual backdating and
+  begin-once all charge it. A longer pass can also make the guardian stop a healthy frame
+  as `missed_poll`, or deny it a read retry because the pass's shared retry window is
+  spent. Both stop the frame, so they cost a run, never money.
 
 Before new work/arming/begin, the service independently reads the selected GPU's
 fresh official high-priority published hourly rate through `gpu_class`. Its
@@ -336,7 +368,7 @@ exceed the estimate cap; `escalation_pending` then remains durable. Single-opera
 capacity fences a new reservation while a prior operation remains unresolved.
 
 `estimated_exposure_cents`, `published_hourly_rate_usd`, `rate_unknown`, `rate_read_retries`, `provider_read_retries`, `stop_cause`, `last_workload_refusal`, `last_rate_read_failure`,
-`last_provider_read_failure`,
+`last_provider_read_failure`, `last_loop_frame_failure` and `last_loop_frame_failure_at` (a frame whose loop step raised: the exception type name and time only),
 `budget_fenced`, `escalation_pending` and `exposure_pending` are accounting
 projections, not invoices. `actual_billed_cost_cents` remains null,
 `exposure_unknown:true` and `financial_hard_cap:false`: provider outage, changing

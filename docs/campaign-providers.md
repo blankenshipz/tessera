@@ -77,6 +77,13 @@ no fetch or redirect host other than the stage's `public_artifact` pins, below),
 profile's program template, and a cost estimate of the full duration at the profile's CPU rate. The
 ordinary submit, approval and placement checks then apply to it.
 
+The request may also carry `"alternate_profiles": ["cpu-2c-4g-b"]` (ADR 0151; up to four, distinct,
+not the request's own profile). Each alternate must be a CPU profile with a `stage_adapter` that
+derives exactly the same workload (same worker, custody host, watchdog, program and grant
+lifetime: only the profile name may differ), or the request is refused naming it. The expanded
+block then lists them under `alternate_profiles`, and the candidate's estimate is that of its
+costliest listed profile (still never above the stage's `max_exposure_cents`).
+
 The operator opens a CPU profile to this by adding a `stage_adapter` section to it (its presence
 is the opt-in; [ADR 0077](decisions/0077-campaign-prep-from-the-spec.md)). Every field is optional:
 `program` (absent: a generic program template naming only the stage), `max_input_bytes` (absent: the
@@ -213,6 +220,64 @@ stage image, fetches the pins. A Salad candidate answers from its profile's
 Give each instance its own worker principal (a principal binds one provider in the trust file),
 and set `worker_slots` to the pollers that share it, so placement sees real capacity.
 
+### Next class after a pre-start failure
+
+Contract: [ADR 0060](decisions/0060-capacity-aware-stage-placement.md) (addendum), with the
+strict rule of [ADR 0169](decisions/0169-salad-profile-fallback-policy.md): this is the only
+automatic class move, and it happens only before any possible start. A Salad stage may list
+further operator profiles, in order, after its `profile` (one GPU class each; the one
+`alternate_profiles` list of [ADR 0151](decisions/0151-salad-alternate-execution-profiles.md), one
+to four):
+
+```json
+"salad": {"profile": "gpu-a", "alternate_profiles": ["gpu-b", "gpu-c"], "...": "..."}
+```
+
+(`provider_config` carries the same field on a v2 stage.) Every profile is checked at submit,
+approval and placement exactly like `profile` (it exists for the project, has the stage's worker,
+matches `gpu`, an enrolled credential, the image allowlist, the per-run and per-task ceilings).
+The executor must serve every listed profile. A stage that lists alternates must set
+`retry.max_class_fallbacks` to at least 1, or submit refuses it.
+
+When an attempt fails before start and spent nothing, the runner records it as
+`prestart_no_spend` (with a closed reason such as `create_rejected`, `create_failed`,
+`group_unsettled` or `input_delivery_unconfirmed`, never free text) and places the next attempt on
+the next class of the same candidate, then on the next `alternate_providers` candidate. Placement
+re-runs every check for that class (registry, enrollment, trust, licence labels, per-run cap,
+campaign and program budget, project limits, open exposure, free slots, the heavy-stage guard). A
+class that failed this way is not used again. The move uses no scientific retry and is bounded by
+`retry.max_class_fallbacks` (0 to 4, default 0: off unless the spec sets it, like
+`infra_retries`). Each move is a new attempt with its own hold, so the approved worst case, the
+experiment budget and Salad's per-task ceiling count `max_attempts + infra_retries +
+max_class_fallbacks`. When no class is left, or the
+bound is spent, the stage fails with `class_fallback_exhausted`; it never moves anywhere the spec
+does not list.
+
+"Spent nothing" is proved, not assumed: the attempt's route carries no `start` effect (effects are
+committed as intents before the provider is called), it was never reallocated, the executor's
+live receipt did not pass and names the pre-start step (or the provider's create rejection), and
+the attempt settled at exactly zero (a person's zero charge, a zero reconcile of an unclaimed
+attempt, or a zero reconcile of an unknown attempt followed by a zero charge). An attempt that
+may have started or been billed, including a provisional `guardian_bounded_hold` settlement,
+keeps its existing path, failed or unknown and held until a person reconciles it, and never
+changes class. Each move is a `campaign.stage_class_fallback` event (candidate, class index,
+reason, path, counts) and, for a Salad stage, a `campaign.salad_profile_switched` event
+(`from_profile`, `to_profile`, reason `prestart_no_spend`, `attempt_id`, `started` and `spent`
+false), both committed with the attempt's transition; the next profile is the first listed one not
+yet tried on that candidate, so none is chosen twice. A next profile that no longer passes the
+approved checks (per-run cap, capability declaration, a review pre-approval binding its plan
+digest) is not moved to: the stage is held with one `profile_not_approved` stop event. The next
+placement carries `class_index`, the receipt's attempt entry carries `class_fallback` and its
+`salad_profile`, and the stage carries `salad_profiles`. A stage without `alternate_profiles` or
+`alternate_providers` behaves exactly as before, and absent fields keep every spec digest.
+
+After the approved `alternate_profiles`, a CPU stage may also move along its profile's operator
+`fallback_profiles` chain (operator config in the profile file, no spec or digest change; see
+[Salad operator setup](salad-operator-setup.md#cpu-capacity-fallback-fallback_profiles)): the same
+pre-start trigger, counted against the same `retry.max_class_fallbacks`, and each fallback checked
+at move time against the stage's approved hold. Every switch event and receipt switch carries
+`source` (`spec_alternate` or `operator_fallback`).
+
 ### Placement preference by resource class
 
 Contract: [ADR 0070](decisions/0070-salad-first-placement-preference.md). The
@@ -275,6 +340,45 @@ event: `source: default_policy`, `class`, `signals`, `kinds`, `spec_order`, `ord
 `chosen` and `fell_back` (each skipped candidate and why). `tessera_get_campaign` shows a
 `default_policy` block under `placement_preference` (enabled, thresholds, and per stage the
 class, signals, order and whether it applies).
+
+### Allocation instability fallback
+
+Contract: [ADR 0148](decisions/0148-salad-allocation-instability-fallback.md). Off by default. With
+`"placement_preferences": {"allocation_instability": {"window_seconds": 900, "threshold": 2,
+"lookback_seconds": 86400}}` (each field optional, bounded and validated), placement counts the
+routes per GPU class in the campaign's project whose allocation changed within `window_seconds` of
+first running. When the next attempt's first candidate is on a class at `threshold`, eligible
+approved candidates (not on an unstable class, within the per-run cap, not steered out, a
+third-party one only under its own pre-approval) are tried first. Every placement check still runs,
+an attempt in flight is never moved, and with no eligible candidate the order stays. The placement
+event and receipt carry `placement.allocation_instability` (`outcome`
+`allocation_unstable_fallback` or `allocation_unstable_no_alternate`, counts, classes and refusal
+reasons), and a receipt attempt whose own route changed allocation carries `allocation_instability`.
+The fallback is to another approved candidate (usually a CPU host), not to another Salad GPU
+class on its own, and it applies only while no earlier attempt of the stage may have started
+(ADR 0169): a retry after a possible start stays where it ran. A Salad-only stage only records
+`allocation_unstable_no_alternate`. When the fallback puts a heavy stage's local candidate first,
+the heavy-stage guard records the explicit reason `allocation_unstable` (never a silent local
+placement).
+
+### Alternate profiles: no move after a possible start
+
+Contract: [ADR 0151](decisions/0151-salad-alternate-execution-profiles.md) as narrowed by
+[ADR 0169](decisions/0169-salad-profile-fallback-policy.md). A Salad stage that lists
+`alternate_profiles` moves to the next one only before any possible start (above). When an attempt
+ended unstable on its own route (its verdict is `failed` and its route lost the allocation within
+the ADR 0148 window, `allocation_unstable`, or was reallocated and the provider confirmed the stop,
+ADR 0149, `termination_confirmed_unstable`), that run started or may have, and may have been
+billed: the stage does not move. The attempt keeps its outcome and settles as any failed run; the
+stage is held (`blocked_unknown`, the campaign blocks with reason `post_start_switch_refused`)
+with one `campaign.salad_profile_fallback_stopped` event (`outcome`, `reason`, `attempt`,
+`attempt_id`, `from_profile`, `tried`, `started: true`, `spent`). `tessera_list_stuck_campaigns`
+shows the stage's finding with `salad_profile_decision` (outcome, attempt, `started`) in its
+evidence: a person or an approved delegation decides. The receipt's stage carries `salad_profiles` (`order`, `switches`,
+`stopped`) and each attempt `salad_profile`. A paired gate comparison never pairs attempts that
+ran on different profiles (`class_mismatch`). A held, unconfirmed attempt never moves the stage,
+even when its confirmation arrives after the termination bound: a person still decides. A stage
+without alternates is unchanged.
 
 ### Image pull-size preflight
 
@@ -498,6 +602,8 @@ A CPU and a GPU Salad profile (example values; the credential is a reference, ne
 ```
 
 The GPU profile is the same with `"gpu_class": "<GPU class UUID>"` instead of `cpu_rate`.
+A CPU profile may add `"fallback_profiles": ["cpu-2c-4g-alt"]` (one to three other CPU
+profiles of the same file, each its own entry; optional, absent by default).
 
 Optional `image_capabilities` maps an allowlisted image digest to the runtime capabilities the
 operator has verified that image has, e.g. `"image_capabilities": {"sha256:<64 hex>":

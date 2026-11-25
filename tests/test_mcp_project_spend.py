@@ -49,15 +49,15 @@ def test_project_spend_reports_limits_and_unfinished_totals(tmp_path):
     _spender_submitted_every_campaign(env)
     body = client.get(path, headers={**_token("spender"), **DEST}).json()
     limits = body["limits"]
-    assert limits["remaining_cents"] == limits["monetary_limit_cents"] - 5
     assert set(limits) == {
         "currency",
         "monetary_limit_cents",
         "max_concurrency",
-        "held_cents",
-        "settled_cents",
-        "remaining_cents",
+        "own_held_cents",
+        "own_settled_cents",
+        "ceiling_has_headroom",
     }
+    assert limits["ceiling_has_headroom"] is True
     assert sum(row["campaigns"] for row in body["campaigns_by_status"]) == 1
     assert body["unfinished"]["campaigns"] == 1 and body["unfinished"]["cap_cents"] == 10
     assert "no tool raises them" in body["boundary"]

@@ -52,6 +52,8 @@ _FAILURES = {
     "sealed_partition": "it needed data from a sealed partition",
     "public_fetch_unreported": "the worker never reported fetching its pinned public files",
     "egress_violation": "it transferred data outside the stage's egress allowlist",
+    "prestart_no_spend": "it never started on that machine class and cost nothing, so the next "
+    "class was tried",
 }
 
 _STATUS_WORDS = {

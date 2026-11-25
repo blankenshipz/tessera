@@ -384,7 +384,7 @@ class CampaignGateCommands:
             raise StoreError(f"Invalid gate decision: {location}") from None
 
         def command(connection, live):
-            campaign = self._campaign(connection, live, campaign_id)
+            campaign = self._readable_campaign(connection, live, campaign_id)
             # Agents, workers and external-scope credentials never write a gate decision.
             if live.get("kind") == "worker" or live["role"] != "human":
                 raise Forbidden("A human must record a gate decision.")

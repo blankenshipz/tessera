@@ -32,8 +32,8 @@ def _fence_events(service):
     return [{"open": opened, "limit": limit} for opened, limit in rows]
 
 
-@pytest.mark.parametrize("value", [0, 2, -1, True, "1", 1.0, None])
-def test_the_guardian_refuses_to_start_with_any_limit_other_than_one(tmp_path, value):
+@pytest.mark.parametrize("value", [0, 5, -1, True, "1", 1.0, None])
+def test_the_guardian_refuses_to_start_with_a_limit_outside_one_to_four(tmp_path, value):
     tmp_path.chmod(0o700)
     with pytest.raises(ValueError, match="invalid_max_open_billable_frames"):
         make_service(

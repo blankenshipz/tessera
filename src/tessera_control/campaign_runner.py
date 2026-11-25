@@ -29,11 +29,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import campaign_class_fallback as class_fallback
 from . import campaign_heavy_guard as heavy_guard
 from . import campaign_hold, provider_trust
 from . import campaign_holdout as holdout
 from . import campaign_image_pull as image_pull
 from . import campaign_placement as placement
+from . import campaign_salad_fallback as salad_fallback
 from . import execution_frames as frames
 from . import late_bound_inputs as late_bound
 from .campaign_autoreconcile import (
@@ -90,6 +92,7 @@ from .campaign_models import (
     needs_composition,
     normalize,
     parse_spec_json,
+    placement_candidates,
     spec_digest,
     stage_input_class,
     stage_on_candidate,
@@ -998,15 +1001,19 @@ class CampaignRunner:
         """The stage as it runs now: on the candidate it was last placed on (ADR 0060).
 
         A stage that names one provider (no alternates, no ADR 0058 reroute targets) always runs
-        on it, unchanged."""
+        on it, unchanged, unless an earlier attempt failed there before start with nothing spent
+        and the stage lists another profile (ADR 0060 addendum): it then runs on the profile its
+        recorded ``campaign.salad_profile_switched`` events name (ADR 0151)."""
         base = ctx.spec.stage(key)
-        if not base.has_candidates:
-            return base
-        row = self._one(
-            "SELECT provider_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
-            (ctx.campaign["id"], key),
-        )
-        return self._on_candidate(base, None if row is None else row["provider_id"])
+        if base.has_candidates:
+            row = self._one(
+                "SELECT provider_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+            )
+            base = self._on_candidate(base, None if row is None else row["provider_id"])
+        # ADR 0151: a Salad stage that lists alternate profiles runs on the profile its recorded
+        # pre-start switches on this candidate name (without alternates: unchanged, no read).
+        return salad_fallback.current_stage(self, ctx, key, base)
 
     @staticmethod
     def _on_candidate(base: NormalStage, provider_id: str | None) -> NormalStage:
@@ -1696,7 +1703,9 @@ class CampaignRunner:
         # attempt's) provider must still be registered.
         base = ctx.spec.stage(key)
         placing = (
-            bool(base.alternates) or (base.has_candidates and placement.reroute_due(base, attempts))
+            bool(base.alternates)
+            or (base.has_candidates and placement.reroute_due(base, attempts))
+            or class_fallback.prestart_attempts(attempts) > 0
         ) and (status == "pending" or latest is None or latest["status"] == "failed_transient")
         if not placing:
             try:
@@ -1723,7 +1732,23 @@ class CampaignRunner:
             # A recorded exit code is part of the outcome the campaign reports (ADR 0063).
             code = latest["exit_code"]
             suffix = "" if code is None else f":exit_code={code}"
-            return self._stage_failed(ctx, key, f"{latest['failure_class']}{suffix}")
+            # The stop event (if any) and the stage's state change commit in one transaction.
+            with self.store.runner_connection() as connection:
+                fallback = self._salad_profile_fallback(
+                    ctx, key, stage, latest, stopping, connection
+                )
+                if fallback.action == salad_fallback.HOLD:
+                    # The strict rule (ADR 0169): no profile move after a possible start; the
+                    # stage is held for an explicit retry decision with one stop event.
+                    self._mark_stage_unknown(connection, ctx, key, fallback.outcome)
+                else:
+                    self._mark_stage_failed(
+                        connection, ctx, key, f"{latest['failure_class']}{suffix}"
+                    )
+            if fallback.action == salad_fallback.HOLD:
+                self._actions.append(f"blocked:{key}")
+                return False
+            return True
         if attempt_status == "refused_budget":
             return False
         if attempt_status == "cancelled":
@@ -1740,13 +1765,17 @@ class CampaignRunner:
                 # (ADR 0046), may release it again: the stage fails and the claim is spent.
                 return self._stage_failed(ctx, key, f"holdout_spent:{latest['failure_class']}")
             # An attempt that never started uses an attempt number, not a scientific retry.
-            # An infrastructure retry (ADR 0058) has its own bound, not a scientific one.
+            # An infrastructure retry (ADR 0058) has its own bound, not a scientific one, and so
+            # does a pre-custody reallocation retry (ADR 0179) and a move to the next candidate
+            # after a pre-start failure (ADR 0060 addendum).
             realloc_used = reallocation_attempts(attempts)
+            moved = class_fallback.prestart_attempts(attempts)
             scientific = (
                 stage["attempts_used"]
                 - not_started_count(attempts)
                 - infra_attempts(attempts)
                 - realloc_used
+                - moved
             )
             if (
                 latest["failure_class"] == REALLOCATED_PRECUSTODY
@@ -1754,6 +1783,15 @@ class CampaignRunner:
             ):
                 # ADR 0179: the bound on fresh attempts after a pre-custody reallocation.
                 return self._stage_failed(ctx, key, f"{REALLOCATED_PRECUSTODY}_exhausted")
+            if (
+                not stopping
+                and latest["failure_class"] == class_fallback.PRESTART_NO_SPEND
+                and (
+                    moved + self._timeout_move_count(ctx, key) > base.retry.max_class_fallbacks
+                    or stage["attempts_used"] >= MAX_ATTEMPT_NUMBERS
+                )
+            ):
+                return self._stage_failed(ctx, key, class_fallback.EXHAUSTED)
             if (
                 stopping
                 or scientific >= spec_stage.retry.max_attempts
@@ -1769,6 +1807,37 @@ class CampaignRunner:
         except _Waiting:
             return False
 
+    def _timeout_move_count(self, ctx: _Ctx, key: str) -> int:
+        """Allocation-timeout profile moves of the stage (they share
+        ``retry.max_class_fallbacks`` with the pre-start moves)."""
+        with self.store.runner_connection() as connection:
+            return len(salad_fallback.timeout_moves(connection, ctx.campaign, key))
+
+    def _salad_profile_fallback(
+        self,
+        ctx: _Ctx,
+        key: str,
+        stage: Mapping[str, Any],
+        latest: Mapping[str, Any],
+        stopping: bool,
+        connection: sqlite3.Connection,
+    ) -> salad_fallback.Verdict:
+        """ADR 0151 with the strict rule of ADR 0169: after a failed attempt of a stage that lists
+        alternate profiles, whether the stage is held for an explicit retry decision (the run
+        ended unstable after a possible start, or a pre-start move was not covered) or nothing
+        changes. It never moves the stage to another profile.
+
+        Only a stage whose approved spec lists alternate profiles (or whose profiles the operator
+        chains fallbacks after, when its ``max_class_fallbacks`` allows a move) is read; a
+        stopping campaign
+        keeps the existing behavior. Runs in ``connection``, where the caller applies the
+        verdict to the stage."""
+        base = ctx.spec.stage(key)
+        approved = self._on_candidate(base, stage["provider_id"]) if base.has_candidates else base
+        if not salad_fallback.reads_fallback(approved) or stopping:
+            return salad_fallback.Verdict(None)
+        return salad_fallback.after_failure(self, ctx, key, approved, dict(latest), connection)
+
     # -- placement (ADR 0060) ---------------------------------------------------------
 
     def _place_and_reserve(self, ctx: _Ctx, key: str, *, prepare: bool = False) -> bool:
@@ -1782,8 +1851,13 @@ class CampaignRunner:
         if self._reservation_held_back(ctx, key):
             return False
         base = ctx.spec.stage(key)
-        if not base.has_candidates or (
-            not base.alternates and not placement.reroute_due(base, self._attempts(ctx, key))
+        attempts = self._attempts(ctx, key)
+        # ADR 0060 addendum: after a pre-start failure the next attempt is placed (every
+        # check runs again on the next class), even for a stage that names one provider.
+        moved = class_fallback.prestart_attempts(attempts) > 0
+        if not moved and (
+            not base.has_candidates
+            or (not base.alternates and not placement.reroute_due(base, attempts))
         ):
             floor = self._single_provider_floor(base)
             if floor is not None:
@@ -2520,28 +2594,34 @@ class CampaignRunner:
 
     def _stage_unknown(self, ctx: _Ctx, key: str, reason: str | None = None) -> bool:
         with self.store.runner_connection() as connection:
-            self._touch(
-                connection,
-                "campaign_stages",
-                "campaign_id=? AND stage_key=?",
-                (ctx.campaign["id"], key),
-                status="blocked_unknown",
-            )
-            updated = connection.execute(
-                """UPDATE campaigns SET status='blocked', updated_at=?
-                WHERE id=? AND status IN ('running','stopping','cancel_requested')""",
-                (_iso(self.now()), ctx.campaign["id"]),
-            )
-            if updated.rowcount:
-                self.store.record_runner_event(
-                    connection,
-                    ctx.campaign,
-                    "campaign.blocked",
-                    {"stage_key": key, **({"reason": reason} if reason else {})},
-                )
-                self._free_campaign_releases(connection, ctx.campaign["id"], "campaign_blocked")
+            self._mark_stage_unknown(connection, ctx, key, reason)
         self._actions.append(f"blocked:{key}")
         return False
+
+    def _mark_stage_unknown(
+        self, connection: sqlite3.Connection, ctx: _Ctx, key: str, reason: str | None
+    ) -> None:
+        """The stage ``blocked_unknown`` and the campaign blocked, in the caller's transaction."""
+        self._touch(
+            connection,
+            "campaign_stages",
+            "campaign_id=? AND stage_key=?",
+            (ctx.campaign["id"], key),
+            status="blocked_unknown",
+        )
+        updated = connection.execute(
+            """UPDATE campaigns SET status='blocked', updated_at=?
+            WHERE id=? AND status IN ('running','stopping','cancel_requested')""",
+            (_iso(self.now()), ctx.campaign["id"]),
+        )
+        if updated.rowcount:
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "campaign.blocked",
+                {"stage_key": key, **({"reason": reason} if reason else {})},
+            )
+            self._free_campaign_releases(connection, ctx.campaign["id"], "campaign_blocked")
 
     def _attempt_failed(
         self, ctx: _Ctx, key: str, attempt: dict[str, Any], failure_class: str, detail: str
@@ -2618,15 +2698,11 @@ class CampaignRunner:
         phase = stage["prep_phase"]
         title = f"{ctx.spec.name}/{key}"[:200]
         purpose = f"Campaign {campaign['id']} stage {key} (ADR 0038)"
-        # Every attempt, scientific or infrastructure (ADR 0058), holds its own exposure; the
-        # stage's own exposure is the per-run cap every candidate fits under (ADR 0060).
+        # Every attempt, scientific, infrastructure (ADR 0058) or class fallback (ADR 0060
+        # addendum), holds its own exposure; the stage's own exposure is the per-run cap every
+        # candidate fits under (ADR 0060).
         budget = min(
-            ctx.spec.stage(key).max_exposure_cents
-            * (
-                spec_stage.retry.max_attempts
-                + spec_stage.retry.infra_retries
-                + spec_stage.retry.max_reallocation_retries
-            ),
+            ctx.spec.stage(key).max_exposure_cents * spec_stage.retry.hold_attempts,
             EXPERIMENT_CEILING_CENTS,
         )
 
@@ -4474,6 +4550,16 @@ class CampaignRunner:
         )
         if infra is not None:
             status, failure_class, detail = infra
+        elif status == "failed_permanent" and self._class_fallback(
+            ctx, stage["stage_key"], spec_stage, attempt, "failed"
+        ):
+            return True
+        elif (
+            failure_class == INFRA_ALLOCATION_TIMEOUT
+            and status == "failed_transient"
+            and self._allocation_timeout_fallback(ctx, stage["stage_key"], attempt, detail)
+        ):
+            return True
         elif failure_class == INFRA_ALLOCATION_TIMEOUT and status == "failed_transient":
             status, detail = self._placement_failure(
                 ctx, stage["stage_key"], spec_stage, attempt, detail
@@ -4482,6 +4568,161 @@ class CampaignRunner:
             attempt["id"], status=status, failure_class=failure_class, failure_detail=detail
         )
         return True
+
+    def _allocation_timeout_fallback(
+        self, ctx: _Ctx, key: str, attempt: Mapping[str, Any], observed_detail: str | None
+    ) -> bool:
+        """The one exception to ADR 0169 point 3: an observed ``infra_allocation_timeout`` of a
+        CPU Salad stage whose group was started but never got an instance moves the stage to its
+        next CPU profile (the spec alternates, then the operator chain), recorded as one
+        ``campaign.salad_profile_switched`` event (reason ``allocation_timeout``) in the SAME
+        transaction as the attempt's ``failed_transient`` / ``infra_allocation_timeout``
+        transition. True when it did; False changes nothing (today's infrastructure retry path).
+
+        Fails closed: only a stage that names one provider (no alternate or reroute candidates:
+        placement would otherwise send the next attempt elsewhere), whose fallback gate reads
+        (``reads_fallback``), with a class fallback left (``retry.max_class_fallbacks`` counts
+        pre-start moves and these together), on a running campaign, with the provider's proof
+        (``allocation_timeout_evidence``) and a covered CPU next profile. The attempt still counts
+        as an infrastructure attempt (``infra_retries``) exactly as today, so the worst case
+        ``max_attempts + infra_retries + max_class_fallbacks`` stays an upper bound. Settlement is
+        untouched: the attempt already settled at its hold (``guardian_bounded_hold``)."""
+        base = ctx.spec.stage(key)
+        if base.has_candidates or base.retry.max_class_fallbacks < 1:
+            return False
+        if not class_fallback.enabled(base, placement_candidates(base)):
+            return False
+        if not salad_fallback.reads_fallback(base) or self._stopping(ctx):
+            return False
+        with self.store.runner_connection() as connection:
+            fresh = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+            ).fetchone()
+            if fresh is None or fresh["status"] != "reconciled":
+                return False
+            if (fresh["provider_id"] or base.provider) != base.provider:
+                return False
+            number = int(fresh["attempt"])
+            rows = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE campaign_id=? AND stage_key=? "
+                "AND id<>?",
+                (ctx.campaign["id"], key, attempt["id"]),
+            ).fetchall()
+            moves = salad_fallback.timeout_moves(connection, ctx.campaign, key)
+            used = class_fallback.prestart_attempts(rows) + sum(1 for n in moves if n != number)
+            if used >= base.retry.max_class_fallbacks:
+                return False
+            outcome = salad_fallback.allocation_timeout_move(
+                self, ctx, key, base, dict(fresh), connection
+            )
+            if outcome != salad_fallback.MOVED:
+                return False
+            base_detail = observed_detail or "allocation_timeout: no instance was allocated"
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                status="failed_transient",
+                failure_class=INFRA_ALLOCATION_TIMEOUT,
+                failure_detail=(
+                    f"{base_detail}; moved to the next profile, class fallback "
+                    f"{used + 1} of {base.retry.max_class_fallbacks}"
+                )[:500],
+            )
+        self._actions.append(f"allocation_timeout_fallback:{key}:{number}")
+        return True
+
+    def _class_fallback(
+        self,
+        ctx: _Ctx,
+        key: str,
+        spec_stage: NormalStage,
+        attempt: Mapping[str, Any],
+        path: str,
+        connection: sqlite3.Connection | None = None,
+        settled: int | None = None,
+    ) -> bool:
+        """ADR 0060 addendum: record a failed attempt that provably never started and settled
+        at zero as ``prestart_no_spend``, so the stage is placed again on its next eligible
+        class or candidate (for a Salad stage with alternates, its next listed profile with a
+        ``campaign.salad_profile_switched`` event). True when it did. The attempt transition
+        and its events commit together (in ``connection`` when the caller has one open); a
+        provider without the proof, any amount other than zero, or a stage without alternates
+        changes nothing. A next profile that is not covered records one stop event and returns
+        False (the stage is then held, never moved)."""
+        base = ctx.spec.stage(key)
+        if not class_fallback.enabled(base, placement_candidates(base)):
+            return False
+        try:
+            provider = self._provider(spec_stage)
+        except KeyError:
+            return False
+
+        def apply(connection: sqlite3.Connection) -> bool:
+            fresh = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+            ).fetchone()
+            if fresh is None:
+                return False
+            amount = fresh["settled_cents"] if settled is None else settled
+            code = class_fallback.reason(provider, connection, fresh, amount)
+            if code is None:
+                return False
+            pid = fresh["provider_id"] or spec_stage.provider
+            rows = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE campaign_id=? AND stage_key=? "
+                "AND id<>?",
+                (ctx.campaign["id"], key, attempt["id"]),
+            ).fetchall()
+            # ADR 0151 / ADR 0169: a Salad candidate that lists alternate profiles (then the
+            # operator's fallback chain) moves to its next profile, recorded as a switch event in
+            # this same transaction. Past the
+            # bound nothing is recorded: the stage fails ``class_fallback_exhausted``.
+            approved = self._on_candidate(base, pid) if base.has_candidates else base
+            # Allocation-timeout moves share the bound with pre-start moves (none: unchanged).
+            used = class_fallback.prestart_attempts(rows) + len(
+                salad_fallback.timeout_moves(connection, ctx.campaign, key)
+            )
+            if salad_fallback.reads_fallback(approved) and used < base.retry.max_class_fallbacks:
+                outcome = salad_fallback.prestart_move(
+                    self, ctx, key, approved, fresh, code, connection
+                )
+                if outcome == salad_fallback.PROFILE_NOT_APPROVED:
+                    return False  # held for a person (one stop event), never moved
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                status="failed_transient",
+                failure_class=class_fallback.PRESTART_NO_SPEND,
+                failure_detail=code,
+            )
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                class_fallback.EVENT,
+                class_fallback.payload(
+                    fresh,
+                    pid,
+                    class_fallback.failures(rows, base.provider).get(pid, 0),
+                    code,
+                    path,
+                    used + 1,
+                    base.retry.max_class_fallbacks,
+                ),
+            )
+            return True
+
+        if connection is not None:
+            moved = apply(connection)
+        else:
+            with self.store.runner_connection() as own:
+                moved = apply(own)
+        if moved:
+            self._actions.append(f"class_fallback:{key}:{attempt['attempt']}")
+        return moved
 
     def _infra_failure(
         self,
@@ -5525,18 +5766,43 @@ class CampaignRunner:
                     )
                 except _Waiting:
                     continue  # claimed and no recorded charge yet: wait, never zero
+                key = attempt["stage_key"]
+                current = self._spec_stage(ctx, key)
                 with self.store.runner_connection() as connection:
-                    self._touch(
+                    # ADR 0060 addendum: a reconciled attempt that provably never started,
+                    # settled at zero, moves the stage to its next candidate instead.
+                    moved = self._class_fallback(
+                        ctx,
+                        key,
+                        current,
+                        attempt,
+                        "reconciled_unknown",
                         connection,
-                        "campaign_stage_attempts",
-                        "id=?",
-                        (attempt["id"],),
-                        status="failed_permanent",
+                        settled=cents,
                     )
+                    if not moved:
+                        self._touch(
+                            connection,
+                            "campaign_stage_attempts",
+                            "id=?",
+                            (attempt["id"],),
+                            status="failed_permanent",
+                        )
                     self._settle(connection, attempt["id"], cents, basis)
-                    self._free_campaign_releases(
-                        connection, ctx.campaign["id"], "attempt_settled_while_blocked"
-                    )
+                    if moved:
+                        self._touch(
+                            connection,
+                            "campaign_stages",
+                            "campaign_id=? AND stage_key=? AND status='blocked_unknown'",
+                            (ctx.campaign["id"], key),
+                            status="preparing",
+                        )
+                    else:
+                        self._free_campaign_releases(
+                            connection, ctx.campaign["id"], "attempt_settled_while_blocked"
+                        )
+                if moved:
+                    continue
                 self._set_stage(ctx, attempt["stage_key"], status="failed")
                 with self.store.runner_connection() as connection:
                     connection.execute(

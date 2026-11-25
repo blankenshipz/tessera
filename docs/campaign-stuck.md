@@ -10,7 +10,7 @@ or retry. A person, or what existing policy and the standing agent loop already 
 |---|---|---|
 | `campaign_blocked` | the campaign is `blocked` | `inspect_stop_reason_then_resume_or_cancel` |
 | `delegation_lapsed` | paused because its delegation lapsed | `renew_delegation_by_reapproval` |
-| `attempt_outcome_unknown` | an attempt (or its stage) has an unknown outcome | `resolve_unknown_attempt` |
+| `attempt_outcome_unknown` | an attempt (or its stage) has an unknown outcome; a Salad stage held because it may not move to another profile (ADR 0169) adds `salad_profile_decision` (`outcome` `post_start_switch_refused` or `profile_not_approved`, `attempt`, `started`) to the evidence: a retry decision for a person | `resolve_unknown_attempt` |
 | `stale_execution_lease` | an execution lease past its expiry plus the grace, for a live attempt | `reconcile_or_cancel_the_grant` |
 | `runner_lease_stale` | no live campaign runner while campaigns are active | `check_the_campaign_runner_service` |
 | `no_progress` | nothing in the campaign changed for longer than `unchanged_seconds` | `check_provider_capacity_or_cancel` |

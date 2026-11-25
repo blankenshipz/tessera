@@ -177,10 +177,10 @@ def test_an_agent_cannot_lift_a_pause_a_person_set(tmp_path):
 def test_steering_needs_the_submitting_agent_the_cancel_scope_and_a_running_campaign(tmp_path):
     s = Steer(tmp_path)
     other = s.env.agent(ACTIONS, "other")
-    with pytest.raises(Forbidden):
+    with pytest.raises(NotFound):  # another agent's campaign looks missing, not forbidden
         s.call("pause_campaign", actor=other)
     reader = s.env.agent(["campaign:read"], "reader")
-    with pytest.raises(Forbidden):
+    with pytest.raises(NotFound):
         s.call("pause_campaign", actor=reader)
     with pytest.raises(Conflict, match="revision"):
         s.n += 1
@@ -339,10 +339,10 @@ def test_the_same_key_with_a_different_request_is_refused(tmp_path):
 def test_a_non_submitter_cannot_cancel_a_stage_and_nothing_is_recorded(tmp_path):
     s = Steer(tmp_path)
     other = s.env.agent(ACTIONS, "other")
-    with pytest.raises(Forbidden):
+    with pytest.raises(NotFound):  # another agent's campaign looks missing, not forbidden
         s.call("cancel_campaign_stage", "s1", actor=other)
     no_scope = s.env.agent(["campaign:read", "campaign:submit"], "no-cancel-scope")
-    with pytest.raises(Forbidden):
+    with pytest.raises(NotFound):  # not the submitter either, so the campaign looks missing
         s.call("cancel_campaign_stage", "s1", actor=no_scope)
     assert s.world.row("SELECT count(*) FROM campaign_stage_cancels")[0] == 0
     assert not s.events("campaign.stage_cancel_requested")

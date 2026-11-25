@@ -3,7 +3,8 @@
 Status: accepted. No schema change. Builds on ADR 0038 (campaign runner), 0040 (providers and
 data-class routing), 0045 (program budget), 0047 (agent-routed data destinations), 0048 (grant
 lifetime and slot release), 0053 (resolving a confirmed exit), 0055 (steering tools) and 0058
-(infrastructure retries, whose reroute list it absorbs, section 5a).
+(infrastructure retries, whose reroute list it absorbs, section 5a). The class fallback addendum is
+extended by ADR 0191 (operator CPU `fallback_profiles` after the spec's own alternates).
 
 ## Context
 
@@ -179,6 +180,42 @@ section with the same fields, and the attempt's and stage's `runtime` are the ch
   grant; it waits there as a single-provider stage does.
 - Trust narrowed after approval intersects with the approval-time setting; if that setting is not
   stored, only public data is admitted anywhere (unchanged).
+
+## Addendum: next class after a pre-start failure that spent nothing
+
+A candidate may offer several classes through an optional provider hook (`fallback_classes`): a
+Salad stage's `profile` then its `alternate_profiles` (the one list of
+[ADR 0151](0151-salad-alternate-execution-profiles.md), at most 4, the same number that bounds
+`retry.max_class_fallbacks`), one GPU class each, all checked at submit and approval. The class a
+candidate runs on is derived from its recorded `campaign.salad_profile_switched` events; the next
+one is `salad_alternate_profiles.next_profile` over the profiles already tried there. When an attempt fails and its provider proves from its own
+records that nothing started (`prestart_failure`: no `start` effect on the route, not
+reallocated, a live receipt naming the pre-start step or a create rejection) and the attempt
+settled at exactly zero, the runner marks it `prestart_no_spend` with a closed reason and an event
+in the same transaction as the attempt transition (for a Salad stage with alternates also one
+`campaign.salad_profile_switched` event: reason `prestart_no_spend`, `started` and `spent` false,
+the attempt id and both profiles), then places the next attempt on the next class of that
+candidate, else the next candidate, with every placement check re-run for that class. The next
+profile must be covered as for any approved profile (per-run cap, capability declaration, a
+review pre-approval binding its plan digest); otherwise the stage is held with one
+`profile_not_approved` stop event and nothing moves. A
+class that failed this way is skipped (`prestart_failed`); the moves are bounded by
+`retry.max_class_fallbacks` (default 0, off, absent from the digest at the default) and use no
+scientific retry; when none is left the stage fails with `class_fallback_exhausted`. Like ADR
+0058's `infra_retries`, an approval never covers holds its approver did not see: each move is a
+new attempt with its own hold, so the worst case the approval, the experiment budget and Salad's
+per-task ceiling count is `max_attempts + infra_retries + max_class_fallbacks` (the experiment
+ledger keeps a zero-charged hold counted, so the headroom is real, not nominal). Anything that may have started or been billed, any
+non-zero or provisional settlement, and a provider without the hook keep the existing failed or
+unknown path and never change class: this is the only automatic class move (the strict rule of
+[ADR 0169](0169-salad-profile-fallback-policy.md)); a run that may have started is never moved to
+another profile. On a heavy stage (ADR 0107) the remote candidate's next class is tried before any
+local candidate (a retry tries first where the last attempt ran); once every remote class is
+spent the `prestart_failed` skip is a recorded `remote_skipped` reason, so a local candidate the
+spec lists is reached only as the guard's mode allows (recorded in `warn`, skipped in `refuse`),
+and with no such candidate the stage fails with `class_fallback_exhausted`. Tests:
+`tests/test_campaign_class_fallback.py`, `tests/test_campaign_class_fallback_heavy.py`,
+`tests/test_salad_profile_strict_rule.py`.
 
 ## Tests
 

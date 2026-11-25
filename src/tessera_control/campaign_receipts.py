@@ -8,6 +8,8 @@ import sqlite3
 from datetime import timedelta
 from typing import Any
 
+from . import campaign_allocation_instability, campaign_salad_fallback
+from . import campaign_class_fallback as class_fallback
 from .campaign_gates import unlock_receipt_section
 from .campaign_heavy_guard import recorded as recorded_heavy_guards
 from .campaign_heavy_guard import refusals as recorded_heavy_refusals
@@ -655,6 +657,16 @@ def _attempt_entry(
         if decision.get("preference") is not None:
             # ADR 0070: the operator rule that ordered the approved candidates.
             entry["placement"]["preference"] = decision["preference"]
+        if decision.get("allocation_instability") is not None:
+            # ADR 0148: instability counts per GPU class and the fallback outcome.
+            entry["placement"]["allocation_instability"] = decision["allocation_instability"]
+        if decision.get("class_index"):
+            # ADR 0060 addendum: the candidate's class after earlier pre-start failures there.
+            entry["placement"]["class_index"] = decision["class_index"]
+    observed = campaign_allocation_instability.attempt_entry(connection, attempt)
+    if observed is not None:
+        # ADR 0148: this attempt's own allocation change (only when the operator opted in).
+        entry["allocation_instability"] = observed
     # ADR 0107: a heavy stage that fell back to a local provider while a remote profile was
     # registered carries the warning (from its placement, or for a one-provider stage from the
     # recorded warning event).
@@ -679,6 +691,22 @@ def _attempt_entry(
         # ADR 0058: the attempt ended for an infrastructure reason and was retried (or, when
         # the bound was spent, the stage failed); the reason is the recorded detail.
         entry["infrastructure_retry"] = {"reason": attempt["failure_detail"]}
+    if attempt["failure_class"] == class_fallback.PRESTART_NO_SPEND:
+        # ADR 0060 addendum: never started on this class, settled at zero; the stage moved on.
+        # Closed codes and counts only, from the event recorded with the transition.
+        moved = connection.execute(
+            """SELECT payload_json FROM events WHERE event_type=?
+            AND json_extract(payload_json, '$.attempt_id') = ? ORDER BY cursor DESC LIMIT 1""",
+            (class_fallback.EVENT, attempt["id"]),
+        ).fetchone()
+        seen = {} if moved is None else json.loads(moved["payload_json"])
+        code = attempt["failure_detail"]
+        entry["class_fallback"] = {
+            "reason": code if code in class_fallback.REASONS else None,
+            "class_index": seen.get("class_index"),
+            "path": seen.get("path") if seen.get("path") in class_fallback.PATHS else None,
+            "is_evidence": False,
+        }
     if attempt["failure_class"] == "not_started":
         # ADR 0046: recorded as no evidence; it is never a pass or a fail.
         entry["not_started"] = {"reason": attempt["failure_detail"], "is_evidence": False}
@@ -927,6 +955,7 @@ def build_receipt(
         code_info = code_summary(connection, spec_stage)
         # ADR 0164: what the stage reads under a seal, and for which role; absent otherwise.
         sealed = sealed_access(normal, stage["stage_key"])
+        profiles = _salad_profiles(connection, current, spec_stage, stage)
         stage_rows.append(
             {
                 "stage_key": stage["stage_key"],
@@ -949,19 +978,28 @@ def build_receipt(
                 **({"sealed_access": sealed} if sealed else {}),
                 "output_data_class": stage["output_data_class"],
                 "attempts": [
-                    _attempt_entry(
-                        connection,
-                        attempt,
-                        stage,
-                        spec_stage,
-                        code,
-                        io_rows,
-                        grants,
-                        placed,
-                        code_info,
-                        guards,
-                        pulls,
-                    )
+                    {
+                        **_attempt_entry(
+                            connection,
+                            attempt,
+                            stage,
+                            spec_stage,
+                            code,
+                            io_rows,
+                            grants,
+                            placed,
+                            code_info,
+                            guards,
+                            pulls,
+                        ),
+                        # ADR 0151: the profile this attempt ran on (stages with alternates),
+                        # only when it ran on a candidate that lists them.
+                        **(
+                            {}
+                            if profiles is None
+                            else _attempt_salad_profile(connection, current, spec_stage, attempt)
+                        ),
+                    }
                     for attempt in attempts
                     if attempt["stage_key"] == stage["stage_key"]
                 ],
@@ -976,6 +1014,9 @@ def build_receipt(
                     if stage["stage_key"] in refusals
                     else {}
                 ),
+                # ADR 0151: the approved profile order, each switch and why, and a stop;
+                # absent for a stage without alternate profiles, so its receipt keeps its shape.
+                **({} if profiles is None else {"salad_profiles": profiles}),
                 **_placement_refused(connection, current, stage),
             }
         )
@@ -1052,6 +1093,40 @@ def build_receipt(
             **({"rerun": rerun} if rerun else {}),
         }
     )
+
+
+def _salad_profiles(
+    connection: sqlite3.Connection, campaign: Any, spec_stage: Any, stage: Any
+) -> dict[str, Any] | None:
+    """The stage's ADR 0151 section; None without alternates. The candidate is the one the
+    stage is placed on, else the first approved candidate that lists alternates: a stage that
+    moved on to (or ended on) another candidate keeps the record of its profile moves."""
+    from .campaign_models import stage_on_candidate
+
+    candidates = [stage["provider_id"], *spec_stage.candidate_ids]
+    for pid in dict.fromkeys(item for item in candidates if item):
+        try:
+            approved = (
+                spec_stage if pid == spec_stage.provider else stage_on_candidate(spec_stage, pid)
+            )
+        except KeyError:
+            continue
+        section = campaign_salad_fallback.receipt_section(
+            connection, campaign, stage["stage_key"], approved
+        )
+        if section is not None:
+            return section
+    return None
+
+
+def _attempt_salad_profile(
+    connection: sqlite3.Connection, campaign: Any, spec_stage: Any, attempt: Any
+) -> dict[str, Any]:
+    """``{"salad_profile": ...}`` when the attempt ran on a candidate that lists alternate
+    profiles, else nothing: an attempt placed on another provider never carries a Salad label,
+    even when a switch named its attempt number (ADR 0151, ADR 0060)."""
+    name = campaign_salad_fallback.attempt_profile(connection, campaign, spec_stage, dict(attempt))
+    return {} if name is None else {"salad_profile": name}
 
 
 def _review_delegation(connection: sqlite3.Connection, approval: Any) -> dict[str, Any]:

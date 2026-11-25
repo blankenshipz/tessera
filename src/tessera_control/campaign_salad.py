@@ -1267,6 +1267,14 @@ class SaladStageDriver:
             if salad_row["capability_id"]
             else None
         )
+        if existing is not None and existing["declaration_digest"] != digest:
+            # The stage's capability was declared for another profile (ADR 0151): it never
+            # stands in for this one, and a new one would need a plan revision.
+            raise StepFailed(
+                "request_capability",
+                "step_refused",
+                "capability declaration differs from the stage's current profile",
+            )
         if existing is not None and existing["status"] == "approved":
             if _parse_utc(existing["expires_at"]) <= self.runner.now() + timedelta(minutes=5):
                 raise StepFailed(

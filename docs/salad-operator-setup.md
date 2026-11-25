@@ -352,3 +352,48 @@ amendment) additionally need an owner-only campaign profile file
 `allowed_image_digests` (required, non-empty `sha256:` digests); a campaign stage whose
 image is not on that list is refused at submit, approval and dispatch. See
 [campaigns](campaigns.md).
+
+### CPU capacity fallback (`fallback_profiles`)
+
+A CPU profile may name up to three other profiles of the same file that a stage running on it may
+move to when the provider cannot place it, in order, after the stage's own approved
+`alternate_profiles` are used up. It is operator configuration: no spec, approval or spec digest
+changes. Every fallback must be listed as a profile of its own (a cheaper shape or another country
+is a separate entry with its own `name`, `country`, shape, `cpu_rate` and ceilings), and must share
+the listing profile's organization, project, worker, `salad_organization`, capability environment,
+artifact and checkpoint destinations, monitor, watchdog, custody host and `stage_adapter` section.
+Example entries (placeholders only; the credential is a reference, never a value):
+
+```json
+{"schema": "tessera.salad.campaign-profiles.v1", "profiles": [
+ {"name": "cpu-2c-4g", "country": "US", "cpu_millicores": 2000, "memory_mb": 4096,
+  "cpu_rate": {"vcpu_hour_usd": "<rate>", "memory_gb_hour_usd": "<rate>"},
+  "fallback_profiles": ["cpu-2c-4g-alt", "cpu-4c-8g"],
+  "max_run_cents": 50, "max_task_cents": 50, "...": "the shared fields below"},
+ {"name": "cpu-2c-4g-alt", "country": "CA", "cpu_millicores": 2000, "memory_mb": 4096,
+  "cpu_rate": {"vcpu_hour_usd": "<rate>", "memory_gb_hour_usd": "<rate>"},
+  "max_run_cents": 50, "max_task_cents": 50, "...": "the shared fields below"},
+ {"name": "cpu-4c-8g", "country": "US", "cpu_millicores": 4000, "memory_mb": 8192,
+  "cpu_rate": {"vcpu_hour_usd": "<rate>", "memory_gb_hour_usd": "<rate>"},
+  "max_run_cents": 50, "max_task_cents": 50, "...": "the shared fields below"}]}
+```
+
+"The shared fields" are every other required profile field. The load check requires these to be
+identical to the listing profile's: `org_id`, `project_id`, `worker_principal_id`,
+`salad_organization`, `capability_environment_id`, `artifact_destination`,
+`checkpoint_destination`, `monitor_profile`, `watchdog_profile`, `custody_host` and
+`stage_adapter`. The rest (`salad_project`, `disk_mb`, `route_max_seconds`, the credential
+reference, `allowed_image_digests`) may differ; the stage's image must still be allowlisted on the
+fallback and its credential usable, which is checked at move time like every other submit check.
+
+The file is refused at load when a name is unknown, repeated, the profile itself, more than three,
+of another kind (a GPU profile cannot list fallbacks), differs in a shared field, or when the
+fallbacks form a cycle. A stage moves to a fallback only under the strict pre-start rule (an
+attempt proven never started that settled at exactly zero; never after a possible start or any
+spend), only within the stage's approved `retry.max_class_fallbacks` (a stage approved with 0 never
+uses one), and only when the fallback's CPU rate over the stage's whole `max_duration_seconds` is
+within the stage's approved `max_exposure_cents`, that hold is within the fallback's
+`max_run_cents`, and every allowed attempt's hold within its `max_task_cents`. A fallback that
+fails a check is skipped (named on the move); when none passes, the stage is held
+(`profile_not_approved`, detail such as `fallback_over_hold`). Each move is a
+`campaign.salad_profile_switched` event with `source: operator_fallback`.

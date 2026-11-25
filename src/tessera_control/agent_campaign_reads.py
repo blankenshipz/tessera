@@ -16,6 +16,7 @@ import json
 from typing import Any
 
 from . import license_labels
+from .agent_stage_status import salad_profile_views
 from .campaign_holdout import campaign_claims, project_claims
 from .campaign_infra_retry import infra_attempts
 from .campaign_models import TERMINAL_CAMPAIGN, normalize, parse_spec_json
@@ -159,10 +160,17 @@ class AgentCampaignReads(CampaignStore):
                 WHERE campaign_id = ? ORDER BY stage_key, attempt LIMIT ?""",
                 (campaign_id, _ROW_CAP),
             ).fetchall()
+            salad = salad_profile_views(connection, campaign)
+            shown = []
+            for row in stages:
+                item = dict(row)
+                if row["stage_key"] in salad:
+                    item["salad_profiles"] = salad[row["stage_key"]]
+                shown.append(item)
             return {
                 "campaign_id": campaign_id,
                 "status": campaign["status"],
-                "stages": [dict(row) for row in stages],
+                "stages": shown,
                 "attempts": [dict(row) for row in attempts],
                 "truncated": len(attempts) == _ROW_CAP,
                 "boundary": BOUNDARY + " Raw stdout/stderr is not retained by Tessera.",
@@ -421,7 +429,8 @@ class AgentCampaignReads(CampaignStore):
                 (project_id,),
             ).fetchone()
             # Audit O-05: an agent's per-status totals cover its own campaigns only. The
-            # operator's project limit row below is the project's ledger, one shared ceiling.
+            # operator's project limit row is one shared ledger; an agent never receives its
+            # project-wide held/settled/remaining aggregates (they reveal other agents' spend).
             clause, args = own_clause(actor, "c.id")
             rows = connection.execute(
                 f"""SELECT c.status, COUNT(*) AS campaigns, SUM(c.budget_cap_cents) AS cap_cents,
@@ -446,9 +455,27 @@ class AgentCampaignReads(CampaignStore):
             }
             if limits is not None:
                 limit = dict(limits)
-                limit["remaining_cents"] = (
-                    limit["monetary_limit_cents"] - limit["held_cents"] - limit["settled_cents"]
-                )
+                shared = limit["held_cents"] + limit["settled_cents"]
+                if reads_every_campaign(actor):
+                    limit["remaining_cents"] = limit["monetary_limit_cents"] - shared
+                else:
+                    # The project row aggregates every agent's spend, so an agent gets the
+                    # operator's configuration, its own totals (all statuses) and a boolean
+                    # for the shared ceiling; the aggregates themselves stay out.
+                    own = connection.execute(
+                        f"""SELECT COALESCE(SUM(c.held_cents), 0) AS own_held_cents,
+                        COALESCE(SUM(c.settled_cents), 0) AS own_settled_cents
+                        FROM campaigns c WHERE c.project_id=? AND c.org_id=?{clause}""",
+                        (project_id, actor["org_id"], *args),
+                    ).fetchone()
+                    limit = {
+                        "currency": limit["currency"],
+                        "monetary_limit_cents": limit["monetary_limit_cents"],
+                        "max_concurrency": limit["max_concurrency"],
+                        "own_held_cents": own["own_held_cents"],
+                        "own_settled_cents": own["own_settled_cents"],
+                        "ceiling_has_headroom": shared < limit["monetary_limit_cents"],
+                    }
                 result["limits"] = limit
             return result
         finally:

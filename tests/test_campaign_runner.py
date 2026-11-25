@@ -570,7 +570,9 @@ def test_the_runner_aborts_its_tick_when_the_lease_is_lost(tmp_path):
 def test_project_limits_that_cannot_fit_the_stage_emit_one_waiting_event(tmp_path, monkeypatch):
     world = World(tmp_path)
     campaign = _single(world)
-    monkeypatch.setattr(CampaignRunner, "_limits_allow", lambda self, project_id, hold: False)
+    monkeypatch.setattr(
+        CampaignRunner, "_limits_allow", lambda self, project_id, hold, attempt=None: False
+    )
     for _ in range(40):
         world.runner.tick()
     (waiting,) = world.events_of("campaign.stage_waiting_limits")
@@ -709,7 +711,9 @@ def test_waiting_for_project_limits_holds_nothing_and_resumes_when_they_allow(
 ):
     world = World(tmp_path)
     campaign = _single(world)
-    monkeypatch.setattr(CampaignRunner, "_limits_allow", lambda self, project_id, hold: False)
+    monkeypatch.setattr(
+        CampaignRunner, "_limits_allow", lambda self, project_id, hold, attempt=None: False
+    )
     for _ in range(10):
         world.runner.tick()
     assert world.status(campaign["id"]) == "running"

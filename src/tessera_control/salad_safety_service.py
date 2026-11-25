@@ -245,6 +245,42 @@ assert (
 )
 assert REQUEST_SECONDS <= ADMIN_ACCEPT_WINDOW_SECONDS
 
+# Operator range of ``max_open_billable_frames`` (ADR 0041 section 7.2, resolved question 4b):
+# default 1, at most this many frames that may still bill at once.
+MAX_OPEN_BILLABLE_FRAMES_LIMIT = 4
+# The unseen-run gap above is sized for a loop pass that reads ONE open frame. Each further open
+# frame adds its own first-attempt provider requests to every pass (its retries share the pass's
+# per-kind windows, already in LOOP_PASS_ALLOWANCE_SECONDS). Worst case per frame and pass: the
+# rate read (1), a group read plus the follow-up instance read (2), the tick's observe (2), the
+# stop (1) and the uncertain-orphan close check (2) = 8 requests, each bounded by the transport
+# deadline. (The never-bound lost-create probe, two requests for read_absence, replaces the
+# tick's reads in that pass, so it is no larger.)
+EXTRA_FRAME_PASS_REQUESTS = 8
+EXTRA_FRAME_PASS_SECONDS = EXTRA_FRAME_PASS_REQUESTS * PROVIDER_READ_SECONDS
+
+
+def unseen_run_gap_seconds(frames):
+    """Most billed time a run can hide between two guardian polls when up to ``frames`` frames
+    may bill at once: the one-frame gap plus each further frame's worst-case pass reads. With one
+    frame it is exactly UNSEEN_RUN_GAP_SECONDS. Admission, accrual backdating and begin-once all
+    charge this gap, so a longer pass never lets billed time exceed what admission counted."""
+    return UNSEEN_RUN_GAP_SECONDS + (frames - 1) * EXTRA_FRAME_PASS_SECONDS
+
+
+assert unseen_run_gap_seconds(1) == UNSEEN_RUN_GAP_SECONDS
+for _frames in range(1, MAX_OPEN_BILLABLE_FRAMES_LIMIT + 1):
+    assert (
+        UNIX_ADMIN_FRAME_SECONDS
+        + UNIX_ADMIN_BUDGET_SECONDS
+        + CHUNK_REQUEST_SECONDS
+        + LOOP_PASS_ALLOWANCE_SECONDS
+        + (_frames - 1) * EXTRA_FRAME_PASS_SECONDS
+        <= unseen_run_gap_seconds(_frames)
+    )
+    # The guardian's post-start read retry never outlasts the gap admission charges.
+    assert POSTSTART_READ_WINDOW_SECONDS <= unseen_run_gap_seconds(_frames)
+del _frames
+
 
 def log_unclosed_refusal(error, channel):
     """Journal line for a refusal without a closed code: the exception class only.
@@ -522,11 +558,16 @@ class SaladSafetyService:
         ):
             raise ValueError("invalid_allocation_deadline")
         self.allocation_deadline_seconds = allocation_deadline_seconds
-        # ADR 0041 resolved question 4b: concurrent billable frames need a later record that
-        # covers total-cap races, partial stops and accrual interleaving, so only 1 is allowed.
-        if type(max_open_billable_frames) is not int or max_open_billable_frames != 1:
+        # ADR 0041 resolved question 4b: an operator setting, an integer 1..4 (bool refused).
+        # Every per-frame invariant holds per frame; the total cap is checked in aggregate with
+        # the insert, and the unseen-run gap grows with the number of frames a pass may read.
+        if (
+            type(max_open_billable_frames) is not int
+            or not 1 <= max_open_billable_frames <= MAX_OPEN_BILLABLE_FRAMES_LIMIT
+        ):
             raise ValueError("invalid_max_open_billable_frames")
         self.max_open_billable_frames = max_open_billable_frames
+        self.unseen_run_gap_seconds = unseen_run_gap_seconds(max_open_billable_frames)
         if total_cap_cents is not None and (
             type(total_cap_cents) is not int or not 1 <= total_cap_cents <= 1_000_000
         ):
@@ -1017,12 +1058,32 @@ class SaladSafetyService:
         except ValueError:
             return False
 
+    def _late_watch_held(self, row):
+        """True while a lost-create-closed frame still holds its per-run cap in the total.
+
+        The 24 h late-resource watch can reopen such a frame (a late group under its reserved
+        name), which then counts ``max(accrued, hold)`` again. Keeping that hold committed for
+        the whole watch means a reopening can never push the total past the cap. A frame
+        proven absent after Salad's own clean create rejection (``create_rejected``) is a
+        rejected-absent frame, not a lost create: it frees its hold at once (ADR 0041 7.2).
+        An unreadable resolution record holds (fails closed)."""
+        if not self._lost_create_closed(row):
+            return False
+        try:
+            record = json.loads(row["lost_create_resolution"])
+            if record["kind"] == "create_rejected":
+                return False
+            return self.clock() - float(record["resolved_at"]) < LOST_CREATE_WATCH_SECONDS
+        except Exception:
+            return True
+
     def _committed(self, *, exclude=None, account=True):
         """Estimated spend plus still-possible per-run exposure over all reservations.
 
         A stopped/reconciled reservation contributes only its frozen accrued
         estimate; any other contributes the larger of its accrual and its
-        admitted per-run cap."""
+        admitted per-run cap. A lost-create-closed frame still under the late-resource
+        watch counts as the latter (``_late_watch_held``)."""
         total = Decimal(0)
         for (name,) in self.db.execute("SELECT reservation FROM reservations").fetchall():
             if name == exclude:
@@ -1032,7 +1093,7 @@ class SaladSafetyService:
                 self._account(row)
                 row = self._row(name)
             accrued = Decimal(row["accrued_cents"])
-            if self._settled(row):
+            if self._settled(row) and not self._late_watch_held(row):
                 total += accrued
                 continue
             cap = row["cost_cap"]
@@ -1081,31 +1142,74 @@ class SaladSafetyService:
             self._exposure_fence(row)
             raise ValueError("exposure_fenced")
 
-    def _open_billable_frames(self, operation):
+    def _open_billable_frames(self, operation, *, account=True):
         """Frames other than ``operation`` that may still bill: not yet ``stopped`` or
         ``reconciled`` (proven-absent frames reconcile). An ambiguous create with no provider
-        id still counts until it is resolved (ADR 0041 section 7.2, resolved question 4a).
+        id still counts until it is resolved (ADR 0041 section 7.2, resolved question 4a)."""
+        return len(self._open_frames(operation, account=account))
+
+    def _open_frames(self, operation, *, account=True):
+        """The rows counted by ``_open_billable_frames``.
 
         Only each frame's verdict is needed, so this takes ``_frame_verdict`` (the same branch
         ``_status`` uses) instead of building the whole status per frame: the status also sums
         the total committed spend over every reservation, which made one reserve quadratic in
-        the reservation count. Each frame is still accounted once, as ``_status`` did."""
+        the reservation count. With ``account`` each frame is accounted once, as ``_status``
+        did; without it nothing is written, so it may run inside the reserve transaction."""
         others = self.db.execute(
             "SELECT reservation FROM reservations WHERE operation!=?", (operation,)
         ).fetchall()
-        count = 0
+        rows = []
         for (other,) in others:
-            self._account(self._row(other))
-            if self._frame_verdict(self._row(other)) not in {"stopped", "reconciled"}:
-                count += 1
-        return count
+            if account:
+                self._account(self._row(other))
+            row = self._row(other)
+            if self._frame_verdict(row) not in {"stopped", "reconciled"}:
+                rows.append(row)
+        return rows
 
-    def _over_total_cap(self, reservation, profile):
-        return self.total_cap_cents is not None and (
-            self._committed(exclude=reservation, account=False)
-            + Decimal(profile.execution.max_cost_cents)
-            > self.total_cap_cents
+    @staticmethod
+    def _same_provider_group(row, profile):
+        """True when ``row``'s approved selection names the same Salad group as ``profile``. Two
+        open frames under one reserved name would read, bind and stop the same provider group."""
+        other = RemoteProposal.model_validate_json(row["proposal"]).selection.salad
+        return (other.organization, other.project, other.group) == (
+            profile.organization,
+            profile.project,
+            profile.group,
         )
+
+    def _enforce_total_cap(self):
+        """Aggregate backstop for the total cap, once per loop pass.
+
+        Admission keeps the sum of every frame's hold within the cap, and each frame is stopped
+        before its own accrual passes its hold, so this fires only on an overshoot (a frame's
+        accrual past its hold, or a cap lowered across a restart). Then every frame that may
+        still bill is fenced and stopped, not only the one that overshot: no frame's accrual
+        can ever be offset against another frame's hold. An unreadable total fails closed."""
+        try:
+            # Outside any transaction, so every frame is accounted up to now first.
+            breached = self._committed() > self.total_cap_cents
+        except Exception:
+            breached = True
+        if not breached:
+            return
+        for (name,) in self.db.execute("SELECT reservation FROM reservations").fetchall():
+            try:
+                row = self._row(name)
+                if self._settled(row) or (row["budget_fenced"] and row["recovery"]):
+                    continue
+                with self.db:
+                    self.db.execute(
+                        "INSERT INTO events(reservation,operation,at,kind,detail) "
+                        "VALUES(?,?,?,'total_cap_breached',?)",
+                        (name, row["operation"], self.clock(), str(self.total_cap_cents)),
+                    )
+                    self._frame_note(name, "total_cap_breached", once=True)
+                self._exposure_fence(row)
+            except Exception:
+                # Never let one frame's failure skip the others; the next pass retries.
+                self.diagnostic_write_failures += 1
 
     def _record_fence_refusal(self, reservation, operation, open_frames):
         """Durable record of a refused reserve: the count and the limit, nothing else."""
@@ -1225,6 +1329,11 @@ class SaladSafetyService:
                 row["reservation"], "provider_read_failed"
             ),
             **self._read_failure_diagnostics(row["reservation"], "provider_read_failed"),
+            # A guardian pass that raised for this frame: the exception type name only.
+            last_loop_frame_failure=self._last_event_detail(
+                row["reservation"], "loop_frame_failed"
+            ),
+            last_loop_frame_failure_at=self._last_event_at(row["reservation"], "loop_frame_failed"),
             diagnostic_write_failures=self.diagnostic_write_failures,
             exposure_unknown=True,
             exposure_pending=True,
@@ -1233,6 +1342,7 @@ class SaladSafetyService:
             total_cap_cents=self.total_cap_cents,
             allocation_deadline_seconds=self.allocation_deadline_seconds,
             max_open_billable_frames=self.max_open_billable_frames,
+            unseen_run_gap_seconds=self.unseen_run_gap_seconds,
             total_committed_cents=None,
             total_remaining_cents=None,
             escalation_pending=bool(row["escalation"]),
@@ -1624,6 +1734,15 @@ class SaladSafetyService:
         group = normalized_uuid(observation["provider_id"])
         if row["provider_id"] and group != row["provider_id"]:
             raise ValueError("provider_identity_changed")
+        if not row["provider_id"]:
+            # Never bind one provider group to two frames that may still bill: a stop, an
+            # accrual or a workload token for one would then act for the other.
+            for (other,) in self.db.execute(
+                "SELECT reservation FROM reservations WHERE provider_id=? AND reservation!=?",
+                (group, row["reservation"]),
+            ).fetchall():
+                if self._frame_verdict(self._row(other)) not in {"stopped", "reconciled"}:
+                    raise ValueError("provider_identity_in_use")
         with self.db:
             self.db.execute(
                 "UPDATE reservations SET provider_id=? WHERE reservation=?",
@@ -1745,7 +1864,7 @@ class SaladSafetyService:
                     "first_running_at=COALESCE(first_running_at,last_unseen_at,?),"
                     "seen_running_at=COALESCE(seen_running_at,?) WHERE reservation=?",
                     # No earlier unseen poll: it may have run up to one poll gap.
-                    (now - UNSEEN_RUN_GAP_SECONDS, now, row["reservation"]),
+                    (now - self.unseen_run_gap_seconds, now, row["reservation"]),
                 )
         elif row["first_running_at"] is None:
             if terminal and row["provider_id"]:
@@ -1756,7 +1875,7 @@ class SaladSafetyService:
                         "UPDATE reservations SET first_running_at=MIN(?, "
                         "COALESCE(last_unseen_at,?)) WHERE reservation=? "
                         "AND first_running_at IS NULL",
-                        (now - UNSEEN_RUN_GAP_SECONDS, now, row["reservation"]),
+                        (now - self.unseen_run_gap_seconds, now, row["reservation"]),
                     )
             elif _positively_not_running(observation):
                 # Only positive evidence that nothing runs yet may advance this;
@@ -2012,73 +2131,86 @@ class SaladSafetyService:
             # own runtime argument, never longer than the route window.
             running = self._running_window(profile.execution, request, body["deadline"] - now)
             # Billed time can exceed the running window by up to one unseen poll gap.
-            billed = running + UNSEEN_RUN_GAP_SECONDS
+            # With more than one frame allowed, a pass may read every open frame (see
+            # unseen_run_gap_seconds), so the gap charged here is the configured one.
+            billed = running + self.unseen_run_gap_seconds
             if rate * Decimal(str(billed)) * 100 / 3600 > profile.execution.max_cost_cents:
                 raise ValueError("budget_insufficient")
-            # Statuses and accounting write, so gather them before the transaction.
-            open_frames = self._open_billable_frames(p.operation_id)
-            orphan = open_frames >= self.max_open_billable_frames
+            # Accounting writes (it commits), so bring every frame up to date before the
+            # transaction; the checks inside it only read.
+            self._open_billable_frames(p.operation_id)
             if self.total_cap_cents is not None:
-                self._committed(exclude=reservation)  # bring accounting up to date first
-            if orphan and not self._over_total_cap(reservation, profile):
-                # Receipted before the refusal: the transaction below rolls back, so the
-                # record is written here (the total-cap refusal, checked first, is not a fence).
-                self._record_fence_refusal(reservation, p.operation_id, open_frames)
-            with self.db:
-                # The total-cap check and the insert are one write transaction.
-                self.db.execute("BEGIN IMMEDIATE")
-                if self.total_cap_cents is not None and (
-                    self._committed(exclude=reservation, account=False)
-                    + Decimal(profile.execution.max_cost_cents)
-                    > self.total_cap_cents
-                ):
-                    raise ValueError("total_budget_exhausted")
-                if orphan:
-                    raise ValueError("single_operation_orphan_exposure")
-                self.db.execute(
-                    "INSERT OR IGNORE INTO reservations(reservation,operation,tenant,project,"
-                    "proposal,binding,deadline,heartbeat,routing_package,route_id,runtime_package,"
-                    "budget_binding,running_seconds) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        reservation,
-                        p.operation_id,
-                        body["org_id"],
-                        body["project_id"],
-                        serialized,
-                        binding.key(),
-                        body["deadline"],
-                        now,
-                        package.model_dump_json(),
-                        body["route_id"],
-                        encoded(runtime).decode(),
-                        budget_json,
-                        running,
-                    ),
-                )
-                self._frame_note(reservation, "reserved", once=True)
-                row = self._row(reservation)
-                if (
-                    row["proposal"] != serialized
-                    or row["binding"] != binding.key()
-                    or row["routing_package"] != package.model_dump_json()
-                    or row["route_id"] != body["route_id"]
-                    or row["runtime_package"] != encoded(runtime).decode()
-                    or row["budget_binding"] != budget_json
-                    or body["deadline"] < row["deadline"]
-                ):
-                    raise ValueError("reservation_mismatch")
-                if row["accounted_at"] is None:
+                self._committed(exclude=reservation)
+            fenced_at = None
+            try:
+                with self.db:
+                    # The total-cap check, the open-frame count and the insert are one write
+                    # transaction: the aggregate of every other frame's hold is read under the
+                    # same lock that adds this frame's.
+                    self.db.execute("BEGIN IMMEDIATE")
+                    if self.total_cap_cents is not None and (
+                        self._committed(exclude=reservation, account=False)
+                        + Decimal(profile.execution.max_cost_cents)
+                        > self.total_cap_cents
+                    ):
+                        raise ValueError("total_budget_exhausted")
+                    open_rows = self._open_frames(p.operation_id, account=False)
+                    if len(open_rows) >= self.max_open_billable_frames:
+                        fenced_at = len(open_rows)
+                        raise ValueError("single_operation_orphan_exposure")
+                    if any(self._same_provider_group(o, profile) for o in open_rows):
+                        # Only reachable with more than one frame allowed.
+                        raise ValueError("provider_group_in_use")
                     self.db.execute(
-                        "UPDATE reservations SET rate=?,rate_at=?,accounted_at=?,cost_cap=?,"
-                        "rate_unknown=0 WHERE reservation=?",
+                        "INSERT OR IGNORE INTO reservations(reservation,operation,tenant,project,"
+                        "proposal,binding,deadline,heartbeat,routing_package,route_id,runtime_package,"
+                        "budget_binding,running_seconds) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
-                            format(rate, "f"),
-                            rate_at,
-                            now,
-                            profile.execution.max_cost_cents,
                             reservation,
+                            p.operation_id,
+                            body["org_id"],
+                            body["project_id"],
+                            serialized,
+                            binding.key(),
+                            body["deadline"],
+                            now,
+                            package.model_dump_json(),
+                            body["route_id"],
+                            encoded(runtime).decode(),
+                            budget_json,
+                            running,
                         ),
                     )
+                    self._frame_note(reservation, "reserved", once=True)
+                    row = self._row(reservation)
+                    if (
+                        row["proposal"] != serialized
+                        or row["binding"] != binding.key()
+                        or row["routing_package"] != package.model_dump_json()
+                        or row["route_id"] != body["route_id"]
+                        or row["runtime_package"] != encoded(runtime).decode()
+                        or row["budget_binding"] != budget_json
+                        or body["deadline"] < row["deadline"]
+                    ):
+                        raise ValueError("reservation_mismatch")
+                    if row["accounted_at"] is None:
+                        self.db.execute(
+                            "UPDATE reservations SET rate=?,rate_at=?,accounted_at=?,cost_cap=?,"
+                            "rate_unknown=0 WHERE reservation=?",
+                            (
+                                format(rate, "f"),
+                                rate_at,
+                                now,
+                                profile.execution.max_cost_cents,
+                                reservation,
+                            ),
+                        )
+            except ValueError:
+                if fenced_at is not None:
+                    # Receipted after the rollback; the total-cap refusal, checked first, is
+                    # not a fence refusal.
+                    self._record_fence_refusal(reservation, p.operation_id, fenced_at)
+                raise
             # Aggregate operation cap is allocated once. The fixed smoke keeps one
             # undeclared bounded output; workload_v1 binds every declared output
             # name and per-file cap (ADR 0036 phase 3). No checkpoint destinations.
@@ -2257,20 +2389,36 @@ class SaladSafetyService:
         finally:
             self.retry_windows = None
 
+    def _loop_pass(self):
+        now = self.clock()
+        if self.jwt.refreshed is None or now - self.jwt.refreshed >= 1800:
+            try:
+                with alarm_budget(2):
+                    self.jwt.refresh()
+            except Exception:
+                pass
+        for (reservation,) in self.db.execute("SELECT reservation FROM reservations").fetchall():
+            try:
+                self._loop_frame(reservation, now)
+            except Exception as error:  # never KeyboardInterrupt/SystemExit
+                # One frame's failure never aborts the pass for the others nor skips the
+                # aggregate cap below: that frame is failed closed and reported.
+                self._loop_frame_failed(reservation, error)
+        if self.total_cap_cents is not None:
+            # After every frame was accounted and polled: the aggregate over all frames.
+            self._enforce_total_cap()
+        self.loop_at = self.clock()
 
     def _loop_frame_failed(self, reservation, error):
-        """Fail one frame closed after its lost-create close or watch raised, and record only the
-        error's type name.
+        """Fail one frame closed after its pass raised, and record only the error's type name.
 
         The frame is fenced exactly like one whose reads cannot be trusted (``_exposure_fence``:
         recovery, budget fence, writers closed, stop requested); a bound frame's stop is then
         driven by a throttled best-effort poll, since the raise may have skipped this pass's
-        poll. A frame that keeps raising is re-fenced on every pass (idempotent). The event is
-        deduplicated per type per WORKLOAD_REFUSAL_DEDUP_SECONDS; the frame record keeps each
-        type once. Nothing here raises: a failure of the fence or the record counts a diagnostic
-        write failure. Callers must not re-raise: on this tree that would abort the guardian
-        pass and take ``serve()`` down.
-        """
+        poll. A frame that keeps raising is re-fenced on every pass (idempotent) and stays
+        visible in status as ``last_loop_frame_failure``. The event is deduplicated per type
+        per WORKLOAD_REFUSAL_DEDUP_SECONDS; the frame record keeps each type once. Nothing
+        here raises: a failure of the fence or the record counts a diagnostic write failure."""
         name = type(error).__name__
         code = name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
         row = None
@@ -2314,149 +2462,140 @@ class SaladSafetyService:
         except Exception:
             self.diagnostic_write_failures += 1
 
-    def _loop_pass(self):
-        now = self.clock()
-        if self.jwt.refreshed is None or now - self.jwt.refreshed >= 1800:
+    def _loop_frame(self, reservation, now):
+        """One frame's share of a guardian pass: account, poll, stop and close checks."""
+        row = self._row(reservation)
+        if self._lost_create_closed(row):
+            # The late-group watch must run even when closing fails: this frame has no
+            # provider_id, so nothing else ticks it. A close or drop failure is recorded
+            # after the watch (fail closed via _loop_frame_failed) and retried on the next
+            # pass; it is not re-raised, so the frame is failed exactly once per pass.
+            close_error = None
             try:
-                with alarm_budget(2):
-                    self.jwt.refresh()
-            except Exception:
-                pass
-        for (reservation,) in self.db.execute("SELECT reservation FROM reservations").fetchall():
-            row = self._row(reservation)
-            if self._lost_create_closed(row):
-                # The late-group watch must run even when closing fails: this frame has no
-                # provider_id, so nothing else ticks it. A close or drop failure is
-                # recorded after the watch and retried on the next pass. It is not
-                # re-raised out of the guardian pass: on this tree that would abort
-                # serve() for every frame.
-                close_error = None
-                try:
-                    if self.inputs:
-                        self.inputs.drop(row["operation"])
-                except Exception as error:
-                    close_error = error
-                try:
-                    # Idempotent: an interrupted resolution never leaves writers open.
-                    self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
-                except Exception as error:
-                    close_error = close_error or error
-                try:
-                    resolved_at = json.loads(row["lost_create_resolution"])["resolved_at"]
-                    watching = now - resolved_at < LOST_CREATE_WATCH_SECONDS
-                    if watching and now >= self.next_absence.get(reservation, 0):
-                        self.next_absence[reservation] = now + LOST_CREATE_WATCH_INTERVAL_SECONDS
-                        self._watch_lost_create(row, now)
-                except Exception as error:
-                    close_error = close_error or error
-                if close_error is not None:
-                    self._loop_frame_failed(reservation, close_error)
-                continue
-            self._account(row)
-            if self.inputs and row["recovery"]:
-                self.inputs.drop(row["operation"])
-            if row["provider_id"]:
-                try:
-                    if self.guardian.status(row["operation"])["status"] in {
-                        "stopped",
-                        "reconciled",
-                    }:
-                        if self.inputs:
-                            self.inputs.drop(row["operation"])
-                        self.next_close_check.pop(reservation, None)
-                        continue
-                except ValueError:
-                    pass
-            expired = (
-                now >= self._stop_deadline(row)
-                or now - row["heartbeat"] >= 30
-                or now < row["heartbeat"]
-            )
-            if now >= self.next_rate.get(reservation, 0):
-                try:
-                    self._budget(row, refresh=True)
-                except Exception:
-                    expired = True
-                    with self.db:
-                        self.db.execute(
-                            "UPDATE reservations SET budget_fenced=1,rate_unknown=1 "
-                            "WHERE reservation=?",
-                            (reservation,),
-                        )
-                self.next_rate[reservation] = self.clock() + 5
-            if expired and not row["recovery"]:
-                with self.db:
-                    self.db.execute(
-                        "UPDATE reservations SET recovery=1 WHERE reservation=?", (reservation,)
-                    )
-                row["recovery"] = 1
                 if self.inputs:
                     self.inputs.drop(row["operation"])
-            if not row["provider_id"]:
-                if row["recovery"]:
-                    # Lost-create recovery is read by immutable reserved name only.
-                    try:
-                        self._provider(row)
-                        row = self._row(reservation)
-                        self.guardian.arm(self._assignment(row), stop_only=True)
-                    except Exception:
-                        self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
-                        row = self._row(reservation)
-                        margin = now >= row["deadline"] + LOST_CREATE_MARGIN_SECONDS
-                        eligible = self._rejection_eligible_at(row)
-                        rejected = eligible is not None and now >= eligible
-                        if (
-                            not row["provider_id"]
-                            and (margin or rejected)
-                            and now >= self.next_absence.get(reservation, 0)
-                        ):
-                            self.next_absence[reservation] = now + LOST_CREATE_READ_SECONDS
-                            try:
-                                # Past the margin the ordinary path applies even after
-                                # a reported rejection; before it only the fast path.
-                                self._resolve_lost_create(row, rejected=not margin)
-                            except Exception:
-                                pass  # stays reserved and blocking
-                        continue
-                else:
-                    continue
-            if row["recovery"]:
-                self.guardian.arm(self._assignment(row), stop_only=True)
-                self._cancel(row["operation"])
-            else:
-                self.guardian.arm(self._assignment(row))
-            state = self.guardian.status(row["operation"])
-            urgent = row["recovery"] and state["status"] == "armed"
-            if now < self.next_poll.get(reservation, 0) and not urgent:
-                continue
+            except Exception as error:
+                close_error = error
             try:
-                self.guardian.tick(row["operation"])
-                after = self.guardian.status(row["operation"])
-                if after["status"] == "stopped":
-                    self._account(self._row(reservation), force=True)
-                elif after["status"] == "unknown" and (
-                    after["allocation_uncertain"] or self._row(reservation)["allocation_uncertain"]
-                ):
-                    # The guardian cannot self-confirm after an allocation change, but
-                    # the provider's exact read can end the spend: stop retrying the
-                    # stop, freeze accrual, release the fence (custody stays unsealed).
-                    # Throttled: the close check is one more exact provider read.
-                    if now >= self.next_close_check.get(reservation, 0):
-                        self.next_close_check[reservation] = now + CLOSE_CHECK_SECONDS
-                        try:
-                            self._close_uncertain_stopped(self._row(reservation))
-                        except ValueError:
-                            pass  # still running, unreadable or ambiguous: keep stopping
-            except Exception:
-                # No failed observation/custody write is a confirmed stop.
+                # Idempotent: an interrupted resolution never leaves writers open.
+                self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
+            except Exception as error:
+                close_error = close_error or error
+            try:
+                resolved_at = json.loads(row["lost_create_resolution"])["resolved_at"]
+                watching = now - resolved_at < LOST_CREATE_WATCH_SECONDS
+                if watching and now >= self.next_absence.get(reservation, 0):
+                    self.next_absence[reservation] = now + LOST_CREATE_WATCH_INTERVAL_SECONDS
+                    self._watch_lost_create(row, now)
+            except Exception as error:
+                close_error = close_error or error
+            if close_error is not None:
+                self._loop_frame_failed(reservation, close_error)
+            return
+        self._account(row)
+        if self.inputs and row["recovery"]:
+            self.inputs.drop(row["operation"])
+        if row["provider_id"]:
+            try:
+                if self.guardian.status(row["operation"])["status"] in {
+                    "stopped",
+                    "reconciled",
+                }:
+                    if self.inputs:
+                        self.inputs.drop(row["operation"])
+                    self.next_close_check.pop(reservation, None)
+                    return
+            except ValueError:
                 pass
-            # A pre-start read failure being retried across polls backs off (bounded).
+        expired = (
+            now >= self._stop_deadline(row)
+            or now - row["heartbeat"] >= 30
+            or now < row["heartbeat"]
+        )
+        if now >= self.next_rate.get(reservation, 0):
             try:
-                backoff = self.guardian.read_retry_backoff(row["operation"])
+                self._budget(row, refresh=True)
             except Exception:
-                backoff = None
-            self.next_poll[reservation] = self.clock() + max(5, backoff or 0)
-        self.loop_at = self.clock()
+                expired = True
+                with self.db:
+                    self.db.execute(
+                        "UPDATE reservations SET budget_fenced=1,rate_unknown=1 "
+                        "WHERE reservation=?",
+                        (reservation,),
+                    )
+            self.next_rate[reservation] = self.clock() + 5
+        if expired and not row["recovery"]:
+            with self.db:
+                self.db.execute(
+                    "UPDATE reservations SET recovery=1 WHERE reservation=?", (reservation,)
+                )
+            row["recovery"] = 1
+            if self.inputs:
+                self.inputs.drop(row["operation"])
+        if not row["provider_id"]:
+            if row["recovery"]:
+                # Lost-create recovery is read by immutable reserved name only.
+                try:
+                    self._provider(row)
+                    row = self._row(reservation)
+                    self.guardian.arm(self._assignment(row), stop_only=True)
+                except Exception:
+                    self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
+                    row = self._row(reservation)
+                    margin = now >= row["deadline"] + LOST_CREATE_MARGIN_SECONDS
+                    eligible = self._rejection_eligible_at(row)
+                    rejected = eligible is not None and now >= eligible
+                    if (
+                        not row["provider_id"]
+                        and (margin or rejected)
+                        and now >= self.next_absence.get(reservation, 0)
+                    ):
+                        self.next_absence[reservation] = now + LOST_CREATE_READ_SECONDS
+                        try:
+                            # Past the margin the ordinary path applies even after
+                            # a reported rejection; before it only the fast path.
+                            self._resolve_lost_create(row, rejected=not margin)
+                        except Exception:
+                            pass  # stays reserved and blocking
+                    return
+            else:
+                return
+        if row["recovery"]:
+            self.guardian.arm(self._assignment(row), stop_only=True)
+            self._cancel(row["operation"])
+        else:
+            self.guardian.arm(self._assignment(row))
+        state = self.guardian.status(row["operation"])
+        urgent = row["recovery"] and state["status"] == "armed"
+        if now < self.next_poll.get(reservation, 0) and not urgent:
+            return
+        try:
+            self.guardian.tick(row["operation"])
+            after = self.guardian.status(row["operation"])
+            if after["status"] == "stopped":
+                self._account(self._row(reservation), force=True)
+            elif after["status"] == "unknown" and (
+                after["allocation_uncertain"] or self._row(reservation)["allocation_uncertain"]
+            ):
+                # The guardian cannot self-confirm after an allocation change, but
+                # the provider's exact read can end the spend: stop retrying the
+                # stop, freeze accrual, release the fence (custody stays unsealed).
+                # Throttled: the close check is one more exact provider read.
+                if now >= self.next_close_check.get(reservation, 0):
+                    self.next_close_check[reservation] = now + CLOSE_CHECK_SECONDS
+                    try:
+                        self._close_uncertain_stopped(self._row(reservation))
+                    except ValueError:
+                        pass  # still running, unreadable or ambiguous: keep stopping
+        except Exception:
+            # No failed observation/custody write is a confirmed stop.
+            pass
+        # A pre-start read failure being retried across polls backs off (bounded).
+        try:
+            backoff = self.guardian.read_retry_backoff(row["operation"])
+        except Exception:
+            backoff = None
+        self.next_poll[reservation] = self.clock() + max(5, backoff or 0)
 
     def _input(self, row, body):
         """Serve the held, verified snapshot to the identity-checked bound workload."""
@@ -2661,7 +2800,7 @@ class SaladSafetyService:
                     "seen_running_at=COALESCE(seen_running_at,?) "
                     "WHERE operation=? AND begun=0 AND recovery=0",
                     (
-                        self.clock() - UNSEEN_RUN_GAP_SECONDS,
+                        self.clock() - self.unseen_run_gap_seconds,
                         self.clock(),
                         row["operation"],
                     ),

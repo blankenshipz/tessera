@@ -82,6 +82,10 @@ Then the agent, over MCP only:
    waited on, the latest attempt's phase and failure class, executor lease and heartbeat age with a
    stale flag, and the latest control refusal of a worker step, from any provider, as a short code with counts; only lease
    acquire, renewal, package and observation refusals are recorded, not other worker routes).
+   For a Salad stage it also lists the approved profile keys in order, which profile the latest
+   attempt ran on, each pre-start switch (from, to, reason code, attempts, `started`/`spent` false)
+   and a `profile_not_approved` or `post_start_switch_refused` outcome (`salad_profiles`), so no
+   journal grep is needed.
 
 ## Smoke test on a running Tessera ($0, dry run by default)
 

@@ -26,6 +26,7 @@ import sqlite3
 from typing import Any
 
 from .campaign_autoreconcile import not_started_count
+from .campaign_class_fallback import prestart_attempts
 from .campaign_infra_retry import infra_attempts
 from .campaign_models import normalize, parse_spec_json
 from .execution import MAX_OBSERVATION_FUTURE_SKEW, UNRESOLVED_GRANT_STATUSES, ExecutionStore
@@ -118,7 +119,8 @@ def _retry_bounds(
     ).fetchall()
     used = stage_row["attempts_used"]
     infra_used = infra_attempts(attempts)
-    scientific_used = used - not_started_count(attempts) - infra_used
+    # A move to the next class after a pre-start failure is not a scientific retry either.
+    scientific_used = used - not_started_count(attempts) - infra_used - prestart_attempts(attempts)
     facts = {
         "stage_key": attempt["stage_key"],
         "attempt": attempt["attempt"],

@@ -450,8 +450,9 @@ def register_campaign_tools(
         """Read one of your campaigns: status, stages, attempts, intents and placement.
 
         An agent reads only the campaigns it submitted (campaign:read); any other id answers
-        like a missing one. Cancel and steering are submitter-only too. A campaign in a
-        re-run tree also shows rerun_tree (withheld when the tree holds another submitter's
+        like a missing one. Cancel and steering are submitter-only too. Approvals appear in this
+        agent view without approving_principal_id (only the owner view carries it). A campaign in
+        a re-run tree also shows rerun_tree (withheld when the tree holds another submitter's
         campaign): the first cap, what the tree has committed (settled spend plus the caps of
         unfinished campaigns) and what is left for another re-run. The receipt is a separate
         record: use tessera_get_campaign_receipt once the campaign is terminal. Status is recorded
@@ -613,8 +614,12 @@ def register_campaign_tools(
         limits, slot, release, placement) with counts, and the latest attempt with its phase,
         failure class, grant and spend-limit state, whether an executor lease is held, the
         lease age, the executor's heartbeat age and whether that heartbeat is stale, plus
-        failure counts by class. Codes, ages and counts only: no log text, host, address or
-        credential. Use it before cancelling or re-placing a stage that is not moving.
+        failure counts by class. A Salad stage adds `salad_profiles`: the approved profile keys
+        in the order tried, the profile the latest attempt ran on, each pre-start switch (from,
+        to, reason code, attempts, started/spent false) and the profile_not_approved or
+        post_start_switch_refused outcome (no profile move after a possible start). Codes,
+        ages and counts only: no log text, host, address or credential. Use it before
+        cancelling or re-placing a stage that is not moving.
         """
         return await client.campaign_view(campaign_id, "stage-status")
 
@@ -634,8 +639,10 @@ def register_campaign_tools(
 
     async def tessera_project_spend() -> dict[str, Any]:
         """Read the operator's project limits (money, concurrency) and what this project's
-        campaigns hold and have settled (budget:read, read-only). Use it before reducing a
-        campaign's budget or concurrency; no tool raises a limit.
+        campaigns hold and have settled (budget:read, read-only). An agent sees the limits, its
+        own campaigns' held and settled totals and whether the shared ceiling still has
+        headroom, not other agents' spend. Use it before reducing a campaign's budget or
+        concurrency; no tool raises a limit.
         """
         return await client.project_spend()
 

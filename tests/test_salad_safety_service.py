@@ -2554,7 +2554,10 @@ def test_lost_create_blocks_until_deadline_plus_margin(tmp_path):
 
 
 def test_lost_create_resolves_after_margin_on_definite_absence(tmp_path):
-    from tessera_control.salad_safety_service import LOST_CREATE_MARGIN_SECONDS
+    from tessera_control.salad_safety_service import (
+        LOST_CREATE_MARGIN_SECONDS,
+        LOST_CREATE_WATCH_SECONDS,
+    )
 
     s, b, clock, provider = _lost_create(tmp_path)
     try:
@@ -2582,13 +2585,17 @@ def test_lost_create_resolves_after_margin_on_definite_absence(tmp_path):
             )
         with pytest.raises(ValueError):
             s.admin(dict(operation="ready", reservation=b["reservation"]))
-        # The orphan fence now admits a new operation, with zero committed for this one.
+        # The orphan fence now admits a new operation. Its accrual stays zero, but its hold
+        # stays committed while the 24 h late-resource watch could still reopen it.
         clock[0] += 1
         s.loop()
         nxt = _next_reservation(s, clock)
         s.admin(nxt)
-        assert s._committed(exclude=nxt["reservation"]) == 0
+        hold = b["proposal"]["selection"]["salad"]["execution"]["max_cost_cents"]
+        assert s._committed(exclude=nxt["reservation"]) == hold
         assert s._row(b["reservation"])["accrued_cents"] == "0"
+        clock[0] = record["resolved_at"] + LOST_CREATE_WATCH_SECONDS
+        assert s._committed(exclude=nxt["reservation"], account=False) == 0
     finally:
         s.close()
 

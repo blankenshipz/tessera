@@ -182,7 +182,7 @@ class CampaignSteeringCommands:
             connection.close()
 
     def _own_campaign_for_reduction(self, connection, live, campaign_id) -> sqlite3.Row:
-        campaign = self._campaign(connection, live, campaign_id)
+        campaign = self._readable_campaign(connection, live, campaign_id)
         if self._external_scope(connection, live):
             self._scope(connection, live, "campaign:cancel")
             if campaign["submitted_by_principal_id"] != live["id"]:

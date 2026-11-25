@@ -44,6 +44,7 @@ ATTEMPT_CAP = "attempt_cap"
 TOTAL_CAP = "total_cap"
 NOT_APPROVE = "not_approve"
 WRONG_PROVIDER = "wrong_provider"
+WRONG_PROFILE = "wrong_profile"
 
 _DENIED = "Campaign pre-approval does not authorize this review."
 
@@ -201,13 +202,106 @@ def covered_provider(
     stage's own provider only."""
     row = connection.execute(
         """SELECT json_extract(p.value, '$.provider_id') AS provider_id
-        FROM events e, json_each(e.payload_json, '$.preapprovals') p
-        WHERE e.event_type='campaign.approved'
-        AND json_extract(e.payload_json, '$.campaign_id')=?
+        FROM events e JOIN campaigns c ON c.id=?, json_each(e.payload_json, '$.preapprovals') p
+        WHERE e.event_type='campaign.approved' AND e.org_id=c.org_id
+        AND e.project_id=c.project_id AND json_extract(e.payload_json, '$.campaign_id')=c.id
         AND json_extract(p.value, '$.id')=? LIMIT 1""",
         (pre["campaign_id"], pre["id"]),
     ).fetchone()
     return (row["provider_id"] if row is not None else None) or stage_provider_id
+
+
+def bound_profiles(placed_stage: Any, entry: Any) -> list[dict[str, str]] | None:
+    """The profiles one approve-body entry covers, each with its bound plan digest (ADR 0151).
+
+    ``placed_stage`` is the stage on the candidate the entry covers (``stage_on_candidate``);
+    ``entry`` is its ``StagePreapproval``. ``None`` when that candidate lists no alternate
+    profiles: the entry then covers its own profile only, exactly as before ADR 0151. Otherwise
+    the entry must name every listed alternate once with its plan digest (``plan_digest`` stays
+    the candidate's own profile's); a profile the approved spec does not list is refused and so
+    can never be bound. Source assessment and source use do not depend on the profile, so the
+    entry's digests of those cover every listed profile. Raises ValueError naming the profile."""
+    from .salad_alternate_profiles import covered_profiles
+
+    key = entry.stage_key
+    order = covered_profiles(placed_stage)
+    named = {item.profile: item.plan_digest for item in entry.alternate_profiles or ()}
+    for name in named:
+        if name == order[0]:
+            raise ValueError(
+                f"Pre-approval of stage {key!r} lists profile {name!r}, which is the stage's own "
+                "profile: its plan digest is the entry's plan_digest."
+            )
+        if name not in order:
+            raise ValueError(
+                f"Pre-approval of stage {key!r} names profile {name!r}, which the approved spec "
+                "does not list for that stage; a profile not in the spec is never bound."
+            )
+    missing = [name for name in order[1:] if name not in named]
+    if missing:
+        raise ValueError(
+            f"Pre-approval of stage {key!r} does not cover its alternate profile "
+            f"{missing[0]!r}: add an alternate_profiles entry with that profile's plan digest "
+            "(the pre-approval preview lists it), or approve without pre-approving the stage."
+        )
+    if len(order) == 1:
+        return None
+    return [
+        {"profile": name, "plan_digest": entry.plan_digest if index == 0 else named[name]}
+        for index, name in enumerate(order)
+    ]
+
+
+def recorded_profiles(connection: sqlite3.Connection, pre: dict[str, Any]) -> list[dict] | None:
+    """The profiles this pre-approval covers, as recorded on the approve event (ADR 0151).
+
+    ``None`` for an entry whose candidate listed no alternate profiles (or one approved before
+    ADR 0151): it covers its own profile with its ``plan_digest`` only."""
+    row = connection.execute(
+        """SELECT json_extract(p.value, '$.profiles') AS profiles
+        FROM events e JOIN campaigns c ON c.id=?, json_each(e.payload_json, '$.preapprovals') p
+        WHERE e.event_type='campaign.approved' AND e.org_id=c.org_id
+        AND e.project_id=c.project_id AND json_extract(e.payload_json, '$.campaign_id')=c.id
+        AND json_extract(p.value, '$.id')=? LIMIT 1""",
+        (pre["campaign_id"], pre["id"]),
+    ).fetchone()
+    if row is None or not row["profiles"]:
+        return None
+    return list(json.loads(row["profiles"]))
+
+
+def _profile_plan_digest(
+    connection: sqlite3.Connection,
+    campaign: Any,
+    pre: dict[str, Any],
+    stage_key: str,
+    provider_id: str,
+    attempt_id: str,
+) -> str | None:
+    """The plan digest this pre-approval binds for the profile the attempt runs on, or None
+    when the attempt's profile is not one it covers (ADR 0151, fail closed to a person).
+
+    A candidate without alternate profiles keeps the pre-ADR-0151 rule unchanged: the entry's
+    ``plan_digest`` (its provider was already checked)."""
+    from .campaign_delegation import _normal_spec
+    from .campaign_models import stage_on_candidate
+    from .salad_alternate_profiles import attempt_profile, covered_profiles
+
+    try:
+        placed = stage_on_candidate(_normal_spec(campaign).stage(stage_key), provider_id)
+        order = covered_profiles(placed)
+    except (StopIteration, ValueError, KeyError):
+        return None
+    if len(order) == 1:
+        return pre["plan_digest"]
+    recorded = recorded_profiles(connection, pre)
+    if recorded is None:
+        return None  # a candidate with alternates is covered only by a per-profile entry
+    bound = {item["profile"]: item["plan_digest"] for item in recorded}
+    running = attempt_profile(connection, attempt_id)
+    if running not in order:
+        return None
+    return bound.get(running)
 
 
 def _bound(scope: dict[str, Any], kind: str, salad: Any) -> bool:
@@ -272,7 +366,7 @@ def evaluate(
             return Verdict(DIGEST_MISMATCH, pre, digest)
         return Verdict(None, pre, digest)
     attempt = connection.execute(
-        """SELECT a.attempt AS attempt, a.provider_id AS provider_id
+        """SELECT a.attempt AS attempt, a.provider_id AS provider_id, a.id AS attempt_id
         FROM campaign_salad_attempts sa
         JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
         WHERE a.campaign_id=? AND a.stage_key=? AND
@@ -296,6 +390,12 @@ def evaluate(
     if (attempt["provider_id"] or own) != covered_provider(connection, pre, own):
         # An entry covers only the candidate it names: another one waits for a person.
         return Verdict(WRONG_PROVIDER, pre, attempt=attempt["attempt"])
+    # ADR 0151: an entry covers only the profiles it names; another one waits for a person.
+    plan_digest = _profile_plan_digest(
+        connection, campaign, pre, stage_key, attempt["provider_id"] or own, attempt["attempt_id"]
+    )
+    if plan_digest is None:
+        return Verdict(WRONG_PROFILE, pre, attempt=attempt["attempt"])
     try:
         scope = json.loads(decision["scope_json"])
     except ValueError:
@@ -303,7 +403,7 @@ def evaluate(
     if not _bound(scope, kind, salad):
         return Verdict(UNBOUND_SCOPE, pre)
     digest = review_core_digest(scope)
-    expected = pre["plan_digest"] if kind == KIND_PLAN else pre["source_use_digest"]
+    expected = plan_digest if kind == KIND_PLAN else pre["source_use_digest"]
     if digest != expected:
         return Verdict(DIGEST_MISMATCH, pre, digest, attempt=attempt["attempt"])
     cents = 0
@@ -616,7 +716,8 @@ def preview_for_campaign(
     state_dir: Any, profiles_file: Any, campaign_id: str, stage_key: str | None = None
 ) -> list[dict[str, str]]:
     """Read-only: the digests a human would bind in the approve body for a campaign's Salad
-    stages (ADR 0044). Grants nothing; nothing is written."""
+    stages (ADR 0044), with each alternate profile's plan digest (ADR 0151). Grants nothing;
+    nothing is written."""
     from pathlib import Path
 
     from .campaign_models import normalize, parse_spec_json, stage_on_candidate, stage_provider
@@ -656,6 +757,32 @@ def preview_for_campaign(
                     ),
                     "max_attempt_cents": placed.max_exposure_cents,
                     "max_total_cents": spec.budget_cap_cents,
+                    **alternate_profile_digests(driver, campaign, spec, placed),
                 }
             )
     return result
+
+
+def alternate_profile_digests(
+    driver: Any, campaign: dict[str, Any], spec: Any, placed: Any
+) -> dict[str, list[dict[str, str]]]:
+    """``{"alternate_profiles": [{profile, plan_digest}, ...]}`` for a placed Salad candidate
+    that lists alternate profiles, else ``{}`` (ADR 0151). Read-only.
+
+    Each plan digest is computed by the driver's own preview, on the stage as it runs on that
+    profile (``stage_on_profile``), so the entry a human binds is exactly what ``evaluate``
+    compares for an attempt on that profile."""
+    import dataclasses
+
+    from .campaign_runner import _Ctx
+    from .salad_alternate_profiles import covered_profiles, stage_on_profile
+
+    found = []
+    for name in covered_profiles(placed)[1:]:
+        moved = stage_on_profile(placed, name)
+        shifted = dataclasses.replace(
+            spec, stages=tuple(moved if item.key == placed.key else item for item in spec.stages)
+        )
+        digests = driver.preview_review_digests(_Ctx(campaign, shifted, None, 0), placed.key, None)
+        found.append({"profile": name, "plan_digest": digests["plan_digest"]})
+    return {"alternate_profiles": found} if found else {}

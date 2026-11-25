@@ -11,6 +11,10 @@ One executor serves every operator profile its config names (``profile`` or ``pr
 ADR 0070) for its worker principal, so a CPU profile (ADR 0062) placed beside a GPU one is
 leased and run by the same process; work for a profile it does not name is refused.
 
+Routes run one at a time unless ``max_concurrent_paid_routes`` (1 to 4, default 1) is raised;
+then each child waits on its own thread and a further route starts only while the guardian's
+own ``max_open_billable_frames`` admits it (docs/campaigns.md, Salad GPU stage executor).
+
     python -m tessera_control.campaign_salad_executor --config FILE [--once] [--health-file PATH]
 """
 
@@ -26,10 +30,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -190,6 +195,11 @@ class ExecutorConfig(_Closed):
     termination_confirm_seconds: Annotated[int, Field(ge=0, le=3600)] = 600
     termination_poll_seconds: Annotated[int, Field(ge=5, le=60)] = 15
     stage_watcher: StageWatcherBlock | None = None
+    # How many paid routes (live-check children) this executor drives at once. The default 1
+    # is the serial executor: each route's child runs to completion inside the pass. Above 1, a
+    # further route starts only while the guardian's own status names a ``max_open_billable_frames``
+    # that admits it (the executor never plans past the guardian's setting); otherwise it waits.
+    max_concurrent_paid_routes: Annotated[int, Field(ge=1, le=4)] = 1
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
 
@@ -438,6 +448,27 @@ def _write_private_json(path: Path, document: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+_UNREAD = object()
+
+
+class _RouteRun:
+    """One in-flight route (concurrent mode). Its thread calls only ``route_runner`` and
+    writes only ``receipt``/``error``; the pass reads them after ``join``."""
+
+    def __init__(self, item: dict[str, Any], config_path: Path, signals: Path | None) -> None:
+        self.item, self.config_path, self.signals = item, config_path, signals
+        self.stack = ExitStack()
+        self.thread: threading.Thread | None = None
+        self.receipt: dict[str, Any] | None = None
+        self.error: BaseException | None = None
+
+    def run(self, runner: RouteRunner, config_path: Path, receipts: Path, timeout: int) -> None:
+        try:
+            self.receipt = runner(config_path, receipts, timeout)
+        except BaseException as error:  # noqa: BLE001 - handed to the pass unchanged
+            self.error = error
+
+
 def _key(step: str, attempt_id: str) -> str:
     return f"salad-exec-{step}-{hashlib.sha256(attempt_id.encode()).hexdigest()[:40]}"
 
@@ -490,20 +521,46 @@ class SaladCampaignExecutor:
         self._group_stop_given_up: set[str] = set()
         self._group_stop_next: dict[str, float] = {}
         self.log: list[dict[str, Any]] = []
+        # Concurrent mode only (``max_concurrent_paid_routes`` above 1): the routes whose child
+        # runs now, by attempt. Every field of the executor is read and written by the pass's own
+        # thread only; a route's thread runs ``route_runner`` alone and writes only its record.
+        self._in_flight: dict[str, _RouteRun] = {}
+        self._watched: str | None = None  # the one in-flight attempt the stage watcher follows
+        self._concurrency_held = False  # a concurrent route ended without a receipt: drain first
+        self._executing_elsewhere: set[str] = set()
+        self._pass_frame_limit: Any = _UNREAD
 
     # -- one pass ---------------------------------------------------------------------------
+
+    @property
+    def concurrent(self) -> bool:
+        return self.config.max_concurrent_paid_routes > 1
 
     def run_once(self) -> list[dict[str, Any]]:
         start = len(self.log)
         self._heartbeat_sent = False
+        concurrent = self.concurrent
+        if concurrent:
+            self._harvest()
         try:
             items = self.control.work()
         except Exception as error:
             self._note("work_unavailable", None, type(error).__name__)
             return self.log[start:]
+        if concurrent:
+            self._pass_frame_limit = _UNREAD
+            self._executing_elsewhere = {
+                entry["attempt_id"]
+                for entry in items
+                if entry.get("phase") == "executing" and entry["attempt_id"] not in self._in_flight
+            }
         pending: set[str] | None = None
         for item in items:
             attempt = item["attempt_id"]
+            if concurrent and attempt in self._in_flight:
+                # Its child owns the route (and renews the lease) until it returns, exactly as
+                # in the serial executor; it is finished by ``_harvest`` only, never resumed.
+                continue
             try:
                 self._step = "grant_poll"
                 if item["phase"] == "awaiting_lease":
@@ -514,7 +571,10 @@ class SaladCampaignExecutor:
                     self._step = "renew"
                     self._keepalive(item)
                     self._step = "execute"
-                    self._execute(item)
+                    if concurrent:
+                        self._launch(item)
+                    else:
+                        self._execute(item)
                 elif item["phase"] == "executing":
                     self._step = "execute"
                     self._resume(item)
@@ -722,46 +782,15 @@ class SaladCampaignExecutor:
         return path
 
     def _execute(self, item: dict[str, Any]) -> None:
-        attempt, route_id = item["attempt_id"], item["route_id"]
-        if attempt in self.fenced:
-            self._note("fenced_no_run", attempt, self.fenced[attempt])
+        prepared = self._prepare_route(item, self.stage_watch)
+        if prepared is None:
             return
-        state = self.control.route(route_id)
-        if any(effect["action"] in {"create", "start"} for effect in state["effects"]):
-            # A route with any effect is never re-run; the runner's silent-executor rule applies.
-            self._note("refused_route_has_effects", attempt)
-            return
-        verified = self._verified_selection(item, state)
-        if verified is None:
-            self._note("refused_selection_mismatch", attempt)
-            return
-        derived, plan, profile = verified
-        directory = self._route_dir(route_id)
-        if directory.exists():
-            # A directory means a prior pass already launched (or tried to): never re-run.
-            self._note("refused_route_already_attempted", attempt)
-            return
-        try:
-            self.control.mark_executing(attempt)
-        except Exception as error:
-            self._note("mark_executing_refused", attempt, type(error).__name__)
-            return
-        directory.mkdir(mode=0o700)
-        receipts = directory / "receipts"
-        receipts.mkdir(mode=0o700)
-        (directory / "outputs").mkdir(mode=0o700)
+        attempt = item["attempt_id"]
+        config_path, receipts, timeout, signals = prepared
         watch = self.stage_watch
-        signals = None if watch is None else self._watch_begin(watch, item, derived)
-        config_path = self._write_live_config(
-            route_id, state, derived, plan, directory, profile, signals
-        )
         try:
             with watch.ticking() if signals is not None else nullcontext():
-                receipt = self.route_runner(
-                    config_path,
-                    receipts,
-                    derived.resources.max_seconds + SUBPROCESS_GRACE_SECONDS,
-                )
+                receipt = self.route_runner(config_path, receipts, timeout)
         except RouteTimeout:
             self._note("route_timeout", attempt)
             return
@@ -776,6 +805,181 @@ class SaladCampaignExecutor:
             config_path.unlink(missing_ok=True)
             if signals is not None:
                 watch.end(item["operation_id"])
+        if receipt is None:
+            self._note("no_receipt", attempt)
+            self.no_receipt.add(attempt)
+            self._report_no_receipt(item)
+            return
+        self._finish(item, receipt)
+
+    def _prepare_route(
+        self,
+        item: dict[str, Any],
+        watch: Any,
+        admit: Callable[[str], bool] | None = None,
+    ) -> tuple[Path, Path, int, Path | None] | None:
+        """Every check before a route's child starts, then mark it executing and lay out its
+        private directory and live config. None when it must not (or may not yet) run.
+
+        ``admit`` (concurrent mode) is asked last before ``mark_executing``: a False answer
+        leaves the attempt untouched (``route_started``, no directory) to be asked again."""
+        attempt, route_id = item["attempt_id"], item["route_id"]
+        if attempt in self.fenced:
+            self._note("fenced_no_run", attempt, self.fenced[attempt])
+            return None
+        state = self.control.route(route_id)
+        if any(effect["action"] in {"create", "start"} for effect in state["effects"]):
+            # A route with any effect is never re-run; the runner's silent-executor rule applies.
+            self._note("refused_route_has_effects", attempt)
+            return None
+        verified = self._verified_selection(item, state)
+        if verified is None:
+            self._note("refused_selection_mismatch", attempt)
+            return None
+        derived, plan, profile = verified
+        directory = self._route_dir(route_id)
+        if directory.exists():
+            # A directory means a prior pass already launched (or tried to): never re-run.
+            self._note("refused_route_already_attempted", attempt)
+            return None
+        if admit is not None and not admit(attempt):
+            return None
+        try:
+            self.control.mark_executing(attempt)
+        except Exception as error:
+            self._note("mark_executing_refused", attempt, type(error).__name__)
+            return None
+        directory.mkdir(mode=0o700)
+        receipts = directory / "receipts"
+        receipts.mkdir(mode=0o700)
+        (directory / "outputs").mkdir(mode=0o700)
+        signals = None if watch is None else self._watch_begin(watch, item, derived)
+        config_path = self._write_live_config(
+            route_id, state, derived, plan, directory, profile, signals
+        )
+        timeout = derived.resources.max_seconds + SUBPROCESS_GRACE_SECONDS
+        return config_path, receipts, timeout, signals
+
+    # -- concurrent mode (``max_concurrent_paid_routes`` above 1) ---------------------------
+
+    def _launch(self, item: dict[str, Any]) -> None:
+        """Start one route's child on its own thread and return; ``_harvest`` finishes it.
+
+        The checks, ``mark_executing``, the private directory and the live config are exactly
+        the serial executor's (``_prepare_route``); only the wait for the child moves off the
+        pass. The stage watcher follows one in-flight route at a time (it is built for one)."""
+        attempt = item["attempt_id"]
+        watch = self.stage_watch if self._watched is None else None
+        prepared = self._prepare_route(item, watch, self._admit)
+        if prepared is None:
+            return
+        config_path, receipts, timeout, signals = prepared
+        run = _RouteRun(item, config_path, signals)
+        if signals is not None:
+            self._watched = attempt
+            run.stack.enter_context(self.stage_watch.ticking())
+        self._in_flight[attempt] = run
+        run.thread = threading.Thread(
+            target=run.run,
+            args=(self.route_runner, config_path, receipts, timeout),
+            name="salad-route",
+        )
+        try:
+            run.thread.start()
+        except Exception as error:  # noqa: BLE001 - finished below as the runner's failure
+            run.thread, run.error = None, error
+        self._note("route_launched", attempt)
+        if run.thread is None:
+            self._harvest()
+
+    def _admit(self, attempt: str) -> bool:
+        """Whether one more route may start now; a False answer only defers it (no failure).
+
+        With nothing in flight a route always starts, as in the serial executor. A further one
+        needs every bound: the configured count (routes left ``executing`` by an earlier process
+        count too, their frames may still bill), no recent receiptless end, and the guardian's
+        own ``max_open_billable_frames`` read from an in-flight route's status admitting it. An
+        unreadable or refused guardian read (``single_operation_orphan_exposure`` included)
+        waits; the attempt is not marked executing, so nothing is spent or retried past it."""
+        if not self._in_flight:
+            return True
+        occupied = len(self._in_flight) + len(self._executing_elsewhere)
+        if self._concurrency_held:
+            reason = "draining_after_no_receipt"
+        elif occupied >= self.config.max_concurrent_paid_routes:
+            reason = "executor_route_limit"
+        else:
+            limit = self._guardian_frame_limit()
+            if limit is None:
+                reason = "guardian_limit_unknown"
+            elif occupied + 1 > limit:
+                reason = "guardian_frame_limit"
+            else:
+                return True
+        self._note("route_deferred", attempt, reason)
+        return False
+
+    def _guardian_frame_limit(self) -> int | None:
+        """The guardian's ``max_open_billable_frames``, read at most once per pass."""
+        if self._pass_frame_limit is not _UNREAD:
+            return self._pass_frame_limit
+        self._pass_frame_limit = None
+        read = getattr(self.control, "guardian_frame_limit", None)
+        if read is None:
+            return None
+        for attempt in sorted(self._in_flight):
+            try:
+                value = read(self._in_flight[attempt].item["route_id"])
+            except Exception:  # noqa: BLE001 - an unreadable guardian defers, never fails
+                continue
+            if type(value) is int and value >= 1:
+                self._pass_frame_limit = value
+                break
+        return self._pass_frame_limit
+
+    def _harvest(self) -> None:
+        """Finish every in-flight route whose child returned, in attempt order."""
+        for attempt in sorted(self._in_flight):
+            run = self._in_flight[attempt]
+            if run.thread is not None and run.thread.is_alive():
+                continue
+            if run.thread is not None:
+                run.thread.join()
+            del self._in_flight[attempt]
+            try:
+                self._step = "execute"
+                self._complete(run)
+            except Exception as error:
+                self._note("error", attempt, type(error).__name__)
+                self._record_rejection(attempt, error)
+        if not self._in_flight:
+            self._concurrency_held = False
+
+    def _complete(self, run: _RouteRun) -> None:
+        """The serial executor's handling of the child's result, unchanged."""
+        item, attempt = run.item, run.item["attempt_id"]
+        if run.receipt is None:
+            # Any receiptless end (a guardian fence refusal inside the child included) stops
+            # further concurrent starts until every in-flight route is finished.
+            self._concurrency_held = True
+        try:
+            run.stack.close()
+            if run.error is not None:
+                raise run.error
+            receipt = run.receipt
+        except RouteTimeout:
+            self._note("route_timeout", attempt)
+            return
+        except RouteExitedWithoutReceipt as error:
+            self._note("no_receipt", attempt, error.detail)
+            self.no_receipt.add(attempt)
+            self._report_no_receipt(item)
+            return
+        finally:
+            run.config_path.unlink(missing_ok=True)
+            if run.signals is not None:
+                self._watched = None
+                self.stage_watch.end(item["operation_id"])
         if receipt is None:
             self._note("no_receipt", attempt)
             self.no_receipt.add(attempt)
@@ -1265,6 +1469,17 @@ class StoreControl:
         if type(status) is not dict:
             return None
         return {key: status.get(key) for key in ("status", "reason", "provider_id")}
+
+    def guardian_frame_limit(self, route_id):
+        """The guardian's own ``max_open_billable_frames`` from the route's status, else None.
+
+        Read only to bound concurrent starts (never to start or settle anything); a route the
+        guardian holds no reservation for, or any other unusable status, gives None."""
+        if self.guardian_status is None:
+            return None
+        status = self.guardian_status(self.routes.get(self.worker, route_id))
+        value = status.get("max_open_billable_frames") if type(status) is dict else None
+        return value if type(value) is int and value >= 1 else None
 
     def record_outcome(self, attempt_id, payload):
         self.campaigns.record_salad_outcome(

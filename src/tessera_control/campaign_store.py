@@ -139,10 +139,12 @@ def infra_retry_policy(spec: Any) -> list[dict[str, Any]]:
             "reroute_providers": list(stage.retry.reroute_providers),
             # ADR 0179: shown even at its default (2), which the stored spec omits.
             "max_reallocation_retries": stage.retry.max_reallocation_retries,
-            "worst_case_attempts": (
-                stage.retry.max_attempts
-                + stage.retry.infra_retries
-                + stage.retry.max_reallocation_retries
+            "worst_case_attempts": stage.retry.hold_attempts,
+            # ADR 0060 addendum: present only when the spec enables class fallbacks.
+            **(
+                {"max_class_fallbacks": stage.retry.max_class_fallbacks}
+                if stage.retry.max_class_fallbacks
+                else {}
             ),
         }
         for stage in normalize(spec).stages
@@ -972,7 +974,7 @@ class CampaignStore(
             raise _invalid(error) from None
 
         def command(connection, live):
-            campaign = self._campaign(connection, live, campaign_id)
+            campaign = self._readable_campaign(connection, live, campaign_id)
             if live["role"] != "human":
                 raise Forbidden("A human must approve a campaign.")
             require_decision_actor(live, forbidden=Forbidden)
@@ -1236,12 +1238,14 @@ class CampaignStore(
         """Store the approve body's Salad review pre-approvals (ADR 0044), fail closed.
 
         Only a forward approval may carry them; each names a distinct Salad stage of the
-        approved spec; nothing carries over from a superseded approval."""
+        approved spec and covers all of its listed profiles (ADR 0151); nothing carries over
+        from a superseded approval."""
         if not entries:
             return []
         if not forward:
             raise Conflict("A cleanup re-approval cannot carry review pre-approvals.")
         from .campaign_models import normalize, stage_on_candidate, stage_provider
+        from .campaign_preapproval import bound_profiles
 
         normal = normalize(spec)
         cap = approval["expires_at"]
@@ -1266,6 +1270,12 @@ class CampaignStore(
             if not billable:
                 raise Conflict("Pre-approvals apply to Salad stages only.")
             stage = stage_on_candidate(stage, wanted)
+            # ADR 0151: an entry covers every profile the candidate lists, each named with its
+            # own plan digest; an unlisted profile can never be bound, a missing one refuses.
+            try:
+                profiles = bound_profiles(stage, entry)
+            except ValueError as error:
+                raise Conflict(str(error)) from None
             if entry.max_total_cents < entry.max_attempt_cents:
                 raise Conflict("max_total_cents must be at least max_attempt_cents.")
             if entry.max_total_cents > normal.budget_cap_cents:
@@ -1301,7 +1311,9 @@ class CampaignStore(
                 row,
             )
             declared.append(
-                {k: v for k, v in row.items() if k != "created_at"} | {"provider_id": wanted}
+                {k: v for k, v in row.items() if k != "created_at"}
+                | {"provider_id": wanted}
+                | ({} if profiles is None else {"profiles": profiles})
             )
         return declared
 
@@ -1312,7 +1324,7 @@ class CampaignStore(
             raise _invalid(error) from None
 
         def command(connection, live):
-            campaign = self._campaign(connection, live, campaign_id)
+            campaign = self._readable_campaign(connection, live, campaign_id)
             if self._external_scope(connection, live):
                 self._scope(connection, live, "campaign:cancel")
                 if campaign["submitted_by_principal_id"] != live["id"]:

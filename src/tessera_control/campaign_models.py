@@ -109,6 +109,11 @@ StageInput = Annotated[SnapshotSource | StageSource, Field(discriminator="kind")
 DEFAULT_INFRA_EXIT_CODES = (137,)
 DEFAULT_INFRA_RETRIES = 0
 DEFAULT_REALLOCATION_RETRIES = 2
+# ADR 0060 addendum: pre-start moves to the next approved class or candidate (``RetryPolicy``).
+# One bound for both: a stage's profile plus at most ``MAX_ALTERNATE_PROFILES`` alternates
+# (ADR 0151) gives at most that many moves on one candidate.
+DEFAULT_CLASS_FALLBACKS = 0
+MAX_CLASS_FALLBACKS = 4
 
 
 class RetryPolicy(_Strict):
@@ -142,11 +147,21 @@ class RetryPolicy(_Strict):
     # budget, for example) when their recorded value is above zero. Such an attempt is an
     # infrastructure failure, retried under ``infra_retries`` like a killed container.
     resource_limit_metrics: Annotated[list[MetricName], Field(max_length=4)] = []  # noqa: RUF012
+    # ADR 0060 addendum: how many times a stage may move to its next eligible class or
+    # candidate after an attempt that provably never started and settled at zero
+    # (``campaign_class_fallback``). Off unless the spec says so, like ``infra_retries``: each
+    # move is a new attempt with its own hold, so it counts in the worst-case exposure the
+    # approver sees (``worst_case_attempts``). Absent (0) keeps every earlier spec digest.
+    max_class_fallbacks: Annotated[int, Field(strict=True, ge=0, le=MAX_CLASS_FALLBACKS)] = (
+        DEFAULT_CLASS_FALLBACKS
+    )
 
     @model_serializer(mode="wrap")
     def _omit_defaults(self, handler):
         """Absent stays absent: a spec written before ADR 0058 keeps its digest."""
         value = handler(self)
+        if self.max_class_fallbacks == DEFAULT_CLASS_FALLBACKS:
+            value.pop("max_class_fallbacks", None)
         if self.infra_retries == DEFAULT_INFRA_RETRIES:
             value.pop("infra_retries", None)
         if self.max_reallocation_retries == DEFAULT_REALLOCATION_RETRIES:
@@ -158,6 +173,21 @@ class RetryPolicy(_Strict):
         if not self.resource_limit_metrics:
             value.pop("resource_limit_metrics", None)
         return value
+
+    @property
+    def worst_case_attempts(self) -> int:
+        """Attempts the spec's experiment-ceiling check counts: scientific, infrastructure
+        (ADR 0058) and class fallback (ADR 0060 addendum) attempts. Reallocation retries
+        (ADR 0179) default to on and stay out of this bound so existing specs keep validating;
+        ``hold_attempts`` is the count every attempt's own hold is budgeted over."""
+        return self.max_attempts + self.infra_retries + self.max_class_fallbacks
+
+    @property
+    def hold_attempts(self) -> int:
+        """Every attempt that holds its own exposure: ``worst_case_attempts`` plus the
+        pre-custody reallocation retries (ADR 0179). Alternate profiles / class fallbacks and
+        reallocation retries are independent attempt-count dimensions."""
+        return self.worst_case_attempts + self.max_reallocation_retries
 
 
 class MetricSpec(_Strict):
@@ -221,10 +251,33 @@ class SaladProgramTemplate(_Strict):
     gate: SaladGateTemplate
 
 
+# ADR 0151: further operator profiles a Salad stage may fall back to, in order.
+MAX_ALTERNATE_PROFILES = 4
+AlternateProfiles = Annotated[list[Key], Field(min_length=1, max_length=MAX_ALTERNATE_PROFILES)]
+
+
+def _check_alternate_profiles(profile: str, alternates: list[str] | None) -> None:
+    """ADR 0151: alternates are distinct and never repeat the stage's own profile."""
+    if alternates is None:
+        return
+    if len(set(alternates)) != len(alternates):
+        raise ValueError("alternate_profiles must be distinct")
+    if profile in alternates:
+        raise ValueError("alternate_profiles must not repeat profile")
+
+
 class SaladStageSpec(_Strict):
     """Salad-specific stage fields; every policy value comes from the operator profile."""
 
     profile: Key
+    # ADR 0151 / ADR 0060 addendum: further operator profiles (for example other GPU
+    # classes), tried in this order after ``profile``. A move happens only before any possible
+    # start (an attempt that provably never started and settled at zero, bounded by
+    # ``retry.max_class_fallbacks``); never after a possible start or spend (the strict rule).
+    # Each is checked at submit exactly as ``profile`` is, under the same per-run cap; a
+    # profile not listed is never used. Absent (never an empty list) keeps every existing spec
+    # digest unchanged. The one definition and length cap of the field.
+    alternate_profiles: AlternateProfiles | None = None
     worker_principal_id: Identifier
     workload: WorkloadContractV1
     program: SaladProgramTemplate
@@ -238,6 +291,11 @@ class SaladStageSpec(_Strict):
     # False, so every existing spec digest is unchanged.
     adapted: bool = False
 
+    @model_validator(mode="after")
+    def _distinct_profiles(self):
+        _check_alternate_profiles(self.profile, self.alternate_profiles)
+        return self
+
     @model_serializer(mode="wrap")
     def _omit_default_gpu(self, handler):
         value = handler(self)
@@ -245,11 +303,20 @@ class SaladStageSpec(_Strict):
             value.pop("gpu", None)
         if not self.adapted:
             value.pop("adapted", None)
+        if self.alternate_profiles is None:
+            value.pop("alternate_profiles", None)
         return value
 
 
 class SaladAdapterBody(_Strict):
     profile: Key
+    # ADR 0151: the adapted stage's alternate profiles, carried to the expanded config.
+    alternate_profiles: AlternateProfiles | None = None
+
+    @model_validator(mode="after")
+    def _distinct_profiles(self):
+        _check_alternate_profiles(self.profile, self.alternate_profiles)
+        return self
 
 
 class SaladAdapterRequest(_Strict):
@@ -1753,14 +1820,14 @@ def validate_structure(spec: NormalSpec) -> None:
             raise ValueError(
                 f"Stage {stage.key}: reroute provider {sorted(banned)[0]} is forbidden"
             )
-        # An enabled infrastructure retry is another attempt with its own hold, so it counts
-        # (billable providers included); with it off this is the formula as it always was.
-        worst_hold = stage.max_exposure_cents * (
-            stage.retry.max_attempts + stage.retry.infra_retries
-        )
+        # An enabled infrastructure retry or class fallback is another attempt with its own
+        # hold, so it counts (billable providers included); with both off this is the formula
+        # as it always was.
+        worst_hold = stage.max_exposure_cents * stage.retry.worst_case_attempts
         if worst_hold > EXPERIMENT_CEILING_CENTS:
             raise ValueError(
-                f"Stage {stage.key} max_exposure_cents x (max_attempts + infra_retries) = "
+                f"Stage {stage.key} max_exposure_cents x (max_attempts + infra_retries"
+                f"{' + max_class_fallbacks' if stage.retry.max_class_fallbacks else ''}) = "
                 f"{worst_hold} "
                 f"exceeds the experiment budget ceiling of {EXPERIMENT_CEILING_CENTS} cents"
             )
@@ -1935,6 +2002,16 @@ class SubmitCampaign(_Strict):
         return value
 
 
+class ProfilePlanPreapproval(_Strict):
+    """ADR 0151: the plan-review digest a human binds for one alternate profile of a stage.
+
+    Only the plan review depends on the profile (its compute window); the source assessment
+    and source-use digests of the entry cover every profile it names."""
+
+    profile: Key
+    plan_digest: Sha256Digest
+
+
 class StagePreapproval(_Strict):
     """Opt-in Salad review pre-approval for one stage (ADR 0044); approve body only."""
 
@@ -1948,6 +2025,22 @@ class StagePreapproval(_Strict):
     max_attempt_cents: Annotated[int, Field(strict=True, ge=1, le=5000)]
     max_total_cents: Annotated[int, Field(strict=True, ge=1, le=5000)]
     expires_at: Annotated[str, StringConstraints(min_length=1, max_length=40)] | None = None
+    # ADR 0151: the plan digest of each alternate profile of the covered candidate, one entry
+    # per profile it lists (``plan_digest`` is the candidate's own profile). Required, complete,
+    # when that candidate lists alternate profiles; absent keeps every earlier body's digest.
+    alternate_profiles: (
+        Annotated[
+            list[ProfilePlanPreapproval], Field(min_length=1, max_length=MAX_ALTERNATE_PROFILES)
+        ]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def _distinct_profiles(self):
+        names = [item.profile for item in self.alternate_profiles or ()]
+        if len(set(names)) != len(names):
+            raise ValueError("alternate_profiles must name each profile once")
+        return self
 
 
 class ApproveCampaign(_Strict):
@@ -2045,6 +2138,8 @@ FAILURE_CLASSES = (
     "sealed_partition",
     "public_fetch_unreported",
     "egress_violation",
+    # ADR 0060 addendum: never started on its candidate, settled at zero; the stage moved on.
+    "prestart_no_spend",
 )
 # ADR 0097: a worker-grant attempt whose stage declares public_artifact pins exited without a
 # fetch report recorded before its run receipt; it fails closed instead of succeeding with

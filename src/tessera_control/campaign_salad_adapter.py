@@ -5,9 +5,10 @@ The heavy-stage rule (ADR 0141, amendment 2026-11-23) also derives a GPU candida
 ``{"adapt": ...}`` request still takes a CPU-only profile only.
 
 A v2 stage lists ``{"provider": "salad", "runtime": "salad-workload-v1", "provider_config":
-{"adapt": {"profile": NAME}}}`` among its ``alternate_providers``. ``expand_spec`` turns that
-request into the explicit ``salad`` block a hand-written candidate would carry, from the stage
-itself and the operator's profile, before the spec is digested and stored. It is a pure function:
+{"adapt": {"profile": NAME}}}`` (optionally with ``"alternate_profiles": [NAME, ...]``, ADR 0151)
+among its ``alternate_providers``. ``expand_spec`` turns that request into the explicit ``salad``
+block a hand-written candidate would carry, from the stage itself and the operator's profile,
+before the spec is digested and stored. It is a pure function:
 the same stage and profile give the same bytes, nothing is read from the network or the database,
 and every refusal is a 409 that names the limit. The expanded candidate then passes the ordinary
 submit, approval and placement checks of the Salad provider; this module relaxes none of them.
@@ -491,6 +492,22 @@ def candidate_estimate_cents(stage: Any, profile: SaladCampaignProfile) -> int:
     return max(1, cents if cents == worst else cents + 1)
 
 
+def _visible(
+    profiles: SaladCampaignProfiles, name: str, tenant: tuple[str, str] | None
+) -> SaladCampaignProfile | None:
+    """The named profile, or None when it is unknown or (with ``tenant``) of another
+    organization or project: such a profile is not visible, so nothing about it (resources,
+    allowlist, rates) can shape a message."""
+    profile = profiles.get(name)
+    if (
+        profile is not None
+        and tenant is not None
+        and (profile.org_id, profile.project_id) != tenant
+    ):
+        return None
+    return profile
+
+
 def expand_spec(
     spec: Any,
     profiles: SaladCampaignProfiles | None,
@@ -539,22 +556,39 @@ def expand_spec(
             try:
                 request = SaladAdapterRequest.model_validate(item.provider_config)
             except ValidationError:
-                raise _refuse(stage, "the adapt request must be exactly {profile: NAME}") from None
+                raise _refuse(
+                    stage,
+                    "the adapt request must be exactly {profile: NAME} with optional distinct "
+                    "alternate_profiles (at most 4, none equal to profile)",
+                ) from None
             if profiles is None or not profiles.profiles:
                 raise _refuse(stage, "no Salad profile is configured")
-            profile = profiles.get(request.adapt.profile)
-            if profile is not None and tenant is not None:
-                # A profile of another organization or project is not visible: refuse before
-                # anything about it (resources, allowlist, rates) can shape a message.
-                if (profile.org_id, profile.project_id) != tenant:
-                    profile = None
+            profile = _visible(profiles, request.adapt.profile, tenant)
             if profile is None:
                 raise _refuse(stage, f"unknown profile {request.adapt.profile!r}")
             config = derive_candidate_config(base, profile, entries, upstream_outputs(spec))
+            estimates = [candidate_estimate_cents(base, profile)]
+            # ADR 0151: each alternate must derive exactly the same workload (only the profile
+            # name may differ), so ``stage_on_profile`` is an exact substitution at run time.
+            for name in request.adapt.alternate_profiles or ():
+                other = _visible(profiles, name, tenant)
+                if other is None:
+                    raise _refuse(stage, f"unknown alternate profile {name!r}")
+                derived = derive_candidate_config(base, other, entries, upstream_outputs(spec))
+                if derived | {"profile": profile.name} != config:
+                    raise _refuse(
+                        stage,
+                        f"alternate profile {name!r} derives a different Salad workload than "
+                        f"profile {profile.name!r} (worker, custody host, watchdog, program or "
+                        "grant lifetime differ); list only profiles that run the same workload",
+                    )
+                estimates.append(candidate_estimate_cents(base, other))
+            if request.adapt.alternate_profiles:
+                config["alternate_profiles"] = list(request.adapt.alternate_profiles)
+            # The candidate's hold covers its costliest listed profile (a single profile keeps
+            # its own estimate, so an existing expansion is byte-identical).
             estimate = (
-                item.max_exposure_cents
-                if item.max_exposure_cents is not None
-                else candidate_estimate_cents(base, profile)
+                item.max_exposure_cents if item.max_exposure_cents is not None else max(estimates)
             )
             if estimate > stage.max_exposure_cents:
                 raise _refuse(

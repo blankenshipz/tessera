@@ -67,6 +67,7 @@ REASON_ORDER = (
     "remote_failed_infra",
     "remote_skipped",
     "operator_override",
+    "allocation_unstable",
     "remote_candidate_not_added",
     "not_listed",
     "remote_not_tried",
@@ -74,7 +75,9 @@ REASON_ORDER = (
 # Explicit fallback reasons: Salad unavailable (no profile, credential, fitting profile,
 # infrastructure, a placement check skipping it: capacity, a cap, a trust or licence refusal),
 # an operator's own placement decision (steering, a placement rule, the default policy switched
-# off), or the ADR 0141 record saying why no remote candidate was added.
+# off), the operator's allocation-instability rule (ADR 0148: it moved the unstable remote
+# class behind this candidate for a stage that had not started anywhere), or the ADR 0141 record
+# saying why no remote candidate was added.
 EXPLAINED_REASONS = frozenset(
     {
         "no_remote_profile",
@@ -83,6 +86,7 @@ EXPLAINED_REASONS = frozenset(
         "remote_failed_infra",
         "remote_skipped",
         "operator_override",
+        "allocation_unstable",
         "remote_candidate_not_added",
     }
 )
@@ -318,12 +322,18 @@ def reasons(
     steering: Mapping[str, Any] | None,
     order_record: Mapping[str, Any] | None,
     attempts: Iterable[Mapping[str, Any]] = (),
+    *,
+    instability: Mapping[str, Any] | None = None,
 ) -> tuple[list[str], list[dict[str, str]]]:
     """Why a heavy stage reached the local candidate ``local_id``: reason codes in
     ``REASON_ORDER`` and each remote candidate's skip (provider id and reason code).
     ``attempts`` are the stage's earlier attempts: a remote candidate whose attempt failed on
     infrastructure is moved last by placement, which is ``remote_failed_infra`` (the provider
-    id and the failure class in ``detail``), not an untried remote."""
+    id and the failure class in ``detail``), not an untried remote. ``instability`` is the
+    placement's ADR 0148 record: when the operator's allocation-instability rule moved an
+    unstable remote candidate behind ``local_id`` (outcome ``allocation_unstable_fallback`` with
+    ``local_id`` eligible), that is the explicit reason ``allocation_unstable``, recorded with
+    the remote candidate in ``detail``; the warning is recorded, never silent."""
     skipped = list(skipped)
     remote = [pid for pid in base.candidate_ids if guard.is_remote(pid)]
     remote_skips = [item for item in skipped if guard.is_remote(item.provider_id)]
@@ -375,6 +385,11 @@ def reasons(
     else:
         tried = {item.provider_id for item in remote_skips} | set(infra_failed)
         untried = [pid for pid in remote if pid not in tried]
+        moved = _instability_moved(instability, local_id, remote)
+        if moved is not None:
+            found.add("allocation_unstable")
+            detail.append(moved)
+            untried = [pid for pid in untried if pid != moved["provider_id"]]
         if untried:
             # A remote candidate came after the local one in the order used.
             operator_ordered = order_record is not None and (
@@ -385,6 +400,20 @@ def reasons(
             elif "operator_override" not in found:
                 found.add("remote_not_tried")
     return [code for code in REASON_ORDER if code in found], detail
+
+
+def _instability_moved(
+    instability: Mapping[str, Any] | None, local_id: str, remote: list[str]
+) -> dict[str, str] | None:
+    """The remote candidate an ADR 0148 fallback moved behind ``local_id``, or None."""
+    from .campaign_allocation_instability import FALLBACK
+
+    if not instability or instability.get("outcome") != FALLBACK:
+        return None
+    head = instability.get("from_provider")
+    if head not in remote or local_id not in (instability.get("eligible") or ()):
+        return None
+    return {"provider_id": str(head), "reason": "allocation_unstable"}
 
 
 def record(

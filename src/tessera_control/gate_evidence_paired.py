@@ -128,6 +128,10 @@ def compute_paired_delta(
     units = {m[1]["unit"] for m in members} | {m[2]["unit"] for m in members}
     if len(units) != 1:
         raise PairedRefused("unit_mismatch", "The metric records use different units.")
+    # ADR 0169: a pair never crosses execution classes. Each arm's attempt is read for the
+    # Salad profile (one GPU class) it ran on; a pair whose two attempts ran on different
+    # classes (or one on a Salad class and one elsewhere) is refused, never paired.
+    execution_class = _pair_class(connection, members)
     if campaign_id is not None:
         attempts = {m[1]["attempt_id"] for m in members} | {m[2]["attempt_id"] for m in members}
         owned = {
@@ -187,8 +191,38 @@ def compute_paired_delta(
         "excluded_attempts": excluded,
         "pairs": pairs,
     }
+    if execution_class is not None:
+        # Absent for pairs off Salad, so every earlier result keeps its digest.
+        view["execution_class"] = execution_class
     view["result_digest"] = canonical_digest(view)
     return view
+
+
+def _pair_class(
+    connection: sqlite3.Connection, members: list[tuple[int, dict[str, Any], dict[str, Any]]]
+) -> str | None:
+    """The one execution class every paired attempt ran on (None off Salad); refuses a pair
+    whose arms ran on different classes with the closed code ``class_mismatch``."""
+    from .campaign_salad_fallback import attempt_class
+
+    seen: set[str | None] = set()
+    for seed, a, b in members:
+        left = attempt_class(connection, a["attempt_id"]) if a.get("attempt_id") else None
+        right = attempt_class(connection, b["attempt_id"]) if b.get("attempt_id") else None
+        if left != right:
+            raise PairedRefused(
+                "class_mismatch",
+                f"Seed {seed}: the arms ran on different execution classes; a paired "
+                "comparison never crosses GPU classes (rerun both arms on one class).",
+            )
+        seen.add(left)
+    if len(seen) > 1:
+        raise PairedRefused(
+            "class_mismatch",
+            "The pairs ran on different execution classes; a paired comparison stays on one "
+            "GPU class.",
+        )
+    return next(iter(seen), None)
 
 
 def paired_outcome(

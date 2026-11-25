@@ -105,9 +105,12 @@ def test_explained_reason_codes():
         "remote_failed_infra",
         "remote_skipped",
         "operator_override",
+        # ADR 0169: the operator's allocation-instability rule moved the remote class behind.
+        "allocation_unstable",
         "remote_candidate_not_added",
     }
     assert guard.explained(["remote_skipped"])
+    assert guard.explained(["allocation_unstable"])
     assert guard.explained(["not_listed", "operator_override"])
     assert not guard.explained(["not_listed"])
     assert not guard.explained(["remote_not_tried"])

@@ -197,6 +197,10 @@ pauses (`paused_delegation_lapsed`); a human re-approval of the same digest resu
 forward re-approval never extends the total bound: its expiry is capped at the first
 approval plus `deadline_seconds`, and one after that point is refused with 409. When an
 approval lapses the runner pauses the campaign with `approval_expired`.
+
+The agent view of a campaign (`tessera_get_campaign`) shows the approvals but omits
+`approving_principal_id`; only the owner view carries it.
+
 A re-approval of a `cancel_requested` or `blocked` campaign installs a live delegation for
 reduce-only cleanup only and never resumes forward work, so a lapsed approver cannot strand a cancel.
 
@@ -355,7 +359,7 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   stage's worst-case exposure (and a Salad stage's per-task ceiling), the approval view
   (`infra_retry_policy` on submit and every read) states it per stage, together with
   `max_reallocation_retries` (ADR 0179, shown even at its default of 2, which the stored spec
-  omits) and a `worst_case_attempts` of `max_attempts + infra_retries + max_reallocation_retries`,
+  omits) and a `worst_case_attempts` of `max_attempts + infra_retries + max_reallocation_retries` (plus `max_class_fallbacks` when set),
   and it applies on the
   confirmed-exit path (ADR 0053) too. Each is a new attempt with its own hold (against
   the campaign cap and project limits), grant, receipt and recorded reason; a task failure,
@@ -817,6 +821,26 @@ reports `available: true` as a **constant**: it is not evidence that Salad has C
 must not be read as one. The preflight checks the replica quota only; allocation is left to Salad
 (a stalled one ends at the route deadline). The provider's CPU-only group shape is untested live.
 
+**Alternate profiles ([ADR 0151](decisions/0151-salad-alternate-execution-profiles.md)).** The
+`salad` block may add `alternate_profiles`: one to four further operator profile names, distinct
+and not the stage's own `profile`, in the order the execution plane may move to them, only before
+any possible start ([ADR 0169](decisions/0169-salad-profile-fallback-policy.md): an attempt proven
+never started that settled at zero, at most `retry.max_class_fallbacks` times, which must be at
+least 1 when alternates are listed; never after a run that may have started or been billed). Absent
+(the default) leaves the spec, and its digest, exactly as before. Submit and approval check every
+listed profile exactly as the stage's own: registered and of this organization and project, the
+stage's worker, the same GPU or CPU kind as `salad.gpu`, the image digest in its allowlist, the
+stage's unchanged `max_exposure_cents` within its `max_run_cents` (and the CPU worst case within
+it), and the worst-case hold within its `max_task_cents`; a refusal (409) names the alternate.
+The approved spec digest binds the list, so approving the spec approves every listed profile up
+front and a profile not listed is never used. A review pre-approval of such a stage must cover
+every listed profile: its `plan_digest` is the stage's own profile's, and `alternate_profiles:
+[{"profile": NAME, "plan_digest": ...}]` names each alternate's (the plan's compute window
+depends on the profile; the source-assessment and source-use digests do not). An entry that omits
+a listed profile, or names one the spec does not list, is refused at approval with the profile
+named; an attempt on a profile the entry does not cover waits for a person (`wrong_profile`).
+`tessera campaign preapproval-digests` prints the per-profile digests with the others.
+
 **Data class.** By default a Salad stage may consume only snapshot sources the control
 plane records public (ADR 0039: a human declaration with license and source evidence at
 staging), and anything else is refused with 409 at submit and approve and again at
@@ -929,6 +953,26 @@ and manifest stores, reports the provider-confirmed exit only when the route sho
 termination without reallocation, and records its outcome. A route directory under the work
 directory marks a route as attempted: it is never run twice. The executor never approves,
 starts a route, resolves a decision, records a charge or reconciles a grant.
+
+`max_concurrent_paid_routes` (an integer from 1 to 4, default 1; anything else, including a
+boolean, a string or null, is refused when the config loads) bounds how many live-check
+children the executor drives at once. At 1 the executor is serial: each started route's child
+runs to completion inside the pass that started it. Above 1, a pass starts a child on its own
+thread and returns; later passes finish each child that returned with the same import,
+upload, exit report, guardian final status and outcome, in attempt order. All executor state
+stays on the pass's thread: a route's thread only waits for its child, and the child renews
+its own lease as it always has. A further route starts only when every bound holds: fewer
+routes in flight (plus attempts an earlier process left `executing`) than the configured
+value, no route has ended without a receipt since the in-flight set was last empty, and the
+guardian's own `max_open_billable_frames`, read from an in-flight route's guardian status,
+admits one more frame. Otherwise the route waits (`route_deferred`, with the reason): it stays
+`route_started` with its lease renewed, is not marked executing and has no route directory,
+so waiting is not a failure and nothing is retried. An unreadable guardian status, or one
+without the limit (a route the guardian has not reserved yet), waits too. The guardian still
+decides at reserve: a `single_operation_orphan_exposure` refusal inside a started child (a
+frame the executor cannot see, such as another worker's, still open) ends that attempt
+without a receipt, as before, and holds further concurrent starts until the in-flight routes
+finish. The stage watcher follows one in-flight route at a time; the others run unwatched.
 
 When the control service refuses a worker step, it records one `campaign.stage_rejection` event on
 the attempt's stage. This is provider-generic: the worker-facing control routes that every

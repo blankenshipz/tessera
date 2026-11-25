@@ -13,6 +13,10 @@ single-provider stage would when no candidate can ever pass. The decision, with 
 other candidate was skipped, is recorded as a ``campaign.stage_placed`` event and copied into
 the receipt.
 
+ADR 0148: when the operator turns on allocation instability, a candidate whose GPU class lost
+its allocation shortly after start too often moves behind eligible candidates for the next attempt
+(``campaign_allocation_instability``), recorded on the placement.
+
 A stage with no alternates is routed through ``decide`` only when an ADR 0058 reroute can apply
 (``reroute_due``: its last attempt was an infrastructure failure, or ran on a reroute target).
 Otherwise it keeps its single-provider behaviour, events and receipts unchanged, except that a
@@ -29,6 +33,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import (
+    campaign_allocation_instability,
+    campaign_class_fallback,
     campaign_heavy_guard,
     campaign_image_pull,
     campaign_placement_preference,
@@ -81,6 +87,9 @@ PERMANENT_REASONS = frozenset(
         # ADR 0058 limits on a candidate listed only in ``retry.reroute_providers``.
         "infra_retry_only",
         "reroute_refused",
+        # ADR 0060 addendum: this stage already failed before start on the candidate, with
+        # nothing spent; it moves on instead (``campaign_class_fallback``).
+        campaign_class_fallback.SKIP_REASON,
         # ADR 0107 amendment 2026-11-23b: a heavy stage's local candidate with no explicit
         # fallback reason; an approved spec never gains one, so the stage does not wait for it.
         campaign_heavy_guard.UNEXPLAINED_REASON,
@@ -128,6 +137,10 @@ class Decision:
     preference: dict[str, Any] | None = None
     # ADR 0107: the heavy-stage guard's warning (chosen local) or refusal (waiting), if any.
     heavy_guard: dict[str, Any] | None = None
+    # ADR 0148: the allocation instability record (counts per GPU class, fallback outcome).
+    allocation_instability: dict[str, Any] | None = None
+    # ADR 0060 addendum: the chosen candidate's class after earlier pre-start failures there.
+    class_index: int = 0
 
     @property
     def waiting(self) -> bool:
@@ -149,6 +162,10 @@ class Decision:
             value["preference"] = self.preference
         if self.heavy_guard is not None:  # absent keeps every earlier payload unchanged
             value["heavy_guard"] = self.heavy_guard
+        if self.allocation_instability is not None:  # absent unless the operator opted in
+            value["allocation_instability"] = self.allocation_instability
+        if self.class_index:  # absent keeps every earlier payload unchanged
+            value["class_index"] = self.class_index
         return value
 
 
@@ -408,6 +425,7 @@ def candidate_order(
     base: NormalStage,
     attempts: list[Mapping[str, Any]],
     order: tuple[str, ...] | None = None,
+    classes: Mapping[str, int] | None = None,
 ) -> tuple[tuple[str, ...], dict[str, Skip]]:
     """The order the candidates are tried in for the stage's next attempt, and the candidates
     that may not be used for it at all (ADR 0060 section 5a, one list with ADR 0058).
@@ -422,6 +440,10 @@ def candidate_order(
     A ``retry.reroute_providers`` target is used only for an infrastructure retry, or to stay
     where an earlier infrastructure retry moved the stage (``infra_retry_only`` otherwise).
 
+    A candidate on which attempts of this stage failed before start with nothing spent
+    (``prestart_no_spend``) on each of its ``classes`` (1 unless its provider offers more) is
+    not used again (``prestart_failed``): the stage moves on.
+
     ``order`` is the candidate list an operator placement preference produced (ADR 0070), a
     permutation of ``base.candidate_ids``; the retry rules above apply on top of it."""
     ids = base.candidate_ids if order is None else order
@@ -433,6 +455,12 @@ def candidate_order(
         for pid in base.reroute_ids:
             if pid not in base.placement_ids:
                 excluded[pid] = Skip(pid, "infra_retry_only", "only for an infrastructure retry")
+    for pid, count in sorted(campaign_class_fallback.failures(attempts, base.provider).items()):
+        if pid in ids and count >= (classes or {}).get(pid, 1):
+            excluded.setdefault(
+                pid,
+                Skip(pid, campaign_class_fallback.SKIP_REASON, "every class failed before start"),
+            )
     if latest is None:
         return ids, excluded
     if _infra(latest):
@@ -465,7 +493,24 @@ def decide(
         guard = campaign_heavy_guard.applies(connection, ctx.campaign, base, heavy_result)
     # Ordering counts the guard's signals, so what is heavy for ordering is heavy for the guard.
     ordered, preference = campaign_placement_preference.preferred_order(base, heavy_result[1])
-    ids, excluded = candidate_order(base, list(attempts or ()), ordered)
+    history = list(attempts or ())
+    failed = campaign_class_fallback.failures(history, base.provider)
+    classes = {
+        pid: campaign_class_fallback.class_count(stage_on_candidate(base, pid)) for pid in failed
+    }
+    ids, excluded = candidate_order(base, history, ordered, classes)
+    # ADR 0148: an unstable GPU class at the head lets eligible candidates go first; it only
+    # reorders the approved list, and every check below still runs on every candidate. The
+    # strict rule (ADR 0169): only while no earlier attempt of this stage may have started, so
+    # a stage never changes class after a possible start or spend.
+    instability = None
+    if campaign_allocation_instability.may_reorder(history):
+        blocked = {
+            pid: skip
+            for pid in ids
+            if (skip := excluded.get(pid) or steered_skip(pid, steering)) is not None
+        }
+        ids, instability = campaign_allocation_instability.reorder(rt, ctx, base, ids, blocked)
     # (position in ``ids``, skip): kept in candidate order however late a skip is decided.
     skips: list[tuple[int, Skip]] = []
     refusal: dict[str, Any] | None = None
@@ -481,7 +526,14 @@ def decide(
         """(skip, warning, defer) for a local candidate of a guarded heavy stage."""
         nonlocal refusal
         codes, detail = campaign_heavy_guard.reasons(
-            guard, base, pid, skipped(), steering, preference, attempts or ()
+            guard,
+            base,
+            pid,
+            skipped(),
+            steering,
+            preference,
+            history,
+            instability=instability,
         )
         if guard.refuses_unexplained(codes, detail):
             if not final:
@@ -509,10 +561,19 @@ def decide(
             not_evaluated,
             preference=_with_outcome(preference, pid, done),
             heavy_guard=warning,
+            allocation_instability=campaign_allocation_instability.with_outcome(instability, pid),
+            # ADR 0060 addendum: the class the chosen candidate runs on (0 unless earlier
+            # classes of it failed before start with nothing spent).
+            class_index=failed.get(pid, 0),
         )
 
     for index, pid in enumerate(ids):
+        # ADR 0060 addendum: a candidate whose earlier classes failed before start is checked
+        # (and runs) on its next class.
         stage = stage_on_candidate(base, pid)
+        if pid in failed and pid not in excluded:
+            # The profile the candidate's recorded pre-start switches name (ADR 0151 events).
+            stage = campaign_class_fallback.on_current_class(rt, ctx, base.key, stage)
         skip = (
             excluded.get(pid)
             or steered_skip(pid, steering)
@@ -550,6 +611,7 @@ def decide(
         steering,
         preference=_with_outcome(preference, None, done),
         heavy_guard=refusal,
+        allocation_instability=campaign_allocation_instability.with_outcome(instability, None),
     )
 
 
@@ -581,6 +643,13 @@ def failure_reason(decision: Decision) -> str:
         "not_pinned",
         "infra_retry_only",
     }
+    if campaign_class_fallback.SKIP_REASON in reasons:
+        # ADR 0060 addendum: budget and policy causes on the candidates left are reported
+        # first; the exhausted fallback is the verdict when nothing else refused.
+        others = reasons - {campaign_class_fallback.SKIP_REASON}
+        if not others:
+            return campaign_class_fallback.EXHAUSTED
+        reasons = others
     if "resource_limit_last_attempt" in reasons:
         # ADR 0067: budget and policy causes are reported first; the resource limit is the
         # verdict only when it is what left no candidate (every skip stays on the record).

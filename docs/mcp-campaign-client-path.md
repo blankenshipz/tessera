@@ -88,7 +88,8 @@ sha256 with `tessera_campaign_outputs`.
   caller's rows: the campaign list and its pages, the window report and its counts, holdout
   claims, stuck findings (list, scan result, acknowledge), delegation decisions and
   escalations, standing-approval starts and triggers, and `tessera_project_spend`'s per-status
-  totals (the operator's project limit row stays the shared project ceiling). A delegation's
+  totals; its limits carry the operator's configuration, its own held and settled totals over all
+  statuses and a `ceiling_has_headroom` boolean, never the project-wide held, settled or remaining. A delegation's
   `usage` totals are withheld from agents; an approved submission another agent consumed
   shows `campaign_withheld` instead of that campaign's id. Re-run links and the re-run tree
   are shown only for campaigns the caller may read. A person reads every campaign of their
@@ -112,6 +113,15 @@ sha256 with `tessera_campaign_outputs`.
   class, and `rejections` (the latest control refusal of a worker step, from any provider, for lease acquire, renewal, package and observation only: attempt, step, code, time
   and age, plus counts by code; see the Salad executor in [campaigns](campaigns.md)). Codes, ages and counts only: no failure detail or log text, no principal, credential or
   worker ids, no hosts or addresses; a free-text waiting reason is returned as `detail_withheld`.
+  A Salad stage also carries `salad_profiles` (ADR 0151): `profiles` (the operator profile keys in
+  the order they are tried, primary first; a single-profile stage lists one), `latest_attempt_profile`
+  (the key the latest attempt runs or ran on), `switches` (each pre-start move so far:
+  `from_profile`, `to_profile`, a reason code, the attempt numbers, `started` and `spent` (false)
+  and the time) and `outcome` (null, or when a move did not happen: the code
+  `profile_not_approved` or `post_start_switch_refused` (ADR 0169), a detail code, the attempt
+  number, the next profile key and `started`). Keys
+  outside the short `[a-z0-9_-]` shape are returned as `detail_withheld`. `tessera_campaign_logs`
+  shows the same `salad_profiles` object on each Salad stage.
   A caller in another organization gets the same 404 as for a missing campaign.
 - `budget:read` also unlocks the HTTP budget read of the agent's own campaigns (a person: any
   campaign of the organization), for credentials enrolled for results roll-ups as well; MCP registration gating

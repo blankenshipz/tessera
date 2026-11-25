@@ -4,7 +4,7 @@
 
 Accepted and implemented (2026-11-21). No schema change. Extends the Salad campaign profiles of
 [ADR 0038](0038-campaign-specs-and-platform-campaign-runner.md) and the provider plugin of
-[ADR 0040](0040-multi-stage-multi-vendor-campaigns.md). The runner core is unchanged.
+[ADR 0040](0040-multi-stage-multi-vendor-campaigns.md). The runner core is unchanged. Amended by [ADR 0191](0191-salad-cpu-fallback-and-concurrent-frames.md): a CPU profile may list operator `fallback_profiles`.
 
 ## Context
 

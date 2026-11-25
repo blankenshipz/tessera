@@ -30,6 +30,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from .campaign_allocation_instability import AllocationInstability
 from .campaign_heavy_remote import HeavyRemoteCandidate
 from .campaign_models import MAX_PLACEMENT_TAGS, NormalStage, PlacementTag, ProviderId
 
@@ -118,6 +119,8 @@ class PlacementPreferences(_Closed):
     heavy_unexplained_local: Literal["refuse", "warn"] = "refuse"
     # ADR 0141: the remote candidate submit adds to a heavy stage that lists none (absent: none).
     heavy_remote_candidate: HeavyRemoteCandidate | None = None
+    # ADR 0148: allocation instability per GPU class; absent (the default) is off.
+    allocation_instability: AllocationInstability | None = None
 
     @model_validator(mode="after")
     def _distinct(self) -> PlacementPreferences:

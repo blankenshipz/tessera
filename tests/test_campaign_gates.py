@@ -103,7 +103,9 @@ def test_agents_workers_and_external_scopes_never_write_a_gate_decision(sched):
     campaign = finished_campaign(sched)
     external = sched.env.agent(["campaign:submit", "campaign:read", "campaign:cancel"], "ext")
     for actor in (sched.env.agent(name="plain"), external, sched.env.worker):
-        with pytest.raises(Forbidden):
+        # An agent that did not submit the campaign finds nothing (NotFound, never a 403 that
+        # would confirm the id exists); a worker is Forbidden. Either way nothing is written.
+        with pytest.raises((Forbidden, NotFound)):
             decide(sched, campaign, actor=actor)
     unlabelled = {k: v for k, v in sched.env.owner.items() if k != "automation_label"}
     with pytest.raises(Forbidden):

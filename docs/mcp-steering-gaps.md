@@ -146,11 +146,14 @@ Notes:
 
 `tessera_project_spend` (`GET /projects/{p}/agent-spend`):
 without it a client could read one campaign's cap but not the ceiling it works within. It
-returns the project's limits row (currency, monetary limit, max concurrency, held, settled,
-remaining) when one is configured and per-status campaign totals, from explicit columns. It is
-ledger data, not provider billing, and changes nothing. It is project-scoped on purpose: any
-`budget:read` credential for the project sees the project's totals, including campaigns other
-agents submitted, and nothing per-principal or per-credential. No ADR: it narrows nothing and grants
+returns the project's limits when one is configured and per-status campaign totals, from
+explicit columns. A person sees the full row (currency, monetary limit, max concurrency, held,
+settled, remaining). An agent credential sees the currency, monetary limit and max concurrency,
+its own campaigns' `own_held_cents` and `own_settled_cents` (all statuses) and
+`ceiling_has_headroom` (whether the shared held plus settled is still below the limit); the
+project-wide aggregates would reveal other agents' spend and are not returned. It is
+ledger data, not provider billing, and changes nothing. It is project-scoped: any
+`budget:read` credential for the project sees the same configuration, and nothing per-credential. No ADR: it narrows nothing and grants
 nothing, and ADR 0047's destination rules are untouched.
 
 When a tool is still on another change, mark it "(pending)" here: the consistency test fails

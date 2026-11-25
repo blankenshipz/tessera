@@ -107,8 +107,10 @@ def test_budget_reduction_is_scoped_submitter_only_and_not_for_unapproved_or_fin
     cid = campaign["id"]
     url = f"/campaigns/{cid}/budget-reduction"
     payload = {"expected_revision": _revision(env, cid), "budget_cap_cents": 4, "reason": "x"}
-    assert _post(client, url, "other-agent", payload, "o").status_code == 403
-    assert _post(client, url, "reader", payload, "r").status_code == 403
+    # A campaign another agent submitted looks missing (the same 404 as an unknown id), so a
+    # refusal never confirms that it exists (tests/test_campaign_write_existence_oracle.py).
+    assert _post(client, url, "other-agent", payload, "o").status_code == 404
+    assert _post(client, url, "reader", payload, "r").status_code == 404
     env.execute("UPDATE campaigns SET status='failed' WHERE id=?", cid)
     assert _post(client, url, "owner-agent", payload, "f").status_code == 409
     fresh = env.submit(env.agent(SUBMIT, "owner-agent"))  # never approved
@@ -164,8 +166,9 @@ def test_a_release_is_revoked_only_for_a_finished_own_campaign_and_one_it_used(w
     payload = {"expected_revision": env.release_revision, "reason": "stale"}
     assert _post(client, url, "owner-agent", payload, "a").status_code == 404  # no attempt used it
     _attempt(env, cid)
-    assert _post(client, url, "other-agent", payload, "b").status_code == 403
-    assert _post(client, url, "reader", payload, "c").status_code == 403
+    # Another agent's campaign looks missing, never forbidden (no existence oracle).
+    assert _post(client, url, "other-agent", payload, "b").status_code == 404
+    assert _post(client, url, "reader", payload, "c").status_code == 404
     assert (
         _post(client, url, "owner-agent", {**payload, "expected_revision": 7}, "d").status_code
         == 409
@@ -194,8 +197,11 @@ def test_the_grant_view_needs_campaign_logs_and_lists_recorded_columns_only(worl
     env, client = world
     campaign = _running(env)
     url = f"/campaigns/{campaign['id']}/grants"
-    ok = client.get(url, headers={**_token("reader"), **DEST})
+    # An agent credential reads only the campaigns it submitted (audit O-05): the submitter
+    # sees its grants, a reader with the same scopes that did not submit the campaign gets 404.
+    ok = client.get(url, headers={**_token("owner-agent"), **DEST})
     assert ok.status_code == 200 and ok.json()["grants"] == []
+    assert client.get(url, headers={**_token("reader"), **DEST}).status_code == 404
     env.agent(["campaign:read"], "nologs")
     assert client.get(url, headers={**_token("nologs"), **DEST}).status_code == 403
     assert (
