@@ -353,7 +353,10 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   retried by the runner itself, up to `retry.infra_retries` (off by default; 0 to 3) extra
   attempts that use no scientific retry; enabling it puts it in the approved digest and in the
   stage's worst-case exposure (and a Salad stage's per-task ceiling), the approval view
-  (`infra_retry_policy` on submit and every read) states it per stage, and it applies on the
+  (`infra_retry_policy` on submit and every read) states it per stage, together with
+  `max_reallocation_retries` (ADR 0179, shown even at its default of 2, which the stored spec
+  omits) and a `worst_case_attempts` of `max_attempts + infra_retries + max_reallocation_retries`,
+  and it applies on the
   confirmed-exit path (ADR 0053) too. Each is a new attempt with its own hold (against
   the campaign cap and project limits), grant, receipt and recorded reason; a task failure,
   a refused step, a policy or budget refusal and any unknown effect are never retried this

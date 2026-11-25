@@ -398,3 +398,11 @@ number of re-binds is bounded by `max_prestart_rebinds` (default 3; 0 turns the 
 above 10 are refused at startup). Once the bound is spent, once any instance ran, or once any custody
 began, a change of allocation stops the run with `allocation_changed` exactly as before, and a guardian
 that cannot tell whether custody began stops too.
+
+A stop on `allocation_changed` after an instance ran but before any custody work (the workload
+called no begin-once, no input was served, no output was requested or written) is reported on the
+live receipt as `provider_reallocated_before_custody` when the provider confirmed the exact group
+stopped, and the status says `custody_work_begun: false`. The campaign runner may then place a
+fresh attempt (never a re-bind of the old instance), bounded by `retry.max_reallocation_retries`
+and the budget cap ([ADR 0179](decisions/0179-precustody-reallocation-retry.md)). After custody
+work began, or when the guardian cannot say, the stop keeps `provider_stopped_custody_unsealed`.

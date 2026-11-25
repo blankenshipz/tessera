@@ -19,6 +19,7 @@ from typing import Any
 from . import provider_trust
 from .campaign_delegation import STEP_TABLE
 from .campaign_image_pull import DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES
+from .campaign_infra_retry import REALLOCATED_PRECUSTODY
 from .campaign_models import SALAD_BACKEND, SALAD_RUNTIME, SALAD_TARGET, SaladStageSpec
 from .campaign_providers import (
     ComputeProvider,
@@ -490,7 +491,12 @@ class SaladRouteProvider:
                 )
         # Every attempt holds its own exposure, an enabled infrastructure retry (ADR 0058)
         # included: the operator's billable per-task ceiling counts them all.
-        attempts = stage.retry.max_attempts + stage.retry.infra_retries
+        # A pre-custody reallocation retry (ADR 0179) is one more attempt with its own hold.
+        attempts = (
+            stage.retry.max_attempts
+            + stage.retry.infra_retries
+            + stage.retry.max_reallocation_retries
+        )
         if stage.max_exposure_cents * attempts > profile.max_task_cents:
             raise Conflict("Salad stage worst-case hold exceeds the profile's per-task ceiling.")
 
@@ -580,7 +586,25 @@ class SaladRouteProvider:
             )
         if verdict is None:
             return Observation("running")
-        detail = f"salad:{attempt.get('failure_detail') or 'not_passed'}"[:500]
+        failure_detail = str(attempt.get("failure_detail") or "")
+        # The class is durable: before the runner records its observation the detail carries it;
+        # afterwards the stored failure_class (and the ``salad:``-prefixed detail) do, so a
+        # repeated observe of the same attempt gives the same answer.
+        failure_detail = failure_detail.removeprefix("salad:")
+        stored_class = attempt.get("failure_class")
+        if stored_class == REALLOCATED_PRECUSTODY or failure_detail.startswith(
+            REALLOCATED_PRECUSTODY
+        ):
+            # ADR 0179: moved by the provider before any custody work; a fresh attempt may retry.
+            return Observation(
+                "failed_transient",
+                failure_class=REALLOCATED_PRECUSTODY,
+                detail=f"salad:{failure_detail}"[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        detail = f"salad:{failure_detail or 'not_passed'}"[:500]
         return Observation(
             "failed_permanent",
             failure_class="salad_not_passed",

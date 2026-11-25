@@ -59,8 +59,10 @@ from .campaign_infra_retry import (
     INFRA_CONTAINER_KILLED,
     INFRA_PREFIX,
     INFRA_RESOURCE_LIMIT,
+    REALLOCATED_PRECUSTODY,
     RESOURCE_LIMIT_CLASSES,
     infra_attempts,
+    reallocation_attempts,
     resource_limit_stop,
 )
 from .campaign_io import (
@@ -1732,9 +1734,19 @@ class CampaignRunner:
                 return self._stage_failed(ctx, key, f"holdout_spent:{latest['failure_class']}")
             # An attempt that never started uses an attempt number, not a scientific retry.
             # An infrastructure retry (ADR 0058) has its own bound, not a scientific one.
+            realloc_used = reallocation_attempts(attempts)
             scientific = (
-                stage["attempts_used"] - not_started_count(attempts) - infra_attempts(attempts)
+                stage["attempts_used"]
+                - not_started_count(attempts)
+                - infra_attempts(attempts)
+                - realloc_used
             )
+            if (
+                latest["failure_class"] == REALLOCATED_PRECUSTODY
+                and realloc_used > spec_stage.retry.max_reallocation_retries
+            ):
+                # ADR 0179: the bound on fresh attempts after a pre-custody reallocation.
+                return self._stage_failed(ctx, key, f"{REALLOCATED_PRECUSTODY}_exhausted")
             if (
                 stopping
                 or scientific >= spec_stage.retry.max_attempts
@@ -2586,7 +2598,11 @@ class CampaignRunner:
         # stage's own exposure is the per-run cap every candidate fits under (ADR 0060).
         budget = min(
             ctx.spec.stage(key).max_exposure_cents
-            * (spec_stage.retry.max_attempts + spec_stage.retry.infra_retries),
+            * (
+                spec_stage.retry.max_attempts
+                + spec_stage.retry.infra_retries
+                + spec_stage.retry.max_reallocation_retries
+            ),
             EXPERIMENT_CEILING_CENTS,
         )
 

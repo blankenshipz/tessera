@@ -481,14 +481,21 @@ def test_submit_enforces_the_operator_profile_ceilings(tmp_path):
 
     world = SaladWorld(tmp_path, max_run_cents=25, max_task_cents=30)
     env = world.env
-    ok = submit(world, salad_spec(env, [salad_stage(env, "g1", hold=25)]))
+    one_attempt = {"retry": {"max_attempts": 1, "max_reallocation_retries": 0}}
+    ok = submit(world, salad_spec(env, [salad_stage(env, "g1", hold=25, **one_attempt)]))
     assert ok[0] == 201
     world.counter += 1
     with pytest.raises(Conflict, match="per-run ceiling"):
-        submit(world, salad_spec(env, [salad_stage(env, "g1", hold=26)]))
+        submit(world, salad_spec(env, [salad_stage(env, "g1", hold=26, **one_attempt)]))
     world.counter += 1
     with pytest.raises(Conflict, match="per-task ceiling"):
         submit(world, salad_spec(env, [salad_stage(env, "g1", hold=20, attempts=2)]))
+    world.counter += 1
+    # ADR 0179: the default two reallocation retries are attempts too, 3 x 10 fits 30, 3 x 11 not.
+    assert submit(world, salad_spec(env, [salad_stage(env, "g1", hold=10)]))[0] == 201
+    world.counter += 1
+    with pytest.raises(Conflict, match="per-task ceiling"):
+        submit(world, salad_spec(env, [salad_stage(env, "g1", hold=11)]))
     world.counter += 1
     unknown = salad_stage(env, "g1")
     unknown["salad"] = {**unknown["salad"], "profile": "other"}

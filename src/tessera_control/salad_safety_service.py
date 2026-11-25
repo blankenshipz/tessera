@@ -1118,6 +1118,16 @@ class SaladSafetyService:
         status["input_delivery"] = (
             self.inputs.status(row["operation"]) if self.inputs else dict(ticket_held=False)
         )
+        # Custody work proper (not merely a run seen, nor the recovery a reallocation sets): the
+        # workload began, an input was served, or an output was requested or written. A stop
+        # before any of it is a provider-side interruption a fresh attempt can retry.
+        status["custody_work_begun"] = bool(
+            row["begun"]
+            or row["output"]
+            or row["input_requests"]
+            or row["output_requests"]
+            or (self.inputs is not None and self.inputs.served(row["operation"]))
+        )
         # ADR 0160: the exact provider group this verdict is about (None before any bind), so a
         # caller can match a stop to the group control recorded and never to another one.
         status["provider_id"] = row["provider_id"]

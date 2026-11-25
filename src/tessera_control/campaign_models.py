@@ -108,6 +108,7 @@ StageInput = Annotated[SnapshotSource | StageSource, Field(discriminator="kind")
 # the kernel's out-of-memory killer, ADR 0058) rather than the task failing.
 DEFAULT_INFRA_EXIT_CODES = (137,)
 DEFAULT_INFRA_RETRIES = 0
+DEFAULT_REALLOCATION_RETRIES = 2
 
 
 class RetryPolicy(_Strict):
@@ -121,6 +122,12 @@ class RetryPolicy(_Strict):
     # and counted in the stage's worst-case exposure. Never for a task failure, a policy
     # refusal or a budget refusal. Each is a new attempt with its own hold and receipt.
     infra_retries: Annotated[int, Field(strict=True, ge=0, le=3)] = DEFAULT_INFRA_RETRIES
+    # ADR 0179: fresh attempts, beyond max_attempts, after the provider reallocated the instance
+    # before any custody work began. Each is a new attempt with its own hold and receipt, so the
+    # budget cap bounds the spend; at its default it is not serialized, so existing digests hold.
+    max_reallocation_retries: Annotated[int, Field(strict=True, ge=0, le=3)] = (
+        DEFAULT_REALLOCATION_RETRIES
+    )
     infra_exit_codes: Annotated[
         list[Annotated[int, Field(strict=True, ge=1, le=255)]], Field(min_length=1, max_length=8)
     ] = list(DEFAULT_INFRA_EXIT_CODES)  # noqa: RUF012 - pydantic copies defaults
@@ -142,6 +149,8 @@ class RetryPolicy(_Strict):
         value = handler(self)
         if self.infra_retries == DEFAULT_INFRA_RETRIES:
             value.pop("infra_retries", None)
+        if self.max_reallocation_retries == DEFAULT_REALLOCATION_RETRIES:
+            value.pop("max_reallocation_retries", None)
         if tuple(self.infra_exit_codes) == DEFAULT_INFRA_EXIT_CODES:
             value.pop("infra_exit_codes", None)
         if not self.reroute_providers:
@@ -2021,6 +2030,7 @@ FAILURE_CLASSES = (
     "t1_salad_unclaimed",
     "infra_container_killed",
     "infra_resource_limit",
+    "provider_reallocated_before_custody",
     "not_started",
     "exit_confirmed_unresolved",
     "exited_without_report",

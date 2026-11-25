@@ -172,7 +172,9 @@ def test_enabled_infrastructure_retries_count_against_the_billable_task_ceiling(
             return stage.model_copy(
                 update={
                     "max_exposure_cents": exposure,
-                    "retry": RetryPolicy(max_attempts=1, **retry),
+                    "retry": RetryPolicy(
+                        max_attempts=1, **{"max_reallocation_retries": 0, **retry}
+                    ),
                 }
             )
 

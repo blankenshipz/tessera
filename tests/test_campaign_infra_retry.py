@@ -330,7 +330,8 @@ def test_the_stage_experiment_budget_ceiling_covers_every_attempt_it_may_make(tm
             "s1",
             metrics=METRIC,
             max_exposure_cents=1000,
-            retry={"max_attempts": 1, "infra_retries": 3},
+            # ADR 0179's reallocation retries are off here: this test counts the infra bound.
+            retry={"max_attempts": 1, "infra_retries": 3, "max_reallocation_retries": 0},
         )
     ]
     cid = world.campaign(spec)["id"]
@@ -472,14 +473,16 @@ def test_the_approval_time_view_states_the_infrastructure_retry_policy(tmp_path,
             "infra_retries": 0,
             "infra_exit_codes": [137],
             "reroute_providers": [],
-            "worst_case_attempts": 1,
+            "max_reallocation_retries": 2,
+            "worst_case_attempts": 3,
         },
         "loud": {
             "stage_key": "loud",
             "infra_retries": 3,
             "infra_exit_codes": [137],
             "reroute_providers": ["lab-box"],
-            "worst_case_attempts": 5,
+            "max_reallocation_retries": 2,
+            "worst_case_attempts": 7,
         },
     }
     # The submit response (what the approver is shown) and every later read say so, even

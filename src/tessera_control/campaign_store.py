@@ -122,14 +122,21 @@ def infra_retry_policy(spec: Any) -> list[dict[str, Any]]:
 
     The stored spec omits the policy fields at their defaults, so "off" would be invisible in
     it; this states every stage's bound, the exit codes that count, the providers a retry may
-    move to and the attempts its holds are counted over, always."""
+    move to, the pre-custody reallocation retries (ADR 0179) and the attempts its holds are
+    counted over, always."""
     return [
         {
             "stage_key": stage.key,
             "infra_retries": stage.retry.infra_retries,
             "infra_exit_codes": list(stage.retry.infra_exit_codes),
             "reroute_providers": list(stage.retry.reroute_providers),
-            "worst_case_attempts": stage.retry.max_attempts + stage.retry.infra_retries,
+            # ADR 0179: shown even at its default (2), which the stored spec omits.
+            "max_reallocation_retries": stage.retry.max_reallocation_retries,
+            "worst_case_attempts": (
+                stage.retry.max_attempts
+                + stage.retry.infra_retries
+                + stage.retry.max_reallocation_retries
+            ),
         }
         for stage in normalize(spec).stages
     ]

@@ -26,6 +26,18 @@ INFRA_RESOURCE_LIMIT = "infra_resource_limit"
 RESOURCE_LIMIT_CLASSES = frozenset({INFRA_CONTAINER_KILLED, INFRA_RESOURCE_LIMIT})
 
 
+# ADR 0179: the provider moved the instance before any custody work (begin-once, an input
+# served, an output requested or written). Nothing was produced or received, so a FRESH attempt
+# on a new instance may retry it; the old instance is never re-bound. Bounded by
+# ``retry.max_reallocation_retries``, and every attempt keeps its own hold under the budget cap.
+REALLOCATED_PRECUSTODY = "provider_reallocated_before_custody"
+
+
+def reallocation_attempts(attempts: Sequence[Mapping[str, Any]]) -> int:
+    """Attempts of a stage that ended on a reallocation before custody began."""
+    return sum(1 for a in attempts if (a["failure_class"] or "") == REALLOCATED_PRECUSTODY)
+
+
 def infra_attempts(attempts: Sequence[Mapping[str, Any]]) -> int:
     """Attempts of a stage that ended for an infrastructure reason."""
     return sum(1 for a in attempts if str(a["failure_class"] or "").startswith(INFRA_PREFIX))

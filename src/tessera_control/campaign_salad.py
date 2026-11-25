@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import campaign_preapproval, provider_trust
 from . import execution_frames as frames
+from .campaign_infra_retry import REALLOCATED_PRECUSTODY
 from .campaign_models import (
     SALAD_TARGET,
     TERMINAL_CAMPAIGN,
@@ -1566,11 +1567,17 @@ class SaladStageDriver:
         ):
             return "unknown", "no confirmed exited worker observation", None
         provider = [r for r in state["receipts"] if r.get("provenance") == "provider"]
-        return (
-            "failed",
-            "allocation changed; termination confirmed by provider read",
-            self._evidence(row, state, provider, None),
-        )
+        receipt = json.loads(row["live_receipt_json"]) if row["live_receipt_json"] else {}
+        detail = "allocation changed; termination confirmed by provider read"
+        if (
+            receipt.get("reason") == REALLOCATED_PRECUSTODY
+            and receipt.get("guardian_stop_cause") == "allocation_changed"
+            and receipt.get("custody_work_begun") is False
+        ):
+            # ADR 0179: the guardian's own word that no custody work began. The class rides on
+            # the detail so the provider adapter reports a retryable interruption.
+            detail = f"{REALLOCATED_PRECUSTODY}: {detail}"
+        return "failed", detail, self._evidence(row, state, provider, None)
 
     def _termination_unconfirmed(
         self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]

@@ -27,6 +27,9 @@ from pathlib import Path
 # How long a group that reads stopped may take to read settled (no change in flight, no instance)
 # before start is attempted anyway and the transport's own exact read decides.
 PRESTART_SETTLE_SECONDS = 45
+# The guardian stopped on a reallocation before any custody work: the provider moved an instance
+# that had produced and received nothing, so a fresh attempt may retry it (ADR 0179).
+PRECUSTODY_REALLOCATION = "provider_reallocated_before_custody"
 MAX_ROUTE_SECONDS = 7200
 MAX_POLLS = 720
 
@@ -622,6 +625,11 @@ class SaladLiveSession:
             rate_read_retries=_count(status.get("rate_read_retries")),
             provider_read_retries=_count(status.get("provider_read_retries")),
             stop_cause=_cause(status.get("stop_cause")),
+            custody_work_begun=(
+                status.get("custody_work_begun")
+                if type(status.get("custody_work_begun")) is bool
+                else None
+            ),
             last_workload_refusal=_cause(status.get("last_workload_refusal")),
             last_rate_read_failure=_cause(status.get("last_rate_read_failure")),
             last_provider_read_failure=_cause(status.get("last_provider_read_failure")),
@@ -1176,6 +1184,10 @@ def _drive(
         "guardian_rate_read_retries": None,
         "guardian_provider_read_retries": None,
         "guardian_stop_cause": None,
+        # Whether custody work (begin-once, an input served, an output requested or written)
+        # had begun when the guardian stopped: False only on the guardian's own word, None when
+        # unknown. With a reallocation stop it classifies the run as retryable (ADR 0179).
+        "custody_work_begun": None,
         # Latest closed code with which the guardian refused a workload call, if any
         # (e.g. a container that called begin-once before its instance could be bound).
         # ADVISORY: recorded before the call's token binds, so it is a diagnostic hint only.
@@ -1477,6 +1489,7 @@ def _drive(
             receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
             receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
             receipt["guardian_stop_cause"] = evidence.get("stop_cause")
+            receipt["custody_work_begun"] = evidence.get("custody_work_begun")
             receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
             receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
             receipt["guardian_last_provider_read_failure"] = evidence.get(
@@ -1547,6 +1560,7 @@ def _drive(
                 receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
                 receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
                 receipt["guardian_stop_cause"] = evidence.get("stop_cause")
+                receipt["custody_work_begun"] = evidence.get("custody_work_begun")
                 receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
                 receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
                 receipt["guardian_last_provider_read_failure"] = evidence.get(
@@ -1571,7 +1585,12 @@ def _drive(
                     break
                 if evidence.get("provider_stop_confirmed"):
                     # Spend closed but custody can never seal: waiting cannot help.
-                    receipt["reason"] = "provider_stopped_custody_unsealed"
+                    receipt["reason"] = (
+                        PRECUSTODY_REALLOCATION
+                        if receipt["guardian_stop_cause"] == "allocation_changed"
+                        and receipt["custody_work_begun"] is False
+                        else "provider_stopped_custody_unsealed"
+                    )
                     break
                 if clock() >= stop_deadline:
                     break
@@ -1587,6 +1606,7 @@ def _drive(
         receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
         receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
         receipt["guardian_stop_cause"] = evidence.get("stop_cause")
+        receipt["custody_work_begun"] = evidence.get("custody_work_begun")
         receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
         receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
         receipt["guardian_last_provider_read_failure"] = evidence.get("last_provider_read_failure")
@@ -1655,7 +1675,10 @@ def _drive(
                 if receipt["create_rejection"].get("status") == 0
                 else "provider_rejected_request"
             )
-        elif receipt["reason"] != "provider_stopped_custody_unsealed":
+        elif receipt["reason"] not in {
+            "provider_stopped_custody_unsealed",
+            PRECUSTODY_REALLOCATION,
+        }:
             receipt["reason"] = "custody_stop_or_reconnect_unresolved"
     return receipt
 
