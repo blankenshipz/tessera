@@ -15,8 +15,10 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -25,7 +27,7 @@ from tessera_control.image_build_models import MAX_RESULT_BYTES, repository_regi
 from tessera_control.persistent_output_storage import validate_persistent_output_storage
 
 from .chunked_inputs import materialize_chunked_snapshot, verify_chunked_authority
-from .control_channel import classify_control_failure
+from .control_channel import ControlChannelError, classify_control_failure
 from .cpu import EGRESS_PROFILE, CpuOperation
 from .image_build import ImageBuildError, builder_argv, parse_build_result
 from .inputs import materialize_snapshot
@@ -50,6 +52,43 @@ DELIVERY_MAX_AGE = timedelta(hours=24)
 # renewal follows). It is never shorter than the minimum request time.
 REPORT_LEASE_RESERVE_SECONDS = 10.0
 MIN_REPORT_REQUEST_SECONDS = 1.0
+# Authority re-reads (the lease's package) can be sent at a bounded cadence, not on every tick:
+# the development worker re-reads at most once per this many seconds (one renewal interval) by
+# default, and every renewal forces one. Revocation and fencing are still seen by the renewal.
+AUTHORITY_MAX_AGE_SECONDS = 10.0
+# A transient control failure (timeout, connection error, 5xx) during an authority check does
+# not deny a lease that still has more than this margin left: the lease's own expiry, not one
+# slow answer, bounds how long an unconfirmed operation runs. The margin leaves time for the
+# cancellation to land before control's lease actually expires.
+LEASE_SAFETY_MARGIN_SECONDS = 5.0
+# A control request made while the stage runs on a lease is never given less than this, even when
+# the lease has less time left (the margin above absorbs it).
+MIN_LEASE_REQUEST_SECONDS = 1.0
+
+
+def lease_request_seconds(
+    channel_timeout: float, seconds_left: float, *, attempts: int = 1
+) -> float:
+    """One control request's time limit while a stage runs on a lease (ADR 0178).
+
+    ``seconds_left`` is the lease's time left less ``LEASE_SAFETY_MARGIN_SECONDS``. The limit is
+    the channel's timeout, cut to an ``attempts``-th share of that time (so that many attempts
+    fit before the deadline), and never below ``MIN_LEASE_REQUEST_SECONDS``.
+    """
+    share = max(0.0, seconds_left) / max(1, attempts)
+    return min(float(channel_timeout), max(MIN_LEASE_REQUEST_SECONDS, share))
+
+
+def is_transient_control_failure(error: BaseException) -> bool:
+    """A control failure a retry can get through: no answer in time, a lost connection, 5xx.
+
+    Classified positively: only a ``ControlChannelError`` (the HTTP channel turns every
+    transport failure into one) or a ``TimeoutError`` that ``classify_control_failure`` calls
+    transient. Any other exception (a local journal or programming error) is not.
+    """
+    return isinstance(error, (ControlChannelError, TimeoutError)) and (
+        classify_control_failure(error) == "transient"
+    )
 
 
 class ObservationDeliveryPending(SupervisorError):
@@ -142,6 +181,16 @@ class CpuRuntime:
         )
         # Injectable so retry timing is testable without sleeping.
         self._clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self._monotonic: Callable[[], float] = time.monotonic
+        # Wall-clock time compared with the lease's expiry by the transient-failure grace.
+        self._lease_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        # (lease_id, epoch, validated package response, monotonic read time) of the last
+        # authority read, reused for ``authority_max_age_seconds`` by ticks only. Both settings
+        # below are off for a bare runtime (a read on every tick, any failed read denies); the
+        # development worker, which retries stalled renewals, turns them on (ADR 0178).
+        self._authority: tuple[str, int, dict[str, Any], float] | None = None
+        self.authority_max_age_seconds = 0.0
+        self.transient_lease_grace = False
         self._initialize_observation_journal()
         self._initialize_package_refresh_journal()
         self.supervisor = CpuSupervisor(
@@ -179,13 +228,31 @@ class CpuRuntime:
             body["persistent_output_storage"] = self.persistent_output_storage
         return body
 
-    def _current_package(self, lease_id: str, epoch: int) -> dict[str, Any]:
-        """Read current authority with a durable fresh key, not a cached package reply."""
+    def _current_package(
+        self, lease_id: str, epoch: int, *, max_age: float = 0.0
+    ) -> dict[str, Any]:
+        """Read current authority with a durable fresh key, not a cached package reply.
 
+        With ``max_age`` > 0 a validated read of the same lease and epoch made less than
+        ``max_age`` seconds ago is reused instead of posting again (bounded cadence).
+        """
+
+        cached = self._authority
+        if (
+            max_age > 0
+            and cached is not None
+            and cached[0] == lease_id
+            and cached[1] == epoch
+            and 0 <= self._monotonic() - cached[3] < max_age
+        ):
+            return cached[2]
         key = self._package_refresh_key(lease_id, epoch)
         try:
-            response = self.channel.post(
-                f"/worker/leases/{lease_id}/package", self._package_body(epoch), key
+            response = self._post_capped(
+                f"/worker/leases/{lease_id}/package",
+                self._package_body(epoch),
+                key,
+                self._authority_request_seconds(lease_id, epoch),
             )
             self._validate_package(response, lease_id, epoch)
         except Exception:
@@ -193,7 +260,52 @@ class CpuRuntime:
             # replays it rather than silently treating a stale cached reply as live.
             raise
         self._complete_package_refresh(lease_id, epoch)
+        self._authority = (lease_id, epoch, response, self._monotonic())
         return response
+
+    def _lease_seconds_left(self) -> float | None:
+        """The held lease's time left less the safety margin, on the lease clock."""
+        if self.lease is None:
+            return None
+        left = (self.lease.expires_at - self._lease_clock()).total_seconds()
+        return left - LEASE_SAFETY_MARGIN_SECONDS
+
+    def _channel_timeout(self) -> float | None:
+        """The channel's own request timeout when a single call can be capped below it."""
+        channel_timeout = getattr(self.channel, "timeout_seconds", None)
+        if type(channel_timeout) not in {int, float}:
+            return None
+        try:
+            accepts = "timeout_seconds" in inspect.signature(self.channel.post).parameters
+        except (AttributeError, TypeError, ValueError):
+            accepts = False
+        return float(channel_timeout) if accepts else None
+
+    def _authority_request_seconds(self, lease_id: str, epoch: int) -> float | None:
+        """An authority read's time limit: capped by the held lease's time left (ADR 0178).
+
+        Only where a transient failure is tolerated until the lease's deadline (the
+        development worker): a read that hangs must return by then, so the stage is cancelled
+        before control's lease expires. ``None`` (the channel's own timeout) otherwise.
+        """
+        if not self.transient_lease_grace:
+            return None
+        lease = self.lease
+        if lease is None or lease.id != lease_id or lease.epoch != epoch:
+            return None
+        channel_timeout = self._channel_timeout()
+        left = self._lease_seconds_left()
+        if channel_timeout is None or left is None:
+            return None
+        return lease_request_seconds(channel_timeout, left)
+
+    def _post_capped(
+        self, path: str, payload: dict[str, Any], key: str, seconds: float | None
+    ) -> dict[str, Any]:
+        """Post, with a per-call time limit when one is given and the channel takes it."""
+        if seconds is None or self._channel_timeout() is None:
+            return self.channel.post(path, payload, key)
+        return self.channel.post(path, payload, key, timeout_seconds=seconds)
 
     def _validate_package(self, response: dict[str, Any], lease_id: str, epoch: int) -> None:
         try:
@@ -533,12 +645,31 @@ class CpuRuntime:
         if self.descriptor is None:
             return False
         try:
-            response = self._current_package(lease.id, lease.epoch)
-            return response["package_digest"] == self.descriptor["control"][
-                "package_digest"
-            ] and datetime.fromisoformat(response["lease"]["expires_at"]) > datetime.now(UTC)
-        except Exception:
+            response = self._current_package(
+                lease.id, lease.epoch, max_age=self.authority_max_age_seconds
+            )
+            return (
+                response["package_digest"] == self.descriptor["control"]["package_digest"]
+                and datetime.fromisoformat(response["lease"]["expires_at"]) > self._lease_clock()
+            )
+        except Exception as error:
+            return self._transient_grace(lease, error)
+
+    def _transient_grace(self, lease: Lease, error: BaseException) -> bool:
+        """Whether a failed authority read leaves the lease standing.
+
+        Only a transient control failure (no answer, a timeout, a 5xx; see
+        ``is_transient_control_failure``) does, and only while the lease this worker holds has
+        more than ``LEASE_SAFETY_MARGIN_SECONDS`` left. A refusal (409, 404, an authority-gone
+        403), a rejected credential, a local error, a malformed or changed package, or a lease
+        near its expiry denies, as before.
+        """
+        if not self.transient_lease_grace:
             return False
+        if not is_transient_control_failure(error):
+            return False
+        left = (lease.expires_at - self._lease_clock()).total_seconds()
+        return left > LEASE_SAFETY_MARGIN_SECONDS
 
     def start(self, lease_id: str, epoch: int) -> DriverResult:
         """Recover an existing identity or stage exactly one newly admitted package."""
@@ -699,13 +830,23 @@ class CpuRuntime:
         finally:
             os.unlink(temporary)
 
-    def _refresh_lease(self) -> None:
+    def _refresh_lease(self, *, max_age: float = 0.0) -> None:
         if self.lease is None or self.descriptor is None:
             raise SupervisorError("Runtime has no bound operation.")
         try:
-            current = self._current_package(self.lease.id, self.lease.epoch)
+            current = self._current_package(self.lease.id, self.lease.epoch, max_age=max_age)
             if current["package_digest"] == self.descriptor["control"]["package_digest"]:
-                self.lease = self._lease(current)
+                fresh = self._lease(current)
+                held = self.lease
+                if (
+                    fresh.id == held.id
+                    and fresh.epoch == held.epoch
+                    and fresh.expires_at < held.expires_at
+                ):
+                    # Never move the expiry earlier: a read (possibly a reused one) older than
+                    # the last renewal's answer does not undo it (ADR 0178).
+                    fresh = replace(fresh, expires_at=held.expires_at)
+                self.lease = fresh
         except Exception:
             # Retain old bounds; the supervisor's fresh validation will deny and
             # cancel possible execution when the control channel is unavailable.
@@ -725,10 +866,31 @@ class CpuRuntime:
         )
         self._refresh_lease()
 
+    def apply_renewal(self, response: Any) -> bool:
+        """Take the new expiry from control's answer to a renewal of this lease.
+
+        The renewal answer is control's own record of the lease, so the worker knows the
+        extended bound even when the following package re-read fails. Only an answer for this
+        lease and epoch whose expiry is a later UTC time is applied; anything else is ignored.
+        """
+        lease = self.lease
+        if lease is None or not isinstance(response, dict):
+            return False
+        try:
+            if response.get("id") != lease.id or response.get("epoch") != lease.epoch:
+                return False
+            expires_at = datetime.fromisoformat(response["expires_at"]).astimezone(UTC)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if expires_at <= lease.expires_at:
+            return False
+        self.lease = replace(lease, expires_at=expires_at)
+        return True
+
     def tick(self) -> DriverResult:
         if self.operation is None or self.lease is None:
             raise SupervisorError("Runtime has no bound operation.")
-        self._refresh_lease()
+        self._refresh_lease(max_age=self.authority_max_age_seconds)
         return self.supervisor.tick(self.operation, self.lease)
 
     def report(self, result: DriverResult) -> dict[str, Any]:
@@ -757,7 +919,9 @@ class CpuRuntime:
             )
             self._begin_delivery(intent_id, confirmed_exit)
             try:
-                response = self._post_report("/worker/observations", payload, key)
+                response = self._post_report(
+                    "/worker/observations", payload, key, terminal=confirmed_exit
+                )
             except Exception as error:
                 self._delivery_failed(intent_id, error)
             with self._observation_connection() as connection:
@@ -777,8 +941,14 @@ class CpuRuntime:
             self._report_image_build(exit_code)
         return response
 
-    def _report_request_seconds(self) -> float | None:
+    def _report_request_seconds(self, *, terminal: bool = False) -> float | None:
         """The request time one report may use: the channel's timeout, capped by the lease.
+
+        A terminal report (a confirmed exit, and the egress-journal and image-build reports that
+        follow it) always gets the channel's full timeout: the stage has stopped, so no lease
+        needs protecting, and after a cancel at the lease's deadline, or on redelivery against
+        an expired lease, a cap by the time left would squeeze it to the minimum and keep it
+        timing out under a slow control (ADR 0178).
 
         ``None`` when the channel has no timeout of its own (a test double): it is called
         without one.
@@ -787,14 +957,18 @@ class CpuRuntime:
         if type(channel_timeout) not in {int, float}:
             return None
         budget = float(channel_timeout)
+        if terminal:
+            return budget
         if self.lease is not None:
             left = (self.lease.expires_at - self._clock()).total_seconds()
             budget = min(budget, left - REPORT_LEASE_RESERVE_SECONDS)
         return max(MIN_REPORT_REQUEST_SECONDS, min(float(channel_timeout), budget))
 
-    def _post_report(self, path: str, payload: dict[str, Any], key: str) -> dict[str, Any]:
+    def _post_report(
+        self, path: str, payload: dict[str, Any], key: str, *, terminal: bool = False
+    ) -> dict[str, Any]:
         """Post a report, with a per-call time cap when the channel supports one."""
-        seconds = self._report_request_seconds()
+        seconds = self._report_request_seconds(terminal=terminal)
         try:
             accepts = "timeout_seconds" in inspect.signature(self.channel.post).parameters
         except (TypeError, ValueError):
@@ -965,7 +1139,10 @@ class CpuRuntime:
         self._begin_delivery(intent_id, False)
         try:
             self._post_report(
-                f"/worker/operations/{operation.operation_id}/egress-journal", payload, key
+                f"/worker/operations/{operation.operation_id}/egress-journal",
+                payload,
+                key,
+                terminal=True,
             )
         except Exception as error:
             self._delivery_failed(intent_id, error)
@@ -1094,7 +1271,10 @@ class CpuRuntime:
         self._begin_delivery(intent_id, False)
         try:
             self._post_report(
-                f"/worker/operations/{operation.operation_id}/image-build", payload, key
+                f"/worker/operations/{operation.operation_id}/image-build",
+                payload,
+                key,
+                terminal=True,
             )
         except Exception as error:
             self._delivery_failed(intent_id, error)

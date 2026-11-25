@@ -1544,13 +1544,7 @@ class ExecutionStore(Store):
             grant = self._active_worker_grant(connection, worker, lease["grant_id"])
             if grant["epoch"] != expected_epoch:
                 raise Conflict("Execution grant epoch is no longer current.")
-            if connection.execute(
-                """SELECT 1 FROM events WHERE project_id=?
-                AND event_type='execution.observation_reported'
-                AND json_extract(payload_json,'$.grant_id')=?
-                AND json_extract(payload_json,'$.launch_error') IS NOT NULL LIMIT 1""",
-                (grant["project_id"], grant["id"]),
-            ).fetchone():
+            if self._launch_error_reported(connection, grant):
                 # ADR 0046: a reported launch error is final for this operation, so its
                 # lease is never extended (the worker must not start after reporting it).
                 raise Conflict("A launch error was reported for this operation.")
@@ -1594,6 +1588,38 @@ class ExecutionStore(Store):
             command,
             audience="worker",
             replay_guard=self._guard_lease_replay,
+        )
+
+    @staticmethod
+    def _launch_error_reported(connection: sqlite3.Connection, grant: sqlite3.Row) -> bool:
+        """Whether a launch error was reported for this grant (ADR 0046).
+
+        The event scan reads every event of the project, inside the renewal's write lock, and
+        the project's event log only grows, so on a busy host it made renewals slow enough to
+        miss the worker's timeout. A launch error is only accepted on an ``unknown``
+        observation with no provider identity (the request model refuses anything else), and
+        its observation row is written in the same transaction as its event. So a grant with
+        no such row (the indexed per-grant lookup) cannot have one, and the scan runs only
+        when one exists.
+        """
+        if (
+            connection.execute(
+                """SELECT 1 FROM execution_observations WHERE grant_id=?
+                AND observed_state='unknown' AND provider_id IS NULL LIMIT 1""",
+                (grant["id"],),
+            ).fetchone()
+            is None
+        ):
+            return False
+        return (
+            connection.execute(
+                """SELECT 1 FROM events WHERE project_id=?
+                AND event_type='execution.observation_reported'
+                AND json_extract(payload_json,'$.grant_id')=?
+                AND json_extract(payload_json,'$.launch_error') IS NOT NULL LIMIT 1""",
+                (grant["project_id"], grant["id"]),
+            ).fetchone()
+            is not None
         )
 
     def _check_termination_evidence(

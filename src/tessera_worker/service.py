@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import sqlite3
 import stat
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,13 +46,51 @@ from .outputs import OutputCollectionError, worker_output_limit
 from .private_auth_file import AuthFileRefused, check_private_auth_file
 from .provider import Provider
 from .public_fetch import PublicFetchError, parse_proxy
-from .runtime import MAX_DESCRIPTOR_BYTES, ObservationDeliveryPending, ObservationRefused
+from .runtime import (
+    AUTHORITY_MAX_AGE_SECONDS,
+    LEASE_SAFETY_MARGIN_SECONDS,
+    MAX_DESCRIPTOR_BYTES,
+    ObservationDeliveryPending,
+    ObservationRefused,
+    is_transient_control_failure,
+    lease_request_seconds,
+)
 from .supervisor import DriverResult, SupervisorError
 
 _ABSOLUTE_PATH = re.compile(r"(?<![\w.])/[^\s'\"<>:;,)\]]+")
 _DETAIL_LIMIT = 200
 RUN_RECEIPT_ATTEMPTS = 3
 _RUN_RECEIPT_RETRY_SECONDS = 1.0
+# A renewal (heartbeat plus lease renewal) that fails transiently while the lease has time left
+# is retried after this backoff (doubling, capped), until the lease's own expiry less
+# LEASE_SAFETY_MARGIN_SECONDS. Only a refusal or that deadline stops the stage.
+_RENEWAL_RETRY_BASE_SECONDS = 1.0
+_RENEWAL_RETRY_CAP_SECONDS = 4.0
+# Each renewal request (the heartbeat and the renewal separately) may use at most this share of
+# the lease time left before the deadline, so this many attempts fit in it and one hung request
+# never uses up the whole window (ADR 0178). Never below the minimum request time.
+_RENEWAL_ATTEMPTS_PER_WINDOW = 3
+
+
+@dataclass
+class _RenewalRetries:
+    """What the worker records about renewals that did not get through (grant result)."""
+
+    failed: int = 0  # every failed renewal attempt in this run
+    consecutive: int = 0  # failed attempts since the last confirmed renewal
+    recovered: int = 0  # stalls that a later retry got through
+    last_failure: str | None = None
+    retry_at: float | None = None
+
+    def summary(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "failed_attempts": self.failed,
+            "recovered_stalls": self.recovered,
+            "unconfirmed_attempts": self.consecutive,
+        }
+        if self.last_failure is not None:
+            record["last_failure"] = self.last_failure
+        return record
 
 
 def safe_error_detail(error: BaseException, *private_paths: Path | str) -> str:
@@ -82,13 +122,30 @@ class _CredentialWatch:
         """The wrapped channel's request bound: large-artifact uploads size their parts to it."""
         return getattr(self._channel, "max_request_bytes", None)
 
-    def post(self, *arguments: Any, **keywords: Any) -> Any:
+    @property
+    def timeout_seconds(self) -> float | None:
+        """The wrapped channel's request timeout, when it can cap a single call below it."""
+        if not _accepts_timeout(self._channel):
+            return None
+        value = getattr(self._channel, "timeout_seconds", None)
+        return value if type(value) in {int, float} else None
+
+    def post(self, path: str, body: Any, key: str, *, timeout_seconds: float | None = None) -> Any:
         try:
-            return self._channel.post(*arguments, **keywords)
+            if timeout_seconds is None:
+                return self._channel.post(path, body, key)
+            return self._channel.post(path, body, key, timeout_seconds=timeout_seconds)
         except ControlChannelError as error:
             if self.rejected_status is None and classify_control_failure(error) == "auth":
                 self.rejected_status = error.status
             raise
+
+
+def _accepts_timeout(channel: Any) -> bool:
+    try:
+        return "timeout_seconds" in inspect.signature(channel.post).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 class DevelopmentWorkerError(SupervisorError):
@@ -167,6 +224,10 @@ class DevelopmentWorkerConfig:
     # extends them. Renew on elapsed time as well as tick count, so a longer poll interval or
     # slow control round trips can never let a running operation's lease lapse.
     renew_after_seconds: float = 10.0
+    # How long a running operation's tick reuses its last authority read (the lease's package)
+    # before posting again; every renewal forces a fresh read. 0 re-reads on every tick (the
+    # old behaviour, two control writes per tick). At most 20 s, inside the 30 s lease.
+    authority_reread_seconds: float = AUTHORITY_MAX_AGE_SECONDS
 
     def __post_init__(self) -> None:
         if (
@@ -177,6 +238,8 @@ class DevelopmentWorkerConfig:
             or self.max_ticks < 0
             or self.renew_every_ticks < 1
             or not 0 < self.renew_after_seconds <= 20
+            or type(self.authority_reread_seconds) not in {int, float}
+            or not 0 <= self.authority_reread_seconds <= 20
             or (self.output_capacity_bytes is not None and self.output_capacity_bytes < 1)
             or (
                 self.max_output_bytes is not None
@@ -492,6 +555,9 @@ class DevelopmentWorkerService:
     ) -> None:
         self.config = config
         self.clock = clock
+        # Wall-clock time, compared with the lease's own expiry (injectable for tests).
+        self.wall_clock: Any = lambda: datetime.now(UTC)
+        self._renewal_retries = _RenewalRetries()
         self.root = _private_directory(config.workspace_root)
         # ADR 0125: on by default. None means the default marker ``<workspace>/stage-watch.kill``
         # (never created); an explicit StageWatchConfig wins, a disabled one never imports the
@@ -616,6 +682,7 @@ class DevelopmentWorkerService:
                 build_repositories=self.config.build_repositories,
                 public_fetch_proxy=self.config.public_fetch_proxy,
             ) as runtime:
+                self._configure_runtime(runtime)
                 self._attach_stage_watch(runtime, adapter)
                 result = runtime.recover(lease_id, epoch)
                 return self._drive(runtime, result)
@@ -641,9 +708,18 @@ class DevelopmentWorkerService:
             build_repositories=self.config.build_repositories,
             public_fetch_proxy=self.config.public_fetch_proxy,
         ) as runtime:
+            self._configure_runtime(runtime)
             self._attach_stage_watch(runtime, adapter)
             result = runtime.start(lease_id, epoch)
             return self._drive(runtime, result)
+
+    def _configure_runtime(self, runtime: DevelopmentCpuRuntime) -> None:
+        runtime.authority_max_age_seconds = float(self.config.authority_reread_seconds)
+        # This service retries a stalled renewal until the lease's own expiry less the margin,
+        # so a transient failure of an authority read may leave the lease standing until then.
+        runtime.transient_lease_grace = True
+        # One view of the lease's time left: the renewal retry and the authority grace agree.
+        runtime._lease_clock = self.wall_clock
 
     def _attach_stage_watch(self, runtime: DevelopmentCpuRuntime, adapter: Any) -> None:
         """Give the supervisor an observe-and-report stage watch runner, unless opted out.
@@ -664,6 +740,16 @@ class DevelopmentWorkerService:
         )
 
     def _drive(self, runtime: DevelopmentCpuRuntime, result: DriverResult) -> dict[str, Any]:
+        outcome = self._drive_loop(runtime, result)
+        retries = self._renewal_retries
+        if retries.failed and isinstance(outcome, dict):
+            # Every failed renewal attempt of this run is on the grant result, whether a later
+            # retry got through or the lease ran out (an operator can see stalls that a
+            # healthy stage survived, not only the ones that stopped it).
+            outcome = {**outcome, "lease_renewal_retries": retries.summary()}
+        return outcome
+
+    def _drive_loop(self, runtime: DevelopmentCpuRuntime, result: DriverResult) -> dict[str, Any]:
         # None: renew on the first pass. start() leases afresh, but recover() resumes a lease
         # that may have only seconds left, and neither renews it.
         renewed_at: float | None = None
@@ -748,19 +834,29 @@ class DevelopmentWorkerService:
                     "reason": "tick_limit_cancellation_requested",
                 }
             now = self.clock()
-            due = renewed_at is None or now - renewed_at >= self.config.renew_after_seconds
-            if due or (tick and tick % self.config.renew_every_ticks == 0):
-                try:
-                    self._heartbeat()
-                    self._renew(runtime)
-                except Exception:
-                    return self._cancel_unresolved(
-                        runtime, "heartbeat_or_renewal_failure", report_exit=True
-                    )
-                renewed_at = now  # measured before the request, so the interval never stretches
-            # Never sleep past the next renewal: a long poll interval cannot outlast the lease.
-            assert renewed_at is not None  # the first pass always renews
-            until_due = renewed_at + self.config.renew_after_seconds - self.clock()
+            retries = self._renewal_retries
+            if retries.retry_at is not None:
+                due = now >= retries.retry_at
+            else:
+                due = (
+                    renewed_at is None
+                    or now - renewed_at >= self.config.renew_after_seconds
+                    or bool(tick and tick % self.config.renew_every_ticks == 0)
+                )
+            if due:
+                stopped = self._renew_or_retry(runtime)
+                if stopped is not None:
+                    return stopped
+                if retries.retry_at is None:
+                    # Measured before the request, so the interval never stretches.
+                    renewed_at = now
+            # Never sleep past the next renewal (or renewal retry): a long poll interval cannot
+            # outlast the lease.
+            if retries.retry_at is not None:
+                until_due = retries.retry_at - self.clock()
+            else:
+                assert renewed_at is not None  # the first pass always renews
+                until_due = renewed_at + self.config.renew_after_seconds - self.clock()
             self.sleep(max(0.0, min(self.config.poll_seconds, until_due)))
             result = runtime.tick()
         raise AssertionError("bounded worker loop did not return")
@@ -846,26 +942,124 @@ class DevelopmentWorkerService:
             "detail": detail,
         }
 
+    def _lease_seconds_left(self, runtime: DevelopmentCpuRuntime) -> float | None:
+        """Seconds until the held lease expires, less the safety margin; None without a lease."""
+        lease = getattr(runtime, "lease", None)
+        expires_at = getattr(lease, "expires_at", None)
+        if not isinstance(expires_at, datetime):
+            return None
+        left = (expires_at - self.wall_clock()).total_seconds()
+        return left - LEASE_SAFETY_MARGIN_SECONDS
+
+    def _renewal_request_seconds(self, runtime: DevelopmentCpuRuntime) -> float | None:
+        """One renewal request's time limit, worked out again before each call.
+
+        ``min(channel timeout, max(1 s, time left / 3))``, the time left being the lease's
+        expiry less the safety margin: two or three attempts fit before the deadline, and a
+        single hung request cannot use up the window. ``None`` (no per-call cap) when the
+        channel has no timeout of its own or there is no lease.
+        """
+        channel_timeout = self._watch.timeout_seconds
+        if channel_timeout is None:
+            return None
+        left = self._lease_seconds_left(runtime)
+        if left is None:
+            return None
+        return lease_request_seconds(channel_timeout, left, attempts=_RENEWAL_ATTEMPTS_PER_WINDOW)
+
+    def _renewal_limit(self, runtime: DevelopmentCpuRuntime) -> dict[str, float]:
+        """The keyword that caps one renewal call (computed now), or none without a cap."""
+        seconds = self._renewal_request_seconds(runtime)
+        return {} if seconds is None else {"timeout_seconds": seconds}
+
+    def _renew_or_retry(self, runtime: DevelopmentCpuRuntime) -> dict[str, Any] | None:
+        """Heartbeat and renew once; None while the run goes on, else the stopped outcome.
+
+        A transient failure (no answer in time, a dropped connection, a 5xx) while the lease
+        has time left schedules a retry with backoff and the stage keeps running. A refusal
+        (a 409 fence, a 404, an authority-gone 403), a rejected credential, or a lease whose
+        expiry (less the safety margin) arrives before a renewal is confirmed stops it, and the
+        result names the cause and the failed attempts before it.
+        """
+        retries = self._renewal_retries
+        try:
+            self._heartbeat(runtime)
+            self._renew(runtime)
+        except Exception as error:
+            retries.failed += 1
+            retries.consecutive += 1
+            detail = safe_error_detail(error, self.root)
+            retries.last_failure = detail
+            if is_transient_control_failure(error):
+                kind = "transient"
+            elif isinstance(error, ControlChannelError):
+                kind = classify_control_failure(error)
+            else:
+                kind = "local"
+            if kind == "transient":
+                left = self._lease_seconds_left(runtime)
+                if left is not None and left > 0:
+                    backoff = min(
+                        _RENEWAL_RETRY_CAP_SECONDS,
+                        _RENEWAL_RETRY_BASE_SECONDS * 2 ** (retries.consecutive - 1),
+                    )
+                    retries.retry_at = self.clock() + min(backoff, left)
+                    return None
+                cause = (
+                    "the lease expired before a renewal was confirmed: "
+                    f"{retries.consecutive} renewal attempt(s) failed, last: {detail}"
+                )
+            elif isinstance(error, ControlChannelError) and kind in {"permanent", "auth"}:
+                cause = f"control refused the lease renewal (HTTP {error.status})"
+                if retries.consecutive > 1:
+                    cause += (
+                        f" after {retries.consecutive - 1} unanswered renewal attempt(s) "
+                        f"(the lease may have expired during the stall)"
+                    )
+            else:
+                cause = f"the renewal could not be attempted: {detail}"
+            retries.retry_at = None
+            outcome = self._cancel_unresolved(
+                runtime, "heartbeat_or_renewal_failure", report_exit=True
+            )
+            return {**outcome, "renewal_failure": cause[: _DETAIL_LIMIT * 2]}
+        if retries.consecutive:
+            retries.recovered += 1
+        retries.consecutive = 0
+        retries.retry_at = None
+        return None
+
     def _renew(self, runtime: DevelopmentCpuRuntime) -> None:
         if runtime.lease is None:
             raise DevelopmentWorkerError("Development runtime has no lease to renew.")
         lease = runtime.lease
         key = self.renewals.key(lease.id, lease.epoch)  # durable before the HTTP mutation
-        self._watch.post(
+        response = self._watch.post(
             "/worker/leases/renew",
             {"lease_id": lease.id, "expected_epoch": lease.epoch},
             key,
+            **self._renewal_limit(runtime),
         )
         self.renewals.complete(lease.id, lease.epoch)
-        # Re-read frozen authority; renewal never changes operation identity.
+        apply = getattr(runtime, "apply_renewal", None)
+        if apply is not None:
+            # The extended expiry stands even if the package re-read below fails.
+            apply(response)
+        # Re-read frozen authority; renewal never changes operation identity. The runtime caps
+        # this read by the lease time left too (ADR 0178).
         runtime._refresh_lease()
 
-    def _heartbeat(self) -> None:
+    def _heartbeat(self, runtime: DevelopmentCpuRuntime | None = None) -> None:
         key, body = self.heartbeats.intent(
             {} if self._memory_unsupported else self._memory_report()
         )  # durable before the mutation
+
+        def limit(runtime: DevelopmentCpuRuntime | None) -> dict[str, float]:
+            # Worked out again before each call, from the lease time left now.
+            return {} if runtime is None else self._renewal_limit(runtime)
+
         try:
-            self._watch.post("/worker/heartbeat", body, key)
+            self._watch.post("/worker/heartbeat", body, key, **limit(runtime))
         except ControlChannelError as error:
             # An older control plane refuses the memory fields (HTTP 400/422: the beat was
             # validated and rejected, never recorded). Liveness must not depend on them: send the
@@ -873,7 +1067,7 @@ class DevelopmentWorkerService:
             if not body or error.status not in (400, 422):
                 raise
             self._memory_unsupported = True
-            self._watch.post("/worker/heartbeat", {}, key + "-plain")
+            self._watch.post("/worker/heartbeat", {}, key + "-plain", **limit(runtime))
         self.heartbeats.complete()
 
     def _memory_report(self) -> dict[str, int]:

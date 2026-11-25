@@ -11,7 +11,12 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from test_development_worker_service import ApiChannel, _service, _unleased_delivery
+from test_development_worker_service import (
+    ApiChannel,
+    _outage_outlasts_the_lease,
+    _service,
+    _unleased_delivery,
+)
 from test_supervisor import FakeAdapter
 
 from tessera_control.store import _connect
@@ -591,7 +596,7 @@ def test_a_confirmed_refusal_of_a_running_observation_still_cancels(tmp_path, st
     assert any(r["abandoned"] for r in _outbox(tmp_path))
 
 
-def test_a_lost_lease_while_an_observation_waits_still_cancels(tmp_path):
+def test_a_lost_lease_while_an_observation_waits_still_cancels(tmp_path, monkeypatch):
     """Authority loss, not a slow report, is what stops a run: renewal fails and cancels."""
     state, _, _, _, grant = _unleased_delivery(tmp_path)
     adapter = FakeAdapter()
@@ -599,15 +604,15 @@ def test_a_lost_lease_while_an_observation_waits_still_cancels(tmp_path):
     class Outage(SlowObservations):
         def post(self, path, body, key):
             if path == OBSERVATIONS and self.posts_seen >= 1:
-                raise ConnectionError("control unreachable")  # everything fails after the first
+                raise ControlChannelError("control unreachable")  # all fails after the first
             if path == OBSERVATIONS:
                 self.posts_seen += 1
                 raise self.error
             if self.posts_seen >= 1:
-                raise ConnectionError("control unreachable")
+                raise ControlChannelError("control unreachable")
             return ApiChannel.post(self, path, body, key)
 
-    outcome = _service(
+    service = _service(
         tmp_path,
         state,
         grant,
@@ -615,7 +620,10 @@ def test_a_lost_lease_while_an_observation_waits_still_cancels(tmp_path):
         adapter=adapter,
         max_ticks=6,
         sleep=_exits_on_nth_sleep(adapter, 4),
-    ).run()
+    )
+    # The outage lasts past the lease's own expiry: a renewal that fails while the lease has
+    # time left is retried (ADR 0178), one that cannot be confirmed before it ends cancels.
+    outcome = _outage_outlasts_the_lease(service, monkeypatch).run()
     assert outcome["reason"] == "heartbeat_or_renewal_failure"
     assert adapter.calls.count("cancel") == 1
 

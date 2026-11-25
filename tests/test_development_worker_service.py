@@ -14,6 +14,7 @@ from test_supervisor import FakeAdapter
 from tessera_control.api import create_app
 from tessera_control.experiments import ExperimentStore
 from tessera_control.store import _connect, canonical_digest
+from tessera_worker.control_channel import ControlChannelError
 from tessera_worker.development_runtime import DevelopmentCpuRuntime, DevelopmentOutputProfile
 from tessera_worker.provider import FakeProvider
 from tessera_worker.service import (
@@ -35,15 +36,40 @@ class ApiChannel:
         self.paths.append(path)
         self.keys.append((path, key))
         if self.disconnected:
-            raise ConnectionError("synthetic control disconnect")
+            # The HTTP channel turns every transport failure into a status-less
+            # ControlChannelError (a transient failure).
+            raise ControlChannelError("synthetic control disconnect")
         response = self.client.post(
             path,
             json=body,
             headers={"Authorization": "Bearer worker-token", "Idempotency-Key": key},
         )
-        if response.status_code >= 400:
-            raise ConnectionError(f"control rejected command: {response.status_code}")
-        return response.json()
+        return _answer_like_the_http_channel(response)
+
+
+def _answer_like_the_http_channel(response):
+    """Map control's answer as ``HttpControlChannel`` does.
+
+    Every HTTP error is a ``ControlChannelError`` with its status: a 409 fence or a 404 is a
+    refusal, a 401 or 403 a rejected credential (a 403 with one of control's authority-gone
+    details is permanent), a 5xx transient.
+    """
+    from tessera_worker.control_channel import _authority_gone, _refusal_reason
+
+    status = response.status_code
+    if status >= 400:
+        try:
+            body = response.json() if status < 500 else None
+        except ValueError:
+            body = None
+        body = body if isinstance(body, dict) else None
+        raise ControlChannelError(
+            "control rejected command",
+            status,
+            authority_gone=_authority_gone(status, body),
+            refusal_reason=_refusal_reason(body),
+        )
+    return response.json()
 
 
 def _service(
@@ -75,6 +101,42 @@ def _service(
         provider=provider,
         sleep=sleep or (lambda _: None),
     )
+
+
+def _outage_outlasts_the_lease(service, monkeypatch):
+    """A control outage that begins while the lease is live and lasts past its expiry.
+
+    One failed renewal no longer stops a stage whose lease has time left (it is retried until
+    the lease's deadline, ADR 0178). Here the first control call that fails transiently (no
+    answer, a lost connection) takes until after the held lease has run out: from then on the
+    worker's wall clock and control's clock (one timeline) are five minutes later, so the
+    worker sees its lease end during the outage and control's lease has expired too.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from tessera_control.execution import ExecutionStore
+    from tessera_worker.runtime import is_transient_control_failure
+
+    offset = [timedelta(0)]
+
+    def now():
+        return datetime.now(UTC) + offset[0]
+
+    monkeypatch.setattr(ExecutionStore, "_now", staticmethod(now))
+    service.wall_clock = now
+    watch = service._watch
+    post = watch.post
+
+    def post_through_the_outage(path, body, key, **keywords):
+        try:
+            return post(path, body, key, **keywords)
+        except Exception as error:
+            if is_transient_control_failure(error):
+                offset[0] = timedelta(minutes=5)  # the call hung until after the lease ended
+            raise
+
+    watch.post = post_through_the_outage
+    return service
 
 
 def _unleased_delivery(tmp_path):
@@ -260,7 +322,9 @@ def test_lost_heartbeat_reply_replays_its_durable_key_before_the_next_beat(tmp_p
     assert heartbeat_keys[2] != heartbeat_keys[1]
 
 
-def test_disconnect_while_reporting_attempts_cancellation_and_retains_the_report(tmp_path):
+def test_disconnect_while_reporting_attempts_cancellation_and_retains_the_report(
+    tmp_path, monkeypatch
+):
     state, _, _, _, grant = _unleased_delivery(tmp_path)
 
     class ReportingDisconnectChannel(ApiChannel):
@@ -278,6 +342,7 @@ def test_disconnect_while_reporting_attempts_cancellation_and_retains_the_report
         adapter=adapter,
         max_ticks=1,
     )
+    _outage_outlasts_the_lease(service, monkeypatch)
 
     result = service.run()
     # A running observation that could not be delivered no longer stops the container (ADR
@@ -337,7 +402,9 @@ def test_terminal_report_failure_still_attempts_cancellation_before_collection(t
     assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
 
 
-def test_renewal_disconnect_attempts_cancellation_and_replays_the_renewal_intent(tmp_path):
+def test_renewal_disconnect_attempts_cancellation_and_replays_the_renewal_intent(
+    tmp_path, monkeypatch
+):
     state, _, _, _, grant = _unleased_delivery(tmp_path)
 
     class RenewalDisconnectChannel(ApiChannel):
@@ -355,6 +422,7 @@ def test_renewal_disconnect_attempts_cancellation_and_replays_the_renewal_intent
         adapter=adapter,
         max_ticks=2,
     )
+    _outage_outlasts_the_lease(service, monkeypatch)
 
     assert service.run()["reason"] == "heartbeat_or_renewal_failure"
     assert adapter.calls.count("cancel") == 1
@@ -392,6 +460,11 @@ def test_revocation_with_receipt_report_failure_cancels_provider_and_retains_wor
         max_ticks=2,
         sleep=revoke,
     )
+    # Re-read authority on every tick, so the revocation is seen by the tick right after it
+    # (by default a tick reuses a read up to 10 s old and the next renewal sees it).
+    import dataclasses
+
+    service.config = dataclasses.replace(service.config, authority_reread_seconds=0.0)
 
     result = service.run()
     assert result["state"] == "unknown"
@@ -514,14 +587,15 @@ def test_restart_reconciles_expired_or_revoked_grant_without_a_new_start(tmp_pat
     assert list((tmp_path / "outputs").glob("development-only-cpu-outputs/workspaces/*"))
 
 
-def test_restart_control_outage_cancels_boundedly_without_new_authority(tmp_path):
+def test_restart_control_outage_cancels_boundedly_without_new_authority(tmp_path, monkeypatch):
     state, _, _, _, grant = _unleased_delivery(tmp_path)
     adapter = FakeAdapter()
     _crashed_running_service(tmp_path, state, grant, adapter)
     channel = ApiChannel(state)
     channel.disconnected = True
 
-    result = _service(tmp_path, state, grant, channel=channel, adapter=adapter).run()
+    service = _service(tmp_path, state, grant, channel=channel, adapter=adapter)
+    result = _outage_outlasts_the_lease(service, monkeypatch).run()
 
     assert result == {
         "state": "report_pending",
@@ -537,7 +611,9 @@ def test_restart_control_outage_cancels_boundedly_without_new_authority(tmp_path
 
 
 @pytest.mark.parametrize("failure", ["revocation", "disconnect"])
-def test_revocation_or_disconnect_cancels_and_never_reclaims_uncertain_output(tmp_path, failure):
+def test_revocation_or_disconnect_cancels_and_never_reclaims_uncertain_output(
+    tmp_path, monkeypatch, failure
+):
     state, execution, owner, _, grant = _unleased_delivery(tmp_path)
     channel = ApiChannel(state)
     adapter = FakeAdapter()
@@ -551,6 +627,12 @@ def test_revocation_or_disconnect_cancels_and_never_reclaims_uncertain_output(tm
     service = _service(
         tmp_path, state, grant, channel=channel, adapter=adapter, max_ticks=1, sleep=stop
     )
+    if failure == "disconnect":
+        import dataclasses
+
+        # A lasting outage, seen by the tick right after it (no reuse of the last read).
+        _outage_outlasts_the_lease(service, monkeypatch)
+        service.config = dataclasses.replace(service.config, authority_reread_seconds=0.0)
     result = service.run()
     if failure == "revocation":
         # The synthetic adapter writes no declared output; confirmed cancellation

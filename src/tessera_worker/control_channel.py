@@ -365,18 +365,19 @@ class HttpControlChannel:
     ) -> tuple[Future[dict[str, Any]], float]:
         """Start the request thread; return its future and the time left to wait for it.
 
-        A request that timed out may still be winding down; wait briefly for it so the next call
-        (a heartbeat, say) is not refused and a healthy run is not cancelled for it. The wait is
-        bounded (``STRAGGLER_WAIT_SECONDS`` and half of this call's own timeout, so a call with
-        a short deadline, such as a cancellation path, is never held), it comes out of this
-        call's own deadline, and there is still never more than one request thread.
+        A request that timed out may still be winding down; wait for it so the next call (a
+        heartbeat, or the retry of a renewal that timed out) is not refused and a healthy run is
+        not cancelled for it. The wait is bounded by ``STRAGGLER_WAIT_SECONDS`` and by this
+        call's own timeout: it comes out of this call's own deadline, so a call with a short
+        deadline (a cancellation path, a renewal retry capped by the lease time left) is never
+        held past it, and there is still never more than one request thread (ADR 0178).
         """
         with self._inflight_lock:
             straggler = self._inflight if self._inflight and not self._inflight.done() else None
         waited = 0.0
         if straggler is not None:
             started = time.monotonic()
-            wait([straggler], timeout=min(STRAGGLER_WAIT_SECONDS, timeout_seconds / 2))
+            wait([straggler], timeout=min(STRAGGLER_WAIT_SECONDS, timeout_seconds))
             waited = time.monotonic() - started
             timeout_seconds = max(0.001, timeout_seconds - waited)
         with self._inflight_lock:

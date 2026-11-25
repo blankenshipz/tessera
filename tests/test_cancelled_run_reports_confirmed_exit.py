@@ -65,7 +65,9 @@ class Recording(ApiChannel):
         if path == RENEW:
             self.renewals += 1
             if self.renewals > 1:
-                raise ConnectionError("synthetic renewal failure")
+                # A refusal (a 409 fence) stops the run at once; a transient failure would be
+                # retried until the lease's own expiry (ADR 0178).
+                raise ControlChannelError("synthetic renewal refusal", 409)
         if path == OBSERVATIONS:
             self.observations.append(body)
             if body.get("observed_state") == "exited":
@@ -127,6 +129,15 @@ def test_an_unconfirmed_cancel_reports_nothing_new(tmp_path):
         "state": "unknown",
         "quarantined": False,
         "reason": "heartbeat_or_renewal_failure",
+        "renewal_failure": "control refused the lease renewal (HTTP 409)",
+        "lease_renewal_retries": {
+            "failed_attempts": 1,
+            "recovered_stalls": 0,
+            "unconfirmed_attempts": 1,
+            "last_failure": (
+                "ControlChannelError: Control channel failed: synthetic renewal refusal (HTTP 409)"
+            ),
+        },
     }
     assert adapter.calls.count("cancel") == 1
     assert channel.exits() == [] and _control_exits(state) == 0
@@ -237,7 +248,8 @@ def _killed_world(tmp_path, *, lose_first_exit=False):
         if path == RENEW:
             state["renewals"] += 1
             if state["renewals"] > 1:
-                raise ConnectionError("synthetic renewal failure")
+                # A refusal stops the run at once (a transient failure is retried, ADR 0178).
+                raise ControlChannelError("synthetic renewal refusal", 409)
         if path == OBSERVATIONS and body.get("observed_state") == "exited":
             posted_exits.append(body)
             if state["lose_exit"]:
@@ -341,3 +353,54 @@ def test_the_poller_recovers_an_undelivered_kill_exit_and_the_runner_closes_it(t
     assert len(exits) == 1
     world.runner.tick()
     _assert_closed_and_retried(world, cid, attempt)
+
+
+# -- a cancel at the lease's deadline (ADR 0178) ---------------------------------------------
+
+
+def test_a_deadline_cancel_reports_its_confirmed_exit_with_the_full_request_time(
+    tmp_path, monkeypatch
+):
+    """Renewals stop being answered; the stage is cancelled at the lease's deadline (not by a
+    refusal), and the confirmed exit is reported with the channel's whole timeout, not the
+    1 s floor a cap by the lease time left would give it."""
+    from test_worker_lease_renewal_stall import HANG, _control_lease_expiry, _timed
+
+    def fail(channel, path):
+        return HANG if path == RENEW and channel.renew_attempts >= 2 else None
+
+    service, channel, adapter, state = _timed(tmp_path, monkeypatch, fail, max_ticks=200)
+
+    outcome = service.run()
+
+    assert outcome["reason"] == "heartbeat_or_renewal_failure"
+    assert "lease expired before a renewal was confirmed" in outcome["renewal_failure"]
+    assert "delivery_pending" not in outcome  # delivered, not left for the poller
+    (cancelled_at,) = adapter.cancelled_at
+    assert cancelled_at < _control_lease_expiry(state)
+    cancel_time = (cancelled_at - channel.timeline.base).total_seconds()
+    after = [
+        limit
+        for path, limit, at in channel.calls
+        if path == OBSERVATIONS and at >= cancel_time - 0.001
+    ]
+    assert after and after[0] == channel.timeout_seconds  # the confirmed exit's report
+    assert _control_exits(state) == 1
+
+
+def test_a_terminal_report_is_never_squeezed_by_an_expired_lease():
+    """On redelivery against an expired lease only a non-terminal report is capped."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    from tessera_worker.runtime import MIN_REPORT_REQUEST_SECONDS, CpuRuntime
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    runtime = SimpleNamespace(
+        channel=SimpleNamespace(timeout_seconds=15.0),
+        lease=SimpleNamespace(expires_at=now - timedelta(minutes=3)),
+        _clock=lambda: now,
+    )
+    seconds = CpuRuntime._report_request_seconds
+    assert seconds(runtime) == MIN_REPORT_REQUEST_SECONDS
+    assert seconds(runtime, terminal=True) == 15.0

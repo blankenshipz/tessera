@@ -89,9 +89,9 @@ itself outlast the lease.
 A request that times out leaves its transport thread finishing briefly (the socket timeout restarts
 on every read). The channel's next call (usually the heartbeat) waits for it instead of being
 refused with "still in progress", which would have cancelled the healthy run as a failed heartbeat.
-The wait is at most 5 s and at most half of that call's own timeout, so a call with a short
-deadline (a cancellation path) is never held; it comes out of the call's own deadline; and there is
-still only ever one request thread.
+The wait is at most 5 s and at most that call's own timeout (half of it before ADR 0178), so a call
+with a short deadline (a cancellation path) is never held past it; it comes out of the call's own
+deadline; and there is still only ever one request thread.
 
 ## Open
 

@@ -109,14 +109,20 @@ def _gave_up_while_running(world, cid):
     original = world.channel.post
     factory = world.poller.service_factory
 
+    # A lasting outage: the renewal gets no answer until after the held lease has run out
+    # (ADR 0178 retries a renewal that fails while the lease still has time left).
+    outage = [timedelta(0)]
+
     def cut(path, body, key):
         if "/worker/leases/renew" in path:
-            raise ConnectionError("synthetic renewal loss")
+            outage[0] = timedelta(minutes=5)
+            raise ControlChannelError("synthetic renewal loss")  # no answer, as over HTTP
         return original(path, body, key)
 
     def unconfirmed_cancel(config):
         service = factory(config)
         service.adapter.cancel_unknown = True
+        service.wall_clock = lambda: datetime.now(UTC) + outage[0]
         return service
 
     world.channel.post = cut

@@ -271,3 +271,46 @@ def test_per_request_timeout_narrows_transport_and_total_deadline() -> None:
 
     with pytest.raises(ValueError, match="no longer"):
         channel.post("/worker/leases/lease/package", {}, "too-long", timeout_seconds=6)
+
+
+def test_a_retry_waits_within_its_own_limit_for_an_earlier_request() -> None:
+    """A renewal retry is not refused because the attempt that timed out is still finishing.
+
+    The earlier request ends 1.2 s after it timed out: more than half of the retry's own 2 s
+    limit, but within it. The retry waits for it out of its own limit, then goes through, and
+    there is still only one request thread at a time (ADR 0178).
+    """
+
+    class SlowToFinish(FakeResponse):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = threading.Event()
+
+        def read(self, amount: int) -> bytes:
+            assert self.release.wait(5)
+            return super().read(amount)
+
+    first = SlowToFinish()
+
+    class Opener(FakeOpener):
+        def __call__(self, request, timeout):
+            self.requests.append((request, timeout))
+            return first if len(self.requests) == 1 else FakeResponse()
+
+    opener = Opener()
+    channel = HttpControlChannel(
+        "https://control.example", "worker-token", timeout_seconds=5, opener=opener
+    )
+    with pytest.raises(ControlChannelError, match="deadline"):
+        channel.post("/worker/leases/renew", {}, "renew", timeout_seconds=0.1)
+    timer = threading.Timer(1.2, first.release.set)
+    timer.start()
+    try:
+        assert channel.post("/worker/leases/renew", {}, "renew", timeout_seconds=2.0) == {
+            "ok": True
+        }
+    finally:
+        timer.cancel()
+        first.release.set()
+    assert len(opener.requests) == 2
+    assert 0 < opener.requests[1][1] < 1.0  # what was left of the retry's 2 s after the wait

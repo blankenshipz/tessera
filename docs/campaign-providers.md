@@ -755,8 +755,18 @@ amendment:
 - A running operation's control lease lasts 30 seconds and only the worker's renewal extends
   it. The worker renews as soon as it starts driving an operation (a recovered lease may have
   only seconds left), then every 10 seconds of elapsed time (and at least every 15 ticks), and
-  never sleeps past the next renewal, whatever `poll_seconds` is. A renewal failure cancels
-  the operation.
+  never sleeps past the next renewal, whatever `poll_seconds` is. A refused renewal (a 409
+  fence, a 404, an authority-gone 403) or a rejected credential cancels the operation at once.
+  A renewal that gets no answer in time (or a dropped connection, or a 5xx) is retried with
+  backoff (1 s doubling to 4 s) until the lease's own expiry less 5 s, and only then cancels.
+  Each request (the heartbeat and the renewal separately) gets at most a third of the time
+  left before that deadline, so one hung request leaves room for retries; authority re-reads
+  are capped by the time left too, so the cancel lands before control's lease ends. A
+  confirmed exit's report always gets the full control timeout. The grant result lists the failed attempts
+  (`lease_renewal_retries`), and a stop for this reason names its cause (`renewal_failure`)
+  ([ADR 0178](decisions/0178-lease-renewal-stall-retry.md)). A running tick re-reads the
+  lease's authority at most every `authority_reread_seconds` (default 10, 0 to 20; 0 re-reads
+  every tick), and each renewal forces a re-read.
 - Logs are bounded JSON lines with error classes only. A cycle that raises is counted and
   the loop continues.
 - Exit 2 means the configuration or credential was refused: do not restart. Restart is
