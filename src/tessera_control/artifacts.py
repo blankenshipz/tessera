@@ -380,22 +380,29 @@ class ArtifactStore(Store):
         and the receipt's finish time are the worker's word, but when the upload began is not, so a
         worker that reports an exit early and keeps computing is late unless it registers inside
         the grace (``registered_at`` is None for a manifest, which follows its artifacts).
-        The grant's tenant, epoch and plan checks in ``_late`` are unchanged (ADR 0086)."""
-        rows = connection.execute(
-            """SELECT observed_state, termination_confirmed, recorded_at FROM execution_observations
-            WHERE lease_id=? AND epoch=? ORDER BY rowid""",
+        The grant's tenant, epoch and plan checks in ``_late`` are unchanged (ADR 0086).
+
+        Two indexed reads (ADR 0190), not every observation of the lease: the latest one, and
+        the lease's confirmed exits (``termination_confirmed`` is 0 or 1 by its CHECK)."""
+        latest = connection.execute(
+            """SELECT observed_state, termination_confirmed FROM execution_observations
+            WHERE lease_id=? AND epoch=? ORDER BY rowid DESC LIMIT 1""",
             (lease["id"], lease["epoch"]),
-        ).fetchall()
+        ).fetchone()
         if (
-            not rows
-            or rows[-1]["observed_state"] != "exited"
-            or not rows[-1]["termination_confirmed"]
+            latest is None
+            or latest["observed_state"] != "exited"
+            or not latest["termination_confirmed"]
         ):
             return False
         exited = min(
             _parse_utc(row["recorded_at"])
-            for row in rows
-            if row["observed_state"] == "exited" and row["termination_confirmed"]
+            for row in connection.execute(
+                """SELECT recorded_at FROM execution_observations
+                WHERE lease_id=? AND epoch=? AND observed_state='exited'
+                AND termination_confirmed=1""",
+                (lease["id"], lease["epoch"]),
+            )
         )
         within = min(_parse_utc(grant["expires_at"]), _parse_utc(lease["expires_at"]))
         if registered_at is not None:

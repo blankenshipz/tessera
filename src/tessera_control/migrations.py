@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (REVIEW_TIERS_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 91
+# Literal: must equal the highest registered constant (OUTPUT_LOOKUP_INDEXES_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 92
 LOCAL_ORG_ID = "org_local"
 
 
@@ -2110,3 +2110,32 @@ def migrate_review_tiers_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(REVIEW_TIERS_SCHEMA_VERSION - 1, migrate_review_tiers_schema)
+
+
+# Bounded output-delivery lookups (ADR 0190, schema 92; migration number 108 reserved): indexes on
+# events(event_type, cursor), execution_observations(lease_id), a partial index of confirmed exits
+# and snapshot_chunk_uploads(status, expires_at), so a run's observation posts, uploads, manifest
+# and run receipt no longer read whole growing tables inside the write lock. Additive and
+# idempotent; no row changes. The next contiguous version after the review tiers (91); if another
+# change owns it when branches merge, raise OUTPUT_LOOKUP_INDEXES_SCHEMA_VERSION,
+# LATEST_SCHEMA_VERSION (the literal near the top) and the fresh-database INSERT in store.py.
+OUTPUT_LOOKUP_INDEXES_SCHEMA_VERSION = 92
+
+
+def migrate_output_lookup_indexes(connection: sqlite3.Connection) -> None:
+    from .output_lookup_indexes import create_output_lookup_indexes
+
+    create_output_lookup_indexes(connection)
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (OUTPUT_LOOKUP_INDEXES_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(OUTPUT_LOOKUP_INDEXES_SCHEMA_VERSION - 1, migrate_output_lookup_indexes)

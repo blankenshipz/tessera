@@ -139,7 +139,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL
         );
-        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 91);
+        INSERT INTO schema_meta (singleton, schema_version) VALUES (1, 92);
 
         CREATE TABLE organizations (
             id TEXT PRIMARY KEY,
@@ -420,6 +420,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     from .license_labels import create_output_license_schema
 
     create_output_license_schema(connection)
+    from .output_lookup_indexes import create_output_lookup_indexes
+
+    create_output_lookup_indexes(connection)
 
 
 def validate_database(database_path: Path) -> None:
