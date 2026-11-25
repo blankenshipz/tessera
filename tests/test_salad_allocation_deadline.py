@@ -532,3 +532,186 @@ def test_a_route_limit_after_an_instance_was_seen_is_not_a_timeout(world):
     seen.update(_from_group(NO_CAPACITY))  # same allocation id, group now empty
     status = step(guardian, clock, 2000)
     assert status["stop_cause"] == "deadline" and "allocation_timeout" not in status
+
+
+# -- an allocating instance with no machine never disables the deadline ---------------------------
+
+ALLOCATING_NO_MACHINE = {
+    "provider_id": "group-id",
+    "state": "running",
+    "instances": [{"state": "allocating", "machine_id": None}],
+    "instance_status_counts": dict(
+        allocating_count=1, creating_count=0, running_count=0, stopping_count=0
+    ),
+    "instance_counts_complete": True,
+    "pending_change": False,
+}
+ALLOCATING_WITH_MACHINE = {
+    **ALLOCATING_NO_MACHINE,
+    "instances": [{"state": "allocating", "machine_id": "m" * 32}],
+}
+GONE = {**NO_CAPACITY, "instance_status_counts": dict.fromkeys(
+    ("allocating_count", "creating_count", "running_count", "stopping_count"), 0), "instances": []}
+
+
+@pytest.fixture
+def flaky(world, tmp_path):
+    """The same guardian, but a read can be made to fail (a timeout) via ``mode['fail']``."""
+    guardian, clock, seen, stops, make = world
+    mode = {"fail": False}
+
+    def observe(a):
+        if mode["fail"]:
+            raise TimeoutError("provider read timed out")
+        return ProviderObservation(
+            a.organization,
+            a.provider_project,
+            a.group_id,
+            a.group_name,
+            seen["allocation"],
+            a.image_digest,
+            seen["state"],
+            clock[0],
+            instance_count=seen["count"],
+            group_started=seen["started"],
+        )
+
+    mode["custody"] = False
+    guardian = make("flaky.db", observe=observe, custody_started=lambda op: mode["custody"])
+    return guardian, clock, seen, stops, mode
+
+
+def test_an_allocating_instance_without_a_machine_does_not_disable_the_deadline(flaky):
+    guardian, clock, seen, stops, mode = flaky
+    seen.update(_from_group(GONE))
+    step(guardian, clock)  # the group is started: the clock starts
+    seen.update(_from_group(ALLOCATING_NO_MACHINE))
+    assert seen["count"] == 0 and seen["state"] == "pending"
+    step(guardian, clock, 30)  # a fresh, exact poll sees it: not placed
+    seen.update(_from_group(GONE))  # then it disappears
+    assert step(guardian, clock, LIMIT - 60)["stop_cause"] is None and not stops
+    status = step(guardian, clock, 60)
+    assert status["stop_cause"] == ALLOCATION_TIMEOUT_REASON and stops
+    assert status["allocation_timeout"]["deadline_seconds"] == LIMIT
+
+
+def test_an_allocating_instance_with_a_machine_still_disables_it(flaky):
+    guardian, clock, seen, stops, mode = flaky
+    seen.update(_from_group(GONE))
+    step(guardian, clock)
+    seen.update(_from_group(ALLOCATING_WITH_MACHINE))
+    assert seen["count"] == 1  # placed (the 10:32 decision)
+    step(guardian, clock, 10)
+    seen.update(_from_group(GONE))
+    status = step(guardian, clock, LIMIT * 5)
+    assert status["stop_cause"] is None and not stops and "allocation_timeout" not in status
+
+
+def test_failed_reads_after_an_unplaced_sighting_do_not_prevent_the_deadline(flaky):
+    guardian, clock, seen, stops, mode = flaky
+    seen.update(_from_group(GONE))
+    step(guardian, clock)
+    seen.update(_from_group(ALLOCATING_NO_MACHINE))
+    step(guardian, clock, LIMIT - 3)  # reads keep answering until just before the deadline
+    mode["fail"] = True  # then they time out; the next poll lands after it
+    status = None
+    for _ in range(60):
+        status = step(guardian, clock, 5)
+        if status["stop_cause"] is not None:
+            break
+    assert status["stop_cause"] == ALLOCATION_TIMEOUT_REASON
+    assert status["allocation_timeout"]["elapsed_seconds"] >= LIMIT
+    # kept through control's projection, so control retries it as infra_allocation_timeout
+    from tessera_control.campaign_salad_executor import project_guardian_final
+
+    final = project_guardian_final(
+        dict(CLEAN, stop_cause=status["stop_cause"], allocation_timeout=status["allocation_timeout"])
+    )
+    assert final["allocation_timeout"]["elapsed_seconds"] >= LIMIT
+
+
+def test_failed_reads_never_fire_it_once_a_placed_instance_was_seen(flaky):
+    guardian, clock, seen, stops, mode = flaky
+    seen.update(_from_group(GONE))
+    step(guardian, clock)
+    seen.update(_from_group(ALLOCATING_WITH_MACHINE))
+    step(guardian, clock, 10)
+    mode["fail"] = True
+    status = None
+    for _ in range(60):
+        status = step(guardian, clock, 5)
+        if status["stop_cause"] is not None:
+            break
+    assert status["stop_cause"] != ALLOCATION_TIMEOUT_REASON
+    assert "allocation_timeout" not in status
+
+
+def test_failed_reads_before_the_clock_started_never_fire_it(flaky):
+    guardian, clock, seen, stops, mode = flaky
+    mode["fail"] = True  # the group was never seen started
+    status = step(guardian, clock, LIMIT * 3)
+    assert status["stop_cause"] != ALLOCATION_TIMEOUT_REASON
+    assert "allocation_timeout" not in status
+
+
+def _fail_past_the_deadline(guardian, clock, seen, mode):
+    seen.update(_from_group(GONE))
+    step(guardian, clock)
+    seen.update(_from_group(ALLOCATING_NO_MACHINE))
+    step(guardian, clock, LIMIT - 3)
+    mode["fail"] = True
+    status = None
+    for _ in range(60):
+        status = step(guardian, clock, 5)
+        if status["stop_cause"] is not None:
+            break
+    return status
+
+
+def test_failed_reads_after_custody_began_never_become_an_allocation_timeout(flaky):
+    guardian, clock, seen, stops, mode = flaky
+    mode["custody"] = True  # input fetched or output written: not an unallocated empty group
+    status = _fail_past_the_deadline(guardian, clock, seen, mode)
+    assert status["stop_cause"] == "provider_unavailable"
+    assert "allocation_timeout" not in status
+
+
+def test_an_adapter_that_cannot_say_or_raises_never_fires_the_read_failure_timeout(
+    flaky, tmp_path
+):
+    guardian, clock, seen, stops, mode = flaky
+
+    def boom(operation):
+        raise RuntimeError("custody lookup failed")
+
+    guardian.custody_started = boom
+    status = _fail_past_the_deadline(guardian, clock, seen, mode)
+    assert status["stop_cause"] == "provider_unavailable"
+    assert "allocation_timeout" not in status
+    guardian.custody_started = None
+    assert guardian._allocation_expired(OPERATION, clock[0] + 10**6) is None
+
+
+def test_a_database_error_in_the_expiry_check_falls_back_to_the_ordinary_read_failure(flaky, monkeypatch):
+    guardian, clock, seen, stops, mode = flaky
+
+    def broken(operation, now):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(guardian, "_allocation_expired", broken)
+    status = _fail_past_the_deadline(guardian, clock, seen, mode)  # tick never raises
+    status = step(guardian, clock, 600)  # the ordinary pre-start read-retry window runs out
+    assert status["stop_cause"] == "provider_unavailable"
+    assert "allocation_timeout" not in status
+
+
+def test_a_placement_written_earlier_blocks_the_read_failure_timeout(flaky):
+    guardian, clock, seen, stops, mode = flaky
+    seen.update(_from_group(GONE))
+    step(guardian, clock)
+    # the placement is bound in the database (as an earlier read of the same tick would do)
+    with guardian.db:
+        guardian.db.execute(
+            "UPDATE assignments SET assigned_allocation='alloc-a' WHERE operation=?", (OPERATION,)
+        )
+    assert guardian._allocation_expired(OPERATION, clock[0] + 10**6) is None

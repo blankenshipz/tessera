@@ -482,6 +482,31 @@ class SaladGuardian:
         waited = now - started
         return waited if waited >= self.allocation_seconds else None
 
+    def _allocation_expired(self, operation: str, now: float) -> float | None:
+        """Seconds waited when the allocation deadline has passed without any instance ever seen
+        (no instance latch, clock started, no allocation bound, never seen running); None
+        otherwise. Used when a read failed, so it needs no fresh observation: the latch is only
+        ever set by an exact, fresh one. It also needs the adapter to say that no custody has
+        begun (``custody_started`` wired and False); one that cannot say, or raises, never fires
+        it. The bound allocation and first-running instant are re-read from the database, so a
+        placement written earlier in the same tick counts."""
+        if self.allocation_seconds is None or self.custody_started is None:
+            return None
+        found = self.db.execute(
+            "SELECT instance_seen,alloc_started_at,assigned_allocation,first_running "
+            "FROM assignments WHERE operation=?",
+            (operation,),
+        ).fetchone()
+        if found is None or found[0] or found[1] is None or found[2] or found[3] is not None:
+            return None
+        try:
+            if self.custody_started(operation) is not False:
+                return None
+        except Exception:
+            return None
+        waited = now - found[1]
+        return waited if waited >= self.allocation_seconds else None
+
     def _never_allocated(self, operation: str, now: float) -> float | None:
         """Seconds a started group has waited when it never showed an instance (None when the
         clock never started or an instance was ever seen)."""
@@ -733,10 +758,11 @@ class SaladGuardian:
             elif not exact or not fresh or o.state not in {"running", "stopped", "pending"}:
                 reason, stopping = "provider_unknown", True
             elif allocation == "unallocated" and o.allocation_id != "unallocated":
+                allocation = o.allocation_id  # a later raise in this tick sees the placement
                 with self.db:
                     self.db.execute(
                         "UPDATE assignments SET assigned_allocation=? WHERE operation=?",
-                        (o.allocation_id, operation),
+                        (allocation, operation),
                     )
                 terminal = o.state == "stopped" and not uncertain
             elif o.allocation_id != allocation:
@@ -769,10 +795,27 @@ class SaladGuardian:
                 never_allocated = self._never_allocated(operation, now)
         except Exception as error:
             failed_at = self.clock()
-            retry_prefix = self._may_retry_read(
-                operation, error, first_running, allocation, stopping, fail_since, failed_at
-            )
-            if retry_prefix is not None:
+            try:
+                expired = (
+                    None
+                    if stopping or first_running is not None or allocation != "unallocated"
+                    else self._allocation_expired(operation, failed_at)
+                )
+            except Exception:
+                expired = None  # cannot tell: record the failure as before, never a timeout
+            if expired is not None:
+                # No instance was ever seen, the clock started and has run out: a stretch of
+                # failed or unknown reads must not keep the deadline from firing. Stopping
+                # a group nothing was seen to run on is the fail-closed direction.
+                reason, stopping, allocation_waited = ALLOCATION_TIMEOUT_REASON, True, expired
+                retry_prefix = None
+            else:
+                retry_prefix = self._may_retry_read(
+                    operation, error, first_running, allocation, stopping, fail_since, failed_at
+                )
+            if expired is not None:
+                pass
+            elif retry_prefix is not None:
                 # The window opens at this poll's start, the same instant its retry event is
                 # stamped with, so every retry of the window counts from fail_since.
                 fail_since = now if fail_since is None else fail_since

@@ -466,6 +466,19 @@ incurred while your container group is allocating or downloading", and that you 
 Cold Boot time". Treating `machine_id` as placed is therefore conservative: our exposure estimate
 and deadline latch may start earlier than Salad bills, never later.
 
+An allocating instance with no `machine_id` is never placed: it neither latches the deadline nor
+counts as an instance, however many polls saw it, and it may disappear again. A placed one (a
+`machine_id`, or a state past `allocating`) latches it for good, as before. The clock still starts
+only on the first poll that saw the group started, never at arming.
+
+Reads that time out or fail do not hold the deadline off. When a poll fails after the clock has run
+past `allocation_deadline_seconds` with no instance ever latched, no allocation bound, nothing
+seen running and the adapter reporting that no custody has begun (an adapter that cannot say, or
+raises, never qualifies), the guardian stops with `allocation_timeout` (and keeps the evidence) instead of
+`provider_unavailable`. A failed read before the deadline behaves as before (retry window, then
+`provider_unavailable`); the latch is only ever set by an exact, fresh read, so a group that showed a
+placed instance is never stopped as a timeout this way.
+
 When the route limit stops a started group that never showed an instance, the status carries the
 same `allocation_timeout` evidence (elapsed seconds; the stop cause stays `deadline`), and control's
 guardian-final projection keeps it for a `deadline` as well as an `allocation_timeout` stop, so the
