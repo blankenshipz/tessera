@@ -767,6 +767,7 @@ amendment:
   ([ADR 0178](decisions/0178-lease-renewal-stall-retry.md)). A running tick re-reads the
   lease's authority at most every `authority_reread_seconds` (default 10, 0 to 20; 0 re-reads
   every tick), and each renewal forces a re-read.
+- After a confirmed exit, the exit report, the output transfer to quarantine and the run receipt each retry a transient control failure with backoff (1 s doubling to 8 s) inside one 180 s window; a refusal is not retried and a spent window fails closed as before. The grant result lists the tries as `handoff_retries` ([ADR 0188](decisions/0188-end-of-attempt-transfer-retry.md)).
 - Logs are bounded JSON lines with error classes only. A cycle that raises is counted and
   the loop continues.
 - Exit 2 means the configuration or credential was refused: do not restart. Restart is

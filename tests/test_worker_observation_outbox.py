@@ -141,7 +141,9 @@ def test_the_backoff_survives_a_restart_and_is_bounded(tmp_path):
         _make_due(tmp_path)
         outcome = _resume(tmp_path, state, grant, adapter, FlakyObservations(state, fail_at={1}))
         delays.append(outcome["retry_after_seconds"])
-    assert delays[:4] == [4.0, 8.0, 16.0, 32.0]
+    # Real time also passes while the end-of-attempt window retries (ADR 0188), so each delay
+    # is the doubled outbox backoff less a fraction of a second.
+    assert delays[:4] == pytest.approx([4.0, 8.0, 16.0, 32.0], abs=0.5)
     assert max(delays) == 300.0 and delays[-1] == 300.0
 
 

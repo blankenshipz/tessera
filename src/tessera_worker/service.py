@@ -17,8 +17,9 @@ import secrets
 import sqlite3
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,73 @@ _RENEWAL_RETRY_CAP_SECONDS = 4.0
 # the lease time left before the deadline, so this many attempts fit in it and one hung request
 # never uses up the whole window (ADR 0178). Never below the minimum request time.
 _RENEWAL_ATTEMPTS_PER_WINDOW = 3
+# End of an attempt (ADR 0188): after a confirmed exit, the exit report, the output transfer to
+# quarantine and the run receipt each retry a transient control failure (no answer in time, a
+# straggling request, a dropped connection, a 5xx) with this backoff (doubling, capped), all
+# within one window counted from the confirmed exit. The window stays inside the output seal's
+# 5-minute termination freshness, and control accepts output of a run that exited inside its
+# grant after the lease lapses, so the lease is not renewed here. When the window is spent the
+# call fails closed exactly as before (custody kept, nothing claimed).
+_HANDOFF_RETRY_WINDOW_SECONDS = 180.0
+_HANDOFF_RETRY_BASE_SECONDS = 1.0
+_HANDOFF_RETRY_CAP_SECONDS = 8.0
+
+
+@dataclass
+class _HandoffRetries:
+    """End-of-attempt control calls that did not get through at first (grant result)."""
+
+    failed: int = 0  # every failed attempt of an end-of-attempt call in this run
+    calls: dict[str, int] = field(default_factory=dict)  # failed attempts per call
+    last_failure: str | None = None
+    exhausted: str | None = None  # the call whose window ran out, if one did
+    started: float | None = None  # clock reading when the window opened (the confirmed exit)
+    waited: float = 0.0  # backoff slept inside the window
+
+    @staticmethod
+    def backoff(attempt: int, minimum: float = 0.0) -> float:
+        """The wait before retry ``attempt`` (from 1): doubling, capped, never below ``minimum``."""
+        doubled = _HANDOFF_RETRY_BASE_SECONDS * 2 ** min(max(attempt - 1, 0), 16)
+        return max(minimum, min(_HANDOFF_RETRY_CAP_SECONDS, doubled))
+
+    def spent(self, now: float, backoff: float) -> bool:
+        """Whether waiting ``backoff`` more would leave the window, on either measure: the backoff
+        already slept, or the clock since the window opened (a call's own request time counts on
+        the clock, so a hung request cannot stretch the window)."""
+        if self.waited + backoff > _HANDOFF_RETRY_WINDOW_SECONDS:
+            return True
+        return (
+            self.started is not None
+            and now + backoff > self.started + _HANDOFF_RETRY_WINDOW_SECONDS
+        )
+
+    def summary(self) -> dict[str, Any]:
+        record: dict[str, Any] = {"failed_attempts": self.failed, "calls": dict(self.calls)}
+        if self.last_failure is not None:
+            record["last_failure"] = self.last_failure
+        if self.exhausted is not None:
+            record["exhausted"] = self.exhausted
+        return record
+
+
+def _transient_handoff_failure(error: BaseException) -> float | None:
+    """The minimum wait before retrying ``error`` at the end of an attempt, or None.
+
+    Only a transient control failure retries: a ``ControlChannelError``/``TimeoutError`` that
+    ``is_transient_control_failure`` accepts, found on the error or the chain it was raised from
+    (an output transfer may wrap it), or an undelivered observation that is pending for a
+    transient reason (its outbox delay is honoured). A refusal, a rejected credential, a local
+    error or anything else is not retried."""
+    if isinstance(error, ObservationDeliveryPending):
+        return None if error.auth else max(0.0, float(error.retry_after_seconds))
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(seen) < 8:
+        seen.add(id(current))
+        if is_transient_control_failure(current):
+            return 0.0
+        current = current.__cause__ or current.__context__
+    return None
 
 
 @dataclass
@@ -558,6 +626,7 @@ class DevelopmentWorkerService:
         # Wall-clock time, compared with the lease's own expiry (injectable for tests).
         self.wall_clock: Any = lambda: datetime.now(UTC)
         self._renewal_retries = _RenewalRetries()
+        self._handoff_retries = _HandoffRetries()
         self.root = _private_directory(config.workspace_root)
         # ADR 0125: on by default. None means the default marker ``<workspace>/stage-watch.kill``
         # (never created); an explicit StageWatchConfig wins, a disabled one never imports the
@@ -747,7 +816,36 @@ class DevelopmentWorkerService:
             # retry got through or the lease ran out (an operator can see stalls that a
             # healthy stage survived, not only the ones that stopped it).
             outcome = {**outcome, "lease_renewal_retries": retries.summary()}
+        handoff = self._handoff_retries
+        if handoff.failed and isinstance(outcome, dict):
+            # The end-of-attempt calls that stalled, whether a retry got through or not.
+            outcome = {**outcome, "handoff_retries": handoff.summary()}
         return outcome
+
+    def _handoff(self, name: str, call: Any) -> Any:
+        """Run one end-of-attempt control call, retrying a transient failure inside the window.
+
+        A failure that is not transient, or one whose next try would leave the window, is raised
+        unchanged, so the caller's existing fail-closed handling applies."""
+        retries = self._handoff_retries
+        attempt = 0
+        while True:
+            try:
+                return call()
+            except Exception as error:
+                minimum = _transient_handoff_failure(error)
+                if minimum is None:
+                    raise
+                attempt += 1
+                retries.failed += 1
+                retries.calls[name] = retries.calls.get(name, 0) + 1
+                retries.last_failure = safe_error_detail(error, self.root)
+                backoff = retries.backoff(attempt, minimum)
+                if retries.spent(self.clock(), backoff):
+                    retries.exhausted = name
+                    raise
+                retries.waited += backoff
+                self.sleep(backoff)
 
     def _drive_loop(self, runtime: DevelopmentCpuRuntime, result: DriverResult) -> dict[str, Any]:
         # None: renew on the first pass. start() leases afresh, but recover() resumes a lease
@@ -760,13 +858,19 @@ class DevelopmentWorkerService:
                     if refused is not None:
                         # A permanent refusal is already durable: never repost.
                         return refused
-                # collect reports a fresh confirmed exit before touching outputs.
+                # collect reports a fresh confirmed exit before touching outputs. Each
+                # end-of-attempt call rides out a control stall within one window (ADR 0188);
+                # only a refusal or the spent window reaches the fail-closed handling below.
+                self._handoff_retries.started = self.clock()
                 try:
-                    observation = runtime.report(result)
+                    observation = self._handoff("exit_report", partial(runtime.report, result))
                 except Exception as error:
                     return self._report_failed(runtime, error)
                 try:
-                    receipt = runtime.collect(result, reported_observation=observation)
+                    receipt = self._handoff(
+                        "output_transfer",
+                        partial(runtime.collect, result, reported_observation=observation),
+                    )
                 except SupervisorError as error:
                     # A confirmed provider exit does not make missing, unsafe, or
                     # untransferable output safe to reclaim.  Keep its workspace.
@@ -777,7 +881,7 @@ class DevelopmentWorkerService:
                         "reason": "quarantine_failed",
                         "detail": safe_error_detail(error, self.root),
                     }
-                run_receipt, failure = self._post_run_receipt(runtime, result)
+                run_receipt, failure = self._post_run_receipt(runtime, result, window=True)
                 if failure is not None:
                     return failure
                 runtime.development_outputs.cleanup(runtime.operation.operation_id)  # type: ignore[union-attr]
@@ -892,7 +996,11 @@ class DevelopmentWorkerService:
         }
 
     def _post_run_receipt(
-        self, runtime: DevelopmentCpuRuntime, result: DriverResult
+        self,
+        runtime: DevelopmentCpuRuntime,
+        result: DriverResult,
+        *,
+        window: bool = False,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Post the run receipt with bounded retry; return (receipt, failure outcome).
 
@@ -900,7 +1008,9 @@ class DevelopmentWorkerService:
         permanent refusal is recorded durably and is terminal.  Custody (workspace
         and uploaded output) is kept on every failure; nothing is claimed recorded.
         """
-        for attempt in range(1, RUN_RECEIPT_ATTEMPTS + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 return runtime.post_run_receipt(result), None
             except Exception as error:
@@ -925,12 +1035,24 @@ class DevelopmentWorkerService:
                             "the refusal could not be recorded durably, so a restart will repost",
                         )
                     return None, self._refusal_outcome(operation_id)
-                if attempt == RUN_RECEIPT_ATTEMPTS:
+                # A transient failure: at least RUN_RECEIPT_ATTEMPTS tries, and within the
+                # end-of-attempt window (ADR 0188) as many as fit with backoff.
+                retries = self._handoff_retries
+                retries.failed += 1
+                retries.calls["run_receipt"] = retries.calls.get("run_receipt", 0) + 1
+                retries.last_failure = safe_error_detail(error, self.root)
+                backoff = retries.backoff(attempt) if window else _RUN_RECEIPT_RETRY_SECONDS
+                within = window and not retries.spent(self.clock(), backoff)
+                if attempt >= RUN_RECEIPT_ATTEMPTS and not within:
+                    if window:
+                        retries.exhausted = "run_receipt"
                     detail = safe_error_detail(error, self.root)
                     return None, self._receipt_failed(
                         f"retries exhausted after {attempt} attempts: {detail}"[:_DETAIL_LIMIT]
                     )
-                self.sleep(_RUN_RECEIPT_RETRY_SECONDS)
+                if window:
+                    retries.waited += backoff
+                self.sleep(backoff)
         raise AssertionError("bounded receipt retry did not return")
 
     @staticmethod

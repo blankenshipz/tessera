@@ -597,12 +597,16 @@ def test_restart_control_outage_cancels_boundedly_without_new_authority(tmp_path
     service = _service(tmp_path, state, grant, channel=channel, adapter=adapter)
     result = _outage_outlasts_the_lease(service, monkeypatch).run()
 
+    # The exit report rode out the outage inside the end-of-attempt window (ADR 0188), then
+    # fell back to the outbox as before; the window's tries are on the result.
+    handoff = result.pop("handoff_retries")
+    assert handoff["exhausted"] == "exit_report" and handoff["calls"]["exit_report"] >= 1
+    assert result.pop("retry_after_seconds") == pytest.approx(2.0, abs=0.5)
     assert result == {
         "state": "report_pending",
         "quarantined": False,
         "reason": "observation_delivery_pending",
         "delivery_pending": True,
-        "retry_after_seconds": 2.0,
     }
     assert "/worker/leases" not in channel.paths
     assert adapter.calls.count("start") == 1
@@ -835,7 +839,8 @@ def test_receipt_key_is_stable_across_a_restart_after_a_lost_reply(tmp_path):
     assert result["state"] == "exited" and result["run_receipt"]["status"] == "recorded"
     # A lost reply is transient: the worker retries a bounded number of times with the SAME
     # key and body, and the restart reuses that key, so control sees one logical request.
-    assert len(first_channel.receipts) == 3
+    # At least the old three tries, then as many as the end-of-attempt window allows (ADR 0188).
+    assert 3 <= len(first_channel.receipts) <= 40
     assert {item[2] for item in first_channel.receipts} == {second_channel.receipts[0][2]}
     assert {json.dumps(item[1], sort_keys=True) for item in first_channel.receipts} == {
         json.dumps(second_channel.receipts[0][1], sort_keys=True)

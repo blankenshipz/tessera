@@ -130,7 +130,9 @@ def test_transient_exhaustion_is_bounded_unknown_and_a_restart_may_retry(tmp_pat
     result = build(channel).run()
     assert result["reason"] == "run_receipt_failed" and "terminal" not in result
     assert "retries exhausted" in result["detail"] and len(result["detail"]) <= 200
-    assert len(channel.receipts) == RUN_RECEIPT_ATTEMPTS
+    # At least RUN_RECEIPT_ATTEMPTS tries, more while the end-of-attempt window lasts (ADR 0188).
+    assert RUN_RECEIPT_ATTEMPTS <= len(channel.receipts) <= 40
+    assert len({key for _path, _body, key in channel.receipts}) == 1
     second_channel = _ReceiptChannel(state)
     again = build(second_channel).run()
     assert again["state"] == "exited" and again["run_receipt"]["status"] == "recorded"
