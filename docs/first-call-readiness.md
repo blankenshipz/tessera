@@ -39,11 +39,12 @@ writes only a transient probe file in the state directory.
    needs a running experiment) is not required: a person issues a reasoning-only grant
    ([ADR 0155](decisions/0155-reasoning-only-grant.md)). See
    [reasoning first call: operator steps](reasoning-first-call-ops.md) for the command.
-   The profile must carry the issued `grant_id`, `revision` and `epoch`. The readiness `grant` check (it
-   needs `--control-state-dir`, otherwise it reports `unchecked`) reads the control database read-only and
-   fails closed with a named finding: `grant_profile_incomplete`, `grant_missing`, `grant_malformed`,
+   The profile must carry the issued `grant_id`, `revision` and `epoch`. The readiness `grant` check reads the grant either through the read-only control API
+   (`--control-url`, with the service's own `agent-token`; no database access, see
+   [ADR 0162](decisions/0162-first-call-db-free-readiness.md)) or from the control database
+   (`--control-state-dir`); with neither it reports `unchecked`. It fails closed with a named finding: `grant_profile_incomplete`, `grant_missing`, `grant_malformed`,
    `grant_kind_unsupported`, `grant_revoked`, `grant_expired`, `grant_lineage_inactive`,
-   `grant_revision_mismatch`, `grant_scope_mismatch`, `grant_binding_inactive` (execution kind only),
+   `grant_revision_mismatch`, `grant_scope_mismatch`, `grant_binding_inactive` (execution kind only; through `--control-url` the control plane reports one `bindings_active` answer for the grant's own bound execution grants, and a control plane that does not send it leaves the check `unchecked`),
    `grant_budget_exhausted` or `grant_budget_below_call_cap`. It does not check the subject's scopes (issuance
    does) or the read-only tool gate (the runtime does).
 5. **Run the check** in the unit's own context, as root: `tessera-reasoning-readiness check --in-unit`
@@ -58,13 +59,20 @@ writes only a transient probe file in the state directory.
      [--control-state-dir DIR] [--control-url URL] [--project-id ID]
    ```
 
+   `--in-unit` needs no database path: with `--control-url URL` alone, `spend_caps` and `grant` are
+   read through the control API with the unit's `agent-token` credential, so one run as the service
+   user can exit 0 (the credential needs `model_spend:record` and `authority:consume`, which the
+   reasoning service already has). Give `--control-state-dir` as well, or instead, only where the
+   database is readable; it takes precedence. An unreachable, refused or malformed answer is a
+   failure, and a missing token leaves the check `unchecked`, never a pass.
+
    It prints JSON `{overall, checks, key}`. Each check has `name`, `status`
    (`ok`, `missing`, `fail`, `unchecked`), a `detail` and a `fix`. Exit status: **0** ready,
    **10** ready except the key, **11** not fully checked, **1** not ready, **2** usage.
 6. **Expect `ready_except_key` before the key is placed and `ready` after.** Anything else names the
-   thing to fix. `unchecked` (for example `spend_caps` without `--control-state-dir`, or `control_slices`
+   thing to fix. `unchecked` (for example `spend_caps` with neither `--control-url` nor `--control-state-dir`, or `control_slices`
    without `--control-url`) is not a pass: the result is `not_fully_checked` (exit 11), never `ready` or
-   `ready_except_key`. Run it with both inputs where the control state is readable, or check the limits
+   `ready_except_key`. Run it with `--control-url` (the database-free read) or `--control-state-dir`, or check the limits
    through `GET /model-spend`.
 7. **Start the service and make one call.** First create the admission marker,
    `sudo install -m 0600 /dev/null /etc/tessera/reasoning.admitted`: the unit has
@@ -85,7 +93,7 @@ writes only a transient probe file in the state directory.
 | `egress_allowlist` | the model-runtime allowlist is exactly the API host and port |
 | `receipts_store` | the state directory is writable, not group/world-writable, with free space |
 | `control_slices` | `/health/ready` answers and `/model-spend/limits` exists (probed without any credential) |
-| `spend_caps` | a limit row for the project and provider with caps at least the profile's per-call cap (`unchecked` when no project is known: set `model_spend.project_id` or pass `--project-id`) |
+| `spend_caps` | (database or `GET /model-spend/limits`) a limit row for the project and provider with caps at least the profile's per-call cap (`unchecked` when no project is known: set `model_spend.project_id` or pass `--project-id`) |
 
 Only a missing key file still reads `ready_except_key`, and only when every other check ran and passed. A
 check that could not run makes the result `not_fully_checked`; everything else that is not `ok` is `not_ready`.

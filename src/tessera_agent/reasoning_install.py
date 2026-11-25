@@ -69,6 +69,9 @@ WorkingDirectory=@STATE@
 LoadCredential=profile:@PROFILE@
 LoadCredential=prompt:@PROMPT@
 LoadCredential=agent-token:@TOKEN@
+# The admission marker, by reference only: start-up reads it from $CREDENTIALS_DIRECTORY to refuse a
+# malformed or expired recorded admission (exit 78). It holds no secret and is never in env or argv.
+LoadCredential=admission:@ADMITTED@
 # Default provider: Anthropic Messages API, called directly by Tessera's own client (ADR 0082).
 # anthropic-api-key is a root-owned 0600 operator file holding the API key. Tessera reads it from
 # $CREDENTIALS_DIRECTORY at call time, keeps it in memory only and sends it only to the allowlisted
@@ -782,9 +785,89 @@ def pending_operator(options: Options) -> list[dict[str, str]]:
         {
             "name": "admission",
             "path": str(Path(options.config_dir) / ADMITTED_FILE),
-            "action": "a person admits the service by creating this file",
+            "action": (
+                "a person admits the service with `tessera reasoning admit` (their own session "
+                "records the admission on receipts, then this file is written with a reference "
+                "to it; ADR 0163)"
+            ),
         },
     ]
+
+
+# -- the admission marker (ADR 0163) ---------------------------------------------------------------
+
+MAX_ADMITTED_BYTES = 4096
+
+
+def admitted_path(options: Options) -> Path:
+    """Where the unit's ``ConditionPathExists`` marker lives on this host."""
+    return _real(options, Path(options.config_dir) / ADMITTED_FILE)
+
+
+def write_admitted_marker(
+    options: Options,
+    content: bytes,
+    *,
+    replace: bool = False,
+    accounts: Accounts | None = None,
+) -> Path:
+    """Write the admission marker atomically: root-owned 0600, through an exclusive temp file
+    in the same directory, fsynced, renamed over the target, directory fsynced. The content is a
+    non-secret reference to the admission record; the unit only checks that the file exists.
+
+    Refuses a symlink or non-regular file at the path, a group/world-writable parent, a missing
+    config directory, and (without ``replace``) any existing marker. Needs root unless a root
+    prefix is given (staging and tests), where ``accounts`` performs the chown."""
+    _check_options(options)
+    if len(content) > MAX_ADMITTED_BYTES:
+        raise InstallRefused("the admission marker content is too large")
+    if options.root is None and os.geteuid() != 0:
+        raise InstallRefused("writing the admission marker needs root")
+    if options.root is not None and accounts is None:
+        raise InstallRefused("with a root option, writing the marker needs injected accounts")
+    path = admitted_path(options)
+    _check_ancestors(options, path)
+    if _lstat(path.parent, want="dir") is None:
+        raise InstallRefused(f"{path.parent} does not exist; install the service first")
+    if _lstat(path, want="file") is not None and not replace:
+        raise InstallRefused(
+            f"{path} already exists; nothing was changed (replace is needed to overwrite it)"
+        )
+    owner = accounts or SystemAccounts(_refuse_runner)
+    directory = path.parent
+    temp = directory / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, content)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        owner.chown(temp, 0, 0)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+    _fsync_directory(directory)
+    return path
+
+
+def remove_admitted_marker(options: Options) -> bool:
+    """Remove the marker (the unit can then no longer start). False when it was absent.
+    Refuses a symlink or a non-regular file. Needs root unless a root prefix is given."""
+    _check_options(options)
+    if options.root is None and os.geteuid() != 0:
+        raise InstallRefused("removing the admission marker needs root")
+    path = admitted_path(options)
+    if _lstat(path, want="file") is None:
+        return False
+    os.unlink(path)
+    _fsync_directory(path.parent)
+    return True
 
 
 def apply(
@@ -853,6 +936,7 @@ def apply(
         "key_owner_uid": 0,
         # The check is pointed at the stored directory, where the files carry their stored names.
         "credential_files": credential_files(options),
+        "admitted_path": admitted_path(options),
     }
     from . import first_call_readiness
 

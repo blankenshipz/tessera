@@ -39,6 +39,16 @@ class ServiceLike(Protocol):
 
 
 @dataclass(frozen=True)
+class VenvResult:
+    venv: str
+    services: tuple[str, ...]
+    ok: bool
+    version: str | None
+    error_class: str | None
+    seconds: float
+
+
+@dataclass(frozen=True)
 class StepResult:
     step: str
     name: str
@@ -212,4 +222,65 @@ def start_services(
                 results.append(StepResult("health", service.name, False, round(elapsed, 3), detail))
                 return results
             sleep(POLL_INTERVAL_SECONDS)
+    return results
+
+
+_VERSION_CODE = "import importlib.metadata as m;print(m.version('tessera'))"
+
+
+def venv_python(venv: str) -> str:
+    return os.path.join(venv, "bin", "python")
+
+
+def _error_class(code: int, output: str) -> str:
+    if code == 124:
+        return "timeout"
+    if code == 127:
+        return output if output.isidentifier() else "OSError"
+    return "pip_failed"
+
+
+def install_service_venvs(
+    services: Sequence[Any],
+    source: str,
+    runner: Runner,
+    *,
+    timeout: int,
+    expected_version: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[VenvResult]:
+    """Reinstall the release into each distinct service venv; stop at the first failure.
+
+    Success needs a clean pip exit and the venv's own interpreter to report the installed
+    version (which must equal ``expected_version`` when that is known)."""
+    owners: dict[str, list[str]] = {}
+    for service in services:
+        venv = getattr(service, "venv", None)
+        if venv:
+            owners.setdefault(venv, []).append(service.name)
+    results: list[VenvResult] = []
+    for venv, names in owners.items():
+        started = clock()
+        python = venv_python(venv)
+        code, out = _run(
+            runner,
+            [python, "-m", "pip", "install", "--no-input", "--disable-pip-version-check", source],
+            timeout,
+        )
+        version: str | None = None
+        error: str | None = None if code == 0 else _error_class(code, out)
+        if error is None:
+            code, out = _run(runner, [python, "-c", _VERSION_CODE], 60)
+            version = out.strip() if code == 0 and out.strip() else None
+            if version is None:
+                error = "version_unreadable"
+            elif expected_version is not None and version != expected_version:
+                error = "version_mismatch"
+        results.append(
+            VenvResult(
+                venv, tuple(names), error is None, version, error, round(clock() - started, 3)
+            )
+        )
+        if error is not None:
+            break
     return results

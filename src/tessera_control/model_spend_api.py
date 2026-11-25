@@ -138,6 +138,13 @@ def read(
     return store.read(actor, project_id, days)
 
 
+@router.get("/limits")
+def read_limits(actor: Actor, store: Spend, project_id: Identifier):
+    """The project's caps only (read only): a human, or an agent with model_spend:record or
+    model_spend:read in its own project."""
+    return store.read_limits(actor, project_id)
+
+
 @router.put("/limits")
 def set_limits(body: LimitsBody, actor: Actor, key: Key, store: Spend):
     """Human only: set the per-call and daily caps for a project and provider (``*`` = default)."""

@@ -96,19 +96,34 @@ Roles: **root** is the host operator; **person** is a human credential on the co
      --control-state-dir DIR --control-url URL --project-id PROJECT
    ```
 
+   `--control-state-dir` is optional: as the service user (or with `--in-unit`) pass only
+   `--control-url URL` and the spend caps and the grant are read through the read-only control API
+   with the service's own agent token ([ADR 0162](decisions/0162-first-call-db-free-readiness.md)); no
+   database access is needed.
+
    Expected exit status: **0** ready. The key-file check requires a regular file owned by the user
    running the check with no group or other access (0600 as installed), 1 to 512 bytes. Exit **10**
-   means everything but the key file is fine, **11** means a check could not run (pass both
-   `--control-state-dir` and `--control-url`), **1** not ready (the output names the fix), **2** usage.
+   means everything but the key file is fine, **11** means a check could not run (pass `--control-url`, or `--control-state-dir` where the database is
+   readable), **1** not ready (the output names the fix), **2** usage.
    Do not go on until it is 0. It does not open the key and does not prove the provider accepts it.
 
-5. **Create the admission marker (root).** The unit carries
+5. **Admit the service (a person, root).** The unit carries
    `ConditionPathExists=/etc/tessera/reasoning.admitted`; without the marker it is silently skipped.
-   The marker is an operator assertion, not a grant or billing proof:
+   Admit it with your own session credential (a root-owned 0600 header file
+   `Authorization: Bearer ...` holding a `human_session` token; the owner token is refused, labelled
+   or not). The command records who admitted the service, the caps (defaulting to the profile's
+   limits) and the expiry on receipts, then writes the marker with a reference to that record
+   ([ADR 0163](decisions/0163-reasoning-admission-delegation-record.md)):
 
    ```sh
-   sudo install -m 0600 /dev/null /etc/tessera/reasoning.admitted
+   sudo tessera reasoning admit --session-header SESSION_HEADER_FILE --expires-in 86400
    ```
+
+   The marker is an admission, not a grant or billing proof. Run the readiness check again: its
+   `admission` check is `ok` for an active record that covers the profile and `fail` for a revoked,
+   expired, altered or exceeded one. A hand-made empty marker
+   (`sudo install -m 0600 /dev/null /etc/tessera/reasoning.admitted`) still lets the unit start, but
+   readiness reports it as `unrecorded`; `tessera reasoning admit --replace` records it.
 
 6. **Make the one call (root).** `sudo systemctl start tessera-reasoning.service`. Do **not**
    `enable` it: the unit has no `[Install]` section on purpose. A start-up refusal exits 78 and is
@@ -151,8 +166,10 @@ Roles: **root** is the host operator; **person** is a human credential on the co
 9. **Check nothing leaked.** The journal and `status` output hold no prompt or completion text and
    no key; the completion text is only in the private output file in the state directory.
 
-10. **Stop (root).** `sudo systemctl stop tessera-reasoning.service` and
-    `sudo rm /etc/tessera/reasoning.admitted`.
+10. **Stop (root).** `sudo systemctl stop tessera-reasoning.service`, then
+    `sudo tessera reasoning revoke-admission --session-header SESSION_HEADER_FILE --project-id
+    PROJECT --admission-id ID` (revokes the record and removes the marker that references it), or
+    `sudo rm /etc/tessera/reasoning.admitted` for a bare marker.
 
 ## Rollback
 
@@ -174,6 +191,14 @@ Roles: **root** is the host operator; **person** is a human credential on the co
   credential reference and fingerprint from the install receipt, when, outcome). A second run records
   `already_absent`. `check` then reports the credential as not configured, and the unit will not
   start until a key is installed again. Then revoke the key at the provider.
+
+## Start-up refusal of a bad admission
+
+The unit loads the admission marker as `LoadCredential=admission:` (a reference, never a secret).
+At start-up the supervisor reads it offline and exits 78 (configuration refusal, never restarted) with
+`admission_marker_malformed` or `admission_expired` on stderr when a recorded marker is damaged or
+past its expiry. A bare marker, or a unit without the credential, starts as before. Revocation needs
+the record: run the readiness check. See [ADR 0170](decisions/0170-reasoning-startup-admission-refusal.md).
 
 ## Not proven offline
 

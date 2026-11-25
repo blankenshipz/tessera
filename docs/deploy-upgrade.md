@@ -50,6 +50,19 @@ the service-health file the units write (its `last_loop_at` must be at or after 
 HTTP 2xx. A service without `stop_argv` is not stopped: execute refuses it unless the service sets
 `"writes_state": false`; the dry run and receipt list what is not stopped.
 
+**Service venvs (optional).** A service that runs from its own virtualenv (for example the
+reasoning service) declares `"venv": "/abs/path/to/venv"`. Then the plan also needs
+`install_source` (a checkout or built wheel path; default `repo_root`) and may set
+`venv_install_timeout_seconds` (30 to 1800, default 600). Under `--execute`, after the services
+stop, the backup, the migration and the config fixes, and before any restart, the release is
+`pip install`ed with each distinct venv's own `bin/python`, and the version it reports is read
+back (and must equal the control plane's, when known). The receipt gets `service_venvs`: per venv
+the path, services, release (`source_revision`), installed version, `ok` and `error_class`
+(`pip_failed`, `timeout`, `version_unreadable`, `version_mismatch`, `not_attempted`, or an OS
+error name). A failed install stops the run before any restart and leaves the services stopped.
+A venv without an executable `bin/python` blocks preflight, and the dry run lists each planned
+install. Details: [ADR 0161](decisions/0161-deploy-upgrade-service-venvs.md).
+
 **Focused tests (optional).** Four more plan fields add a test gate before anything stops
 ([ADR 0117](decisions/0117-focused-test-selection.md)). All are optional and the step is
 disabled by default.

@@ -12,6 +12,8 @@ The steps a deploy took by hand, in order, each recorded in one receipt:
    the installed source with the plan's ``source_revision`` commit, each with the deploy-check
    receipt.
 5. *migrate*: the existing explicit migration; the backup above is the confirmation it needs.
+   Then *service venvs*: the release is reinstalled into each service's declared venv (after the
+   stop, before the restart); a failure leaves the services stopped.
 6. *start*: the services in plan order, each restarted and waited on until healthy.
 7. *smoke*: the fixed cheap set: a second deploy check must be ready (schema current, configs
    clean, providers valid) and, if the plan asks, the synthetic networkless CPU smoke passes.
@@ -412,6 +414,7 @@ class _Run:
             "backup": None,
             "fixes": [],
             "services": [],
+            "service_venvs": [],
             "smoke": [],
         }
 
@@ -519,6 +522,9 @@ def run_upgrade(
                 deploy_check.require_writable_directory(Path(directory), what)
             except ValueError as error:
                 blocking.append(f"plan.{what.split()[0]}_dir ({error})")
+    for venv in plan.venvs:
+        if not os.access(deploy_services.venv_python(venv), os.X_OK):
+            blocking.append(f"service venv {venv} (no executable bin/python)")
     unsafe = _unsafe_unstopped(plan)
     run.document["not_stopped"] = _not_stopped(plan)
     if execute:
@@ -673,6 +679,54 @@ def run_upgrade(
         return run.finish()
     run.step("config-fixes", True, f"{len(run.document['fixes'])} applied", began)
 
+    # -- reinstall the release into each registered service venv (services are stopped) -------
+    if plan.venvs:
+        began = clock()
+        installed = deploy_services.install_service_venvs(
+            services,
+            plan.release_source,
+            runner,
+            timeout=plan.venv_install_timeout_seconds,
+            expected_version=package_version(),
+            clock=clock,
+        )
+        for item in installed:
+            run.document["service_venvs"].append(
+                {
+                    "venv": item.venv,
+                    "services": list(item.services),
+                    "release": plan.source_revision,
+                    "version": item.version,
+                    "ok": item.ok,
+                    "error_class": item.error_class,
+                }
+            )
+            run.step(
+                f"install-venv:{item.venv}",
+                item.ok,
+                f"installed {item.version}" if item.ok else f"failed ({item.error_class})",
+                seconds=item.seconds,
+            )
+        if len(installed) < len(plan.venvs) or not all(r.ok for r in installed):
+            run.document["service_venvs"].extend(
+                {
+                    "venv": v,
+                    "services": [s.name for s in services if s.venv == v],
+                    "release": plan.source_revision,
+                    "version": None,
+                    "ok": False,
+                    "error_class": "not_attempted",
+                }
+                for v in plan.venvs[len(installed) :]
+            )
+            run.step(
+                "install-venvs",
+                False,
+                f"a service venv was not refreshed; services left stopped, backup {name}",
+                began,
+            )
+            return run.finish()
+
     # -- start in order, wait for health ------------------------------------------------------
     started = deploy_services.start_services(
         services, runner, probe=probe, sleep=sleep, clock=clock
@@ -781,6 +835,11 @@ def _planned(plan: Any, findings: list[deploy_check.Finding]) -> list[str]:
         steps.append("after the migrate: drop removed config keys (receipted; originals kept)")
     if any(i.fix is not None and i.fix.fix_id == "refresh_source_pin" for i in findings):
         steps.append("after the migrate: pin executor source_revision to the installed source")
+    for venv in plan.venvs:
+        steps.append(
+            f"after the stop: reinstall the release into the service venv {venv} "
+            "(version read back and recorded)"
+        )
     steps.append("start in order, waiting for health: " + ", ".join(s.name for s in plan.services))
     steps.append("smoke: deploy check ready" + (", CPU smoke" if plan.smoke_cpu else ""))
     steps.append("write the deploy receipt")

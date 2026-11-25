@@ -1,5 +1,6 @@
 """``tessera reasoning install --plan|--apply``: the reasoning service's install checklist as one
-checked, idempotent command (ADR 0119)."""
+checked, idempotent command (ADR 0119). ``tessera reasoning admit`` / ``revoke-admission``: a
+person's recorded admission of the service and its marker (ADR 0163)."""
 
 from __future__ import annotations
 
@@ -70,6 +71,9 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
     install.add_argument("--control-url")
     install.add_argument("--project-id")
     install.add_argument("--format", choices=("text", "json"), default="text")
+    from .reasoning_admit_cli import add_admission_parsers
+
+    add_admission_parsers(actions)
 
 
 def _options(arguments: argparse.Namespace):
@@ -105,6 +109,14 @@ def _text_plan(steps) -> str:
 
 
 def run(arguments: argparse.Namespace) -> int:
+    if arguments.reasoning_action == "admit":
+        from .reasoning_admit_cli import run_admit
+
+        return run_admit(arguments)
+    if arguments.reasoning_action == "revoke-admission":
+        from .reasoning_admit_cli import run_revoke
+
+        return run_revoke(arguments)
     from . import reasoning_install as engine
 
     try:

@@ -434,9 +434,38 @@ class AgentAuthorityStore(ExternalAgentStore):
                 result["effective_status"] = "active"
             except Forbidden:
                 result["effective_status"] = "fenced"
+            if authority_kind(result["bounds"]) != REASONING_KIND:
+                result["bindings_active"] = self._bindings_active(connection, row, result["bounds"])
             return result
         finally:
             connection.close()
+
+    @staticmethod
+    def _bindings_active(connection, row, bounds) -> bool:
+        """Read only: is every execution grant this grant is bound to active at its pinned
+        revision and epoch, unexpired, and in this grant's own project? One boolean, so the
+        subject learns nothing about execution grants beyond the ones its own bounds name."""
+        bindings = bounds.get("bindings")
+        if not isinstance(bindings, list) or not bindings:
+            return False
+        for binding in bindings:
+            try:
+                found = connection.execute(
+                    "SELECT status, revision, epoch, expires_at FROM execution_grants "
+                    "WHERE id=? AND project_id=?",
+                    (binding["execution_grant_id"], row["project_id"]),
+                ).fetchone()
+                if (
+                    found is None
+                    or found["status"] != "active"
+                    or found["revision"] != binding["expected_execution_grant_revision"]
+                    or found["epoch"] != binding["expected_execution_epoch"]
+                    or _time(found["expires_at"]) <= datetime.now(UTC)
+                ):
+                    return False
+            except (KeyError, TypeError, ValueError):
+                return False
+        return True
 
     def revoke_grant(self, principal, grant_id, key, payload):
         body = self._body(RevokeAgentAuthority, payload)

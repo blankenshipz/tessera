@@ -17,6 +17,9 @@ WorkingDirectory=/var/lib/tessera-reasoning
 LoadCredential=profile:/etc/tessera/reasoning.json
 LoadCredential=prompt:/etc/tessera/reasoning-prompt.txt
 LoadCredential=agent-token:/etc/tessera/credentials/reasoning-agent-token
+# The admission marker, by reference only: start-up reads it from $CREDENTIALS_DIRECTORY to refuse a
+# malformed or expired recorded admission (exit 78). It holds no secret and is never in env or argv.
+LoadCredential=admission:/etc/tessera/reasoning.admitted
 # Default provider: Anthropic Messages API, called directly by Tessera's own client (ADR 0082).
 # anthropic-api-key is a root-owned 0600 operator file holding the API key. Tessera reads it from
 # $CREDENTIALS_DIRECTORY at call time, keeps it in memory only and sends it only to the allowlisted

@@ -21,6 +21,26 @@ effect: only billed destinations, today the Anthropic Messages API, go through t
 plus the output cap at the output price); the daily cap (UTC day) against settled spend plus open
 reservations plus that worst case.
 
+## Read the limits (a person or the reasoning service)
+
+```
+GET /model-spend/limits?project_id=<project>
+```
+
+Read only. Who may call it: a human, or an enrolled agent whose scope includes `model_spend:record`
+(the reasoning manager credential, which already spends under these caps) or `model_spend:read`; a
+worker is refused (403), as is an agent without either scope. It is scoped to the caller's own
+organization and the named project (another organization's or project's id is a 404). The answer is
+the caps and nothing else, with no totals, calls or reservations (use `GET /model-spend` for those):
+
+```
+{"project_id": "<project>", "limits": [{"provider_id": "anthropic", "revision": 3, ...caps}]}
+```
+
+`provider_id` `*` is the project default. `PUT /model-spend/limits` stays human only and is the only
+way to change a limit. The first-call readiness check uses this route with the service's own
+credential ([ADR 0162](decisions/0162-first-call-db-free-readiness.md)).
+
 ## Scopes
 
 - `model_spend:record`: the reasoning manager credential. It reserves, settles and releases. Nothing

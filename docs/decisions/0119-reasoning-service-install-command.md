@@ -68,8 +68,10 @@ did each by hand, and any slip (a wrong owner, mode or reference) surfaced only 
 ## Consequences
 
 - The install is one command with a plan, instead of a checklist done by hand.
-- A host is not admitted by running it: the operator still creates the admission marker, installs the
-  key and the agent token, and a person sets the spend limits.
+- A host is not admitted by running it: a person still admits it (since
+  [ADR 0163](0163-reasoning-admission-delegation-record.md), `tessera reasoning admit` records the
+  admission and writes the marker), the operator installs the key and the agent token, and a person
+  sets the spend limits.
 - Not done: prompts, key rotation, installing the Tessera package or its virtualenv, and any
   provider call.
 

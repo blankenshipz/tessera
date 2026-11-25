@@ -59,12 +59,20 @@ def unit_properties(unit_text: str) -> dict:
     environment_names: list[str] = []
     read_write_paths: list[str] = []
     in_service = False
+    in_unit = False
+    condition_path = None
     for raw in unit_text.splitlines():
         line = raw.strip()
         if not line or line.startswith(("#", ";")):
             continue
         if line.startswith("[") and line.endswith("]"):
             in_service = line == "[Service]"
+            in_unit = line == "[Unit]"
+            continue
+        if in_unit and line.startswith("ConditionPathExists="):
+            value = line.partition("=")[2].strip()
+            if value.startswith("/"):
+                condition_path = value
             continue
         if not in_service or "=" not in line:
             continue
@@ -106,6 +114,8 @@ def unit_properties(unit_text: str) -> dict:
         "sandbox": [(name, scalars[name]) for name in SANDBOX_PROPERTIES if scalars.get(name)],
         "environment_names": environment_names,
         "read_write_paths": read_write_paths,
+        # The marker the unit's ConditionPathExists= names (the admission, ADR 0163).
+        "admitted_path": condition_path,
     }
 
 
@@ -139,6 +149,7 @@ def transient_argv(
     control_state_dir=None,
     control_url=None,
     project_id=None,
+    admitted_path=None,
     lstat=os.lstat,
 ) -> list[str]:
     python = props.get("python")
@@ -176,6 +187,8 @@ def transient_argv(
         argv += ["--control-url", control_url]
     if project_id:
         argv += ["--project-id", project_id]
+    if admitted_path:
+        argv += ["--admitted-path", str(admitted_path)]
     return argv
 
 
@@ -233,6 +246,7 @@ def run_in_unit(
     control_state_dir=None,
     control_url=None,
     project_id=None,
+    admitted_path=None,
     runner: Callable[[list[str]], tuple[int, str]] | None = None,
     lstat=os.lstat,
 ) -> tuple[int, str]:
@@ -250,6 +264,8 @@ def run_in_unit(
         control_state_dir=control_state_dir,
         control_url=control_url,
         project_id=project_id,
+        # An explicit path wins; otherwise the marker the unit's own condition names.
+        admitted_path=admitted_path or props.get("admitted_path"),
         lstat=lstat,
     )
     try:

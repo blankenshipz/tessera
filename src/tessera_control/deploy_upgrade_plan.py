@@ -99,9 +99,14 @@ class Service(_Closed):
     # False only when the operator declares the service never writes the control database;
     # otherwise a service without a stop_argv blocks execute (ADR 0099).
     writes_state: bool = True
+    # A virtualenv directory this service runs from. deploy-upgrade reinstalls the deployed
+    # release into it after the stop and before the restart (ADR 0161).
+    venv: _Path | None = None
     health: Annotated[HealthFile | HealthHttp, Field(discriminator="kind")]
     health_wait_seconds: Annotated[int, Field(ge=5, le=900)] = 120
     command_timeout_seconds: Annotated[int, Field(ge=5, le=300)] = 60
+
+    _venv = field_validator("venv")(lambda value: None if value is None else _absolute(value))
 
     @field_validator("restart_argv", "stop_argv")
     @classmethod
@@ -122,13 +127,19 @@ class UpgradePlan(_Closed):
     focused_tests: bool = False
     focused_tests_jobs: Annotated[int, Field(ge=1, le=4)] = 2
     repo_root: _Path | None = None
+    # What is pip-installed into each service venv: a checkout or built wheel path (default:
+    # repo_root). Required when any service declares a venv.
+    install_source: _Path | None = None
+    venv_install_timeout_seconds: Annotated[int, Field(ge=30, le=1800)] = 600
     executor_configs: Annotated[list[_Path], Field(max_length=4)] = []
     live_configs: Annotated[list[_Path], Field(max_length=4)] = []
     providers_file: _Path | None = None
     services: Annotated[list[Service], Field(min_length=1, max_length=8)]
     smoke_cpu: bool = False
 
-    @field_validator("state_dir", "backup_dir", "receipt_dir", "providers_file", "repo_root")
+    @field_validator(
+        "state_dir", "backup_dir", "receipt_dir", "providers_file", "repo_root", "install_source"
+    )
     @classmethod
     def _absolute_path(cls, value: str | None) -> str | None:
         return None if value is None else _absolute(value)
@@ -160,10 +171,25 @@ class UpgradePlan(_Closed):
         return self
 
     @model_validator(mode="after")
+    def _venv_source(self) -> UpgradePlan:
+        if self.venvs and (self.install_source or self.repo_root) is None:
+            raise ValueError("service venv needs install_source or repo_root")
+        return self
+
+    @model_validator(mode="after")
     def _focused_range(self) -> UpgradePlan:
         if self.focused_tests and (self.from_revision is None or self.source_revision is None):
             raise ValueError("focused_tests needs from_revision and source_revision")
         return self
+
+    @property
+    def venvs(self) -> tuple[str, ...]:
+        """Distinct service venv directories, in service order."""
+        return tuple(dict.fromkeys(s.venv for s in self.services if s.venv))
+
+    @property
+    def release_source(self) -> str | None:
+        return self.install_source or self.repo_root
 
     @property
     def service_names(self) -> tuple[str, ...]:

@@ -162,7 +162,7 @@ def test_missing_agent_token_is_left_out_too():
         SHIPPED, state_dir="/s", lstat=fake_lstat(missing={KEY_SOURCE, TOKEN_SOURCE})
     )
     names = [line.partition(":")[0] for line in _loaded(argv)]
-    assert names == ["profile", "prompt", "model-credential"]
+    assert names == ["profile", "prompt", "admission", "model-credential"]
 
 
 @pytest.mark.parametrize(
@@ -182,7 +182,7 @@ def test_unstatable_source_is_left_out(error):
 
     argv = riu.transient_argv(SHIPPED, state_dir="/s", lstat=lstat)
     assert "agent-token" not in [line.partition(":")[0] for line in _loaded(argv)]
-    assert len(_loaded(argv)) == 4
+    assert len(_loaded(argv)) == 5
 
 
 def test_every_present_credential_passes_unchanged_and_store_names_untouched():
@@ -259,7 +259,7 @@ def test_real_check_without_the_key_exits_10(world, monkeypatch, capsys):  # noq
         runner=runner,
         lstat=fake_lstat(missing=missing),
     )
-    assert code == 10 and json.loads(output)["overall"] == "ready_except_key"
+    assert code == 10 and json.loads(output)["overall"] == "ready_except_key", output
 
 
 SANDBOXED = """[Service]
@@ -416,6 +416,7 @@ def test_shipped_unit():
         "profile",
         "prompt",
         "agent-token",
+        "admission",
         "model-credential",
         "anthropic-api-key",
     ]

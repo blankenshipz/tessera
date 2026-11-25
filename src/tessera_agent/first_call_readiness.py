@@ -3,7 +3,9 @@
 ``tessera-reasoning-readiness check`` verifies everything the first call needs EXCEPT the key
 value: the profile, the credential reference file, the model-runtime egress allowlist, the receipts
 store, the control-plane slices, the model-spend caps and the agent authority grant the profile
-names (an execution grant or a reasoning-only one, ADR 0155; read-only from the control database).
+names (an execution grant or a reasoning-only one, ADR 0155; read-only, from the control database
+with ``--control-state-dir`` or, with no database access, through the control API with
+``--control-url``, ADR 0162).
 The API key file is looked at by ``stat`` only (present, owner, mode, size): it is never opened,
 read, hashed or printed, so no function here can leak it. A deployment that is complete apart from
 the key file reports ``ready_except_key``; anything else that is missing or wrong reports
@@ -15,8 +17,10 @@ installed.
 
 It makes no model call and no outbound call except two unauthenticated probes of the control
 plane's own ``/health/ready`` and ``/model-spend/limits`` routes when ``--control-url`` is given
-(no credential is ever sent). It writes only a short-lived probe file inside the receipts
-directory and removes it.
+(no credential is sent on those). Without ``--control-state-dir``, ``--control-url`` also makes
+two read-only authenticated GETs (``/model-spend/limits`` and ``/agent-authority-grants/{id}``)
+with the service's own ``agent-token`` credential, which is never printed, logged or put in a
+finding. It writes only a short-lived probe file inside the receipts directory and removes it.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from .model_destinations import (
     ANTHROPIC_ACCOUNT_MODE,
@@ -73,8 +77,9 @@ SUMMARIES = {
     "not_ready": "not ready: fix the failing checks above, then run the check again.",
     # {names} is the checks that could not run; this is not a pass.
     "not_fully_checked": (
-        "not fully checked: {names} could not be verified (pass --control-url and "
-        "--control-state-dir, or check the limits through GET /model-spend and the grant through "
+        "not fully checked: {names} could not be verified (pass --control-url, which reads "
+        "them with the service's agent token, or --control-state-dir; or check the limits "
+        "through GET /model-spend and the grant through "
         "GET /agent-authority-grants/{{id}}); no check failed, "
         "but this is not a pass and the first call may still be refused"
     ),
@@ -386,11 +391,14 @@ def _open_control_database(name: str, control_state_dir: Path):
 
 
 def _spend_caps(
-    profile: dict | None, control_state_dir: Path | None, project_id: str | None
+    profile: dict | None,
+    control_state_dir: Path | None,
+    project_id: str | None,
+    api: _ControlApi | None = None,
 ) -> dict[str, Any]:
     name = "spend_caps"
-    if control_state_dir is None:
-        return _check(name, "unchecked", "no --control-state-dir was given")
+    if control_state_dir is None and (api is None or api.unavailable):
+        return _check(name, "unchecked", _no_database(api))
     if profile is None:
         return _check(name, "unchecked", "the profile is not valid")
     if not project_id:
@@ -401,13 +409,15 @@ def _spend_caps(
             "comes from the grant at run time)",
             "set model_spend.project_id in the profile or pass --project-id",
         )
+    if control_state_dir is None:
+        return _spend_caps_api(api, profile, project_id)
     connection, failure = _open_control_database(name, control_state_dir)
     if connection is None:
         return failure
     try:
         try:
             rows = {
-                row[0]: row
+                row[0]: (row[1], row[2])
                 for row in connection.execute(
                     "SELECT provider_id, per_call_micro, daily_micro FROM model_spend_limits "
                     "WHERE project_id=? AND provider_id IN (?, '*')",
@@ -418,6 +428,13 @@ def _spend_caps(
             return _spend_query_failure(name, exc)
     finally:
         connection.close()
+    return _judge_caps(rows, profile)
+
+
+def _judge_caps(rows: Mapping[str, tuple[int, int]], profile: dict) -> dict[str, Any]:
+    """The verdict on the limit rows (provider -> (per-call, daily) in micro-cents); one rule for
+    the database read and the API read."""
+    name = "spend_caps"
     row = rows.get(PROVIDER) or rows.get("*")
     if row is None:
         return _check(
@@ -427,7 +444,7 @@ def _spend_caps(
             "would be refused",
             "a person sets limits with PUT /model-spend/limits (see docs/model-spend.md)",
         )
-    _, per_call, daily = row
+    per_call, daily = row
     if per_call <= 0 or daily < per_call:
         return _check(
             name, "fail", "the limit row is not usable (per-call must be > 0 and <= daily)"
@@ -481,7 +498,10 @@ def _is_revision(value: Any) -> bool:
 
 
 def _grant(
-    profile: dict | None, control_state_dir: Path | None, project_id: str | None
+    profile: dict | None,
+    control_state_dir: Path | None,
+    project_id: str | None,
+    api: _ControlApi | None = None,
 ) -> dict[str, Any]:
     """The agent authority grant the profile names, read-only from the control database: it
     exists, is active with a live lineage, unexpired, at the profile's revision and epoch, in the
@@ -490,8 +510,8 @@ def _grant(
     provider and model; an execution grant must still have every bound execution grant active.
     Anything unreadable or malformed fails: this check never reports a grant it could not read."""
     name = "grant"
-    if control_state_dir is None:
-        return _check(name, "unchecked", "no --control-state-dir was given")
+    if control_state_dir is None and (api is None or api.unavailable):
+        return _check(name, "unchecked", _no_database(api))
     if profile is None:
         return _check(name, "unchecked", "the profile is not valid")
     grant_id = profile.get("grant_id")
@@ -502,6 +522,8 @@ def _grant(
             "grant_profile_incomplete",
             "the profile does not name the grant's id, revision and epoch",
         )
+    if control_state_dir is None:
+        return _grant_api(api, profile, project_id, grant_id)
     connection, failure = _open_control_database(name, control_state_dir)
     if connection is None:
         return failure
@@ -539,13 +561,43 @@ def _grant_query_failure(name: str, exc: sqlite3.Error) -> dict[str, Any]:
 
 def _grant_row(connection, row, profile: dict, project_id: str | None) -> dict[str, Any]:
     from tessera_control.agent_authority import require_active_agent_lineage
+    from tessera_control.grant_model_spend import grant_remaining_micro
+
+    try:
+        bounds = json.loads(row["bounds_json"])
+    except (ValueError, KeyError, TypeError):
+        return _grant_finding("grant_malformed", "the grant's stored bounds cannot be read")
+    return _judge_grant(
+        row,
+        bounds,
+        profile,
+        project_id,
+        lineage=lambda: require_active_agent_lineage(connection, row["id"]),
+        bindings=lambda now: _execution_bindings_active(connection, bounds, now),
+        remaining_micro=lambda: grant_remaining_micro(connection, row),
+    )
+
+
+def _judge_grant(
+    row,
+    bounds,
+    profile: dict,
+    project_id: str | None,
+    *,
+    lineage: Callable[[], Any],
+    bindings: Callable[[datetime], bool],
+    remaining_micro: Callable[[], int | float],
+) -> dict[str, Any]:
+    """One rule for the database read and the API read: ``row`` is the grant's columns (a sqlite
+    row or the API's JSON object), ``lineage`` raises when the grant's ancestry is not live,
+    ``bindings`` says whether every bound execution grant is active, ``remaining_micro`` is the
+    budget left. The order of the findings is the same on both paths."""
     from tessera_control.agent_authority_models import authority_kind
-    from tessera_control.grant_model_spend import MICRO, grant_remaining_micro
+    from tessera_control.grant_model_spend import MICRO
     from tessera_control.store import StoreError
 
     now = datetime.now(UTC)
     try:
-        bounds = json.loads(row["bounds_json"])
         if not isinstance(bounds, dict):
             raise TypeError
         kind = authority_kind(bounds)
@@ -562,7 +614,7 @@ def _grant_row(connection, row, profile: dict, project_id: str | None) -> dict[s
     if now >= expiry:
         return _grant_finding("grant_expired", "the grant has expired")
     try:
-        require_active_agent_lineage(connection, row["id"])
+        lineage()
     except (StoreError, ValueError, KeyError, TypeError, AttributeError):
         return _grant_finding(
             "grant_lineage_inactive", "the grant's lineage is revoked, expired or not live"
@@ -600,12 +652,12 @@ def _grant_row(connection, row, profile: dict, project_id: str | None) -> dict[s
             "grant_scope_mismatch",
             "the grant does not match the profile on: " + ", ".join(fields),
         )
-    if kind == "execution" and not _execution_bindings_active(connection, bounds, now):
+    if kind == "execution" and not bindings(now):
         return _grant_finding(
             "grant_binding_inactive",
             "an execution grant this agent grant is bound to is not active, current and unexpired",
         )
-    remaining = grant_remaining_micro(connection, row)
+    remaining = remaining_micro()
     if remaining <= 0:
         return _grant_finding("grant_budget_exhausted", "the grant has no budget left")
     cap = (profile.get("limits") or {}).get("max_cost_cents_per_call")
@@ -652,6 +704,218 @@ def _execution_bindings_active(connection, bounds: dict, now: datetime) -> bool:
     return True
 
 
+# -- the database-free read through the control API ----------------------------------------------
+
+AGENT_TOKEN_FILE = "agent-token"
+MAX_TOKEN_BYTES = 4096
+MAX_API_BYTES = 1024 * 1024
+# (status, body) of one authenticated GET; the headers carry the credential and must never be
+# logged or echoed.
+Fetcher = Callable[[str, dict[str, str], float], tuple[int, bytes]]
+_NO_API_CREDENTIAL = (
+    "no --control-state-dir was given and the service's agent-token credential could not be read "
+    "for the control API read"
+)
+
+
+def _default_fetcher(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+    """One GET: no proxy, no redirects (the credential is never forwarded), a bounded body."""
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    try:
+        with opener.open(
+            urllib.request.Request(url, headers=headers, method="GET"), timeout=timeout
+        ) as response:
+            return response.status, response.read(MAX_API_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        return error.code, b""
+
+
+class _ControlApi:
+    """Read-only GETs of the control API as the reasoning service's own agent credential."""
+
+    def __init__(self, base: str, headers: dict[str, str], fetcher: Fetcher | None):
+        self.base = base
+        self._headers = headers
+        self._fetch = fetcher or _default_fetcher
+        self.unavailable = False
+
+    def __repr__(self) -> str:  # never show the credential
+        return "<_ControlApi>"
+
+    def get(self, path: str) -> tuple[int | None, Any]:
+        """(HTTP status, parsed JSON or None); status None when the control plane is unreachable
+        or the answer is oversized or not JSON on a 200."""
+        try:
+            status, body = self._fetch(self.base + path, dict(self._headers), PROBE_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - sanitized: unreachable is one finding
+            return None, None
+        if status != 200:
+            return status, None
+        if not isinstance(body, bytes | bytearray) or len(body) > MAX_API_BYTES:
+            return None, None
+        try:
+            return 200, json.loads(body)
+        except ValueError:
+            return None, None
+
+
+def _no_database(api: _ControlApi | None) -> str:
+    return _NO_API_CREDENTIAL if api is not None else "no --control-state-dir was given"
+
+
+def _agent_token(root: Path | None, filename: str) -> str | None:
+    """The service's agent token from the manager credential directory (never printed)."""
+    if root is None:
+        return None
+    try:
+        raw = private_file(Path(root) / filename, credentials_dir=Path(root))
+        token = raw.decode("ascii").strip()
+    except (OSError, ValueError):
+        return None
+    if not token or len(token.encode()) > MAX_TOKEN_BYTES:
+        return None
+    if any(ord(c) < 33 or ord(c) == 127 for c in token):
+        return None
+    return token
+
+
+def _control_api(
+    control_url: str,
+    profile: dict | None,
+    root: Path | None,
+    filename: str,
+    fetcher: Fetcher | None,
+) -> _ControlApi:
+    parts = urlsplit(control_url)
+    token = _agent_token(root, filename)
+    destination_name = (profile or {}).get("destination")
+    headers = {"Authorization": "Bearer " + token} if token else {}
+    if isinstance(destination_name, str) and destination_name:
+        headers["X-Agent-Destination"] = destination_name
+    api = _ControlApi(control_url.rstrip("/"), headers, fetcher)
+    api.unavailable = (
+        token is None
+        or parts.scheme not in {"http", "https"}
+        or not parts.hostname
+        or bool(parts.username)
+    )
+    return api
+
+
+def _api_failure(name: str, status: int | None, what: str) -> dict[str, Any]:
+    """The fixed finding for a read that did not answer 200 (no body is ever echoed)."""
+    if status is None:
+        return _check(
+            name,
+            "fail",
+            f"the control API read of the {what} failed (unreachable, oversized or not JSON)",
+            "start tessera serve and check the control URL",
+        )
+    if status in {401, 403}:
+        scope = "model_spend:record" if name == "spend_caps" else "authority:consume"
+        return _check(
+            name,
+            "fail",
+            f"the control API refused the service's credential for the {what} (HTTP {status})",
+            f"enroll the agent credential with the {scope} scope and its destination, or run "
+            "the check where --control-state-dir is readable",
+        )
+    return _check(name, "fail", f"unexpected answer reading the {what} (HTTP {status})")
+
+
+def _micro(value: Any) -> int | None:
+    """Cents (a finite JSON number) to micro-cents, or None."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return int(round(value * 1_000_000))
+
+
+def _spend_caps_api(api: _ControlApi, profile: dict, project_id: str) -> dict[str, Any]:
+    name = "spend_caps"
+    what = "model-spend limits"
+    status, body = api.get(f"/model-spend/limits?project_id={quote(project_id, safe='')}")
+    if status != 200:
+        return _api_failure(name, status, what)
+    malformed = _check(name, "fail", "the model-spend read answered with an unexpected shape")
+    limits = body.get("limits") if isinstance(body, dict) else None
+    if not isinstance(limits, list):
+        return malformed
+    rows: dict[str, tuple[int, int]] = {}
+    for entry in limits:
+        if not isinstance(entry, dict) or not isinstance(entry.get("provider_id"), str):
+            return malformed
+        if entry["provider_id"] not in {PROVIDER, "*"}:
+            continue
+        per_call, daily = _micro(entry.get("per_call_cents")), _micro(entry.get("daily_cents"))
+        if per_call is None or daily is None or entry["provider_id"] in rows:
+            return malformed
+        rows[entry["provider_id"]] = (per_call, daily)
+    return _judge_caps(rows, profile)
+
+
+def _grant_api(
+    api: _ControlApi, profile: dict, project_id: str | None, grant_id: str
+) -> dict[str, Any]:
+    name = "grant"
+    status, body = api.get("/agent-authority-grants/" + quote(grant_id, safe=""))
+    if status == 404:
+        return _grant_finding("grant_missing", "no agent authority grant has the profile's id")
+    if status != 200:
+        return _api_failure(name, status, "agent authority grant")
+    required = ("status", "revision", "epoch", "project_id", "subject_credential_id", "bounds")
+    if not isinstance(body, dict) or any(key not in body for key in required):
+        return _grant_finding("grant_malformed", "the control API's grant answer is malformed")
+    if body.get("id") != grant_id:
+        return _grant_finding("grant_malformed", "the control API answered for a different grant")
+    remaining = _micro(body.get("remaining_budget_cents"))
+    effective = body.get("effective_status")
+    if remaining is None or not isinstance(effective, str):
+        return _grant_finding("grant_malformed", "the control API's grant answer is malformed")
+
+    def lineage():
+        if effective != "active":
+            raise ValueError("lineage is not live")
+
+    def bindings(_now):
+        # The control plane computes this for the grant's own subject (ADR 0162 addendum). An
+        # older control plane that does not send it leaves the check unchecked, never ok.
+        active = body.get("bindings_active")
+        if not isinstance(active, bool):
+            raise _Unverifiable
+        return active
+
+    try:
+        return _judge_grant(
+            body,
+            body["bounds"],
+            profile,
+            project_id,
+            lineage=lineage,
+            bindings=bindings,
+            remaining_micro=lambda: remaining,
+        )
+    except _Unverifiable:
+        return _check(
+            name,
+            "unchecked",
+            "the control API did not report whether the execution grants this grant is bound to "
+            "are active (an older control plane); check the grant with --control-state-dir",
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):  # fail closed, never crash
+        return _grant_finding("grant_malformed", "the grant and the profile cannot be compared")
+
+
+class _Unverifiable(Exception):
+    """A fact the API read cannot establish (so the check is unchecked, never ok)."""
+
+
 # -- the report ------------------------------------------------------------------------------------
 
 
@@ -668,12 +932,19 @@ def run_checks(
     state_owner_uid: int | None = None,
     key_owner_uid: int | None = None,
     credential_files: Mapping[str, str] | None = None,
+    fetcher: Fetcher | None = None,
+    admitted_path: Path | None = None,
 ) -> dict[str, Any]:
     """All checks, in a stable order. Never reads the API key file's contents.
 
     ``state_owner_uid`` and ``key_owner_uid`` name the owners to expect when the check is run by
     someone other than the service user (the installer, as root: the state directory belongs to
     the service account and the key file, per ADR 0093, to root). Default: the running user.
+
+    Without ``control_state_dir`` but with ``control_url``, ``spend_caps`` and ``grant`` are read
+    through the control API (read-only GETs) with the service's own ``agent-token`` credential
+    (``fetcher`` replaces the HTTP transport in tests); the database path is used when
+    ``control_state_dir`` is given.
 
     ``credential_files`` maps the names the service sees (``model-credential``,
     ``anthropic-api-key``) to the file names they have on disk when the check is pointed at the
@@ -692,6 +963,11 @@ def run_checks(
         root, key_owner_uid, files.get(ANTHROPIC_API_KEY_FILE, ANTHROPIC_API_KEY_FILE)
     )
     project = _project_id(profile, project_id) if profile else None
+    api = None
+    if control_state_dir is None and control_url:
+        api = _control_api(
+            control_url, profile, root, files.get(AGENT_TOKEN_FILE, AGENT_TOKEN_FILE), fetcher
+        )
     checks = [
         _environment(environment),
         profile_check,
@@ -702,10 +978,15 @@ def run_checks(
         _egress_allowlist(),
         _receipts_store(Path(state_dir), state_owner_uid),
         _control_slices(control_url, opener),
-        _spend_caps(profile, control_state_dir, project),
-        _grant(profile, control_state_dir, project),
+        _spend_caps(profile, control_state_dir, project, api),
+        _grant(profile, control_state_dir, project, api),
     ]
-    blocking = [c for c in checks if c["status"] not in {"ok", "unchecked"}]
+    if admitted_path is not None:
+        from tessera_agent.reasoning_admission import admission_check
+
+        checks.append(admission_check(Path(admitted_path), profile, control_state_dir, project))
+    # "warn" (not admitted yet) is informational: the unit's own condition decides.
+    blocking = [c for c in checks if c["status"] not in {"ok", "unchecked", "warn"}]
     unchecked = [c["name"] for c in checks if c["status"] == "unchecked"]
     key_only = (
         len(blocking) == 1
@@ -737,6 +1018,7 @@ _EXIT = {
 
 
 _DEFAULT_UNIT_PATH = "/etc/systemd/system/tessera-reasoning.service"
+_DEFAULT_ADMITTED_PATH = "/etc/tessera/reasoning.admitted"
 
 
 def main(argv=None) -> int:
@@ -755,9 +1037,24 @@ def main(argv=None) -> int:
         help="run as the service user in a transient unit with the installed unit's credentials",
     )
     check.add_argument("--unit-path", type=Path, default=Path(_DEFAULT_UNIT_PATH))
-    check.add_argument("--control-state-dir", type=Path)
-    check.add_argument("--control-url")
+    check.add_argument(
+        "--control-state-dir",
+        type=Path,
+        help="read spend caps and the grant from the control database (needs read access to it)",
+    )
+    check.add_argument(
+        "--control-url",
+        help="probe the control plane; without --control-state-dir also read the spend caps and "
+        "the grant through the read-only control API with the service's agent-token credential",
+    )
     check.add_argument("--project-id")
+    check.add_argument(
+        "--admitted-path",
+        type=Path,
+        default=None,
+        help="the admission marker the unit's ConditionPathExists= names "
+        f"(default: the unit's own path with --in-unit, else {_DEFAULT_ADMITTED_PATH})",
+    )
     args = parser.parse_args(argv)
     if args.in_unit:
         from tessera_agent import readiness_in_unit
@@ -769,6 +1066,8 @@ def main(argv=None) -> int:
                 control_state_dir=args.control_state_dir,
                 control_url=args.control_url,
                 project_id=args.project_id,
+                # An explicit --admitted-path wins over the unit's own condition path (ADR 0170).
+                admitted_path=args.admitted_path,
             )
         except ValueError as exc:
             print(f"in-unit check refused: {exc}", file=sys.stderr)
@@ -792,6 +1091,7 @@ def main(argv=None) -> int:
         control_state_dir=args.control_state_dir,
         control_url=args.control_url,
         project_id=args.project_id,
+        admitted_path=args.admitted_path or Path(_DEFAULT_ADMITTED_PATH),
     )
     print(json.dumps(report, indent=2))
     print(report["summary"], file=sys.stderr)

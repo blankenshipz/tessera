@@ -56,7 +56,12 @@ Generic operator procedure (all paths operator-supplied; no automatic start):
    check, which refuses a sealed input before the prompt is sent.
 4. Confirm the unit environment has none of `ANTHROPIC_API_KEY`,
    `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_API_KEY`; startup refuses (exit 78) otherwise.
-5. Create the admission marker: `sudo install -m 0600 /dev/null /etc/tessera/reasoning.admitted`.
+5. Admit the service: `sudo tessera reasoning admit --session-header SESSION_HEADER_FILE
+   --expires-in 86400` records a person's admission (who, caps, expiry) on receipts and writes the
+   marker `/etc/tessera/reasoning.admitted` with a reference to it
+   ([ADR 0163](decisions/0163-reasoning-admission-delegation-record.md)). The unit checks only that
+   the marker exists; a hand-made empty marker still works for the unit, and readiness reports it as
+   `unrecorded`.
 6. Start one bounded run through the manual unit
    (`sudo systemctl start tessera-reasoning.service`). The unit has no `[Install]` section, so it
    is manual-start and not enabled at boot.
@@ -162,6 +167,11 @@ standard input only; it writes the root-owned 0600 key file and the `model-crede
 receipt with the reference and fingerprint). The start-up checks above are the admission: the installer adds
 none of its own. `tessera-service-credential withdraw` removes both files with a receipt (do not delete them by hand). See [service credentials](service-credentials.md). The ordered steps left once the key
 exists are in [reasoning first call: operator steps](reasoning-first-call-ops.md).
+Start-up also reads the `admission` credential (the marker, via `LoadCredential=admission:`) and exits 78
+with a code only when a recorded marker is malformed or expired; a bare marker passes
+([ADR 0170](decisions/0170-reasoning-startup-admission-refusal.md)). 78 is a configuration refusal and is in
+`RestartPreventExitStatus`.
+
 ## Before the first call
 
 `tessera-reasoning-readiness check` verifies everything the first receipted call needs except the key
@@ -498,7 +508,7 @@ The supervisor is one-shot: a run identity runs once. Exit codes of `run`:
 
 A closed run (completed, failed or stopped) is never resumed or rerun: a later start with the
 same run identity makes no harness, control-plane, grant, ledger or model call, prints the
-journal's receipt and exits 0 (completed) or 2 (otherwise). `report` exits 0 when provenance
+journal's receipt and exits 0 (completed) or 2 (otherwise). The installed `service_startup` makes the same check first, from the profile's run identity and the journal, before it requires any model credential file: a closed run exits 0 or 2 with `run <id> already closed ...; no model credential needed`, while a run that is open, unknown or has no journal still needs the credential and exits 78 without it. `report` exits 0 when provenance
 delivery is complete and 2 otherwise. For the next run, give it a new run identity: `run
 --run-id ID` (also accepted by `status`, `stop` and `report`) overrides the profile's `run_id`
 for that request, and for the installed unit `tessera reasoning install --apply --new-run` writes

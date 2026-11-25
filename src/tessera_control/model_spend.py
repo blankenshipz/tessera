@@ -18,6 +18,7 @@ every provider that has no row of its own.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import date, timedelta
@@ -620,6 +621,42 @@ class ModelSpendStore(ExternalAgentStore):
                 "resolution": row["resolution"],
                 "settled_micro_cents": row["settled_micro"],
                 "day": row["utc_day"],
+            }
+        finally:
+            connection.close()
+
+    def read_limits(self, principal, project_id: str) -> dict[str, Any]:
+        """The project's caps and nothing else, read only (the first-call readiness check).
+
+        A human, or an enrolled agent holding ``model_spend:record`` (the reasoning manager
+        credential, which already lives under these caps) or ``model_spend:read``, in its own
+        project and organization. No totals, no calls, no reservations."""
+        connection = _connect(self.database_path)
+        try:
+            actor = self._actor(connection, principal)
+            if actor["kind"] == "worker":
+                raise Forbidden("Workers cannot read model spend.")
+            self._project(connection, actor, project_id)
+            if actor["role"] == "agent":
+                scope = self._scope(connection, actor, None)
+                if not {SCOPE_RECORD, SCOPE_READ} & set(json.loads(scope["actions_json"])):
+                    raise Forbidden("External-agent action is outside enrolled scope.")
+            elif actor["role"] != "human":
+                raise Forbidden("A human or a model_spend agent is required.")
+            return {
+                "project_id": project_id,
+                "limits": [
+                    {
+                        "provider_id": r["provider_id"],
+                        "revision": r["revision"],
+                        **_limits_view(r),
+                    }
+                    for r in connection.execute(
+                        """SELECT * FROM model_spend_limits WHERE org_id=? AND project_id=?
+                        ORDER BY provider_id""",
+                        (actor["org_id"], project_id),
+                    )
+                ],
             }
         finally:
             connection.close()

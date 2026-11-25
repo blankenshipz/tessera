@@ -34,8 +34,11 @@ EXPECTED = (
 
 
 @pytest.fixture
-def world(anthropic, tmp_path):  # noqa: F811 - imported fixture
+def world(anthropic, tmp_path, monkeypatch):  # noqa: F811 - imported fixture
     root, profile, env = anthropic
+    # Hermetic: the CLI's default admission marker path is a host file (an installed host has
+    # one); a test that gives no --admitted-path must not read it.
+    monkeypatch.setattr(fcr, "_DEFAULT_ADMITTED_PATH", str(tmp_path / "no-such.admitted"))
     # The profile names the grant it runs under (id, revision, epoch); the control state holds
     # that grant (a reasoning grant, ADR 0155) beside the spend limit.
     profile = {**profile, "model_spend": {"project_id": PROJECT}, "revision": 1, "epoch": 1}

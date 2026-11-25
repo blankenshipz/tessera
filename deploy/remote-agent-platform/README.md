@@ -213,16 +213,19 @@ required for that path; raw OpenCode or a shared coding endpoint is not a fallba
 
 Reasoning has **no `[Install]` target** and requires
 `/etc/tessera/reasoning.admitted`. Only after profile/harness/grant admission should
-the operator create this empty marker, then explicitly start one bounded run:
+a person admit it with their own session credential, which records who admitted it, the caps and
+the expiry on receipts and writes the marker with a reference to that record
+([ADR 0163](../../docs/decisions/0163-reasoning-admission-delegation-record.md)); then
+explicitly start one bounded run:
 
 ```sh
-sudo install -m 0600 /dev/null /etc/tessera/reasoning.admitted
+sudo tessera reasoning admit --session-header SESSION_HEADER_FILE --expires-in 86400
 sudo systemctl start tessera-reasoning.service
 sudo systemctl status tessera-reasoning.service
 ```
 
-Creating the marker is an operator readiness assertion, **not** human grant issue
-or billing proof. It cannot bypass runtime/MCP grant, epoch, expiry or quota checks.
+A hand-made empty marker still satisfies the unit, but readiness reports it as
+`unrecorded`. The admission is **not** human grant issue or billing proof. It cannot bypass runtime/MCP grant, epoch, expiry or quota checks.
 Do not `enable` this unit or add it to a boot target. A completed/failed/fenced run
 retains its journal. An OS/process failure can resume acknowledged sessions under
 `Restart=on-failure`; pending/uncertain calls cannot be replayed. The supervisor is

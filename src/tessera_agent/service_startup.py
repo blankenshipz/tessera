@@ -19,7 +19,13 @@ from .model_destinations import (
     destination,
     refuse_api_key_environment,
 )
-from .remote_reasoning_runtime import validate_profile
+from .reasoning_admission import startup_refusal
+from .remote_reasoning_runtime import (
+    EXIT_BLOCKED,
+    EXIT_COMPLETED,
+    _closed_run,
+    validate_profile,
+)
 from .remote_reasoning_store import (
     ReasoningStore,
     manager_directory_ok,
@@ -36,6 +42,9 @@ MODEL_CREDENTIAL_FILE = "model-credential"
 # only checks it is a private non-empty regular file; the supervisor reads it at call
 # time. It is never placed in the child environment, argv or any output.
 ANTHROPIC_API_KEY_FILE = "anthropic-api-key"
+# Manager-provided copy of the admission marker (LoadCredential=admission:...). It holds a
+# non-secret reference (ADR 0163); start-up reads it only to refuse a malformed or expired one.
+ADMISSION_FILE = "admission"
 _AGENT_REF = ("agent_token_env", "TESSERA_REASONING_AGENT_TOKEN", "agent-token")
 _HARNESS_REF = ("harness_token_env", "TESSERA_REASONING_HARNESS_TOKEN", "harness-password")
 
@@ -53,6 +62,24 @@ def credential_root(environment: dict[str, str]) -> Path:
     if not manager_directory_ok(info):
         raise StartupBlocked("invalid_manager_credential_directory")
     return path
+
+
+def admission_refusal(environment: dict[str, str]) -> str | None:
+    """Reason code when the loaded admission marker refuses the start, else None.
+
+    A missing file (an older unit without the credential) or a bare marker passes. The content is
+    never logged or returned; only the fixed code.
+    """
+    value = environment.get("CREDENTIALS_DIRECTORY", "")
+    if not value or not Path(value).is_absolute():
+        return None
+    try:
+        content = private_file(Path(value) / ADMISSION_FILE, credentials_dir=Path(value))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return "admission_marker_unreadable"
+    return startup_refusal(content)
 
 
 def refuse_forbidden_environment(environment: dict[str, str]) -> None:
@@ -106,6 +133,36 @@ def token_reference(root: Path, name: str) -> str:
     if not token or len(token) > 4096 or any(ord(c) <= 32 or ord(c) >= 127 for c in token):
         raise StartupBlocked("invalid_runtime_credential")
     return token
+
+
+def closed_run_exit(state_dir: Path, environment: dict[str, str]) -> int | None:
+    """The exit code when the configured run identity already ended, else None.
+
+    A closed run is never resumed or rerun, so no model credential is needed to say so. Only the
+    profile (for its run id) and an existing journal are read; nothing is created, no credential
+    file is touched and nothing is forwarded. A missing profile or journal, an invalid profile or
+    an unclosed run returns None so the caller's fail-closed credential checks decide.
+    """
+    root = credential_root(environment)
+    profile = json.loads(private_file(root / "profile", credentials_dir=root))
+    validate_profile(profile)
+    if not (state_dir / "reasoning.sqlite3").is_file():
+        return None
+    store = ReasoningStore(state_dir)
+    try:
+        closed = _closed_run(store, profile["run_id"])
+    finally:
+        store.close()
+    if closed is None:
+        return None
+    print(
+        f"tessera-reasoning: run {profile['run_id']} already closed (state {closed['state']});"
+        " not rerun, no model call, no model credential needed."
+        " Start a new run with a new run identity.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return EXIT_COMPLETED if closed["state"] == "completed" else EXIT_BLOCKED
 
 
 def launch_spec(mode: str, state_dir: Path, environment: dict[str, str]):
@@ -183,6 +240,23 @@ def main(argv=None):
         if not args.state_dir.is_absolute():
             raise StartupBlocked("absolute_service_state_required")
         refuse_forbidden_environment(dict(os.environ))
+        if args.mode == "reasoning":
+            # One-shot: an already-closed run exits 0 or 2 before the admission marker is
+            # judged (an expired marker must not turn a finished run into a failed unit) and
+            # without any credential check. An open or unknown run falls through: an
+            # expired or malformed marker still refuses with 78, never weakened.
+            try:
+                closed_exit = closed_run_exit(args.state_dir, dict(os.environ))
+            except Exception:
+                # An unreadable profile or journal cannot show the run closed: the admission and
+                # credential checks below decide, and each fails closed.
+                closed_exit = None
+            if closed_exit is not None:
+                return closed_exit
+            code = admission_refusal(dict(os.environ))
+            if code is not None:
+                print(f"Tessera reasoning start refused: {code}", file=sys.stderr)
+                return 78
         if args.mode == "research":
             # Packaging may expose this fixed entrypoint, but no source manifest
             # or environment switch can substitute for installed admission.

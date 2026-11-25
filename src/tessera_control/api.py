@@ -396,6 +396,12 @@ def create_app(
     app.state.approval_delegations = app.state.delegated_decisions
     app.include_router(approval_delegations_router)
     app.include_router(delegated_decisions_router)
+    from .reasoning_admissions import ReasoningAdmissionCommands
+    from .reasoning_admissions_api import router as reasoning_admissions_router
+
+    # A person's admission of the reasoning service, recorded on receipts (ADR 0163).
+    app.state.reasoning_admissions = ReasoningAdmissionCommands(state_dir)
+    app.include_router(reasoning_admissions_router)
     app.include_router(snapshot_composition_router)
     app.include_router(worker_grants_router)
     from .salad_unclaimed import SaladUnclaimedStore
