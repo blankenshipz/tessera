@@ -387,6 +387,32 @@ quiescence, enforce provider billing as a hard financial cap, or survive simulta
 host/storage/supervisor loss. Multiple concurrent Salad operations are not this
 milestone's acceptance; deploy and capacity-test the single-operation journey.
 
+## Allocation deadline
+
+A container group that never gets an instance must not burn the whole route window. The guardian
+counts from the first poll at which the group is no longer stopped (the start was dispatched), and
+only while no instance has **ever** appeared in the group's instance list. An instance that exists
+but is still allocating, downloading its image or creating is an allocation: the first sighting
+disables the deadline for good (recorded in the guardian's own database, so a restart cannot revive
+it). If the clock runs out first, the guardian stops the group through the ordinary stop path with
+`stop_cause` `allocation_timeout` and its status then carries the elapsed seconds.
+
+The setting is `allocation_deadline_seconds` in the service configuration (default 600, bounds
+60 to 3600; an invalid value refuses at startup). It never raises or replaces the route deadline,
+the run cap or the total cap, and an adapter that cannot say how many instances the group has
+never triggers it. The live check exits as soon as it sees the cause and its receipt says
+`allocation_timeout` with the elapsed seconds; spend so far is the attempt's `guardian_estimate`.
+The deadline is on by default for every Salad operation; it is a per-service setting, not part of a
+campaign spec, so spec and profile digests are unchanged.
+
+Control records the attempt as `failed_transient` with failure class `infra_allocation_timeout`
+(a placement failure, not a stage logic failure). The stage's `retry.infra_retries` bounds the
+retries exactly as for other infrastructure failures, and `retry.reroute_providers` may place the
+next attempt on another allowed provider; each retry is a new attempt under the campaign and
+project spend caps, and nothing escalates spend. The timed-out attempt still settles through the
+guardian-bounded hold (or a human charge when the published rate was never readable), and a retry
+waits for that settlement because open Salad exposure blocks a new positive hold.
+
 ## Allocation change before anything ran
 
 Salad can reschedule a container group while its image is still being pulled. An allocation change

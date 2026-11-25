@@ -55,6 +55,14 @@ class _SaladPackage(BaseModel):
 _CentsText = Annotated[str, StringConstraints(pattern=r"^[0-9]{1,12}(\.[0-9]{1,12})?$")]
 
 
+class _AllocationTimeout(BaseModel):
+    """The guardian cancelled the group because no instance was ever allocated in time."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    elapsed_seconds: Annotated[int, Field(ge=0, le=86400)]
+    deadline_seconds: Annotated[int, Field(ge=1, le=86400)]
+
+
 class _PrestartRebind(BaseModel):
     """One re-bind of the guardian to a new allocation before anything ran (bounded text)."""
 
@@ -86,6 +94,9 @@ class _GuardianFinal(BaseModel):
     estimated_exposure_cents: _CentsText | None = None
     actual_billed_cost_cents: Annotated[int, Field(ge=0)] | None = None
     observed_at: Annotated[str, StringConstraints(max_length=40)]
+    # Present only for a group cancelled at its allocation deadline (stop cause
+    # ``allocation_timeout``), so the stored shape of every other run is unchanged.
+    allocation_timeout: _AllocationTimeout | None = None
     # Present only when the guardian re-bound its allocation before anything ran.
     prestart_rebinds: _PrestartRebinds | None = None
 
@@ -306,8 +317,9 @@ class SaladWorkerCommands:
                         key: value
                         for key, value in body.guardian_final.model_dump().items()
                         # Absent unless used, so the stored shape (and its digest) of every
-                        # run without a pre-start re-bind is unchanged.
-                        if key != "prestart_rebinds" or value is not None
+                        # run without an allocation timeout or a pre-start re-bind is unchanged.
+                        if key not in ("allocation_timeout", "prestart_rebinds")
+                        or value is not None
                     },
                     sort_keys=True,
                     separators=(",", ":"),

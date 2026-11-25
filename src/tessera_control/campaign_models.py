@@ -2035,6 +2035,7 @@ FAILURE_CLASSES = (
     "t1_salad_unclaimed",
     "infra_container_killed",
     "infra_resource_limit",
+    "infra_allocation_timeout",
     "provider_reallocated_before_custody",
     "not_started",
     "exit_confirmed_unresolved",

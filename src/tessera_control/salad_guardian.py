@@ -23,6 +23,12 @@ from .salad_custody import CustodyBinding, SaladCustody, private_database
 
 # Guardian event kind prefix recording why a tick first decided to stop.
 STOP_CAUSE_PREFIX = "stop_cause:"
+# No instance allocated within the allocation deadline (armed -> first allocation or running
+# instant): the group is cancelled through the ordinary stop path and the record below is kept.
+ALLOCATION_TIMEOUT_REASON = "allocation_timeout"
+ALLOCATION_TIMEOUT_PREFIX = "allocation_timeout:"
+MIN_ALLOCATION_SECONDS, MAX_ALLOCATION_SECONDS = 60, 3600
+DEFAULT_ALLOCATION_SECONDS = 600
 RECONCILE_OPERATOR = "operator_reconciled_exact_group_stopped"
 RECONCILE_PROVIDER = "provider_confirmed_exact_group_stopped"
 # reason -> guardian event kind
@@ -187,6 +193,11 @@ class ProviderObservation:
     state: str  # running, stopped, pending, unknown; absence is unknown
     observed_at: float
     prior_allocation_id: str | None = None  # independently retained native read, never caller input
+    # Additive evidence for the allocation deadline; None means the adapter cannot say, and the
+    # deadline then never fires (fail closed): how many instances the group lists (an instance
+    # that is still pulling its image counts), and whether the group has been started.
+    instance_count: int | None = None
+    group_started: bool | None = None
 
 
 class SaladGuardian:
@@ -198,10 +209,19 @@ class SaladGuardian:
         observe: Callable[[GuardianAssignment], ProviderObservation],
         stop: Callable[[GuardianAssignment], str],
         clock=time.time,
+        allocation_seconds: int | None = None,
         custody_started: Callable[[str], bool] | None = None,
         max_prestart_rebinds: int = DEFAULT_MAX_PRESTART_REBINDS,
         prestart_read_deadline_seconds: float = DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
     ):
+        if allocation_seconds is not None and (
+            type(allocation_seconds) is not int
+            or not MIN_ALLOCATION_SECONDS <= allocation_seconds <= MAX_ALLOCATION_SECONDS
+        ):
+            raise ValueError("invalid_allocation_seconds")
+        # None: no allocation deadline (only the route deadline bounds a group that is never
+        # allocated). Not part of the stored assignment, so changing it never mismatches a re-arm.
+        self.allocation_seconds = allocation_seconds
         if (
             type(max_prestart_rebinds) is not int
             or not 0 <= max_prestart_rebinds <= MAX_PRESTART_REBINDS_LIMIT
@@ -244,6 +264,14 @@ class SaladGuardian:
             self.db.execute("ALTER TABLE assignments ADD COLUMN assigned_allocation TEXT")
         if "first_running" not in columns:
             self.db.execute("ALTER TABLE assignments ADD COLUMN first_running REAL")
+        if "alloc_started_at" not in columns:
+            # First poll that saw the group started (not stopped). Absolute; the allocation
+            # deadline counts from here, never from arming (which precedes input delivery).
+            self.db.execute("ALTER TABLE assignments ADD COLUMN alloc_started_at REAL")
+        if "instance_seen" not in columns:
+            # Set once, permanently, when any instance appeared in the group (even one still
+            # pulling its image) or ran: the allocation deadline can never fire afterwards.
+            self.db.execute("ALTER TABLE assignments ADD COLUMN instance_seen INTEGER DEFAULT 0")
         if "read_fail_since" not in columns:
             self.db.execute("ALTER TABLE assignments ADD COLUMN read_fail_since REAL")
         # Every process recovery is stop-only, even if a prior owner died before
@@ -371,6 +399,10 @@ class SaladGuardian:
             node_writers="unknown",
             quarantine=True,
         )
+        timeout = self._allocation_timeout_record(operation)
+        if timeout is not None:
+            # Additive: present only for a group cancelled because nothing was ever allocated.
+            result["allocation_timeout"] = timeout
         rebinds = self._prestart_rebinds(operation)
         if rebinds:
             # Additive: absent unless an allocation was re-bound before anything started.
@@ -389,6 +421,66 @@ class SaladGuardian:
             post["limit"] = POSTSTART_READ_RETRY_LIMIT
             result["poststart_read_retries"] = post
         return result
+
+    def _allocation_timeout_record(self, operation: str) -> dict | None:
+        found = self.db.execute(
+            "SELECT kind FROM events WHERE operation=? AND substr(kind,1,?)=? "
+            "ORDER BY sequence LIMIT 1",
+            (operation, len(ALLOCATION_TIMEOUT_PREFIX), ALLOCATION_TIMEOUT_PREFIX),
+        ).fetchone()
+        if found is None:
+            return None
+        try:
+            detail = json.loads(found[0][len(ALLOCATION_TIMEOUT_PREFIX) :])
+            elapsed, limit = int(detail["elapsed_seconds"]), int(detail["deadline_seconds"])
+        except (ValueError, KeyError, TypeError):
+            return None
+        return {"elapsed_seconds": elapsed, "deadline_seconds": limit}
+
+    def _allocation_waited(
+        self, operation: str, o: ProviderObservation, *, allocated: bool, first_running, now: float
+    ) -> float | None:
+        """Seconds the group waited for an instance when the allocation deadline has passed,
+        else None. Called only on a fresh, exact observation.
+
+        The deadline needs positive evidence of an empty group: ``instance_count == 0`` and a
+        started group. Any instance in the group, even one still pulling its image, any running
+        instant and any allocation disable it permanently (persisted); an adapter that cannot
+        say (None) never triggers it. It counts from the first poll that saw the group started
+        (persisted, absolute), never from arming. It moves no other bound.
+
+        Why only fresh, exact reads latch ``instance_seen``: a read that is not fresh or not
+        exact makes ``tick`` set ``stopping`` (``provider_unknown``) and that is persisted, so
+        the guardian is already stopping and this method is never reached again for the
+        operation. An instance seen only on such a read therefore cannot be followed by a
+        deadline firing."""
+        if self.allocation_seconds is None or o.instance_count is None or o.group_started is None:
+            return None
+        if allocated or first_running is not None or o.instance_count > 0 or o.state == "running":
+            with self.db:
+                self.db.execute(
+                    "UPDATE assignments SET instance_seen=1 WHERE operation=?", (operation,)
+                )
+            return None
+        found = self.db.execute(
+            "SELECT instance_seen,alloc_started_at FROM assignments WHERE operation=?",
+            (operation,),
+        ).fetchone()
+        if found is None or found[0]:
+            return None
+        started = found[1]
+        if started is None:
+            if not o.group_started:
+                return None
+            with self.db:
+                self.db.execute(
+                    "UPDATE assignments SET alloc_started_at=? "
+                    "WHERE operation=? AND alloc_started_at IS NULL",
+                    (now, operation),
+                )
+            return None
+        waited = now - started
+        return waited if waited >= self.allocation_seconds else None
 
     def read_retry_backoff(self, operation: str) -> float | None:
         """Seconds to wait before the next poll while a pre-start read failure is being
@@ -577,6 +669,7 @@ class SaladGuardian:
         uncertain = bool(row[6])
         allocation = row[7] or a.allocation_id
         stop_safe = True
+        allocation_waited = None
         fail_since = row[9]
         retry_detail = None
         retry_prefix = None
@@ -642,6 +735,14 @@ class SaladGuardian:
                     reason, stopping, uncertain = "allocation_changed", True, True
             else:
                 terminal = o.state == "stopped" and not uncertain
+            if reason is None and not stopping and not terminal and exact and fresh:
+                allocated = allocation != "unallocated" or o.allocation_id != "unallocated"
+                waited = self._allocation_waited(
+                    operation, o, allocated=allocated, first_running=first_running, now=now
+                )
+                if waited is not None:
+                    reason, stopping = ALLOCATION_TIMEOUT_REASON, True
+                    allocation_waited = waited
         except Exception as error:
             failed_at = self.clock()
             retry_prefix = self._may_retry_read(
@@ -680,6 +781,22 @@ class SaladGuardian:
                     "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
                     (operation, now, STOP_CAUSE_PREFIX + reason),
                 )
+                if reason == ALLOCATION_TIMEOUT_REASON and allocation_waited is not None:
+                    self.db.execute(
+                        "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                        (
+                            operation,
+                            now,
+                            ALLOCATION_TIMEOUT_PREFIX
+                            + json.dumps(
+                                {
+                                    "elapsed_seconds": int(allocation_waited),
+                                    "deadline_seconds": self.allocation_seconds,
+                                },
+                                separators=(",", ":"),
+                            ),
+                        ),
+                    )
             if reason:
                 self.db.execute(
                     "UPDATE assignments SET reason=? WHERE operation=?", (reason, operation)

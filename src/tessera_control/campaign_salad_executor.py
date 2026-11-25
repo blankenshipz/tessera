@@ -1341,6 +1341,12 @@ def project_guardian_final(
         actual_billed_cost_cents=billed if type(billed) is int and billed >= 0 else None,
         observed_at=(now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
+    timeout = status.get("allocation_timeout")
+    if status.get("stop_cause") == "allocation_timeout" and type(timeout) is dict:
+        projected["allocation_timeout"] = {
+            "elapsed_seconds": timeout.get("elapsed_seconds"),
+            "deadline_seconds": timeout.get("deadline_seconds"),
+        }
     rebinds = _project_rebinds(status.get("prestart_rebinds"))
     if rebinds is not None:
         projected["prestart_rebinds"] = rebinds

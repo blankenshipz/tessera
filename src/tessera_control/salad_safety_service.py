@@ -39,7 +39,10 @@ from .remote_execution_models import (
 )
 from .salad_custody import CustodyBinding, SaladCustody, private_database
 from .salad_guardian import (
+    DEFAULT_ALLOCATION_SECONDS,
     DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
+    MAX_ALLOCATION_SECONDS,
+    MIN_ALLOCATION_SECONDS,
     POSTSTART_READ_WINDOW_SECONDS,
     RECONCILE_OPERATOR,
     RECONCILE_PROVIDER,
@@ -383,6 +386,42 @@ def _positively_not_running(observation):
     return observation.get("state") in {"pending", "stopped"}
 
 
+_COUNT_KEYS = {"allocating_count", "creating_count", "running_count", "stopping_count"}
+
+
+def _instance_count(observation):
+    """How many instances the group lists, an instance still pulling its image included; None
+    when the read does not say completely (the allocation deadline then never fires)."""
+    instances = observation.get("instances")
+    if instances:
+        return len(instances)
+    counts = observation.get("instance_status_counts")
+    if (
+        observation.get("instance_counts_complete", True) is True
+        and type(counts) is dict
+        and set(counts) == _COUNT_KEYS
+        and all(type(v) is int and v >= 0 for v in counts.values())
+    ):
+        return sum(counts.values())
+    return None
+
+
+def _group_started(observation):
+    """True once the group is no longer the created-but-stopped one (it was started).
+
+    A fresh autostart=false group answers ``pending`` while its create settles, before it
+    reaches ``stopped``; that transient is not start evidence. The clock only starts on a
+    non-stopped read that also reports no pending change, so a poll that lands inside the
+    create-settle window (or one that cannot say) never starts it (fail closed: the
+    deadline is only delayed)."""
+    state = observation.get("state")
+    if state is None:
+        return None
+    if state == "stopped":
+        return False
+    return observation.get("pending_change") is False
+
+
 def _running(observation):
     """Group reports running, or its (single) instance already runs while deploying."""
     return observation.get("state") == "running" or any(
@@ -443,10 +482,20 @@ class SaladSafetyService:
         total_cap_cents=None,
         control_origin=None,
         control_opener=None,
+        allocation_deadline_seconds=DEFAULT_ALLOCATION_SECONDS,
         max_open_billable_frames=1,
         max_prestart_rebinds=3,
         prestart_read_deadline_seconds=DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
     ):
+        # Named, validated setting (60..3600 seconds, default 600): a container group that gets
+        # no instance by then is cancelled as ``allocation_timeout`` instead of burning the whole
+        # route window. It never moves the route deadline, run cap or total cap.
+        if (
+            type(allocation_deadline_seconds) is not int
+            or not MIN_ALLOCATION_SECONDS <= allocation_deadline_seconds <= MAX_ALLOCATION_SECONDS
+        ):
+            raise ValueError("invalid_allocation_deadline")
+        self.allocation_deadline_seconds = allocation_deadline_seconds
         # ADR 0041 resolved question 4b: concurrent billable frames need a later record that
         # covers total-cap races, partial stops and accrual interleaving, so only 1 is allowed.
         if type(max_open_billable_frames) is not int or max_open_billable_frames != 1:
@@ -548,6 +597,7 @@ class SaladSafetyService:
             observe=self._observe,
             stop=self._stop,
             clock=clock,
+            allocation_seconds=allocation_deadline_seconds,
             custody_started=self._custody_started,
             max_prestart_rebinds=max_prestart_rebinds,
             prestart_read_deadline_seconds=prestart_read_deadline_seconds,
@@ -1155,6 +1205,7 @@ class SaladSafetyService:
             budget_fenced=bool(row["budget_fenced"]),
             first_running_at=row["first_running_at"],
             total_cap_cents=self.total_cap_cents,
+            allocation_deadline_seconds=self.allocation_deadline_seconds,
             max_open_billable_frames=self.max_open_billable_frames,
             total_committed_cents=None,
             total_remaining_cents=None,
@@ -1709,6 +1760,8 @@ class SaladSafetyService:
             state,
             self.clock(),
             prior_allocation_id=row["allocation"],
+            instance_count=_instance_count(observation),
+            group_started=_group_started(observation),
         )
 
     def _stop(self, assignment):
@@ -2974,6 +3027,9 @@ def main(argv=None):
             destination=cfg["destination"],
             verifier=jwt,
             total_cap_cents=cfg.get("total_cap_cents"),
+            allocation_deadline_seconds=cfg.get(
+                "allocation_deadline_seconds", DEFAULT_ALLOCATION_SECONDS
+            ),
             control_origin=cfg.get("control_origin"),
             max_open_billable_frames=cfg.get("max_open_billable_frames", 1),
             max_prestart_rebinds=cfg.get("max_prestart_rebinds", 3),

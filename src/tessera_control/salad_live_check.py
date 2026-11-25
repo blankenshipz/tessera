@@ -625,6 +625,7 @@ class SaladLiveSession:
             rate_read_retries=_count(status.get("rate_read_retries")),
             provider_read_retries=_count(status.get("provider_read_retries")),
             stop_cause=_cause(status.get("stop_cause")),
+            allocation_timeout=_allocation_timeout(status.get("allocation_timeout")),
             custody_work_begun=(
                 status.get("custody_work_begun")
                 if type(status.get("custody_work_begun")) is bool
@@ -919,6 +920,22 @@ def installed_source_pin(commit, root=None):
 
 
 INVALID_CODE = "invalid_code"
+
+
+def _allocation_timeout(value):
+    """The guardian's allocation-timeout record (seconds waited, deadline) when well formed."""
+    if (
+        type(value) is dict
+        and type(value.get("elapsed_seconds")) is int
+        and type(value.get("deadline_seconds")) is int
+        and 0 <= value["elapsed_seconds"] <= 86400
+        and 0 < value["deadline_seconds"] <= 86400
+    ):
+        return {
+            "elapsed_seconds": value["elapsed_seconds"],
+            "deadline_seconds": value["deadline_seconds"],
+        }
+    return None
 
 
 def _cause(value):
@@ -1509,6 +1526,12 @@ def _drive(
             receipt["guardian_last_provider_read_failure_request_kind"] = evidence.get(
                 "last_provider_read_failure_request_kind"
             )
+            if evidence.get("stop_cause") == "allocation_timeout":
+                # The guardian cancelled the group: no instance was ever allocated in time.
+                # Nothing more can happen, so stop polling; the reason is kept below.
+                receipt["reason"] = "allocation_timeout"
+                receipt["allocation_timeout"] = evidence.get("allocation_timeout")
+                break
             if evidence["output_retained"]:
                 break
             # Spread polls over the approved window; stay well inside the guardian's
@@ -1530,7 +1553,8 @@ def _drive(
             raise ValueError("output unavailable")
         execution_complete = True
     except Exception as error:
-        receipt["reason"] = "execution_or_output_unresolved"
+        if receipt["reason"] != "allocation_timeout":
+            receipt["reason"] = "execution_or_output_unresolved"
         if step["name"] is not None and receipt["create_rejection"] is None:
             receipt["prestart_failure"] = _prestart_failure(error, step["name"])
     finally:
@@ -1587,18 +1611,20 @@ def _drive(
                     break
                 if evidence.get("provider_stop_confirmed"):
                     # Spend closed but custody can never seal: waiting cannot help.
-                    receipt["reason"] = (
-                        PRECUSTODY_REALLOCATION
-                        if receipt["guardian_stop_cause"] == "allocation_changed"
-                        and receipt["custody_work_begun"] is False
-                        else "provider_stopped_custody_unsealed"
-                    )
+                    if receipt["reason"] != "allocation_timeout":
+                        receipt["reason"] = (
+                            PRECUSTODY_REALLOCATION
+                            if receipt["guardian_stop_cause"] == "allocation_changed"
+                            and receipt["custody_work_begun"] is False
+                            else "provider_stopped_custody_unsealed"
+                        )
                     break
                 if clock() >= stop_deadline:
                     break
                 sleep(min(interval, max(0, stop_deadline - clock())))
         except Exception:
-            receipt["reason"] = "stop_unresolved"
+            if receipt["reason"] != "allocation_timeout":
+                receipt["reason"] = "stop_unresolved"
     try:
         if not execution_complete or not receipt["stop_confirmed"]:
             raise ValueError("stop unresolved")
@@ -1679,6 +1705,7 @@ def _drive(
             )
         elif receipt["reason"] not in {
             "provider_stopped_custody_unsealed",
+            "allocation_timeout",
             PRECUSTODY_REALLOCATION,
         }:
             receipt["reason"] = "custody_stop_or_reconnect_unresolved"

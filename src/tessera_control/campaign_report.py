@@ -41,6 +41,7 @@ _FAILURES = {
     "t1_salad_unclaimed": "no cloud worker picked up the job",
     "infra_container_killed": "the infrastructure killed the container",
     "infra_resource_limit": "the container hit a resource limit",
+    "infra_allocation_timeout": "no cloud instance was allocated in time",
     "not_started": "it was never started",
     "exit_confirmed_unresolved": "the program was confirmed to have exited but its result could "
     "not be resolved",

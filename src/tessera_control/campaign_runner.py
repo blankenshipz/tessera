@@ -56,6 +56,7 @@ from .campaign_exited_resolve import (
 )
 from .campaign_exited_resolve import assess as assess_exited
 from .campaign_infra_retry import (
+    INFRA_ALLOCATION_TIMEOUT,
     INFRA_CONTAINER_KILLED,
     INFRA_PREFIX,
     INFRA_RESOURCE_LIMIT,
@@ -4473,6 +4474,10 @@ class CampaignRunner:
         )
         if infra is not None:
             status, failure_class, detail = infra
+        elif failure_class == INFRA_ALLOCATION_TIMEOUT and status == "failed_transient":
+            status, detail = self._placement_failure(
+                ctx, stage["stage_key"], spec_stage, attempt, detail
+            )
         self._set_attempt(
             attempt["id"], status=status, failure_class=failure_class, failure_detail=detail
         )
@@ -4552,6 +4557,46 @@ class CampaignRunner:
             INFRA_CONTAINER_KILLED,
             f"exit_code:{exit_code}; infrastructure failure, retry {used + 1} of {limit}"[:500],
         )
+
+    def _placement_failure(
+        self,
+        ctx: _Ctx,
+        key: str,
+        spec_stage: NormalStage,
+        attempt: dict[str, Any],
+        observed_detail: str | None = None,
+    ) -> tuple[str, str]:
+        """``(status, detail)`` for an attempt the provider could not place (no instance was
+        ever allocated): a retryable infrastructure failure within ``retry.infra_retries``, which
+        placement may send to another approved candidate; with no retries left or enabled it
+        fails permanently, never retried and never a scientific retry. Each retry is a new
+        attempt with its own hold, so the campaign budget and project limits still bound it."""
+        limit = spec_stage.retry.infra_retries
+        used = infra_attempts(
+            self._rows(
+                "SELECT * FROM campaign_stage_attempts WHERE campaign_id=? AND stage_key=? "
+                "ORDER BY attempt",
+                (ctx.campaign["id"], key),
+            )
+        )
+        base = (
+            observed_detail
+            or attempt["failure_detail"]
+            or "allocation_timeout: no instance was allocated"
+        )
+        if limit < 1 or used >= limit:
+            self.emit_once(
+                ctx,
+                "campaign.stage_infra_retries_exhausted",
+                {"stage_key": key},
+                {"attempt": attempt["attempt"], "infra_retries_max": limit},
+            )
+            return "failed_permanent", f"{base}; no infrastructure retry left ({used} of {limit})"[
+                :500
+            ]
+        return "failed_transient", f"{base}; infrastructure failure, retry {used + 1} of {limit}"[
+            :500
+        ]
 
     # -- lineage --------------------------------------------------------------------
 

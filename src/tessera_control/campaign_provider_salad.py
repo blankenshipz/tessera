@@ -598,6 +598,26 @@ class SaladRouteProvider:
             )
         if verdict is None:
             return Observation("running")
+        timeout = self._allocation_timeout(rt, attempt)
+        # Only the guardian's own recorded timeout counts. A reason string the executor
+        # reported (the live receipt's detail) is not evidence of a placement failure.
+        if timeout is not None:
+            # The guardian cancelled the group because nothing was ever allocated: a placement
+            # failure (the runner bounds and reroutes it like an infrastructure one), never the
+            # stage's own logic failing.
+            return Observation(
+                "failed_transient",
+                failure_class="infra_allocation_timeout",
+                detail=(
+                    "allocation_timeout: no instance allocated within the allocation deadline"
+                    if timeout["deadline_seconds"] is None
+                    else f"allocation_timeout: no instance allocated within "
+                    f"{timeout['deadline_seconds']}s (elapsed {timeout['elapsed_seconds']}s)"
+                )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         failure_detail = str(attempt.get("failure_detail") or "")
         # The class is durable: before the runner records its observation the detail carries it;
         # afterwards the stored failure_class (and the ``salad:``-prefixed detail) do, so a
@@ -625,6 +645,31 @@ class SaladRouteProvider:
             evidence_digest=evidence,
             manifest_id=attempt.get("manifest_id"),
         )
+
+    @staticmethod
+    def _allocation_timeout(
+        rt: RunnerServices, attempt: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """The guardian's recorded allocation timeout for this attempt, or None."""
+        if rt is None or attempt.get("id") is None:
+            return None  # nothing to look up: the verdict alone decides, as before
+        row = rt._one(
+            "SELECT guardian_final_json FROM campaign_salad_attempts WHERE attempt_id=?",
+            (attempt["id"],),
+        )
+        if row is None or row["guardian_final_json"] is None:
+            return None
+        try:
+            found = json.loads(row["guardian_final_json"]).get("allocation_timeout")
+        except ValueError:
+            return None
+        if (
+            type(found) is dict
+            and type(found.get("elapsed_seconds")) is int
+            and type(found.get("deadline_seconds")) is int
+        ):
+            return found
+        return None
 
     # -- cancel -----------------------------------------------------------------------------
 
@@ -754,7 +799,12 @@ class SaladRouteProvider:
             "guardian_estimate": estimate,
         }
         if row is not None and row["guardian_final_json"] is not None:
-            rebinds = json.loads(row["guardian_final_json"]).get("prestart_rebinds")
+            timeout = final.get("allocation_timeout")
+            if timeout:
+                # Reason, how long the guardian waited, and (guardian_estimate above) the spend
+                # so far; absent unless the guardian cancelled for lack of an allocation.
+                fields["allocation_timeout"] = {"reason": "allocation_timeout", **timeout}
+            rebinds = final.get("prestart_rebinds")
             if rebinds:
                 # Recorded by the guardian: an allocation change before anything ran, re-bound.
                 fields["guardian_prestart_rebinds"] = rebinds

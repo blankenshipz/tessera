@@ -23,6 +23,9 @@ INFRA_CONTAINER_KILLED = "infra_container_killed"
 # ADR 0067: a stage that stopped because it reached a resource limit (its time budget, as its
 # own stop metric reports, or a kill at the stage time limit or for memory).
 INFRA_RESOURCE_LIMIT = "infra_resource_limit"
+# No instance was allocated before the provider's allocation deadline: a placement failure, bounded
+# by ``retry.infra_retries`` and rerouted like any infrastructure failure, never a task failure.
+INFRA_ALLOCATION_TIMEOUT = "infra_allocation_timeout"
 RESOURCE_LIMIT_CLASSES = frozenset({INFRA_CONTAINER_KILLED, INFRA_RESOURCE_LIMIT})
 
 
