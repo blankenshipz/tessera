@@ -43,6 +43,35 @@ receives a stage only if every label of every input is in the list. Unlabelled d
 resolved carries `unknown-lineage` and is always refused by a restricted provider (the trust file does not
 accept `unknown-lineage` in the list).
 
+## Example: research-only data on rented capacity
+
+A common case is a dataset whose licence allows research use but not commercial use. Label its
+snapshot once, for example `non-commercial` (the slug is your choice; Tessera gives it no meaning
+beyond what the trust file says). Every stage that reads it, and everything derived from it in this
+or a later campaign, then carries the label.
+
+By default a rented provider (a Salad route, say) receives `unlabelled` data only, so such a stage is
+refused there and runs on the operator's own capacity. To allow it on the rented provider, the
+operator names the label in that provider's trust entry, next to whatever it already receives:
+
+```json
+"salad": {"data_classes": ["public", "private_derived"],
+          "worker_principal_ids": ["<worker-principal-id>"],
+          "allowed_license_labels": ["unlabelled", "non-commercial"]}
+```
+
+This is an explicit operator decision that the rented provider may process data under that licence
+for this research; it is recorded with the trust file's digest on every approval and placement, and
+admission, approval and reservation re-check it. It changes nothing else: the data-class guard,
+`unknown-lineage` (never admitted) and every other label still apply.
+
+To revert, remove the label from `allowed_license_labels` (or drop the key, which for a third-party
+provider means `unlabelled` only) and restart serve with the edited file. Nothing already approved is
+widened: a stage not yet placed on that provider is refused there from the next placement; it falls
+back to another approved candidate, or, when none is left, the stage ends `input_not_admitted` (a
+stage whose only candidate is that provider fails rather than waits). A campaign approved under the
+old setting is re-checked against the new one before anything else is released to the provider.
+
 ## Derived data inherits
 
 The effective labels of a stage's inputs include everything upstream: a stage that reads a labelled

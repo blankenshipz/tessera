@@ -99,3 +99,53 @@ covered, revoked, expired, signer not live, the re-check after recording, the at
 existing `tests/test_delegation_rules.py`, `tests/test_delegated_decisions.py`,
 `tests/test_approval_delegations.py`, `tests/test_campaign_salad_preapproval.py`,
 `tests/test_campaign_pending_approval*.py` and `tests/test_campaign_not_before_runner.py`.
+
+## Amendment (2026-11-25): an owner may bind a review delegation to a direct approval
+
+Context. Decision 3 covered only a campaign an agent approved under a delegation. A campaign the
+owner approved directly (the common case) still stopped at every Salad stage's source assessment and
+plan and source-use reviews until a person acted, and each run mints a new source, so the stops could
+not be pre-cleared without that person at the approval with `tessera campaign preapproval-digests`.
+The owner's decision: an agent, not the owner, should resolve these so nobody waits.
+
+1. **The approving owner names the delegation.** The human approve body may carry
+   `review_delegation_id`: one of the approving person's own owner-signed delegations (ADR 0122) with a
+   review rule. It is checked in the approve transaction, fail closed, with the reason codes in a
+   409 `review_delegation_refused: ...`: a forward approval only (never a cleanup re-approval); never
+   together with explicit `preapprovals` (so every pre-approval under such an approval was made by the
+   delegation and is always re-checked); a delegation of the campaign's own organization and project
+   (another project's reads as not found); active and unexpired (`delegation_revoked`,
+   `delegation_expired`); signed by this same person (`not_the_delegating_owner`) whose credential is
+   still live; terms that parse and carry a review rule (`no_review_rule`). Only a human, or the
+   owner's own labelled automation (the same principal, admitted by `require_decision_actor`), can
+   approve, so no other agent can bind one.
+2. **Recorded with the approval.** A `campaign.review_delegation_bound` event (campaign, approval,
+   delegation id, terms digest, covered kinds) is written in the approval's own transaction, and
+   `campaign.approved` carries `review_delegation_id`. The binding exists exactly when the approval
+   does; it cannot be added, changed or carried to a later approval (a re-approval must name it again).
+   No schema change.
+3. **The same path as decisions 3 to 6.** The runner treats such an approval exactly like one made
+   under the delegation: at the stage's first review stop it records an exact-digest pre-approval
+   bound to the digests it derives itself, capped by the stage's own hold and the smaller of the
+   campaign's cap and the delegation's per-run cap, expiring with the earlier of the approval and the
+   delegation; every resolution re-checks the delegation (active, unexpired, signer live, kind covered,
+   stage inside the rule, provider allowed) in the runner and again in the resolving transaction;
+   anything outside it records nothing, leaves the review with a person and records
+   `campaign.preapproval_declined` with the codes, shown as `delegation_declined` on the pending view.
+   Revoking (or letting expire) a bound delegation therefore sends that approval's later reviews back
+   to a person; it does not pause the run, because the owner's direct approval, not the delegation,
+   authorized the campaign and its spend (unlike a campaign an agent approved under the delegation,
+   which the runner pauses as `paused_delegation_lapsed`, ADR 0038). For the same reason the
+   delegation's `budget_ceiling_cents`, `max_approvals` and `program_id` do not count or limit a
+   direct approval that binds it.
+4. **Who acts.** The platform's campaign runner resolves the reviews as `campaign_delegated` under the
+   campaign delegation (ADR 0038), citing the pre-approval and through it the delegation id and terms
+   digest; no agent credential gains a new power, and the delegation's other terms (approving
+   campaigns, gate decisions, budget ceilings) are not used by this binding. The receipt's approval
+   section names `review_delegation_id` (id only, never the signer) and each pre-approval entry carries
+   `delegation: {id, terms_digest}`.
+5. **Unchanged.** Grants, spend limits and program budget, snapshot release, worker credentials,
+   provider trust, the data-class guard and licence labels, gate go, conclusions and exports stay as
+   they are; a bare approval without the field behaves exactly as before and keeps its approve digest.
+
+Tests: `tests/test_owner_bound_review_delegation.py`.

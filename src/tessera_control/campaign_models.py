@@ -1958,6 +1958,11 @@ class ApproveCampaign(_Strict):
     )
     # Conditional unlock (ADR 0045): checked in the admission transaction, fail closed.
     unlock: UnlockList | None = None
+    # ADR 0150 amendment (2026-11-25): the approving owner names one of their own active
+    # owner-signed delegations (ADR 0122) carrying a review rule, so the per-run Salad reviews
+    # of this approval are resolved by the platform under it instead of waiting for a person.
+    # Absent keeps every earlier approve digest; never combined with ``preapprovals``.
+    review_delegation_id: Identifier | None = None
 
 
 def approve_payload(body: ApproveCampaign) -> dict[str, Any]:

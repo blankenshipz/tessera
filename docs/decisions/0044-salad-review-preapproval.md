@@ -240,3 +240,10 @@ frame reconciles; go, conclusions, exports and publication.
 A provider other than Salad needs review pre-approval; an owner wants per-attempt caps that
 differ from the stage hold; or the ADR 0041 per-frame guardian record and fence land (the verdict check itself is
 already in `settle_frame`, for the automatic billable bases only).
+
+## Note (2026-11-25)
+
+Besides an explicit `preapprovals` entry, the approving human may instead name one of their own
+owner-signed delegations with a review rule (`review_delegation_id`); the runner then records the
+same exact-digest row at the stage's first review stop and resolves under it (ADR 0150 amendment
+2026-11-25). The two cannot be combined in one approve body.

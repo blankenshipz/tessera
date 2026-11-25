@@ -1013,6 +1013,7 @@ def build_receipt(
                     if approval["delegation_id"] is not None
                     else {}
                 ),
+                **_review_delegation(connection, approval),
                 **_smoke_grant(connection, approval["approving_principal_id"]),
             },
             **_wall_clock(connection, campaign_id, parse_spec_json(current["spec_json"])),
@@ -1051,6 +1052,17 @@ def build_receipt(
             **({"rerun": rerun} if rerun else {}),
         }
     )
+
+
+def _review_delegation(connection: sqlite3.Connection, approval: Any) -> dict[str, Any]:
+    """ADR 0150 amendment: the owner-signed delegation the approving owner bound to this direct
+    approval's per-run reviews (id only, never the signer); absent when none was bound."""
+    from .campaign_preapproval import bound_review_delegation
+
+    if approval["delegation_id"] is not None:
+        return {}
+    found = bound_review_delegation(connection, approval)
+    return {"review_delegation_id": found} if found else {}
 
 
 def _chained_inputs(spec_json: str) -> dict[str, Any]:

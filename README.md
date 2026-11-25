@@ -240,7 +240,10 @@ Descriptors are validated at registration. `--provider-trust` sets which data cl
 provider's worker may receive (public only by default); a provider entry may also list
 `allowed_license_labels`, and a stage whose inputs (or the data they derive from) carry any other
 licence label is refused for that provider, fail closed
-([ADR 0113](docs/decisions/0113-license-placement-guard.md)). With the owner-set mode
+([ADR 0113](docs/decisions/0113-license-placement-guard.md)). For example, research-only data
+labelled `non-commercial` runs on a rented provider only once the operator names that label in the
+provider's `allowed_license_labels`, and removing it reverts that for every stage not yet placed
+([licence labels](docs/license-labels.md)). With the owner-set mode
 `all_registered_providers` (ADR 0047), agents and specs route any data class among the
 configured, registered providers without a per-run approval; data never goes to the public
 internet or an unregistered destination in any mode, because non-public inputs cannot use
@@ -395,7 +398,11 @@ operator profile can only narrow this
 every delegated review is cited on the receipt with the approval id. A campaign approved under
 an owner-signed delegation with a review rule gets the same exact-digest pre-approval recorded by
 the runner at the stage's first review stop, bound to and citing that delegation
-([ADR 0150](docs/decisions/0150-deferred-launch-delegated-preclear.md)). A person is still
+([ADR 0150](docs/decisions/0150-deferred-launch-delegated-preclear.md)). So does a campaign the owner
+approves directly while naming one of their own such delegations (`review_delegation_id` in the
+approve body): the platform then resolves that approval's per-run source assessments and plan and
+source-use reviews on the owner's behalf, inside the delegation's review rule, caps, providers and
+expiry, re-checked at every use; outside it the review stays with a person. A person is still
 required for: approving each campaign digest (and each re-approval), staging inputs with
 their public declaration and code approval, gate go, conclusions, exports, publication and
 data classification (never pre-approvable), recording compute charges, reconciling orphans

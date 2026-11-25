@@ -130,3 +130,11 @@ after a downstream output was recorded reaches it through recomputation (within 
 through the recorded row (the same limit as derived snapshots).
 
 Tests: `tests/test_lineage_use_restriction_labels.py`.
+
+## Note (2026-11-25): a research-only label on a rented provider
+
+An operator may admit a label such as `non-commercial` (research use allowed, no commercial use) on a
+rented provider by naming it in that provider's `allowed_license_labels`; removing it (and restarting
+serve) reverts the decision for every stage not yet placed, which is re-checked at placement and
+reservation. The worked example and the revert steps are in [licence labels](../license-labels.md).
+

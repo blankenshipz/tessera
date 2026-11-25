@@ -1008,7 +1008,10 @@ class SaladStageDriver:
             return None
         with self.runner.store.runner_connection() as connection:
             found = campaign_preapproval.stage_preapproval(connection, ctx.approval["id"], key)
-        if found is None and not ctx.approval.get("delegation_id"):
+            # ADR 0150: the delegation the campaign was approved under, or the one the
+            # approving owner bound to this approval's reviews (amendment 2026-11-25).
+            delegated = campaign_preapproval._delegation_of(ctx.approval, connection)
+        if found is None and not delegated:
             return None
         try:
             if not self.profile(self._spec(ctx, key)).preapprove_reviews:
@@ -1024,7 +1027,8 @@ class SaladStageDriver:
         delegation records nothing and leaves the stop with a person, with the reasons on a
         ``campaign.preapproval_declined`` event."""
         assert ctx.approval is not None
-        delegation_id = ctx.approval["delegation_id"]
+        with self.runner.store.runner_connection() as connection:
+            delegation_id = campaign_preapproval._delegation_of(ctx.approval, connection)
         try:
             digests = self.preview_review_digests(ctx, key)
         except Exception:  # noqa: BLE001 - a stage the driver cannot preview is not covered

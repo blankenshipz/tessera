@@ -21,7 +21,14 @@ from pydantic import ValidationError
 
 from . import campaign_heavy_guard_readout as heavy_guard_readout
 from . import campaign_heavy_remote as heavy_remote
-from . import campaign_hold, campaign_placement, program_budget, provider_trust, smoke_credentials
+from . import (
+    campaign_hold,
+    campaign_placement,
+    campaign_preapproval,
+    program_budget,
+    provider_trust,
+    smoke_credentials,
+)
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_comparison import ComparisonRefused, compare_arms
 from .campaign_gates import (
@@ -1108,6 +1115,10 @@ class CampaignStore(
                 evaluations=unlock_evaluations,
                 now=now,
             )
+            # Checked before any pre-approval row is written (it refuses combining the two).
+            review_delegation = self._bind_review_delegation(
+                connection, live, campaign, approval, body, forward
+            )
             declared = self._insert_preapprovals(
                 connection, campaign, spec, approval, body.preapprovals, forward
             )
@@ -1134,8 +1145,31 @@ class CampaignStore(
                     "resulting_status": resulting,
                     "preapprovals": declared,
                     **({"smoke_grant_id": smoke_grant_id} if smoke_grant_id else {}),
+                    **(
+                        {"review_delegation_id": review_delegation["id"]}
+                        if review_delegation
+                        else {}
+                    ),
                 },
             )
+            if review_delegation:
+                # Recorded in the approval's own transaction: the binding exists exactly when
+                # the approval does, and cannot be added or changed later (re-approve instead).
+                self._event(
+                    connection,
+                    live,
+                    campaign["project_id"],
+                    None,
+                    campaign_preapproval.REVIEW_DELEGATION_EVENT,
+                    revision,
+                    {
+                        "campaign_id": campaign_id,
+                        "approval_id": approval["id"],
+                        "delegation_id": review_delegation["id"],
+                        "terms_digest": review_delegation["terms_digest"],
+                        "kinds": review_delegation["kinds"],
+                    },
+                )
             return 200, {
                 **_summary(campaign),
                 "status": resulting,
@@ -1147,6 +1181,55 @@ class CampaignStore(
         return self._mutate(
             principal, key, "POST", f"/campaigns/{campaign_id}/approve", digest, command
         )
+
+    @staticmethod
+    def _bind_review_delegation(connection, live, campaign, approval, body, forward):
+        """ADR 0150 amendment (2026-11-25): validate the approving owner's named review
+        delegation, or None when the body names none. Fail closed with a stable reason: a
+        forward approval only, never with explicit pre-approvals, a delegation of this org and
+        project, active and unexpired, signed by this same person with a live credential, whose
+        terms parse and carry a review rule. Nothing about the delegation's other powers (gate
+        decisions, approvals, budgets) is used here."""
+        delegation_id = body.review_delegation_id
+        if delegation_id is None:
+            return None
+        if not forward:
+            raise Conflict("review_delegation_refused: a cleanup re-approval cannot bind one.")
+        if body.preapprovals:
+            raise Conflict(
+                "review_delegation_refused: name either preapprovals or review_delegation_id."
+            )
+        from .delegation_rules import (
+            _creator_reasons,
+            _delegation_reasons,
+            _scope_reasons,
+            parse_terms,
+        )
+
+        delegation = connection.execute(
+            "SELECT * FROM approval_delegations WHERE id=? AND org_id=? AND project_id=?",
+            (delegation_id, campaign["org_id"], campaign["project_id"]),
+        ).fetchone()
+        if delegation is None:
+            raise NotFound("Approval delegation was not found.")
+        now_dt = _parse_utc(approval["approved_at"])
+        reasons = _delegation_reasons(delegation, now_dt)
+        reasons += _scope_reasons(delegation, campaign)
+        reasons += _creator_reasons(connection, delegation, None)
+        if delegation["created_by_principal_id"] != live["id"]:
+            reasons.append("not_the_delegating_owner")
+        terms = parse_terms(delegation)
+        if terms is None:
+            reasons.append("delegation_terms_invalid")
+        elif terms.review_rule is None:
+            reasons.append("no_review_rule")
+        if reasons:
+            raise Conflict("review_delegation_refused: " + ",".join(dict.fromkeys(reasons)))
+        return {
+            "id": delegation["id"],
+            "terms_digest": delegation["terms_digest"],
+            "kinds": sorted(terms.review_rule.kinds),  # type: ignore[union-attr]
+        }
 
     @staticmethod
     def _insert_preapprovals(connection, campaign, spec, approval, entries, forward) -> list[dict]:

@@ -247,7 +247,7 @@ def evaluate(
     now = _parse_utc(utc_now())
     if now >= min(_parse_utc(pre["expires_at"]), _parse_utc(approval["expires_at"])):
         return Verdict(EXPIRED, pre)
-    if _delegation_of(approval) is not None:
+    if _delegation_of(approval, connection) is not None:
         # ADR 0150: a pre-approval recorded under a delegation is only as good as the
         # delegation is now: re-checked at every use, in the resolving transaction too.
         refused = delegated_review_reasons(connection, campaign, approval, stage_key, kind, now)
@@ -329,11 +329,40 @@ UNCOVERED_DIGEST = canonical_digest({"type": "delegated_review_kind_not_covered"
 NOT_SALAD_STAGE = "stage_provider_not_salad"
 
 
-def _delegation_of(approval: Any) -> str | None:
+REVIEW_DELEGATION_EVENT = "campaign.review_delegation_bound"
+
+
+def _delegation_of(approval: Any, connection: sqlite3.Connection | None = None) -> str | None:
+    """The owner-signed delegation this approval's per-run reviews are resolved under, if any:
+    the delegation an agent approved the campaign under (ADR 0150), or the one the approving
+    owner bound in a direct approval (``review_delegation_id``, recorded as a
+    ``campaign.review_delegation_bound`` event in the approval's own transaction). Without a
+    connection only the first is visible."""
     try:
-        return approval["delegation_id"]
+        found = approval["delegation_id"]
+    except (KeyError, IndexError):
+        found = None
+    if found is not None or connection is None:
+        return found
+    return bound_review_delegation(connection, approval)
+
+
+def bound_review_delegation(connection: sqlite3.Connection, approval: Any) -> str | None:
+    """The delegation the approving owner bound to this approval's reviews, or None."""
+    try:
+        approval_id, campaign_id = approval["id"], approval["campaign_id"]
     except (KeyError, IndexError):
         return None
+    row = connection.execute(
+        """SELECT e.payload_json FROM events e JOIN campaigns c ON c.project_id = e.project_id
+        WHERE c.id=? AND e.event_type=? AND json_extract(e.payload_json,'$.campaign_id')=?
+        AND json_extract(e.payload_json,'$.approval_id')=? ORDER BY e.cursor LIMIT 1""",
+        (campaign_id, REVIEW_DELEGATION_EVENT, campaign_id, approval_id),
+    ).fetchone()
+    if row is None:
+        return None
+    value = json.loads(row[0]).get("delegation_id")
+    return value if isinstance(value, str) else None
 
 
 def delegated_review_reasons(
@@ -351,7 +380,7 @@ def delegated_review_reasons(
 
     delegation = connection.execute(
         "SELECT * FROM approval_delegations WHERE id=? AND org_id=?",
-        (_delegation_of(approval), campaign["org_id"]),
+        (_delegation_of(approval, connection), campaign["org_id"]),
     ).fetchone()
     if delegation is None:
         return ["delegation_missing"]
@@ -390,7 +419,8 @@ def record_delegated_preapproval(
     ).fetchone()
     if campaign is None or approval is None or approval["status"] != "active":
         return None, [APPROVAL_INACTIVE]
-    if _delegation_of(approval) is None:
+    delegation_id = _delegation_of(approval, connection)
+    if delegation_id is None:
         return None, [NO_PREAPPROVAL]
     existing = stage_preapproval(connection, approval_id, stage_key)
     if existing is not None:
@@ -406,8 +436,11 @@ def record_delegated_preapproval(
     if not covered:
         return None, reasons
     delegation = connection.execute(
-        "SELECT * FROM approval_delegations WHERE id=?", (approval["delegation_id"],)
+        "SELECT * FROM approval_delegations WHERE id=? AND org_id=?",
+        (delegation_id, campaign["org_id"]),
     ).fetchone()
+    if delegation is None:
+        return None, ["delegation_missing"]
     terms = parse_terms(delegation)
     exposure = _stage_exposure(connection, campaign, stage_key)
     if terms is None or exposure is None:
@@ -541,11 +574,17 @@ def preapproval_summary(connection: sqlite3.Connection, campaign_id: str) -> lis
         ).fetchall()
         # ADR 0150: a pre-approval the platform recorded under an owner-signed delegation names
         # that delegation and its terms digest (never the person who signed it).
-        delegation = connection.execute(
-            """SELECT d.id, d.terms_digest FROM campaign_approvals a
-            JOIN approval_delegations d ON d.id = a.delegation_id WHERE a.id=?""",
-            (row["approval_id"],),
+        approval = connection.execute(
+            "SELECT * FROM campaign_approvals WHERE id=?", (row["approval_id"],)
         ).fetchone()
+        delegation_id = None if approval is None else _delegation_of(approval, connection)
+        delegation = (
+            None
+            if delegation_id is None
+            else connection.execute(
+                "SELECT id, terms_digest FROM approval_delegations WHERE id=?", (delegation_id,)
+            ).fetchone()
+        )
         result.append(
             {
                 "id": row["id"],

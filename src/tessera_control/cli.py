@@ -206,6 +206,11 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
         help="default: the campaign's current revision, read just before approving",
     )
     approve.add_argument("--expected-spec-digest", required=True)
+    approve.add_argument(
+        "--review-delegation-id",
+        help="one of your own owner-signed delegations with a review rule: the platform then "
+        "resolves this approval's per-run Salad reviews under it (ADR 0150)",
+    )
     common(approve, mutating=True, label=True, optional_key=True)
     get = actions.add_parser("get")
     get.add_argument("--campaign-id", required=True)
@@ -455,6 +460,7 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
             body = ApproveCampaign(
                 expected_revision=revision,
                 expected_spec_digest=arguments.expected_spec_digest,
+                review_delegation_id=arguments.review_delegation_id,
             )
             body = approve_payload(body)
             call = ("POST", f"/campaigns/{campaign}/approve", body, key)

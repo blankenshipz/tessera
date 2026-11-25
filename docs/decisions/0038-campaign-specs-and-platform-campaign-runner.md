@@ -525,3 +525,13 @@ owner decision. Go, conclusions, exports and classification are never pre-approv
 module without reopening a settlement. ADR 0041 stage 3 turns it into `settle_frame`. Once
 that stage lands, the worker-attested guardian final status in amendment A (automatic
 Salad settlement) is superseded by ADR 0041's guardian verdict, which control reads itself.
+
+## Note (2026-11-25): per-run Salad reviews on the owner's behalf
+
+The Salad driver's source assessment and per-attempt plan and source-use reviews (amendment
+2026-11-19) can be resolved by the runner under the campaign delegation when the approval binds an
+exact-digest pre-approval: one in the approve body (ADR 0044), one recorded under an owner-signed
+delegation the campaign was approved under (ADR 0150), or one recorded under a delegation the owner
+named in a direct approval (`review_delegation_id`, ADR 0150 amendment 2026-11-25). Each is
+`campaign_delegated`, re-checked at every use and cited on the receipt; anything outside it stays with
+a person.

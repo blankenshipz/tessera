@@ -69,14 +69,14 @@ def pending_human_approval(
     if status in {"cancelled", "succeeded", "stopped", "failed"}:
         return items
     now = datetime.now(UTC)
-    delegated = (
-        connection.execute(
-            """SELECT 1 FROM campaign_approvals WHERE campaign_id=? AND status='active'
-            AND delegation_id IS NOT NULL""",
-            (campaign["id"],),
-        ).fetchone()
-        is not None
-    )
+    from .campaign_preapproval import _delegation_of
+
+    active = connection.execute(
+        "SELECT * FROM campaign_approvals WHERE campaign_id=? AND status='active'",
+        (campaign["id"],),
+    ).fetchone()
+    # Approved under a delegation, or a direct approval whose owner bound one to its reviews.
+    delegated = active is not None and _delegation_of(active, connection) is not None
     rows = connection.execute(
         """SELECT a.stage_key, a.attempt, s.plan_decision_id, s.source_decision_id
         FROM campaign_salad_attempts s JOIN campaign_stage_attempts a ON a.id = s.attempt_id
