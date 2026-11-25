@@ -598,6 +598,7 @@ class SaladWorld:
         passed: bool = True,
         outputs: bool = True,
         guardian_final: dict[str, Any] | None = None,
+        receipt_extra: dict[str, Any] | None = None,
     ) -> None:
         """Executor double for a route that ran: claim, stop, import, observe, record."""
         row = self.salad()
@@ -621,6 +622,7 @@ class SaladWorld:
                 }
             ],
         }
+        receipt.update(receipt_extra or {})
         self.env.store.record_salad_outcome(
             self.worker,
             row["attempt_id"],

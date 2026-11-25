@@ -231,6 +231,25 @@ def stage_data_digest(stage: dict[str, Any], spec_stage: Any) -> str:
     return canonical_digest(sorted(rows))
 
 
+# Closed values naming which signal made a reallocation retryable (ADR 0179 addendum).
+SIGNAL_ROUTE_FLAG = "route_flag"
+SIGNAL_GUARDIAN = "guardian_evidence"
+
+
+def _guardian_precustody_evidence(
+    receipt: dict[str, Any], *, provider_confirmed: bool = True
+) -> bool:
+    """Fail closed: only the live receipt's own pre-custody word counts. Custody must be
+    literally False (not None), the stop cause an allocation change and, unless the route's own
+    provider read already confirmed it, the provider's stop confirmed."""
+    return (
+        receipt.get("reason") == REALLOCATED_PRECUSTODY
+        and receipt.get("guardian_stop_cause") == "allocation_changed"
+        and receipt.get("custody_work_begun") is False
+        and (not provider_confirmed or receipt.get("provider_stop_confirmed") is True)
+    )
+
+
 class SaladStageDriver:
     def __init__(
         self, runner: CampaignRunner, profiles: Any = None, guardian_reader: Any = None
@@ -1527,6 +1546,16 @@ class SaladStageDriver:
         if not passed:
             digest = self._evidence(row, state, provider, manifest)
             reason = str(receipt.get("reason", "not_passed"))[:80]
+            if _guardian_precustody_evidence(receipt):
+                # ADR 0179 as amended: the route never flagged a reallocation, but the live
+                # receipt carries the guardian's own pre-custody word, with the provider's stop
+                # read confirmed above. Same retryable class as a route-flagged one.
+                return (
+                    "failed",
+                    f"{REALLOCATED_PRECUSTODY}: signal={SIGNAL_GUARDIAN}; "
+                    "allocation changed before custody; termination confirmed by provider read",
+                    digest,
+                )
             return "failed", f"live receipt not passed: {reason}", digest
         if manifest is None or not self._outputs_match(receipt, manifest):
             return "unknown", "manifest does not match the imported output hashes", None
@@ -1569,14 +1598,10 @@ class SaladStageDriver:
         provider = [r for r in state["receipts"] if r.get("provenance") == "provider"]
         receipt = json.loads(row["live_receipt_json"]) if row["live_receipt_json"] else {}
         detail = "allocation changed; termination confirmed by provider read"
-        if (
-            receipt.get("reason") == REALLOCATED_PRECUSTODY
-            and receipt.get("guardian_stop_cause") == "allocation_changed"
-            and receipt.get("custody_work_begun") is False
-        ):
+        if _guardian_precustody_evidence(receipt, provider_confirmed=False):
             # ADR 0179: the guardian's own word that no custody work began. The class rides on
             # the detail so the provider adapter reports a retryable interruption.
-            detail = f"{REALLOCATED_PRECUSTODY}: {detail}"
+            detail = f"{REALLOCATED_PRECUSTODY}: signal={SIGNAL_ROUTE_FLAG}; {detail}"
         return "failed", detail, self._evidence(row, state, provider, None)
 
     def _termination_unconfirmed(
