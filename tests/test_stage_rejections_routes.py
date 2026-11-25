@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -284,3 +285,106 @@ def test_recording_context_reraises_the_same_exception_and_unexpected_has_no_tex
         raise ValueError("secret host.example.invalid")
     assert [e["code"] for e in _events(env)] == ["campaign_not_running", "unexpected_error"]
     assert "secret" not in json.dumps(_events(env))
+
+
+# -- recording never changes a refusal and never allows (fail closed) ---------------------------
+
+
+_OWN_LEASE_REFUSALS = [
+    ("/worker/leases/renew", {"lease_id": "lease_rej", "expected_epoch": 99}),
+    ("/worker/leases/lease_rej/package", {"expected_epoch": 99}),
+    (
+        "/worker/observations",
+        {
+            "lease_id": "lease_rej",
+            "expected_epoch": 99,
+            "observed_state": "running",
+            "observed_at": "2026-01-01T00:00:00Z",
+        },
+    ),
+]
+
+
+def _boom(*_args, **_kwargs):
+    raise RuntimeError("recorder down host.example.invalid")
+
+
+@pytest.mark.parametrize(("path", "body"), _OWN_LEASE_REFUSALS)
+def test_a_failing_recorder_leaves_a_lease_step_refusal_identical(world, monkeypatch, path, body):
+    env, _, client = world
+    _lease_it(env)
+    baseline = _post(client, path, body)
+    assert baseline.status_code in (404, 409), baseline.text  # a refusal, never an allow
+    assert len(_events(env)) == 1  # sanity: the recorder works
+    env.execute("DELETE FROM events WHERE event_type=?", EVENT)
+    monkeypatch.setattr(module, "record", _boom)
+    response = _post(client, path, body, key="k-boom")
+    assert (response.status_code, response.json()) == (baseline.status_code, baseline.json())
+    assert _events(env) == []
+    assert "host.example.invalid" not in response.text
+
+
+@pytest.mark.parametrize(("step", "path", "body"), _FOREIGN_LEASE_STEPS)
+def test_a_failing_recorder_never_changes_the_foreign_lease_not_found(
+    world, monkeypatch, step, path, body
+):
+    env, campaign, client = world
+    env.execute("UPDATE campaigns SET status='running' WHERE id=?", campaign["id"])
+    other = _other_worker(env)
+    with sqlite3.connect(env.state / "tessera.sqlite3") as db:
+        _lease(db, "grant_rej", other["id"])
+    missing = _post(client, *_for_lease(path, body, "lease_missing"), key="k0")
+    monkeypatch.setattr(module, "record", _boom)  # not even reached: nothing is recorded
+    before = _all_events(env)
+    response = _post(client, *_for_lease(path, body, "lease_rej"))
+    assert response.status_code == 404, response.text
+    assert (response.status_code, response.json()) == (missing.status_code, missing.json())
+    assert _all_events(env) == before
+
+
+@pytest.mark.parametrize(("path", "body"), _OWN_LEASE_REFUSALS)
+def test_a_failing_ownership_query_records_nothing_and_keeps_the_refusal(
+    world, monkeypatch, path, body
+):
+    """If the ownership check itself cannot run it answers 'not mine': the caller still sees the
+    refusal (never an allow) and nothing is recorded."""
+    import tessera_control.store as store_module
+
+    env, _, client = world
+    _lease_it(env)
+    baseline = _post(client, path, body)
+    assert baseline.status_code in (404, 409), baseline.text
+    env.execute("DELETE FROM events WHERE event_type=?", EVENT)
+    real_connect = store_module._connect
+
+    def connect_failing_only_for_the_ownership_check(*args, **kwargs):
+        # execution_api imports _connect lazily inside _owns_lease, so only that call sees the
+        # patched name; the stores that serve the request keep their own bound reference.
+        if sys._getframe(1).f_code.co_name == "_owns_lease":
+            raise sqlite3.OperationalError("database is locked host.example.invalid")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store_module, "_connect", connect_failing_only_for_the_ownership_check)
+    response = _post(client, path, body, key="k-lock")
+    assert (response.status_code, response.json()) == (baseline.status_code, baseline.json())
+    assert _events(env) == []
+    assert "host.example.invalid" not in response.text
+
+
+def test_the_ownership_check_logs_at_debug_only_and_names_no_ids(world, caplog):
+    import logging
+
+    from tessera_control import execution_api
+
+    env, _, _ = world
+    other = _other_worker(env)
+    with sqlite3.connect(env.state / "tessera.sqlite3") as db:
+        _lease(db, "grant_rej", other["id"])
+    with caplog.at_level(logging.DEBUG, logger="tessera_control.execution_api"):
+        assert execution_api._owns_lease(env.execution, env.worker, "lease_rej") is False
+        assert execution_api._owns_lease(env.execution, other, "lease_rej") is True
+    records = [r for r in caplog.records if r.name == "tessera_control.execution_api"]
+    assert [r.levelno for r in records] == [logging.DEBUG]  # only the foreign probe logs
+    text = records[0].getMessage()
+    assert "lease_rej" not in text and env.worker["id"] not in text and other["id"] not in text
+    assert "does not own" in text

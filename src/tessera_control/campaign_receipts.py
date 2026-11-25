@@ -214,6 +214,7 @@ def _scratch(connection: sqlite3.Connection, attempt: sqlite3.Row, spec_stage: A
 
 
 CACHE_OUTCOMES = frozenset({"hit", "miss", "unavailable", "off"})
+RECORDED_CACHE_OUTCOMES = frozenset({"hit", "miss", "unavailable"})
 
 
 def cache_outcome(row: dict[str, Any]) -> str | None:
@@ -221,7 +222,9 @@ def cache_outcome(row: dict[str, Any]) -> str | None:
 
     A runtime reports ``cache`` (``hit``, ``miss``, ``unavailable`` when it has no usable
     persistent storage, ``off`` when the file was not flagged); a local worker reports a boolean
-    ``cached``. Anything else is not trusted and reads as unknown (``None``)."""
+    ``cached`` (a recorded row may also carry the ``cache`` string, and ``unavailable`` then reads
+    as itself rather than as unknown). Anything else is not trusted and reads as unknown
+    (``None``)."""
     value = row.get("cache")
     if isinstance(value, str) and value in CACHE_OUTCOMES:
         return value
@@ -356,15 +359,20 @@ def _local_fetched(
         pin = pins.get((item.get("input"), item.get("name"))) if isinstance(item, dict) else None
         if pin is None or item.get("sha256") != pin[1]:
             continue
-        rows.append(
-            {
-                "url": pin[0],
-                "sha256": pin[1],
-                "bytes": item.get("bytes"),
-                "seconds": item.get("seconds"),
-                "cached": item.get("cached"),
-            }
-        )
+        reported = {
+            "url": pin[0],
+            "sha256": pin[1],
+            "bytes": item.get("bytes"),
+            "seconds": item.get("seconds"),
+            "cached": item.get("cached"),
+        }
+        if "cache" in item:
+            # Only the recorded tri-state is passed on; any other value reads as unknown.
+            value = item["cache"]
+            reported["cache"] = (
+                value if isinstance(value, str) and value in RECORDED_CACHE_OUTCOMES else None
+            )
+        rows.append(reported)
     return rows or None
 
 

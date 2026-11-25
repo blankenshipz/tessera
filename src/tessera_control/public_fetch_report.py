@@ -126,7 +126,12 @@ class PublicFetchStore(ExecutionStore):
                 raise Conflict("A public fetch was already recorded for this operation.")
             event = {
                 "operation_id": operation_id,
-                "files": payload["files"],
+                # Optional keys are stored only when present, so a row without the cache
+                # outcome keeps the exact shape it always had.
+                "files": [
+                    {k: v for k, v in row.items() if k not in ("cache", "cached") or v is not None}
+                    for row in payload["files"]
+                ],
                 "hosts": plan["hosts"],
                 "via_control": False,
             }

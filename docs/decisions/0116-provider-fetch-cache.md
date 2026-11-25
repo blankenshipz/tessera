@@ -41,7 +41,10 @@ holds anything but pinned public bytes, or a path that carries bytes to the cont
    (the flag was not set), and `bytes` as before; it is null, with the file `declared_only`, when no
    provider report is available. The `public_fetch` object gains `cache_requested: true` only when a
    source asked for caching, so receipts of specs without the flag are unchanged. Local-worker rows map
-   their `cached` boolean to `hit` or `miss`.
+   their `cached` boolean to `hit` or `miss`. A recorded fetch row may also carry an optional `cache`
+   string (`hit`, `miss` or `unavailable`, absent when the spec never asked for the cache) next to
+   `cached`; `cached` stays for hit and miss and is absent for `unavailable`. Any other value reads as
+   unknown (null) on the receipt, never as a trusted outcome.
 7. **Partial files are locked, and a stale one is reclaimed.** The writer holds an exclusive,
    non-blocking `flock` on its `.<sha>.part` file for the whole copy; the kernel drops the lock when
    the process ends, even when it is killed, so a part file whose lock can be taken is not being

@@ -255,7 +255,8 @@ report in the outbox, and it is resumed only when a worker next runs over the sa
 `development-poll` gives each grant its own workspace, so a finished grant's leftover report is
 not resumed. That gap is still open.
 
-`--stage-watcher-stats` (disabled by default, only with `--stage-watcher`) makes the local Docker probe
+`--stage-watcher-stats` (off unless given; on its own it is an explicit, enabled watcher config that
+uses the default marker, like `--stage-watcher`) makes the local Docker probe
 also sample `docker stats` and fill the `mem_bytes` counter; without it `mem_bytes` stays absent.
 It is an unverified worker claim like every counter. `cpu_ms` is not sampled this way because
 `docker stats` gives a CPU percentage, not cumulative CPU time.

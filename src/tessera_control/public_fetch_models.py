@@ -8,7 +8,7 @@ must not import it.
 from __future__ import annotations
 
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -150,7 +150,23 @@ class PublicFetchRow(_Strict):
     sha256: Sha256
     bytes: Annotated[int, Field(strict=True, ge=0, le=MAX_FILE_BYTES)]
     seconds: Annotated[float, Field(ge=0, le=7 * 86400)]
-    cached: bool
+    # ``cached`` is the hit/miss boolean every row has always carried. ``cache`` is the optional
+    # tri-state outcome (absent when the spec never asked for the cache); ``unavailable`` means
+    # the runtime had no usable storage, so there is no boolean to report.
+    cached: Annotated[bool, Field(strict=True)] | None = None
+    cache: Literal["hit", "miss", "unavailable"] | None = None
+
+    @model_validator(mode="after")
+    def _cache_consistent(self) -> PublicFetchRow:
+        if self.cache is None:
+            if self.cached is None:
+                raise ValueError("a public fetch row reports cached or cache")
+        elif self.cache == "unavailable":
+            if self.cached is not None:
+                raise ValueError("an unavailable cache has no hit or miss boolean")
+        elif self.cached is not None and self.cached != (self.cache == "hit"):
+            raise ValueError("cached must agree with the cache outcome")
+        return self
 
 
 class ReportPublicFetch(_Strict):

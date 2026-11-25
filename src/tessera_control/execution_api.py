@@ -1,5 +1,6 @@
 """Typed control admission and separately authenticated worker authority routes."""
 
+import logging
 from contextlib import contextmanager
 from typing import Annotated, Any
 
@@ -79,6 +80,9 @@ def result_checkpoints(request: Request) -> ResultCheckpointStore:
 Checkpoints = Annotated[ResultCheckpointStore, Depends(result_checkpoints)]
 
 
+log = logging.getLogger(__name__)
+
+
 def result_acceptances(request: Request) -> ResultAcceptanceStore:
     return ResultAcceptanceStore(request.app.state.execution.database_path.parent)
 
@@ -94,13 +98,17 @@ RemoteWorkflows = Annotated[RemoteWorkflowStore, Depends(remote_workflows)]
 
 
 def _owns_lease(store, worker, lease_id) -> bool:
-    """True when ``lease_id`` is a lease of this worker; any failure answers False."""
+    """True when ``lease_id`` is a lease of this worker; any failure answers False.
+
+    Both False outcomes are logged at debug level only: a lease of another worker is an expected
+    probe (it answers 404 exactly like a missing lease and records nothing), and a failed
+    ownership query must never change the refusal. No lease or worker id is logged."""
     from .store import _connect
 
     try:
         connection = _connect(store.database_path)
         try:
-            return (
+            owned = (
                 connection.execute(
                     "SELECT 1 FROM execution_leases WHERE id = ? AND worker_principal_id = ?",
                     (lease_id, worker["id"]),
@@ -109,8 +117,12 @@ def _owns_lease(store, worker, lease_id) -> bool:
             )
         finally:
             connection.close()
-    except Exception:  # noqa: BLE001 - recording must never change the refusal
+    except Exception as error:  # noqa: BLE001 - recording must never change the refusal
+        log.debug("lease ownership check failed (%s); nothing is recorded", type(error).__name__)
         return False
+    if not owned:
+        log.debug("a worker step named a lease it does not own; nothing is recorded")
+    return owned
 
 
 @contextmanager

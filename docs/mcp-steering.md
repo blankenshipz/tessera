@@ -10,6 +10,11 @@ campaign through submit, inspect, approve, adjust, stop, re-run of the failed st
 re-run tree's spend bound (ADR 0074) and outcome and receipt retrieval, with every step a tool
 call; approval is `tessera_approve_campaign` on an approve-only server holding a person's own
 credential, and an agent credential is refused there.
+`tests/test_mcp_steering_e2e_delegated.py` has one agent approve its own campaign with
+`tessera_delegated_approve_campaign` under an owner-signed delegation (ADR 0122), run it to a
+receipt and see an out-of-rule campaign refused (`outside_delegation`) and left for a person; it
+also checks that every acting step left an event or receipt, that no read changed stored state, and
+that no response carried an approver identifier.
 
 `tests/test_mcp_research_steering_e2e.py` does the same for the research loop: the loop's own
 agent creates review jobs when a plan is admitted and advanced, a client pauses the loop with
