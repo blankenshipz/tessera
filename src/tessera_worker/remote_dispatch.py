@@ -40,6 +40,23 @@ class RemoteAdapter(Protocol):
     def perform(self, action: str, proposal: RemoteProposal, state: dict) -> ProviderReadback: ...
 
 
+def _failed_readback(error, trusted):
+    """An unknown readback for a failed provider call that keeps only closed diagnostics."""
+    provenance = "provider" if trusted else "synthetic"
+    tokens = dict(
+        proxy_reason=getattr(error, "reason", None),
+        proxy_detail=getattr(error, "detail", None),
+        proxy_field=getattr(error, "field", None),
+        proxy_request_kind=getattr(error, "request_kind", None),
+    )
+    try:
+        return ProviderReadback(
+            state="unknown", observed_at=utc_now(), provenance=provenance, **tokens
+        )
+    except ValueError:  # a token outside its closed vocabulary: keep none of them
+        return ProviderReadback(state="unknown", observed_at=utc_now(), provenance=provenance)
+
+
 class RemoteDispatcher:
     def __init__(self, store, worker, adapters: dict[str, RemoteAdapter]):
         self.store, self.worker, self.adapters = store, worker, dict(adapters)
@@ -97,13 +114,11 @@ class RemoteDispatcher:
                 raise Conflict("Remote effect fenced after intent; reconcile only.")
             readback = adapter.perform(action, proposal, intent)
             readback = ProviderReadback.model_validate_json(readback.model_dump_json())
-        except Exception:
-            # Provider exceptions may contain keys/URLs/headers; never retain their text.
-            readback = ProviderReadback(
-                state="unknown",
-                observed_at=utc_now(),
-                provenance="provider" if trusted else "synthetic",
-            )
+        except Exception as error:
+            # Provider exceptions may contain keys/URLs/headers; never retain their text. Only
+            # the closed read-failure tokens (reason, detail, field, request kind) are kept, and
+            # only when they validate against their closed vocabularies.
+            readback = _failed_readback(error, trusted)
         return self.store.record(self.worker, route_id, effect_id, readback.model_dump(mode="json"))
 
 

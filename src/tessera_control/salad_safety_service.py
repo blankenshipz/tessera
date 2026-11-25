@@ -423,6 +423,7 @@ def _positively_not_running(observation):
 
 
 _COUNT_KEYS = {"allocating_count", "creating_count", "running_count", "stopping_count"}
+_UNPLACED_COUNT_KEYS = {"allocating_count", "creating_count"}
 
 
 def _placed(instance):
@@ -433,12 +434,14 @@ def _placed(instance):
 
 
 def _instance_count(observation):
-    """How many instances the group lists that Salad has actually placed (one still pulling its
-    image included), not those still ``allocating``: a group waiting for a node has no machine
-    yet. None when the read does not say completely (the allocation deadline then never fires)."""
+    """How many instances the group lists that Salad has assigned a machine to (one still pulling
+    its image included). An instance with no ``machine_id`` (allocating or creating) has no
+    machine, and a group-level ``running`` with only such instances is not an allocation. Counts
+    without an instance list cannot name a machine, so only running and stopping counts are
+    evidence there. None when the read does not say completely (the deadline then never fires)."""
     instances = observation.get("instances")
     if instances:
-        return sum(1 for i in instances if _placed(i))
+        return sum(1 for i in instances if i.get("machine_id"))
     counts = observation.get("instance_status_counts")
     if (
         observation.get("instance_counts_complete", True) is True
@@ -446,7 +449,11 @@ def _instance_count(observation):
         and set(counts) == _COUNT_KEYS
         and all(type(v) is int and v >= 0 for v in counts.values())
     ):
-        return sum(v for k, v in counts.items() if k != "allocating_count")
+        return sum(v for k, v in counts.items() if k not in _UNPLACED_COUNT_KEYS)
+    if instances == []:
+        # The instance list itself was read and is empty (a CPU group may omit its counts): that
+        # is positive evidence of no machine, not an adapter that cannot say.
+        return 0
     return None
 
 

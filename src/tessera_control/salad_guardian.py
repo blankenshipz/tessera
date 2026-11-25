@@ -456,7 +456,10 @@ class SaladGuardian:
         deadline firing."""
         if self.allocation_seconds is None or o.instance_count is None or o.group_started is None:
             return None
-        if allocated or first_running is not None or o.instance_count > 0 or o.state == "running":
+        # Only a machine the provider assigned latches: a group-level ``running`` or an instance
+        # still allocating or creating without one is not an allocation (``instance_count``
+        # counts machines). ``first_running`` is not set from such a read either (see tick).
+        if allocated or first_running is not None or o.instance_count > 0:
             with self.db:
                 self.db.execute(
                     "UPDATE assignments SET instance_seen=1 WHERE operation=?", (operation,)
@@ -720,6 +723,11 @@ class SaladGuardian:
                 first_running is None
                 and isinstance(o, ProviderObservation)
                 and o.state == "running"
+                # A group-level ``running`` is not a running instance when the read positively
+                # says no machine is assigned (a count of zero). An unsaid count (an adapter
+                # that cannot say) keeps the running-seconds cap fail closed; it never fires
+                # the allocation deadline either way (``_allocation_waited`` needs a count).
+                and o.instance_count != 0
             ):
                 first_running = now
                 with self.db:

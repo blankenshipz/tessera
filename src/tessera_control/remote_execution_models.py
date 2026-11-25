@@ -367,6 +367,25 @@ class ProviderReadback(Frozen):
             "observed",
             "provider_rejected_request",
             "request_not_sent",
+            "group_gone",
+        ]
+        | None
+    ) = None
+    # Closed diagnostics of a failed read (never a value, body, URL or path): the transport's
+    # detail token (e.g. ``timeout``, ``non_2xx_5xx``), the NAME of an offending field, and
+    # which provider request failed. Only ever set on an unknown readback.
+    proxy_detail: Annotated[str | None, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,31}$")] = None
+    proxy_field: Annotated[str | None, StringConstraints(pattern=r"^[a-z][a-z_.\-]{0,47}$")] = None
+    proxy_request_kind: (
+        Literal[
+            "list",
+            "quotas",
+            "gpu_classes",
+            "availability",
+            "read_group",
+            "read_instance",
+            "create",
+            "other",
         ]
         | None
     ) = None
@@ -379,6 +398,12 @@ class ProviderReadback(Frozen):
         from .store import _parse_utc
 
         _parse_utc(self.observed_at)
+        if self.state != "unknown" and (
+            self.proxy_detail is not None
+            or self.proxy_field is not None
+            or self.proxy_request_kind is not None
+        ):
+            raise ValueError("read-failure diagnostics are only set on an unknown readback")
         if self.state != "unknown" and self.provider_id is None:
             raise ValueError("non-unknown provider observations require exact provider identity")
         if self.provider_rejection is not None and (

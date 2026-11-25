@@ -236,9 +236,12 @@ def test_the_service_observation_counts_an_instance_that_is_still_pulling():
     assert _instance_count({"instance_status_counts": counts}) == 0
     # a group still waiting for a node (allocating) has no machine: it is not an instance
     assert _instance_count({"instance_status_counts": {**counts, "allocating_count": 1}}) == 0
-    assert _instance_count({"instance_status_counts": {**counts, "creating_count": 1}}) == 1
+    # a creating instance is named by no machine in counts: not an allocation
+    assert _instance_count({"instance_status_counts": {**counts, "creating_count": 1}}) == 0
+    assert _instance_count({"instance_status_counts": {**counts, "running_count": 1}}) == 1
     assert _instance_count({"instances": [{"state": "allocating"}]}) == 0
-    assert _instance_count({"instances": [{"state": "downloading"}]}) == 1
+    assert _instance_count({"instances": [{"state": "creating"}]}) == 0
+    assert _instance_count({"instances": [{"state": "downloading", "machine_id": "m"}]}) == 1
     assert (
         _instance_count({"instance_status_counts": counts, "instance_counts_complete": False})
         is None

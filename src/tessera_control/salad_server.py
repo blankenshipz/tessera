@@ -87,6 +87,19 @@ class ProviderReadUnavailable(Conflict):
     request_kind = None
 
 
+def _failed_read_diagnostics(source, state, reallocated=False):
+    """The closed ``detail`` / ``field`` / ``request_kind`` of a failed read, keyed on the
+    readback's final state: only an unknown one that is not a reallocation carries them. Tokens,
+    never a value or a path."""
+    if state != "unknown" or reallocated:
+        return {}
+    return dict(
+        proxy_detail=getattr(source, "detail", None),
+        proxy_field=getattr(source, "field", None),
+        proxy_request_kind=getattr(source, "request_kind", None),
+    )
+
+
 class GuardianRefused(ValueError):
     """The guardian answered and refused; ``code`` is its closed refusal code.
 
@@ -999,6 +1012,9 @@ class TrustedSaladServer:
             termination_confirmed=bool(terminal) and not reallocated,
             provenance="provider",
             proxy_reason="reallocation_uncertain" if reallocated else result.reason,
+            **_failed_read_diagnostics(
+                result, "unknown" if reallocated else provider_state, reallocated
+            ),
         )
 
     def dispatcher(self, route_id):
