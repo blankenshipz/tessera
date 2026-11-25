@@ -1,3 +1,10 @@
 #!/bin/sh
 # Fixed entrypoint: no shell expansion of arguments, no environment lookups.
+# The interpreter is one of two fixed absolute paths, never found through PATH.
+# Official Python images ship /usr/local/bin/python3 (often with no /usr/bin/python3);
+# apt-based images such as the GPU recipe ship /usr/bin/python3. /usr/local/bin wins,
+# which Dockerfile.cpu checks at build time is the python3 its wheels were installed for.
+if [ -x /usr/local/bin/python3 ]; then
+  exec /usr/local/bin/python3 -I /tessera/lib/runtime.py "$@"
+fi
 exec /usr/bin/python3 -I /tessera/lib/runtime.py "$@"

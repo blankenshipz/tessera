@@ -4,6 +4,9 @@
 # from a package manager. Optional dependencies are the wheels in requirements.lock, every one
 # pinned by sha256 (pip --require-hashes, binary wheels only, no resolution), fetched at BUILD
 # time from the index the operator chooses. The image then needs no network at run time.
+# Official Python images put python3 under /usr/local/bin, often with no /usr/bin/python3.
+# /tessera/bin/run picks /usr/local/bin/python3, else /usr/bin/python3, without PATH; the
+# build checks that this is the same python3 (on PATH here) that the wheels are installed for.
 #
 # Build (linux/amd64; keep the context to this directory plus your requirements.lock):
 #   docker build -f Dockerfile.cpu --build-arg CPU_RUNTIME_BASE=<name@sha256:...> \
@@ -19,6 +22,8 @@ RUN printf '%s' "$CPU_RUNTIME_BASE" | grep -Eq '^[a-z0-9][a-z0-9./_-]*@sha256:[a
  && test "$(uname -m)" = x86_64 \
  && python3 -c 'import sys; assert sys.version_info >= (3, 10)' \
  && python3 -m pip --version >/dev/null \
+ && py=/usr/bin/python3 && if [ -x /usr/local/bin/python3 ]; then py=/usr/local/bin/python3; fi \
+ && test -x "$py" && test "$(readlink -f "$py")" = "$(readlink -f "$(command -v python3)")" \
  && mkdir -p /tessera/bin /tessera/lib/entries /tessera/work \
  && chown 65532:65532 /tessera/work
 COPY run /tessera/bin/run

@@ -38,6 +38,13 @@ The built image digest is the trust anchor: the operator records it in the profi
 cannot choose another. The image name and digest of the base, the lock file's sha256 and the
 recipe's commit are recorded with it (documented in the workload README).
 
+Official Python images put the interpreter at `/usr/local/bin/python3` and may have no
+`/usr/bin/python3`; the apt-based GPU recipe has only `/usr/bin/python3`. `/tessera/bin/run` must
+not hard-require `/usr/bin/python3` (that image exits 127 before `runtime.py` starts). It still
+does no `PATH` lookup: it execs `/usr/local/bin/python3` when present, else `/usr/bin/python3`, and
+`Dockerfile.cpu` fails the build unless that choice is the `python3` its wheels were installed for.
+`tests/test_gpu_runtime_entrypoint_interpreter.py` checks both layouts without Docker.
+
 Input-sourced wheels (a `wheel` item with `source: input` and a sha256) were considered and not
 built. They would add a manifest item shape, a second install path in the runtime and a matching
 rule in the contract, to deliver what an image digest already pins once and reviews once, and the
