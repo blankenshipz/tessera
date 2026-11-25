@@ -208,6 +208,16 @@ def covered_provider(
         AND json_extract(p.value, '$.id')=? LIMIT 1""",
         (pre["campaign_id"], pre["id"]),
     ).fetchone()
+    if row is None:
+        # A pre-approval a delegation wrote (ADR 0150) names the candidate it was written for
+        # on its own event, in the transaction that recorded it.
+        row = connection.execute(
+            """SELECT json_extract(e.payload_json, '$.provider_id') AS provider_id
+            FROM events e WHERE e.event_type=?
+            AND json_extract(e.payload_json, '$.campaign_id')=?
+            AND json_extract(e.payload_json, '$.preapproval_id')=? LIMIT 1""",
+            (DELEGATED_PREAPPROVAL_EVENT, pre["campaign_id"], pre["id"]),
+        ).fetchone()
     return (row["provider_id"] if row is not None else None) or stage_provider_id
 
 
@@ -427,6 +437,16 @@ def evaluate(
 # not a review core, so no review ever digests to it: an uncovered kind can never match.
 UNCOVERED_DIGEST = canonical_digest({"type": "delegated_review_kind_not_covered", "version": 1})
 NOT_SALAD_STAGE = "stage_provider_not_salad"
+DELEGATED_PREAPPROVAL_EVENT = "campaign.review_preapproval_delegated"
+
+
+def placed_provider(connection: sqlite3.Connection, campaign_id: str, stage_key: str) -> str | None:
+    """The candidate the stage was last placed on (ADR 0060), None before any placement."""
+    row = connection.execute(
+        "SELECT provider_id FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
+        (campaign_id, stage_key),
+    ).fetchone()
+    return None if row is None else row["provider_id"]
 
 
 REVIEW_DELEGATION_EVENT = "campaign.review_delegation_bound"
@@ -484,11 +504,18 @@ def delegated_review_reasons(
     ).fetchone()
     if delegation is None:
         return ["delegation_missing"]
+    from .campaign_models import stage_on_candidate
+
     try:
         stage = _normal_spec(campaign).stage(stage_key)
+        # The review is of the stage as placed: an alternate of the approved spec, never a
+        # provider the approved spec does not name (``stage_on_candidate`` raises KeyError).
+        placed = placed_provider(connection, campaign["id"], stage_key) or stage.provider
+        if placed != stage.provider:
+            stage = stage_on_candidate(stage, placed)
     except (StopIteration, ValueError, KeyError):
         return [UNBOUND_SCOPE]
-    if _stage_exposure(connection, campaign, stage_key) is None:
+    if _stage_exposure(connection, campaign, stage_key, placed) is None:
         return [NOT_SALAD_STAGE]
     return list(evaluate_review(connection, delegation, campaign, stage, kind, now=now).reasons)
 
@@ -542,7 +569,9 @@ def record_delegated_preapproval(
     if delegation is None:
         return None, ["delegation_missing"]
     terms = parse_terms(delegation)
-    exposure = _stage_exposure(connection, campaign, stage_key)
+    exposure = _stage_exposure(
+        connection, campaign, stage_key, placed_provider(connection, campaign_id, stage_key)
+    )
     if terms is None or exposure is None:
         return None, ["delegation_terms_invalid"]
     total = min(int(campaign["budget_cap_cents"]), terms.per_run_cap_cents)

@@ -147,5 +147,13 @@ The owner's decision: an agent, not the owner, should resolve these so nobody wa
 5. **Unchanged.** Grants, spend limits and program budget, snapshot release, worker credentials,
    provider trust, the data-class guard and licence labels, gate go, conclusions and exports stay as
    they are; a bare approval without the field behaves exactly as before and keeps its approve digest.
+6. **A placed alternate.** The digests, the delegation's coverage check and the hold are those of the
+   candidate the stage was placed on (ADR 0060/0066), not of the stage's own provider: a stage that
+   prefers another provider and runs on its Salad alternate is previewed and checked as that
+   alternate, the pre-approval names it on its `campaign.review_preapproval_delegated` event
+   (`provider_id`), and it covers only that candidate. A stage that cannot be previewed, or whose
+   placed provider is not a Salad route the approved spec names, records no pre-approval and stays
+   with a person; the `campaign.preapproval_declined` reason is then `review_preview_failed:<type>`,
+   plus the refusal's closed detail code when it has one, never its message.
 
-Tests: `tests/test_owner_bound_review_delegation.py`.
+Tests: `tests/test_owner_bound_review_delegation.py`, `tests/test_delegated_review_placed_alternate.py`.

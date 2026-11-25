@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -140,6 +141,20 @@ def salad_config(spec_stage: Any) -> SaladStageSpec:
     if not found:
         raise StepFailed("salad", "step_refused", "salad_config_missing")
     return SaladStageSpec.model_validate(found)
+
+
+PREVIEW_FAILED = "review_preview_failed"
+
+
+def _preview_failure(error: Exception) -> str:
+    """A short stable reason for a stage the driver could not preview: the closed code, then the
+    exception type and, for a refused step, its own closed detail code. Never the message
+    (it may carry a path or a host name)."""
+    code = PREVIEW_FAILED + ":" + type(error).__name__
+    detail = getattr(error, "detail", None)
+    if isinstance(detail, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", detail):
+        code += ":" + detail
+    return code
 
 
 # Late-bound stage-output inputs (``campaign_salad_adapter.late_bind_key``). The event records,
@@ -1059,12 +1074,14 @@ class SaladStageDriver:
         assert ctx.approval is not None
         with self.runner.store.runner_connection() as connection:
             delegation_id = campaign_preapproval._delegation_of(ctx.approval, connection)
+        failure = None
+        placed = self._placed_alternate(ctx, key)
         try:
-            digests = self.preview_review_digests(ctx, key)
-        except Exception:  # noqa: BLE001 - a stage the driver cannot preview is not covered
-            digests = None
+            digests = self.preview_review_digests(ctx, key, placed)
+        except Exception as error:  # noqa: BLE001 - a stage the driver cannot preview is not covered
+            digests, failure = None, _preview_failure(error)
         if digests is None:
-            row, reasons = None, ["review_preview_failed"]
+            row, reasons = None, [failure or PREVIEW_FAILED]
         else:
             with self.runner.store.runner_connection() as connection:
                 row, reasons = campaign_preapproval.record_delegated_preapproval(
@@ -1078,10 +1095,12 @@ class SaladStageDriver:
                     self.runner.store.record_runner_event(
                         connection,
                         ctx.campaign,
-                        "campaign.review_preapproval_delegated",
+                        campaign_preapproval.DELEGATED_PREAPPROVAL_EVENT,
                         {
                             "campaign_id": ctx.campaign["id"],
                             "stage_key": key,
+                            # The candidate the digests were derived for (ADR 0066).
+                            "provider_id": placed or self._spec(ctx, key).provider,
                             "preapproval_id": row["id"],
                             "delegation_id": row["delegation_id"],
                             "terms_digest": row["terms_digest"],
@@ -1094,6 +1113,14 @@ class SaladStageDriver:
         if row is None:
             self._declined(ctx, key, None, "delegated_review", delegation_id, ",".join(reasons))
         return row
+
+    def _placed_alternate(self, ctx: _Ctx, key: str) -> str | None:
+        """The Salad alternate the stage was placed on (ADR 0060/0066), else None for the stage's
+        own provider. The reviews a delegation clears are the ones of the candidate that runs,
+        so they are previewed on it: the stage's own spec names no Salad configuration when its
+        preferred provider is another one and Salad is only its alternate."""
+        placed = self._spec(ctx, key).provider
+        return None if placed == ctx.spec.stage(key).provider else placed
 
     def _declined(
         self, ctx: _Ctx, key: str, attempt: int | None, kind: str, subject: str, reason: str
