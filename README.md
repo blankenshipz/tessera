@@ -235,7 +235,11 @@ Providers and their profiles are added, updated and listed through one validated
 reference, unknown providers refused, [ADR 0081](docs/decisions/0081-validated-provider-registration.md)).
 Through the API a human manages only its own organization's Salad profiles (checked against the
 database), and deployment-wide entries (local-docker, self-hosted, plugins) need the deployment's root
-owner. A change applies at the next start, and provider trust remains operator-edited.
+owner. A change applies at the next start, and a launch never runs on the old values: the
+files `tessera serve` read are fingerprinted at start, and a Salad stage whose operator provider,
+profile or trust file changed since (or whose profile differs from the executor's own copy named by
+`--salad-executor-config`) is refused as stale, fail closed, until the service restarts; a run already
+started is untouched. Provider trust remains operator-edited.
 Descriptors are validated at registration. `--provider-trust` sets which data classes each
 provider's worker may receive (public only by default); a provider entry may also list
 `allowed_license_labels`, and a stage whose inputs (or the data they derive from) carry any other

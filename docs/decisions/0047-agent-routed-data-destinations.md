@@ -70,3 +70,12 @@ destination entry lists the input's derived class, and the destination is reache
 model-runtime allowlist that is not the stage or sandbox allowlist. Credentials are held by
 reference only. This is an amendment to this record, not a clarification of it. Until an operator
 enrolls a destination, review jobs with private inputs stay refused.
+
+## Amendment: the destinations are the operator's current files
+
+The operator's provider profile names the `country`, `artifact_destination`, `checkpoint_destination`
+and `custody_host` a launch uses, so a stale in-memory copy would send work, and the data it carries,
+to a destination the operator file no longer names. A launch therefore refuses, fail closed, when
+those files changed since the service read them or differ from the executor's copy
+([ADR 0081](0081-validated-provider-registration.md), amendment). Data still goes only to a
+destination the operator's files currently register at the time of the launch checks.

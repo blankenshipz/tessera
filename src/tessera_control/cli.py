@@ -642,6 +642,16 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
+        "--salad-executor-config",
+        type=Path,
+        help=(
+            "the Salad executor's config file. Its profiles file is the executor's copy of "
+            "the profiles; a launch is refused when it differs from the profile control "
+            "holds, or when this file or the other served operator files changed since "
+            "start (ADR 0081)"
+        ),
+    )
+    serve.add_argument(
         "--salad-guardian-read",
         type=Path,
         help=(
@@ -1383,6 +1393,23 @@ def main(argv: list[str] | None = None) -> int:
                 load_review_destination_policy(review_destinations_file)
                 if review_destinations_file is not None
                 else None
+            )
+            from . import operator_config_freshness
+
+            if arguments.salad_executor_config is not None and (
+                not arguments.salad_executor_config.is_absolute()
+            ):
+                raise ValueError("--salad-executor-config must be an absolute path")
+            # Fingerprint before loading: a file edited after this point is loaded as the
+            # new bytes but compared with the old digest, so a later launch refuses.
+            # A launch refuses when any of these files changes before the next start.
+            operator_config_freshness.record(
+                [
+                    arguments.campaign_providers,
+                    arguments.salad_campaign_profiles,
+                    arguments.provider_trust,
+                ],
+                executor_config=arguments.salad_executor_config,
             )
             from .provider_trust import builtin_policy, load_policy_file
 

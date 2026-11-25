@@ -35,6 +35,7 @@ from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
 from .external_operations import current_operation_reconciliation
 from .guardian_record_reader import validate_frame_record
+from . import operator_config_freshness
 from .programs import program_context
 from .remote_execution_models import ExecutionSelection, TargetPolicy
 from .salad_campaign_profiles import (
@@ -435,6 +436,15 @@ class SaladStageDriver:
         self._await_charge(attempt)
         return None
 
+    def _operator_config_problem(self, spec_stage: StageSpec) -> str | None:
+        """Refusal code when the operator's files no longer match this process, else None."""
+        name = salad_config(spec_stage).profile
+        try:
+            profile = self.profile(spec_stage)
+        except StepFailed:
+            profile = None  # refused later with its own reason
+        return operator_config_freshness.launch_problem(name, profile)
+
     def _selection(
         self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec, row: dict[str, Any]
     ) -> ExecutionSelection:
@@ -484,6 +494,26 @@ class SaladStageDriver:
         salad = salad_config(spec_stage)
         row = self._stage_row(ctx, key)
         project = ctx.campaign["project_id"]
+        problem = self._operator_config_problem(spec_stage)
+        if problem is not None:
+            # The operator's provider files changed after this process read them, or the
+            # executor's copy of the profile differs: refuse before any step, hold or
+            # reservation rather than place on a selection the operator no longer names.
+            self.runner.emit_once(
+                ctx,
+                "campaign.stage_operator_profile_mismatch"
+                if problem == operator_config_freshness.MISMATCH_CODE
+                else "campaign.stage_operator_config_stale",
+                {"stage_key": key},
+                {
+                    "reason": problem,
+                    "detail": "the operator provider files changed since this process "
+                    "started, or differ from the executor's profiles; fix them and "
+                    "restart tessera serve",
+                },
+            )
+            self.runner._stage_failed(ctx, key, problem)
+            return "waiting"
         state = self._credential_state(spec_stage)
         if credential_blocked(state):
             # Refused up front, before any step, hold or reservation, with the reason on the
@@ -1365,6 +1395,16 @@ class SaladStageDriver:
         attempt: dict[str, Any],
         row: dict[str, Any],
     ) -> bool:
+        with self.runner.store.runner_connection() as connection:
+            started = self.runner.steps.completed(
+                connection, ctx.campaign["id"], stage["stage_key"], attempt["attempt"],
+                "start_route", 0,
+            )
+        # Only before the route started: a replay after start_route is recorded must
+        # finish its bookkeeping, never fail an attempt that is already running.
+        problem = None if started is not None else self._operator_config_problem(spec_stage)
+        if problem is not None:
+            raise StepFailed("salad", "step_refused", problem)
         selection = self._selection(ctx, stage, spec_stage, row)
         self._command(ctx, stage, attempt, row, "approve_route", "approve", selection)
         self._command(ctx, stage, attempt, row, "start_route", "start", selection)

@@ -135,6 +135,20 @@ so no other path waits on the database while holding it.
   temporary file, the lock and the audit file). Otherwise an API write is refused cleanly. To keep the
   service read-only, leave it so and edit the file with `tessera providers` as its owner.
 
+## Amendment: a launch refuses a stale operator config
+
+"A change applies at the next start" stays true, and is now enforced rather than assumed. At start
+`tessera serve` fingerprints the operator files it read (`--campaign-providers`,
+`--salad-campaign-profiles`, `--provider-trust`, and the executor config named by
+`--salad-executor-config`). Before a Salad stage is scaffolded and again before its route is approved
+and started, the driver refuses (`operator_config_stale`) when any of them changed, was removed or
+cannot be read. The executor keeps its own copy of the profiles, which can diverge from the served
+file, so when the executor config is named, the profile control is about to use must also equal the
+executor file's entry of the same name (`operator_profile_mismatch`). Nothing is re-read or
+re-registered mid-process, so a run that already started is untouched; the operator restarts the
+service to apply a change. Without `--salad-executor-config`, only the served files are checked.
+Placement, trust, licence, budget and allowlist checks are unchanged.
+
 ## Tests
 
 `tests/test_provider_registration.py` (sections, refusals, secrets, digest guard, atomic write, audit
