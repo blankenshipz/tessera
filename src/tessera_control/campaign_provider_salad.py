@@ -924,7 +924,8 @@ class SaladRouteProvider:
           guardian's own ``allocation_timeout`` (its deadline fired: by the guardian's rules no
           instance, allocation or running time was ever seen), status ``stopped``, no orphan,
           uncertain allocation, pending escalation, budget fence or unknown rate, no billed
-          cost, and an estimate that parses to exactly zero;
+          cost, no pre-start re-bind (an allocation once existed) and an estimate that parses
+          to exactly zero;
         - the attempt's route (read within the campaign's own organization and project) was
           never reallocated, and the executor's live receipt did not pass."""
         from decimal import Decimal, InvalidOperation
@@ -972,6 +973,9 @@ class SaladRouteProvider:
             or final.budget_fenced
             or final.rate_unknown
             or final.actual_billed_cost_cents is not None
+            # A group the guardian re-bound to a new allocation was allocated once: never "never
+            # allocated", whatever else its final says.
+            or final.prestart_rebinds is not None
             or not estimate.is_finite()
             or estimate != 0
         ):

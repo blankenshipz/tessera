@@ -34,6 +34,17 @@ from tessera_control.campaign_provider_salad import register_provider_instance
 from tessera_control.salad_campaign_profiles import SaladCampaignProfiles
 
 TIMEOUT = "infra_allocation_timeout"
+REBOUND = {
+    "count": 1,
+    "events": [
+        {
+            "at": "2026-01-01T00:00:00Z",
+            "from_allocation": "allocation-one",
+            "to_allocation": "allocation-two",
+            "reason": "prestart_reallocation",
+        }
+    ],
+}
 
 
 def _world(
@@ -179,6 +190,7 @@ def test_a_proven_no_instance_timeout_moves_to_the_next_cpu_profile(tmp_path):
         dict(TIMEOUT_FINAL, status="unknown"),
         dict(TIMEOUT_FINAL, actual_billed_cost_cents=0),
         dict(CLEAN, estimated_exposure_cents="0"),  # no allocation_timeout
+        dict(TIMEOUT_FINAL, prestart_rebinds=REBOUND),  # allocated once, then re-bound
     ],
     ids=[
         "estimate_1",
@@ -191,6 +203,7 @@ def test_a_proven_no_instance_timeout_moves_to_the_next_cpu_profile(tmp_path):
         "not_stopped",
         "actual_billed",
         "no_timeout",
+        "prestart_rebinds",
     ],
 )
 def test_any_missing_proof_keeps_todays_path_exactly(tmp_path, final):
@@ -317,6 +330,40 @@ def test_a_replayed_conclusion_or_a_restart_records_one_switch(tmp_path):
     assert _ended(world)["status"] == "failed_transient"
     world.tick(5)
     assert len(world.events(fallback.SWITCH_EVENT)) == 1
+
+
+# -- the move is not an infrastructure retry (ADR 0191 section 1 item 9) ----------
+
+
+def test_with_no_infrastructure_retries_a_proven_timeout_still_moves_and_is_bounded(tmp_path):
+    """infra_retries 0: today a timeout fails the stage (stage_infra_retries_exhausted). A proven
+    no-instance timeout instead moves along the chain, limited only by max_class_fallbacks, and
+    the next timeout with no move left then fails exactly as today."""
+    world = _world(tmp_path, infra=0, fallbacks=1)
+    world.to_route_started()
+    _timeout(world)
+    _to_next_route(world)
+    assert _country(world) == "CA"
+    assert len(world.events(fallback.SWITCH_EVENT)) == 1
+    assert world.events("campaign.stage_infra_retries_exhausted") == []
+    assert world.status() == "running"
+    _timeout(world)
+    world.tick_until(lambda: world.status() == "failed")
+    rows = _attempts(world)
+    assert len(rows) == 2 and rows[1]["status"] == "failed_permanent"
+    assert len(world.events(fallback.SWITCH_EVENT)) == 1  # no second move: bound spent
+    assert world.events("campaign.stage_infra_retries_exhausted") != []
+
+
+def test_with_no_infrastructure_retries_and_no_bound_the_first_timeout_fails_as_today(tmp_path):
+    world = _world(tmp_path, infra=0, fallbacks=0)
+    world.to_route_started()
+    _timeout(world)
+    world.tick_until(lambda: world.status() == "failed")
+    rows = _attempts(world)
+    assert len(rows) == 1 and rows[0]["status"] == "failed_permanent"
+    assert world.events(fallback.SWITCH_EVENT) == []
+    assert world.events("campaign.stage_infra_retries_exhausted") != []
 
 
 # -- (7) the worst case ----------

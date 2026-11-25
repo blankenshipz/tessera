@@ -67,7 +67,9 @@ route at a time, so nothing else could run while the first waited.
    chain) after such an attempt, ONLY when control's own records prove all of: the guardian's final carries `allocation_timeout`, status
    `stopped`, no orphan, uncertain allocation, pending escalation, budget fence or unknown rate, no billed cost, and an estimate of exactly
    zero; the attempt settled under `guardian_bounded_hold`, which the settlement path records only after control's own guardian read said
-   `stopped`, and its frame carries that verdict digest; the route was never reallocated and the live receipt did not pass. The move uses
+   `stopped`, and its frame carries a guardian verdict digest (a presence check: the digest is not compared with the one the settlement read
+   produced); the guardian's final records no pre-start re-bind (a group that was allocated once and re-bound is never "never allocated"); the route was never
+   reallocated and the live receipt did not pass. The move uses
    the same selector, coverage checks and `max_class_fallbacks` bound as a pre-start move, and that bound now counts pre-start and
    allocation-timeout moves together. It is one `campaign.salad_profile_switched` event with the closed reason `allocation_timeout`
    (`started: true`, `spent: false`, the settled amount and basis, `estimated_exposure_cents: "0"`, closed evidence) committed in the same
@@ -75,7 +77,10 @@ route at a time, so nothing else could run while the first waited.
    alternate or reroute candidates, and any missing, malformed or ambiguous record keep today's infrastructure retry path; an uncovered
    next profile also keeps that path rather than holding the stage. **Settlement is unchanged:** per ADR 0041 section 7.3 point 2 a created
    frame settles at its hold under `guardian_bounded_hold` (non-final) until a human charge or reconcile; no zero settlement or new
-   basis is introduced (that would need a migration and its own review). The timed-out attempt still counts as an infrastructure attempt and
+   basis is introduced (that would need a migration and its own review). **The move is not an infrastructure retry:** it does not go through the `retry.infra_retries` check, so a stage with the default
+   `infra_retries` of 0 that would otherwise fail permanently (`stage_infra_retries_exhausted`) retries on the next profile instead, limited only
+   by `max_class_fallbacks` (which the approver set, and which is in the worst case below); when no move is left the next timeout fails exactly
+   as today. The timed-out attempt still counts as an infrastructure attempt (a later same-profile retry has one slot fewer) and
    the next attempt reserves its own hold, so the approved worst case `max_attempts + infra_retries + max_class_fallbacks` stays an upper
    bound and the first hold stays reserved. The guardian's rule that `allocation_timeout` fires only when no instance, allocation or running
    time was ever seen is relied on, not re-proven here. Residuals: an uncovered fallback leaves no trace on the receipt (it keeps the

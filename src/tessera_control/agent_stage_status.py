@@ -147,7 +147,8 @@ def _profile_view(
                 "reason": _code(body.get("reason")),
                 "from_attempt": _int(body.get("from_attempt")),
                 "to_attempt": _int(body.get("to_attempt")),
-                # Closed booleans: a recorded move is always before any start or spend.
+                # Closed booleans: a pre-start move records started and spent false; an
+                # allocation-timeout move (ADR 0191) records started true and spent false.
                 "started": body.get("started") if isinstance(body.get("started"), bool) else None,
                 "spent": body.get("spent") if isinstance(body.get("spent"), bool) else None,
                 # Where the target came from: the approved spec's alternates (every move
