@@ -455,7 +455,7 @@ class CampaignGateCommands:
         connection = _connect(self.database_path)
         try:
             actor = self._read_actor(connection, principal)
-            self._campaign(connection, actor, campaign_id)
+            self._readable_campaign(connection, actor, campaign_id)
             rows = connection.execute(
                 "SELECT * FROM campaign_gate_decisions WHERE campaign_id=? ORDER BY rowid",
                 (campaign_id,),

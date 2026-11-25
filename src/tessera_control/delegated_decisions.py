@@ -33,6 +33,7 @@ from .approval_trust import (
     require_decision_actor,
 )
 from .campaign_models import parse_spec_json, spec_digest
+from .campaign_read_scope import own_decision_clause
 from .delegation_receipts import delegation_receipt_section  # noqa: F401 - re-exported
 from .delegation_rules import evaluate_approval, evaluate_gate
 from .delegation_terms import Identifier, Slug, _Strict
@@ -438,10 +439,14 @@ class DelegatedDecisionStore(ApprovalDelegationCommands):
         try:
             actor = self._reader(connection, principal)
             self._project(connection, actor, project_id)
+            clause, args = own_decision_clause(
+                actor, "d.campaign_id", "d.actor_principal_id"
+            )  # audit O-05
             rows = connection.execute(
-                """SELECT d.* FROM delegated_decisions d WHERE d.project_id=? AND d.org_id=?
-                AND d.outcome='escalated' ORDER BY d.created_at DESC, d.id LIMIT ? OFFSET ?""",
-                (project_id, actor["org_id"], limit, offset),
+                f"""SELECT d.* FROM delegated_decisions d WHERE d.project_id=? AND d.org_id=?
+                AND d.outcome='escalated'{clause} ORDER BY d.created_at DESC, d.id
+                LIMIT ? OFFSET ?""",
+                (project_id, actor["org_id"], *args, limit, offset),
             ).fetchall()
             return {
                 "escalations": [

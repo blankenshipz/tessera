@@ -79,10 +79,21 @@ sha256 with `tessera_campaign_outputs`.
 
 ## Scope semantics
 
-- `tessera_get_campaign`, `tessera_list_campaigns` and the receipt read **any campaign in
-  the credential's project**, not only the caller's own. Agents in one project can
-  see each other's campaigns. Cancel is submitter-only. Cross-project and cross-tenant
-  reads return 404.
+- An agent credential reads **only the campaigns it submitted** (audit O-05): those whose
+  recorded submitter is the caller's principal, or that the caller started by consuming an
+  owner's approved submission. Another agent's campaign, or a person's, answers exactly like a
+  missing id (the same 404 and message). Every per-campaign read follows this rule: get,
+  report, receipt, gate decisions, retries, holdout, outputs, logs, stage status, stage watch,
+  grants, budget, and the re-run and stage-retry tools. Project-wide reads hold only the
+  caller's rows: the campaign list and its pages, the window report and its counts, holdout
+  claims, stuck findings (list, scan result, acknowledge), delegation decisions and
+  escalations, standing-approval starts and triggers, and `tessera_project_spend`'s per-status
+  totals (the operator's project limit row stays the shared project ceiling). A delegation's
+  `usage` totals are withheld from agents; an approved submission another agent consumed
+  shows `campaign_withheld` instead of that campaign's id. Re-run links and the re-run tree
+  are shown only for campaigns the caller may read. A person reads every campaign of their
+  organization unchanged. Cancel and steering stay submitter-only. Cross-project and
+  cross-tenant reads return 404.
 - `tessera_list_snapshots` lists metadata (id, digest, size, file count, recorded data
   class). It never returns host paths. It grants no bytes. Staging stays a human step.
 - `tessera_get_snapshot` lists one snapshot's files (relative path, size, sha256, classification,
@@ -102,8 +113,8 @@ sha256 with `tessera_campaign_outputs`.
   and age, plus counts by code; see the Salad executor in [campaigns](campaigns.md)). Codes, ages and counts only: no failure detail or log text, no principal, credential or
   worker ids, no hosts or addresses; a free-text waiting reason is returned as `detail_withheld`.
   A caller in another organization gets the same 404 as for a missing campaign.
-- `budget:read` also unlocks the HTTP budget read of any campaign in the credential's
-  project, for credentials enrolled for results roll-ups as well; MCP registration gating
+- `budget:read` also unlocks the HTTP budget read of the agent's own campaigns (a person: any
+  campaign of the organization), for credentials enrolled for results roll-ups as well; MCP registration gating
   does not limit direct HTTP. The figures are the campaign ledger (cap, held, settled,
   remaining).
 - Outputs and attempts are capped per read; a `truncated` flag marks a capped list.

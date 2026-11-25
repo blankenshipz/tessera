@@ -164,9 +164,24 @@ def test_an_agent_reads_the_marked_receipt_view_and_a_person_the_stored_receipt(
     ):
         assert name in in_store
 
+    # Agents read only campaigns they submitted (campaign_read_scope): record the reading agent
+    # as the submitter (test setup only; the stored receipt row is untouched).
+    world.env.execute(
+        "UPDATE campaigns SET submitted_by_principal_id=? WHERE id=?",
+        world.env.agent(READS, "agent")["id"],
+        world.campaign_id,
+    )
     client = TestClient(create_app(world.env.state))
     human = _read_all(world, client, _token("human"), terminal=True)
     agent = _read_all(world, client, {**_token("agent"), **DEST}, terminal=True)
+    # Another agent with the same scopes gets exactly the 404 of a missing id.
+    world.env.agent(READS, "other_agent")
+    other = {**_token("other_agent"), **DEST}
+    for suffix in ("", "/receipt"):
+        theirs = client.get(f"/campaigns/{world.campaign_id}{suffix}", headers=other)
+        missing = client.get(f"/campaigns/campaign_{'0' * 32}{suffix}", headers=other)
+        assert theirs.status_code == missing.status_code == 404, (suffix, theirs.text)
+        assert theirs.json() == missing.json()
     # A person reads the stored receipt whole, unmarked.
     assert human["receipt"] == {
         "campaign_id": world.campaign_id,

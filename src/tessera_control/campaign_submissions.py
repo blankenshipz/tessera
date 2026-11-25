@@ -52,6 +52,7 @@ from .campaign_models import (
     spec_digest,
     stage_provider,
 )
+from .campaign_read_scope import may_read
 from .campaign_rerun import (
     FINISHED,
     RERUN_EVENT,
@@ -294,6 +295,18 @@ def create_submission_schema(connection: sqlite3.Connection) -> None:
 def _summary(row: sqlite3.Row | dict) -> dict[str, Any]:
     result = {k: v for k, v in dict(row).items() if k not in {"spec_json", "lineage_json"}}
     result["lineage"] = json.loads(row["lineage_json"]) if row["lineage_json"] else None
+    return result
+
+
+def _visible_summary(connection: sqlite3.Connection, actor, row) -> dict[str, Any]:
+    """The record as a reader sees it (audit O-05): the owner's approved submissions stay
+    project-wide for the agents they are addressed to, but the campaign another agent started
+    from one is named only to a reader who may read that campaign."""
+    result = _summary(row)
+    if result.get("campaign_id") and not may_read(connection, actor, result["campaign_id"]):
+        result["campaign_id"] = None
+        result["approval_id"] = None
+        result["campaign_withheld"] = True
     return result
 
 
@@ -609,7 +622,7 @@ class CampaignSubmissionStore(CampaignStore):
                 AND (? IS NULL OR status=?) ORDER BY created_at, id LIMIT ? OFFSET ?""",
                 (project_id, actor["org_id"], status, status, limit, offset),
             ).fetchall()
-            return {"submission_approvals": [_summary(r) for r in rows]}
+            return {"submission_approvals": [_visible_summary(connection, actor, r) for r in rows]}
         finally:
             connection.close()
 
@@ -618,11 +631,17 @@ class CampaignSubmissionStore(CampaignStore):
         try:
             actor = self._reader(connection, principal)
             row = self._row(connection, actor, approval_id)
-            return {
-                **_summary(row),
-                "spec": json.loads(row["spec_json"]),
-                "decisions": _decisions(connection, approval_id),
-            }
+            summary = _visible_summary(connection, actor, row)
+            decisions = _decisions(connection, approval_id)
+            if summary.get("campaign_withheld"):
+                # The submitted decision names the campaign and who started it (audit O-05).
+                decisions = [
+                    {**d, "details": {}, "actor_principal_id": None}
+                    if d["decision"] == "submitted"
+                    else d
+                    for d in decisions
+                ]
+            return {**summary, "spec": json.loads(row["spec_json"]), "decisions": decisions}
         finally:
             connection.close()
 
@@ -718,7 +737,8 @@ class CampaignSubmissionStore(CampaignStore):
             row = self._row(connection, live, approval_id)
             if row["status"] == "submitted":
                 # The approval was already consumed: answer with the same campaign.
-                return 200, {**_summary(row), "replayed": True}
+                # Named only to a caller that may read that campaign (audit O-05).
+                return 200, {**_visible_summary(connection, live, row), "replayed": True}
             if not config.enabled:
                 raise SubmissionRefused(
                     "feature_disabled", approval_id, revision=row["revision"], live=live

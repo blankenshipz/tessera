@@ -391,8 +391,11 @@ def test_usage_counts_cancelled_campaigns_by_what_they_spent(dele):
         # a cancelled campaign counts what it spent (never its cap, never nothing)
         assert ad.committed_cents(connection, record["id"]) == 10 + 4
         assert ad.approval_count(connection, record["id"]) == 2  # cancelled still counted
-    got = dele.store.get_approval_delegation(dele.reader(), record["id"])
+    got = dele.store.get_approval_delegation(dele.env.human(), record["id"])
     assert got["usage"] == {"committed_cents": 14, "approvals": 2}
+    # Audit O-05: the totals sum campaigns other principals submitted, so an agent gets none.
+    hidden = dele.store.get_approval_delegation(dele.reader(), record["id"])["usage"]
+    assert set(hidden) == {"withheld"}
     assert first["id"] != second["id"]
 
 
@@ -428,6 +431,11 @@ def test_record_decision_and_decision_reads_paginate(dele):
     ids = [decide(dele, record, campaign, now=f"2026-06-01T00:00:0{n}Z") for n in range(5)]
     assert all(i.startswith("ddec_") for i in ids)
     reader = dele.reader()
+    # Audit O-05: an agent sees decisions only on campaigns it submitted.
+    assert dele.store.list_delegated_decisions(reader, record["id"])["decisions"] == []
+    dele.env.execute(
+        "UPDATE campaigns SET submitted_by_principal_id=? WHERE id=?", reader["id"], campaign["id"]
+    )
     page = dele.store.list_delegated_decisions(reader, record["id"], 1, 2)["decisions"]
     assert [d["id"] for d in page] == ids[1:3]
     assert page[0]["evaluation"] == {"observed": 0.25, "threshold": 0.5}
@@ -493,7 +501,10 @@ def test_routes_round_trip(dele):
     assert [r["id"] for r in listed.json()["approval_delegations"]] == [record["id"]]
     assert client.get(base + "?limit=0", headers=agent).status_code == 422
     detail = client.get(f"/approval-delegations/{record['id']}", headers=agent).json()
-    assert detail["usage"] == {"committed_cents": 0, "approvals": 0} and detail["decisions"] == []
+    # Audit O-05: an agent never gets the usage totals (they sum other submitters' campaigns).
+    assert set(detail["usage"]) == {"withheld"} and detail["decisions"] == []
+    human_detail = client.get(f"/approval-delegations/{record['id']}", headers=human).json()
+    assert human_detail["usage"] == {"committed_cents": 0, "approvals": 0}
     decisions = client.get(f"/approval-delegations/{record['id']}/decisions", headers=agent)
     assert decisions.json() == {"decisions": []}
     assert (

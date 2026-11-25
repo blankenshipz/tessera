@@ -99,7 +99,7 @@ class StageWatchRead(AgentCampaignReads):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, LOGS_SCOPE)
-            self._campaign(connection, actor, campaign_id)
+            self._readable_campaign(connection, actor, campaign_id)
             args = (EVENT_TYPE, DECISION_EVENT_TYPE, campaign_id)
             summary: dict[tuple[str, int], dict[str, Any]] = {}
             for row in connection.execute(

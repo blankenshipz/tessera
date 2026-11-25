@@ -82,6 +82,13 @@ class World:
         self.env.plain.issue_credential(owner_b, "cred-b", canonical_digest(body), body, session)
         return {"Authorization": f"Bearer {session}", "X-Agent-Destination": DESTINATION}
 
+    def submitted_by(self, headers):
+        """Record the credential's agent as the campaign's submitter (test setup only): an agent
+        sees and acknowledges findings only on campaigns it submitted (audit O-05)."""
+        token = headers["Authorization"].split(" ", 1)[1]
+        principal = self.env.plain.authenticate(token)["id"]
+        self.sql("UPDATE campaigns SET submitted_by_principal_id=?", principal)
+
     def key(self):
         self.n += 1
         return {"Idempotency-Key": f"k{self.n}"}
@@ -143,14 +150,21 @@ def test_a_scan_replays_with_its_key_and_changes_nothing_when_repeated(world):
 
 def test_an_agent_with_the_read_scope_scans_and_lists_but_cannot_acknowledge(world):
     reader = world.agent(["campaign:read"])
-    fid = world.scan(reader).json()["opened"][0]["id"]
+    assert world.scan(reader).json()["opened"] == []  # another submitter's campaign: unseen
+    assert world.listing(reader).json()["findings"] == []
+    world.submitted_by(reader)
+    fid = world.listing().json()["findings"][0]["id"]
+    assert [f["id"] for f in world.listing(reader).json()["findings"]] == [fid]
     assert world.listing(reader).status_code == 200
     assert world.ack(fid, reader).status_code == 403
 
 
 def test_acknowledging_needs_the_cancel_scope_and_an_unscoped_agent_is_refused(world):
     fid = world.scan().json()["opened"][0]["id"]
-    assert world.ack(fid, world.agent(["campaign:cancel"])).status_code == 200
+    canceller = world.agent(["campaign:cancel"])
+    assert world.ack(fid, canceller).status_code == 404  # not its campaign (audit O-05)
+    world.submitted_by(canceller)
+    assert world.ack(fid, canceller).status_code == 200
     nobody = world.agent(["context:read"])
     assert world.scan(nobody).status_code == 403
     assert world.listing(nobody).status_code == 403

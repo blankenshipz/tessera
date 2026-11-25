@@ -32,10 +32,21 @@ def _world(tmp_path):
     return env, TestClient(create_app(env.state))
 
 
+def _spender_submitted_every_campaign(env):
+    """Audit O-05: an agent's per-status totals cover only campaigns it submitted. These tests
+    are about the totals, so the reading agent is recorded as every campaign's submitter."""
+    env.execute(
+        "UPDATE campaigns SET submitted_by_principal_id=?", env.agent(None, "spender")["id"]
+    )
+
+
 def test_project_spend_reports_limits_and_unfinished_totals(tmp_path):
     env, client = _world(tmp_path)
     env.execute("UPDATE execution_project_limits SET held_cents=3, settled_cents=2")
     path = f"/projects/{env.project['id']}/agent-spend"
+    others = client.get(path, headers={**_token("spender"), **DEST}).json()
+    assert others["campaigns_by_status"] == [] and others["unfinished"]["campaigns"] == 0
+    _spender_submitted_every_campaign(env)
     body = client.get(path, headers={**_token("spender"), **DEST}).json()
     limits = body["limits"]
     assert limits["remaining_cents"] == limits["monetary_limit_cents"] - 5
@@ -117,6 +128,7 @@ def test_project_spend_without_limits_and_with_finished_campaigns(tmp_path):
     env.execute("DELETE FROM execution_project_limits")
     done = env.submit()
     env.execute("UPDATE campaigns SET status='failed', settled_cents=4 WHERE id=?", done["id"])
+    _spender_submitted_every_campaign(env)
     path = f"/projects/{env.project['id']}/agent-spend"
     body = client.get(path, headers={**_token("spender"), **DEST}).json()
     assert body["limits"] is None
@@ -156,6 +168,7 @@ def test_project_spend_sums_every_campaign_status_without_nulls(tmp_path):
             number * 10,
             campaign_id,
         )
+    _spender_submitted_every_campaign(env)
     path = f"/projects/{env.project['id']}/agent-spend"
     body = client.get(path, headers={**_token("spender"), **DEST}).json()
     by = {row["status"]: row for row in body["campaigns_by_status"]}

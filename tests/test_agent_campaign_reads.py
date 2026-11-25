@@ -51,8 +51,20 @@ def world(tmp_path):
     env.agent(ALL, "full")
     env.agent(["context:read"], "plain")
     env.agent(["campaign:read"], "reader")
+    # Audit O-05: an agent reads only campaigns it submitted. These tests are about scopes and
+    # tenancy, not ownership, so the reading agent is recorded as the submitter.
+    _submitted_by(env, campaign, "full")
     client = TestClient(create_app(env.state))
     return env, client, campaign
+
+
+def _submitted_by(env, campaign, name):
+    """Record the named agent as the campaign's submitter (test setup only)."""
+    env.execute(
+        "UPDATE campaigns SET submitted_by_principal_id=? WHERE id=?",
+        env.agent(None, name)["id"],
+        campaign["id"],
+    )
 
 
 def _get(client, path, name, destination=DEST):
@@ -180,6 +192,7 @@ def test_outputs_logs_budget_need_their_own_scope(world):
 def test_single_scope_does_not_unlock_the_others(world):
     env, client, campaign = world
     env.agent(["artifact:read"], "artifacts")
+    _submitted_by(env, campaign, "artifacts")
     base = f"/campaigns/{campaign['id']}"
     assert _get(client, base + "/outputs", "artifacts").status_code == 200
     assert _get(client, base + "/logs", "artifacts").status_code == 403
@@ -337,6 +350,7 @@ def test_no_cross_project_or_cross_tenant_reads(world):
 
 def test_receipt_and_list_are_readable_with_campaign_read(world):
     env, client, campaign = world
+    _submitted_by(env, campaign, "reader")
     listing = _get(client, f"/projects/{env.project['id']}/campaigns", "reader").json()
     assert [c["id"] for c in listing["campaigns"]] == [campaign["id"]]
     assert "spec_json" not in listing["campaigns"][0]
@@ -582,6 +596,8 @@ def test_stage_status_needs_campaign_logs_and_the_human_owner_reads(world):
     assert _get(client, path, "plain").status_code == 403
     assert _get(client, path, "full").status_code == 200
     env.agent(["campaign:logs"], "logsonly")
+    assert _get(client, path, "logsonly").status_code == 404  # not its campaign (audit O-05)
+    _submitted_by(env, campaign, "logsonly")
     assert _get(client, path, "logsonly").status_code == 200
     human = {"Authorization": (env.state / "owner.header").read_text().strip().split(": ", 1)[1]}
     assert client.get(path, headers=human).status_code == 200

@@ -57,6 +57,7 @@ from .campaign_models import (
     topological_order,
 )
 from .campaign_pending_approval import pending_human_approval
+from .campaign_read_scope import may_read, own_clause, reads_every_campaign
 from .campaign_receipt_read import load_verified_receipt
 from .campaign_rerun import (
     RERUN_EVENT,
@@ -207,6 +208,25 @@ class CampaignStore(
             """SELECT c.* FROM campaigns c JOIN projects p ON p.id = c.project_id
             WHERE c.id = ? AND p.org_id = ?""",
             (campaign_id, actor["org_id"]),
+        ).fetchone()
+        if row is None:
+            raise NotFound("Campaign was not found.")
+        Store._project(connection, actor, row["project_id"])
+        return row
+
+    @staticmethod
+    def _readable_campaign(
+        connection: sqlite3.Connection, actor: dict[str, Any], campaign_id: str
+    ) -> sqlite3.Row:
+        """``_campaign`` for a read (audit O-05): an agent finds only a campaign it submitted.
+
+        The submitter filter is part of the one lookup query, so another agent's campaign and a
+        missing id take the same path to the same ``NotFound``."""
+        clause, args = own_clause(actor, "c.id")
+        row = connection.execute(
+            f"""SELECT c.* FROM campaigns c JOIN projects p ON p.id = c.project_id
+            WHERE c.id = ? AND p.org_id = ?{clause}""",
+            (campaign_id, actor["org_id"], *args),
         ).fetchone()
         if row is None:
             raise NotFound("Campaign was not found.")
@@ -856,7 +876,7 @@ class CampaignStore(
                 # Reusing outputs hands the caller their digests (in the pins and the receipt):
                 # the same scope the offline retry tool needs to read them.
                 self._require_action(connection, actor, "artifact:read")
-            old = self._campaign(connection, actor, campaign_id)
+            old = self._readable_campaign(connection, actor, campaign_id)
             project_id = old["project_id"]
             request_digest = canonical_digest(payload)
             stored = connection.execute(
@@ -889,7 +909,9 @@ class CampaignStore(
             source = None
             connection = _connect(self.database_path)
             try:
-                source = load_source(connection, self._campaign(connection, actor, campaign_id))
+                source = load_source(
+                    connection, self._readable_campaign(connection, actor, campaign_id)
+                )
             finally:
                 connection.close()
         try:
@@ -1266,7 +1288,7 @@ class CampaignStore(
         connection = _connect(self.database_path)
         try:
             actor = self._read_actor(connection, principal)
-            campaign = self._campaign(connection, actor, campaign_id)
+            campaign = self._readable_campaign(connection, actor, campaign_id)
             approvals = [
                 dict(row)
                 for row in connection.execute(
@@ -1328,6 +1350,23 @@ class CampaignStore(
             rerun_of = lineage_of(connection, campaign_id, campaign["project_id"])
             reruns = reruns_of(connection, campaign_id, campaign["project_id"])
             tree = rerun_tree(connection, campaign) if (rerun_of or reruns) else None
+            if not reads_every_campaign(actor):
+                # Audit O-05: an agent sees re-run links only to campaigns it may read, and the
+                # tree's totals only when every member is its own (they sum the others' spend).
+                if rerun_of is not None and not may_read(
+                    connection, actor, rerun_of.get("rerun_of")
+                ):
+                    rerun_of = None
+                reruns = [r for r in reruns if may_read(connection, actor, r["campaign_id"])]
+                if tree is not None and (
+                    tree["truncated"]
+                    or not all(
+                        may_read(connection, actor, m["campaign_id"]) for m in tree["members"]
+                    )
+                ):
+                    tree = {
+                        "withheld": "the re-run tree includes campaigns another principal submitted"
+                    }
             return {
                 **_read_summary(campaign),
                 **({} if rerun_of is None else {"rerun": rerun_of}),
@@ -1361,10 +1400,12 @@ class CampaignStore(
         try:
             actor = self._read_actor(connection, principal)
             self._project(connection, actor, project_id)
+            # Audit O-05: an agent pages through its own campaigns only.
+            clause, args = own_clause(actor, "c.id")
             rows = connection.execute(
-                """SELECT * FROM campaigns WHERE project_id=? AND org_id=?
-                ORDER BY created_at, id LIMIT ? OFFSET ?""",
-                (project_id, actor["org_id"], limit, offset),
+                f"""SELECT c.* FROM campaigns c WHERE c.project_id=? AND c.org_id=?{clause}
+                ORDER BY c.created_at, c.id LIMIT ? OFFSET ?""",
+                (project_id, actor["org_id"], *args, limit, offset),
             ).fetchall()
             return {"campaigns": [_read_summary(row) for row in rows]}
         finally:
@@ -1374,7 +1415,7 @@ class CampaignStore(
         connection = _connect(self.database_path)
         try:
             actor = self._read_actor(connection, principal)
-            self._campaign(connection, actor, campaign_id)
+            self._readable_campaign(connection, actor, campaign_id)
             # A stored receipt is returned only when its digest verifies (409 otherwise).
             verified = load_verified_receipt(connection, campaign_id)
             if verified is None:
@@ -1446,7 +1487,7 @@ class CampaignStore(
         connection = _connect(self.database_path)
         try:
             actor = self._read_actor(connection, principal)
-            self._campaign(connection, actor, campaign_id)
+            self._readable_campaign(connection, actor, campaign_id)
             report = campaign_report.build_report(connection, campaign_id, detail=detail)
             return {**report, "text": campaign_report.render_text(report)}
         finally:
@@ -1470,7 +1511,13 @@ class CampaignStore(
             actor = self._read_actor(connection, principal)
             self._project(connection, actor, project_id)
             report = campaign_report.window_report(
-                connection, project_id, since, until, detail=detail, limit=limit
+                connection,
+                project_id,
+                since,
+                until,
+                detail=detail,
+                limit=limit,
+                reader=None if reads_every_campaign(actor) else actor,
             )
             return {**report, "text": campaign_report.render_text(report)}
         finally:

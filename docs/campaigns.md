@@ -191,8 +191,12 @@ Agents with the external scopes `campaign:submit|read|cancel` may submit, read a
 (`tessera_submit_campaign`, `tessera_get_campaign`, `tessera_cancel_campaign`, enabled with
 `tessera-mcp`: registered by default only when the credential's live scopes include
 `campaign:*`, forced with `--campaign-tools` or `--no-campaign-tools`). They cannot approve.
-`campaign:read` covers every campaign in the credential's project, not only the caller's own;
-for an agent, cancel stays submitter-only, and so do the steering tools (budget reduction, release revoke,
+`campaign:read` covers only the campaigns the agent submitted (audit O-05; the recorded
+submitter is the caller, or the caller consumed the owner's approved submission that started
+it): another agent's or a person's campaign answers the same 404 as a missing id, and
+project-wide lists, counts and pages hold only the caller's rows (details in
+[mcp-campaign-client-path.md](mcp-campaign-client-path.md#scope-semantics)). A person still reads
+every campaign of their organization. For an agent, cancel stays submitter-only, and so do the steering tools (budget reduction, release revoke,
 pause, resume, concurrency limit, stage cancel, placement steering): for an agent caller they act only on a
 campaign that agent itself submitted, while a person (human principal) may cancel or steer any campaign in
 their tenant. The v2 spec, receipt, list, snapshot, output, log and budget

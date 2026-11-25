@@ -16,7 +16,7 @@ from tessera_control.campaign_gates import (
     evaluate_unlock,
     parse_unlock_json,
 )
-from tessera_control.store import Conflict, Forbidden, StoreError, canonical_digest
+from tessera_control.store import Conflict, Forbidden, NotFound, StoreError, canonical_digest
 
 
 @pytest.fixture
@@ -84,6 +84,13 @@ def test_an_external_reader_sees_the_decision_but_not_who_decided(sched):
     campaign = finished_campaign(sched)
     _, record = decide(sched, campaign)
     reader = sched.env.agent(["campaign:read"], "gate-reader")
+    # Audit O-05: an agent reads only campaigns it submitted, so another agent finds nothing.
+    other = sched.env.agent(["campaign:read"], "other-reader")
+    with pytest.raises(NotFound):
+        sched.env.store.list_gate_decisions(other, campaign)
+    sched.env.execute(
+        "UPDATE campaigns SET submitted_by_principal_id=? WHERE id=?", reader["id"], campaign
+    )
     seen = sched.env.store.list_gate_decisions(reader, campaign)
     assert seen["effective"]["id"] == record["id"] and seen["effective"]["note"] == "reviewed"
     for item in [*seen["gate_decisions"], seen["effective"]]:

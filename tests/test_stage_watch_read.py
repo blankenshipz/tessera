@@ -25,12 +25,16 @@ def _token(name):
 def world(tmp_path: Path):
     world = World(tmp_path)
     env = world.env
-    env.agent(["campaign:read", "campaign:logs"], "reader")
+    reader = env.agent(["campaign:read", "campaign:logs"], "reader")
     env.agent(["campaign:read"], "nologs")
     env.human("human")
     spec = env.spec()
     spec["stages"] = [stage_spec(env, "s1")]
     campaign = world.campaign(spec)
+    # Audit O-05: an agent reads only campaigns it submitted; the reader is the submitter here.
+    env.execute(
+        "UPDATE campaigns SET submitted_by_principal_id=? WHERE id=?", reader["id"], campaign["id"]
+    )
     world.tick_all(campaign["id"])
     (attempt,) = world.attempts(campaign["id"])
     connection = _connect(env.state / "tessera.sqlite3")

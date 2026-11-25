@@ -36,6 +36,14 @@ def _failed_after_one_success(tmp_path):
 
 
 def _rerun(world, actor, campaign_id, key, **body):
+    if actor.get("role") == "agent":
+        # Audit O-05: an agent re-runs only a campaign it may read, i.e. one it submitted. The
+        # sources here are run by the harness as a person, so the re-running agent is recorded
+        # as the source's submitter (test setup only; the refusal is in
+        # test_campaign_read_submitter_scope.py).
+        world.env.execute(
+            "UPDATE campaigns SET submitted_by_principal_id=? WHERE id=?", actor["id"], campaign_id
+        )
     return world.env.store.rerun_campaign(actor, campaign_id, key, canonical_digest(body), body)
 
 

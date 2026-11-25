@@ -10,11 +10,13 @@ organization and project.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
 from . import campaign_hold
 from .campaign_models import parse_spec_json
+from .campaign_read_scope import own_clause
 from .campaign_receipt_read import load_verified_receipt
 from .campaign_receipts import build_receipt
 from .model_spend import MICRO
@@ -607,11 +609,18 @@ def window_report(
     *,
     detail: bool = False,
     limit: int = 100,
+    reader: Mapping[str, Any] | None = None,
 ) -> dict:
+    """``reader`` (an agent, audit O-05) limits the window, its count and totals to the
+    campaigns that reader may read; ``None`` is the human, project-wide view."""
     connection.row_factory = sqlite3.Row
     project = connection.execute("SELECT org_id FROM projects WHERE id=?", (project_id,)).fetchone()
     where = "project_id=? AND created_at >= ? AND created_at < ?"
-    args = (project_id, since, until)
+    args: tuple[Any, ...] = (project_id, since, until)
+    if reader is not None:
+        clause, own_args = own_clause(reader, "campaigns.id")
+        where += clause
+        args = (*args, *own_args)
     total = connection.execute(f"SELECT COUNT(*) FROM campaigns WHERE {where}", args).fetchone()[0]
     rows = connection.execute(
         f"SELECT * FROM campaigns WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ?",

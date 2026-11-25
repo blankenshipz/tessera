@@ -24,6 +24,7 @@ from pydantic import Field, ValidationError
 
 from . import program_budget
 from .approval_trust import decision_provenance, require_decision_actor
+from .campaign_read_scope import own_decision_clause, reads_every_campaign
 from .campaign_store import CampaignStore
 from .delegation_rules import approval_count, committed_cents
 from .delegation_terms import MAX_DELEGATION_DAYS, DelegationTerms, _Strict
@@ -430,17 +431,25 @@ class ApprovalDelegationCommands(CampaignStore):
         try:
             actor = self._reader(connection, principal)
             row = self._visible(connection, actor, delegation_id)
+            # Audit O-05: an agent sees decisions on its own campaigns only, and not the usage
+            # totals, which sum every campaign the delegation approved.
+            clause, args = own_decision_clause(actor, "d.campaign_id", "d.actor_principal_id")
             latest = connection.execute(
-                """SELECT * FROM delegated_decisions WHERE delegation_id=?
-                ORDER BY created_at DESC, rowid DESC LIMIT ?""",
-                (row["id"], LATEST_DECISIONS_LISTED),
+                f"""SELECT d.* FROM delegated_decisions d WHERE d.delegation_id=?{clause}
+                ORDER BY d.created_at DESC, d.rowid DESC LIMIT ?""",
+                (row["id"], *args, LATEST_DECISIONS_LISTED),
             ).fetchall()
-            return {
-                **_summary(row),
-                "usage": {
+            usage: dict[str, Any] = (
+                {
                     "committed_cents": committed_cents(connection, row["id"]),
                     "approvals": approval_count(connection, row["id"]),
-                },
+                }
+                if reads_every_campaign(actor)
+                else {"withheld": "usage sums campaigns other principals submitted"}
+            )
+            return {
+                **_summary(row),
+                "usage": usage,
                 "decisions": [_decision(r) for r in latest],
             }
         finally:
@@ -454,10 +463,13 @@ class ApprovalDelegationCommands(CampaignStore):
         try:
             actor = self._reader(connection, principal)
             row = self._visible(connection, actor, delegation_id)
+            clause, args = own_decision_clause(
+                actor, "d.campaign_id", "d.actor_principal_id"
+            )  # audit O-05
             rows = connection.execute(
-                """SELECT * FROM delegated_decisions WHERE delegation_id=?
-                ORDER BY created_at, rowid LIMIT ? OFFSET ?""",
-                (row["id"], limit, offset),
+                f"""SELECT d.* FROM delegated_decisions d WHERE d.delegation_id=?{clause}
+                ORDER BY d.created_at, d.rowid LIMIT ? OFFSET ?""",
+                (row["id"], *args, limit, offset),
             ).fetchall()
             return {"decisions": [_decision(r) for r in rows]}
         finally:

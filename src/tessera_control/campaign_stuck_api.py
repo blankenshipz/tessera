@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from . import campaign_stuck as stuck
 from .approval_trust import require_decision_actor
+from .campaign_read_scope import reads_every_campaign
 from .execution_api import result
 from .external_agent_api import Actor, Key
 from .external_agents import ExternalAgentStore
@@ -61,8 +62,9 @@ class CampaignStuckStore(ExternalAgentStore):
             return {
                 "project_id": project_id,
                 "settings": stuck.get_settings(connection, actor["org_id"], project_id),
+                # Audit O-05: an agent lists findings on its own campaigns only.
                 "findings": stuck.list_findings(
-                    connection, actor["org_id"], project_id, status, limit
+                    connection, actor["org_id"], project_id, status, limit, reader=_reader(actor)
                 ),
             }
         finally:
@@ -85,9 +87,14 @@ class CampaignStuckStore(ExternalAgentStore):
         def command(connection, live):
             self._may(connection, live, "campaign:read")
             self._project(connection, live, project_id)
-            return 200, stuck.scan_project(
+            scanned = stuck.scan_project(
                 connection, live["org_id"], project_id, self.clock(), lambda _c: live["id"]
             )
+            if _reader(live) is None:
+                return 200, scanned
+            # Audit O-05: the scan records every campaign's findings; an agent is told only
+            # about the ones on its own campaigns.
+            return 200, stuck.own_scan_view(connection, live["org_id"], project_id, scanned, live)
 
         return self._mutate(
             principal,
@@ -106,7 +113,7 @@ class CampaignStuckStore(ExternalAgentStore):
             self._project(connection, live, project_id)
             found = stuck.acknowledge(
                 connection, live["org_id"], project_id, finding_id, live["id"], body.note,
-                self.clock(),
+                self.clock(), reader=_reader(live),
             )  # fmt: skip
             if found is None:
                 raise NotFound("Finding was not found.")
@@ -159,6 +166,11 @@ class CampaignStuckStore(ExternalAgentStore):
             canonical_digest(body.model_dump(mode="json")),
             command,
         )
+
+
+def _reader(actor) -> dict[str, Any] | None:
+    """The agent whose own campaigns bound what it sees (audit O-05); ``None`` for a human."""
+    return None if reads_every_campaign(actor) else actor
 
 
 def stuck_store(request: Request) -> CampaignStuckStore:

@@ -179,10 +179,21 @@ def _leaks(body, secrets: dict[str, str]) -> list[str]:
     return sorted(name for name, value in secrets.items() if value and value in text)
 
 
+def _reading_agent(world) -> None:
+    """The reading agent, recorded as the campaign's submitter: agents read only campaigns they
+    submitted (campaign_read_scope). Test setup only."""
+    agent = world.env.agent(READS, "agent")
+    world.env.execute(
+        "UPDATE campaigns SET submitted_by_principal_id=? WHERE id=?",
+        agent["id"],
+        world.campaign_id,
+    )
+
+
 def _preapproved_world(tmp_path) -> PreWorld:
     world = PreWorld(tmp_path, stages=_short, preapprove_reviews=True)
     world.start_pre()
-    world.env.agent(READS, "agent")
+    _reading_agent(world)
     world.tick_until_phase("awaiting_lease")
     world.lease_and_package()
     world.tick_until_phase("route_started")
@@ -197,8 +208,8 @@ def _preapproved_world(tmp_path) -> PreWorld:
 
 def test_baseline_human_gated_review_is_pending_for_the_agent_with_only_its_own_fields(tmp_path):
     world = SaladWorld(tmp_path)
-    world.env.agent(READS, "agent")
     world.to_awaiting_review()
+    _reading_agent(world)
     client = TestClient(create_app(world.env.state))
     agent = client.get(f"/campaigns/{world.campaign_id}", headers={**_token("agent"), **DEST})
     human = client.get(f"/campaigns/{world.campaign_id}", headers=_token("human"))

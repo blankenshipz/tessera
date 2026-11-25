@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .campaign_models import NormalSpec, normalize
+from .campaign_read_scope import own_clause
 
 CLAIM_STATUSES = ("opened", "scored", "spent")
 HOLDOUT_ALREADY_CLAIMED = "holdout_already_claimed"
@@ -401,15 +402,24 @@ def project_claims(
     project_id: str,
     partition_digest: str | None = None,
     limit: int = 200,
+    *,
+    reader: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Tenant-scoped: the caller has already checked the project; the org is re-applied."""
-    where = "org_id=? AND project_id=?"
+    """Tenant-scoped: the caller has already checked the project; the org is re-applied.
+
+    ``reader`` (an agent, audit O-05) keeps only claims of campaigns that reader may read."""
+    where = "h.org_id=? AND h.project_id=?"
     params: list[Any] = [org_id, project_id]
     if partition_digest is not None:
-        where += " AND partition_digest=?"
+        where += " AND h.partition_digest=?"
         params.append(partition_digest)
+    if reader is not None:
+        clause, own_args = own_clause(reader, "h.campaign_id")
+        where += clause
+        params.extend(own_args)
     rows = connection.execute(
-        f"SELECT * FROM campaign_holdout_claims WHERE {where} ORDER BY opened_at, id LIMIT ?",
+        f"SELECT h.* FROM campaign_holdout_claims h WHERE {where} "
+        "ORDER BY h.opened_at, h.id LIMIT ?",
         (*params, limit),
     )
     return [_claim(row) for row in rows]

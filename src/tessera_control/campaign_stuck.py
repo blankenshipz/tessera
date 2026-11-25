@@ -26,12 +26,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
 from . import campaign_heavy_guard_readout as heavy_readout
 from . import campaign_hold
+from .campaign_read_scope import own_clause
 from .store import Store, _parse_utc, _utc_string
 
 CODES = {
@@ -559,20 +560,57 @@ def scan_project(
     return {"scanned_at": stamp, "opened": opened, "resolved": resolved, "open_count": open_count}
 
 
+def own_scan_view(
+    connection: sqlite3.Connection,
+    org_id: str,
+    project_id: str,
+    scanned: dict[str, Any],
+    reader: Mapping[str, Any],
+) -> dict[str, Any]:
+    """A scan result cut down to the findings on campaigns ``reader`` may read (audit O-05):
+    opened and resolved ids and the open count, so the scan never reveals other campaigns."""
+    own, own_args = own_clause(reader, "f.campaign_id")
+    visible = {
+        row["id"]
+        for row in connection.execute(
+            f"SELECT f.id FROM campaign_stuck_findings f WHERE f.org_id=? AND f.project_id=?{own}",
+            (org_id, project_id, *own_args),
+        )
+    }
+    open_count = connection.execute(
+        "SELECT COUNT(*) FROM campaign_stuck_findings f WHERE f.org_id=? AND f.project_id=? "
+        f"AND f.status IN ('open','acknowledged'){own}",
+        (org_id, project_id, *own_args),
+    ).fetchone()[0]
+    return {
+        **scanned,
+        "opened": [found for found in scanned["opened"] if found["id"] in visible],
+        "resolved": [fid for fid in scanned["resolved"] if fid in visible],
+        "open_count": open_count,
+    }
+
+
 def list_findings(
     connection: sqlite3.Connection,
     org_id: str,
     project_id: str,
     status: str = "open",
     limit: int = 50,
+    *,
+    reader: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    """``reader`` (an agent, audit O-05) keeps only findings on campaigns it may read."""
     clause, args = "", [org_id, project_id]
     if status != "all":
-        clause = " AND status=?"
+        clause = " AND f.status=?"
         args.append(status)
+    if reader is not None:
+        own, own_args = own_clause(reader, "f.campaign_id")
+        clause += own
+        args.extend(own_args)
     rows = connection.execute(
-        f"SELECT * FROM campaign_stuck_findings WHERE org_id=? AND project_id=?{clause} "
-        "ORDER BY last_seen_at DESC, id LIMIT ?",
+        f"SELECT f.* FROM campaign_stuck_findings f WHERE f.org_id=? AND f.project_id=?{clause} "
+        "ORDER BY f.last_seen_at DESC, f.id LIMIT ?",
         (*args, limit),
     ).fetchall()
     return [_row(r) for r in rows]
@@ -586,12 +624,17 @@ def acknowledge(
     actor_id: str,
     note: str | None,
     now: datetime,
+    *,
+    reader: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Mark an open finding seen. ``None`` when the id is unknown here; a resolved finding is a
-    conflict the caller reports. Acknowledging an acknowledged finding replays it unchanged."""
+    """Mark an open finding seen. ``None`` when the id is unknown here, or (``reader``, an agent,
+    audit O-05) it is on a campaign that reader may not read; a resolved finding is a conflict the
+    caller reports. Acknowledging an acknowledged finding replays it unchanged."""
+    own, own_args = ("", ()) if reader is None else own_clause(reader, "f.campaign_id")
     row = connection.execute(
-        "SELECT * FROM campaign_stuck_findings WHERE id=? AND org_id=? AND project_id=?",
-        (fid, org_id, project_id),
+        "SELECT f.* FROM campaign_stuck_findings f WHERE f.id=? AND f.org_id=? AND f.project_id=?"
+        + own,
+        (fid, org_id, project_id, *own_args),
     ).fetchone()
     if row is None:
         return None

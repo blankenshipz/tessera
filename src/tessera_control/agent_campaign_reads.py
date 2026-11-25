@@ -19,6 +19,7 @@ from . import license_labels
 from .campaign_holdout import campaign_claims, project_claims
 from .campaign_infra_retry import infra_attempts
 from .campaign_models import TERMINAL_CAMPAIGN, normalize, parse_spec_json
+from .campaign_read_scope import own_clause, reads_every_campaign
 from .campaign_rerun import custody_released
 from .campaign_store import CampaignStore
 from .data_class import snapshot_data_class
@@ -120,7 +121,7 @@ class AgentCampaignReads(CampaignStore):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, ARTIFACT_SCOPE)
-            self._campaign(connection, actor, campaign_id)
+            self._readable_campaign(connection, actor, campaign_id)
             rows = connection.execute(
                 """SELECT stage_key, attempt_id, name, kind, media_type, sha256, size_bytes,
                 snapshot_id, manifest_id, data_class, created_at FROM campaign_stage_io
@@ -146,7 +147,7 @@ class AgentCampaignReads(CampaignStore):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, LOGS_SCOPE)
-            campaign = self._campaign(connection, actor, campaign_id)
+            campaign = self._readable_campaign(connection, actor, campaign_id)
             stages = connection.execute(
                 """SELECT stage_key, status, attempts_used, provider_id, updated_at
                 FROM campaign_stages WHERE campaign_id = ? ORDER BY topo_index""",
@@ -176,7 +177,7 @@ class AgentCampaignReads(CampaignStore):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, LOGS_SCOPE)
-            campaign = self._campaign(connection, actor, campaign_id)
+            campaign = self._readable_campaign(connection, actor, campaign_id)
             view = stage_status(connection, campaign)
             view["boundary"] = (
                 BOUNDARY + " Codes, ages and counts only; no log text, host or credential."
@@ -195,7 +196,7 @@ class AgentCampaignReads(CampaignStore):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, LOGS_SCOPE)
-            self._campaign(connection, actor, campaign_id)
+            self._readable_campaign(connection, actor, campaign_id)
             rows = connection.execute(
                 """SELECT a.stage_key, a.attempt, a.status AS attempt_status, a.failure_class,
                 a.hold_cents, a.settled_cents, a.settlement_basis,
@@ -241,23 +242,28 @@ class AgentCampaignReads(CampaignStore):
             items = []
             for row in approvals:
                 item = dict(row)
+                # Audit O-05: an agent sees the starts and triggers of campaigns it may read
+                # (a standing start is submitted by the approving human, so none for an agent).
+                started, start_args = own_clause(actor, "s.campaign_id")
+                triggered, trigger_args = own_clause(actor, "t.trigger_campaign_id")
                 item["starts"] = [
                     dict(r)
                     for r in connection.execute(
-                        """SELECT start_index, campaign_id, kind, trigger_campaign_id,
-                        retry_number, budget_cap_cents, created_at
-                        FROM campaign_standing_starts WHERE standing_approval_id=?
-                        ORDER BY start_index""",
-                        (row["id"],),
+                        f"""SELECT s.start_index, s.campaign_id, s.kind, s.trigger_campaign_id,
+                        s.retry_number, s.budget_cap_cents, s.created_at
+                        FROM campaign_standing_starts s WHERE s.standing_approval_id=?{started}
+                        ORDER BY s.start_index""",
+                        (row["id"], *start_args),
                     )
                 ]
                 item["triggers"] = [
                     dict(r)
                     for r in connection.execute(
-                        """SELECT trigger_campaign_id, kind, retry_number, status, start_index,
-                        reason, created_at, resolved_at FROM campaign_standing_triggers
-                        WHERE target_standing_approval_id=? ORDER BY created_at""",
-                        (row["id"],),
+                        f"""SELECT t.trigger_campaign_id, t.kind, t.retry_number, t.status,
+                        t.start_index, t.reason, t.created_at, t.resolved_at
+                        FROM campaign_standing_triggers t
+                        WHERE t.target_standing_approval_id=?{triggered} ORDER BY t.created_at""",
+                        (row["id"], *trigger_args),
                     )
                 ]
                 items.append(item)
@@ -280,7 +286,7 @@ class AgentCampaignReads(CampaignStore):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, "campaign:read")
-            campaign = self._campaign(connection, actor, campaign_id)
+            campaign = self._readable_campaign(connection, actor, campaign_id)
             spec = parse_spec_json(campaign["spec_json"])
             normal = normalize(spec)
             stages = []
@@ -336,7 +342,7 @@ class AgentCampaignReads(CampaignStore):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, "campaign:read")
-            campaign = self._campaign(connection, actor, campaign_id)
+            campaign = self._readable_campaign(connection, actor, campaign_id)
             listed = campaign_claims(connection, campaign_id, _ROW_CAP)
             claims = {c["stage_key"]: c for c in listed}
             stages = []
@@ -365,9 +371,12 @@ class AgentCampaignReads(CampaignStore):
             connection.close()
 
     def holdout_claims(self, principal, project_id, partition_digest=None) -> dict[str, Any]:
-        """Every holdout claim in the project, optionally for one partition (campaign:read).
+        """Holdout claims in the project, optionally for one partition (campaign:read).
 
-        A partition listed here is sealed for that scope: a new claim on it is refused."""
+        A person sees every claim; an agent only those its own campaigns opened (audit O-05),
+        so a partition missing here may still be sealed by another campaign, which submit
+        refuses. A partition listed here is sealed for that scope: a new claim on it is
+        refused."""
         if partition_digest is not None and (
             len(partition_digest) != 64
             or any(ch not in "0123456789abcdef" for ch in partition_digest)
@@ -377,8 +386,14 @@ class AgentCampaignReads(CampaignStore):
         try:
             actor = self._reader(connection, principal, "campaign:read")
             self._project(connection, actor, project_id)
+            # Audit O-05: an agent lists only the claims its own campaigns opened.
             claims = project_claims(
-                connection, actor["org_id"], project_id, partition_digest, _ROW_CAP
+                connection,
+                actor["org_id"],
+                project_id,
+                partition_digest,
+                _ROW_CAP,
+                reader=None if reads_every_campaign(actor) else actor,
             )
             return {
                 "project_id": project_id,
@@ -405,11 +420,15 @@ class AgentCampaignReads(CampaignStore):
                 settled_cents FROM execution_project_limits WHERE project_id=?""",
                 (project_id,),
             ).fetchone()
+            # Audit O-05: an agent's per-status totals cover its own campaigns only. The
+            # operator's project limit row below is the project's ledger, one shared ceiling.
+            clause, args = own_clause(actor, "c.id")
             rows = connection.execute(
-                """SELECT status, COUNT(*) AS campaigns, SUM(budget_cap_cents) AS cap_cents,
-                SUM(held_cents) AS held_cents, SUM(settled_cents) AS settled_cents
-                FROM campaigns WHERE project_id=? AND org_id=? GROUP BY status ORDER BY status""",
-                (project_id, actor["org_id"]),
+                f"""SELECT c.status, COUNT(*) AS campaigns, SUM(c.budget_cap_cents) AS cap_cents,
+                SUM(c.held_cents) AS held_cents, SUM(c.settled_cents) AS settled_cents
+                FROM campaigns c WHERE c.project_id=? AND c.org_id=?{clause}
+                GROUP BY c.status ORDER BY c.status""",
+                (project_id, actor["org_id"], *args),
             ).fetchall()
             by_status = [dict(row) for row in rows]
             unfinished = [row for row in by_status if row["status"] not in TERMINAL_CAMPAIGN]
@@ -439,7 +458,7 @@ class AgentCampaignReads(CampaignStore):
         connection = _connect(self.database_path)
         try:
             actor = self._reader(connection, principal, BUDGET_SCOPE)
-            campaign = self._campaign(connection, actor, campaign_id)
+            campaign = self._readable_campaign(connection, actor, campaign_id)
             spec = json.loads(campaign["spec_json"])
             cap, held, settled = (
                 campaign["budget_cap_cents"],

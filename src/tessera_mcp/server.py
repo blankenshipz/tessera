@@ -435,13 +435,14 @@ def register_campaign_tools(
         )
 
     async def tessera_get_campaign(campaign_id: str) -> dict[str, Any]:
-        """Read any campaign in this project: status, stages, attempts, intents and placement.
+        """Read one of your campaigns: status, stages, attempts, intents and placement.
 
-        Reads are project-wide (campaign:read), not limited to your own submissions; only
-        cancel is submitter-only. A campaign in a re-run tree also shows rerun_tree: the first
-        cap, what the tree has committed (settled spend plus the caps of unfinished
-        campaigns) and what is left for another re-run. The receipt is a separate record: use
-        tessera_get_campaign_receipt once the campaign is terminal. Status is recorded
+        An agent reads only the campaigns it submitted (campaign:read); any other id answers
+        like a missing one. Cancel and steering are submitter-only too. A campaign in a
+        re-run tree also shows rerun_tree (withheld when the tree holds another submitter's
+        campaign): the first cap, what the tree has committed (settled spend plus the caps of
+        unfinished campaigns) and what is left for another re-run. The receipt is a separate
+        record: use tessera_get_campaign_receipt once the campaign is terminal. Status is recorded
         platform state, not evidence of a scientific result. ``pending_human_approval`` lists
         what a person must still decide (a campaign approval or re-approval of its spec
         digest, or a Salad plan or source-use review) and is empty when nothing is awaited; it
@@ -461,7 +462,9 @@ def register_campaign_tools(
         return await client.campaign(campaign_id)
 
     async def tessera_list_campaigns(offset: int = 0, limit: int = 50) -> dict[str, Any]:
-        """List campaign summaries in this project (campaign:read), oldest first."""
+        """List your campaign summaries in this project (campaign:read), oldest first.
+
+        An agent sees only the campaigns it submitted; a person sees every one."""
         return await client.list_campaigns(offset, limit)
 
     async def tessera_list_stuck_campaigns(
@@ -655,7 +658,9 @@ def register_campaign_tools(
     ) -> dict[str, Any]:
         """List this project's holdout claims, optionally for one partition digest
         (campaign:read, read-only). Check here before submitting a final evaluation stage:
-        a (partition digest, claim scope) pair already listed is refused at submit.
+        a (partition digest, claim scope) pair already listed is refused at submit. An agent
+        sees only the claims its own campaigns opened, so submit can still refuse a pair
+        another campaign claimed.
         """
         return await client.holdout_claims(partition_digest)
 
