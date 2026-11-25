@@ -2231,6 +2231,63 @@ class SaladSafetyService:
         finally:
             self.retry_windows = None
 
+
+    def _loop_frame_failed(self, reservation, error):
+        """Fail one frame closed after its lost-create close or watch raised, and record only the
+        error's type name.
+
+        The frame is fenced exactly like one whose reads cannot be trusted (``_exposure_fence``:
+        recovery, budget fence, writers closed, stop requested); a bound frame's stop is then
+        driven by a throttled best-effort poll, since the raise may have skipped this pass's
+        poll. A frame that keeps raising is re-fenced on every pass (idempotent). The event is
+        deduplicated per type per WORKLOAD_REFUSAL_DEDUP_SECONDS; the frame record keeps each
+        type once. Nothing here raises: a failure of the fence or the record counts a diagnostic
+        write failure. Callers must not re-raise: on this tree that would abort the guardian
+        pass and take ``serve()`` down.
+        """
+        name = type(error).__name__
+        code = name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
+        row = None
+        try:
+            row = self._row(reservation)
+            self._exposure_fence(row)
+        except Exception:
+            self.diagnostic_write_failures += 1
+            try:  # the flags alone, when the row or the fence's later steps failed
+                with self.db:
+                    self.db.execute(
+                        "UPDATE reservations SET recovery=1,budget_fenced=1,rate_unknown=1 "
+                        "WHERE reservation=?",
+                        (reservation,),
+                    )
+            except Exception:
+                self.diagnostic_write_failures += 1
+        if row is not None and row["provider_id"]:
+            now = self.clock()
+            if now >= self.next_poll.get(reservation, 0):
+                self.next_poll[reservation] = now + 5
+                try:
+                    self.guardian.tick(row["operation"])
+                except Exception:
+                    pass  # no failed observation is a confirmed stop; the next pass retries
+        try:
+            now = self.clock()
+            last = self.db.execute(
+                "SELECT at FROM events WHERE reservation=? AND kind='loop_frame_failed' "
+                "AND detail=? ORDER BY sequence DESC LIMIT 1",
+                (reservation, code),
+            ).fetchone()
+            with self.db:
+                if not (last and 0 <= now - last[0] < WORKLOAD_REFUSAL_DEDUP_SECONDS):
+                    self.db.execute(
+                        "INSERT INTO events(reservation,operation,at,kind,detail) "
+                        "VALUES(?,?,?,'loop_frame_failed',?)",
+                        (reservation, row["operation"] if row else None, now, code),
+                    )
+                self._frame_note(reservation, "loop_frame_failed", {"error_type": code}, once=True)
+        except Exception:
+            self.diagnostic_write_failures += 1
+
     def _loop_pass(self):
         now = self.clock()
         if self.jwt.refreshed is None or now - self.jwt.refreshed >= 1800:
@@ -2242,15 +2299,32 @@ class SaladSafetyService:
         for (reservation,) in self.db.execute("SELECT reservation FROM reservations").fetchall():
             row = self._row(reservation)
             if self._lost_create_closed(row):
-                if self.inputs:
-                    self.inputs.drop(row["operation"])
-                # Idempotent: an interrupted resolution never leaves writers open.
-                self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
-                resolved_at = json.loads(row["lost_create_resolution"])["resolved_at"]
-                watching = now - resolved_at < LOST_CREATE_WATCH_SECONDS
-                if watching and now >= self.next_absence.get(reservation, 0):
-                    self.next_absence[reservation] = now + LOST_CREATE_WATCH_INTERVAL_SECONDS
-                    self._watch_lost_create(row, now)
+                # The late-group watch must run even when closing fails: this frame has no
+                # provider_id, so nothing else ticks it. A close or drop failure is
+                # recorded after the watch and retried on the next pass. It is not
+                # re-raised out of the guardian pass: on this tree that would abort
+                # serve() for every frame.
+                close_error = None
+                try:
+                    if self.inputs:
+                        self.inputs.drop(row["operation"])
+                except Exception as error:
+                    close_error = error
+                try:
+                    # Idempotent: an interrupted resolution never leaves writers open.
+                    self.custody.close_writers(CustodyBinding(**json.loads(row["binding"])))
+                except Exception as error:
+                    close_error = close_error or error
+                try:
+                    resolved_at = json.loads(row["lost_create_resolution"])["resolved_at"]
+                    watching = now - resolved_at < LOST_CREATE_WATCH_SECONDS
+                    if watching and now >= self.next_absence.get(reservation, 0):
+                        self.next_absence[reservation] = now + LOST_CREATE_WATCH_INTERVAL_SECONDS
+                        self._watch_lost_create(row, now)
+                except Exception as error:
+                    close_error = close_error or error
+                if close_error is not None:
+                    self._loop_frame_failed(reservation, close_error)
                 continue
             self._account(row)
             if self.inputs and row["recovery"]:

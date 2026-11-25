@@ -2723,6 +2723,43 @@ def test_lost_create_late_group_is_bound_and_stopped_and_fences_again(tmp_path):
         s.close()
 
 
+def test_lost_create_watch_runs_while_close_writers_keeps_raising(tmp_path, monkeypatch):
+    s, b, clock, provider = _resolved(tmp_path)
+    try:
+        calls = []
+
+        def failing(binding):
+            calls.append(binding)
+            raise RuntimeError("custody store unavailable")
+
+        monkeypatch.setattr(s.custody, "close_writers", failing)
+        # The late-group watch is due and finds nothing: it still reads, every interval.
+        reads = _absence_reads(provider)
+        provider.absence = "not_found"
+        for _ in range(2):
+            clock[0] += 61
+            s.loop()
+        assert len(calls) >= 2 and _absence_reads(provider) > reads
+        assert s._row(b["reservation"])["lost_create_resolution"] is not None
+        # A group appears while close keeps failing: the watch still sees, voids and
+        # binds it, so the ordinary loop can stop it and the fence blocks again.
+        provider.absence = "present"
+        provider.group_missing = False
+        provider.state = "running"
+        clock[0] += 61
+        s.loop()
+        row = s._row(b["reservation"])
+        assert row["lost_create_resolution"] is None and row["provider_id"] == GROUP
+        assert "lost_create_late_group_observed" in _kinds(s)
+        assert s._status(row)["status"] != "reconciled"
+        with pytest.raises(ValueError, match="single_operation_orphan_exposure"):
+            s.admin(_next_reservation(s, clock))
+        # The failure is still reported, not swallowed.
+        assert "loop_frame_failed" in _kinds(s)
+    finally:
+        s.close()
+
+
 def test_lost_create_watch_event_is_written_even_when_the_bind_fails(tmp_path):
     s, b, clock, provider = _resolved(tmp_path)
     try:
