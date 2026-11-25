@@ -163,6 +163,18 @@ def _registered(provider_id: str) -> bool:
     return provider_id in provider_ids()
 
 
+def _operator_owned(provider_id: str) -> bool:
+    """Is the id registered here as the operator's own capacity (its descriptor declares
+    ``third_party`` false)? An unregistered id is not (fail closed)."""
+    from .campaign_providers import get_provider, load_builtin_providers
+
+    load_builtin_providers()
+    try:
+        return get_provider(provider_id).descriptor.third_party is False
+    except KeyError:
+        return False
+
+
 def _allowed_in(
     document: dict[str, Any], provider_id: str | None, worker_principal_id: str | None
 ) -> frozenset[TrustClass]:
@@ -199,20 +211,22 @@ class TrustPolicy:
     def allowed_license_labels(self, provider_id: str | None) -> frozenset[str] | None:
         """The licence labels the provider may receive, or None when it is unrestricted.
 
-        A provider the trust file does not list is refused anything labelled (fail closed):
-        it may receive only ``unlabelled`` data. A listed provider without the key is
-        unrestricted (the operator has recorded the provider and chose no label limit). No
-        provider id (not a placed stage) is unrestricted."""
+        A provider the trust file does not list may receive only ``unlabelled`` data (fail
+        closed). A listed provider without ``allowed_license_labels`` is unrestricted only when
+        it is registered here as the operator's own capacity (``third_party`` false); a
+        third-party provider (Salad, say) or one not registered in this process receives only
+        ``unlabelled`` data, so a label reaches it only where its entry names that label (ADR
+        0113 amendment 2026-11-23). No provider id (not a placed stage) is unrestricted."""
         if not provider_id:
             return None
         entry = self.document.get("providers", {}).get(provider_id)
-        if entry is None:
-            from .license_labels import UNLABELLED
-
-            return frozenset({UNLABELLED})
-        if "allowed_license_labels" not in entry:
+        if entry is not None and "allowed_license_labels" in entry:
+            return frozenset(entry["allowed_license_labels"])
+        if entry is not None and _operator_owned(provider_id):
             return None
-        return frozenset(entry["allowed_license_labels"])
+        from .license_labels import UNLABELLED
+
+        return frozenset({UNLABELLED})
 
     def provider_for_worker(self, worker_principal_id: str) -> str | None:
         """None means the principal is unbound."""

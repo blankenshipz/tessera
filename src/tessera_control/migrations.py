@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (PROJECT_CONCURRENCY_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 89
+# Literal: must equal the highest registered constant (OUTPUT_LICENSE_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 90
 LOCAL_ORG_ID = "org_local"
 
 
@@ -2038,3 +2038,24 @@ def migrate_project_concurrency_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(PROJECT_CONCURRENCY_SCHEMA_VERSION - 1, migrate_project_concurrency_schema)
+
+
+# Recorded stage outputs keep their licence labels (ADR 0113 amendment 2026-11-23, schema 90):
+# one add-only row per campaign stage. Additive and idempotent. Reserved as 100; it takes the next
+# contiguous version after the project concurrency ceiling (89). If another change owns it when
+# branches merge, raise OUTPUT_LICENSE_SCHEMA_VERSION, LATEST_SCHEMA_VERSION (the literal near the
+# top) and the fresh-database INSERT in store.py.
+OUTPUT_LICENSE_SCHEMA_VERSION = 90
+
+
+def migrate_output_license_schema(connection: sqlite3.Connection) -> None:
+    from .license_labels import create_output_license_schema
+
+    create_output_license_schema(connection)
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (OUTPUT_LICENSE_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(OUTPUT_LICENSE_SCHEMA_VERSION - 1, migrate_output_license_schema)

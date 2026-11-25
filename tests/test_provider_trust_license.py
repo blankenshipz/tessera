@@ -26,7 +26,9 @@ def test_an_absent_key_leaves_the_canonical_form_and_digest_as_before():
         "data_classes": ["public"],
         "worker_principal_ids": ["w1"],
     }
-    assert plain.allowed_license_labels("remote") is None
+    # 'remote' is not registered in this process, so not known to be operator-owned: it
+    # receives unlabelled data only (ADR 0113 amendment 2026-11-23); the digest is unchanged.
+    assert plain.allowed_license_labels("remote") == {"unlabelled"}
     # a provider the file does not list is refused anything labelled (fail closed)
     assert plain.allowed_license_labels("unlisted") == {"unlabelled"}
     assert not plain.lists_license_labels("unlisted")
@@ -90,10 +92,16 @@ def test_the_restriction_holds_in_every_mode():
         assert policy.allowed_license_labels("remote") == {"cc-by"}
 
 
-def test_a_listed_provider_without_the_key_is_unrestricted_and_the_builtin_policy_is_not():
+def test_a_listed_provider_without_the_key_is_unrestricted_only_when_operator_owned():
     from tessera_control.provider_trust import builtin_policy
 
+    own = {"data_classes": ["public"], "worker_principal_ids": ["w2"]}
     assert document()["providers"]["remote"].get("allowed_license_labels") is None
-    listed = policy_from_document(document(), "file")
-    assert listed.allowed_license_labels("remote") is None
+    listed = policy_from_document(document(**{"local-docker": own}), "file")
+    # The built-in local provider is the operator's own capacity: unrestricted as before.
+    assert listed.allowed_license_labels("local-docker") is None
+    # ADR 0113 amendment 2026-11-23: an unregistered (or third-party) id receives unlabelled
+    # data only until its entry names a label.
+    assert listed.allowed_license_labels("remote") == {"unlabelled"}
+    assert not listed.lists_license_labels("remote")
     assert builtin_policy().allowed_license_labels("anything") == {"unlabelled"}

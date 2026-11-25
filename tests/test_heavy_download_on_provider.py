@@ -33,7 +33,7 @@ from tessera_control.campaign_models import (
     parse_spec,
     stage_on_candidate,
 )
-from tessera_control.campaign_provider_salad import PUBLIC_ARTIFACT_MISMATCH
+from tessera_control.campaign_provider_salad import PUBLIC_ARTIFACT_CACHE, PUBLIC_ARTIFACT_MISMATCH
 from tessera_control.campaign_providers import get_provider
 from tessera_control.salad_workload_contract import (
     check_gpu_runtime_manifest_rules,
@@ -240,8 +240,74 @@ def test_an_adapted_workload_without_pins_still_declares_no_fetch(tmp_path, near
     data["workload"]["egress"]["fetches"] = [{"url": URL, "sha256": SHA, "max_bytes": SIZE}]
     candidate = stage_on_candidate(normalize(spec).stages[0], "salad")
     candidate = candidate.__class__(**{**candidate.__dict__, "provider_config": data})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="manifest fetches must equal egress.fetches"):
         get_provider("salad").validate_stage(candidate)
+
+
+def test_an_extra_redirect_host_on_a_pinned_stage_is_refused(tmp_path, near):
+    world = cpu_world(tmp_path, near)
+
+    def extra(egress, manifest):
+        egress["redirect_hosts"] = ["extra.example.org"]
+        manifest["redirect_hosts"] = ["extra.example.org"]
+
+    # The contract model refuses first: a redirect host needs its digest token, and a token the
+    # adapter did not derive from the pins is not carried by the tampered argv.
+    with pytest.raises(ValueError, match="redirect-hosts token must be present exactly"):
+        get_provider("salad").validate_stage(_tampered(world, extra))
+
+
+def test_a_redirect_host_declared_on_an_unpinned_stage_is_refused(tmp_path, near):
+    world = cpu_world(tmp_path, near)
+    spec = expanded(world)  # no public_artifact input
+    data = spec.stages[0].alternate_providers[0].provider_config
+    data["workload"]["egress"]["redirect_hosts"] = [CDN]
+    candidate = stage_on_candidate(normalize(spec).stages[0], "salad")
+    candidate = candidate.__class__(**{**candidate.__dict__, "provider_config": data})
+    with pytest.raises(ValueError, match="redirect-hosts token must be present exactly"):
+        get_provider("salad").validate_stage(candidate)
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["manifest_adds", "manifest_drops"])
+def test_a_cache_flag_that_differs_from_the_spec_pin_is_refused(tmp_path, near, flag):
+    world = cpu_world(tmp_path, near)
+
+    def flipped(egress, manifest):
+        if flag:
+            manifest["fetches"][1]["cache"] = True
+        else:
+            manifest["fetches"][1].pop("cache", None)
+
+    extra = public(cache=not flag)
+    spec = expanded(world, argv=ARGV, inputs=inputs(world, extra))
+    data = spec.stages[0].alternate_providers[0].provider_config
+    manifest = _manifest(SaladStageSpec.model_validate(data))
+    flipped(data["workload"]["egress"], manifest)
+    import hashlib
+
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    template = [t for t in data["workload"]["argv_template"] if not t.startswith("b64:")]
+    template[8] = hashlib.sha256(raw).hexdigest()
+    template += [f"b64:{encoded[i : i + 250]}" for i in range(0, len(encoded), 250)]
+    data["workload"]["argv_template"] = template
+    candidate = stage_on_candidate(normalize(spec).stages[0], "salad")
+    candidate = candidate.__class__(**{**candidate.__dict__, "provider_config": data})
+    with pytest.raises(ValueError, match=PUBLIC_ARTIFACT_CACHE):
+        get_provider("salad").validate_stage(candidate)
+
+
+def test_pins_beside_a_private_snapshot_input_are_adapted_and_accepted(tmp_path, near):
+    from campaign_fixture import record_snapshot_private
+
+    world = cpu_world(tmp_path, near)
+    record_snapshot_private(world.env.state, world.env.snapshot_id, "derived")
+    spec = expanded(world, argv=ARGV, inputs=inputs(world, public()))
+    config = _config(spec)
+    assert config.workload.input is not None
+    assert [f.url for f in config.workload.egress.fetches] == [URL]
+    candidate = stage_on_candidate(normalize(spec).stages[0], "salad")
+    get_provider("salad").validate_stage(candidate)
 
 
 # -- ADR 0141: a heavy pinned-download stage gets the remote candidate -----------------------

@@ -32,9 +32,14 @@ In the provider trust file add `allowed_license_labels` to the provider's entry 
              "allowed_license_labels": ["cc-by", "public-domain"]}}}
 ```
 
-A provider the file lists without the key is unrestricted; one the file does not list receives only
-`unlabelled` data (fail closed). With the key, the provider receives a stage only if every label of
-every input is in the list. Unlabelled data needs `unlabelled` in the list; data whose lineage cannot be
+A label reaches third-party capacity only where the provider's entry names it. A provider the file
+does not list, and a provider it lists without the key that is registered as third-party (a Salad route,
+say) or is not registered at all, receive `unlabelled` data only: any explicit label, including one nobody
+has named anywhere (a typo, say), and `unknown-lineage` are refused (fail closed; ADR 0113 as amended
+2026-11-23; before that amendment every listed provider without the key received everything). A provider
+registered as the operator's own capacity (a worker-grant provider such as `local-docker` or a self-hosted
+instance, `third_party` false) and listed without the key stays unrestricted. With the key, the provider
+receives a stage only if every label of every input is in the list. Unlabelled data needs `unlabelled` in the list; data whose lineage cannot be
 resolved carries `unknown-lineage` and is always refused by a restricted provider (the trust file does not
 accept `unknown-lineage` in the list).
 
@@ -44,6 +49,13 @@ The effective labels of a stage's inputs include everything upstream: a stage th
 snapshot, and any stage that reads that stage's outputs, in the same campaign or in a later one through a
 pinned artifact, carries the label. Labelling the source once is enough; copying data does not remove a
 label.
+
+Within one campaign the labels follow the spec's stage graph however long the pipeline is. Across
+campaigns they are recomputed from the source campaign's stored spec (up to 8 campaign hops); in addition,
+when a stage's outputs are recorded the labels its inputs carried are stored with it (add-only, table
+`campaign_output_license_labels`), so an output read beyond that limit carries its recorded labels rather
+than `unknown-lineage`. Outputs recorded before this table existed are recomputed only. An input fetched
+from a pinned public URL on the provider (`public_artifact`) is `unlabelled`.
 
 Snapshots the platform builds from labelled sources (a composed snapshot, or one staged from a collected
 output manifest) are labelled with the union of their sources' labels when they are created, so staging or

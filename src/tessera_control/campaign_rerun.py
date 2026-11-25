@@ -22,7 +22,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .campaign_models import TERMINAL_CAMPAIGN
+from .campaign_models import TERMINAL_CAMPAIGN, normalize, parse_spec_json
+from .campaign_seals import carried_seals
 
 FINISHED = frozenset({"failed", "stopped", "cancelled"})
 MAX_NAME = 200
@@ -324,6 +325,14 @@ def build_retry_spec(
     if cap < needed:
         raise RerunRefused(f"The cap must cover the retried stages' exposure ({needed} cents).")
     spec["stages"] = kept
+    if spec.get("seals"):
+        # ADR 0164: a pinned output keeps the seals it carried (on itself or by lineage).
+        source_spec = normalize(parse_spec_json(json.dumps(campaign["spec"])))
+        carried = carried_seals(source_spec, rerun, reused)
+        if carried:
+            spec["seals"] = carried
+        else:
+            spec.pop("seals")
     spec["budget_cap_cents"] = cap
     spec["name"] = (spec["name"] + "-retry")[:MAX_NAME]
     return {

@@ -89,9 +89,7 @@ def test_an_unknown_recorded_cache_value_reads_as_unknown_never_trusted(bad):
 def test_a_row_without_the_field_keeps_its_exact_shape():
     st = stage(False)
     fetched = _local_fetched(db([row(cached=True)]), {"operation_id": "op1"}, st)
-    assert fetched == [
-        {"url": URL, "sha256": SHA, "bytes": 640, "seconds": 0.5, "cached": True}
-    ]
+    assert fetched == [{"url": URL, "sha256": SHA, "bytes": 640, "seconds": 0.5, "cached": True}]
 
 
 def test_a_spec_that_never_asked_and_a_silent_row_has_no_cache_key():

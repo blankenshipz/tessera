@@ -730,9 +730,26 @@ class RemoteExecutionStore(CapabilityStore):
             live = self._live_principal(db, actor, audience=actor.get("audience", "control"))
             state = self._load(db, live, ident)
             # Connection presence never renews a lease, cancels or grants execution.
+            from .campaign_route_live_path import (
+                CONTROL_SURFACE,
+                builtin_proxy_view,
+                campaign_live_path,
+            )
+
             state["control_surface"] = "desktop_control_only"
             state["go_no_go"] = "no_go_live_activation_blocked"
             hooks_for(state["proposal"]["selection"]["target"]).project_state(state)
+            live_path = campaign_live_path(db, live["org_id"], ident)
+            if live_path is not None:
+                # A campaign stage's route runs through the Salad executor and the guardian, not
+                # control's disabled built-in proxy: report the real path, and keep the built-in
+                # proxy's state under its own label (read-only; nothing here enables anything).
+                # go_no_go and proxy_safety stay for existing readers (desktop renderer).
+                from .salad_proxy_contract import safety_projection
+
+                state["control_surface"] = CONTROL_SURFACE
+                state["live_path"] = live_path
+                state["builtin_proxy"] = builtin_proxy_view(safety_projection())
             state["authority_status"] = "unreviewed"
             if state["approved_by"]:
                 try:

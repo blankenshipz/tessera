@@ -299,6 +299,17 @@ def applies(
     )
 
 
+def _skip_entry(skip: Any) -> dict[str, Any]:
+    """A remote skip's detail entry: provider and reason code, plus its structured cause
+    (CAUSE_KEYS) when placement recorded one for a licence-label or data-class refusal."""
+    entry: dict[str, Any] = {"provider_id": skip.provider_id, "reason": skip.reason}
+    cause = getattr(skip, "cause", None) or {}
+    for key in CAUSE_KEYS:
+        if cause.get(key) is not None:
+            entry[key] = cause[key]
+    return entry
+
+
 def reasons(
     guard: Guard,
     base: NormalStage,
@@ -316,7 +327,7 @@ def reasons(
     skipped = list(skipped)
     remote = [pid for pid in base.candidate_ids if guard.is_remote(pid)]
     remote_skips = [item for item in skipped if guard.is_remote(item.provider_id)]
-    detail = [{"provider_id": s.provider_id, "reason": s.reason} for s in remote_skips]
+    detail = [_skip_entry(s) for s in remote_skips]
     if not guard.registered:
         return ["no_remote_profile"], detail
     found: set[str] = set()

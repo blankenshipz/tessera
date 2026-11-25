@@ -111,6 +111,12 @@ def write_io(
             ),
         )
         written += 1
+    if direction == "output" and written:
+        # ADR 0113 (amendment 2026-11-23): the outputs keep the labels their stage read, so a
+        # later campaign reading them inherits those labels whatever the lineage depth.
+        from .license_labels import record_output_labels
+
+        record_output_labels(connection, campaign, stage_key, now)
     return written
 
 

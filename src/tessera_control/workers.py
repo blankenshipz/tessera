@@ -25,6 +25,17 @@ from .worker_models import RegisterWorker, WorkerHeartbeat, WorkerLifecycle
 HEARTBEAT_MAX_AGE = timedelta(seconds=60)
 
 
+def derive_credential_status(revoked_at: str | None, expires_at: str | None, now: datetime) -> str:
+    """revoked | expired | expiry_unknown | active, as worker discovery fences on it."""
+    if revoked_at is not None:
+        return "revoked"
+    try:
+        expiry = _parse_utc(expires_at)
+    except (TypeError, ValueError):
+        return "expiry_unknown"
+    return "expired" if expiry <= now else "active"
+
+
 def create_worker_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """CREATE TABLE IF NOT EXISTS worker_registry (
@@ -326,15 +337,9 @@ class WorkerRegistryStore(Store):
         except ValueError:
             freshness = "unknown"
 
-        if row["credential_revoked_at"] is not None:
-            credential_status = "revoked"
-        else:
-            try:
-                expires_at = _parse_utc(row["credential_expires_at"])
-            except (TypeError, ValueError):
-                credential_status = "expiry_unknown"
-            else:
-                credential_status = "expired" if expires_at <= cls._now() else "active"
+        credential_status = derive_credential_status(
+            row["credential_revoked_at"], row["credential_expires_at"], cls._now()
+        )
         if credential_status == "revoked":
             admission, fence_reason = "fenced", "credential_revoked"
         elif credential_status == "expired":

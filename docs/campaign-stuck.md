@@ -28,7 +28,12 @@ evidence carries `config_gap: "no_remote_profile"` and its suggested action is
 local provider in the project's non-terminal campaigns, with `explained`, including that case. It
 is served read-only (`campaign:read`, no scan, nothing written) as
 `GET /projects/{project_id}/campaign-stuck/heavy-local-audit` (`{"items": [...], "count": n}`,
-ordered by campaign then attempt) and as the MCP tool `tessera_heavy_local_audit`. It
+ordered by campaign then attempt) and as the MCP tool `tessera_heavy_local_audit`. Its `detail`
+names a remote candidate skipped for a licence label or data class with the structured `cause`
+(`license_label` with the refused `labels`, or `data_class` with the class), from the placement
+refusal and not from message text. It lists live attempts only, so a stage the guard refused
+before any attempt (`heavy_local_unexplained`, or a refuse-mode wait that ended without one) never
+appears there; its reasons are on the campaign receipt stage entry as `placement.heavy_guard`. It
 is per project; `scan_all` covers all projects but only persists findings.
 
 A finding carries a stable id, the code, the suggested action, when it was first and last seen,

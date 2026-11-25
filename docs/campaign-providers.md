@@ -515,12 +515,12 @@ with `provider_trust:read`, limited to its own organization's profiles) and the 
 `tessera_list_salad_gpu_classes` (registered with the `provider_trust:read` tools). Eligible means
 a GPU profile in the file's `salad_profiles` names the class; the provider's class catalog is read
 live at admission and is not copied locally. Per class the listing gives the id, the profiles that
-name it, the largest `max_run_cents`, the hourly rate the latest guardian record carried, and over
+name it, the largest `max_run_cents`, the hourly rate the latest guardian record in the window carried (the latest recorded, not an average), and over
 a window of 1 to 90 days (default 14) the attempts with a guardian record, the pre-start re-binds
 and the attempts flagged `allocation_uncertain`. Names are never recorded locally and are `null`; a
 rate or count no receipt recorded is `null` with a `not_recorded` status, never zero. The receipt
 counts are read through a read-only database connection (without `--state-dir` the CLI reports
-`not_recorded`). A providers file or database that cannot be read fails closed with no listing. The
+`not_recorded`). At most the newest 2000 attempts in the window are read; when that cap is reached each class's `allocation_instability` carries `truncated: true` and a note says the counts may be too low (the field is absent otherwise). A providers file or database that cannot be read fails closed with no listing. The
 output names profiles and class ids only, never credential references or custody hosts. It changes
 nothing and does not rank classes.
 
@@ -740,6 +740,22 @@ amendment:
 A Salad stage names an operator profile that is either a GPU profile (a `gpu_class`) or a CPU-only
 profile (`cpu_rate`, no GPU); a stage that declares `salad.gpu: false` runs only on the latter. See
 [campaigns](campaigns.md#salad-gpu-stages) and [ADR 0062](decisions/0062-salad-cpu-only-profiles.md).
+
+### Reading a campaign Salad route
+
+`GET /remote-executions/{id}` on the route of a campaign Salad attempt reports the path that
+route really takes: the Salad executor dispatches it through the guardian, not through control's
+built-in proxy (which stays disabled). The response carries `control_surface:
+campaign_executor_guardian` and a `live_path` object instead of a top-level `go_no_go` and
+`proxy_safety`; the built-in proxy's state is still shown, labelled, under `builtin_proxy`. See
+[remote agent execution](remote-agent-execution.md#reading-a-route) for the fields.
+
+It is a reading, not a grant. `readiness` (`ready`, `degraded`, `not_ready`, `finished`) is
+derived from the executor's registered worker (lifecycle state, credential status, project and a heartbeat within the worker registry's bound; see the reasons in the linked section),
+the attempt's execution lease, and what the guardian has recorded (evidence, live receipt, final
+state). Nothing is enabled, authorized or renewed by reading it, and `conformance` is always
+`not_attested_by_this_view`: the view does not claim the guardian conforms. There is no MCP tool
+that reads a route today; use the API.
 
 ### Checking a CPU profile against Salad (opt-in, bounded)
 

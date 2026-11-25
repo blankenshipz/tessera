@@ -89,9 +89,19 @@ class Skip:
     provider_id: str
     reason: str
     detail: str = ""
+    # Structured cause of a licence-label or data-class skip, from the refusal's own fields
+    # (never parsed from ``detail``): ``cause`` with ``labels`` or ``data_class``. Additive.
+    cause: Mapping[str, Any] | None = None
 
-    def payload(self) -> dict[str, str]:
-        return {"provider_id": self.provider_id, "reason": self.reason, "detail": self.detail}
+    def payload(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "provider_id": self.provider_id,
+            "reason": self.reason,
+            "detail": self.detail,
+        }
+        if self.cause:  # absent keeps every earlier payload unchanged
+            value.update(self.cause)
+        return value
 
 
 @dataclass(frozen=True)
@@ -240,7 +250,8 @@ def _check(
     exposure_open: Callable[[sqlite3.Connection], bool],
 ) -> Skip | None:
     """The first existing check this candidate fails, or None when it may run now."""
-    from .campaign_store import CampaignStore, LicenseRefused
+    from .campaign_heavy_remote import refusal_cause
+    from .campaign_store import CampaignStore, DataClassConflict, LicenseRefused
 
     pid = stage.provider
     campaign = ctx.campaign
@@ -288,7 +299,9 @@ def _check(
                 scope=(campaign["org_id"], campaign["project_id"]),
             )
         except LicenseRefused as error:
-            return Skip(pid, "license_label", str(error)[:300])
+            return Skip(pid, "license_label", str(error)[:300], refusal_cause(error))
+        except DataClassConflict as error:
+            return Skip(pid, "untrusted", str(error)[:300], refusal_cause(error))
         except Conflict as error:
             return Skip(pid, "untrusted", str(error)[:300])
         pull = campaign_image_pull.refusal_detail(campaign_image_pull.evaluate(provider, stage))

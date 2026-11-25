@@ -418,8 +418,10 @@ class CampaignStore(
 
         A provider whose trust entry lists ``allowed_license_labels`` receives a stage only if
         every effective label of every input (snapshot labels, inherited through lineage) is in
-        that list; a provider the trust file lists without the key is unrestricted, and one it
-        does not list may receive only ``unlabelled`` data. When the labels cannot be
+        that list; a provider the trust file does not list, or lists without the key while
+        it is third-party (or unregistered), may receive only ``unlabelled`` data; an
+        operator-owned provider listed without the key is unrestricted (ADR 0113 amendment
+        2026-11-23). When the labels cannot be
         determined for a restricted provider the stage is refused, never admitted. A busy or
         locked database (``sqlite3.OperationalError``) is transient and propagates so the
         caller retries; it is never turned into a refusal. Returns the labels checked."""

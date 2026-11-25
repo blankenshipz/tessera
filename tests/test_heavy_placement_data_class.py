@@ -195,7 +195,14 @@ def test_a_listed_salad_the_trust_forbids_is_skipped_and_local_says_why(tmp_path
     assert event["reasons"] == block["reasons"]
     (skip,) = [s for s in placed["skipped"] if s["provider_id"] == "salad"]
     assert skip["reason"] == "license_label" and NON_COMMERCIAL in skip["detail"]
-    assert block["detail"] == [{"provider_id": "salad", "reason": "license_label"}]
+    assert block["detail"] == [
+        {
+            "provider_id": "salad",
+            "reason": "license_label",
+            "cause": "license_label",  # structured cause from the refusal, not the message
+            "labels": [NON_COMMERCIAL],
+        }
+    ]
     assert block["reasons"] == ["remote_skipped"]
 
 

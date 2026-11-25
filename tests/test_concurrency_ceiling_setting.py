@@ -273,7 +273,7 @@ def test_schema_check_is_the_hard_cap(tmp_path):
 
 
 def test_migration_rebuilds_old_check_and_keeps_rows(tmp_path):
-    assert PROJECT_CONCURRENCY_SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 89
+    assert PROJECT_CONCURRENCY_SCHEMA_VERSION == 89 <= LATEST_SCHEMA_VERSION
     assert MIGRATIONS[88].__name__ == "migrate_project_concurrency_schema"
     fresh = tmp_path / "fresh"
     initialize_state(fresh)

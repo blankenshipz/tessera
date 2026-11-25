@@ -32,6 +32,9 @@ NAME_NOTE = (
     "Class names are not recorded locally; the provider's class catalog is read live at "
     "admission. Select by id."
 )
+TRUNCATED_NOTE = (
+    f"Only the newest {MAX_ROWS} recorded attempts were read, so the counts may be too low."
+)
 INSTABILITY_BASIS = (
     "Guardian final records of Salad attempts whose profile names the class: pre-start "
     "re-binds and attempts flagged allocation_uncertain."
@@ -131,6 +134,8 @@ def build_listing(
 ) -> dict[str, Any]:
     """The listing from loaded profiles and recorded attempts (``None``: receipts unavailable)."""
     profiles = list(profiles)
+    attempts = None if attempts is None else list(attempts)
+    truncated = attempts is not None and len(attempts) >= MAX_ROWS
     by_class: dict[str, list[SaladCampaignProfile]] = {}
     for profile in profiles:
         if profile.gpu_class is not None:
@@ -156,6 +161,15 @@ def build_listing(
     for cid in sorted(by_class):
         tally = seen[cid]
         recorded = attempts is not None and tally["attempts"] > 0
+        instability: dict[str, Any] = {
+            "status": "recorded" if recorded else NOT_RECORDED,
+            "window_days": window_days,
+            "attempts_with_guardian_record": tally["attempts"] if recorded else None,
+            "prestart_rebinds": tally["rebinds"] if recorded else None,
+            "allocation_uncertain_attempts": tally["uncertain"] if recorded else None,
+        }
+        if truncated:
+            instability["truncated"] = True
         classes.append(
             {
                 "id": cid,
@@ -165,20 +179,14 @@ def build_listing(
                 "max_run_cents": max(p.max_run_cents for p in by_class[cid]),
                 "published_hourly_rate_usd": tally["rate"],
                 "price_status": "recorded_on_latest_receipt" if tally["rate"] else NOT_RECORDED,
-                "allocation_instability": {
-                    "status": "recorded" if recorded else NOT_RECORDED,
-                    "window_days": window_days,
-                    "attempts_with_guardian_record": tally["attempts"] if recorded else None,
-                    "prestart_rebinds": tally["rebinds"] if recorded else None,
-                    "allocation_uncertain_attempts": tally["uncertain"] if recorded else None,
-                },
+                "allocation_instability": instability,
             }
         )
     return {
         "schema": SCHEMA,
         "classes": classes,
         "cpu_only_profiles": sum(1 for p in profiles if p.gpu_class is None),
-        "notes": [NAME_NOTE, INSTABILITY_BASIS],
+        "notes": [NAME_NOTE, INSTABILITY_BASIS] + ([TRUNCATED_NOTE] if truncated else []),
     }
 
 
@@ -213,6 +221,8 @@ def render_text(listing: Mapping[str, Any]) -> str:
             )
         else:
             seen = "not_recorded"
+        if stats.get("truncated"):
+            seen += " (truncated)"
         lines.append(
             f"{item['id']}  profiles={','.join(item['profiles'])}  "
             f"max_run_cents={item['max_run_cents']}  usd/hour={rate}  "

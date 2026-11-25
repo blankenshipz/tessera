@@ -431,7 +431,11 @@ def derive_candidate_config(
         *refs,
     ]
     if len(template) > MAX_TEMPLATE_TOKENS:
-        raise _refuse(stage, "the argv is too large to carry in a Salad workload argv")
+        raise _refuse(
+            stage,
+            "the argv is too large to carry in a Salad workload argv (long pinned public_artifact "
+            "URLs, many pinned files or a long stage argv are the usual cause)",
+        )
     try:
         contract = WorkloadContractV1.model_validate(
             {

@@ -28,6 +28,7 @@ from pydantic import (
 
 from .artifact_limits import ABSOLUTE_MAX_ARTIFACT_BYTES
 from .campaign_providers import TrustClass
+from .campaign_seals import validate_seals
 from .data_class import OUTPUT_DATA_CLASS, PRIVATE_DERIVED, PUBLIC, DataClass
 from .egress_models import EgressPolicy
 from .evaluation_models import MetricCategory
@@ -627,6 +628,43 @@ class EvaluationSpec(_Strict):
         return value
 
 
+# ADR 0164: the role a sealed input or artifact is opened for (for example ``evaluation``).
+SealRole = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
+MAX_SEALS = 32
+MAX_STAGE_ROLES = 8
+
+
+class SealSpec(_Strict):
+    """Data a v2 spec seals for one role (ADR 0164).
+
+    Name exactly one target: ``digest``, the pinned digest of a ``snapshot`` or ``artifact``
+    input (sealed wherever any stage mounts it), or ``stage`` and ``output``, one output of a
+    stage in this spec. Only a stage whose ``roles`` include ``role`` may mount the sealed data
+    or anything derived from it inside the spec; parsing refuses every other stage."""
+
+    name: Key
+    role: SealRole
+    digest: Sha256Digest | None = None
+    stage: Key | None = None
+    output: Key | None = None
+
+    @model_validator(mode="after")
+    def _one_target(self) -> SealSpec:
+        if (self.stage is None) != (self.output is None):
+            raise ValueError(f"Seal {self.name!r}: stage and output go together")
+        if (self.digest is None) == (self.stage is None):
+            raise ValueError(f"Seal {self.name!r}: name exactly one of digest and stage/output")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler):
+        value = handler(self)
+        for key in ("digest", "stage", "output"):
+            if value.get(key) is None:
+                value.pop(key, None)
+        return value
+
+
 # ADR 0060: a stage may name further provider candidates after its own, in order.
 MAX_ALTERNATE_PROVIDERS = 4
 # ADR 0070: a stage's placement tags, matched by an operator placement preference.
@@ -826,6 +864,9 @@ class StageV2(_Strict):
     # ADR 0141: set by submit only (see ``HeavyRemoteRecord``): a submitted value is discarded
     # and recomputed there, never trusted. Absent keeps the digest.
     heavy_remote_candidate: HeavyRemoteRecord | None = None
+    # ADR 0164: the roles this stage acts in; only a stage declaring a seal's role may read the
+    # sealed data. Absent keeps the digest.
+    roles: Annotated[list[SealRole], Field(min_length=1, max_length=MAX_STAGE_ROLES)] | None = None
 
     @model_validator(mode="after")
     def _one_image(self) -> StageV2:
@@ -888,6 +929,8 @@ class StageV2(_Strict):
             value.pop("image_resolved_from", None)
         if self.heavy_remote_candidate is None:
             value.pop("heavy_remote_candidate", None)
+        if self.roles is None:
+            value.pop("roles", None)
         if self.evaluation is None:
             value.pop("evaluation", None)
         if self.send_classes is None:
@@ -926,6 +969,8 @@ class CampaignSpecV2(_Strict):
     # present; absent keeps every existing digest.
     not_before: NotBefore | None = None
     stages: Annotated[list[StageV2], Field(min_length=1, max_length=MAX_STAGES_V2)]
+    # ADR 0164: inputs and artifacts sealed for a role; absent keeps every existing digest.
+    seals: Annotated[list[SealSpec], Field(min_length=1, max_length=MAX_SEALS)] | None = None
 
     @field_validator("not_before")
     @classmethod
@@ -943,6 +988,8 @@ class CampaignSpecV2(_Strict):
         value = handler(self)
         if self.not_before is None:
             value.pop("not_before", None)
+        if self.seals is None:
+            value.pop("seals", None)
         return value
 
     @model_validator(mode="after")
@@ -1084,6 +1131,8 @@ class NormalStage:
     code_input: str | None = None
     # ADR 0123: the image-build plan (``BuildSpec`` as a dict) or None.
     build: dict[str, Any] | None = None
+    # ADR 0164: the roles the stage acts in (a sealed input needs its role here).
+    roles: tuple[str, ...] = ()
 
     @property
     def holdout(self) -> HoldoutClaimSpec | None:
@@ -1167,6 +1216,8 @@ class NormalSpec:
     stages: tuple[NormalStage, ...]
     worker_principal_id: str | None = None
     not_before: str | None = None
+    # ADR 0164: the spec's seals (v2 only); empty when the spec declares none.
+    seals: tuple[SealSpec, ...] = ()
 
     def stage(self, key: str) -> NormalStage:
         return next(item for item in self.stages if item.key == key)
@@ -1353,6 +1404,7 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                 expected_duration_seconds=stage.expected_duration_seconds,
                 code_input=stage.code_input,
                 build=None if stage.build is None else stage.build.model_dump(mode="json"),
+                roles=tuple(stage.roles or ()),
             )
         )
     return NormalSpec(
@@ -1364,6 +1416,7 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
         tuple(stages),
         None,
         spec.not_before,
+        tuple(spec.seals or ()),
     )
 
 
@@ -1724,6 +1777,8 @@ def validate_structure(spec: NormalSpec) -> None:
     data_edges = sum(len(stage.inputs) - (stage.code_input is not None) for stage in spec.stages)
     if data_edges > spec.max_edges:
         raise ValueError(f"Campaign declares more than {spec.max_edges} stage inputs in total")
+    # ADR 0164: no stage reads sealed data, directly or through lineage, without its role.
+    validate_seals(spec)
     classes = stage_classes(spec)
     for stage in spec.stages:
         input_class = classes[stage.key][0]

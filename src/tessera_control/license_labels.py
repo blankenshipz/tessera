@@ -8,9 +8,13 @@ labels of everything the upstream stage read; an artifact input carries those of
 stage, computed the same way from the source campaign's stored spec). An input whose lineage
 cannot be resolved carries ``unknown-lineage`` as well as ``unlabelled``.
 
-The operator's provider trust file may restrict what a provider receives with
-``allowed_license_labels``. A stage goes to a restricted provider only if every effective label
-of every input is in that list (fail closed: unlabelled data needs ``unlabelled`` in the list).
+The operator's provider trust file says what a provider may receive with
+``allowed_license_labels``. A stage goes to a provider only if every effective label of every
+input is in that list (fail closed: unlabelled data needs ``unlabelled`` in the list); a
+third-party (or unregistered or unlisted) provider without the list receives only ``unlabelled``
+data, while an operator-owned provider listed without it is unrestricted. A recorded stage
+output keeps the labels its inputs carried (``campaign_output_license_labels``), so later
+campaigns that read it inherit them.
 Labels carry no experiment, dataset or vendor meaning here; the vocabulary is the operator's.
 """
 
@@ -237,6 +241,100 @@ def inherit_snapshot_labels(
     }
 
 
+def create_output_license_schema(connection: sqlite3.Connection) -> None:
+    """The labels a recorded campaign stage output carries (ADR 0113 amendment 2026-11-23).
+
+    One add-only row per campaign stage, written when the stage's outputs are first indexed.
+    Shared by the migration and fresh databases. Additive, idempotent."""
+    for statement in (
+        """CREATE TABLE IF NOT EXISTS campaign_output_license_labels (
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+        stage_key TEXT NOT NULL,
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        labels_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (campaign_id, stage_key))""",
+        """CREATE TRIGGER IF NOT EXISTS campaign_output_license_labels_no_delete
+        BEFORE DELETE ON campaign_output_license_labels
+        BEGIN SELECT RAISE(ABORT, 'recorded output labels are permanent'); END""",
+        """CREATE TRIGGER IF NOT EXISTS campaign_output_license_labels_add_only
+        BEFORE UPDATE ON campaign_output_license_labels
+        WHEN NEW.campaign_id != OLD.campaign_id OR NEW.stage_key != OLD.stage_key
+            OR NEW.org_id != OLD.org_id OR NEW.project_id != OLD.project_id
+            OR EXISTS (
+                SELECT 1 FROM json_each(OLD.labels_json)
+                WHERE value NOT IN (SELECT value FROM json_each(NEW.labels_json)))
+        BEGIN SELECT RAISE(ABORT, 'recorded output labels can only be added'); END""",
+    ):
+        connection.execute(statement)
+
+
+def recorded_output_labels(
+    connection: sqlite3.Connection,
+    campaign_id: str,
+    stage_key: str,
+    *,
+    org_id: str,
+    project_id: str,
+) -> frozenset[str] | None:
+    """The labels recorded for a campaign stage's outputs, or None when none were recorded."""
+    row = connection.execute(
+        """SELECT labels_json FROM campaign_output_license_labels
+        WHERE campaign_id=? AND stage_key=? AND org_id=? AND project_id=?""",
+        (campaign_id, stage_key, org_id, project_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return frozenset(json.loads(row[0])) or _UNRESOLVED
+
+
+def record_output_labels(
+    connection: sqlite3.Connection, campaign: Mapping[str, Any], stage_key: str, now: str
+) -> list[str]:
+    """Record (add-only) the labels a stage's outputs carry, in the caller's transaction.
+
+    The labels are those of every input of the stage, computed from the campaign's stored
+    spec. A lineage that cannot be computed is recorded as ``unknown-lineage`` (fail closed);
+    a busy database propagates for a retry. Returns the recorded labels."""
+    from .campaign_models import normalize, parse_spec_json
+
+    org_id, project_id = campaign["org_id"], campaign["project_id"]
+    try:
+        row = connection.execute(
+            "SELECT spec_json FROM campaigns WHERE id=? AND org_id=? AND project_id=?",
+            (campaign["id"], org_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("campaign not found")
+        spec = normalize(parse_spec_json(row[0]))
+        labels = set(
+            stage_labels(connection, spec, stage_key, org_id=org_id, project_id=project_id)
+        )
+    except sqlite3.OperationalError:
+        raise
+    except Exception:  # noqa: BLE001 - an unreadable lineage is recorded as unknown, never clean
+        labels = set(_UNRESOLVED)
+    current = recorded_output_labels(
+        connection, campaign["id"], stage_key, org_id=org_id, project_id=project_id
+    )
+    if current is None:
+        merged = sorted(labels)
+        connection.execute(
+            "INSERT INTO campaign_output_license_labels VALUES (?,?,?,?,?,?)",
+            (campaign["id"], stage_key, org_id, project_id, json.dumps(merged), now),
+        )
+        return merged
+    merged = sorted(set(current) | labels)
+    if merged != sorted(current):
+        connection.execute(
+            """UPDATE campaign_output_license_labels SET labels_json=?, updated_at=?
+            WHERE campaign_id=? AND stage_key=?""",
+            (json.dumps(merged), now, campaign["id"], stage_key),
+        )
+    return merged
+
+
 def _stage_union(
     connection: sqlite3.Connection,
     spec: Any,
@@ -246,13 +344,19 @@ def _stage_union(
     depth: int,
     path: frozenset[tuple[Any, str]],
     spec_id: Any,
+    memo: dict[tuple[Any, str], dict[str, frozenset[str]]],
 ) -> dict[str, frozenset[str]]:
-    """Input name -> effective labels for one stage of ``spec``."""
+    """Input name -> effective labels for one stage of ``spec``.
+
+    Stage inputs follow the spec's own (acyclic, bounded) stage graph without a depth limit;
+    ``depth`` counts campaign hops (artifact inputs) only. ``path`` refuses a cycle."""
+    marker = (spec_id, stage_key)
+    if marker in memo:
+        return memo[marker]
     try:
         stage = spec.stage(stage_key)
     except StopIteration:
         return {}
-    marker = (spec_id, stage_key)
     result: dict[str, frozenset[str]] = {}
     for item in stage.inputs:
         if marker in path or depth > MAX_DEPTH:
@@ -270,11 +374,17 @@ def _stage_union(
                 result[item.name] = _UNRESOLVED
             else:
                 upstream = _stage_union(
-                    connection, spec, item.stage, org_id, project_id, depth + 1, inner, spec_id
+                    connection, spec, item.stage, org_id, project_id, depth, inner, spec_id, memo
                 )
                 result[item.name] = _flatten(upstream)
-        else:  # artifact: another campaign's output, from its stored spec
-            result[item.name] = _artifact_labels(connection, item, org_id, project_id, depth, inner)
+        elif item.kind == "artifact":  # another campaign's output
+            result[item.name] = _artifact_labels(
+                connection, item, org_id, project_id, depth, inner, memo
+            )
+        else:  # an input kind this guard does not know: fail closed
+            result[item.name] = _UNRESOLVED
+    if marker not in path:
+        memo[marker] = result
     return result
 
 
@@ -292,11 +402,18 @@ def _artifact_labels(
     project_id: str,
     depth: int,
     path: frozenset[tuple[Any, str]],
+    memo: dict[tuple[Any, str], dict[str, frozenset[str]]],
 ) -> frozenset[str]:
+    """The labels of an earlier campaign's output: recomputed from its stored spec, united with
+    the labels recorded when the output was indexed. Where recomputation cannot finish (the
+    campaign-hop limit) the recorded labels stand in; without them it is ``unknown-lineage``."""
     from .campaign_models import normalize, parse_spec_json
 
+    recorded = recorded_output_labels(
+        connection, item.campaign_id, item.stage, org_id=org_id, project_id=project_id
+    )
     if depth + 1 > MAX_DEPTH:
-        return _UNRESOLVED
+        return _UNRESOLVED if recorded is None else recorded
     row = connection.execute(
         "SELECT spec_json FROM campaigns WHERE id=? AND org_id=? AND project_id=?",
         (item.campaign_id, org_id, project_id),
@@ -319,17 +436,24 @@ def _artifact_labels(
             depth + 1,
             path,
             marker_id,
+            memo,
         )
     except (ValueError, TypeError, KeyError):
-        return _UNRESOLVED
-    return _flatten(inputs)
+        return _UNRESOLVED if recorded is None else recorded
+    computed = _flatten(inputs)
+    if recorded is None:
+        return computed
+    # The recorded row is the lineage of record; recomputation adds labels given since.
+    return recorded | (computed - {UNKNOWN_LINEAGE})
 
 
 def effective_labels(
     connection: sqlite3.Connection, spec: Any, stage_key: str, *, org_id: str, project_id: str
 ) -> dict[str, frozenset[str]]:
     """Input name -> the labels that input carries, through lineage (``spec`` is a NormalSpec)."""
-    return _stage_union(connection, spec, stage_key, org_id, project_id, 0, frozenset(), id(spec))
+    return _stage_union(
+        connection, spec, stage_key, org_id, project_id, 0, frozenset(), id(spec), {}
+    )
 
 
 def stage_labels(

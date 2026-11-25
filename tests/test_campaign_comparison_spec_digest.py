@@ -26,9 +26,9 @@ def _get(client, headers, cid):
 
 def _edit_spec(database, cid, edit):
     with _connect(database) as connection:
-        text = connection.execute(
-            "SELECT spec_json FROM campaigns WHERE id=?", (cid,)
-        ).fetchone()["spec_json"]
+        text = connection.execute("SELECT spec_json FROM campaigns WHERE id=?", (cid,)).fetchone()[
+            "spec_json"
+        ]
         spec = json.loads(text)
         edit(spec)
         connection.execute(

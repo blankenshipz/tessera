@@ -27,6 +27,7 @@ from .campaign_models import (
 from .campaign_placement import final_refusal
 from .campaign_placement import placements as recorded_placements
 from .campaign_rerun import lineage_of
+from .campaign_seals import sealed_access
 from .campaign_submissions import submission_receipt_section
 from .code_approval import input_classes, snapshot_code_approval
 from .delegation_receipts import delegation_receipt_section
@@ -875,6 +876,8 @@ def build_receipt(
         )
         spec_stage = normal.stage(stage["stage_key"])
         code_info = code_summary(connection, spec_stage)
+        # ADR 0164: what the stage reads under a seal, and for which role; absent otherwise.
+        sealed = sealed_access(normal, stage["stage_key"])
         stage_rows.append(
             {
                 "stage_key": stage["stage_key"],
@@ -894,6 +897,7 @@ def build_receipt(
                     **_bound_section(connection, current, stage["stage_key"]),
                 },
                 **({} if code_info is None else {"code": code_info}),
+                **({"sealed_access": sealed} if sealed else {}),
                 "output_data_class": stage["output_data_class"],
                 "attempts": [
                     _attempt_entry(

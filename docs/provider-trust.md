@@ -49,10 +49,15 @@ adds.
 ## Limiting a provider by licence label
 
 A provider entry may also carry `allowed_license_labels`: a list of 1 to 16 unique label slugs (the
-same slugs a person adds to snapshots, see [licence labels](license-labels.md)). A provider the file lists
-without the key is unrestricted and the setting digest is unchanged; a provider the file does not list
-(a registered provider under `all_registered_providers`, say) is refused anything labelled and may receive
-only `unlabelled` data. Present, the provider receives a stage only if every
+same slugs a person adds to snapshots, see [licence labels](license-labels.md)). A provider the file
+does not list (a registered provider under `all_registered_providers`, say) may receive only `unlabelled`
+data. A listed provider without the key is unrestricted only when it is registered as the operator's own
+capacity (`third_party` false: `local-docker`, self-hosted workers); a third-party provider (a Salad
+route) or an id not registered in the serving process listed without the key also receives only
+`unlabelled` data, so labelled data, and derived (`private_derived`) data built from it, reaches it only
+where its entry names the label (ADR 0113, amended 2026-11-23; earlier every listed provider without the
+key was unrestricted). Leaving the key out keeps the setting digest unchanged and keeps unlabelled data
+flowing as before. Present, the provider receives a stage only if every
 effective label of every input, inherited through lineage, is in the list; unlabelled data needs
 `unlabelled` in it, and data whose lineage cannot be resolved (`unknown-lineage`) is always refused. It
 applies in every mode, `all_registered_providers` included, and only narrows what the data class rules

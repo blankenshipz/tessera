@@ -275,3 +275,29 @@ def test_route_says_so_when_no_file_is_configured_and_fails_closed_on_a_bad_one(
     world.path.write_text("{broken")
     world.path.chmod(0o600)
     assert world.client.get(url, headers=world.human()).status_code == 409
+
+
+def test_a_read_at_the_row_cap_is_marked_truncated(tmp_path, monkeypatch):
+    rows = [("a-one", final(), now_text(0)), ("a-one", final(), now_text(1))]
+    path = database(tmp_path / "db.sqlite3", rows)
+    full = gpu.list_gpu_classes([make("a-one")], path)
+    assert "truncated" not in full["classes"][0]["allocation_instability"]
+    monkeypatch.setattr(gpu, "MAX_ROWS", 2)
+    capped = gpu.list_gpu_classes([make("a-one")], path)
+    assert capped["classes"][0]["allocation_instability"]["truncated"] is True
+    assert len(capped["notes"]) == len(full["notes"]) + 1
+    assert "(truncated)" in gpu.render_text(capped)
+    assert "(truncated)" not in gpu.render_text(full)
+
+
+def test_cli_refuses_a_window_outside_range_with_or_without_a_state_dir(tmp_path, capsys):
+    path = _providers_file(tmp_path, make("a-one"))
+    state = tmp_path / "state"
+    state.mkdir()
+    database(state / "tessera.sqlite3", [])
+    for extra in ([], ["--state-dir", str(state)]):
+        for days in ("0", "91"):
+            argv = ["providers", "gpu-classes", "--file", str(path), "--days", days, *extra]
+            assert main(argv) == 2
+            captured = capsys.readouterr()
+            assert "refused" in json.loads(captured.err) and captured.out == ""

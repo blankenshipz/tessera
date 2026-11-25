@@ -77,7 +77,7 @@ synthetic composition as target-level remote deployment; no cluster was operated
 
 `GET /tasks/{task_id}/remote-executions` lists at most 32 routes, failing closed
 rather than truncating. `GET /remote-executions/{id}` exposes route, authority,
-provider status, receipts and go/no-go. Desktop task detail has **Inspect /
+provider status, receipts and go/no-go (see [Reading a route](#reading-a-route)). Desktop task detail has **Inspect /
 reconnect remote execution**, exact review/start and pause/cancel controls.
 Structured proposal authoring remains API-first. Logs/checkpoints/artifacts are
 textual evidence references, not arbitrary URLs, automatic downloads or shell tools.
@@ -88,6 +88,50 @@ in one transaction. A 202 stop reply is `pending`; missing evidence/timeout is
 retried. Read-only `observe` reconciles the same identity. Delete requires stop
 intent and confirmed termination and is itself one-shot. Restart does not reset
 any intent, operation, epoch, provider identity, bounded observation count or lease.
+
+### Reading a route
+
+`GET /remote-executions/{id}` has two shapes, and both are read-only: nothing in them
+enables, authorizes or renews anything.
+
+* **Any route that is not a campaign Salad attempt** reports `control_surface:
+  desktop_control_only` and `go_no_go: no_go_live_activation_blocked`; a Salad route also
+  carries `proxy_safety`. Live activation of control's built-in `SaladProxy` stays blocked.
+* **A route owned by a campaign Salad attempt** is dispatched by the Salad executor through the
+  guardian, not by the built-in proxy, so it reports `control_surface:
+  campaign_executor_guardian`, a `live_path` object, and a labelled `builtin_proxy` object. The
+  top-level `go_no_go` (`no_go_live_activation_blocked`) and `proxy_safety` stay for existing
+  readers such as the desktop renderer: the built-in proxy and desktop-initiated activation remain
+  blocked, and the campaign path is reported in `live_path`.
+
+`live_path` fields: `dispatcher` (`salad_executor_guardian`), `campaign_id`, `stage_key`,
+`attempt`, `attempt_phase`; `executor` (`registered`, `lifecycle_state`,
+`heartbeat_age_seconds`, `heartbeat_max_age_seconds`, `freshness` fresh|stale); `lease` (`state`
+none|held|expired, `expires_in_seconds`); `guardian` (`evidence_recorded`,
+`live_receipt_recorded`, `final_recorded`, `conformance`); `readiness`; `reasons`;
+`authorizes_nothing: true`.
+
+`readiness` is `finished` once the attempt is no longer in an executor-driven phase, `not_ready`
+when the store would refuse the executor's worker outright, `degraded` for the remaining reasons
+(`executor_heartbeat_stale`, `no_lease`, `lease_expired`), and `ready` when there are none.
+`reasons` may contain `executor_retired`, `executor_not_registered`,
+`executor_not_ready:<state>` (any other lifecycle state `require_ready_worker` refuses:
+`draining`, `disconnected`, `quarantined`, even with a fresh heartbeat),
+`executor_credential_revoked|expired|expiry_unknown` (the worker credential, derived by
+`workers.derive_credential_status`, the same derivation worker discovery fences on),
+`executor_project_mismatch` (the worker is registered to a different project than the campaign),
+`executor_heartbeat_stale`, `no_lease` and `lease_expired` (the two lease reasons are not raised
+while the attempt still awaits its lease). Heartbeat freshness uses the worker registry's own
+`HEARTBEAT_MAX_AGE`. Limitation: the view is a reading of recorded rows; it does not evaluate the
+live principal behind a request (the store's `require_ready_worker` also matches the presenting
+credential), so it reads the credential bound to the registry row. `conformance` is always `not_attested_by_this_view`: the view reports what is
+recorded, and deliberately does not claim the guardian conforms.
+
+`builtin_proxy` is the state of control's own proxy (`state: disabled`, `go_no_go:
+no_go_live_activation_blocked`, `control_surface: desktop_control_only`, `proxy_safety`). Campaign
+stages do not use it; it is shown so the disabled built-in proxy is not mistaken for, or hidden
+by, the campaign path. The `salad_safety` prerequisites are unchanged. There is no MCP tool that
+reads a route today.
 
 Desktop close/disconnect sends no stop or heartbeat. Reconnect reads current state;
 missing UI connectivity proves nothing about termination. Continued execution

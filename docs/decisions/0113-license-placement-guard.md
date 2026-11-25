@@ -85,3 +85,48 @@ data, any provider and any label vocabulary, without naming a dataset or a vendo
 The runner records the labels it checked at reservation as `campaign.stage_license_checked`; the
 receipt reports those (`license_labels_checked: "dispatch"`) rather than recomputing at close. A busy
 database (`sqlite3.OperationalError`) during the check propagates for a retry; it is never a refusal.
+
+## Amendment 2026-11-23: a label is admitted only where a trust entry names it
+
+Context. Decision 4 left a provider the trust file lists without `allowed_license_labels`
+unrestricted. Derived data (`private_derived`) built from a labelled source is admitted by data-class
+trust alone, so a provider listed for `private_derived` without a label list received non-commercial
+or restricted-derivation data and everything derived from it; only a campaign spec's
+`forbid_providers` list kept such data off. Labels are open slugs, so a label nobody had named (a typo)
+also reached every such provider.
+
+Decision (narrows only; no change for unlabelled data):
+
+1. **Closed for third-party capacity, fail closed.** A provider listed without the key whose
+   registered descriptor declares `third_party` (every Salad route must), or that is not registered
+   in the process checking it, may receive only `unlabelled` data, exactly like a provider the file
+   does not list. Any explicit label, whatever the vocabulary (a label no entry names included), and
+   `unknown-lineage` are refused; the placement skip reason stays `license_label` and the refusal
+   names the labels. To admit a label, name it in the provider's `allowed_license_labels` (with
+   `unlabelled` if the provider should keep receiving unlabelled data). A provider registered as the
+   operator's own capacity (`third_party` false: `local-docker`, self-hosted worker grants) listed
+   without the key stays unrestricted, as decision 4 said: the labels describe what may not go to
+   rented third-party capacity, and refusing them on the operator's own host would block labelled
+   data everywhere. The trust document, its canonical form and its digest are unchanged;
+   `lists_license_labels` (receipt shape) still reports only an explicit key.
+2. **Lineage within a campaign is not depth-limited.** A stage input is resolved through the spec's
+   stage graph (memoized, cycle-checked); the depth limit (8) now counts campaign hops only, so a long
+   pipeline in one campaign no longer reads as `unknown-lineage`.
+3. **Recorded outputs keep their labels.** When a stage's outputs are first indexed (the runner's
+   `campaign_stage_io` output rows), the labels its inputs carry are stored in
+   `campaign_output_license_labels` (one add-only row per campaign stage, org and project scoped; a
+   later attempt adds labels, never removes them), in the same transaction. An `artifact` input (and
+   so a resolved `receipt_output` input) carries the recomputed labels united with the recorded ones;
+   where recomputation stops at the hop limit the recorded labels are used instead of
+   `unknown-lineage`. Outputs recorded before the table existed are recomputed only, as before.
+   Schema change: the table, migration schema 89 (reserved as 100; contiguous after 88).
+4. **Public fetches are unlabelled.** A `public_artifact` input (ADR 0097) is `unlabelled`, as any
+   source nobody labelled, instead of `unknown-lineage`.
+
+Consequences. An operator who listed a third-party provider without the key and labelled data meant
+for it must now name the labels on that provider (the 409 or placement skip says which). Deep cross-campaign
+chains recorded after this change no longer depend on the recompute limit. A label added to a source
+after a downstream output was recorded reaches it through recomputation (within 8 campaign hops), not
+through the recorded row (the same limit as derived snapshots).
+
+Tests: `tests/test_lineage_use_restriction_labels.py`.

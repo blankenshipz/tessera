@@ -67,6 +67,8 @@ def _gpu_classes(arguments: argparse.Namespace, path: Path) -> int:
     from .store import _database_path
 
     try:
+        if type(arguments.days) is not int or not 1 <= arguments.days <= gpu.MAX_WINDOW_DAYS:
+            raise gpu.GpuClassListingError(f"The window must be 1 to {gpu.MAX_WINDOW_DAYS} days.")
         database = None
         if arguments.state_dir is not None:
             database = _database_path(Path(arguments.state_dir))

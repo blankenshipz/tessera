@@ -80,6 +80,16 @@ snapshot either. The claim ends `scored` (with the metric
 values) or `spent` and is on the receipt (`holdout_claims`); read it with
 `tessera_campaign_holdout` or `tessera_campaign_holdout_claims`.
 
+A v2 spec may also seal data for a role inside the campaign (`seals`,
+[ADR 0164](decisions/0164-sealed-role-inputs.md)). Each seal has a `name`, a `role` and either a
+`digest` (any `snapshot` or `artifact` input pinned to it, in any stage) or a `stage` and `output`
+of the spec. A stage that mounts sealed data, or an output derived from it at any depth, must list
+the role in its `roles`, or the spec is refused when parsed (submit, validate, approval and every
+runner read); the producing stage of a sealed output needs no role. Each stage receipt entry lists
+what it read under a seal (`sealed_access`: seal, role, input, `direct` or `lineage` with
+`from_stage`). A re-run plan keeps the seals of the outputs it pins. Seals are a per-spec rule;
+combine them with a `holdout` claim when a score must also be one-time.
+
 ```
 tessera campaign submit --owner-header FILE --project-id P --spec spec.json --idempotency-key K
 ```
@@ -152,7 +162,10 @@ the verified bytes by digest: the local worker in its private cache directory, a
 when the provider supplies persistent storage ([ADR 0116](decisions/0116-provider-fetch-cache.md)). Every
 reuse is re-hashed and a bad entry is refetched; cached bytes never go to the control plane. The receipt's
 `public_fetch` per-file entry records `cache` (`hit`, `miss`, `unavailable` or `off`) and the byte count,
-and the object carries `cache_requested: true` only when a source asked for it.
+and the object carries `cache_requested: true` only when a source asked for it. A cache entry is a copy
+(never a link) kept in the cache directory outside the work tree, so a pinned file with `cache: true` may
+occupy up to twice its size on the provider's disk (the verified file and its cache copy); the Salad
+adapter's `disk_mb` check counts the pinned bytes once, so leave room for that.
 
 ## The one human approval
 
@@ -312,6 +325,14 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   the ADR 0141 record and in the guard `detail` (amendment 2026-11-23c). Without a Salad
   profile a heavy local placement records only `no_remote_profile` (as a warning, also in refuse mode); light stages are
   unaffected.
+  A placement skip for a licence label or data class also carries additive `cause` fields on the
+  `campaign.stage_placed` / waiting `skipped` entry, the receipt `placement` block and the guard
+  `detail`: `cause: license_label` with `labels`, or `cause: data_class` with `data_class`. The reason
+  code and message are unchanged. A third-party provider (Salad) receives an explicitly labelled
+  input (or derived data that inherits a label, within a campaign or through a recorded output of an
+  earlier one) only when its trust entry's `allowed_license_labels` names that label; its entry
+  without the key admits unlabelled data only, so a spec's `forbid_providers` list is no longer the
+  only thing keeping such data off it (operator-owned providers listed without the key are unchanged) ([licence labels](license-labels.md), ADR 0113 amendment 2026-11-23).
 - **Grant lifetime and slots (ADR 0048).** A stage whose `grant_ttl_seconds` is shorter than
   `max_duration_seconds` plus 300 s is refused at submit and approval
   (`grant_shorter_than_stage_duration`). The runner issues a grant, and so starts its

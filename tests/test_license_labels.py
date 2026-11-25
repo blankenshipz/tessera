@@ -301,16 +301,16 @@ def test_an_unknown_upstream_stage_and_a_cycle_fail_closed(env):
     assert labels_of(env, ghost, "b") == {"g": {ll.UNLABELLED, ll.UNKNOWN_LINEAGE}}
 
 
-def test_a_chain_deeper_than_the_limit_reads_as_unknown_lineage(env):
+def test_a_long_chain_in_one_spec_carries_its_source_label(env):
+    # Stage hops within one spec are not depth-limited (ADR 0113 amendment 2026-11-23); the
+    # campaign-hop limit is covered in test_lineage_use_restriction_labels.
     add(env, env.snapshot_id, ["non-commercial"])
     depth = ll.MAX_DEPTH + 3
     stages = [stage("s0", [snap(env, "a", env.snapshot_id)])]
     stages += [stage(f"s{i}", [up("up", f"s{i - 1}")]) for i in range(1, depth + 1)]
     spec = spec_of(env, stages)
-    deep = labels_of(env, spec, f"s{depth}")["up"]
-    assert ll.UNKNOWN_LINEAGE in deep  # the bottom is out of reach: never silently clean
-    near = labels_of(env, spec, "s3")["up"]
-    assert near == {"non-commercial"}
+    assert labels_of(env, spec, f"s{depth}")["up"] == {"non-commercial"}
+    assert labels_of(env, spec, "s3")["up"] == {"non-commercial"}
 
 
 # -- the provider rule ---------------------------------------------------------------------
@@ -325,8 +325,11 @@ def policy(allowed=None, provider="remote"):
     )
 
 
-def test_a_provider_without_a_restriction_receives_anything():
-    assert ll.license_refusal("remote", {"non-commercial", ll.UNLABELLED}, policy()) is None
+def test_an_unregistered_provider_without_a_label_list_receives_unlabelled_data_only():
+    # ADR 0113 amendment 2026-11-23: 'remote' is not registered here, so not known to be the
+    # operator's own capacity; a label reaches it only where its entry names the label.
+    assert ll.license_refusal("remote", {"non-commercial", ll.UNLABELLED}, policy()) is not None
+    assert ll.license_refusal("remote", {ll.UNLABELLED}, policy()) is None
     # A provider the trust file does not list may receive only unlabelled data (fail closed).
     assert ll.license_refusal("unlisted", {ll.UNLABELLED}, policy()) is None
     assert ll.license_refusal("unlisted", {"x"}, policy()) is not None
