@@ -196,6 +196,20 @@ An agent can pin or exclude candidates for the next placement with
 approved list. A stage without
 `alternate_providers` behaves exactly as before.
 
+A stage with a pinned `public_artifact` input hands its executor a pinned-fetch manifest, so
+placement also requires the candidate's executor image to declare the runtime capability
+`pinned_fetch_manifest`. A provider reports what the image that would run the stage can do
+through its optional `runtime_capabilities(stage)` hook; a candidate that does not declare the
+capability, or whose capability cannot be determined (no hook, or the hook cannot tell), is
+skipped with the closed reason `runtime_image_below_floor` (the detail says `capability unknown`
+or what is missing). It is permanent for the attempt: another candidate is taken, and when none
+is left the stage fails with `runtime_image_below_floor`, before anything is prepared or held.
+This holds for a stage with one provider too. Stages without pinned public inputs are never
+asked, so their candidates, events and receipts are unchanged. Worker-grant providers
+(`local-docker`, `self-hosted`) declare the capability, because their worker supervisor, not the
+stage image, fetches the pins. A Salad candidate answers from its profile's
+`image_capabilities` (see the Salad profile example below).
+
 Give each instance its own worker principal (a principal binds one provider in the trust file),
 and set `worker_slots` to the pollers that share it, so placement sees real capacity.
 
@@ -484,6 +498,17 @@ A CPU and a GPU Salad profile (example values; the credential is a reference, ne
 ```
 
 The GPU profile is the same with `"gpu_class": "<GPU class UUID>"` instead of `cpu_rate`.
+
+Optional `image_capabilities` maps an allowlisted image digest to the runtime capabilities the
+operator has verified that image has, e.g. `"image_capabilities": {"sha256:<64 hex>":
+["pinned_fetch_manifest"]}` for a runtime image built with pinned-fetch manifest support (the
+`file` items a stage's `public_artifact` pins become). The only name so far is
+`pinned_fetch_manifest`; a key that is not in `allowed_image_digests`, or an unknown name, is
+refused. It defaults to empty, so existing profiles keep loading and stages without pinned
+public inputs run as before, but a pinned-fetch stage is refused on an image with no entry
+(`runtime_image_below_floor`, capability unknown) until the operator declares it. Declare it only
+for an image rebuilt from a runtime that has the support; an older image is refused at placement
+rather than handed a manifest it cannot process.
 
 `MAX_RUN_CENTS = 5000` and `MAX_TASK_CENTS = 10000` in `salad_campaign_profiles.py` are hard
 schema ceilings only. The 50-cent per-run cap used for live GPU runs is operator configuration in

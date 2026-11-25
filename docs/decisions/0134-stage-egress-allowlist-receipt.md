@@ -56,11 +56,27 @@ equality of ADR 0097); the runner core holds no provider logic.
 The change is additive: the entry of a stage with `public_artifact` inputs gains
 `egress_verdict` (and `refused_transfers` on a violation), and a rented provider's
 `egress_allowlist` object gains `entries`, so receipt digests of such stages change; stages
-without them are unchanged, and a reader of the ADR 0097 object finds every field it had. A `violation` is a visible fact on the
-receipt, not a gate: it does not by itself stop or fail an attempt, and a `declared_only` stage
+without them are unchanged, and a reader of the ADR 0097 object finds every field it had. A `violation` is recorded on the
+receipt and fails the attempt (see the amendment), and a `declared_only` stage
 is not evidence that nothing else was transferred. Salad keeps provider-level broad egress (ADR
 0034 section 5); this record states what was approved and what was reported, not what the
 network carried.
+
+## Amendment: a violation fails the attempt
+
+The runner's single observation point checks the provider's reported transfers against the
+allowlist, whatever the provider's own verdict. A transfer to a host outside it, or of an unpinned
+file, turns a succeeded observation into `failed_permanent` with failure class `egress_violation`
+(host names only in the detail). The attempt is not recorded as a usable result, its evidence is
+not taken, and the receipt still records the refused transfer. A provider failure is left as it
+is. The runner holds no provider logic: a provider that reports no transfers is not checked
+(`declared_only`), and today only the local worker's recorded rows are reachable.
+
+A stage with no `public_artifact` inputs has no pinned hosts, so every transfer its provider
+reports is refused (registered destinations aside, a file there is still not pinned). Its receipt
+then gains a `public_fetch` entry with no `files`, `egress_verdict: violation` and the
+`refused_transfers`, so the violation that failed the attempt is on the record. With nothing
+reported the entry stays absent and the receipt keeps its shape.
 
 ## Follow-up note: Kubernetes phase
 

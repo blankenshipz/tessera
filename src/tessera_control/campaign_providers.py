@@ -107,6 +107,33 @@ def placement_capability_of(provider: Any, stage: Any) -> PlacementCapability | 
     return None
 
 
+# Runtime capabilities a provider's executor image may declare for a stage candidate. The
+# vocabulary is closed; placement requires a capability only of a stage that needs it.
+# ``pinned_fetch_manifest``: the image's runtime downloads and verifies a stage's pinned
+# ``public_artifact`` files (ADR 0097) from the manifest it is handed, before the stage runs.
+PINNED_FETCH_MANIFEST = "pinned_fetch_manifest"
+RUNTIME_CAPABILITIES = frozenset({PINNED_FETCH_MANIFEST})
+
+
+def runtime_capabilities_of(provider: Any, stage: Any) -> frozenset[str] | None:
+    """The runtime capabilities the provider reports for the image that would run this stage
+    candidate, through its optional ``runtime_capabilities(stage)`` method, or None when they
+    cannot be determined (no method, an error, or a report that is not a set of names).
+
+    None is "unknown", never "everything": placement refuses a stage that requires a
+    capability on a candidate whose capabilities are unknown."""
+    report = getattr(provider, "runtime_capabilities", None)
+    if not callable(report):
+        return None
+    try:
+        found = report(stage)
+    except Exception:  # noqa: BLE001 - an unreadable report is unknown, never a capability
+        return None
+    if not isinstance(found, (set, frozenset)) or not all(isinstance(c, str) for c in found):
+        return None
+    return frozenset(found)
+
+
 @dataclass(frozen=True)
 class GrantRequest:
     worker_principal_id: str

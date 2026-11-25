@@ -198,11 +198,13 @@ BASE_CREDENTIALS = [
     "LoadCredential=profile:/etc/tessera/reasoning.json",
     "LoadCredential=prompt:/etc/tessera/reasoning-prompt.txt",
     "LoadCredential=agent-token:/etc/tessera/credentials/reasoning-agent-token",
+    # The admission marker, by reference (ADR 0170); start-up refuses a malformed or expired one.
+    "LoadCredential=admission:/etc/tessera/reasoning.admitted",
     MODEL_LINE,
     "LoadCredential=anthropic-api-key:/etc/tessera/credentials/reasoning-anthropic-api-key",
 ]
 OPENAI_CREDENTIALS = [
-    *BASE_CREDENTIALS[:3],
+    *BASE_CREDENTIALS[:3],  # profile, prompt, agent-token (the drop-in does not reload admission)
     "LoadCredential=harness-password:/etc/tessera/credentials/reasoning-harness-password",
 ]
 
@@ -226,9 +228,9 @@ def test_effective_credential_set_with_and_without_openai_drop_in():
     assert len(with_drop_in) == 4
     default = load_credentials(base_unit())
     assert sorted(default) == sorted(
-        {"profile", "prompt", "agent-token", "model-credential", "anthropic-api-key"}
+        {"profile", "prompt", "agent-token", "admission", "model-credential", "anthropic-api-key"}
     )
-    assert len(default) == 5
+    assert len(default) == 6
 
 
 @pytest.mark.parametrize(

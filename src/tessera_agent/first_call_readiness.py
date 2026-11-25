@@ -235,7 +235,7 @@ def _api_key_file(
         pass  # a service manager's own credential: root-owned 0400/0440 in its private directory
     else:
         if info.st_mode & 0o077:
-            problems.append("group or other can access it (mode must be 0600)")
+            problems.append("group or other can access it (needs no group or other access)")
         if info.st_uid != (os.getuid() if owner_uid is None else owner_uid):
             problems.append("not owned by the service user")
     if not key["size_ok"]:

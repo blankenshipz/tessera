@@ -187,3 +187,95 @@ def test_an_unlisted_provider_receives_no_labelled_campaign_input(salad):
     _link_campaign(state, owner, project, snapshot, grant, send_classes=None)
     refused = _issue(client, op, lease)
     assert refused.status_code == 403 and "non-commercial" in refused.json()["detail"]
+
+
+# ------------------------------------------------- legacy rows and tenant filter
+
+
+def _legacy_attempt(state):
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        db.execute("UPDATE campaign_stage_attempts SET provider_id = NULL")
+
+
+def _legacy_rows(state):
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        db.row_factory = None
+        return db.execute(
+            "SELECT a.campaign_id, a.stage_key, a.provider_id, c.spec_json, c.org_id, "
+            "c.project_id FROM campaign_stage_attempts a JOIN campaigns c "
+            "ON c.id = a.campaign_id"
+        ).fetchall()
+
+
+def test_a_legacy_row_without_a_provider_resolves_through_the_spec_stage(salad):
+    state, owner, project, worker, snapshot, grant, lease, client, op = salad
+    _trust(worker["id"], DERIVED, labels=["cc-by"])
+    _label(state, owner, snapshot["id"], "non-commercial")
+    _link_campaign(state, owner, project, snapshot, grant, send_classes=None)
+    _legacy_attempt(state)
+    rows = _legacy_rows(state)
+    assert rows[0][2] is None
+    with (
+        sqlite3.connect(state / "tessera.sqlite3") as db,
+        pytest.raises(data_class.DataClassRefused, match="non-commercial"),
+    ):
+        # Neither the attempt nor the route names a provider: the spec stage's does.
+        data_class._require_campaign_licence_labels(db, rows, snapshot["id"], None)
+
+
+def test_an_unresolvable_provider_is_refused(salad):
+    state, owner, project, worker, snapshot, grant, lease, client, op = salad
+    _link_campaign(state, owner, project, snapshot, grant, send_classes=None)
+    _legacy_attempt(state)
+    row = list(_legacy_rows(state)[0])
+    row[3] = "{not json"  # the stored spec cannot be read
+    with (
+        sqlite3.connect(state / "tessera.sqlite3") as db,
+        pytest.raises(data_class.DataClassRefused, match="cannot be determined"),
+    ):
+        data_class._require_campaign_licence_labels(db, [tuple(row)], snapshot["id"], None)
+
+
+def test_another_orgs_attempts_are_not_returned(salad):
+    state, owner, project, worker, snapshot, grant, lease, client, op = salad
+    _link_campaign(state, owner, project, snapshot, grant, send_classes=["public"])
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        assert data_class._campaign_attempts_for_operation(db, op)
+        db.execute("UPDATE campaigns SET org_id = 'other-org'")
+        assert data_class._campaign_attempts_for_operation(db, op) == []
+
+
+def test_two_stages_sharing_one_release_intersect_their_narrowed_classes(salad):
+    state, owner, project, worker, snapshot, grant, lease, client, op = salad
+    source = {
+        "kind": "snapshot",
+        "name": "data",
+        "snapshot_id": snapshot["id"],
+        "digest": snapshot["digest"],
+        "data_class": "public",
+    }
+    _link_campaign(
+        state,
+        owner,
+        project,
+        snapshot,
+        grant,
+        send_classes=["public", "private_derived"],
+        by="release",
+    )
+    spec = _spec2(
+        _stage2("s1", source, send_classes=["public", "private_derived"]),
+        _stage2("s2", source, send_classes=["public"]),
+    )
+    with sqlite3.connect(state / "tessera.sqlite3") as db:
+        db.execute("UPDATE campaigns SET spec_json = ?", (json.dumps(spec),))
+        db.execute(
+            """INSERT INTO campaign_stage_attempts (id, campaign_id, stage_key, attempt, status,
+            hold_cents, release_id, grant_id, operation_id, revision, created_at, updated_at,
+            provider_id) SELECT 'att2', campaign_id, 's2', 1, status, 0, release_id, NULL, NULL,
+            1, created_at, updated_at, 'salad' FROM campaign_stage_attempts WHERE id = 'att1'"""
+        )
+        attempts = data_class._campaign_attempts_for_operation(db, op)
+        assert {row[1] for row in attempts} == {"s1", "s2"}
+        narrowed, _digest = data_class._campaign_narrowing(db, attempts)
+    assert narrowed == frozenset({"public"})

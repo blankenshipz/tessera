@@ -80,8 +80,9 @@ Roles: **root** is the host operator; **person** is a human credential on the co
    spending; the egress to the model host is limited by the model destination and the egress
    allowlist, not by the grant.
 
-3. **Check the project matches (operator).** The project in the agent's authority grant must equal
-   the profile's `model_spend.project_id`. If both are set and differ, or neither is set, the
+3. **Check the project matches (operator).** The spend project is the agent's authority
+   grant project, or the profile's `model_spend.project_id` when the grant carries none; when
+   both are set they must be the same. If both are set and differ, or neither is set, the
    supervisor refuses with `model_spend_not_configured`. The agent token is delivered as
    `LoadCredential=agent-token:/etc/tessera/credentials/reasoning-agent-token`; it is a scoped agent
    credential, never an owner token, and is not the model key.

@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -46,6 +46,8 @@ _Identifier = Annotated[str, StringConstraints(min_length=1, max_length=200)]
 _SaladName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 _Hex64 = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 _ImageDigest = Annotated[str, StringConstraints(pattern=r"^sha256:[a-f0-9]{64}$")]
+# Runtime capability names an operator may declare for an image (``campaign_providers``).
+_RuntimeCapability = Literal["pinned_fetch_manifest"]
 _GPU_CLASS = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 # Same shape as the CPU rates (``remote_execution_models.CpuRate``); positive.
 _GPU_HOUR_USD = r"^(?:0|[1-9][0-9]{0,3})(?:\.[0-9]{1,6})?$"
@@ -113,6 +115,12 @@ class SaladCampaignProfile(_Closed):
     credential_version: int = Field(ge=1, le=2**31 - 1)
     # Operator allowlist of image digests a stage may run (required, never from a spec).
     allowed_image_digests: Annotated[list[_ImageDigest], Field(min_length=1, max_length=32)]
+    # Operator-declared runtime capabilities of allowlisted images, by digest (closed names). An
+    # image absent here has unknown capabilities: a stage that needs one (a pinned-fetch stage
+    # needs ``pinned_fetch_manifest``) is refused on it at placement; other stages are unaffected.
+    image_capabilities: dict[_ImageDigest, list[_RuntimeCapability]] = Field(
+        default_factory=dict, max_length=32
+    )
     max_run_cents: int = Field(ge=1, le=MAX_RUN_CENTS)
     max_task_cents: int = Field(ge=1, le=MAX_TASK_CENTS)
     # Narrowing only (ADR 0044): False ignores any approve-body review pre-approval for
@@ -160,6 +168,8 @@ class SaladCampaignProfile(_Closed):
             raise ValueError("strict_image_pull needs max_image_pull_bytes")
         if not set(self.image_pull_sizes) <= set(self.allowed_image_digests):
             raise ValueError("image_pull_sizes names a digest that is not allowed")
+        if not set(self.image_capabilities) <= set(self.allowed_image_digests):
+            raise ValueError("image_capabilities names an image not in allowed_image_digests")
         return self
 
     @property
@@ -189,6 +199,14 @@ class SaladCampaignProfile(_Closed):
 
     def image_allowed(self, image: str) -> bool:
         return _image_digest(image) in self.allowed_image_digests
+
+    def image_runtime_capabilities(self, image: str) -> frozenset[str] | None:
+        """The capabilities the operator declared for this allowlisted image, or None when it
+        declared none for it (unknown: placement then fails closed for a stage that needs one)."""
+        digest = _image_digest(image)
+        if digest not in self.allowed_image_digests or digest not in self.image_capabilities:
+            return None
+        return frozenset(self.image_capabilities[digest])
 
 
 class SaladCampaignProfiles(_Closed):

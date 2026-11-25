@@ -20,11 +20,28 @@ from dataclasses import dataclass
 from typing import Any
 
 from .campaign_receipt_read import load_verified_receipt
-from .data_class import OUTPUT_DATA_CLASS, PRIVATE_DERIVED
+from .data_class import OUTPUT_DATA_CLASS, PRIVATE_DERIVED, PUBLIC
 from .store import Conflict
 
 # The shape of ``campaign_models.PinnedImage`` (a built image must satisfy the same rule).
 _PINNED_IMAGE = re.compile(r"[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}")
+
+
+# Known classes from least to most restrictive (ADR 0039).
+_CLASS_RANK = {PUBLIC: 0, PRIVATE_DERIVED: 1}
+
+
+def stricter_data_class(recorded: str, declared: str | None) -> str:
+    """The more restrictive of a pinned row's recorded class and a spec's declared class.
+
+    ``declared`` None keeps the recorded class. A recorded class this module does not rank (a
+    future, more restrictive class) is kept as it is: it is never relabelled to a known class.
+    """
+    if declared is None or recorded not in _CLASS_RANK:
+        return recorded
+    if declared not in _CLASS_RANK:
+        return declared
+    return declared if _CLASS_RANK[declared] > _CLASS_RANK[recorded] else recorded
 
 
 @dataclass(frozen=True)
@@ -268,13 +285,9 @@ def resolve_artifact(
         path=row["path"],
         sha256=source.sha256,
         size_bytes=int(item["size"]),
-        # The platform's recorded class for the pinned row, never relabelled; a spec that
-        # declares private_derived can only keep it at least that restrictive.
-        data_class=(
-            PRIVATE_DERIVED
-            if getattr(source, "data_class", None) == PRIVATE_DERIVED
-            else row["data_class"]
-        ),
+        # ADR 0039 amendment: the stricter of the pinned row's recorded class and the class the
+        # spec states, so a declaration can raise the class but never lower it.
+        data_class=stricter_data_class(row["data_class"], getattr(source, "data_class", None)),
         kind=row["kind"],
         media_type=row["media_type"],
         source_campaign_id=source.campaign_id,

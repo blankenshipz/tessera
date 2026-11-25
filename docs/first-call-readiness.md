@@ -47,6 +47,11 @@ writes only a transient probe file in the state directory.
    `grant_revision_mismatch`, `grant_scope_mismatch`, `grant_binding_inactive` (execution kind only; through `--control-url` the control plane reports one `bindings_active` answer for the grant's own bound execution grants, and a control plane that does not send it leaves the check `unchecked`),
    `grant_budget_exhausted` or `grant_budget_below_call_cap`. It does not check the subject's scopes (issuance
    does) or the read-only tool gate (the runtime does).
+   `grant_binding_inactive` is deliberately stricter than the model-spend ledger. For an execution-kind grant the
+   check fails unless the grant lists at least one binding and every bound execution grant exists, is `active`, is at
+   the pinned revision and epoch and is unexpired; a malformed binding also fails it. The ledger's reservation check
+   does not read those execution grants. The check is conservative: it can report `not_ready` for a grant the
+   ledger would still accept.
 5. **Run the check** in the unit's own context, as root: `tessera-reasoning-readiness check --in-unit`
    (it runs the check as the service user with the unit's `LoadCredential=` files, where they are
    root-owned 0400/0440, and the unit's listed sandbox properties; a credential whose source file

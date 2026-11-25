@@ -21,6 +21,7 @@ from .model_destinations import (
 )
 from .reasoning_admission import startup_refusal
 from .remote_reasoning_runtime import (
+    CLOSED_STATES,
     EXIT_BLOCKED,
     EXIT_COMPLETED,
     _closed_run,
@@ -165,6 +166,52 @@ def closed_run_exit(state_dir: Path, environment: dict[str, str]) -> int | None:
     return EXIT_COMPLETED if closed["state"] == "completed" else EXIT_BLOCKED
 
 
+def _stop_noop(reason: str) -> int:
+    print(f"tessera-reasoning stop: {reason}; nothing to stop.", file=sys.stderr, flush=True)
+    return 0
+
+
+def reasoning_stop(state_dir: Path, environment: dict[str, str]) -> int:
+    """Idempotent ExecStop: request a stop of a live supervisor's open run, else exit 0.
+
+    Stop needs no model credential, admission marker or complete profile and starts nothing, so
+    none is checked. It exits 0 without writing when the state has no journal, when the manager
+    reports the main process already exited (systemd sets EXIT_CODE and no MAINPID for a control
+    process after the main process ended, including before a crash restart, which must resume the
+    open run), or when the run identity is unknown or already closed. Only the profile's run id is
+    read. An open run that cannot be identified or stopped raises, so the caller exits nonzero.
+    """
+    if not (state_dir / "reasoning.sqlite3").is_file():
+        return _stop_noop("no run journal")
+    if "EXIT_CODE" in environment and not environment.get("MAINPID"):
+        return _stop_noop("supervisor not running")
+    store = ReasoningStore(state_dir)
+    try:
+        try:
+            root = credential_root(environment)
+            run_id = json.loads(private_file(root / "profile", credentials_dir=root))["run_id"]
+            if not isinstance(run_id, str):
+                raise StartupBlocked("invalid_run_identity")
+        except Exception:
+            # Without the run identity only a journal with no open run is safe to leave alone.
+            states = {row[0] for row in store.db.execute("SELECT state FROM runs")}
+            if states <= CLOSED_STATES:
+                return _stop_noop("no open run")
+            raise
+        closed = _closed_run(store, run_id)
+        if closed is not None:
+            return _stop_noop(f"run {run_id} already closed (state {closed['state']})")
+        try:
+            store.get(run_id)
+        except ValueError:
+            return _stop_noop("configured run identity not in the journal")
+        store.stop(run_id)
+    finally:
+        store.close()
+    print(f"tessera-reasoning stop: stop requested for run {run_id}.", file=sys.stderr, flush=True)
+    return 0
+
+
 def launch_spec(mode: str, state_dir: Path, environment: dict[str, str]):
     """Return only a fixed Python module argv and allowlisted child environment."""
     if mode not in {"reasoning", "a2a"} or not state_dir.is_absolute():
@@ -240,6 +287,9 @@ def main(argv=None):
         if not args.state_dir.is_absolute():
             raise StartupBlocked("absolute_service_state_required")
         refuse_forbidden_environment(dict(os.environ))
+        if args.mode == "reasoning-stop":
+            # Before every credential, admission and profile check: stop starts nothing.
+            return reasoning_stop(args.state_dir, dict(os.environ))
         if args.mode == "reasoning":
             # One-shot: an already-closed run exits 0 or 2 before the admission marker is
             # judged (an expired marker must not turn a finished run into a failed unit) and
@@ -266,16 +316,6 @@ def main(argv=None):
             # same mapper validation as other modes. No inferred default path.
             reference = credential_root(dict(os.environ)) / "profile"
             return research_main(["--config", str(reference), "--state-dir", str(args.state_dir)])
-        if args.mode == "reasoning-stop":
-            root = credential_root(dict(os.environ))
-            profile = json.loads(private_file(root / "profile", credentials_dir=root))
-            validate_profile(profile)
-            store = ReasoningStore(args.state_dir)
-            try:
-                store.stop(profile["run_id"])
-            finally:
-                store.close()
-            return 0
         command, child = launch_spec(args.mode, args.state_dir, dict(os.environ))
         os.execve(sys.executable, command, child)
     except Exception:

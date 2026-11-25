@@ -42,5 +42,7 @@ def test_the_legacy_exception_is_still_needed():
 def test_a_title_that_names_a_number_names_its_own():
     for path in DECISIONS.glob("[0-9][0-9][0-9][0-9]-*.md"):
         title = path.read_text().splitlines()[0]
-        named = re.search(r"\b(\d{4})\b", title)
+        # Titles read "# NNNN: ...", "# NNNN — ..." or "# ADR NNNN: ..."; any other 4-digit
+        # number in a title (a year, a count) is not an ADR number.
+        named = re.match(r"# (?:ADR )?(\d{4})\b", title)
         assert named is None or named.group(1) == path.name[:4], f"{path.name}: {title!r}"

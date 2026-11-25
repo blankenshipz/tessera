@@ -436,6 +436,8 @@ with `--require-hashes --only-binary=:all:`. Network access is at image build ti
 index you choose. The pushed image's digest, listed in the profile's `allowed_image_digests`, is
 what pins the wheels, so record it with the base digest, the lock file's sha256 and this recipe's
 commit. Wheels supplied as hash-verified items of the input snapshot are not implemented.
+The lock for the Salad CPU profile `cpu-2c-4g` image is `requirements.lock` in this directory
+(cp311 manylinux x86_64; torch from the PyTorch CPU index, named by its `--extra-index-url` line).
 
 ### Image entry
 

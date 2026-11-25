@@ -505,7 +505,7 @@ reports, `artifact`/`receipt_output`/`image_from` resolution and measurement gat
 returning nothing from the stored body.
 `pending_human_approval` there means a stage is bound to a program or gate, so the scientific
 verdict is left to a person. What a campaign is waiting on *now* is shown live in the campaign view
-(`GET /campaigns/{id}`, `tessera_get_campaign`) as `pending_human_approval`, a list derived from
+(`GET /campaigns/{id}`, `tessera_get_campaign`; the human-approval surface of audit G-11, not the receipt) as `pending_human_approval`, a list derived from
 recorded state: `campaign_approval` (submitted, awaiting a person's approval of its spec digest),
 `campaign_reapproval` (its approval lapsed), and `salad_review` (a Salad attempt's pending plan or
 source-use review, with the stage, attempt and decision request). Each item names what is awaited,
@@ -590,7 +590,9 @@ provider has no manifest reader) or `size_unavailable` (the reader returned noth
 it is `null` when a size is recorded. Reasons are a closed list, never free text, and a reference with a
 scheme, user information or whitespace is recorded as `null`: a reference containing `@` is accepted
 only when exactly one `@` is followed by a well-formed `sha256:` digest, so `user:pw@host/img` records
-neither a name nor a digest. Digest pinning is unchanged: a tag-only
+neither a name nor a digest. The check is
+syntactic: a bare `user:pw@sha256:<hex>` has the same shape as `img:tag@sha256:<hex>`, so it is recorded as the
+name `user:pw` (read as a tag) and cannot be told apart from an image tag; never put a secret in an image reference. Digest pinning is unchanged: a tag-only
 reference is still refused wherever the grant or spec requires a digest. A provider may offer an optional
 `image_pull_size_bytes(stage)` hook; the Salad provider takes an operator-supplied manifest reader and
 reports no size without one. The runner waits at most 10 seconds for that read, outside the database
@@ -690,7 +692,8 @@ Each revocation writes a `campaign.release_freed` event (`released_by: system`, 
 `release_id`). A blocked campaign whose last live attempt settles later, and a campaign that
 went idle before this rule existed, are freed by a bounded reconcile sweep on every runner
 tick (so at the first tick after a restart); it handles at most 50 campaigns per tick and
-resumes where it left off, wrapping around, so every idle holder is eventually reached. While the holder still has a live attempt the
+resumes where it left off, wrapping around, so every idle
+holder is eventually reached. While the holder still has a live attempt the
 refusal stays, and names the holding campaign and the release expiry to the same
 organization only (another organization learns only that the snapshot is held and until
 when). A person's own release, which no campaign attempt used, is never revoked by the runner. A steering-paused campaign is treated the same way (ADR 0167); when it resumes it waits for the snapshot in first-come order rather than failing.

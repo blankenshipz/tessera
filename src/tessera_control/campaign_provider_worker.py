@@ -30,6 +30,7 @@ from .campaign_models import (
 from .campaign_providers import (
     MAX_SCRATCH_BYTES,
     MAX_WORKER_SLOTS,
+    PINNED_FETCH_MANIFEST,
     ConfigSection,
     GrantRequest,
     Observation,
@@ -135,6 +136,12 @@ class WorkerGrantProvider:
 
     # A worker-grant provider carries a stage's scratch request to its worker (ADR 0059).
     grants_scratch = True
+
+    def runtime_capabilities(self, stage: NormalStage) -> frozenset[str]:
+        """The worker's supervisor, not the stage image, fetches and verifies a stage's pinned
+        public files before the container starts (ADR 0097, the plan's ``public_fetch``), so
+        the stage's image needs no fetch support of its own."""
+        return frozenset({PINNED_FETCH_MANIFEST})
 
     def check_stage(
         self, connection: sqlite3.Connection, project_id: str, stage: NormalStage

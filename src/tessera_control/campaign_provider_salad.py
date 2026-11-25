@@ -415,6 +415,18 @@ class SaladRouteProvider:
         except ValueError as error:
             raise ValueError(f"{label}: adapted stage: {error}") from None
 
+    def runtime_capabilities(self, stage: Any) -> frozenset[str] | None:
+        """What the stage's runtime image can do, from the operator profile's
+        ``image_capabilities`` for that allowlisted digest (metadata only). None, unknown, when
+        Salad is not enabled, the profile is unknown or the operator declared nothing for the
+        image: placement then refuses a pinned-fetch stage here (fail closed)."""
+        profiles = self.profiles
+        config = _salad_config(stage)
+        if profiles is None or config is None:
+            return None
+        profile = profiles.get(config.profile)
+        return None if profile is None else profile.image_runtime_capabilities(stage.image)
+
     def _check_credential(self, profile: Any) -> None:
         """Refuse up front when the profile's credential is expired, revoked or pinned at a
         version that is not the enrolled one (metadata only; unknown or warning never refuses)."""

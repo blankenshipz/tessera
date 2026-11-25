@@ -417,6 +417,8 @@ Tools variant: change `permissions`, `max_steps` and `limits` as follows and kee
 field (add the optional `control_ca_file`, e.g. `"/etc/tessera/control-ca.pem"`, only if the
 control URL uses a private CA). `tool_catalog_sha256` and both tool limits are required when any allow is present.
 
+The pin hashes each allowed tool's name, description and input schema. `tessera_request_authority` changed its description and input schema when it began to accept reasoning-kind `bounds` (ADR 0155), so a profile that allows it must re-pin `tool_catalog_sha256` with `tessera-reasoning catalog`; a profile that does not allow it is unaffected.
+
 ```json
 {
   "max_steps": 6,
@@ -508,7 +510,7 @@ The supervisor is one-shot: a run identity runs once. Exit codes of `run`:
 
 A closed run (completed, failed or stopped) is never resumed or rerun: a later start with the
 same run identity makes no harness, control-plane, grant, ledger or model call, prints the
-journal's receipt and exits 0 (completed) or 2 (otherwise). The installed `service_startup` makes the same check first, from the profile's run identity and the journal, before it requires any model credential file: a closed run exits 0 or 2 with `run <id> already closed ...; no model credential needed`, while a run that is open, unknown or has no journal still needs the credential and exits 78 without it. `report` exits 0 when provenance
+journal's receipt and exits 0 (completed) or 2 (otherwise). The installed `service_startup` makes the same check first, from the profile's run identity and the journal, before it requires any model credential file: a closed run exits 0 or 2 with `run <id> already closed ...; no model credential needed`, while a run that is open, unknown or has no journal still needs the credential and exits 78 without it. The unit's `ExecStop` (`service_startup reasoning-stop`) is idempotent and needs no model credential, admission marker or complete profile: with no journal, after the main process already exited, or for a closed or unknown run identity it logs one `tessera-reasoning stop: ...; nothing to stop.` line and exits 0 without writing; only a live supervisor's open run gets a recorded stop request, and a stop of an open run that cannot be performed exits 78. After a closed run the unit is therefore inactive (completed, exit 0) or failed without restarting (exit 2) until the operator starts a new run identity (ADR 0119). `report` exits 0 when provenance
 delivery is complete and 2 otherwise. For the next run, give it a new run identity: `run
 --run-id ID` (also accepted by `status`, `stop` and `report`) overrides the profile's `run_id`
 for that request, and for the installed unit `tessera reasoning install --apply --new-run` writes

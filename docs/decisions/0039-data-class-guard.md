@@ -299,5 +299,7 @@ A campaign spec's `artifact` input accepts an explicit `data_class`. It is valid
 known classes and can only be `private_derived`, because an artifact is a run output: `public` or
 an unknown value is refused when the spec is parsed. The default is `private_derived` and is omitted
 from the stored spec, so existing spec digests do not change. At resolution the input's class is
-never less restrictive than the recorded class of the pinned output, and it is carried onto the
-receipt's input row.
+the stricter of the pinned output's recorded class and the stated class (`public` is less
+restrictive than `private_derived`): a statement can raise the class, never lower it, and a
+recorded class outside that order is kept as recorded, never relabelled. The resolved class is
+carried onto the receipt's input row.

@@ -4,7 +4,8 @@ A stage names its own provider and, optionally, ``alternate_providers`` in order
 stage is ready for a new attempt the runner asks ``decide`` which candidate to use. Placement
 never adds a destination: it only chooses among the candidates the approved spec names, after
 an agent's steering (pin or exclude, a filter over that list), and every check it makes is an
-existing one (the provider registry, ``check_stage`` enrollment,
+existing one (the provider registry, the runtime image floor of a pinned-fetch stage,
+``check_stage`` enrollment,
 ``CampaignStore.check_stage_inputs`` trust, the campaign budget cap, the program budget, the
 project limits, open provider exposure and the provider's own slot count). The first candidate
 that passes all of them is chosen; when none does the stage waits, or fails exactly as a
@@ -14,7 +15,9 @@ the receipt.
 
 A stage with no alternates is routed through ``decide`` only when an ADR 0058 reroute can apply
 (``reroute_due``: its last attempt was an infrastructure failure, or ran on a reroute target).
-Otherwise it keeps its single-provider behaviour, events and receipts unchanged.
+Otherwise it keeps its single-provider behaviour, events and receipts unchanged, except that a
+stage with a pinned-fetch manifest is refused there too when its one provider's executor image is
+below the runtime floor (``runtime_floor_skip``).
 """
 
 from __future__ import annotations
@@ -34,12 +37,15 @@ from . import (
 )
 from .campaign_infra_retry import INFRA_PREFIX
 from .campaign_models import NormalStage, _validate_provider, stage_on_candidate, stage_provider
+from .campaign_providers import PINNED_FETCH_MANIFEST, runtime_capabilities_of
 from .concurrency_ceiling import operator_concurrency_ceiling
 from .store import Conflict
 
 PLACED_EVENT = "campaign.stage_placed"
 WAITING_EVENT = "campaign.stage_waiting_placement"
 STEERED_EVENT = "campaign.placement_steered"
+# A candidate whose executor image is below the runtime floor the stage needs (closed reason).
+RUNTIME_FLOOR_REASON = "runtime_image_below_floor"
 
 # Reasons a candidate is skipped. A transient reason can clear without a person (a slot frees,
 # a hold settles); a permanent one cannot during this attempt.
@@ -80,6 +86,9 @@ PERMANENT_REASONS = frozenset(
         campaign_heavy_guard.UNEXPLAINED_REASON,
         # A strict provider's ceiling on the image's compressed pull size is exceeded.
         campaign_image_pull.REFUSED_REASON,
+        # The candidate's executor image does not declare (or cannot be shown to declare) a
+        # runtime capability the stage needs, e.g. pinned-fetch manifests (``runtime_floor_skip``).
+        RUNTIME_FLOOR_REASON,
     }
 )
 
@@ -239,6 +248,46 @@ def free_slots(rt: Any, ctx: Any, provider: Any, stage: NormalStage) -> int | No
     return None
 
 
+# -- runtime image floor -----------------------------------------------------------------------
+
+
+def required_runtime_capabilities(stage: NormalStage) -> frozenset[str]:
+    """The runtime capabilities the stage needs from whatever executor runs it, read from the
+    spec only. A stage with a pinned ``public_artifact`` input (ADR 0097) hands the executor a
+    pinned-fetch manifest, so it needs ``pinned_fetch_manifest``; any other stage needs none."""
+    if any(getattr(item, "kind", None) == "public_artifact" for item in stage.inputs):
+        return frozenset({PINNED_FETCH_MANIFEST})
+    return frozenset()
+
+
+def runtime_floor_skip(provider: Any, stage: NormalStage) -> Skip | None:
+    """``runtime_image_below_floor`` when the candidate ``stage`` (on its provider) needs a
+    runtime capability its executor image does not declare, else None.
+
+    Fails closed: a provider that cannot say what its image supports (no
+    ``runtime_capabilities`` hook, or it reports None) is refused for such a stage with the same
+    reason, the detail saying the capability is unknown. A stage that needs no capability is
+    never asked about, so its candidates and records are exactly what they were."""
+    required = required_runtime_capabilities(stage)
+    if not required:
+        return None
+    declared = runtime_capabilities_of(provider, stage)
+    if declared is None:
+        return Skip(
+            stage.provider,
+            RUNTIME_FLOOR_REASON,
+            "runtime image capability unknown; needs " + ",".join(sorted(required)),
+        )
+    missing = required - declared
+    if missing:
+        return Skip(
+            stage.provider,
+            RUNTIME_FLOOR_REASON,
+            "runtime image does not declare " + ",".join(sorted(missing)),
+        )
+    return None
+
+
 # -- the decision ----------------------------------------------------------------------------
 
 
@@ -289,6 +338,10 @@ def _check(
             if getattr(error, "credential_state", None) is not None:
                 return Skip(pid, "credential_unavailable", str(error)[:300])
             return Skip(pid, "not_enrolled", str(error)[:300])
+        # After the provider's own check, so a profile of another tenant is never consulted.
+        floor = runtime_floor_skip(provider, stage)
+        if floor is not None:
+            return floor
         try:
             CampaignStore.check_stage_inputs(
                 connection,
@@ -544,6 +597,8 @@ def failure_reason(decision: Decision) -> str:
         reasons = others
     if reasons and reasons <= {"untrusted", "license_label"}:
         return "input_not_admitted"
+    if reasons == {RUNTIME_FLOOR_REASON}:
+        return RUNTIME_FLOOR_REASON  # every candidate's image is below the stage's floor
     if reasons and reasons <= {"unregistered", "provider_invalid", "reroute_refused"}:
         return "provider_unavailable"
     return "no_eligible_provider"

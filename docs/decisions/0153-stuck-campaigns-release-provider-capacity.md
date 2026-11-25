@@ -38,6 +38,10 @@ start, and each could stay taken by such a campaign:
    campaign), and an `execution.expired_unattempted_grant_reconciled` event is written with
    `automatic: true`. All of it happens in one transaction, under the runner lease. It needs no
    live approval: it only reduces authority.
+   Fail closed: an attempt whose grant is no longer unresolved (for example one a person
+   already reconciled while the attempt still reads `admitted`) matches nothing, so this rule
+   does not touch the attempt; it keeps its status and is left for a person or the evidence
+   paths below. The same applies when the reservation ledger cannot cover the zero settlement.
 2. **Not-started evidence also applies to a paused campaign.** The ADR 0046 auto-reconcile of
    an `unknown` attempt shown to have never started already ran for a blocked campaign; it now
    runs for `paused_delegation_lapsed` too, unchanged.

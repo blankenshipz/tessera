@@ -98,7 +98,13 @@ from .campaign_providers import (
     Waiting,
     provider_ids,
 )
-from .campaign_receipts import CODE_GRANTED_EVENT, build_receipt, code_delivery, code_summary
+from .campaign_receipts import (
+    CODE_GRANTED_EVENT,
+    build_receipt,
+    code_delivery,
+    code_summary,
+    transfer_violations,
+)
 from .campaign_release_scope import (
     RELEASE_WAITING_EVENT,
     free_idle_campaign_releases,
@@ -1778,6 +1784,14 @@ class CampaignRunner:
         if not base.has_candidates or (
             not base.alternates and not placement.reroute_due(base, self._attempts(ctx, key))
         ):
+            floor = self._single_provider_floor(base)
+            if floor is not None:
+                # The one provider's executor image is below the stage's runtime floor: refused
+                # with the closed reason before anything is prepared or held (never retried).
+                # Placement checks the floor before input admission and the image pull size.
+                number = self._stage_row(ctx, key)["attempts_used"] + 1
+                refused = placement.Decision((base.provider,), None, (floor,))
+                return self._placement_refused(ctx, key, number, refused)
             refused = self._image_pull_preflight(ctx, key, base)
             if refused is not None:
                 return refused
@@ -1850,6 +1864,15 @@ class CampaignRunner:
         if section["status"] == "refused":
             return self._stage_failed(ctx, key, image_pull.REFUSED_REASON)
         return None
+
+    def _single_provider_floor(self, base: NormalStage) -> placement.Skip | None:
+        """The runtime image floor for a stage that is not placed: its own provider's image
+        must declare what the stage's pinned-fetch manifest needs (``runtime_floor_skip``)."""
+        try:
+            provider = self._provider(base)
+        except KeyError:
+            return None  # the registry check upstream fails the stage with its own reason
+        return placement.runtime_floor_skip(provider, base)
 
     def _single_provider_guard(self, ctx: _Ctx, key: str, base: NormalStage) -> str:
         """ADR 0107 for a stage that is not placed (one provider): a heavy stage on a local
@@ -4151,7 +4174,23 @@ class CampaignRunner:
 
     def _observation(self, spec_stage: NormalStage, attempt: dict[str, Any]) -> Any:
         """The provider's report on a collected attempt (read-only)."""
-        return self._provider(spec_stage).observe(self, dict(attempt))
+        observed = self._provider(spec_stage).observe(self, dict(attempt))
+        if observed.outcome != "succeeded":
+            return observed
+        # ADR 0134: a reported transfer outside the stage's egress allowlist is an invariant
+        # breach whatever the provider's own verdict: the attempt fails and its outputs are not
+        # a usable result. The violation stays on the receipt.
+        with self.store.runner_connection() as connection:
+            refused = transfer_violations(connection, attempt, spec_stage)
+        if not refused:
+            return observed
+        hosts = ", ".join(sorted({str(item["host"]) for item in refused}))
+        return dataclasses.replace(
+            observed,
+            outcome="failed_permanent",
+            failure_class="egress_violation",
+            detail=f"transfer outside the egress allowlist: {hosts}",
+        )
 
     def _attempt_passed(self, spec_stage: NormalStage, attempt: dict[str, Any]) -> bool:
         return self._observation(spec_stage, attempt).outcome == "succeeded"

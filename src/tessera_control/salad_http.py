@@ -72,6 +72,22 @@ def _group_not_found(data):
     return "title" not in data or data["title"] == "Not Found"
 
 
+def _group_gone_body(data):
+    """The provider's definitive "this container group does not exist" answer.
+
+    Stricter than ``_group_not_found`` (which a lost-create probe pairs with a project
+    list read): a bound group's deletion is claimed only from the full ProblemDetails
+    404 shape, an integer ``status`` of 404 and the title "Not Found". A bare or
+    conflicting object stays an ordinary failed read.
+    """
+    return (
+        type(data) is dict
+        and type(data.get("status")) is int
+        and data["status"] == 404
+        and data.get("title") == "Not Found"
+    )
+
+
 # A clean client rejection of a create: the request was fully answered with one of
 # these statuses and a ProblemDetails object. 401/403/404/409/429/5xx stay unknown.
 REJECTION_STATUSES = (400, 422)
@@ -1035,7 +1051,25 @@ class SaladHTTPTransport:
                 raise _Failure("admission_denied")
             if operation != "read_group" and provider_id is None:
                 raise _Failure("identity_mismatch")
-            _, data = self._request("GET", self._group, secret)
+            if operation in {"read_group", "read_instance"} and provider_id is not None:
+                # The group was seen to exist (the caller holds its provider id), so a
+                # definitive 404 on the GROUP resource itself means it was deleted. Only
+                # this request: a 404 on the instances sub-resource below is "no instance
+                # yet" for an unstarted group, never group-gone. Any other 404 shape, or a
+                # 404 whose body cannot be read, stays the ordinary failed read.
+                self._last_status = None
+                try:
+                    status, data = self._request("GET", self._group, secret, absent_ok=True)
+                except _Failure as failure:
+                    if failure.reason == "malformed_response" and self._last_status == 404:
+                        raise _Failure("provider_unavailable", detail="non_2xx_4xx") from None
+                    raise
+                if status == 404:
+                    if _group_gone_body(data):
+                        raise _Failure("group_gone")
+                    raise _Failure("provider_unavailable", detail="non_2xx_4xx")
+            else:
+                _, data = self._request("GET", self._group, secret)
             # Stop only the bound tenant/project/name/UUID even if mutable
             # workload configuration drifted. Such drift still fences every
             # execution/read/delete path; a stop acknowledgement stays pending.

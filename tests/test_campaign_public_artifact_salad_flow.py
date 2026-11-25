@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from salad_campaign_fixture import (  # noqa: F401
+    IMAGE,
     SaladWorld,
     salad_provider_reset,
     salad_spec_v2,
@@ -13,6 +14,7 @@ from salad_campaign_fixture import (  # noqa: F401
 )
 
 from tessera_control.campaign_models import normalize, parse_spec_json
+from tessera_control.campaign_providers import PINNED_FETCH_MANIFEST
 from tessera_control.campaign_receipts import public_fetch_entry
 from tessera_control.campaign_runner import _Ctx
 from tessera_control.campaign_salad import stage_data_digest
@@ -82,7 +84,12 @@ def test_the_data_digest_is_the_snapshot_digest_or_binds_the_pins():
 
 
 def public_only_world(tmp_path):
-    world = SaladWorld(tmp_path)
+    # The stage carries pinned public files, so its one Salad profile must declare that the
+    # runtime image can run a pinned-fetch manifest (runtime image floor): the fixture states
+    # the capability the floor checks; the floor itself is not relaxed.
+    world = SaladWorld(
+        tmp_path, image_capabilities={IMAGE.split("@", 1)[1]: [PINNED_FETCH_MANIFEST]}
+    )
     item = salad_stage_v2(world.env, inputs=[public_source()])
     world.spec = salad_spec_v2(world.env, [item])
     return world

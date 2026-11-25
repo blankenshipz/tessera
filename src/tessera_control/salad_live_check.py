@@ -1208,7 +1208,9 @@ def _drive(
         "guardian_last_provider_read_failure_request_kind": None,
         # UTC time each pre-start step finished (create, bound, settle, deliver_inputs,
         # start_preflight, start); a step that did not run stays None. ``start_preflight``
-        # is the moment the start dispatch began (its fresh provider read runs inside it).
+        # is the moment the start dispatch began, not finished (its fresh provider read runs
+        # inside it). ``create`` is stamped even when the create was rejected, and ``settle``
+        # means the settle wait ended, whether or not the group read stopped.
         "prestart_timestamps": dict.fromkeys(PRESTART_STEPS),
         # Closed class of the pre-start step that failed ({"class", "exception"}: the
         # exception's type name only, never its text), or None. Diagnostic; it does not
@@ -1396,7 +1398,7 @@ def _drive(
             launched = True  # lost create reply still requires exact stop/reconcile
             step["name"] = "create_failed"
             created = dispatch("create")
-            stamp("create")
+            stamp("create")  # stamped even if the create is rejected just below
             receipts = created.get("receipts") if isinstance(created, dict) else None
             created = receipts[-1] if isinstance(receipts, list) and receipts else {}
             rejected = isinstance(created, dict) and (
@@ -1456,7 +1458,7 @@ def _drive(
                 # send) spends the whole bound before every start; this makes that visible.
                 "waited_seconds": round(clock() - settle_started, 1),
             }
-            stamp("settle")
+            stamp("settle")  # the settle wait ended; the stopped check follows
             if state["provider_status"] != "stopped":
                 raise ValueError("create unresolved")
             if receipt["input_expected"]:

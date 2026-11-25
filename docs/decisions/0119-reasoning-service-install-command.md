@@ -108,3 +108,24 @@ failure or loop into the start limit.
   every new run as to the first.
 
 Tests: `tests/test_reasoning_oneshot_exit.py`.
+
+## Amendment (2026-11-25): stop is idempotent
+
+systemd runs `ExecStop` after the main process exits on its own too, and a failed stop marks the
+unit failed even after a clean exit 0. `service_startup reasoning-stop` therefore starts nothing and
+checks no model credential, API-key file, admission marker or complete profile. It exits 0 with one
+stderr line and writes nothing when the state has no journal, when the manager reports the main
+process already exited (`EXIT_CODE` set, no `MAINPID`; this includes the stop before a crash
+restart, so that restart still resumes the open run), or when the profile's run identity is unknown
+or already closed (or, without a readable run identity, when no journal run is open). Only for a live
+supervisor's open run does it record the stop request (`stop_requested`), as before, and it exits 78
+when that open run cannot be identified or stopped. The API-key environment refusal still applies
+first. Start is unchanged: an open run still exits 78 without its credential or with an expired or
+malformed admission marker.
+
+After a closed run the unit is inactive (exit 0, completed) or failed without restarting (exit 2,
+failed or stopped). It waits for the operator: a new run needs a new run identity (`--new-run`). The
+unit file and install template are unchanged (`Restart=on-failure`, `RestartPreventExitStatus=2 77
+78`; a stop that cannot record an open run's request still fails the unit visibly).
+
+Tests: `tests/test_reasoning_stop_closed_run.py`.

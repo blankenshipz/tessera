@@ -2038,6 +2038,7 @@ FAILURE_CLASSES = (
     "holdout_already_claimed",
     "sealed_partition",
     "public_fetch_unreported",
+    "egress_violation",
 )
 # ADR 0097: a worker-grant attempt whose stage declares public_artifact pins exited without a
 # fetch report recorded before its run receipt; it fails closed instead of succeeding with

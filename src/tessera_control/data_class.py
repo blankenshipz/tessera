@@ -613,13 +613,21 @@ def _campaign_attempts_for_operation(
     grant_id, release_id = (None, None) if link is None else (link[0], link[1])
     select = """SELECT a.campaign_id, a.stage_key, a.provider_id, c.spec_json, c.org_id,
         c.project_id FROM campaign_stage_attempts a JOIN campaigns c ON c.id = a.campaign_id
-        WHERE """
+        WHERE c.org_id = ? AND ("""
+    # The tenant check is at data access: another organisation's attempts are never read,
+    # whatever grant or release id they carry.
+    org_id = connection.execute(
+        "SELECT org_id FROM external_operations WHERE operation_id = ?", (operation_id,)
+    ).fetchone()
+    if org_id is None or org_id[0] is None:
+        return []
+    org = org_id[0]
     rows = connection.execute(
-        select + "a.operation_id = ? OR (? IS NOT NULL AND a.grant_id = ?)",
-        (operation_id, grant_id, grant_id),
+        select + "a.operation_id = ? OR (? IS NOT NULL AND a.grant_id = ?))",
+        (org, operation_id, grant_id, grant_id),
     ).fetchall()
     if not rows and release_id is not None:
-        rows = connection.execute(select + "a.release_id = ?", (release_id,)).fetchall()
+        rows = connection.execute(select + "a.release_id = ?)", (org, release_id)).fetchall()
     return rows
 
 
@@ -667,6 +675,20 @@ def campaign_input_narrowing(
     )
 
 
+def _spec_stage_providers(row: Any) -> set[str]:
+    """Every provider the approved spec lets this attempt's stage run on; empty if unreadable."""
+    try:
+        from .campaign_models import normalize, parse_spec_json
+
+        stage = next(
+            item for item in normalize(parse_spec_json(row[3])).stages if item.key == row[1]
+        )
+        names = stage.candidate_ids or (stage.provider,)
+        return {name for name in names if name}
+    except Exception:  # noqa: BLE001 - unreadable context resolves nothing (the caller refuses)
+        return set()
+
+
 def _require_campaign_licence_labels(
     connection: sqlite3.Connection,
     attempts: list[Any],
@@ -686,7 +708,20 @@ def _require_campaign_licence_labels(
     from .provider_trust import current_policy
 
     policy = current_policy(connection)
-    providers = sorted({p for p in (route_provider_id, *(row[2] for row in attempts)) if p})
+    resolved = {p for p in (route_provider_id, *(row[2] for row in attempts)) if p}
+    for row in attempts:
+        if row[2] or route_provider_id:
+            continue
+        # A legacy row records no provider and the route names none: take the approved spec's
+        # stage provider(s), as the campaign receipt does, so the guard still applies.
+        fallback = _spec_stage_providers(row)
+        if not fallback:
+            raise DataClassRefused(
+                "the provider of the campaign stage's attempt cannot be determined, so its "
+                "licence-label rule cannot be applied; refused (fail closed)"
+            )
+        resolved |= fallback
+    providers = sorted(resolved)
     restricted = [p for p in providers if policy.allowed_license_labels(p) is not None]
     if not restricted:
         return

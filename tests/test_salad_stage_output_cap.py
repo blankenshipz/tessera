@@ -21,13 +21,13 @@ from salad_campaign_fixture import (
     salad_provider_reset,  # noqa: F401
     salad_stage,
 )
-from test_salad_output_custody import BINDING, Case, private_root, sha
+from test_salad_output_custody import Case
 from test_salad_workload_contract import execution
 
 from tessera_control.campaign_models import CampaignSpec
 from tessera_control.campaign_provider_salad import OUTPUT_LIMITS
 from tessera_control.remote_execution_models import SaladExecution
-from tessera_control.salad_custody import SaladCustody
+from tessera_control.salad_custody import CustodyBinding, SaladCustody
 from tessera_control.salad_workload_contract import (
     MAX_TOTAL_OUTPUT_BYTES,
     OUTPUT_CHUNK_BYTES,
@@ -35,7 +35,18 @@ from tessera_control.salad_workload_contract import (
 )
 
 CAP = 16 * 1024 * 1024
+BINDING = CustodyBinding("t", "p", "op", 1, "artifact-ref:output")
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def private_root(tmp_path):
+    root = tmp_path / "custody"
+    root.mkdir(mode=0o700)
+    return root
 
 
 def _runtime():
@@ -81,10 +92,12 @@ def test_campaign_salad_stage_at_16_mib_is_accepted_and_one_byte_more_is_refused
     exact = CampaignSpec.model_validate(_salad_spec(world, outputs_totalling(CAP), CAP))
     assert exact.stages[0].salad.workload.output_bytes == CAP
     # One byte more on the stage's own bound: refused against the provider's 16 MiB.
-    with pytest.raises(ValidationError, match="outputs exceed|max_output_bytes"):
+    with pytest.raises(ValidationError, match=f"outputs exceed the provider's {CAP} bytes"):
         CampaignSpec.model_validate(_salad_spec(world, outputs_totalling(CAP + 1), CAP + 1))
     # The stage bound kept at 16 MiB but the reviewed contract declaring one byte more.
-    with pytest.raises(ValidationError, match="max_output_bytes is below|custody total"):
+    with pytest.raises(
+        ValidationError, match="max_output_bytes is below the contract's output bytes"
+    ):
         CampaignSpec.model_validate(_salad_spec(world, outputs_totalling(CAP + 1), CAP))
     # A 17th declared file is refused even well under the byte total.
     many = [dict(name=f"f{i}.bin", max_bytes=1) for i in range(17)]
@@ -161,6 +174,29 @@ def test_custody_store_refuses_an_inventory_over_16_mib(tmp_path):
             chunk_sha256=sha(part), data=part, expires=1e12,
         )  # fmt: skip
     assert custody.db.execute("SELECT COUNT(*) FROM parts").fetchone()[0] == 0
+
+
+def test_declared_max_bytes_tightens_the_per_file_cap_below_the_inventory_cap(tmp_path):
+    # ``_declared`` keeps each output's own max_bytes (1..16 MiB); the stored declaration, not the
+    # inventory's byte_cap, is what bounds a file, so a smaller declaration tightens it.
+    custody = SaladCustody(private_root(tmp_path) / "c.db")
+    custody.register(
+        BINDING, byte_cap=CAP, file_cap=1, expected_files=1,
+        outputs=[dict(name="small.bin", max_bytes=1024)],
+    )  # fmt: skip
+    data = b"x" * 1025
+    with pytest.raises(ValueError, match="output_undeclared_or_oversize"):
+        custody.put_chunk(
+            BINDING, name="small.bin", checksum=sha(data), size=1025, seq=0,
+            chunk_sha256=sha(data), data=data, expires=1e12,
+        )  # fmt: skip
+    assert custody.db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == 0
+    ok = data[:1024]
+    custody.put_chunk(
+        BINDING, name="small.bin", checksum=sha(ok), size=1024, seq=0,
+        chunk_sha256=sha(ok), data=ok, expires=1e12,
+    )  # fmt: skip
+    assert custody.db.execute("SELECT SUM(size) FROM tickets").fetchone()[0] == 1024
 
 
 # --- shipped gpu_runtime_v1 ---------------------------------------------------------------------

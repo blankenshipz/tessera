@@ -92,6 +92,8 @@ class ProxyResult(Frozen):
         "malformed_response",
         "redirect_denied",
         "identity_mismatch",
+        # A bound group (provider id known) whose exact read is a definitive 404.
+        "group_gone",
         "reallocation_uncertain",
         "accepted_pending",
         "observed",

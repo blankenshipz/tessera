@@ -254,10 +254,36 @@ def _rented_provider(provider_id: str | None) -> bool:
         return False
 
 
+def _refused(
+    spec_stage: Any, rows: list[dict[str, Any]], allowlist: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    pins = {
+        (url, sha)
+        for source in getattr(spec_stage, "inputs", ())
+        if getattr(source, "kind", None) == "public_artifact"
+        for _name, url, sha, _size in source.public_files
+    }
+    allowed = stage_allowlist(spec_stage) if allowlist is None else allowlist
+    return refused_transfers(allowed, pins, rows)
+
+
+def transfer_violations(
+    connection: sqlite3.Connection, attempt: Any, spec_stage: Any
+) -> list[dict[str, Any]]:
+    """Reported transfers of the attempt outside the stage's egress allowlist (ADR 0134).
+
+    Provider-neutral: whatever rows the attempt's provider reports are checked; with none
+    reported there is nothing to refuse (the receipt says ``declared_only``)."""
+    provider_id = attempt["provider_id"] or spec_stage.provider
+    rows = _retained_fetched(connection, provider_id, attempt, spec_stage)
+    return _refused(spec_stage, list(rows or ()))
+
+
 def public_fetch_entry(
     provider_id: str | None, spec_stage: Any, fetched: list[dict[str, Any]] | None = None
 ) -> dict[str, Any] | None:
-    """The ``public_fetch`` receipt object of a stage with ``public_artifact`` inputs (ADR 0097).
+    """The ``public_fetch`` receipt object of a stage with ``public_artifact`` inputs, or of any
+    stage whose provider reported a transfer outside its egress allowlist (ADR 0097, ADR 0134).
 
     The pin (host, sha256) always comes from the approved spec. ``bytes`` and ``seconds`` come
     only from the provider's own reported ``fetched`` rows (``url``, ``sha256``, ``bytes``,
@@ -278,7 +304,10 @@ def public_fetch_entry(
         files += list(source.public_files)
         hosts |= set(source.redirect_hosts)
         cache_requested = cache_requested or bool(getattr(source, "cache", False))
-    if not files:
+    if not files and not _refused(spec_stage, list(fetched or ())):
+        # No public_artifact input and no reported transfer: the receipt keeps its shape. A
+        # reported transfer still gets an entry (ADR 0134 amendment): with no pins it is outside
+        # the allowlist, so the violation that fails the attempt is on the receipt too.
         return None
     reported = {
         (row.get("url"), row.get("sha256")): row for row in fetched or () if isinstance(row, dict)
@@ -312,9 +341,7 @@ def public_fetch_entry(
             item["cache"] = outcome
         entries.append(item)
     allowlist = stage_allowlist(spec_stage)
-    refused = refused_transfers(
-        allowlist, {(url, sha) for _name, url, sha, _size in files}, list(fetched or ())
-    )
+    refused = _refused(spec_stage, list(fetched or ()), allowlist)
     entry = {
         "provider": provider_id,
         "placement": "provider_side",

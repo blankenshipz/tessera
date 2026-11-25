@@ -14,13 +14,16 @@ def _db(spec_json: str | None, operation_id: str | None = "op1") -> sqlite3.Conn
         """CREATE TABLE campaigns (id TEXT, spec_json TEXT, org_id TEXT, project_id TEXT);
         CREATE TABLE campaign_stage_attempts (campaign_id TEXT, stage_key TEXT, operation_id TEXT,
             grant_id TEXT, release_id TEXT, provider_id TEXT);
-        CREATE TABLE external_operations (operation_id TEXT, grant_id TEXT);
+        CREATE TABLE external_operations (operation_id TEXT, grant_id TEXT, org_id TEXT);
         CREATE TABLE execution_grants (id TEXT, snapshot_release_id TEXT);
         CREATE TABLE campaign_approvals (campaign_id TEXT, trust_policy_digest TEXT,
             status TEXT, approved_at TEXT, id TEXT);"""
     )
+    connection.execute("INSERT INTO external_operations VALUES ('op1', NULL, 'o1')")
     if spec_json is not None:
-        connection.execute("INSERT INTO campaigns (id, spec_json) VALUES ('c1', ?)", (spec_json,))
+        connection.execute(
+            "INSERT INTO campaigns (id, spec_json, org_id) VALUES ('c1', ?, 'o1')", (spec_json,)
+        )
         connection.execute(
             "INSERT INTO campaign_stage_attempts (campaign_id, stage_key, operation_id) "
             "VALUES ('c1','s1',?)",

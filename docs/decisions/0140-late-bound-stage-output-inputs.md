@@ -40,6 +40,13 @@ against the resolved artifact rather than the spec's claim.
    `data_class_refused` or `license_refused`. This is how the operator's rule that certain
    non-commercial or restricted rows never go to a rented provider holds for derived data too. No
    dataset or vendor is named in code: the rule is the operator's trust file.
+   Detail of the refusal records: `data_class_refused` names the first offending input (the
+   event's `input`); `license_refused` is decided on the union of the labels of all resolved
+   inputs, so it names no single input (`input` is null) and its reason lists every label the
+   provider may not receive. The Salad adapter's own late-bound codes
+   (`late_bound_input_*`, `late_bound_resolver_unavailable`, event
+   `campaign.salad_late_bind_refused`) are not `LateBindRefused` codes and carry only the
+   `code`: no `input` and no source stage.
 4. **Pinned and recorded.** The resolved tuple (`ResolvedStageInput`: input name, source stage, output
    name, digest, bytes, data class, licence labels, path, manifest id) is recorded with the event
    `campaign.stage_inputs_bound` under the key `late_bound_inputs`, in the same transaction as the
