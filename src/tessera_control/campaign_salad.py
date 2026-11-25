@@ -19,7 +19,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
-from . import campaign_preapproval, provider_trust
+from pydantic import ValidationError
+
+from . import campaign_preapproval, operator_config_freshness, provider_trust
 from . import execution_frames as frames
 from .campaign_infra_retry import REALLOCATED_PRECUSTODY
 from .campaign_models import (
@@ -36,7 +38,6 @@ from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
 from .external_operations import current_operation_reconciliation
 from .guardian_record_reader import validate_frame_record
-from . import operator_config_freshness
 from .programs import program_context
 from .remote_execution_models import ExecutionSelection, TargetPolicy
 from .salad_campaign_profiles import (
@@ -146,14 +147,46 @@ def salad_config(spec_stage: Any) -> SaladStageSpec:
 PREVIEW_FAILED = "review_preview_failed"
 
 
+_PREVIEW_VALUE_PREFIX = "Value error, "
+_PREVIEW_UNSAFE = re.compile(r"[0-9a-fA-F]{12,}|\S*[/\\@~]\S*|[^\x20-\x7e]")
+
+
+def _preview_message(text: str) -> str:
+    """A validation message with anything environment-specific removed: digests, paths, hosts,
+    home directories and non-printable characters; no commas (the reason list is comma-joined)."""
+    text = text.removeprefix(_PREVIEW_VALUE_PREFIX)
+    text = _PREVIEW_UNSAFE.sub("<redacted>", text).replace(",", ";")
+    return " ".join(text.split())[:160]
+
+
+def _preview_validation(error: ValidationError) -> str:
+    """The closed part of a pydantic failure: per error its type, a location made only of
+    identifier-like parts, and the message. Never the input values or the exception object."""
+    found = []
+    for item in error.errors(include_url=False, include_input=False, include_context=False)[:3]:
+        loc = ".".join(
+            str(part)
+            for part in item.get("loc", ())
+            if re.fullmatch(r"[A-Za-z0-9_]{1,40}", str(part))
+        )
+        kind = re.sub(r"[^a-z0-9_]", "", str(item.get("type", ""))) or "error"
+        found.append(
+            f"{kind}{'@' + loc if loc else ''} {_preview_message(str(item.get('msg', '')))}"
+        )
+    return "[" + " | ".join(found) + "]" if found else ""
+
+
 def _preview_failure(error: Exception) -> str:
     """A short stable reason for a stage the driver could not preview: the closed code, then the
-    exception type and, for a refused step, its own closed detail code. Never the message
-    (it may carry a path or a host name)."""
+    exception type and, for a refused step, its own closed detail code. A pydantic validation
+    failure also carries its error types, locations and messages, with digests, paths, hosts and
+    input values removed; any other message is never recorded (it may carry a path or host)."""
     code = PREVIEW_FAILED + ":" + type(error).__name__
     detail = getattr(error, "detail", None)
     if isinstance(detail, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", detail):
         code += ":" + detail
+    if isinstance(error, ValidationError):
+        code += ":" + _preview_validation(error)
     return code
 
 
@@ -930,6 +963,12 @@ class SaladStageDriver:
         # A stage may have no snapshot input (only public_artifact inputs, ADR 0097).
         snapshot = next((i for i in spec_stage.inputs if i.kind == "snapshot"), None)
         preview_digest = None if snapshot is None else snapshot.digest
+        # An adapted stage's reviewed contract declares the staged input the runner composes and
+        # binds as the route's data manifest; that digest, not the first ``snapshot`` input (which
+        # may be the code snapshot), is what the route carries. A non-adapted stage is unchanged.
+        declared = getattr(salad.workload, "input", None) if salad.adapted else None
+        if declared is not None:
+            preview_digest = declared.snapshot_digest
         placeholder = {
             "study_id": "study_preview",
             "source_id": "source_preview",
@@ -1432,8 +1471,12 @@ class SaladStageDriver:
     ) -> bool:
         with self.runner.store.runner_connection() as connection:
             started = self.runner.steps.completed(
-                connection, ctx.campaign["id"], stage["stage_key"], attempt["attempt"],
-                "start_route", 0,
+                connection,
+                ctx.campaign["id"],
+                stage["stage_key"],
+                attempt["attempt"],
+                "start_route",
+                0,
             )
         # Only before the route started: a replay after start_route is recorded must
         # finish its bookkeeping, never fail an attempt that is already running.
