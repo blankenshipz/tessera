@@ -234,7 +234,10 @@ def test_the_service_observation_counts_an_instance_that_is_still_pulling():
 
     counts = dict(allocating_count=0, creating_count=0, running_count=0, stopping_count=0)
     assert _instance_count({"instance_status_counts": counts}) == 0
-    assert _instance_count({"instance_status_counts": {**counts, "allocating_count": 1}}) == 1
+    # a group still waiting for a node (allocating) has no machine: it is not an instance
+    assert _instance_count({"instance_status_counts": {**counts, "allocating_count": 1}}) == 0
+    assert _instance_count({"instance_status_counts": {**counts, "creating_count": 1}}) == 1
+    assert _instance_count({"instances": [{"state": "allocating"}]}) == 0
     assert _instance_count({"instances": [{"state": "downloading"}]}) == 1
     assert (
         _instance_count({"instance_status_counts": counts, "instance_counts_complete": False})
@@ -358,3 +361,174 @@ def test_the_retry_detail_keeps_the_deadline_and_elapsed_seconds(tmp_path):
     )
     first = world.row("SELECT * FROM campaign_stage_attempts WHERE attempt=1")
     assert "120s (elapsed 125s)" in first["failure_detail"]
+
+
+# -- a no-capacity group reports ``running`` with no machine (q-2625) ---------------------------
+
+# The shape of a started Salad group with no capacity: group status running, one instance
+# waiting for a node, nothing placed, no allocation id.
+NO_CAPACITY = {
+    "provider_id": "group-id",
+    "state": "running",
+    "instance_status_counts": dict(
+        allocating_count=1, creating_count=0, running_count=0, stopping_count=0
+    ),
+    "instance_counts_complete": True,
+    "pending_change": False,
+}
+PLACED = {
+    **NO_CAPACITY,
+    "instance_status_counts": dict(
+        allocating_count=0, creating_count=0, running_count=1, stopping_count=0
+    ),
+}
+
+
+def _from_group(observation):
+    from tessera_control.salad_safety_service import _group_started, _instance_count, _running
+
+    return dict(
+        state="running" if _running(observation) else "pending",
+        count=_instance_count(observation),
+        started=_group_started(observation),
+    )
+
+
+def test_a_no_capacity_group_is_neither_running_nor_an_instance():
+    from tessera_control.salad_safety_service import _instance_count, _running
+
+    assert _running(NO_CAPACITY) is False and _instance_count(NO_CAPACITY) == 0
+    empty = {**NO_CAPACITY, "instance_status_counts": dict.fromkeys(
+        ("allocating_count", "creating_count", "running_count", "stopping_count"), 0)}
+    assert _running(empty) is False
+    assert _running(PLACED) is True and _instance_count(PLACED) == 1
+    # fail closed where the read cannot say: a running group with unknown counts still runs
+    assert _running({"state": "running"}) is True
+    assert _running({**NO_CAPACITY, "instance_counts_complete": False}) is True
+    assert _running({"state": "running", "instances": [{"state": "creating"}]}) is True
+    assert _running({"state": "pending", "instances": [{"state": "running"}]}) is True
+    stopping = {**PLACED, "instance_status_counts": {**PLACED["instance_status_counts"],
+                "running_count": 0, "stopping_count": 1}}
+    assert _running(stopping) is True
+
+
+def test_a_no_capacity_group_read_fires_the_deadline_and_never_accrues(world):
+    guardian, clock, seen, stops, _ = world
+    seen.update(_from_group(NO_CAPACITY))
+    assert seen["state"] == "pending"
+    step(guardian, clock)  # the clock starts: nothing latched it off
+    assert step(guardian, clock, LIMIT - 20)["stop_cause"] is None and not stops
+    status = step(guardian, clock, 30)
+    assert status["stop_cause"] == ALLOCATION_TIMEOUT_REASON and stops
+    assert status["allocation_timeout"]["deadline_seconds"] == LIMIT
+
+
+def test_a_placed_running_instance_disables_the_deadline(world):
+    guardian, clock, seen, stops, _ = world
+    seen.update(_from_group(NO_CAPACITY))
+    step(guardian, clock)
+    seen.update(_from_group(PLACED), allocation="alloc-a")
+    step(guardian, clock, 10)
+    seen.update(_from_group(NO_CAPACITY))
+    assert step(guardian, clock, LIMIT * 5)["stop_cause"] is None and not stops
+
+
+def test_a_no_capacity_group_starts_no_accrual():
+    from tessera_control import salad_safety_service as service
+
+    # the accrual start (first_running_at) and the deadline both key on _running
+    assert service._running(NO_CAPACITY) is False
+    assert service._running(PLACED) is True
+    assert service._positively_not_running({"state": "running", "instances": []}) is False
+
+
+def test_a_route_limit_with_no_allocation_is_recorded_as_a_retryable_timeout(world):
+    guardian, clock, seen, stops, make = world
+    short = GuardianAssignment(
+        CustodyBinding("tenant", "project", "op3", 1, "artifact"),
+        "org",
+        "provider-project",
+        "group-id",
+        "attempt-op3",
+        "unallocated",
+        "sha256:image",
+        clock[0] + 90,  # the route limit falls before the allocation deadline
+    )
+    guardian.custody.register(short.binding, byte_cap=10, file_cap=1)
+    guardian.arm(short)
+    status = None
+    for _ in range(40):
+        clock[0] += 5
+        guardian.heartbeat("op3")
+        status = guardian.tick("op3")
+    assert status["stop_cause"] == "deadline"
+    assert status["allocation_timeout"]["elapsed_seconds"] > 0
+
+
+def _route_limit_status(world):
+    guardian, clock, seen, stops, make = world
+    short = GuardianAssignment(
+        CustodyBinding("tenant", "project", "op4", 1, "artifact"),
+        "org",
+        "provider-project",
+        "group-id",
+        "attempt-op4",
+        "unallocated",
+        "sha256:image",
+        clock[0] + 90,
+    )
+    guardian.custody.register(short.binding, byte_cap=10, file_cap=1)
+    guardian.arm(short)
+    status = None
+    for _ in range(40):
+        clock[0] += 5
+        guardian.heartbeat("op4")
+        status = guardian.tick("op4")
+    return status
+
+
+def test_the_route_limit_evidence_survives_the_control_projection():
+    from tessera_control.campaign_salad_executor import project_guardian_final
+
+    raw = dict(CLEAN, stop_cause="deadline", allocation_timeout=TIMEOUT_FINAL["allocation_timeout"])
+    assert project_guardian_final(raw)["allocation_timeout"] == TIMEOUT_FINAL["allocation_timeout"]
+    # Only the two causes the guardian writes it for keep it; any other stop never does.
+    for cause in ("control_disconnect", "provider_unknown", None):
+        assert "allocation_timeout" not in project_guardian_final(dict(raw, stop_cause=cause))
+    assert "allocation_timeout" not in project_guardian_final(dict(raw, allocation_timeout=None))
+
+
+def test_a_route_limit_with_no_instance_is_retried_as_an_allocation_timeout(world, tmp_path):
+    from tessera_control.campaign_salad_executor import project_guardian_final
+
+    status = _route_limit_status(world)
+    assert status["stop_cause"] == "deadline"
+    final = project_guardian_final(
+        dict(
+            CLEAN,
+            stop_cause=status["stop_cause"],
+            allocation_timeout=status["allocation_timeout"],
+        )
+    )
+    assert final["allocation_timeout"]["elapsed_seconds"] == status["allocation_timeout"][
+        "elapsed_seconds"
+    ]
+    other = tmp_path / "control-world"
+    other.mkdir(mode=0o700)
+    control = _timeout_world(other, infra_retries=1)
+    run(control, final, passed=False)
+    control.tick_until(
+        lambda: control.row("SELECT count(*) AS n FROM campaign_stage_attempts")["n"] >= 2
+    )
+    first = control.row("SELECT * FROM campaign_stage_attempts WHERE attempt=1")
+    assert first["status"] == "failed_transient"
+    assert first["failure_class"] == "infra_allocation_timeout"
+
+
+def test_a_route_limit_after_an_instance_was_seen_is_not_a_timeout(world):
+    guardian, clock, seen, stops, _ = world
+    seen.update(_from_group(PLACED), allocation="alloc-a")
+    step(guardian, clock, 10)
+    seen.update(_from_group(NO_CAPACITY))  # same allocation id, group now empty
+    status = step(guardian, clock, 2000)
+    assert status["stop_cause"] == "deadline" and "allocation_timeout" not in status

@@ -389,12 +389,20 @@ def _positively_not_running(observation):
 _COUNT_KEYS = {"allocating_count", "creating_count", "running_count", "stopping_count"}
 
 
+def _placed(instance):
+    """A listed instance is placed once it is past ``allocating`` or already names its machine
+    (consistent with ``_provider`` and the workload binding: a container may call in while the API
+    still says ``allocating``). Conservative for billing: Salad does not bill allocating time."""
+    return instance.get("state") != "allocating" or bool(instance.get("machine_id"))
+
+
 def _instance_count(observation):
-    """How many instances the group lists, an instance still pulling its image included; None
-    when the read does not say completely (the allocation deadline then never fires)."""
+    """How many instances the group lists that Salad has actually placed (one still pulling its
+    image included), not those still ``allocating``: a group waiting for a node has no machine
+    yet. None when the read does not say completely (the allocation deadline then never fires)."""
     instances = observation.get("instances")
     if instances:
-        return len(instances)
+        return sum(1 for i in instances if _placed(i))
     counts = observation.get("instance_status_counts")
     if (
         observation.get("instance_counts_complete", True) is True
@@ -402,8 +410,24 @@ def _instance_count(observation):
         and set(counts) == _COUNT_KEYS
         and all(type(v) is int and v >= 0 for v in counts.values())
     ):
-        return sum(counts.values())
+        return sum(v for k, v in counts.items() if k != "allocating_count")
     return None
+
+
+def _no_placed_instance(observation):
+    """True only when complete counts show nothing placed: none running, creating or stopping
+    (only allocating, or empty). A group-level ``running`` status is then not a running machine."""
+    instances = observation.get("instances")
+    if instances:
+        return not any(_placed(i) for i in instances)
+    counts = observation.get("instance_status_counts")
+    return (
+        observation.get("instance_counts_complete", True) is True
+        and type(counts) is dict
+        and set(counts) == _COUNT_KEYS
+        and all(type(v) is int and v >= 0 for v in counts.values())
+        and not any(v for k, v in counts.items() if k != "allocating_count")
+    )
 
 
 def _group_started(observation):
@@ -423,10 +447,12 @@ def _group_started(observation):
 
 
 def _running(observation):
-    """Group reports running, or its (single) instance already runs while deploying."""
-    return observation.get("state") == "running" or any(
-        i.get("state") == "running" for i in observation.get("instances") or []
-    )
+    """An instance runs: one listed as running, or the group reports running while its complete
+    counts do not say nothing is placed. A started group with no capacity reports ``running`` with
+    only allocating (or no) instances; that is no machine and no billing, so it is not running."""
+    if any(i.get("state") == "running" for i in observation.get("instances") or []):
+        return True
+    return observation.get("state") == "running" and not _no_placed_instance(observation)
 
 
 FRAME_RECORD_SCHEMA = """

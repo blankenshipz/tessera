@@ -1342,7 +1342,14 @@ def project_guardian_final(
         observed_at=(now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     timeout = status.get("allocation_timeout")
-    if status.get("stop_cause") == "allocation_timeout" and type(timeout) is dict:
+    # The guardian writes the evidence only for a group that never showed an instance: its own
+    # deadline (``allocation_timeout``) or the route limit reached in that state (``deadline``).
+    if (
+        status.get("stop_cause") in {"allocation_timeout", "deadline"}
+        and type(timeout) is dict
+        and type(timeout.get("elapsed_seconds")) is int
+        and type(timeout.get("deadline_seconds")) is int
+    ):
         projected["allocation_timeout"] = {
             "elapsed_seconds": timeout.get("elapsed_seconds"),
             "deadline_seconds": timeout.get("deadline_seconds"),

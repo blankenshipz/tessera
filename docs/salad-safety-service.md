@@ -413,6 +413,34 @@ project spend caps, and nothing escalates spend. The timed-out attempt still set
 guardian-bounded hold (or a human charge when the published rate was never readable), and a retry
 waits for that settlement because open Salad exposure blocks a new positive hold.
 
+### Amendment: an instance means a placed machine
+
+A started group with no capacity reports the group status `running` with an instance only
+`allocating` (waiting for a node) or none, and no allocation id. That is not an allocation and not
+a running machine. The service's observation therefore counts an instance only once Salad has
+placed it (`creating_count`, `running_count`, `stopping_count`, or a listed instance that is
+past `allocating` or already names its `machine_id`; `allocating_count` alone, or a listed
+allocating instance with no machine, is zero), and reports `running` (and starts accrual,
+`first_running_at`) only for a listed running instance or a running group whose complete counts do
+not say nothing is placed. Both the deadline and accrual use the same test. Anything the read does
+not say completely stays as before (a running group with missing counts still counts as running; an
+adapter that cannot count never triggers the deadline). No stop or cap is loosened.
+
+An allocating instance that already has a `machine_id` counts as placed. This matches `_provider`
+and the workload binding (a container may call in while the API still says `allocating`) and is the
+safe choice for billing and exposure. Salad's billing page (updated 2 Nov 2026) says billing is for
+"the time container group instances are running on one of our machines", that "No charges are
+incurred while your container group is allocating or downloading", and that you "will never pay for
+Cold Boot time". Treating `machine_id` as placed is therefore conservative: our exposure estimate
+and deadline latch may start earlier than Salad bills, never later.
+
+When the route limit stops a started group that never showed an instance, the status carries the
+same `allocation_timeout` evidence (elapsed seconds; the stop cause stays `deadline`), and control's
+guardian-final projection keeps it for a `deadline` as well as an `allocation_timeout` stop, so the
+attempt is recorded as the retryable `infra_allocation_timeout` rather than a permanent
+`salad_not_passed`. In that case `deadline_seconds` repeats the elapsed time (the route limit, not
+the allocation setting).
+
 ## Allocation change before anything ran
 
 Salad can reschedule a container group while its image is still being pulled. An allocation change

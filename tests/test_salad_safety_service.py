@@ -3479,3 +3479,66 @@ def test_counts_salad_did_not_send_are_the_only_thing_between_a_stopped_read_and
         assert status["reason"] == "provider_confirmed_exact_group_stopped"
     finally:
         s.close()
+
+
+# -- allocating instances on the production instances-list path (allocation deadline) -------------
+
+
+def _observed(tmp_path, *, machine, group_state="running", counts=None, listed=True):
+    """One ``_observe`` of a started group through ``_provider`` (the instances-list path)."""
+    from tessera_control.salad_guardian import ProviderObservation  # noqa: F401
+
+    tmp_path.chmod(0o700)
+    clock = [100.0]
+    provider = Provider()
+    provider.state = "running"
+    provider.group_state = group_state
+    provider.instance_state = "allocating"
+    provider.machine = machine
+    provider.counts = counts
+    s = make_service(tmp_path, lambda: clock[0], ec.generate_private_key(ec.SECP256R1()), provider)
+    try:
+        b = reservation()
+        s.loop()
+        s.admin(b)
+        s.admin(
+            dict(
+                operation="bind",
+                reservation=b["reservation"],
+                provider_id=GROUP,
+                allocation_id=None,
+            )
+        )
+        if not listed:
+            provider.state = "stopped"
+            provider.group_state = group_state
+        assignment = s._assignment(s._row(b["reservation"]))
+        observation = s._observe(assignment)
+        return observation, s._row(b["reservation"]), clock[0]
+    finally:
+        s.close()
+
+
+def test_an_allocating_instance_without_a_machine_is_no_machine_and_starts_no_accrual(tmp_path):
+    counts = dict(allocating_count=1, creating_count=0, running_count=0, stopping_count=0)
+    o, row, now = _observed(tmp_path, machine=None, counts=counts)
+    assert o.state == "pending" and o.instance_count == 0
+    assert o.allocation_id == "unallocated"
+    assert row["first_running_at"] is None and row["seen_running"] == 0
+    assert row["last_unseen_at"] == now  # positive evidence nothing runs yet
+
+
+def test_an_allocating_instance_that_names_its_machine_is_placed(tmp_path):
+    # Conservative for billing and exposure: it may be started earlier than Salad bills it.
+    counts = dict(allocating_count=1, creating_count=0, running_count=0, stopping_count=0)
+    o, row, now = _observed(tmp_path, machine=MACHINE, counts=counts)
+    assert o.state == "running" and o.instance_count == 1
+    assert o.allocation_id == "unallocated"  # bound only once it is really running
+    assert row["first_running_at"] is not None and row["seen_running"] == 1
+
+
+def test_a_running_group_with_no_listed_instance_and_only_allocating_is_not_running(tmp_path):
+    counts = dict(allocating_count=1, creating_count=0, running_count=0, stopping_count=0)
+    o, row, now = _observed(tmp_path, machine=None, counts=counts, listed=False)
+    assert o.state == "pending" and o.instance_count == 0
+    assert row["first_running_at"] is None and row["seen_running"] == 0

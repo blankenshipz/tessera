@@ -482,6 +482,17 @@ class SaladGuardian:
         waited = now - started
         return waited if waited >= self.allocation_seconds else None
 
+    def _never_allocated(self, operation: str, now: float) -> float | None:
+        """Seconds a started group has waited when it never showed an instance (None when the
+        clock never started or an instance was ever seen)."""
+        found = self.db.execute(
+            "SELECT instance_seen,alloc_started_at FROM assignments WHERE operation=?",
+            (operation,),
+        ).fetchone()
+        if found is None or found[0] or found[1] is None:
+            return None
+        return max(0.0, now - found[1])
+
     def read_retry_backoff(self, operation: str) -> float | None:
         """Seconds to wait before the next poll while a pre-start read failure is being
         retried (bounded, growing with each consecutive failure); None when none is."""
@@ -670,6 +681,7 @@ class SaladGuardian:
         allocation = row[7] or a.allocation_id
         stop_safe = True
         allocation_waited = None
+        never_allocated = None
         fail_since = row[9]
         retry_detail = None
         retry_prefix = None
@@ -743,6 +755,18 @@ class SaladGuardian:
                 if waited is not None:
                     reason, stopping = ALLOCATION_TIMEOUT_REASON, True
                     allocation_waited = waited
+            if (
+                reason == "deadline"
+                and exact
+                and fresh
+                and first_running is None
+                and allocation == "unallocated"
+                and o.allocation_id == "unallocated"
+                and o.instance_count == 0
+            ):
+                # The route limit was reached with a started group that never had an instance:
+                # a placement failure, recorded like the allocation deadline's (retryable).
+                never_allocated = self._never_allocated(operation, now)
         except Exception as error:
             failed_at = self.clock()
             retry_prefix = self._may_retry_read(
@@ -781,7 +805,12 @@ class SaladGuardian:
                     "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
                     (operation, now, STOP_CAUSE_PREFIX + reason),
                 )
-                if reason == ALLOCATION_TIMEOUT_REASON and allocation_waited is not None:
+                if reason == "deadline" and never_allocated is not None:
+                    allocation_waited = never_allocated
+                if (
+                    reason in {ALLOCATION_TIMEOUT_REASON, "deadline"}
+                    and allocation_waited is not None
+                ):
                     self.db.execute(
                         "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
                         (
@@ -791,7 +820,12 @@ class SaladGuardian:
                             + json.dumps(
                                 {
                                     "elapsed_seconds": int(allocation_waited),
-                                    "deadline_seconds": self.allocation_seconds,
+                                    "deadline_seconds": (
+                                        int(allocation_waited)
+                                        if self.allocation_seconds is None
+                                        or reason == "deadline"
+                                        else self.allocation_seconds
+                                    ),
                                 },
                                 separators=(",", ":"),
                             ),
