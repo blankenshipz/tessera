@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 CAMPAIGN_SUBMISSIONS_SCHEMA_VERSION = 76
-# Literal: must equal the highest registered constant (OUTPUT_LICENSE_SCHEMA_VERSION, below).
-LATEST_SCHEMA_VERSION = 90
+# Literal: must equal the highest registered constant (REVIEW_TIERS_SCHEMA_VERSION, below).
+LATEST_SCHEMA_VERSION = 91
 LOCAL_ORG_ID = "org_local"
 
 
@@ -2059,3 +2059,54 @@ def migrate_output_license_schema(connection: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(OUTPUT_LICENSE_SCHEMA_VERSION - 1, migrate_output_license_schema)
+
+
+# Configurable review tiers (schema 91; migration number 101 reserved). Relaxes the review_jobs
+# tier CHECK from the four built-in names to a well-formed tier name (the configured set is
+# checked by the store) by the same-id rebuild schema 75 uses, and adds review_job_tier_grants
+# (the grant a tier approval binds, append-only). Existing rows are copied unchanged, so every
+# old tier stays valid. Idempotent. The next contiguous version after the output licence labels
+# (90); if another change owns it when branches merge, raise REVIEW_TIERS_SCHEMA_VERSION,
+# LATEST_SCHEMA_VERSION (the literal near the top) and the fresh-database INSERT in store.py.
+REVIEW_TIERS_SCHEMA_VERSION = 91
+
+
+def migrate_review_tiers_schema(connection: sqlite3.Connection) -> None:
+    from .review_jobs import create_review_jobs_schema
+
+    preexisting = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+    row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='review_jobs'"
+    ).fetchone()
+    if row is not None and "tier IN (" in row[0]:
+        before = connection.execute("SELECT COUNT(*) FROM review_jobs").fetchone()[0]
+        connection.execute("PRAGMA defer_foreign_keys=ON")
+        old_columns = [r[1] for r in connection.execute("PRAGMA table_info(review_jobs)")]
+        connection.execute("CREATE TABLE review_jobs_v88 AS SELECT * FROM review_jobs")
+        connection.execute("DROP TABLE review_jobs")
+        create_review_jobs_schema(connection)
+        new_columns = {r[1] for r in connection.execute("PRAGMA table_info(review_jobs)")}
+        copied = ",".join(c for c in old_columns if c in new_columns)
+        connection.execute(
+            f"INSERT INTO review_jobs ({copied}) SELECT {copied} FROM review_jobs_v88"
+        )
+        connection.execute("DROP TABLE review_jobs_v88")
+        after = connection.execute("SELECT COUNT(*) FROM review_jobs").fetchone()[0]
+        if after != before:
+            raise ValueError("Migration v91 changed the number of review jobs.")
+    create_review_jobs_schema(connection)
+    if len(connection.execute("PRAGMA foreign_key_check").fetchall()) > preexisting:
+        raise ValueError("Migration v91 introduced foreign key violations.")
+    connection.execute(
+        """UPDATE operator_backup_health SET last_success_at=NULL,last_backup_id=NULL
+        WHERE singleton=1 AND EXISTS (
+            SELECT 1 FROM control_recovery WHERE singleton=1 AND state='active'
+        )"""
+    )
+    connection.execute(
+        "UPDATE schema_meta SET schema_version=? WHERE singleton=1",
+        (REVIEW_TIERS_SCHEMA_VERSION,),
+    )
+
+
+MIGRATIONS.setdefault(REVIEW_TIERS_SCHEMA_VERSION - 1, migrate_review_tiers_schema)

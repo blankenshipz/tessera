@@ -1,0 +1,49 @@
+# Example unit; every path is a generic placeholder (see README.md).
+# Manual start only: no [Install] section, so enabling or starting
+# tessera.target never starts it. Contains no secret: the runner's agent
+# credential and the model key are owner-only files passed with
+# LoadCredential=; the runner never opens the model key itself.
+# It runs on the control host as the control service's user, because it reads
+# job inputs from the control state directory (like the code review runner).
+[Unit]
+Description=Tessera research review runner (admitted, manual start only)
+After=network-online.target
+Wants=network-online.target
+# Admission: an operator creates this empty marker file to allow a start.
+ConditionPathExists=/etc/tessera/research-review-runner.admitted
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=tessera-control
+Group=tessera-control
+UMask=0077
+StateDirectory=tessera/research-review-runner
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/tessera/research-review-runner
+# The agent credential holds exactly review:read, review:findings and model_spend:record.
+LoadCredential=agent-token:/etc/tessera/credentials/research-review-runner-agent-token
+LoadCredential=anthropic-api-key:/etc/tessera/credentials/anthropic-api-key
+# Non-secret references only.
+Environment=TESSERA_AGENT_DESTINATION=example-destination
+ExecStart=/opt/tessera/.venv/bin/python -m tessera_control.research_review_runner --state-dir /var/lib/tessera-control --project-id example-project --journal /var/lib/tessera/research-review-runner/journal.jsonl --receipts-dir /var/lib/tessera/research-review-runner/receipts --prompts-dir /etc/tessera/research-prompts --model-profile /etc/tessera/research-review-profile.json --policy example_policy_module:REVIEW_POLICY --kill-switch /etc/tessera/research-review-runner.kill --poll-seconds 60
+# Exit 2 (configuration refused) will not fix itself.
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/tessera-control /var/lib/tessera/research-review-runner

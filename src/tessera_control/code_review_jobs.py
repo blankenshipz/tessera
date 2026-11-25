@@ -568,6 +568,14 @@ class CodeReviewRunStore:
             ).fetchone()
             if row is None:
                 return None
+            from .review_tiers import tier_start_refusal
+
+            refusal = tier_start_refusal(connection, row)
+            if refusal:
+                # A tier approval whose grant is gone, changed or spent never starts the job.
+                self._bump(connection, row["id"], "not_started", row["revision"], refusal)
+                self._system_event(connection, row, "review_job.not_started", {"reason": refusal})
+                return None
             attempt = row["cr_attempts"] + 1
             history = json.loads(
                 connection.execute(

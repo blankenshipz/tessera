@@ -217,7 +217,12 @@ def test_receipt_declared_only_without_retained_rows(world):
             "redirect_enforced": True,
             "network_enforced": False,
             "statement": EGRESS_ALLOWLIST_STATEMENT,
+            "entries": [
+                {"host": CDN, "port": 443, "source": "redirect"},
+                {"host": HOST, "port": 443, "source": "pinned"},
+            ],
         },
+        "egress_verdict": "declared_only",
     }
 
 

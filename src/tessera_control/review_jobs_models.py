@@ -7,12 +7,16 @@ Prompt text is never stored, only its pinned digest; finding text is untrusted d
 import math
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from .models import NonBlank200, NonBlank4000, Sha256Digest, StrictRequest, StrictRevision
 
 JOB_KINDS = ("plan_review", "dataset_scout", "technique_scout", "pre_gate_review", "code_review")
+# The default tier set (``review_tiers.DEFAULT_TIERS``). The tiers a deployment accepts, and
+# which need a per-job approval, are operator configuration: a request names any well-formed
+# tier and the store refuses one that is not configured (``tier_not_configured``).
 TIERS = ("haiku", "sonnet", "opus", "fable")
+TierName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,31}$")]
 # ADR 0047 class names. Control derives a snapshot's class from its stored record; a client never
 # supplies one. Snapshots resolve to public or private_derived (ADR 0039).
 DATA_CLASSES = ("public", "private_code_approved", "private_derived")
@@ -57,7 +61,7 @@ class SubmitReviewJob(StrictRequest):
     inputs: Annotated[list[ReviewInput], Field(min_length=1, max_length=16)]
     prompt_digest: Sha256Digest
     destination_id: NonBlank200
-    tier: Literal["haiku", "sonnet", "opus", "fable"]
+    tier: TierName
     budget_cents: Annotated[int, Field(strict=True, ge=0, le=MAX_BUDGET_CENTS)]
     egress: Literal["none", "model_runtime"] = "none"
     code_review: CodeReviewSubject | None = None
@@ -80,8 +84,17 @@ class SubmitReviewJob(StrictRequest):
 
 
 class ApproveReviewTier(StrictRequest):
+    """A person's per-job approval of a tier at or above the configured approval threshold.
+
+    ``grant_id`` names the reasoning agent authority grant that pays for the job: it must belong
+    to the job's project, pay for the job's destination and a model bound to the job's tier, and
+    cover the job's budget. It is optional in shape only; the store refuses an approval without
+    one (``tier_grant_required``) so the refusal carries a stable reason code.
+    """
+
     expected_revision: StrictRevision
     rationale: NonBlank4000
+    grant_id: NonBlank200 | None = None
 
 
 class FindingEvidence(StrictRequest):
@@ -131,7 +144,7 @@ class ModelCallReceipt(StrictRequest):
     model_configured: NonBlank200
     model_reported: Annotated[str, Field(max_length=200)] | None = None
     model_identity_basis: Literal["harness_reported_unverified", "provider_response_model"]
-    tier: Literal["haiku", "sonnet", "opus", "fable"]
+    tier: TierName
     input_digests: Annotated[dict[NonBlank200, Sha256Digest], Field(max_length=32)]
     tokens: dict[
         Literal["input", "output", "reasoning", "cache_read", "cache_write", "total"],
@@ -207,7 +220,7 @@ class SubmitCodeReview(StrictRequest):
     branch: Annotated[str, Field(min_length=1, max_length=200)]
     head_sha: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
     base_branch: Annotated[str, Field(min_length=1, max_length=200)] = "main"
-    tier: Literal["haiku", "sonnet", "opus", "fable"]
+    tier: TierName
     destination_id: NonBlank200 = "anthropic"
     budget_cents: Annotated[int, Field(strict=True, ge=0, le=MAX_BUDGET_CENTS)]
     # Bounded loosely here so an over-long list is the store's stable focused_tests_invalid.

@@ -233,6 +233,9 @@ class ControlClient:
     async def deploy_check_report(self):
         return await self._request("GET", "/admin/deploy-check")
 
+    async def deploy_requests(self):
+        return await self._request("GET", "/admin/deploy-requests")
+
     async def register_campaign_provider(self, body, idempotency_key):
         return await self._request(
             "POST",

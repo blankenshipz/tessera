@@ -57,6 +57,7 @@ references, not claims of a supported production deployment.
 - [Salad proxy](salad-proxy.md): the Salad server proxy milestone and activation runbook.
 - [Deploy check](deploy-check.md): one report of what a deploy still needs, with receipted fixes.
 - [Deploy upgrade](deploy-upgrade.md): the checked upgrade command, dry-run first, with a deploy receipt.
+- [Deploy request](deploy-request.md): a gated release that deploys itself once nothing blocks it.
 - [Enablement runbook](operations/enablement-runbook.md): what to switch on after a deploy, with a check that each feature is in use.
 - [Campaign providers](campaign-providers.md): the provider file, the self-hosted provider,
   the Salad provider and the service loop contract.

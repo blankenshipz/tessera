@@ -351,6 +351,18 @@ def register_provider_registration_tools(server: FastMCP, client: ControlClient)
         """
         return await client.deploy_check_report()
 
+    @server.tool(annotations=read)
+    async def tessera_deploy_requests() -> dict[str, Any]:
+        """Deploy requests waiting for their blockers to clear, and what happened to each.
+
+        Read-only. Returns the newest `tessera.deploy-request.v1` records (requested release,
+        requester, gate evidence digest, expiry, status, current blockers such as in-flight
+        remote routes, the fire result) with each request's chained receipts. A pending request
+        deploys itself once nothing blocks it; requests are made and cancelled with
+        `tessera deploy-request` on the operator host. It changes nothing.
+        """
+        return await client.deploy_requests()
+
     @server.tool(annotations=write)
     async def tessera_register_provider(
         action: str,

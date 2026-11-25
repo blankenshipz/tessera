@@ -690,7 +690,7 @@ tick (so at the first tick after a restart); it handles at most 50 campaigns per
 resumes where it left off, wrapping around, so every idle holder is eventually reached. While the holder still has a live attempt the
 refusal stays, and names the holding campaign and the release expiry to the same
 organization only (another organization learns only that the snapshot is held and until
-when). A person's own release, which no campaign attempt used, is never revoked by the runner.
+when). A person's own release, which no campaign attempt used, is never revoked by the runner. A steering-paused campaign is treated the same way (ADR 0167); when it resumes it waits for the snapshot in first-come order rather than failing.
 A release whose `expires_at` has passed is never treated as active, whoever holds it: it
 does not refuse a new campaign, and the new release revokes it in the same transaction with a
 `workspace.snapshot_release_expired` event (`release_id`, `expired_at`, `replaced_by`).

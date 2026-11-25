@@ -157,7 +157,10 @@ statement: "The hosts are the approved pinned sources and their redirect hosts. 
 declared for review and the redirect set is enforced by the workload runtime; the provider's
 network does not restrict the stage to them." Salad's egress is provider-wide
 ([ADR 0036](0036-generic-salad-gpu-workloads.md)), so the receipt never claims network enforcement. A stage without pins has no
-`public_fetch` object and so no allowlist.
+`public_fetch` object and so no allowlist. [ADR 0134](0134-stage-egress-allowlist-receipt.md)
+adds one key to this object, `entries` (the per-host `{host, port, source}` rows of the stage
+allowlist), and the sibling keys `egress_verdict` and `refused_transfers` on the `public_fetch`
+object; the fields above are unchanged.
 
 Limitation, a follow-up: contacted-host journaling (which redirect hosts were actually
 contacted during the fetch) is not recorded. Tests: `tests/test_public_fetch_receipt_allowlist.py`.

@@ -44,7 +44,14 @@ def test_provider_side_entry_declares_the_allowlist_without_network_enforcement(
         "redirect_enforced": True,
         "network_enforced": False,
         "statement": EGRESS_ALLOWLIST_STATEMENT,
+        # ADR 0134: the one added key, the per-host rows of the stage allowlist.
+        "entries": [
+            {"host": "alpha.example.org", "port": 443, "source": "redirect"},
+            {"host": "cdn.example.net", "port": 443, "source": "redirect"},
+            {"host": "zeta.example.com", "port": 443, "source": "pinned"},
+        ],
     }
+    assert entry["egress_verdict"] == "declared_only" and "refused_transfers" not in entry
     assert entry["egress_allowlist"]["network_enforced"] is False
     assert "does not restrict" in EGRESS_ALLOWLIST_STATEMENT
     assert entry["placement"] == "provider_side" and entry["via_control"] is False
@@ -63,6 +70,28 @@ def test_stage_without_pins_has_no_entry():
     assert public_fetch_entry("rented", stage(pins=False)) is None
 
 
-def test_local_worker_and_unknown_provider_entries_are_unchanged():
-    assert "egress_allowlist" not in public_fetch_entry("local", stage())
-    assert "egress_allowlist" not in public_fetch_entry(None, stage())
+def test_local_worker_and_unknown_provider_entries_have_no_allowlist_object():
+    row = {"url": URL, "sha256": SHA, "bytes": 1000, "seconds": 2.0}
+    for provider in ("local", None):
+        entry = public_fetch_entry(provider, stage())
+        assert "egress_allowlist" not in entry
+        # ADR 0134: the verdict is not gated like the allowlist object.
+        assert entry["egress_verdict"] == "declared_only"
+        reported = public_fetch_entry(provider, stage(), [row])
+        assert "egress_allowlist" not in reported
+        assert reported["egress_verdict"] == "within_allowlist"
+
+
+def test_an_earlier_receipt_object_is_a_subset_of_the_merged_one():
+    """Additive only (ADR 0134): every key and value main wrote before stays as it was."""
+    entry = public_fetch_entry("rented", stage("cdn.example.net"))
+    earlier = {
+        "hosts": ["cdn.example.net", "zeta.example.com"],
+        "declared": True,
+        "redirect_enforced": True,
+        "network_enforced": False,
+        "statement": EGRESS_ALLOWLIST_STATEMENT,
+    }
+    merged = entry["egress_allowlist"]
+    assert {key: merged[key] for key in earlier} == earlier
+    assert set(merged) - set(earlier) == {"entries"}

@@ -158,8 +158,11 @@ def _dump(db, table):
 def test_v74_rebuild_preserves_every_column_and_row(world):  # noqa: F811
     """The kind-CHECK rebuild copies the columns the OLD table has (read from the table), so
     every column of every review table survives with its values, whatever the column list."""
+    from test_review_job_tier_approval import tier_grant
+
     approved = world.submit(job(tier="fable")).json()["id"]
-    body = {"expected_revision": 1, "rationale": "ok to spend"}
+    grant = tier_grant(world, model="vendor-fable-1")
+    body = {"expected_revision": 1, "rationale": "ok to spend", "grant_id": grant}
     assert world.post(f"/review-jobs/{approved}/approve-tier", world.owner, body).status_code == 200
     first_job, first_finding = ingested(world)
     second_job, _ = ingested(world, [finding("a"), finding("b")])

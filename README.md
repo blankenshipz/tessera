@@ -493,7 +493,8 @@ at 1 GiB unless the operator passes `--max-backup-bytes`
 (pending migrations, the backup bound, config keys a release removed, provider profiles) and
 applies the safe fixes with a receipt ([deploy check](docs/deploy-check.md)); `tessera deploy-upgrade`
 runs the whole upgrade (preflight, capped backup, migrate, ordered restart, health, smoke, receipt) as
-one dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)). Follow the
+one dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)); `tessera deploy-request`
+records a gated release that deploys itself once nothing blocks it ([deploy request](docs/deploy-request.md)). Follow the
 [screen-by-screen quickstart](docs/quickstart.md) for review/export and troubleshooting.
 Native installation and picker/save acceptance require their own checks;
 simulator evidence does not close those gates.
@@ -512,7 +513,8 @@ Console scripts installed by the package, one line each:
   stopped, keeping the previous database as a restorable backup ([recovery](docs/recovery.md)).
   `tessera deploy-check` reports what a deploy still needs and applies the safe fixes with a receipt
   ([deploy check](docs/deploy-check.md)); `tessera deploy-upgrade` runs the whole upgrade as one
-  dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)).
+  dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)); `tessera deploy-request` records a
+  gated release that deploys itself once nothing blocks it ([deploy request](docs/deploy-request.md)).
 - `tessera-worker` / `tessera-worker-daemon`: worker CLI (`development-poll`) and its
   supervised daemon.
   A stage watcher (on by default in the worker and in the Salad executor, [ADR 0125](docs/decisions/0125-stage-watcher-on-by-default.md): the kill-switch marker `<workspace>/stage-watch.kill` is only named, never created by the platform, and while it exists the watcher files no decision requests and makes no model calls while observing and reporting continue; opt out in the worker with `--no-stage-watcher` (worker only) or in the Salad executor with `"stage_watcher": {"enabled": false}` (the executor has no flag; it logs one bounded line instead), and an unusable default directory means no watcher and one stderr line, never a refused stage) observes and reports and never acts: it cannot stop, cancel, retry, resize or re-route anything. It may also file closed retry and resize *requests* (no shipped caller files them yet) that control records as advisory events and nobody admits ([ADR 0111](docs/decisions/0111-stage-watcher-decision-requests-and-remote-wiring.md)). It is described in [docs/stage-watcher.md](docs/stage-watcher.md), which also covers the Salad executor option.

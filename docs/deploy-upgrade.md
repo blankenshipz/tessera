@@ -5,6 +5,9 @@ restart the services in order, wait for health, a fixed cheap smoke and a receip
 until you pass `--execute`. Design and limits: [ADR 0099](decisions/0099-deploy-upgrade.md); the
 preflight is the [deploy check](deploy-check.md).
 
+To run the upgrade once nothing blocks it (for example a remote route still in flight), record a
+[deploy request](deploy-request.md) instead of watching for the blocker to clear.
+
 ```
 tessera deploy-upgrade --plan PLAN            # preflight and what would happen; writes nothing
 tessera deploy-upgrade --plan PLAN --execute  # do it and write the receipt

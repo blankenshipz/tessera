@@ -85,6 +85,9 @@ def job(job_id: str, request: Request, actor: Actor):
 
 @router.post("/review-jobs/{job_id}/approve-tier")
 def approve_tier(job_id: str, body: ApproveReviewTier, request: Request, actor: Actor, key: Key):
+    """A person approves one job's tier (at or above the configured approval threshold) and
+    names the reasoning grant that pays for it; 409 with a stable ``tier_grant_*`` reason when
+    the grant is missing, foreign, inactive, not bound to the tier's model or underfunded."""
     return _response(
         lambda: request.app.state.review_jobs.approve_tier(
             actor, job_id, key, body.model_dump(mode="json")

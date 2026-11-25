@@ -117,7 +117,10 @@ The receipt's `public_fetch` object for a provider-side stage carries `egress_al
 sorted pinned and redirect `hosts`, `declared: true`, `redirect_enforced: true` and
 `network_enforced: false`, with a statement that the hosts are declared for review and the
 redirect set is enforced by the workload runtime while the provider's network does not restrict
-the stage to them (Salad egress is provider-wide, ADR 0036). Per-file `bytes`, `seconds` and
+the stage to them (Salad egress is provider-wide, ADR 0036), and `entries`, the per-host
+`{host, port, source}` rows of the stage allowlist (ADR 0134). Every `public_fetch` object also
+carries `egress_verdict` (`declared_only`, `within_allowlist` or `violation`) and, on a
+violation, `refused_transfers` (host and reason only). Per-file `bytes`, `seconds` and
 `cache` are `provider_reported` only when control recorded validated fetched rows
 (`execution.public_fetch_recorded`, derived from retained output, never a worker claim), and
 `declared_only` otherwise. Which redirect hosts were actually contacted is not journaled yet.

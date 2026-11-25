@@ -525,6 +525,9 @@ def parser() -> argparse.ArgumentParser:
     from .deploy_check_cli import add_parser as add_deploy_check_command
 
     add_deploy_check_command(subcommands)
+    from .deploy_request_cli import add_parser as add_deploy_request_command
+
+    add_deploy_request_command(subcommands)
     from tessera_agent.reasoning_install_cli import add_parser as add_reasoning_command
 
     add_reasoning_command(subcommands)
@@ -710,6 +713,15 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
+        "--review-tiers",
+        type=Path,
+        help=(
+            "JSON file of review-job tiers: ordered tier names, the tier from which a per-job "
+            "approval and a bound grant are required, optional model ids per tier (env "
+            "fallback TESSERA_REVIEW_TIERS); default: the built-in four tiers"
+        ),
+    )
+    serve.add_argument(
         "--code-review-git-remotes",
         type=Path,
         help=(
@@ -724,6 +736,16 @@ def parser() -> argparse.ArgumentParser:
             "owner-only execution-monitor enrollment file (tessera.monitor-enrollments.v1): "
             "opt in to the pinned mutual-TLS monitor receiver listener; without it no "
             "listener starts (ADR 0127)"
+        ),
+    )
+    serve.add_argument(
+        "--review-destinations",
+        type=Path,
+        help=(
+            "owner-held review destination policy file (tessera.review-destinations.v1; env "
+            "fallback TESSERA_REVIEW_DESTINATIONS): registered model destinations and the data "
+            "classes, tiers and budget each may receive; without it every review job submit "
+            "is refused (ADR 0084)"
         ),
     )
     return command
@@ -1180,6 +1202,10 @@ def main(argv: list[str] | None = None) -> int:
         from .deploy_check_cli import run as run_deploy_check
 
         return run_deploy_check(arguments)
+    if arguments.command == "deploy-request":
+        from .deploy_request_cli import run as run_deploy_request
+
+        return run_deploy_request(arguments)
     if arguments.command == "admin":
         from .provider_trust_cli import run_provider_trust
 
@@ -1311,6 +1337,21 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
+        tiers_file = arguments.review_tiers
+        if tiers_file is None and os.environ.get("TESSERA_REVIEW_TIERS"):
+            tiers_file = Path(os.environ["TESSERA_REVIEW_TIERS"])
+        review_tiers = None
+        if tiers_file is not None:
+            from .review_tiers import load_review_tiers
+
+            try:
+                review_tiers = load_review_tiers(tiers_file)
+            except (ValueError, OSError):
+                print(
+                    "serve configuration error: review tiers file is unreadable or malformed",
+                    file=sys.stderr,
+                )
+                return 2
         runner_interval = None if arguments.no_campaign_runner else arguments.campaign_tick_seconds
         if arguments.agent_submissions and arguments.agent_submission_kill_switch is None:
             print(
@@ -1322,6 +1363,20 @@ def main(argv: list[str] | None = None) -> int:
         try:
             deployment = serving_config(
                 arguments.bind_host, arguments.trusted_host, arguments.public_origin
+            )
+            from .review_destination_policy import (
+                ENVIRONMENT_VARIABLE,
+                load_review_destination_policy,
+            )
+
+            # Like the trust file below: a refused file is a ValueError, so serve exits 2.
+            review_destinations_file = arguments.review_destinations
+            if review_destinations_file is None and os.environ.get(ENVIRONMENT_VARIABLE):
+                review_destinations_file = Path(os.environ[ENVIRONMENT_VARIABLE])
+            review_destinations = (
+                load_review_destination_policy(review_destinations_file)
+                if review_destinations_file is not None
+                else None
             )
             from .provider_trust import builtin_policy, load_policy_file
 
@@ -1448,10 +1503,13 @@ def main(argv: list[str] | None = None) -> int:
                 review_single_owner=arguments.review_single_owner,
                 storage_retention=True,
                 code_review_git_remotes=remotes_file,
+                review_destinations=review_destinations,
             )
             # The state is initialized and current (create_app checked it): audit the load.
             record_at_start(_database_path(arguments.state_dir), trust_policy)
             app.state.provider_trust_path = arguments.provider_trust
+            if review_tiers is not None:
+                app.state.review_jobs.tiers = review_tiers
             from .campaign_submissions import AgentSubmissionConfig
 
             app.state.agent_submission = AgentSubmissionConfig(

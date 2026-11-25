@@ -291,7 +291,10 @@ def test_fable_awaits_human_approval(world):
     j = world.submit(job(tier="fable")).json()
     assert j["state"] == "awaiting_approval"
     path = f"/review-jobs/{j['id']}/approve-tier"
-    body = {"expected_revision": 1, "rationale": "ok to spend"}
+    from test_review_job_tier_approval import tier_grant
+
+    grant = tier_grant(world, model="vendor-fable-1")  # the grant that pays for the tier
+    body = {"expected_revision": 1, "rationale": "ok to spend", "grant_id": grant}
     assert world.post(path, world.submitter, body).status_code == 403
     assert world.post(path, world.reviewer, body).status_code == 403
     # findings are not accepted before approval

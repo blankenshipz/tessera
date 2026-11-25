@@ -13,6 +13,7 @@ generic placeholder: `/etc/tessera` (configuration), `/var/lib/tessera` (state),
 | `tessera-submit-runner.service` | `tessera-submit-runner`: submits owner-approved campaign records on a schedule (in the target, started only on an admitted host) |
 | `tessera-reasoning.service` | not here: it lives in `deploy/remote-agent-platform/` (manual start only, admission marker required, no `[Install]`) |
 | `tessera-stuck-loop.service` | `tessera-stuck-loop`: offers stuck-campaign findings to a standing loop; reads findings only unless `ack_on_offer` is on (disabled by default, manual start, not in the target) |
+| `tessera-research-review-runner.service` | `python -m tessera_control.research_review_runner`: runs queued research review jobs (plan, dataset and technique scouting, pre-gate review; never code review) through the model-spend ledger (manual start, admission marker required, not in the target) |
 | `tessera.target` | groups the four services |
 | `tessera-health-check@.service` + `tessera-health-check-*.timer` | optional freshness probes |
 
@@ -185,3 +186,34 @@ Each prints one line, exits 0, makes no call and needs no network, and appends
 an `operator_reset` or `uncertain_resolved` line to the journal. The per-finding
 ledger rows are kept, so an offered finding is never offered again. Do not
 delete the ledger: that would forget what was already offered.
+
+## Research review runner (manual start)
+
+`tessera-research-review-runner.service` claims queued research review jobs of
+the kinds `plan_review`, `dataset_scout`, `technique_scout` and
+`pre_gate_review` (never `code_review`, which has its own runner), makes one
+model call per job and records the findings. It runs on the control host as
+the control service's user, because it reads each job's verified input content
+from the control state directory. It is not part of `tessera.target` and has no
+`[Install]` section. Gates:
+
+- Admission: it starts only if `/etc/tessera/research-review-runner.admitted`
+  exists (`ConditionPathExists=`).
+- Kill switch: while `/etc/tessera/research-review-runner.kill` exists it claims
+  nothing.
+- Operator policy (`--policy module:attribute`, required) is re-checked at
+  launch; prompts must be pinned: a job's `prompt_digest` must be the sha256 of
+  a file in `--prompts-dir`, or the job is `not_started` (`prompt_not_pinned`).
+- Spend: every call reserves the job's `budget_cents` in the model-spend ledger
+  first, so the project's per-call and daily limits refuse it (no limit set is a
+  refusal); the actual cost is settled with the receipt digest.
+
+The agent credential (`/etc/tessera/credentials/research-review-runner-agent-token`)
+must be enrolled with exactly `review:read`, `review:findings` and
+`model_spend:record`, for a different person than the job submitters (or run
+with `--review-single-owner` to match `tessera serve --review-single-owner`).
+The model key file is named `anthropic-api-key` and is read only by the model
+client. The program refuses to start (exit 2) without a policy, a valid model
+profile, both credentials, or when an API-key environment variable is set. It
+writes the control state (through the store) and
+`/var/lib/tessera/research-review-runner` (journal and receipts).

@@ -112,6 +112,7 @@ def create_app(
     review_single_owner: bool = False,
     storage_retention: bool = False,
     code_review_git_remotes: Path | str | None = None,
+    review_destinations: Any = None,
 ) -> FastAPI:
     """Build a control API with an explicit serving profile around initialized state."""
 
@@ -137,6 +138,7 @@ def create_app(
     from .dataset_ingestion import DatasetIngestionStore
     from .dataset_ingestion_api import router as dataset_ingestion_router
     from .deploy_check_api import router as deploy_check_router
+    from .deploy_request_api import router as deploy_request_router
     from .execution import ConcurrencyAboveCeiling, ExecutionStore
     from .execution_api import router as execution_router
     from .execution_run_receipt_api import router as execution_run_receipt_router
@@ -260,6 +262,7 @@ def create_app(
     app.include_router(storage_retention_router)
     app.include_router(credential_health_router)
     app.include_router(deploy_check_router)
+    app.include_router(deploy_request_router)
     app.state.external_agents = ExternalAgentStore(state_dir)
     app.include_router(external_agent_router)
     app.state.agent_authority = AgentAuthorityStore(state_dir)
@@ -271,7 +274,22 @@ def create_app(
     app.state.review_single_owner = review_single_owner
     app.state.review_jobs = ReviewJobStore(state_dir)
     app.state.review_jobs.single_owner = review_single_owner
-    app.state.review_policy = NoDestinationsPolicy()
+    # Operator-attested review destinations (a file path or a loaded policy); none: every
+    # submit is refused. A refused file raises ReviewDestinationsRefused (a ValueError) here,
+    # so startup fails closed.
+    if review_destinations is None:
+        app.state.review_policy = NoDestinationsPolicy()
+    else:
+        from .review_destination_policy import (
+            ReviewDestinationPolicy,
+            load_review_destination_policy,
+        )
+
+        app.state.review_policy = (
+            review_destinations
+            if isinstance(review_destinations, ReviewDestinationPolicy)
+            else load_review_destination_policy(review_destinations)
+        )
     # Operator git remotes for code review submit (ADR 0108); none: submit is refused. A
     # malformed file raises ValueError/OSError here, so startup fails closed.
     app.state.code_review_git = None

@@ -98,9 +98,12 @@ from .campaign_providers import (
 )
 from .campaign_receipts import CODE_GRANTED_EVENT, build_receipt, code_delivery, code_summary
 from .campaign_release_scope import (
+    RELEASE_WAITING_EVENT,
     free_idle_campaign_releases,
+    freed_by_pause,
     holder_refusal,
     idle_holders,
+    release_waiters_ahead,
 )
 from .campaign_settlement import (
     BASES,
@@ -682,6 +685,34 @@ class CampaignRunner:
                     grant_id=grant["id"],
                 )
             self._actions.append(f"slot_freed:{attempt_id}:{PAUSED_UNLEASED_GRANT}")
+        self._free_paused_releases(ctx)
+
+    def _free_paused_releases(self, ctx: _Ctx) -> None:
+        """Give back the input releases a paused campaign no longer needs (ADR 0167).
+
+        Same fail-closed rule as an idle campaign (``release_still_needed``): nothing is
+        freed while any attempt using the release is in flight, ``unknown`` or unsettled, or a
+        grant against it is unresolved. Idempotent: a revoked release is never active."""
+        with self.store.runner_connection() as connection:
+            self._hold_lease(connection)
+            row = connection.execute(
+                "SELECT status FROM campaigns WHERE id=?", (ctx.campaign["id"],)
+            ).fetchone()
+            steering = connection.execute(
+                "SELECT paused FROM campaign_steering WHERE campaign_id=?", (ctx.campaign["id"],)
+            ).fetchone()
+            if row["status"] == "running" and not (steering and steering["paused"]):
+                return
+            freed = free_idle_campaign_releases(
+                connection,
+                ctx.campaign["id"],
+                trigger="paused_campaign_release",
+                now=_iso(self.now()),
+                record_event=self.store.record_runner_event,
+                steering_paused=True,
+            )
+        for item in freed:
+            self._actions.append(f"release_freed:{item['release_id']}")
 
     def _reclaim_unclaimed_grants(self, ctx: _Ctx) -> None:
         """Reconcile at zero each expired grant of a stuck campaign that no worker claimed.
@@ -3357,6 +3388,49 @@ class CampaignRunner:
             )
         return None
 
+    def _release_must_wait(
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        attempt: dict[str, Any],
+        active: dict[str, Any] | None,
+    ) -> bool:
+        """ADR 0167: a campaign that gave its release back on pause waits for the snapshot
+        (first come, first served) instead of failing the stage when another campaign holds it,
+        and nobody takes a free snapshot ahead of an earlier waiter. A campaign that never
+        gave a release back keeps the original refusal."""
+        snapshot_id = stage["input_snapshot_id"]
+        with self.store.runner_connection() as connection:
+            ahead = release_waiters_ahead(
+                connection, ctx.campaign["project_id"], snapshot_id, attempt
+            )
+            returning = freed_by_pause(connection, ctx.campaign, snapshot_id)
+            held_by_other = False
+            if active is not None and _parse_utc(active["expires_at"]) > self.now():
+                held_by_other = (
+                    connection.execute(
+                        "SELECT 1 FROM campaign_stage_attempts "
+                        "WHERE campaign_id=? AND release_id=?",
+                        (ctx.campaign["id"], active["id"]),
+                    ).fetchone()
+                    is None
+                )
+            if not ahead and not (held_by_other and returning):
+                return False  # free, or the original refusal for a first-time request
+            self._emit_once_in(
+                connection,
+                ctx,
+                RELEASE_WAITING_EVENT,
+                {"stage_key": stage["stage_key"], "attempt_id": attempt["id"]},
+                {
+                    "attempt": attempt["attempt"],
+                    "snapshot_id": snapshot_id,
+                    "reason": "held_by_campaign" if held_by_other else "earlier_waiter",
+                    "returning_from_pause": returning,
+                },
+            )
+        return True
+
     def _ensure_release(
         self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage, attempt: dict[str, Any]
     ) -> bool:
@@ -3371,6 +3445,8 @@ class CampaignRunner:
             AND status='active'""",
             (stage["input_snapshot_id"], worker),
         )
+        if self._release_must_wait(ctx, stage, attempt, active):
+            raise _Waiting
         owned = None
         if active is not None:
             owned = self._one(

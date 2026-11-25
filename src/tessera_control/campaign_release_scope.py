@@ -76,14 +76,23 @@ def free_idle_campaign_releases(
     trigger: str,
     now: str,
     record_event: EventWriter,
+    steering_paused: bool = False,
 ) -> list[dict[str, Any]]:
     """Revoke this campaign's releases nothing still needs, in the caller's transaction.
+
+    ``steering_paused`` lets a ``running`` campaign whose steering pause is set (ADR 0061)
+    count as idle (ADR 0167); the reason recorded is then ``paused``.
 
     ``trigger`` names what freed it (the campaign's own transition or the reconcile sweep);
     the reason recorded is the campaign's status as of this transaction."""
     campaign = connection.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
-    if campaign is None or campaign["status"] not in IDLE_CAMPAIGN:
+    if campaign is None:
         return []
+    if campaign["status"] not in IDLE_CAMPAIGN and not (
+        steering_paused and campaign["status"] == "running"
+    ):
+        return []
+    reason = campaign["status"] if campaign["status"] in IDLE_CAMPAIGN else "paused"
     releases = connection.execute(
         """SELECT r.* FROM snapshot_releases r WHERE r.status='active' AND EXISTS
         (SELECT 1 FROM campaign_stage_attempts a WHERE a.campaign_id=? AND a.release_id=r.id)
@@ -107,7 +116,7 @@ def free_idle_campaign_releases(
             "snapshot_digest": release["digest"],
             "released_by": "system",
             "trigger": trigger,
-            "reason": campaign["status"],
+            "reason": reason,
             "release_expires_at": release["expires_at"],
             "automatic": True,
             "credited_to": "campaign_runner",
@@ -158,3 +167,55 @@ def holder_refusal(
     if holder["org_id"] != requester_org_id:
         return f"the input snapshot is held until {until}"
     return f"the input snapshot is held by campaign {holder['id']} until {until}"
+
+
+RELEASE_WAITING_EVENT = "campaign.stage_waiting_release"
+# Triggers of a ``campaign.release_freed`` written because the campaign was paused.
+PAUSE_RELEASE_TRIGGERS = ("campaign_paused", "paused_campaign_release")
+
+
+def freed_by_pause(connection: sqlite3.Connection, campaign: Mapping[str, Any], snapshot_id: str):
+    """True when this campaign's release of ``snapshot_id`` was given back because it was
+    paused (ADR 0167): its next attempt then waits for the snapshot instead of failing."""
+    marks = ",".join("?" for _ in PAUSE_RELEASE_TRIGGERS)
+    return (
+        connection.execute(
+            f"""SELECT 1 FROM events WHERE project_id=? AND event_type='campaign.release_freed'
+            AND json_extract(payload_json,'$.campaign_id')=?
+            AND json_extract(payload_json,'$.snapshot_id')=?
+            AND json_extract(payload_json,'$.trigger') IN ({marks}) LIMIT 1""",
+            (campaign["project_id"], campaign["id"], snapshot_id, *PAUSE_RELEASE_TRIGGERS),
+        ).fetchone()
+        is not None
+    )
+
+
+def release_waiters_ahead(
+    connection: sqlite3.Connection, project_id: str, snapshot_id: str, attempt: Mapping[str, Any]
+) -> int:
+    """Attempts queued for ``snapshot_id`` before ``attempt`` (fair FIFO, like grant slots).
+
+    A waiter is a reserved attempt of a running, unpaused campaign on the same snapshot that
+    was refused the release (``campaign.stage_waiting_release`` carries its ``attempt_id``)."""
+    row = connection.execute(
+        """SELECT count(*) AS n FROM campaign_stage_attempts w
+        JOIN campaigns wc ON wc.id=w.campaign_id
+        JOIN campaign_stages ws ON ws.campaign_id=w.campaign_id AND ws.stage_key=w.stage_key
+        WHERE wc.project_id=? AND ws.input_snapshot_id=? AND wc.status IN ('running','stopping')
+        AND w.id<>? AND w.status='reserved' AND w.release_id IS NULL
+        AND (w.created_at < ? OR (w.created_at = ? AND w.id < ?))
+        AND NOT EXISTS (SELECT 1 FROM campaign_steering s
+            WHERE s.campaign_id=w.campaign_id AND s.paused=1)
+        AND EXISTS (SELECT 1 FROM events e WHERE e.project_id=wc.project_id
+            AND e.event_type='campaign.stage_waiting_release'
+            AND json_extract(e.payload_json, '$.attempt_id')=w.id)""",
+        (
+            project_id,
+            snapshot_id,
+            attempt["id"],
+            attempt["created_at"],
+            attempt["created_at"],
+            attempt["id"],
+        ),
+    ).fetchone()
+    return int(row["n"])

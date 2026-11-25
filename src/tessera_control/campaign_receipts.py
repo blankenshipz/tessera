@@ -33,6 +33,7 @@ from .code_approval import input_classes, snapshot_code_approval
 from .delegation_receipts import delegation_receipt_section
 from .image_provenance import IMAGE_PROVENANCE_EVENT
 from .image_provenance import closed as image_provenance_closed
+from .stage_egress_allowlist import refused_transfers, stage_allowlist
 from .stage_watch import watch_receipt_section
 from .store import _parse_utc, _utc_string, canonical_digest
 
@@ -264,7 +265,10 @@ def public_fetch_entry(
     marked ``provider_reported``; with none they are null and the file is ``declared_only``. Only
     the host is printed, never the URL. For a provider that is not a local worker,
     ``egress_allowlist`` states that the hosts are declared and the redirect set enforced by the
-    runtime, and that the provider's network is not restricted."""
+    runtime, and that the provider's network is not restricted; its ``entries`` are the per-host
+    ``{host, port, source}`` rows of the stage allowlist (ADR 0134). Every entry, local worker
+    included, carries ``egress_verdict`` and, on a violation, ``refused_transfers``: each reported
+    transfer checked against that allowlist."""
     files: list[tuple[str, str, str, int]] = []
     hosts: set[str] = set()
     cache_requested = False
@@ -307,13 +311,29 @@ def public_fetch_entry(
             # and whose provider said nothing keeps the receipt shape it always had.
             item["cache"] = outcome
         entries.append(item)
+    allowlist = stage_allowlist(spec_stage)
+    refused = refused_transfers(
+        allowlist, {(url, sha) for _name, url, sha, _size in files}, list(fetched or ())
+    )
     entry = {
         "provider": provider_id,
         "placement": "provider_side",
         "hosts": sorted(hosts),
         "files": entries,
         "via_control": False,
+        # ADR 0134: what the check of every reported transfer against the allowlist found.
+        # The verdict agrees with the per-file evidence: a row the receipt could not use
+        # (for example malformed bytes, shown above as declared_only) is not evidence.
+        "egress_verdict": "violation"
+        if refused
+        else (
+            "within_allowlist"
+            if any(item["evidence"] == "provider_reported" for item in entries)
+            else "declared_only"
+        ),
     }
+    if refused:
+        entry["refused_transfers"] = refused
     if cache_requested:
         # The approved spec asked for the provider-side cache (ADR 0097): say so only then, so
         # the receipt of a stage that did not ask is unchanged.
@@ -325,6 +345,8 @@ def public_fetch_entry(
             "redirect_enforced": True,
             "network_enforced": False,
             "statement": EGRESS_ALLOWLIST_STATEMENT,
+            # ADR 0134: the per-host rows derived from the approved spec.
+            "entries": allowlist,
         }
     return entry
 

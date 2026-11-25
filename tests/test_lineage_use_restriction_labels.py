@@ -153,7 +153,7 @@ def test_recorded_output_labels_are_add_only_and_scoped(env):
 
 def test_the_migration_adds_the_table_and_fresh_state_matches(tmp_path):
     version = migrations.OUTPUT_LICENSE_SCHEMA_VERSION
-    assert version == LATEST_SCHEMA_VERSION
+    assert version <= LATEST_SCHEMA_VERSION
     assert MIGRATIONS[version - 1].__name__ == "migrate_output_license_schema"
     names = f"SELECT type,name,sql FROM sqlite_master WHERE name LIKE '{TABLE}%' ORDER BY name"
     fresh, state = tmp_path / "fresh", tmp_path / "old"

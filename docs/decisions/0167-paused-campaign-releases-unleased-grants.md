@@ -60,6 +60,28 @@ worker's lease therefore voids that attempt (`not_started`, no retry consumed) r
 letting it start. Everything else in ADR 0061 (new reservations stop, settlement and cancel
 are unaffected, who may lift a pause) is unchanged.
 
+## Input release of a paused campaign (amendment)
+
+The active input release is a worker's authority to read a snapshot, and the unique active
+index is a mechanical one-row rule, not a promise of exclusive use to a campaign. The
+platform already revokes the release of a terminal, blocked or `paused_delegation_lapsed`
+campaign once nothing needs it (`docs/campaigns.md`, "Input releases of idle campaigns"), and
+a steering pause is the same state for this purpose. So no exclusivity is weakened.
+
+7. **Release on pause.** On the same tick that gives back unleased grants, a steering-paused
+   campaign's releases are revoked under the idle-campaign rule (`release_still_needed`):
+   nothing is freed while any attempt using the release is in flight, `unknown` or
+   unsettled, or a grant against it is unresolved. `campaign.release_freed` records it with
+   reason `paused` and trigger `paused_campaign_release`. A revoked release is not active, so
+   repeating the tick or the pause writes nothing.
+8. **Re-acquire on resume, in line.** A campaign that gave a release back on pause waits when
+   another campaign holds the snapshot instead of failing the stage as `step_refused`; a
+   campaign that never gave one back keeps the original refusal. The wait is one
+   `campaign.stage_waiting_release` event per attempt (`stage_key`, `attempt`, `attempt_id`,
+   `snapshot_id`, `reason` `held_by_campaign` or `earlier_waiter`, `returning_from_pause`).
+   Waiters are served first come, first served by attempt creation time: no campaign takes a
+   free snapshot ahead of an earlier waiter, so a resume cannot race a new admission.
+
 ## Limitations
 
 - The FIFO line counts any earlier waiter, including one that is stuck on a provider slot

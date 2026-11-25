@@ -39,12 +39,22 @@ from .code_review_jobs import (
     source_record,
 )
 from .data_class import snapshot_data_class
+from .license_labels import snapshot_labels
 from .review_jobs_models import (
     BILLED_COST_BASES,
     ApproveReviewTier,
     IngestFindings,
     ResolveReviewFinding,
     SubmitReviewJob,
+)
+from .review_tiers import (
+    DEFAULT_TIERS,
+    TIER_NOT_CONFIGURED,
+    TIER_START_REASONS,
+    approval_record,
+    create_review_tier_grants_schema,
+    tier_grant_check,
+    tier_start_refusal,
 )
 from .store import Conflict, Forbidden, NotFound, _connect, canonical_digest, utc_now
 
@@ -65,6 +75,8 @@ NOT_START_REASONS = (
     "prompt_not_pinned",
     "egress_not_permitted",
     "destination_not_supported",
+    # A tier approval's grant is re-checked when the job starts (review_tiers).
+    *TIER_START_REASONS,
 )
 JOB_STATES = (
     "awaiting_approval",
@@ -249,7 +261,8 @@ def create_review_jobs_schema(connection):
         title TEXT NOT NULL, inputs_json TEXT NOT NULL,
         prompt_digest TEXT NOT NULL CHECK(length(prompt_digest)=64),
         destination_id TEXT NOT NULL,
-        tier TEXT NOT NULL CHECK(tier IN ('haiku','sonnet','opus','fable')),
+        tier TEXT NOT NULL CHECK(length(tier) BETWEEN 1 AND 32 AND tier GLOB '[a-z]*'
+            AND tier NOT GLOB '*[^a-z0-9-]*'),
         budget_cents INTEGER NOT NULL CHECK(budget_cents BETWEEN 0 AND 10000),
         egress TEXT NOT NULL CHECK(egress IN ('none','model_runtime')),
         state TEXT NOT NULL CHECK(state IN ('awaiting_approval','queued','running','completed',
@@ -315,11 +328,14 @@ def create_review_jobs_schema(connection):
         "SELECT RAISE(ABORT,'review finding content is immutable'); END"
     )
     create_code_review_schema(connection)
+    create_review_tier_grants_schema(connection)
 
 
 class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
     #: Deployment opt-in (``tessera serve --review-single-owner``); set by ``create_app``.
     single_owner = False
+    #: Configured review tiers (``tessera serve --review-tiers``); set by ``serve``.
+    tiers = DEFAULT_TIERS
 
     # -- shared helpers -------------------------------------------------------------------
 
@@ -353,7 +369,7 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
             ),
             "submitter_credential_id": row["credential_id"],
             "submitter_principal_id": row["actor_id"],
-            "approval": dict(approval) if approval else None,
+            "approval": (approval_record(connection, row["id"], approval) if approval else None),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "advisory": True,
@@ -483,11 +499,31 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
         if any(item["digest"] in sealed for item in inputs):
             raise ReviewRefused("input_sealed")
         classes = sorted({item["data_class"] for item in inputs})
+        if not self.tiers.known(body["tier"]):
+            raise ReviewRefused(TIER_NOT_CONFIGURED, status=422)
         reason = policy.check(body["destination_id"], body["tier"], classes, body["budget_cents"])
         if reason:
             raise ReviewRefused(reason if reason in REFUSAL_REASONS else "destination_not_enrolled")
+        # ADR 0168: the inputs' licence labels (ADR 0040) must be admitted for the destination;
+        # a policy that does not carry labels (the default refuses every submit) is not asked.
+        labels = sorted(
+            set().union(*(snapshot_labels(connection, item["snapshot_id"]) for item in inputs))
+        )
+        label_check = getattr(policy, "license_labels_refusal", None)
+        if label_check is not None:
+            reason = label_check(body["destination_id"], labels)
+            if reason:
+                raise ReviewRefused(
+                    reason if reason in REFUSAL_REASONS else "destination_not_enrolled"
+                )
+        admitted = {
+            "destination_id": body["destination_id"],
+            "data_classes": classes,
+            "license_labels": labels,
+            "policy_digest": getattr(policy, "digest", None),
+        }
         ident = "review_job_" + uuid.uuid4().hex
-        state = "awaiting_approval" if body["tier"] == "fable" else "queued"
+        state = "awaiting_approval" if self.tiers.requires_approval(body["tier"]) else "queued"
         now = utc_now()
         connection.execute(
             "INSERT INTO review_jobs (id,org_id,project_id,credential_id,actor_id,kind,"
@@ -532,7 +568,13 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
                     subject["rubric_digest"],
                 ),
             )
-        event = {"job_id": ident, "kind": body["kind"], "tier": body["tier"], "state": state}
+        event = {
+            "job_id": ident,
+            "kind": body["kind"],
+            "tier": body["tier"],
+            "state": state,
+            **admitted,
+        }
         if source is not None:
             connection.execute(
                 "INSERT INTO code_review_sources (job_id,org_id,project_id,repo,branch,"
@@ -580,9 +622,30 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
                 raise Conflict("Review job revision changed.")
             if row["state"] != "awaiting_approval":
                 raise Conflict("Review job is not awaiting tier approval.")
+            # The approval names the grant that pays for this tier: a reasoning grant of the
+            # job's project for its destination and a model bound to its tier (review_tiers).
+            refusal, binding = tier_grant_check(connection, row, body["grant_id"], self.tiers)
+            if refusal:
+                raise ReviewRefused(refusal)
+            now = utc_now()
             connection.execute(
-                "INSERT INTO review_job_approvals VALUES (?,?,?,?,?,?)",
-                (job_id, actor["org_id"], actor["id"], body["rationale"], row["digest"], utc_now()),
+                "INSERT INTO review_job_approvals (job_id,org_id,actor_id,rationale,job_digest,"
+                "created_at) VALUES (?,?,?,?,?,?)",
+                (job_id, actor["org_id"], actor["id"], body["rationale"], row["digest"], now),
+            )
+            connection.execute(
+                "INSERT INTO review_job_tier_grants (job_id,org_id,grant_id,tier,provider_id,"
+                "model,subject_credential_id,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    actor["org_id"],
+                    binding["grant_id"],
+                    binding["tier"],
+                    binding["provider_id"],
+                    binding["model"],
+                    binding["subject_credential_id"],
+                    now,
+                ),
             )
             self._bump(connection, job_id, "queued", row["revision"])
             self._event(
@@ -592,7 +655,14 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
                 None,
                 "review_job.tier_approved",
                 row["revision"] + 1,
-                {"job_id": job_id, "tier": row["tier"], "job_digest": row["digest"]},
+                {
+                    "job_id": job_id,
+                    "tier": row["tier"],
+                    "job_digest": row["digest"],
+                    "grant_id": binding["grant_id"],
+                    "provider_id": binding["provider_id"],
+                    "model": binding["model"],
+                },
             )
             return 200, self._job_record(
                 connection,
@@ -639,6 +709,10 @@ class ReviewJobStore(CodeReviewRunStore, AgentResearchStore):
                 # Only the leased runner claim may start a code review: a lease-less running job
                 # would hold a concurrency slot that is never reaped (ADR 0092).
                 raise Conflict("A code review job is started only by the runner's claim.")
+            if state == "running":
+                refusal = tier_start_refusal(connection, row)
+                if refusal:
+                    raise ReviewRefused(refusal)
             self._bump(connection, job_id, state, row["revision"], reason, **columns)
             self._event(
                 connection,
