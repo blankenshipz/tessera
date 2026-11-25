@@ -139,7 +139,7 @@ amounts; incurred/estimated-unbilled/disputed usage feeds remain unimplemented.
 | `POST /worker/leases/renew` | lease_id, expected_epoch |
 | `POST /worker/observations` | lease_id, expected_epoch, operation_id for journaled leases, observed_state, observed_at, optional provider_id, termination_confirmed |
 
-A lease lasts at most 30 seconds. Its fixed hard deadline is the earliest of grant
+A lease lasts at most 150 seconds ([ADR 0189](decisions/0189-lease-stall-margin.md)). Its fixed hard deadline is the earliest of grant
 expiry, worker credential expiry, and initial lease time plus approved task duration.
 Renewal cannot reset that deadline. A grant can acquire only one lease; lost replies
 must use the original key, and an expired lease cannot be reacquired as fresh work.

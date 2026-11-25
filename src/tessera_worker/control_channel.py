@@ -20,12 +20,14 @@ MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 15.0
 MIN_OPERATOR_TIMEOUT_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 30.0
-# A worker lease lasts 30 s (tessera_control.execution.LEASE_SECONDS, asserted by a test) and is
-# renewed every 10 s by a single-threaded loop, so one request may take at most the lease minus a
-# renewal interval; anything longer lets one unanswered call lapse the lease.
-WORKER_LEASE_SECONDS = 30.0
+# A worker lease lasts 150 s (tessera_control.execution.LEASE_SECONDS, asserted by a test) and is
+# renewed every 10 s by a single-threaded loop (ADR 0189). One request may take at most the 30 s
+# request window ADR 0178 sized its retries for, less a renewal interval, so a single unanswered
+# call never holds up the renewal loop for long; the longer lease only adds stall margin.
+WORKER_LEASE_SECONDS = 150.0
 RENEWAL_INTERVAL_SECONDS = 10.0
-MAX_OPERATOR_TIMEOUT_SECONDS = WORKER_LEASE_SECONDS - RENEWAL_INTERVAL_SECONDS
+REQUEST_WINDOW_SECONDS = 30.0
+MAX_OPERATOR_TIMEOUT_SECONDS = REQUEST_WINDOW_SECONDS - RENEWAL_INTERVAL_SECONDS
 # After a request times out its thread may still be finishing (the socket timeout restarts on each
 # read). The next call waits up to this long for it before refusing, instead of failing at once.
 STRAGGLER_WAIT_SECONDS = 5.0
@@ -36,14 +38,14 @@ def validate_operator_timeout(
 ) -> float:
     """An operator-set control HTTP timeout in seconds, or ``ValueError``.
 
-    It must fit the renewal timing: at most the worker lease minus the renewal interval, so a
-    single unanswered request cannot outlast the lease (20 s with the default interval).
+    It must fit the renewal timing: at most the 30 s request window minus the renewal interval,
+    so a single unanswered request cannot stall the renewal loop (20 s with the default interval).
     """
-    ceiling = min(MAX_OPERATOR_TIMEOUT_SECONDS, WORKER_LEASE_SECONDS - renewal_interval_seconds)
+    ceiling = min(MAX_OPERATOR_TIMEOUT_SECONDS, REQUEST_WINDOW_SECONDS - renewal_interval_seconds)
     if type(value) not in {int, float} or not MIN_OPERATOR_TIMEOUT_SECONDS <= value <= ceiling:
         raise ValueError(
             f"Control timeout must be between 1 and {ceiling:g} seconds "
-            "(the lease minus the renewal interval)."
+            "(the 30 s request window minus the renewal interval)."
         )
     return float(value)
 

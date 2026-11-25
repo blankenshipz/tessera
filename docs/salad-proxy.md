@@ -668,7 +668,7 @@ coordinated runtime/service test and actual deployed prerequisites.
 
 After launch, every poll first renews the exact soft execution lease and heartbeats the
 guardian (polls are spaced `max_seconds/max_polls`, at most 10s apart); the guardian
-deadline is bounded by the lease hard expiry, not the 30s renewal window. Stop
+deadline is bounded by the lease hard expiry, not the 150 s soft lease window. Stop
 confirmation gets its own 120s window. Scheduling bounds are up to 900 seconds and 90 polls per observation phase (the workload's own runtime argument stays <=300s), one create/start/stop
 attempt, no retries and no direct mutation bypass. On any issue the driver attempts
 exact cancel/stop/reconcile and retains sanitized inconclusive evidence; unresolved

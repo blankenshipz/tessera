@@ -161,8 +161,8 @@ class ProviderInputStore(InputDeliveryStore):
                 raise Forbidden(f"Provider input refused: {error}.") from None
             _require_license_labels(connection, provider_id, grant["snapshot_id"])
             now = self._now()
-            # The soft lease (30 s, renewed by heartbeats) is re-checked on every pull; the
-            # ticket's own lifetime follows the lease's hard expiry, release and one hour.
+            # The soft lease (150 s, renewed by heartbeats; ADR 0189) is re-checked on every pull;
+            # the ticket's own lifetime follows the lease's hard expiry, release and one hour.
             hard_expiry = _parse_utc(lease["hard_expires_at"])
             expires = min(hard_expiry, _parse_utc(release["expires_at"]), now + TICKET_TTL)
             if expires <= now:

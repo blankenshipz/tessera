@@ -894,7 +894,9 @@ def test_the_timeout_setting_must_fit_the_lease_and_the_renewal_interval():
 
     assert WORKER_LEASE_SECONDS == LEASE_SECONDS  # the worker's copy tracks control's lease
     assert DevelopmentWorkerConfig.renew_after_seconds == RENEWAL_INTERVAL_SECONDS
-    assert MAX_OPERATOR_TIMEOUT_SECONDS == LEASE_SECONDS - RENEWAL_INTERVAL_SECONDS == 20.0
+    # The request ceiling stays at 20 s (ADR 0178's 30 s window); the lease is longer (ADR 0189).
+    assert MAX_OPERATOR_TIMEOUT_SECONDS == 30.0 - RENEWAL_INTERVAL_SECONDS == 20.0
+    assert LEASE_SECONDS == 150
     # A slower renewal cadence leaves less room: with renewal every 15 s the ceiling is 15 s.
     assert validate_operator_timeout(15, 15.0) == 15.0
     with pytest.raises(ValueError):

@@ -43,7 +43,12 @@ from .store import (
     utc_now,
 )
 
-LEASE_SECONDS = 30
+# A lease's soft expiry: how long a holder stays authorized without a confirmed renewal. Workers
+# renew every 10 s, so a 150 s lease survives a control stall of up to 135 s at any phase of the
+# renewal cycle (ADR 0189). It never extends past the lease's fixed ``hard_expires_at`` (grant,
+# credential and task deadline), and fencing (epoch, revocation, an expired lease is never
+# renewed) is unchanged.
+LEASE_SECONDS = 150
 MAX_GRANT_LIFETIME = timedelta(hours=24)
 MAX_CENTS = 2**63 - 1
 MAX_OBSERVATION_FUTURE_SKEW = timedelta(seconds=5)

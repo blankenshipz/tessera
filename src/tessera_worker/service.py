@@ -288,13 +288,14 @@ class DevelopmentWorkerConfig:
     poll_seconds: float = 1.0
     max_ticks: int = 90_000
     renew_every_ticks: int = 15
-    # Control leases last 30 s (tessera_control.execution.LEASE_SECONDS) and only a renewal
-    # extends them. Renew on elapsed time as well as tick count, so a longer poll interval or
-    # slow control round trips can never let a running operation's lease lapse.
+    # Control leases last 150 s (tessera_control.execution.LEASE_SECONDS, ADR 0189) and only a
+    # renewal extends them. Renew on elapsed time as well as tick count, so a longer poll interval
+    # or slow control round trips can never let a running operation's lease lapse. Renewing every
+    # 10 s keeps revocation and fencing seen within 10 s and leaves 135 s of stall margin.
     renew_after_seconds: float = 10.0
     # How long a running operation's tick reuses its last authority read (the lease's package)
     # before posting again; every renewal forces a fresh read. 0 re-reads on every tick (the
-    # old behaviour, two control writes per tick). At most 20 s, inside the 30 s lease.
+    # old behaviour, two control writes per tick). At most 20 s, well inside the lease.
     authority_reread_seconds: float = AUTHORITY_MAX_AGE_SECONDS
 
     def __post_init__(self) -> None:

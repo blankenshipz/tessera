@@ -597,8 +597,8 @@ settings, never a secret:
 `development-poll` and `development-run`) is how long one HTTP request to control may take. A
 slower answer is a transient failure that is retried (a running container is not stopped for it,
 see [ADR 0054](decisions/0054-durable-observation-delivery.md)); raise it for a control plane that
-answers slowly under load. The ceiling is the 30 s worker lease minus the 10 s renewal interval, so
-one unanswered request cannot lapse the lease (the worker refuses a larger value, and a slower
+answers slowly under load. The ceiling is a 30 s request window minus the 10 s renewal interval, so
+one unanswered request cannot hold up the renewal loop (the worker refuses a larger value, and a slower
 `renew_after_seconds` lowers the ceiling accordingly). Each observation report is also capped by
 the lease time left minus one renewal interval, never below 1 s.
 
@@ -752,8 +752,9 @@ amendment:
 - `--health-file PATH` is replaced atomically (0600) after each loop with the pid, start
   time, last loop, loop count, consecutive errors, last error class and state. No port is
   opened.
-- A running operation's control lease lasts 30 seconds and only the worker's renewal extends
-  it. The worker renews as soon as it starts driving an operation (a recovered lease may have
+- A running operation's control lease lasts 150 seconds and only the worker's renewal extends
+  it, so a control stall of up to about 135 s is ridden out
+  ([ADR 0189](decisions/0189-lease-stall-margin.md)). The worker renews as soon as it starts driving an operation (a recovered lease may have
   only seconds left), then every 10 seconds of elapsed time (and at least every 15 ticks), and
   never sleeps past the next renewal, whatever `poll_seconds` is. A refused renewal (a 409
   fence, a 404, an authority-gone 403) or a rejected credential cancels the operation at once.

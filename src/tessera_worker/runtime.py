@@ -48,7 +48,7 @@ DELIVERY_BACKOFF_BASE_SECONDS = 2.0
 DELIVERY_BACKOFF_CAP_SECONDS = 300.0
 DELIVERY_MAX_AGE = timedelta(hours=24)
 # One report may use at most the lease time left, less this reserve (one renewal interval), so a
-# report that hangs cannot by itself lapse the 30 s lease (the loop is single-threaded and the
+# report that hangs cannot by itself lapse the lease (the loop is single-threaded and the
 # renewal follows). It is never shorter than the minimum request time.
 REPORT_LEASE_RESERVE_SECONDS = 10.0
 MIN_REPORT_REQUEST_SECONDS = 1.0

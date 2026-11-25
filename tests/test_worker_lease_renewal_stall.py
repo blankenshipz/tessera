@@ -1,8 +1,9 @@
 """A stalled lease renewal does not kill a healthy stage; a lease that really ends still does.
 
-The development worker renews its 30 s lease every 10 s. One renewal that gets no answer in
-time (control busy, a slow host) is retried with backoff until the lease's own expiry less a
-safety margin; only a refusal (a 409 fence) or that deadline stops the stage, and the grant
+The development worker renews its lease every 10 s (30 s here; 150 s by default since ADR 0189).
+One renewal that gets no answer in time (control busy, a slow host) is retried with backoff
+until the lease's own expiry less a safety margin; only a refusal (a 409 fence) or that deadline
+stops the stage, and the grant
 result records the failed attempts and names the cause (ADR 0178).
 
 These tests model the incident: the channel reports the HTTP channel's 15 s timeout and a
@@ -39,6 +40,19 @@ from tessera_worker.supervisor import Lease
 RENEW = "/worker/leases/renew"
 HEARTBEAT = "/worker/heartbeat"
 ROUND_TRIP = 0.05  # one answered control request
+
+
+@pytest.fixture(autouse=True)
+def _thirty_second_lease(monkeypatch):
+    """These tests pin ADR 0178's deadline arithmetic on the 30 s lease it was written for.
+
+    Control's lease is 150 s since ADR 0189 (tests/test_lease_stall_margin.py), but a lease is
+    still as short as its hard expiry makes it, and the retry, per-request share and
+    cancel-before-expiry rules are the same at any length; 30 s keeps the timings here exact.
+    """
+    from tessera_control import execution
+
+    monkeypatch.setattr(execution, "LEASE_SECONDS", 30)
 
 
 class Timeline:

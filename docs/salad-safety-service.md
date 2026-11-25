@@ -236,7 +236,7 @@ one-chunk cache) and nothing is written to disk. The workload re-verifies end to
 when the remaining life is under min(600 s, max(60 s, a quarter of the issued lifetime)), from its heartbeat, and passes the new ticket by
 `input_ticket`; it revokes at control, best effort and recorded in
 `TrustedSaladServer.input_log`, when it stops the route. A ticket's lifetime follows the lease's hard expiry, the release and one hour; the
-30 s soft lease is re-checked on every pull. A minted ticket the guardian never received
+150 s soft lease (ADR 0189) is re-checked on every pull. A minted ticket the guardian never received
 is discarded once it is near expiry and a new one is minted. The guardian refuses input
 for a budget-fenced or rate-unknown reservation, bounds failed control fetches (3 per
 manifest or chunk, 12 per ticket) and installs an admin ticket only after the

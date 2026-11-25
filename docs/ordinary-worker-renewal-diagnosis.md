@@ -27,10 +27,10 @@ The source already implements ordinary, desktop-independent renewal:
   alone is not lease authority.
 - Control permits renewal only for the assigned live worker and exact epoch,
   current approved task/grant, ready registry, live credential/agent authority,
-  and authorized releases. The extension is at most thirty seconds and cannot
+  and authorized releases. The extension is at most 150 seconds (ADR 0189) and cannot
   cross immutable `hard_expires_at` or revive an expired lease.
 - `runtime_packages._package` seals `hard_expires_at`, not the renewable
-  thirty-second expiry, into the approval-bound package. The live lease is a
+  soft expiry, into the approval-bound package. The live lease is a
   separate response envelope. No package digest rewrite or backend package
   refresh change is needed for this existing running-Job renewal path.
 - The supervisor retains its hard deadline across restart and cancels the exact
