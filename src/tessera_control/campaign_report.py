@@ -9,13 +9,13 @@ organization and project.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import UTC, datetime
 from typing import Any
 
 from . import campaign_hold
 from .campaign_models import parse_spec_json
+from .campaign_receipt_read import load_verified_receipt
 from .campaign_receipts import build_receipt
 from .model_spend import MICRO
 
@@ -155,13 +155,11 @@ def _failure_words(failure_class: str | None, exit_code: int | None = None) -> s
 def _receipt_for(
     connection: sqlite3.Connection, campaign: sqlite3.Row
 ) -> tuple[dict[str, Any], str | None]:
-    """The terminal receipt as stored, else one built now from the recorded rows."""
-    row = connection.execute(
-        "SELECT receipt_json, receipt_digest FROM campaign_receipts WHERE campaign_id=?",
-        (campaign["id"],),
-    ).fetchone()
-    if row is not None:
-        return json.loads(row["receipt_json"]), row["receipt_digest"]
+    """The terminal receipt as stored (refused unless its digest verifies), else one built
+    now from the recorded rows."""
+    verified = load_verified_receipt(connection, campaign["id"])
+    if verified is not None:
+        return verified.receipt, verified.digest
     receipt, _digest = build_receipt(connection, campaign, campaign["status"])
     return receipt, None
 

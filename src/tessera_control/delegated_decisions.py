@@ -339,6 +339,28 @@ class DelegatedDecisionStore(ApprovalDelegationCommands):
             principal, key, f"/campaigns/{campaign_id}/delegated-gate-decision", digest, command
         )
 
+    # -- agent projection ------------------------------------------------------------------
+
+    def agent_view(self, principal, content: dict[str, Any]) -> dict[str, Any]:
+        """The response as the caller may read it: an enrolled external agent sees what was
+        approved (digest, class, expiry, delegation) but not who approved it, as in the live
+        campaign view and the gate decisions. A person gets the full row. Applied after the
+        command, so the stored row and the idempotency record keep the approver (and a replay
+        is projected the same way)."""
+        approval = content.get("approval")
+        if not isinstance(approval, dict) or "approving_principal_id" not in approval:
+            return content
+        connection = _connect(self.database_path)
+        try:
+            if not self._external_scope(connection, self._actor(connection, principal)):
+                return content
+        finally:
+            connection.close()
+        return {
+            **content,
+            "approval": {k: v for k, v in approval.items() if k != "approving_principal_id"},
+        }
+
     # -- shared ----------------------------------------------------------------------------
 
     def _run(self, principal, key, path, digest, command):

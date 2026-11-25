@@ -119,7 +119,9 @@ agent enrolled with `campaign:decide_delegated`, may approve a submitted campaig
 (`POST /campaigns/{id}/delegated-gate-decision`), but only when the platform finds the written rule met,
 computed from recorded data at that moment. The approval is on a receipt that cites the delegation
 (class `owner_delegated`); a request outside it returns 409 `outside_delegation` with reason codes,
-changes nothing and is listed for the owner (`GET /projects/{id}/delegation-escalations`). Creating and
+changes nothing and is listed for the owner (`GET /projects/{id}/delegation-escalations`). An agent
+that makes a delegated approval gets the approval summary (id, spec digest, class, times, delegation,
+status) without `approving_principal_id`, as in the live campaign view; a person gets the full row. Creating and
 revoking a delegation is a person's act; the MCP tools only read delegations and use them
 (`tessera_list_approval_delegations`, `tessera_get_approval_delegation`, `tessera_delegation_escalations`,
 `tessera_delegated_approve_campaign`, `tessera_delegated_gate_decision`). Enroll an agent for it with
@@ -449,6 +451,11 @@ class, measurements derived by the platform from retained bytes, stop-rule resul
 lineage node and edge ids, `verdict {operational, scientific_verdict}` and
 `receipt_digest`, plus `chained_inputs` when an input was resolved from a predecessor's receipt
 (ADR 0080). `scientific_verdict` is `pending_human_approval` or `not_assessed`.
+Every read of a stored receipt (this endpoint and the MCP receipt tool, the campaign and window
+reports, `artifact`/`receipt_output`/`image_from` resolution and measurement gates) recomputes
+`receipt_digest` over the stored body and refuses on a mismatch with the stable code
+`receipt_digest_mismatch` (409; a measurement gate refuses with `measurement_receipt_digest_mismatch`),
+returning nothing from the stored body.
 `pending_human_approval` there means a stage is bound to a program or gate, so the scientific
 verdict is left to a person. What a campaign is waiting on *now* is shown live in the campaign view
 (`GET /campaigns/{id}`, `tessera_get_campaign`) as `pending_human_approval`, a list derived from

@@ -52,7 +52,19 @@ OVERRIDES_FILE = "dev/focused_tests_overrides.toml"
 DEFAULT_MAX_FILES = 60
 DEFAULT_MAX_JOBS = 4
 DEFAULT_HUB_CAP = 40
-BASETEMP = ".pytest-tmp-focused"
+BASETEMP = "focused"  # named under .pytest-tmp, with a per-run id (see scratch_cleanup)
+
+try:
+    from . import scratch_cleanup
+except ImportError:  # loaded by path (dev/focused_tests.py): the sibling file is stdlib only
+    import importlib.util as _importlib_util
+
+    _scratch_spec = _importlib_util.spec_from_file_location(
+        "_tessera_scratch_cleanup", Path(__file__).with_name("scratch_cleanup.py")
+    )
+    scratch_cleanup = _importlib_util.module_from_spec(_scratch_spec)
+    sys.modules["_tessera_scratch_cleanup"] = scratch_cleanup
+    _scratch_spec.loader.exec_module(scratch_cleanup)
 
 # Lower rank is kept first when a cap cuts a selection.
 PRIORITY = {
@@ -630,12 +642,15 @@ def run(
     log_dir: Path | None = None,
     stop_on_first_failure: bool = True,
     max_jobs: int | None = None,
+    keep_basetemp: bool = False,
 ) -> int:
     """Run the given test files (never the whole suite: an empty list runs nothing).
 
     One pytest process for ``jobs == 1``; otherwise one per non-empty shard, each with its
     own basetemp and log, at most ``jobs`` (clamped to the overrides' max_jobs) at once.
-    Exit 1 if any shard fails."""
+    Exit 1 if any shard fails. Each basetemp lives at ``.pytest-tmp/focused*-<run id>`` and
+    is removed when the run is green; a failure (or ``keep_basetemp`` / TESSERA_KEEP_BASETEMP)
+    keeps it and prints its path."""
     root = Path(root)
     files = list(dict.fromkeys(files))
     if not files:
@@ -646,15 +661,23 @@ def run(
         except ValueError:
             max_jobs = DEFAULT_MAX_JOBS
     jobs = clamp_jobs(jobs, max_jobs)
+    scratch = scratch_cleanup.Scratch(root, keep=scratch_cleanup.keep_requested(keep_basetemp))
     if jobs == 1:
-        command = pytest_command(root, files, pytest_args, root / BASETEMP, stop_on_first_failure)
-        return popen(command, cwd=root).wait()
+        command = pytest_command(
+            root, files, pytest_args, scratch.path(BASETEMP), stop_on_first_failure
+        )
+        code = 1  # a launch failure keeps the scratch for triage
+        try:
+            code = popen(command, cwd=root).wait()
+        finally:
+            scratch.finish(green=code == 0)
+        return code
     shards = [shard for shard in plan_shards(files, jobs, max_jobs=max_jobs) if shard]
     log_dir = Path(log_dir) if log_dir else Path(tempfile.mkdtemp(prefix="tessera-focused-"))
     log_dir.mkdir(parents=True, exist_ok=True)
     running = []
     for index, shard in enumerate(shards):
-        basetemp = root / f"{BASETEMP}-{index}"
+        basetemp = scratch.path(f"{BASETEMP}-{index}")
         log_path = log_dir / f"shard{index}.log"
         log = log_path.open("w")
         command = pytest_command(root, shard, pytest_args, basetemp, stop_on_first_failure)
@@ -662,6 +685,7 @@ def run(
             process = popen(command, cwd=root, stdout=log, stderr=subprocess.STDOUT)
         except BaseException:
             log.close()
+            scratch.finish(green=False)  # the shards already started keep their scratch
             raise
         running.append((index, len(shard), log, log_path, process))
     failed = []
@@ -674,6 +698,7 @@ def run(
         if code != 0:
             failed.append(index)
     print(f"logs: {log_dir}")
+    scratch.finish(green=not failed)
     return 1 if failed else 0
 
 
@@ -731,6 +756,12 @@ def main(argv: list[str] | None = None, *, changed_files_fn: Callable | None = N
         "--full", action="store_true", help="run the whole suite (dev/pytest_parallel.py)"
     )
     parser.add_argument(
+        "--keep-basetemp",
+        action="store_true",
+        help="keep this run's pytest base directories even when the run is green "
+        "(also TESSERA_KEEP_BASETEMP=1); a failing run always keeps them",
+    )
+    parser.add_argument(
         "--allow-unmapped",
         action="store_true",
         help="with a run: go ahead although some changed files have no test (blocks by default)",
@@ -744,6 +775,8 @@ def main(argv: list[str] | None = None, *, changed_files_fn: Callable | None = N
         parser.error("--max-files must be at least 1")
     if args.full:
         print("focused tests: running the full suite (--full)")
+        if args.keep_basetemp:
+            pytest_args = ["--keep-basetemp", *pytest_args]
         return run_full(root, args.jobs, pytest_args)
     finder = changed_files_fn or changed_files
     try:
@@ -801,7 +834,14 @@ def main(argv: list[str] | None = None, *, changed_files_fn: Callable | None = N
         return 2
     jobs = clamp_jobs(args.jobs or 1, overrides.limits.max_jobs)
     print(f"focused tests: {len(files)} file(s), {jobs} job(s), stopping at the first failure")
-    return run(files, root, jobs, pytest_args, max_jobs=overrides.limits.max_jobs)
+    return run(
+        files,
+        root,
+        jobs,
+        pytest_args,
+        max_jobs=overrides.limits.max_jobs,
+        keep_basetemp=args.keep_basetemp,
+    )
 
 
 if __name__ == "__main__":

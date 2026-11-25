@@ -121,6 +121,10 @@ def retention_status(state_dir: Path) -> dict[str, Any]:
         "timer_interval_seconds": policy.timer_interval_seconds if policy else None,
         "last_run": last_run,
         "backups": backups,
+        "test_scratch": {
+            "enabled": bool(policy and policy.reclaim_test_scratch),
+            "max_age_hours": policy.test_scratch_max_age_hours if policy else None,
+        },
         "pending_dry_run": pending,
         "totals": {
             "receipts": len(runs),

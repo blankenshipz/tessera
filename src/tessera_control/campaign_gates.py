@@ -27,6 +27,7 @@ from .approval_trust import (
     require_decision_actor,
 )
 from .campaign_gate_models import MeasurementCondition, RecordGateDecision, UnlockRequirement
+from .campaign_receipt_read import ReceiptDigestMismatch, load_verified_receipt
 from .gate_evidence_paired import PairedRefused, compute_paired_delta, paired_outcome
 from .store import (
     Conflict,
@@ -74,13 +75,14 @@ def _measurement_refusal(
     connection: sqlite3.Connection, campaign_id: str, condition: MeasurementCondition
 ) -> str | None:
     """None when the condition holds on the campaign's immutable terminal receipt."""
-    row = connection.execute(
-        "SELECT receipt_json FROM campaign_receipts WHERE campaign_id=?", (campaign_id,)
-    ).fetchone()
-    if row is None:
-        return "measurement_receipt_missing"
     try:
-        receipt = json.loads(row["receipt_json"])
+        verified = load_verified_receipt(connection, campaign_id)
+    except ReceiptDigestMismatch:
+        return "measurement_receipt_digest_mismatch"
+    if verified is None:
+        return "measurement_receipt_missing"
+    receipt = verified.receipt
+    try:
         stage = next(s for s in receipt["stages"] if s["stage_key"] == condition.stage)
     except (ValueError, KeyError, TypeError, StopIteration):
         return "measurement_stage_missing"

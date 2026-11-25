@@ -51,7 +51,7 @@ def delegated_approval(
         )
     except DelegationRefused as error:
         return _refused(error)
-    return JSONResponse(status_code=status, content=content)
+    return JSONResponse(status_code=status, content=store.agent_view(actor, content))
 
 
 @router.post("/campaigns/{campaign_id}/delegated-gate-decision")

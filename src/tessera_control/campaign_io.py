@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .campaign_receipt_read import load_verified_receipt
 from .data_class import OUTPUT_DATA_CLASS, PRIVATE_DERIVED
 from .store import Conflict
 
@@ -201,22 +202,17 @@ def resolve_artifact(
         raise _refuse(source, "no such output in this project")
     # Only receipt-output inputs carry resolved_from today; revisit this lineage guard if
     # another input kind gains a resolved_from attribute.
+    # The source receipt is used only when its digest verifies (ReceiptDigestMismatch, 409).
+    verified = load_verified_receipt(connection, source.campaign_id)
     lineage = getattr(source, "resolved_from", None)
     if lineage is not None:
-        recorded = connection.execute(
-            "SELECT receipt_digest FROM campaign_receipts WHERE campaign_id=?",
-            (source.campaign_id,),
-        ).fetchone()
-        if recorded is None or recorded["receipt_digest"] != lineage.source_receipt_sha256:
+        if verified is None or verified.digest != lineage.source_receipt_sha256:
             raise _refuse(source, "resolved_from does not match the source campaign receipt")
     if row["attempt_status"] != "succeeded":
         raise _refuse(source, "the producing attempt did not succeed")
-    receipt_row = connection.execute(
-        "SELECT receipt_json FROM campaign_receipts WHERE campaign_id=?", (source.campaign_id,)
-    ).fetchone()
-    if receipt_row is None:
+    if verified is None:
         raise _refuse(source, "the source campaign has no terminal receipt")
-    receipt = json.loads(receipt_row["receipt_json"])
+    receipt = verified.receipt
     listed = False
     for stage in receipt.get("stages", []):
         if stage.get("stage_key") != source.stage:
@@ -378,15 +374,10 @@ def resolve_receipt_refs(
                 raise _receipt_ref_refusal(
                     key, item, f"campaign {campaign_id} is {row['status']}, not succeeded"
                 )
-            receipt_row = connection.execute(
-                "SELECT receipt_json, receipt_digest FROM campaign_receipts WHERE campaign_id=?",
-                (campaign_id,),
-            ).fetchone()
-            if receipt_row is None:
+            verified = load_verified_receipt(connection, campaign_id)
+            if verified is None:
                 raise _receipt_ref_refusal(key, item, "the source campaign has no terminal receipt")
-            found = _source_receipt_output(
-                json.loads(receipt_row["receipt_json"]), item["stage"], item["output"]
-            )
+            found = _source_receipt_output(verified.receipt, item["stage"], item["output"])
             if found is None:
                 raise _receipt_ref_refusal(
                     key,
@@ -394,7 +385,7 @@ def resolve_receipt_refs(
                     f"the receipt of {campaign_id} lists no succeeded output "
                     f"{item['output']!r} of stage {item['stage']!r}",
                 )
-            lineage: dict[str, Any] = {"source_receipt_sha256": receipt_row["receipt_digest"]}
+            lineage: dict[str, Any] = {"source_receipt_sha256": verified.digest}
             if item.get("predecessor") is not None:
                 lineage["predecessor"] = item["predecessor"]
             inputs.append(
@@ -493,13 +484,10 @@ def resolve_image_refs(
             raise _image_ref_refusal(
                 key, f"stage {ref['stage']!r} of {campaign_id} is not an image-build stage"
             )
-        receipt_row = connection.execute(
-            "SELECT receipt_json, receipt_digest FROM campaign_receipts WHERE campaign_id=?",
-            (campaign_id,),
-        ).fetchone()
-        if receipt_row is None:
+        verified = load_verified_receipt(connection, campaign_id)
+        if verified is None:
             raise _image_ref_refusal(key, "the source campaign has no terminal receipt")
-        image = _built_image(json.loads(receipt_row["receipt_json"]), ref["stage"])
+        image = _built_image(verified.receipt, ref["stage"])
         if image is None:
             raise _image_ref_refusal(
                 key,
@@ -511,6 +499,6 @@ def resolve_image_refs(
         stage["image_resolved_from"] = {
             "campaign_id": campaign_id,
             "stage": ref["stage"],
-            "source_receipt_sha256": receipt_row["receipt_digest"],
+            "source_receipt_sha256": verified.digest,
         }
     return resolved, used

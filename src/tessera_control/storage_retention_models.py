@@ -34,6 +34,13 @@ class RetentionPolicy(BaseModel):
     # manifest lists, whose lease is over and that are older than the operator's orphan age,
     # or whose every manifest was rejected. The quarantine row stays as evidence.
     reclaim_orphaned_large_artifacts: bool = False
+    # Opt in: age out the repository's ``.pytest-tmp`` (one basetemp per test run). Each direct
+    # child quiet for ``test_scratch_max_age_hours`` is selected; one changed within the last hour
+    # is always kept. ``test_scratch_root`` defaults to ``<repository>/.pytest-tmp`` and must be a
+    # directory literally named ``.pytest-tmp``; nothing outside it is ever classified.
+    reclaim_test_scratch: bool = False
+    test_scratch_max_age_hours: int = Field(default=24, ge=1, le=8760)
+    test_scratch_root: str | None = None
     # The timer only reports (dry run) unless this is true; a person can always apply by hand.
     auto_apply: bool = False
     # How often the timer fully re-hashes every backup (restore's own validation) and receipts
@@ -46,7 +53,7 @@ class RetentionPolicy(BaseModel):
 class Candidate:
     """One thing the policy would delete (or must keep), with why."""
 
-    kind: Literal["backup", "artifact", "large_artifact"]
+    kind: Literal["backup", "artifact", "large_artifact", "test_scratch"]
     ref: str  # backup id, or artifact id
     path: str  # backup directory (relative to backup_root) or object key; no absolute paths
     size_bytes: int

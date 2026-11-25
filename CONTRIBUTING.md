@@ -103,6 +103,12 @@ credentials and `.venv/` must stay out of Git and image contexts.
 
   Every `tests/**/test_*.py` file belongs to exactly one shard. Report concurrent
   changes, failures, skipped and unrun checks explicitly.
+
+  Test scratch: a focused or parallel run puts its pytest base directories under
+  `.pytest-tmp/` (`focused-<run id>`, `parallel<N>-<run id>`), removes exactly those when every
+  process is green, and keeps them, printing their paths, when anything fails. A second run never
+  shares or removes another run's directory. `--keep-basetemp` (or `TESSERA_KEEP_BASETEMP=1`)
+  keeps them even when green; a cleanup problem prints one line and never changes the exit code.
 - **Live fixtures:** Docker/native desktop/Kubernetes/provider checks are separate
   opt-ins outside default pytest/CI. Implement requested live harnesses and run
   them when execution is authorized, with bounded calls/tokens/time/retries and

@@ -57,6 +57,7 @@ from .campaign_models import (
     topological_order,
 )
 from .campaign_pending_approval import pending_human_approval
+from .campaign_receipt_read import load_verified_receipt
 from .campaign_rerun import (
     RERUN_EVENT,
     RerunCampaign,
@@ -1374,16 +1375,15 @@ class CampaignStore(
         try:
             actor = self._read_actor(connection, principal)
             self._campaign(connection, actor, campaign_id)
-            row = connection.execute(
-                "SELECT * FROM campaign_receipts WHERE campaign_id=?", (campaign_id,)
-            ).fetchone()
-            if row is None:
+            # A stored receipt is returned only when its digest verifies (409 otherwise).
+            verified = load_verified_receipt(connection, campaign_id)
+            if verified is None:
                 raise NotFound("Campaign receipt was not found.")
             stored = {
                 "campaign_id": campaign_id,
-                "receipt": json.loads(row["receipt_json"]),
-                "receipt_digest": row["receipt_digest"],
-                "created_at": row["created_at"],
+                "receipt": verified.receipt,
+                "receipt_digest": verified.digest,
+                "created_at": verified.created_at,
             }
             if self._external_scope(connection, actor):
                 # An agent gets the approver-hiding view (receipt_agent_view); the stored row

@@ -100,6 +100,12 @@ def build_plan(state_dir: Path, policy: RetentionPolicy | None, *, now: datetime
         found, bad = list_large_candidates(state_dir, policy, now=now)
         candidates += found
         skipped += bad
+    if policy.reclaim_test_scratch:
+        from .storage_retention_test_scratch import plan_test_scratch
+
+        found, bad = plan_test_scratch(policy, now=now)
+        candidates += found
+        skipped += bad
     return Plan(now.isoformat(), policy_digest(policy), candidates, skipped)
 
 
@@ -114,6 +120,7 @@ def _reason(error: Exception) -> str:
         "BackupRetentionError",
         "RetentionDeleteError",
         "LargeReclaimError",
+        "ScratchError",
     }:
         return str(error)[:300]
     return type(error).__name__
@@ -141,6 +148,7 @@ def run(
     delete_backup: Callable[..., dict] | None = None,
     delete_artifact: Callable[..., dict] | None = None,
     delete_large: Callable[..., dict] | None = None,
+    delete_scratch: Callable[..., dict] | None = None,
 ) -> dict[str, Any]:
     """Plan, and in ``apply`` mode delete; every run leaves a receipt, rewritten per deletion.
 
@@ -213,6 +221,15 @@ def run(
                 if candidate.kind == "backup":
                     assert policy is not None and policy.backup_root is not None
                     removed = remove_backup(Path(policy.backup_root), candidate)
+                elif candidate.kind == "test_scratch":
+                    from .storage_retention_test_scratch import (
+                        delete_test_scratch,
+                        resolve_root,
+                    )
+
+                    assert policy is not None
+                    remove_scratch = delete_scratch or delete_test_scratch
+                    removed = remove_scratch(resolve_root(policy), candidate)
                 elif candidate.kind == "large_artifact":
                     if remove_large is None:
                         from .storage_retention_large import delete_large as large_delete

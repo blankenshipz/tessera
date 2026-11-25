@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 from test_delegated_decisions import World, _terms
@@ -142,3 +144,56 @@ def test_a_header_delegation_reference_never_becomes_an_owner_delegation(api):
     assert not world.env.events("campaign.delegated_approval")
     for event in world.env.events("campaign.approved"):
         assert "delegation_id" not in event["payload"]
+
+
+APPROVER_KEY = re.compile(r"approv.*principal", re.IGNORECASE)
+
+
+def _approver_keys(obj, path="$"):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if APPROVER_KEY.search(str(key)):
+                yield f"{path}.{key}"
+            yield from _approver_keys(value, f"{path}.{key}")
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            yield from _approver_keys(value, f"{path}[{index}]")
+
+
+def test_the_agent_response_hides_who_approved_but_keeps_the_summary(api):
+    """The route projects for an enrolled agent after the command: the stored row and the
+    idempotency record keep the approver (the receipt and runner need it)."""
+    world, client = api
+    delegation = world.create()
+    campaign = world.campaign()
+    headers = agent_headers(world)
+    ok = approve(client, headers, campaign, delegation)
+    assert ok.status_code == 200, ok.text
+    approval = ok.json()["approval"]
+    assert list(_approver_keys(ok.json())) == []
+    assert {
+        "id", "spec_digest", "decision_class", "approved_at", "expires_at", "delegation_id",
+        "trust_policy_digest", "status",
+    } <= set(approval)  # fmt: skip
+    assert approval["delegation_id"] == delegation["id"]
+    # Non-vacuous: the same call is stored with the approver, and a replay is projected too.
+    creator = world.row(delegation["id"])["created_by_principal_id"]
+    (stored,) = world.env.query(
+        "SELECT approving_principal_id FROM campaign_approvals WHERE campaign_id=?",
+        campaign["id"],
+    )
+    assert stored[0] == creator
+    replay = approve(client, headers, campaign, delegation)
+    assert replay.status_code == 200 and list(_approver_keys(replay.json())) == []
+
+
+def test_a_person_gets_the_full_approval_row(api):
+    world, client = api
+    delegation = world.create()
+    campaign = world.campaign()
+    human = {"Authorization": "Bearer synthetic-human-token-" + "x" * 30}
+    ok = approve(client, human, campaign, delegation)
+    assert ok.status_code == 200, ok.text
+    creator = world.row(delegation["id"])["created_by_principal_id"]
+    assert ok.json()["approval"]["approving_principal_id"] == creator
+    assert list(_approver_keys(ok.json())) == ["$.approval.approving_principal_id"]

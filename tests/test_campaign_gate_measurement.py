@@ -18,7 +18,7 @@ from test_campaign_standing import Sched
 from tessera_control import campaign_gates, program_budget
 from tessera_control.campaign_gate_models import UnlockRequirement
 from tessera_control.campaign_gates import requirement_digest
-from tessera_control.store import Conflict
+from tessera_control.store import Conflict, canonical_digest
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def _receipt(sched, campaign_id, attempts, stage="s1"):
         "INSERT INTO campaign_receipts VALUES (?, ?, ?, 'x')",
         campaign_id,
         json.dumps(receipt),
-        "d" * 64,
+        canonical_digest(receipt),  # the reader verifies it
     )
 
 

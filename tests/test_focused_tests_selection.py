@@ -361,7 +361,9 @@ def test_one_job_is_one_pytest_process(tmp_path):
     assert ft.run(FILES[:3], tmp_path, 1, ["-k", "x"], popen=popen) == 0
     (command,) = popen.calls
     assert command[:4] == [sys.executable, "-m", "pytest", "-x"]
-    assert basetemp(command) == str(tmp_path / ".pytest-tmp-focused")
+    # Under .pytest-tmp, named with a per-run id so two runs never share a basetemp.
+    path = Path(basetemp(command))
+    assert path.parent == tmp_path / ".pytest-tmp" and path.name.startswith("focused-")
     assert command[-5:] == ["-k", "x", *FILES[:3]]
 
 

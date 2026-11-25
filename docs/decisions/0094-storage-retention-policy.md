@@ -97,6 +97,21 @@ restore, and the quarantine row stays as evidence). It is opt-in
 dry run first like everything else, and each reclaim is on the receipt with its size and
 digest.
 
+### Test scratch (`.pytest-tmp`)
+
+Focused and parallel test runs leave one basetemp per run under the repository's `.pytest-tmp`;
+on a deploy host these piled up to tens of gigabytes. Retention now lists them as `test_scratch`
+candidates, opt-in (`reclaim_test_scratch: true`), and removes the ones quiet for
+`test_scratch_max_age_hours` (default 24; `test_scratch_root` defaults to `<repository>/.pytest-tmp`
+and must be a directory literally named `.pytest-tmp`). Each direct child is one candidate. A
+tree changed within the last hour is always kept (`recent_activity`) and is checked again right
+before removal; no process lock exists for a basetemp in this repository, so that rule is the guard.
+Nothing outside `.pytest-tmp` is ever classified: a symlink, a non-directory, the root itself or
+anything whose resolved path is not a strict descendant of the root is refused, read-only
+directories are made writable before removal without following a symlink, and a failed removal is
+a receipted failure, never a raised error. Dry run first and the plan digest bind the apply, like
+every other class.
+
 ### Platform agents
 
 An external agent credential enrolled with `retention:read` may read status and list a plan
