@@ -52,6 +52,7 @@ from .salad_termination import (
     UNCONFIRMED_NEW_ALLOCATION_CODE,
     provider_termination,
 )
+from .salad_unclaimed import create_claimed
 from .store import Conflict, _parse_utc, canonical_digest
 
 if TYPE_CHECKING:
@@ -363,15 +364,8 @@ class SaladStageDriver:
         return self._claimed(ctx.campaign["org_id"], operation_id)
 
     def _claimed(self, org_id: str, operation_id: str | None) -> bool:
-        if operation_id is None:
-            return False
-        row = self.runner._one(
-            """SELECT 1 AS n FROM events WHERE org_id=? AND event_type='salad_proxy.claim'
-            AND json_extract(payload_json,'$.operation_id')=?
-            AND json_extract(payload_json,'$.action') IN ('create','start') LIMIT 1""",
-            (org_id, operation_id),
-        )
-        return row is not None
+        with self.runner.store.runner_connection() as connection:
+            return create_claimed(connection, org_id, operation_id)
 
     def reconciled_settlement(self, attempt: dict[str, Any], grant: dict[str, Any]) -> int | None:
         """Cents for a grant someone else reconciled; None means wait for a human charge."""

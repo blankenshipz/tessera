@@ -404,6 +404,25 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   (`campaign.autoreconcile_stopped`). A host reboot, a lost report or any attempt that held
   money or shows a container keeps the human path: control cannot tell an unreported start
   from no start.
+- **Attempts with no claimed provider create (ADR 0157).** An unknown attempt whose provider
+  proves from control's own records that it never claimed a create or start is reconciled by
+  the runner itself. The proof comes from the provider's optional `create_claim_state` hook
+  (Salad: exactly one packaged operation, no `salad_proxy.claim` create or start for it, no
+  route that wants to run or records a create or start effect, and a Salad record with no
+  provider id, receipt, evidence or charge); a provider without the hook is never reconciled
+  this way. The attempt must also show no exit, receipt or manifest, and its grant no provider
+  id, running, exited or terminated observation, receipt or dispatch. The runner revokes the
+  grant through its reduce-only step if it is still active, then in one transaction reconciles
+  it at zero with the operator route's accounting (its hold released), settles the attempt
+  `failed_transient`/`not_started` at zero (`unclaimed_zero`) and re-queues the stage under its
+  own caps (an attempt number, no scientific retry). It records
+  `execution.grant_reconciled_unclaimed` (`automatic: true`) and the receipt event
+  `campaign.attempt_unclaimed_reconciled` (attempt id, proof code, evidence digest). Any failed
+  guard keeps the human path and records `campaign.unclaimed_autoreconcile_refused` with a
+  closed reason and a readable sentence. At most `--campaign-unclaimed-autoreconcile-limit`
+  (default 2, 0 disables) such reconciles per campaign; past it the attempt stays `unknown`
+  with `campaign.autoreconcile_stopped` (`kind: unclaimed`). The operator route
+  `reconcile-unclaimed-salad` is unchanged and still human-only.
 - **Data class (ADR 0039).** Inputs are `public` or `private_derived`; the class of a
   snapshot is the one the control plane recorded when it was staged
   (`snapshot_data_classes`), never the spec's claim. A spec naming a snapshot `public` is

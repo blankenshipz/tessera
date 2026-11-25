@@ -100,7 +100,14 @@ def test_unknown_provider_is_refused_at_submit(tmp_path):
     world = World(tmp_path)
     stage = _spec2()["stages"][0]
     stage["provider"] = "nowhere"
-    stage["inputs"][0].update(snapshot_id=world.env.snapshot_id, digest=world.env.snapshot_digest)
+    # A new dict, never an in-place update: the default input is shared test data.
+    stage["inputs"] = [
+        {
+            **stage["inputs"][0],
+            "snapshot_id": world.env.snapshot_id,
+            "digest": world.env.snapshot_digest,
+        }
+    ]
     body = {"spec": _spec2(stage)}
     with pytest.raises(StoreError, match="Unknown compute provider"):
         world.env.store.submit_campaign(

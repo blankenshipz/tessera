@@ -36,7 +36,8 @@ def _stage(key: str, *inputs: dict, **extra) -> dict:
         "output_paths": ["out.json"],
         "max_output_bytes": 1024,
         "max_duration_seconds": 60,
-        "inputs": list(inputs) or [SNAP],
+        # Copies: a test that edits a stage's inputs in place must never alter the shared SNAP.
+        "inputs": [copy.deepcopy(item) for item in inputs] or [copy.deepcopy(SNAP)],
         **extra,
     }
 

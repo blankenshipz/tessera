@@ -144,6 +144,39 @@ def test_deterministic_classification(error, expected):
     assert is_deterministic_read_failure(error) is expected
 
 
+DETERMINISTIC_REASONS = (
+    "identity_mismatch",
+    "group_not_found",
+    "group_gone",
+    "provider_identity_changed",
+    "reallocation_uncertain",
+    "credential_rejected",
+    "admission_denied",
+    "redirect_denied",
+    "organization_invalid",
+    "some_future_reason",
+)
+
+
+@pytest.mark.parametrize("reason", DETERMINISTIC_REASONS)
+def test_every_non_transient_reason_stops_at_once_without_burning_the_deadline(world, reason):
+    guardian, clock, seen, started, stops, _ = world
+    seen["fail"] = Unknown(reason=reason)
+    assert is_deterministic_read_failure(seen["fail"]) is True
+    status = poll(guardian, clock)  # first failed read, far inside the 30 s deadline
+    assert status["stop_cause"] == "provider_unavailable" and len(stops) == 1
+    assert "prestart_read_retries" not in status
+
+
+@pytest.mark.parametrize("reason", ["provider_unavailable", "malformed_response", "timeout"])
+def test_allowlisted_transient_reasons_are_retried(world, reason):
+    guardian, clock, seen, started, stops, _ = world
+    seen["fail"] = Unknown(reason=reason)
+    assert is_deterministic_read_failure(seen["fail"]) is False
+    status = poll(guardian, clock)
+    assert stops == [] and status["prestart_read_retries"]["count"] == 1
+
+
 def test_identity_mismatch_stops_immediately_without_burning_the_deadline(world):
     guardian, clock, seen, started, stops, _ = world
     seen["fail"] = Unknown(reason="identity_mismatch", field="gpu_classes")

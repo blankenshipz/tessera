@@ -403,7 +403,10 @@ and blocked campaigns (except an attempt whose worker reported a refused launch 
 container, zero cost and no receipt, which the runner reconciles itself and records as no
 evidence, bounded at two identical repeats per stage; a reboot or an unreported start still
 needs a person, see
-[ADR 0046](docs/decisions/0046-automatic-not-started-reconciliation.md); and an attempt whose
+[ADR 0046](docs/decisions/0046-automatic-not-started-reconciliation.md); an attempt whose
+provider proves no create or start was ever claimed, which the runner reconciles at zero and
+re-queues, at most `--campaign-unclaimed-autoreconcile-limit` times per campaign (default 2),
+see [ADR 0157](docs/decisions/0157-unclaimed-attempt-automatic-reconcile.md); and an attempt whose
 worker confirmed the exit with no contradiction, which the runner resolves, releasing its grant
 and slot and never recording a pass (and not while its outputs are still arriving; a stalled upload, or one past the hold ceiling, no longer holds it), see
 [ADR 0053](docs/decisions/0053-resolve-attempts-on-confirmed-exit.md) and

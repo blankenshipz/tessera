@@ -376,7 +376,7 @@ def test_expired_collector_credential_retains_pending_and_original_unknown(deliv
     setup["harness"].fail = "prompt"
     setup["bridge"].tick()
     token = secrets.token_urlsafe(32)
-    post(
+    issued = post(
         setup["setup_client"],
         setup["owner"],
         "/credentials",
@@ -385,11 +385,18 @@ def test_expired_collector_credential_retains_pending_and_original_unknown(deliv
             "kind": "agent",
             "audience": "control",
             "project_id": setup["project"],
-            "expires_at": (datetime.now(UTC) + timedelta(seconds=2)).isoformat(),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             "external_agent": {"destination": "openai:personal", "actions": ["provenance:append"]},
         },
     )
-    time.sleep(2.1)
+    # Cross the expiry boundary deterministically: move the stored expiry into the
+    # past instead of sleeping past a short real-time window.
+    with sqlite3.connect(setup["state"] / "tessera.sqlite3") as db:
+        changed = db.execute(
+            "UPDATE credentials SET expires_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(minutes=1)).isoformat(), issued["credential_id"]),
+        ).rowcount
+    assert changed == 1
     scope = (setup["mapping"]["tenant"], setup["mapping"]["sender_id"], setup["mapping"]["task_id"])
     before = [item["envelope"] for item in setup["peer"].provenance_outbox(*scope)]
     with ProvenanceClient(setup["origin"], token, "openai:personal") as expired:

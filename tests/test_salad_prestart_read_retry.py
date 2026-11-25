@@ -85,6 +85,12 @@ def test_a_404_instance_read_of_a_running_group_is_still_a_failed_read():
     assert run(f, "read_instance").status == "unknown"
 
 
+def test_a_404_instance_read_without_a_problem_details_body_is_a_failed_read():
+    for body in (b"<html>404</html>", [], {"title": "Forbidden", "status": 404}, {"status": "404"}):
+        f = Factory((200, group()), (404, body))
+        assert run(f, "read_instance").status == "unknown"
+
+
 def test_other_instance_read_errors_are_still_failures():
     f = Factory((200, group()), (500, {"title": "x"}))
     assert run(f, "read_instance").status == "unknown"

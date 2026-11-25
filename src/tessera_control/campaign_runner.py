@@ -132,6 +132,8 @@ from .campaign_steps import (
     StepTransient,
 )
 from .campaign_store import CampaignStore, LicenseRefused
+from .campaign_unclaimed import Refused, Unclaimed, automatic_count
+from .campaign_unclaimed import assess as assess_unclaimed
 from .code_approval import snapshot_code_approval
 from .data_class import DataClassRefused
 from .execution import reconcile_grant_row
@@ -148,6 +150,9 @@ from .workspace import inventory_digest
 log = logging.getLogger("tessera.campaign_runner")
 
 MAX_STEPS_PER_TICK = 64
+# ADR 0157: automatic reconciles of unclaimed attempts one campaign may apply (0 disables).
+DEFAULT_UNCLAIMED_AUTORECONCILE_LIMIT = 2
+MAX_UNCLAIMED_AUTORECONCILE_LIMIT = 10
 MAX_STAGE_LOOPS = 12
 # The attempt-number range of campaign_stage_attempts.
 MAX_ATTEMPT_NUMBERS = 5
@@ -256,7 +261,17 @@ class CampaignRunner:
         holder_id: str | None = None,
         lease_seconds: int = 30,
         scheduler: bool = True,
+        unclaimed_autoreconcile_limit: int = DEFAULT_UNCLAIMED_AUTORECONCILE_LIMIT,
     ) -> None:
+        if (
+            type(unclaimed_autoreconcile_limit) is not int
+            or not 0 <= unclaimed_autoreconcile_limit <= MAX_UNCLAIMED_AUTORECONCILE_LIMIT
+        ):
+            raise ValueError(
+                "unclaimed_autoreconcile_limit must be an integer in "
+                f"0..{MAX_UNCLAIMED_AUTORECONCILE_LIMIT}"
+            )
+        self.unclaimed_autoreconcile_limit = unclaimed_autoreconcile_limit
         self.state_dir = Path(state_dir)
         self.store = CampaignStore(self.state_dir)
         self.steps = StepExecutor(self.store, self.state_dir)
@@ -4699,7 +4714,8 @@ class CampaignRunner:
         with self.store.runner_connection() as connection:
             verdict = assess(connection, attempt, now=self.now())
         if verdict is None:
-            return False
+            # Not an ADR 0046 case; perhaps one whose provider claimed no create (ADR 0157).
+            return self._auto_reconcile_unclaimed(ctx, key, attempt)
         others = [a for a in self._attempts(ctx, key) if a["id"] != attempt["id"]]
         repeats = repeat_count(others, verdict.reason)
         stage = self._stage_row(ctx, key)
@@ -4823,6 +4839,193 @@ class CampaignRunner:
                     grant_id=grant["id"],
                 )
         self._actions.append(f"not_started:{key}:{attempt['attempt']}:{verdict.reason}")
+        return True
+
+    # -- automatic reconciliation of attempts with no claimed provider create (ADR 0157) --
+
+    def _attempt_provider(self, ctx: _Ctx, key: str, attempt: Mapping[str, Any]) -> Any:
+        """The provider the attempt ran on, or None when it is not registered."""
+        with self.store.runner_connection() as connection:
+            row = self._attempt_context(connection, attempt["id"])
+        provider_id = None if row is None else row["resolved_provider_id"]
+        if provider_id is None:
+            try:
+                provider_id = self._spec_stage(ctx, key).provider
+            except KeyError:
+                return None
+        return self._provider_or_none(provider_id)
+
+    def _unclaimed_refused(
+        self, ctx: _Ctx, key: str, attempt: Mapping[str, Any], refused: Refused
+    ) -> bool:
+        """Record once why this attempt keeps the human path; always False."""
+        if refused.reason == "attempt_not_unknown":
+            return False
+        self.emit_once(
+            ctx,
+            "campaign.unclaimed_autoreconcile_refused",
+            {
+                "stage_key": key,
+                "attempt": attempt["attempt"],
+                "reason": refused.reason,
+                "provider_reason": refused.provider_reason,
+            },
+            {"attempt_id": attempt["id"], "readable": refused.readable},
+        )
+        return False
+
+    def _auto_reconcile_unclaimed(self, ctx: _Ctx, key: str, attempt: dict[str, Any]) -> bool:
+        """Reconcile an unknown attempt whose provider proves no create was claimed.
+
+        The same zero reconcile a person runs through the operator route: the grant is revoked
+        through the delegated step if still active, then in one transaction the guards are
+        re-read, the grant is reconciled at zero (its hold released), the attempt settles
+        ``unclaimed_zero`` as ``not_started`` and the stage is re-queued under its own caps.
+        Bounded per campaign by ``unclaimed_autoreconcile_limit``; past it, or when any guard
+        fails, the attempt stays unknown for a person with the reason recorded."""
+        provider = self._attempt_provider(ctx, key, attempt)
+        with self.store.runner_connection() as connection:
+            fresh = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+            ).fetchone()
+            if fresh is None:
+                return False
+            verdict = assess_unclaimed(connection, fresh, ctx.campaign, provider)
+            used = automatic_count(connection, ctx.campaign)
+        if isinstance(verdict, Refused):
+            return self._unclaimed_refused(ctx, key, attempt, verdict)
+        limit = self.unclaimed_autoreconcile_limit
+        if used >= limit:
+            # Re-admission itself stays under the stage's own caps (attempt numbers, retries).
+            reason = (
+                "not auto-reconciled: automatic unclaimed reconcile is disabled"
+                if limit == 0
+                else f"not auto-reconciled: {used} of {limit} automatic reconciles used"
+            )
+            self.emit_once(
+                ctx,
+                "campaign.autoreconcile_stopped",
+                {"stage_key": key, "attempt": attempt["attempt"], "kind": "unclaimed"},
+                {
+                    "reason": reason,
+                    "limit": limit,
+                    "used": used,
+                    "evidence_digest": verdict.digest,
+                },
+            )
+            return False
+        grant = self._one("SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],))
+        assert grant is not None
+        if grant["status"] == "active":
+            # The platform's own reduce-only revoke, as the unwind of any attempt runs it.
+            try:
+                self._revoke(ctx, key, attempt, grant)
+            except StepFailed:
+                return self._unclaimed_refused(ctx, key, attempt, Refused("revoke_refused"))
+        applied = self._apply_unclaimed(ctx, key, attempt, verdict, provider)
+        if isinstance(applied, Refused):
+            return self._unclaimed_refused(ctx, key, attempt, applied)
+        return applied
+
+    def _apply_unclaimed(
+        self,
+        ctx: _Ctx,
+        key: str,
+        attempt: dict[str, Any],
+        verdict: Unclaimed,
+        provider: Any,
+    ) -> bool | Refused:
+        with self.store.runner_connection() as connection:
+            fresh = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+            ).fetchone()
+            again = assess_unclaimed(connection, fresh, ctx.campaign, provider)
+            if isinstance(again, Refused):
+                return again
+            if again.digest != verdict.digest:
+                return False  # the records moved: judge them afresh next tick
+            if automatic_count(connection, ctx.campaign) >= self.unclaimed_autoreconcile_limit:
+                return False
+            grant = connection.execute(
+                "SELECT * FROM execution_grants WHERE id=? AND project_id=?",
+                (fresh["grant_id"], ctx.campaign["project_id"]),
+            ).fetchone()
+            if grant is None or grant["status"] != "cancel_requested":
+                return False  # the operator route's own prerequisite: a revoked grant
+            self._hold_lease(connection)
+            now = _iso(self.now())
+            actor = self._actor_principal(connection, ctx.campaign["id"])
+            # The operator route's accounting (ADR 0048 shared reconcile), at zero.
+            revision = reconcile_grant_row(
+                connection, grant, settlement_cents=0, principal_id=actor, now=now
+            )
+            if revision is None:
+                return Refused("ledger_inconsistent")
+            provider.mark_unclaimed(connection, attempt["id"], now)
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                status="failed_transient",
+                failure_class=NOT_STARTED,
+                failure_detail=verdict.detail[:500],
+            )
+            self._settle(
+                connection,
+                attempt["id"],
+                0,
+                "unclaimed_zero",
+                {"unclaimed": {"proof": verdict.proof, "evidence_digest": verdict.digest}},
+            )
+            self._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=? AND status='blocked_unknown'",
+                (ctx.campaign["id"], key),
+                status="preparing",
+            )
+            limits = connection.execute(
+                "SELECT currency FROM execution_project_limits WHERE project_id=?",
+                (grant["project_id"],),
+            ).fetchone()
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "execution.grant_reconciled_unclaimed",
+                {
+                    "grant_id": grant["id"],
+                    "operation_ids": verdict.evidence["operation_ids"],
+                    "proof": verdict.proof,
+                    "settlement_cents": 0,
+                    "currency": None if limits is None else limits["currency"],
+                    "automatic": True,
+                    "provider_termination_inferred": False,
+                    "operational_only": True,
+                },
+                task_id=grant["task_id"],
+            )
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "campaign.attempt_unclaimed_reconciled",
+                {
+                    "stage_key": key,
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "grant_id": grant["id"],
+                    "reason": "no_create_claimed",
+                    "proof": verdict.proof,
+                    "evidence_digest": verdict.digest,
+                    "settlement_cents": 0,
+                    "released_hold_cents": grant["max_exposure_cents"],
+                    "consumed_scientific_retry": False,
+                    "automatic": True,
+                    "is_evidence": False,
+                },
+                task_id=grant["task_id"],
+            )
+        self._actions.append(f"unclaimed:{key}:{attempt['attempt']}")
         return True
 
     # -- confirmed exit (ADR 0053) -------------------------------------------------
@@ -5298,9 +5501,17 @@ def backoff_seconds(interval_seconds: float, failures: int) -> float:
 
 
 def start_background(
-    state_dir: Path, interval_seconds: float, *, scheduler: bool = True
+    state_dir: Path,
+    interval_seconds: float,
+    *,
+    scheduler: bool = True,
+    unclaimed_autoreconcile_limit: int = DEFAULT_UNCLAIMED_AUTORECONCILE_LIMIT,
 ) -> RunnerHandle:
-    runner = CampaignRunner(state_dir, scheduler=scheduler)
+    runner = CampaignRunner(
+        state_dir,
+        scheduler=scheduler,
+        unclaimed_autoreconcile_limit=unclaimed_autoreconcile_limit,
+    )
     stop = threading.Event()
 
     def loop() -> None:

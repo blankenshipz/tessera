@@ -408,7 +408,7 @@ def test_real_research_cancel_and_expired_recipient_disclosure_fail_closed(backe
         ).json()
         assert response["result"]["status"]["state"] == "TASK_STATE_CANCELED"
         assert "error" in b["send"](client, "planner", "consume", task["id"])
-        expires = (datetime.now(UTC) + timedelta(seconds=1)).isoformat()
+        expires = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
         disclosure = post(
             b["setup"],
             b["owner"],
@@ -420,7 +420,14 @@ def test_real_research_cancel_and_expired_recipient_disclosure_fail_closed(backe
                 "expires_at": expires,
             },
         )
-        time.sleep(1.1)
+        # Cross the expiry boundary deterministically instead of sleeping past it.
+        with sqlite3.connect(b["state"] / "tessera.sqlite3") as db:
+            changed = db.execute(
+                "UPDATE generated_output_disclosures "
+                "SET bounds_json=json_set(bounds_json,'$.expires_at',?) WHERE id=?",
+                ((datetime.now(UTC) - timedelta(minutes=1)).isoformat(), disclosure["id"]),
+            ).rowcount
+        assert changed == 1
         assert "error" in b["send"](
             client,
             "critic",

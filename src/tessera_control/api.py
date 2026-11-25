@@ -108,6 +108,7 @@ def create_app(
     campaign_runner_interval: float | None = None,
     campaign_scheduler: bool = True,
     campaign_stuck_scan_seconds: float = 300.0,
+    campaign_unclaimed_autoreconcile_limit: int = 2,
     review_single_owner: bool = False,
     storage_retention: bool = False,
     code_review_git_remotes: Path | str | None = None,
@@ -639,7 +640,10 @@ def create_app(
             from . import campaign_runner
 
             handle = campaign_runner.start_background(
-                state_dir, campaign_runner_interval, scheduler=campaign_scheduler
+                state_dir,
+                campaign_runner_interval,
+                scheduler=campaign_scheduler,
+                unclaimed_autoreconcile_limit=campaign_unclaimed_autoreconcile_limit,
             )
             try:
                 async with previous_lifespan(application) as state:

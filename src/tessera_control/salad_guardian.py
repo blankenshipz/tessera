@@ -61,12 +61,15 @@ PRESTART_READ_BACKOFF_SECONDS = (5.0, 10.0, 15.0)
 POSTSTART_READ_RETRY_PREFIX = "poststart_read_retry:"
 POSTSTART_READ_RETRY_LIMIT = 3
 POSTSTART_READ_WINDOW_SECONDS = 45.0
-# Transport failure reasons that are deterministic or mean the group is gone: retrying
-# cannot change them, so they stop at once instead of burning the deadline. Readers get
-# the reason through an optional ``reason`` attribute on the raised error (absent: unknown,
-# treated as transient), never by parsing text.
-NON_RETRYABLE_READ_REASONS = frozenset(
-    {"identity_mismatch", "group_not_found", "group_gone", "provider_identity_changed"}
+# Allowlist of transient read failure reasons worth retrying while unallocated. Every other
+# reason (identity_mismatch, group_not_found, group_gone, provider_identity_changed,
+# reallocation_uncertain, credential_rejected, admission_denied, redirect_denied,
+# organization_invalid, anything new) is deterministic or may mean a billable instance is
+# visible: it stops at once instead of burning the deadline. Readers get the reason through
+# an optional ``reason`` attribute on the raised error (absent: the generic provider_unknown,
+# an unlabeled failure), never by parsing text.
+TRANSIENT_READ_REASONS = frozenset(
+    {"provider_unavailable", "malformed_response", "timeout", "provider_unknown"}
 )
 # identity_mismatch on one of these field names is a known provider normalization and may
 # be retried like any transient read. Empty: no normalization is accepted by the guardian;
@@ -97,11 +100,11 @@ def read_failure_detail(error) -> tuple[str, str | None]:
 
 
 def is_deterministic_read_failure(error) -> bool:
-    """True for a read failure that retrying cannot fix (see NON_RETRYABLE_READ_REASONS)."""
+    """True for a read failure that retrying cannot fix (reason not in TRANSIENT_READ_REASONS)."""
     reason, field = read_failure_detail(error)
     if reason == "identity_mismatch" and field in RETRYABLE_MISMATCH_FIELDS:
         return False
-    return reason in NON_RETRYABLE_READ_REASONS
+    return reason not in TRANSIENT_READ_REASONS
 
 
 def is_transient_read_failure(error) -> bool:

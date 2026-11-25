@@ -134,6 +134,29 @@ class Settlement:
     estimate_cents: int | None = None
 
 
+# ADR 0157: whether a provider create (or start) was claimed for an attempt's grant.
+ClaimState = Literal["none", "claimed", "unknown"]
+CLAIM_STATES: tuple[ClaimState, ...] = ("none", "claimed", "unknown")
+CLAIM_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+@dataclass(frozen=True)
+class CreateClaim:
+    """A provider's read of whether it claimed a create or start for an attempt (ADR 0157).
+
+    ``state`` is ``none`` only when the provider can prove from control's own records that no
+    create or start was claimed for the attempt's grant and none still can be; ``claimed``
+    when one was (or an effect for one is recorded); ``unknown`` for anything else. ``reason``
+    and ``proof`` are closed lowercase codes of the provider's choosing (``proof`` names what
+    a ``none`` rests on); ``evidence`` holds record ids only and is digested into the
+    receipt. Only ``none`` lets the runner reconcile the attempt automatically."""
+
+    state: ClaimState
+    reason: str
+    proof: str | None = None
+    evidence: Mapping[str, Any] | None = None
+
+
 class Waiting(Exception):  # noqa: N818 - a control-flow signal, like the runner's _Waiting
     """The provider cannot progress or settle yet; the runner retries next tick."""
 
@@ -215,7 +238,11 @@ class ProviderHooks(Protocol):
     None; read outside the grant transaction under a time bound, for the receipt only.
     ``image_pull_limits(stage)``: the stage's ceiling on the image's compressed pull size and
     whether it is strict (else the descriptor's fields). ``image_pull_bytes(stage)``: the
-    recorded compressed pull size of the stage image, or None (see ``campaign_image_pull``)."""
+    recorded compressed pull size of the stage image, or None (see ``campaign_image_pull``).
+    ``create_claim_state(connection, attempt)``: a pure read returning a ``CreateClaim``;
+    ``mark_unclaimed(connection, attempt_id, stamp)``: the provider's bookkeeping in the
+    transaction that reconciles such an attempt. A provider without both is never
+    reconciled automatically as unclaimed (ADR 0157)."""
 
     def sweep(self, rt: RunnerServices) -> None: ...
     def on_settled(
@@ -227,10 +254,19 @@ class ProviderHooks(Protocol):
     def image_pull_size_bytes(self, spec_stage: Any) -> int | None: ...
     def image_pull_limits(self, stage: Any) -> tuple[int | None, bool]: ...
     def image_pull_bytes(self, stage: Any) -> int | None: ...
+    def create_claim_state(
+        self, connection: sqlite3.Connection, attempt: Mapping[str, Any]
+    ) -> CreateClaim: ...
+    def mark_unclaimed(
+        self, connection: sqlite3.Connection, attempt_id: str, stamp: str
+    ) -> None: ...
 
 
 class DefaultHooks:
-    """Mixin with no-op optional hooks, for plugins that want none of them."""
+    """Mixin with no-op optional hooks, for plugins that want none of them.
+
+    It deliberately has no ``create_claim_state``: a provider that cannot read its own
+    claims is never reconciled automatically as unclaimed (ADR 0157)."""
 
     def sweep(self, rt: RunnerServices) -> None:
         return None
@@ -338,6 +374,8 @@ OPTIONAL_PROVIDER_HOOKS = (
     "image_pull_size_bytes",
     "image_pull_limits",
     "image_pull_bytes",
+    "create_claim_state",
+    "mark_unclaimed",
 )
 
 

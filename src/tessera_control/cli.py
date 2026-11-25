@@ -604,6 +604,17 @@ def parser() -> argparse.ArgumentParser:
         help="how often to scan campaigns for stuck conditions, 0 disables (default 300)",
     )
     serve.add_argument(
+        "--campaign-unclaimed-autoreconcile-limit",
+        type=int,
+        choices=range(0, 11),
+        default=2,
+        metavar="0-10",
+        help=(
+            "automatic zero reconciles per campaign of unknown attempts whose provider proves "
+            "no create was claimed, 0 disables (default 2; ADR 0157)"
+        ),
+    )
+    serve.add_argument(
         "--salad-credential-directory",
         type=Path,
         help=(
@@ -1431,6 +1442,9 @@ def main(argv: list[str] | None = None) -> int:
                 campaign_runner_interval=runner_interval,
                 campaign_scheduler=not arguments.no_campaign_scheduler,
                 campaign_stuck_scan_seconds=max(0.0, arguments.campaign_stuck_scan_seconds),
+                campaign_unclaimed_autoreconcile_limit=(
+                    arguments.campaign_unclaimed_autoreconcile_limit
+                ),
                 review_single_owner=arguments.review_single_owner,
                 storage_retention=True,
                 code_review_git_remotes=remotes_file,

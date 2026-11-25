@@ -37,7 +37,8 @@ def _stage2(key: str, *inputs: dict, **extra) -> dict:
         "argv": ["python", "-c", "print(1)"],
         "outputs": [_out()],
         "max_duration_seconds": 60,
-        "inputs": list(inputs) or [SNAP],
+        # Copies: a test that edits a stage's inputs in place must never alter the shared SNAP.
+        "inputs": [copy.deepcopy(item) for item in inputs] or [copy.deepcopy(SNAP)],
         **extra,
     }
 

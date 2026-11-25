@@ -23,6 +23,7 @@ from .campaign_models import SALAD_BACKEND, SALAD_RUNTIME, SALAD_TARGET, SaladSt
 from .campaign_providers import (
     ComputeProvider,
     ConfigSection,
+    CreateClaim,
     GrantRequest,
     Observation,
     OutputLimits,
@@ -51,6 +52,7 @@ from .salad_campaign_profiles import (
     SaladCampaignProfiles,
     stage_has_nonpublic_input,
 )
+from .salad_unclaimed import CLAIMS, PROOF, unclaimed_proof
 from .salad_workload_contract import COMMAND as SALAD_COMMAND
 from .salad_workload_contract import (
     GPU_RUNTIME_V1,
@@ -178,6 +180,13 @@ def public_artifact_refusal(stage: Any, config: SaladStageSpec) -> str | None:
 def _hosts_declared(config: SaladStageSpec) -> bool:
     egress = config.workload.egress
     return bool(egress.fetches or egress.redirect_hosts)
+
+
+# A Salad attempt in one of these phases ran, or may have run, past the provider create: it
+# is never reconciled automatically as unclaimed (ADR 0157).
+UNCLAIMABLE_PHASES = frozenset(
+    {"executing", "outcome_recorded", "awaiting_charge", "settled", "unclaimed"}
+)
 
 
 class CredentialBlocked(Conflict):
@@ -618,6 +627,60 @@ class SaladRouteProvider:
             phase=CASE WHEN phase='unclaimed' THEN phase ELSE 'settled' END,
             revision=revision+1, updated_at=? WHERE attempt_id=?""",
             (cents, stamp, attempt_id),
+        )
+
+    # -- unclaimed attempts (ADR 0157) -------------------------------------------------------
+
+    def create_claim_state(
+        self, connection: sqlite3.Connection, attempt: Mapping[str, Any]
+    ) -> CreateClaim:
+        """Whether a Salad create or start was claimed for the attempt's grant; a pure read.
+
+        ``none`` rests on the same proof the operator's reconcile-unclaimed route checks
+        (``salad_unclaimed.unclaimed_proof``) plus this attempt's own Salad record showing no
+        provider id, receipt, manifest, evidence or charge and no phase past the route start."""
+        row = connection.execute(
+            "SELECT * FROM campaign_salad_attempts WHERE attempt_id=?", (attempt["id"],)
+        ).fetchone()
+        if row is None:
+            return CreateClaim("unknown", "no_salad_record")
+        if row["provider_id"] is not None:
+            return CreateClaim("claimed", "provider_reference")
+        if any(
+            row[name] is not None
+            for name in (
+                "live_receipt_digest",
+                "manifest_id",
+                "salad_evidence_digest",
+                "charged_cents",
+            )
+        ):
+            return CreateClaim("unknown", "salad_record_has_evidence")
+        if row["phase"] in UNCLAIMABLE_PHASES:
+            return CreateClaim("unknown", "salad_phase")
+        org = connection.execute(
+            "SELECT org_id FROM campaigns WHERE id=?", (attempt["campaign_id"],)
+        ).fetchone()
+        if org is None or attempt["grant_id"] is None:
+            return CreateClaim("unknown", "no_grant")
+        refusal, proof = unclaimed_proof(connection, org["org_id"], attempt["grant_id"])
+        if refusal is not None:
+            return CreateClaim("claimed" if refusal in CLAIMS else "unknown", refusal)
+        if row["operation_id"] not in (None, proof["operation_id"]):
+            return CreateClaim("unknown", "operation_mismatch")
+        return CreateClaim(
+            "none",
+            "no_create_or_start_claim",
+            proof=PROOF,
+            evidence={**proof, "phase": row["phase"]},
+        )
+
+    def mark_unclaimed(self, connection: sqlite3.Connection, attempt_id: str, stamp: str) -> None:
+        """The Salad record keeps the unclaimed phase through the zero settlement."""
+        connection.execute(
+            """UPDATE campaign_salad_attempts SET phase='unclaimed', revision=revision+1,
+            updated_at=? WHERE attempt_id=?""",
+            (stamp, attempt_id),
         )
 
     def placement_capability(self, stage: Any) -> PlacementCapability:

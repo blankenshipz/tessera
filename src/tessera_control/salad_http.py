@@ -1055,7 +1055,7 @@ class SaladHTTPTransport:
                     "GET", f"{self._group}/instances", secret, absent_ok=True
                 )
                 if status == 404:
-                    if group["state"] == "running":
+                    if group["state"] == "running" or not _group_not_found(data):
                         raise _Failure("provider_unavailable")
                     data = {"instances": []}
                 instances = data["instances"]

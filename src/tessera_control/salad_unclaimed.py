@@ -17,12 +17,90 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .execution import ExecutionStore
+from .execution import ExecutionStore, reconcile_grant_row
 from .execution_models import ExecutionRequest, Revision
 from .store import Conflict, StoreError, utc_now
 
 ADAPTER = "kubernetes-job-v1"
 PROOF = "no_create_or_start_claim"
+
+# Why a grant is not provably unclaimed (closed values). ``create_claimed`` and
+# ``route_effect`` are claims of a provider effect; the others are unknown claim states.
+REFUSALS = {
+    "operation_count": "Exactly one Salad operation is required for this grant.",
+    "create_claimed": "A provider create or start was claimed; evidence is required.",
+    "route_effect": "A route of this operation still has a run or effect.",
+    "route_wants_run": "A route of this operation still has a run or effect.",
+}
+CLAIMS = frozenset({"create_claimed", "route_effect"})
+
+
+def create_claimed(connection: sqlite3.Connection, org_id: str, operation_id: str | None) -> bool:
+    """True when control holds a provider create or start claim for the operation.
+
+    The one reading of a ``salad_proxy.claim`` for an operation: control writes the claim in
+    the same transaction as the intent to call the provider (ADR 0038 amendment)."""
+    if operation_id is None:
+        return False
+    row = connection.execute(
+        """SELECT 1 FROM events WHERE org_id=? AND event_type='salad_proxy.claim'
+        AND json_extract(payload_json,'$.operation_id')=?
+        AND json_extract(payload_json,'$.action') IN ('create','start') LIMIT 1""",
+        (org_id, operation_id),
+    ).fetchone()
+    return row is not None
+
+
+def unclaimed_proof(
+    connection: sqlite3.Connection, org_id: str, grant_id: str
+) -> tuple[str | None, dict[str, Any]]:
+    """``(refusal, proof)``: refusal is None when the grant provably claimed no provider effect.
+
+    A pure read of the operation, claim and route records; it never looks at the grant's
+    status, so each caller checks that itself. ``proof`` names the one operation and the
+    routes whose newest state was read."""
+    operations = connection.execute(
+        "SELECT operation_id, adapter_version FROM external_operations WHERE grant_id=?",
+        (grant_id,),
+    ).fetchall()
+    if len(operations) != 1 or operations[0]["adapter_version"] != ADAPTER:
+        return "operation_count", {}
+    operation_id = operations[0]["operation_id"]
+    proof: dict[str, Any] = {"operation_id": operation_id, "route_ids": []}
+    if create_claimed(connection, org_id, operation_id):
+        return "create_claimed", proof
+    seen: set[str] = set()
+    for row in connection.execute(
+        """SELECT payload_json FROM events WHERE org_id=?
+        AND event_type='remote_execution.state'
+        AND json_extract(payload_json,'$.proposal.operation_id')=?
+        ORDER BY cursor DESC""",
+        (org_id, operation_id),
+    ):
+        state = json.loads(row["payload_json"])
+        if state["id"] in seen:
+            continue  # newest state per route only
+        seen.add(state["id"])
+        if any(effect.get("action") in {"create", "start"} for effect in state["effects"]):
+            return "route_effect", proof
+        if state.get("desired") == "run":
+            return "route_wants_run", proof
+    proof["route_ids"] = sorted(seen)
+    return None, proof
+
+
+def unclaimed_event(grant_id: str, proof: dict[str, Any], currency: str) -> dict[str, Any]:
+    """The ``execution.grant_reconciled_unclaimed`` payload, for a person or the runner."""
+    return {
+        "grant_id": grant_id,
+        "operation_id": proof["operation_id"],
+        "route_ids": proof["route_ids"],
+        "proof": PROOF,
+        "settlement_cents": 0,
+        "currency": currency,
+        "provider_termination_inferred": False,
+        "operational_only": True,
+    }
 
 
 class ReconcileUnclaimedSalad(ExecutionRequest):
@@ -53,62 +131,20 @@ class SaladUnclaimedStore(ExecutionStore):
                 raise Conflict("Execution grant revision is no longer current.")
             if grant["status"] != "cancel_requested":
                 raise Conflict("Only a cancelled Salad grant can be reconciled as unclaimed.")
-            operations = connection.execute(
-                "SELECT operation_id, adapter_version FROM external_operations WHERE grant_id=?",
-                (grant_id,),
-            ).fetchall()
-            if len(operations) != 1 or operations[0]["adapter_version"] != ADAPTER:
-                raise Conflict("Exactly one Salad operation is required for this grant.")
-            operation_id = operations[0]["operation_id"]
-            claims = connection.execute(
-                """SELECT count(*) FROM events WHERE org_id=? AND event_type='salad_proxy.claim'
-                AND json_extract(payload_json,'$.operation_id')=?
-                AND json_extract(payload_json,'$.action') IN ('create','start')""",
-                (actor["org_id"], operation_id),
-            ).fetchone()[0]
-            if claims:
-                raise Conflict("A provider create or start was claimed; evidence is required.")
-            route_ids: list[str] = []
-            seen: set[str] = set()
-            for row in connection.execute(
-                """SELECT payload_json FROM events WHERE org_id=?
-                AND event_type='remote_execution.state'
-                AND json_extract(payload_json,'$.proposal.operation_id')=?
-                ORDER BY cursor DESC""",
-                (actor["org_id"], operation_id),
-            ):
-                state = json.loads(row["payload_json"])
-                if state["id"] in seen:
-                    continue  # newest state per route only
-                seen.add(state["id"])
-                route_ids.append(state["id"])
-                if state.get("desired") == "run" or any(
-                    effect.get("action") in {"create", "start"} for effect in state["effects"]
-                ):
-                    raise Conflict("A route of this operation still has a run or effect.")
+            refusal, proof = unclaimed_proof(connection, actor["org_id"], grant_id)
+            if refusal is not None:
+                raise Conflict(REFUSALS[refusal])
             limits = self._limit(connection, actor, grant["project_id"])
             now = utc_now()
-            next_revision = grant["revision"] + 1
-            changed = connection.execute(
-                """UPDATE execution_grants SET status='reconciled', revision=?, updated_at=?,
-                reconciled_at=?, reconciled_by_principal_id=?, settlement_cents=0
-                WHERE id=? AND revision=? AND status='cancel_requested'""",
-                (next_revision, now, now, actor["id"], grant_id, grant["revision"]),
-            ).rowcount
-            if changed != 1:
-                raise Conflict("Execution authority is no longer unresolved.")
-            released = connection.execute(
-                """UPDATE execution_project_limits SET held_cents=held_cents-?,updated_at=?
-                WHERE project_id=? AND held_cents>=?""",
-                (
-                    grant["max_exposure_cents"],
-                    now,
-                    grant["project_id"],
-                    grant["max_exposure_cents"],
-                ),
-            ).rowcount
-            if released != 1:
+            # The shared reconcile accounting (ADR 0048), at zero.
+            if (
+                reconcile_grant_row(
+                    connection, grant, settlement_cents=0, principal_id=actor["id"], now=now
+                )
+                is None
+            ):
                 raise Conflict("Execution reservation ledger is inconsistent; authority held.")
+            next_revision = grant["revision"] + 1
             updated = dict(grant)
             updated.update(
                 status="reconciled",
@@ -125,16 +161,7 @@ class SaladUnclaimedStore(ExecutionStore):
                 grant["task_id"],
                 "execution.grant_reconciled_unclaimed",
                 next_revision,
-                {
-                    "grant_id": grant_id,
-                    "operation_id": operation_id,
-                    "route_ids": sorted(route_ids),
-                    "proof": PROOF,
-                    "settlement_cents": 0,
-                    "currency": limits["currency"],
-                    "provider_termination_inferred": False,
-                    "operational_only": True,
-                },
+                unclaimed_event(grant_id, proof, limits["currency"]),
             )
             return 200, self._grant_response(connection, updated)
 

@@ -158,7 +158,7 @@ def test_private_derived_release_is_refused_for_an_egress_plan(tmp_path):
     assert env.query("SELECT count(*) AS n FROM execution_grants")[0]["n"] == 0
 
 
-def test_provider_input_tickets_keep_requiring_a_public_release(tmp_path):
+def test_provider_input_tickets_refuse_a_private_release_unless_a_call_site_opts_in(tmp_path):
     env = Env(tmp_path)
     tickets = ProviderInputStore(env.state)
     connection = _connect(env.state / "tessera.sqlite3")
@@ -184,8 +184,13 @@ def test_provider_input_tickets_keep_requiring_a_public_release(tmp_path):
             )
     finally:
         connection.close()
-    # Neither provider-ticket call site opts in to the private class.
-    assert "allow_private_derived" not in (SRC / "provider_inputs.py").read_text()
+    # The default stays closed (above). Since the trusted-private_derived change, exactly the two
+    # provider-ticket call sites (issue and every pull) opt in to the private class, and each is
+    # followed by the provider-trust data-class gate and the licence-label check that now decide.
+    source = (SRC / "provider_inputs.py").read_text()
+    assert source.count("allow_private_derived=True") == 2
+    assert "require_public_provider_input(" in source
+    assert source.count("_require_license_labels(") >= 3  # the definition and both call sites
 
 
 def test_release_classification_is_closed(tmp_path):
