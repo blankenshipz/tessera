@@ -993,15 +993,21 @@ class SaladSafetyService:
     def _open_billable_frames(self, operation):
         """Frames other than ``operation`` that may still bill: not yet ``stopped`` or
         ``reconciled`` (proven-absent frames reconcile). An ambiguous create with no provider
-        id still counts until it is resolved (ADR 0041 section 7.2, resolved question 4a)."""
+        id still counts until it is resolved (ADR 0041 section 7.2, resolved question 4a).
+
+        Only each frame's verdict is needed, so this takes ``_frame_verdict`` (the same branch
+        ``_status`` uses) instead of building the whole status per frame: the status also sums
+        the total committed spend over every reservation, which made one reserve quadratic in
+        the reservation count. Each frame is still accounted once, as ``_status`` did."""
         others = self.db.execute(
             "SELECT reservation FROM reservations WHERE operation!=?", (operation,)
         ).fetchall()
-        return sum(
-            1
-            for (other,) in others
-            if self._status(self._row(other))["status"] not in {"stopped", "reconciled"}
-        )
+        count = 0
+        for (other,) in others:
+            self._account(self._row(other))
+            if self._frame_verdict(self._row(other)) not in {"stopped", "reconciled"}:
+                count += 1
+        return count
 
     def _over_total_cap(self, reservation, profile):
         return self.total_cap_cents is not None and (
@@ -1044,12 +1050,31 @@ class SaladSafetyService:
                 except ValueError:
                     pass
 
+    def _frame_branch(self, row):
+        """Which source gives this frame's status: ``bound`` (the guardian), ``lost_create_closed``
+        (proven absent) or ``reserved``. The one place both ``_status`` and ``_frame_verdict``
+        decide it, so they cannot drift."""
+        if row["provider_id"]:
+            return "bound"
+        if self._lost_create_closed(row):
+            return "lost_create_closed"
+        return "reserved"
+
+    def _frame_verdict(self, row):
+        """Only the ``status`` string of ``_status(row)`` (``row`` already accounted): no cost,
+        custody or diagnostic reads."""
+        branch = self._frame_branch(row)
+        if branch == "bound":
+            return self.guardian.status(row["operation"])["status"]
+        return "reconciled" if branch == "lost_create_closed" else "reserved"
+
     def _status(self, row):
         self._account(row)
         row = self._row(row["reservation"])
-        if row["provider_id"]:
+        branch = self._frame_branch(row)
+        if branch == "bound":
             status = self.guardian.status(row["operation"])
-        elif self._lost_create_closed(row):
+        elif branch == "lost_create_closed":
             record = json.loads(row["lost_create_resolution"])
             # Terminal by definite absence, never a stop: nothing was created.
             status = dict(
