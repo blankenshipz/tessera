@@ -646,6 +646,51 @@ class SaladRouteProvider:
             )
         if verdict is None:
             return Observation("running")
+        start_failure = self._guardian_record(rt, attempt, "start_failure")
+        if type(start_failure) is dict and type(start_failure.get("machines")) is int:
+            # ADR 0193 (amended): the guardian saw the container fail to start on several
+            # distinct machines before any custody began. The image or its command is at fault,
+            # so another machine, another class or another attempt of the same digest would
+            # fail the same way: permanent, and never a class-fallback trigger (the fallback
+            # reads only ``prestart_failure`` and the allocation timeout, neither of which this
+            # carries).
+            codes = (self._guardian_record(rt, attempt, "start_events") or {}).get("exit_codes")
+            exit_text = (
+                f", exit_code={codes[0]}"
+                if type(codes) is list and codes and type(codes[0]) is int
+                else ""
+            )
+            events = self._guardian_record(rt, attempt, "start_events") or {}
+            if "instance_exited" not in (events.get("events") or []):
+                # Salad also moves a healthy instance between nodes while it allocates, pulls
+                # or creates, so three machines alone do not prove the start failed. Without a
+                # recorded ``instance_exited`` (no read, an empty or rate-limited one) the
+                # attempt is not a permanent failure of the digest: a fresh attempt may retry,
+                # bounded by ``retry.max_reallocation_retries``.
+                return Observation(
+                    "failed_transient",
+                    failure_class=REALLOCATED_PRECUSTODY,
+                    detail=(
+                        f"{REALLOCATED_PRECUSTODY}: start_failure_suspected_unconfirmed: "
+                        f"{start_failure['machines']} distinct machines, no recorded "
+                        "instance_exited"
+                    )[:500],
+                    evidence_kind="salad_live_receipt",
+                    evidence_digest=evidence,
+                    manifest_id=attempt.get("manifest_id"),
+                )
+            return Observation(
+                "failed_permanent",
+                failure_class="start_failure_suspected",
+                detail=(
+                    "start_failure_suspected: the container failed to start on "
+                    f"{start_failure['machines']} distinct machines before its first call-in"
+                    f"{exit_text}"
+                )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         timeout = self._allocation_timeout(rt, attempt)
         # Only the guardian's own recorded timeout counts. A reason string the executor
         # reported (the live receipt's detail) is not evidence of a placement failure.
@@ -731,6 +776,22 @@ class SaladRouteProvider:
         ):
             return found  # a declared-run cap overrun is the workload's, not the route's
         return None
+
+    @staticmethod
+    def _guardian_record(rt: RunnerServices, attempt: Mapping[str, Any], key: str) -> Any:
+        """One key of the executor's recorded guardian final for this attempt, or None."""
+        if rt is None or attempt.get("id") is None:
+            return None
+        row = rt._one(
+            "SELECT guardian_final_json FROM campaign_salad_attempts WHERE attempt_id=?",
+            (attempt["id"],),
+        )
+        if row is None or row["guardian_final_json"] is None:
+            return None
+        try:
+            return json.loads(row["guardian_final_json"]).get(key)
+        except (ValueError, AttributeError):
+            return None
 
     @staticmethod
     def _allocation_timeout(
@@ -1110,6 +1171,10 @@ class SaladRouteProvider:
                 # Reason, how long the guardian waited, and (guardian_estimate above) the spend
                 # so far; absent unless the guardian cancelled for lack of an allocation.
                 fields["allocation_timeout"] = {"reason": "allocation_timeout", **timeout}
+            for key in ("start_failure", "start_events"):
+                if final.get(key):
+                    # Closed tokens only (event names, exit codes, machine count).
+                    fields["guardian_" + key] = final[key]
             rebinds = final.get("prestart_rebinds")
             if rebinds:
                 # Recorded by the guardian: an allocation change before anything ran, re-bound.

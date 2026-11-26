@@ -10,6 +10,7 @@ node-local no-continued-writes and final billing remain explicitly unknown.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -20,6 +21,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .salad_custody import CustodyBinding, SaladCustody, private_database
+from .salad_events import closed_record
 
 # Guardian event kind prefix recording why a tick first decided to stop.
 STOP_CAUSE_PREFIX = "stop_cause:"
@@ -33,6 +35,24 @@ ALLOCATION_TIMEOUT_REASON = "allocation_timeout"
 ALLOCATION_TIMEOUT_PREFIX = "allocation_timeout:"
 MIN_ALLOCATION_SECONDS, MAX_ALLOCATION_SECONDS = 60, 3600
 DEFAULT_ALLOCATION_SECONDS = 600
+# A start-failure loop before custody (ADR 0193 point 2, amended): the provider keeps assigning
+# a machine and the container keeps dying before it can call in, so the group never reaches
+# custody and neither the allocation deadline (a machine was assigned) nor a rebind (the
+# placement never binds before a run) ends it. Distinct machines seen while no custody has
+# begun are persisted; at START_FAILURE_MACHINES the group is stopped. Three: one or two
+# failing nodes are ordinary node trouble (Salad itself moves a failed start to another node
+# and backs off), three distinct nodes failing before the first call-in is the image or its
+# command. One machine that stays downloading or creating is a slow pull and never counts.
+START_FAILURE_REASON = "start_failure_suspected"
+START_FAILURE_PREFIX = "start_failure:"
+DEFAULT_START_FAILURE_MACHINES = 3
+MIN_START_FAILURE_MACHINES, MAX_START_FAILURE_MACHINES = 2, 10
+# One system-events read per operation: the attempt is claimed before the request is sent, so
+# a crash or a failed read never repeats it (Salad limits log queries per day).
+START_EVENTS_ATTEMPT = "start_events_attempt"
+START_EVENTS_PREFIX = "start_events:"
+OUTPUT_RETAINED_REASON = "output_retained"
+OUTPUT_RETAINED_MARK = "output_retained_mark"
 RECONCILE_OPERATOR = "operator_reconciled_exact_group_stopped"
 RECONCILE_PROVIDER = "provider_confirmed_exact_group_stopped"
 # reason -> guardian event kind
@@ -202,6 +222,10 @@ class ProviderObservation:
     # that is still pulling its image counts), and whether the group has been started.
     instance_count: int | None = None
     group_started: bool | None = None
+    # Machines the group's listed instances are assigned to (never stored raw: the guardian
+    # keeps only a truncated digest). None: the adapter cannot say, so the start-failure count
+    # never advances.
+    machine_ids: tuple[str, ...] | None = None
 
 
 class SaladGuardian:
@@ -217,7 +241,16 @@ class SaladGuardian:
         custody_started: Callable[[str], bool] | None = None,
         max_prestart_rebinds: int = DEFAULT_MAX_PRESTART_REBINDS,
         prestart_read_deadline_seconds: float = DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
+        start_failure_machines: int = DEFAULT_START_FAILURE_MACHINES,
+        custody_work_started: Callable[[str], bool] | None = None,
     ):
+        if type(start_failure_machines) is not int or not (
+            start_failure_machines == 0
+            or MIN_START_FAILURE_MACHINES <= start_failure_machines <= MAX_START_FAILURE_MACHINES
+        ):
+            raise ValueError("invalid_start_failure_machines")
+        # 0 turns the start-failure detection off.
+        self.start_failure_machines = start_failure_machines
         if allocation_seconds is not None and (
             type(allocation_seconds) is not int
             or not MIN_ALLOCATION_SECONDS <= allocation_seconds <= MAX_ALLOCATION_SECONDS
@@ -243,6 +276,10 @@ class SaladGuardian:
         # begun for this operation" (an input fetched, an output written, a run observed). With
         # no callable the guardian cannot know, so it never re-binds: every change stops.
         self.custody_started = custody_started
+        # Narrower answer used only to count a start-failure loop: custody work proper began
+        # (the workload called in, an input served, an output touched). With none, the count
+        # falls back to ``custody_started``.
+        self.custody_work_started = custody_work_started
         self.max_prestart_rebinds = max_prestart_rebinds
         self.db = private_database(path)
         self._lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -262,6 +299,8 @@ class SaladGuardian:
                 allocation_uncertain INTEGER DEFAULT 0, manifest TEXT);
             CREATE TABLE IF NOT EXISTS events (
                 sequence INTEGER PRIMARY KEY, operation TEXT, at REAL, kind TEXT);
+            CREATE TABLE IF NOT EXISTS prestart_machines (
+                operation TEXT, machine TEXT, at REAL, PRIMARY KEY (operation, machine));
         """)
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(assignments)")}
         if "assigned_allocation" not in columns:
@@ -344,11 +383,17 @@ class SaladGuardian:
         closes that window. Like cancel, this can only start a stop.
         """
         with self.db:
-            self.db.execute(
+            changed = self.db.execute(
                 "UPDATE assignments SET stopping=1,reason='output_retained' "
                 "WHERE operation=? AND stopping=0 AND status!='stopped'",
                 (operation,),
-            )
+            ).rowcount
+            if changed:
+                # The reason column is overwritten once the stop seals; this is not.
+                self.db.execute(
+                    "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                    (operation, self.clock(), OUTPUT_RETAINED_MARK),
+                )
 
     def fail(self, operation: str, reason: str, exit_code: int | None) -> bool:
         """The bound workload reported a failure: record the cause and stop at once.
@@ -441,6 +486,14 @@ class SaladGuardian:
             # Additive: present only when the workload reported its own failure.
             code = exit_event[0][len(WORKLOAD_EXIT_PREFIX) :]
             result["workload_exit_code"] = None if code == "None" else int(code)
+        failure = self._event_json(operation, START_FAILURE_PREFIX)
+        if failure is not None and type(failure.get("machines")) is int:
+            # Additive: present only for a group stopped as a suspected start-failure loop.
+            result["start_failure"] = {"machines": max(0, min(failure["machines"], 100))}
+        events = closed_record(self._event_json(operation, START_EVENTS_PREFIX))
+        if events is not None:
+            # Additive: the one system-events read of a failed start (closed tokens only).
+            result["start_events"] = events
         timeout = self._allocation_timeout_record(operation)
         if timeout is not None:
             # Additive: present only for a group cancelled because nothing was ever allocated.
@@ -494,6 +547,105 @@ class SaladGuardian:
         except (ValueError, KeyError, TypeError):
             limit = "unknown"
         return {"running_seconds": running, "limit": limit}
+
+    def _event_json(self, operation: str, prefix: str) -> dict | None:
+        found = self.db.execute(
+            "SELECT kind FROM events WHERE operation=? AND substr(kind,1,?)=? "
+            "ORDER BY sequence LIMIT 1",
+            (operation, len(prefix), prefix),
+        ).fetchone()
+        if found is None:
+            return None
+        try:
+            value = json.loads(found[0][len(prefix) :])
+        except ValueError:
+            return None
+        return value if type(value) is dict else None
+
+    def _start_failure_machines(self, operation: str, o, first_running) -> int | None:
+        """Distinct machines seen before custody when that count reaches the limit, else None.
+
+        Called on a fresh, exact, non-terminal observation while the guardian is not stopping.
+        It needs the adapter to say that no custody work has begun (``custody_work_started``,
+        else ``custody_started``, wired and False; one that cannot say, or raises, never
+        counts), and it records machines only while that holds. A running instant does not
+        disable it when the adapter's custody-work signal ignores it (the service's does): an
+        instance that is seen running but never calls in is the same failed start. A container
+        that restarts on the one machine stays a single machine and is not counted."""
+        begun = self.custody_work_started or self.custody_started
+        if (
+            self.start_failure_machines <= 0
+            or begun is None
+            or not isinstance(o.machine_ids, tuple)
+            or not o.machine_ids
+        ):
+            return None
+        try:
+            if begun(operation) is not False:
+                return None
+        except Exception:
+            return None
+        now = self.clock()
+        with self.db:
+            for machine in o.machine_ids:
+                if type(machine) is str and machine:
+                    digest = hashlib.sha256(b"machine:" + machine.encode()).hexdigest()[:16]
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO prestart_machines(operation,machine,at) "
+                        "VALUES(?,?,?)",
+                        (operation, digest, now),
+                    )
+        count = self.db.execute(
+            "SELECT count(*) FROM prestart_machines WHERE operation=?", (operation,)
+        ).fetchone()[0]
+        return count if count >= self.start_failure_machines else None
+
+    def claim_start_events_read(self, operation: str) -> bool:
+        """True exactly once per operation, only for a group that is stopping for a cause other
+        than ``output_retained``. The claim is durable before the caller sends anything."""
+        with self.db:
+            row = self.db.execute(
+                "SELECT stopping,status,reason FROM assignments WHERE operation=?", (operation,)
+            ).fetchone()
+            if not row or not row[0] or row[2] == OUTPUT_RETAINED_REASON:
+                return False
+            cause = self.db.execute(
+                "SELECT kind FROM events WHERE operation=? AND substr(kind,1,?)=? "
+                "ORDER BY sequence LIMIT 1",
+                (operation, len(STOP_CAUSE_PREFIX), STOP_CAUSE_PREFIX),
+            ).fetchone()
+            if (cause and cause[0][len(STOP_CAUSE_PREFIX) :] == OUTPUT_RETAINED_REASON) or (
+                self.db.execute(
+                    "SELECT 1 FROM events WHERE operation=? AND kind=?",
+                    (operation, OUTPUT_RETAINED_MARK),
+                ).fetchone()
+            ):
+                return False
+            if self.db.execute(
+                "SELECT 1 FROM events WHERE operation=? AND kind=?",
+                (operation, START_EVENTS_ATTEMPT),
+            ).fetchone():
+                return False
+            self.db.execute(
+                "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                (operation, self.clock(), START_EVENTS_ATTEMPT),
+            )
+            return True
+
+    def record_start_events(self, operation: str, record: dict) -> None:
+        """Keep the closed result of the one events read; anything not closed is dropped."""
+        closed = closed_record(record)
+        if closed is None or self._event_json(operation, START_EVENTS_PREFIX) is not None:
+            return
+        with self.db:
+            self.db.execute(
+                "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                (
+                    operation,
+                    self.clock(),
+                    START_EVENTS_PREFIX + json.dumps(closed, sort_keys=True, separators=(",", ":")),
+                ),
+            )
 
     def _allocation_timeout_record(self, operation: str) -> dict | None:
         found = self.db.execute(
@@ -783,6 +935,7 @@ class SaladGuardian:
         stop_safe = True
         allocation_waited = None
         never_allocated = None
+        start_failure = None
         fail_since = row[9]
         retry_detail = None
         retry_prefix = None
@@ -825,6 +978,10 @@ class SaladGuardian:
             )
             if isinstance(o, ProviderObservation) and not exact:
                 stop_safe = False
+            if exact and fresh and not stopping:
+                # Counted before the allocation branches below, so a machine seen after a run
+                # was caught running is still recorded; the stop is decided further down.
+                start_failure = self._start_failure_machines(operation, o, first_running)
             if (
                 exact
                 and fresh
@@ -862,6 +1019,9 @@ class SaladGuardian:
                 if waited is not None:
                     reason, stopping = ALLOCATION_TIMEOUT_REASON, True
                     allocation_waited = waited
+            if reason is None and not stopping and not terminal and exact and fresh:
+                if start_failure is not None:
+                    reason, stopping = START_FAILURE_REASON, True
             if (
                 reason == "deadline"
                 and exact
@@ -929,6 +1089,16 @@ class SaladGuardian:
                     "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
                     (operation, now, STOP_CAUSE_PREFIX + reason),
                 )
+                if reason == START_FAILURE_REASON and start_failure is not None:
+                    self.db.execute(
+                        "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                        (
+                            operation,
+                            now,
+                            START_FAILURE_PREFIX
+                            + json.dumps({"machines": start_failure}, separators=(",", ":")),
+                        ),
+                    )
                 if reason == "deadline" and never_allocated is not None:
                     allocation_waited = never_allocated
                 if (

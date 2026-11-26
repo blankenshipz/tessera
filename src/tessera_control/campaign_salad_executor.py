@@ -62,6 +62,7 @@ from .salad_campaign_profiles import (
     proxy_policy,
     route_window_source,
 )
+from .salad_events import closed_record
 from .salad_termination import provider_termination
 from .salad_workload_contract import WorkloadContractV1
 from .store import canonical_digest
@@ -1592,6 +1593,16 @@ def project_guardian_final(
     rebinds = _project_rebinds(status.get("prestart_rebinds"))
     if rebinds is not None:
         projected["prestart_rebinds"] = rebinds
+    failure = status.get("start_failure")
+    if (
+        status.get("stop_cause") == "start_failure_suspected"
+        and type(failure) is dict
+        and type(failure.get("machines")) is int
+    ):
+        projected["start_failure"] = {"machines": failure["machines"]}
+    events = closed_record(status.get("start_events"))
+    if events is not None:
+        projected["start_events"] = events
     try:
         _GuardianFinal.model_validate(projected)
     except ValidationError:

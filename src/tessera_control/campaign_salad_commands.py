@@ -88,6 +88,35 @@ class _PrestartRebinds(BaseModel):
     events: Annotated[list[_PrestartRebind], Field(max_length=3)]
 
 
+class _StartFailure(BaseModel):
+    """The guardian stopped the group: several distinct machines failed before any custody."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    machines: Annotated[int, Field(ge=0, le=100)]
+
+
+class _StartEvents(BaseModel):
+    """The one system-events read of a failed start: closed tokens only, never text or ids."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    outcome: Literal["read", "empty", "log_quota_exhausted", "unavailable"]
+    events: Annotated[
+        list[
+            Literal[
+                "instance_allocated",
+                "image_pull",
+                "instance_created",
+                "instance_started",
+                "instance_exited",
+                "other",
+            ]
+        ],
+        Field(max_length=6),
+    ]
+    exit_codes: Annotated[list[Annotated[int, Field(ge=0, le=255)]], Field(max_length=8)]
+    machines: Annotated[int, Field(ge=0, le=100)]
+
+
 class _GuardianFinal(BaseModel):
     """The final guardian status projection the executor records (nothing else)."""
 
@@ -110,6 +139,9 @@ class _GuardianFinal(BaseModel):
     route_deadline: _RouteDeadline | None = None
     # Present only when the guardian re-bound its allocation before anything ran.
     prestart_rebinds: _PrestartRebinds | None = None
+    # Present only for a group stopped as a suspected start-failure loop / after an events read.
+    start_failure: _StartFailure | None = None
+    start_events: _StartEvents | None = None
 
 
 class _SaladOutcome(BaseModel):
@@ -329,7 +361,14 @@ class SaladWorkerCommands:
                         for key, value in body.guardian_final.model_dump().items()
                         # Absent unless used, so the stored shape (and its digest) of every
                         # run without an allocation timeout or a pre-start re-bind is unchanged.
-                        if key not in ("allocation_timeout", "prestart_rebinds", "route_deadline")
+                        if key
+                        not in (
+                            "allocation_timeout",
+                            "prestart_rebinds",
+                            "route_deadline",
+                            "start_failure",
+                            "start_events",
+                        )
                         or value is not None
                     },
                     sort_keys=True,

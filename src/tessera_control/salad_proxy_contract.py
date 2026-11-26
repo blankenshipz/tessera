@@ -120,6 +120,7 @@ class ProxyResult(Frozen):
             "availability",
             "read_group",
             "read_instance",
+            "read_events",
             "create",
             "other",
         ]

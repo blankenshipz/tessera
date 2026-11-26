@@ -393,7 +393,11 @@ class ProviderReadback(Frozen):
         Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9:/._-]{0,511}$")] | None
     ) = None
     allocation_id: Identifier | None = None
-    state: Literal["stopped", "running", "succeeded", "failed", "deleted", "unknown"]
+    # ``pending`` (image pull) and ``deploying`` (started, no instance running) are observations
+    # only, never authority; a failed read stays ``unknown``.
+    state: Literal[
+        "stopped", "running", "succeeded", "failed", "deleted", "pending", "deploying", "unknown"
+    ]
     observed_at: Annotated[str, StringConstraints(max_length=40)]
     request_id: Identifier | None = None
     response_status: int | None = Field(default=None, ge=100, le=599)
@@ -431,6 +435,7 @@ class ProviderReadback(Frozen):
             "availability",
             "read_group",
             "read_instance",
+            "read_events",
             "create",
             "other",
         ]

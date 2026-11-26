@@ -43,6 +43,7 @@ _FAILURES = {
     "infra_container_killed": "the infrastructure killed the container",
     "infra_resource_limit": "the container hit a resource limit",
     "infra_allocation_timeout": "no cloud instance was allocated in time",
+    "start_failure_suspected": "the container failed to start on several cloud machines",
     "not_started": "it was never started",
     "exit_confirmed_unresolved": "the program was confirmed to have exited but its result could "
     "not be resolved",

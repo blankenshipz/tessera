@@ -980,9 +980,13 @@ class TrustedSaladServer:
             "succeeded",
             "failed",
             "deleted",
+            "pending",
+            "deploying",
             "unknown",
         }:
             provider_state = "unknown"
+        if provider_state in {"pending", "deploying"} and not observation.get("provider_id"):
+            provider_state = "unknown"  # an observation of a group names that group
         counts = observation.get("instance_status_counts")
         terminal = (
             provider_state == "stopped"

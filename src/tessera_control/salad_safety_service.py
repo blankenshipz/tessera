@@ -24,6 +24,7 @@ import ssl
 import stat
 import struct
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from decimal import Decimal
@@ -38,6 +39,7 @@ from .remote_execution_models import (
     route_window_limit,
 )
 from .salad_custody import CustodyBinding, SaladCustody, private_database
+from .salad_events import empty_record
 from .salad_guardian import (
     DEFAULT_ALLOCATION_SECONDS,
     DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
@@ -461,6 +463,14 @@ def _instance_count(observation):
     return None
 
 
+def _machine_ids(observation):
+    """Machines the listed instances are assigned to; None when no instance list was read."""
+    instances = observation.get("instances")
+    if type(instances) is not list:
+        return None
+    return tuple(i["machine_id"] for i in instances if type(i.get("machine_id")) is str)
+
+
 def _no_placed_instance(observation):
     """True only when complete counts show nothing placed: none running, creating or stopping
     (only allocating, or empty). A group-level ``running`` status is then not a running machine."""
@@ -677,6 +687,7 @@ class SaladSafetyService:
             clock=clock,
             allocation_seconds=allocation_deadline_seconds,
             custody_started=self._custody_started,
+            custody_work_started=self._custody_work_started,
             max_prestart_rebinds=max_prestart_rebinds,
             prestart_read_deadline_seconds=prestart_read_deadline_seconds,
         )
@@ -691,6 +702,9 @@ class SaladSafetyService:
         # Diagnostic writes (read failures, workload refusals) that themselves failed.
         self.diagnostic_write_failures = 0
         self.next_poll = {}
+        # The one system-events read per stopped operation runs off the loop thread.
+        self._start_events_done = []
+        self._start_events_threads = []
         self.next_close_check = {}
         self.next_rate = {}
         self.next_absence = {}
@@ -1375,6 +1389,58 @@ class SaladSafetyService:
         status["frame_record"] = self._frame_record(row["reservation"], status)
         return status
 
+    def _read_start_events(self, reservation):
+        """After a stop whose cause is not ``output_retained``, read the group's system events
+        once and keep closed tokens only (event names, exit codes, a machine count).
+
+        The stop never waits on it: the guardian claims the single attempt durably, then the
+        request runs on a short-lived daemon thread under the transport's own deadline, and a
+        later pass (``_drain_start_events``, on the loop's own thread) records the closed
+        result. A failed, slow or rate-limited (``log_quota_exhausted``) read is never repeated.
+        Nothing here raises."""
+        try:
+            self._drain_start_events()
+            row = self._row(reservation)
+            if not row["provider_id"] or not self.guardian.claim_start_events_read(
+                row["operation"]
+            ):
+                return
+            operation, provider_id = row["operation"], row["provider_id"]
+            done = self._start_events_done
+
+            def read():
+                try:
+                    observation = self._bounded_send(row, "read_events", provider_id).observation
+                    record = dict(
+                        outcome="empty" if observation.get("empty") else "read",
+                        events=observation["events"],
+                        exit_codes=observation["exit_codes"],
+                        machines=observation["machines"],
+                    )
+                except ProviderUnknown as error:
+                    record = empty_record(
+                        "log_quota_exhausted" if error.detail == "rate_limited" else "unavailable"
+                    )
+                except Exception:
+                    record = empty_record("unavailable")
+                done.append((operation, record))
+
+            thread = threading.Thread(target=read, name="start-events-read", daemon=True)
+            self._start_events_threads.append(thread)
+            thread.start()
+        except Exception:
+            self.diagnostic_write_failures += 1
+
+    def _drain_start_events(self):
+        """Record the closed results of finished events reads (loop thread only)."""
+        while self._start_events_done:
+            operation, record = self._start_events_done.pop(0)
+            try:
+                self.guardian.record_start_events(operation, record)
+            except Exception:
+                self.diagnostic_write_failures += 1
+        self._start_events_threads[:] = [t for t in self._start_events_threads if t.is_alive()]
+
     def _reconcile(self, row, attestation):
         """Operator recovery for an orphan the guardian may not self-confirm."""
         if type(attestation) is not str or not 1 <= len(attestation) <= 256:
@@ -1711,6 +1777,16 @@ class SaladSafetyService:
         except Exception:
             pass  # unresolved again: the ordinary recovery loop keeps trying
 
+    def _custody_work_started(self, operation):
+        """True once custody work proper began: the workload called in, an input was served or
+        an output was requested or written. Unlike ``_custody_started`` a run merely seen
+        running does not count, so a start-failure loop is still counted after a container was
+        caught running on one poll."""
+        row = self._row(operation=operation)
+        if row["begun"] or row["output"] or row["input_requests"] or row["output_requests"]:
+            return True
+        return bool(self.inputs is not None and self.inputs.served(operation))
+
     def _custody_started(self, operation):
         """True once anything beyond the provider placing the instance has happened for the
         operation: a run was seen, the workload began, an input was fetched, an output was
@@ -1918,6 +1994,7 @@ class SaladSafetyService:
             prior_allocation_id=row["allocation"],
             instance_count=_instance_count(observation),
             group_started=_group_started(observation),
+            machine_ids=_machine_ids(observation),
         )
 
     def _stop(self, assignment):
@@ -2401,6 +2478,7 @@ class SaladSafetyService:
             self.retry_windows = None
 
     def _loop_pass(self):
+        self._drain_start_events()
         now = self.clock()
         if self.jwt.refreshed is None or now - self.jwt.refreshed >= 1800:
             try:
@@ -2601,6 +2679,7 @@ class SaladSafetyService:
         except Exception:
             # No failed observation/custody write is a confirmed stop.
             pass
+        self._read_start_events(reservation)
         # A pre-start read failure being retried across polls backs off (bounded).
         try:
             backoff = self.guardian.read_retry_backoff(row["operation"])

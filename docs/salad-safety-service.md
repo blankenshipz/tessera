@@ -495,6 +495,37 @@ out, `running_cap` when the run overran its own declared-run cap. Only the forme
 itself and exits 0 remains `succeeded` at platform level; the receipt carries
 `completeness_guard: "experiment"` because output completeness is the experiment's own guard.
 
+## Start-failure loop before custody
+
+A container that dies at once is rarely seen `running` at a 15 second poll, and each failed start
+moves to another machine (Salad's backoff grows toward 20 minutes), so an assigned machine alone
+(see the allocation deadline) would hold the frame to the route deadline. While the adapter says
+no custody has begun, the guardian keeps the distinct machines it has seen assigned (a truncated
+digest of each id, never the id). At three distinct machines it stops the group with `stop_cause`
+`start_failure_suspected`; status carries `start_failure.machines`. One machine that stays
+`downloading` or `creating` is a slow pull and counts once. The live check stops polling at
+once and its receipt reason is `start_failure_suspected`. Control records `failed_permanent` with
+that failure class only when the events read below recorded an `instance_exited` (Salad also moves
+healthy instances between nodes); otherwise it is a transient
+`provider_reallocated_before_custody` that a fresh attempt may retry. The permanent failure is not
+retried or rerouted, and the stage is not moved to the next class profile. A run seen `running` on
+one poll is still counted (only custody work proper ends the count); a restart on one machine is
+not. `start_failure_machines` is a guardian setting (2 to 10, 0 off). ADR 0196.
+
+After any stop whose cause is not `output_retained`, the service reads the group's
+`instance_controller` events once (`read_events`, one organization-scoped `query_log_entries` call
+with a bounded page and window), off the loop thread, so the stop never waits on it. The attempt
+is claimed durably first; a failed read is `unavailable` and a 429 is `log_quota_exhausted` (the
+daily log query limit lasts until 00:00 UTC); neither is retried. A query that returns zero
+entries is `empty`, not a successful `read`, so a wrong label name is visible. The result is saved
+on a later loop pass and may miss an immediate receipt, which only makes the failure transient. Status and the receipt keep
+closed tokens only (`start_events`: outcome, event names, exit codes, a distinct-machine count),
+never text, ids or hostnames.
+
+Group status `pending` (image pull) and `deploying` (started, no instance running) are reported
+as observations in the readback and the stage status; a failed read stays `unknown`. They never
+confirm a stop or start accrual.
+
 ## Allocation change before anything ran
 
 Salad can reschedule a container group while its image is still being pulled. An allocation change

@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .salad_events import closed_record
+from .salad_guardian import START_FAILURE_REASON
 from .salad_workload_contract import WORKLOAD_FAILED_CAUSE_PREFIX, WORKLOAD_FAILURE_REASONS
 
 # Route window from create through output and stop.
@@ -661,6 +663,12 @@ class SaladLiveSession:
                 status.get("last_provider_read_failure_request_kind")
             ),
         )
+        start_failure = _start_failure(status.get("start_failure"))
+        if start_failure is not None:
+            proof["start_failure"] = start_failure
+        start_events = closed_record(status.get("start_events"))
+        if start_events is not None:
+            proof["start_events"] = start_events
         declared = self._multi_output(state)
         if declared is not None:
             return self._multi_evidence(route, state, status, stopped, manifest, declared, proof)
@@ -955,7 +963,7 @@ def _allocation_timeout(value):
 
 def _final_reason(reason):
     """A receipt reason later steps must not overwrite: the guardian's own recorded end."""
-    return reason == "allocation_timeout" or str(reason).startswith(WORKLOAD_FAILED_CAUSE_PREFIX)
+    return reason in GUARDIAN_REASONS or str(reason).startswith(WORKLOAD_FAILED_CAUSE_PREFIX)
 
 
 def _stop_cause(value):
@@ -965,6 +973,21 @@ def _stop_cause(value):
     if type(value) is str and value.startswith(prefix):
         return value if value[len(prefix) :] in WORKLOAD_FAILURE_REASONS else "invalid_code"
     return _cause(value)
+
+
+def _start_failure(value):
+    """The guardian's start-failure record (distinct machines seen before custody)."""
+    if type(value) is dict and type(value.get("machines")) is int and 0 <= value["machines"] <= 100:
+        return {"machines": value["machines"]}
+    return None
+
+
+def _note_start_evidence(receipt, evidence):
+    """Copy the start-failure record and the one events read into the receipt: closed tokens
+    only, and only when present, so every other receipt keeps its shape."""
+    for key in ("start_failure", "start_events"):
+        if evidence.get(key) is not None:
+            receipt["guardian_" + key] = evidence[key]
 
 
 def _cause(value):
@@ -1088,11 +1111,14 @@ STOP_CONFIRM_SECONDS = 120
 # long cold image pull cannot exhaust the route's effect budget. Heartbeats/keepalive stay
 # on the normal cadence; only the observe sleep stretches.
 PRESTART_POLL_INTERVAL_SECONDS = 30
-# The server maps every pre-start provider state (pending, deploying, allocating,
-# downloading, creating) to "unknown", so only "unknown" reaches here. It also covers
-# provider failures and reallocation; those see the slower observe cadence, which is safe
-# because the guardian, not the driver, drives stops and retention.
-PRESTART_PROVIDER_STATUSES = frozenset({"unknown"})
+# The server reports a group Salad is still pulling for or deploying as "pending" or
+# "deploying" and maps the instance-level pre-start states (allocating, downloading,
+# creating) and every failed read or reallocation to "unknown". All of these see the slower
+# observe cadence, which is safe because the guardian, not the driver, drives stops and
+# retention.
+# Receipt reasons the guardian's own stop decides; later steps never overwrite them.
+GUARDIAN_REASONS = ("allocation_timeout", START_FAILURE_REASON)
+PRESTART_PROVIDER_STATUSES = frozenset({"unknown", "pending", "deploying"})
 # Guardian heartbeat refusals (docs/salad-safety-service.md, "Loop freshness and
 # admin refusal codes").
 # A running guardian stops a run on its own after GUARDIAN_SILENCE_SECONDS without a
@@ -1564,6 +1590,7 @@ def _drive(
             receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
             receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
             receipt["guardian_stop_cause"] = evidence.get("stop_cause")
+            _note_start_evidence(receipt, evidence)
             receipt["custody_work_begun"] = evidence.get("custody_work_begun")
             receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
             receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
@@ -1592,6 +1619,11 @@ def _drive(
                 # The workload reported its own failure and the guardian stopped the group:
                 # the run failed for that reason (never a provider move). Stop polling.
                 receipt["reason"] = evidence["stop_cause"]
+                break
+            if evidence.get("stop_cause") == START_FAILURE_REASON:
+                # The guardian saw the container fail to start on several machines before any
+                # custody began: stop polling; the reason is kept below.
+                receipt["reason"] = START_FAILURE_REASON
                 break
             if evidence["output_retained"]:
                 break
@@ -1647,6 +1679,7 @@ def _drive(
                 receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
                 receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
                 receipt["guardian_stop_cause"] = evidence.get("stop_cause")
+                _note_start_evidence(receipt, evidence)
                 receipt["custody_work_begun"] = evidence.get("custody_work_begun")
                 receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
                 receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
@@ -1695,6 +1728,7 @@ def _drive(
         receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
         receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
         receipt["guardian_stop_cause"] = evidence.get("stop_cause")
+        _note_start_evidence(receipt, evidence)
         receipt["custody_work_begun"] = evidence.get("custody_work_begun")
         receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
         receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")

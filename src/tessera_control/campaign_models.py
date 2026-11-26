@@ -2130,6 +2130,7 @@ FAILURE_CLASSES = (
     "infra_container_killed",
     "infra_resource_limit",
     "infra_allocation_timeout",
+    "start_failure_suspected",
     "provider_reallocated_before_custody",
     "not_started",
     "exit_confirmed_unresolved",

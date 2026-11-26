@@ -12,10 +12,12 @@ import re
 import socket
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
 from .remote_execution_models import ExecutionSelection
+from .salad_events import summarize_events
 from .salad_proxy_contract import ProxyResult
 from .salad_resources import check_salad_resources
 from .salad_secrets import SecretBuffer
@@ -52,6 +54,11 @@ PAGINATION_HINTS = (
 # (room for 100 groups of up to ~40 KiB each), still a bounded, single read.
 LIST_COMPLETE_BELOW = 100
 LIST_LIMIT = 4 * 1024 * 1024
+# One system-events read (``query_log_entries``): bounded page and time range. Salad limits log
+# queries per day (a 429 lasts until 00:00 UTC), so the caller makes at most one per operation.
+EVENTS_PAGE_SIZE = 50
+EVENTS_WINDOW_SECONDS = 2 * 3600
+EVENTS_LIMIT = 1024 * 1024
 
 
 def _group_not_found(data):
@@ -563,7 +570,13 @@ class SaladHTTPTransport:
             if status not in {200, 201}:
                 raise _Failure(
                     "provider_unavailable",
-                    detail=f"non_2xx_{status // 100}xx" if 100 <= status < 600 else "non_2xx_other",
+                    # A 429 on the one events read is Salad's daily log-query quota (ADR 0196);
+                    # every other request keeps the status-class token its readers parse.
+                    detail="rate_limited"
+                    if status == 429 and method == "POST" and path.endswith("/log-entries")
+                    else f"non_2xx_{status // 100}xx"
+                    if 100 <= status < 600
+                    else "non_2xx_other",
                 )
             data = json.loads(
                 raw,
@@ -594,6 +607,8 @@ class SaladHTTPTransport:
         """Closed kind of the provider request (never the path itself)."""
         if method == "POST" and path.endswith("/availability/sce-gpu-availability"):
             return "availability"
+        if method == "POST" and path.endswith("/log-entries"):
+            return "read_events"
         if method == "POST" and path == self._groups:
             return "create"
         if method != "GET":
@@ -1005,6 +1020,34 @@ class SaladHTTPTransport:
         except Exception as error:
             return self._failed(_unexpected(error))
 
+    def _read_events(self, provider_id, secret):
+        """One org-scoped ``query_log_entries`` call for this group's ``instance_controller``
+        events, reduced to closed tokens (``salad_events``); no body text leaves the call."""
+        if provider_id is None:
+            raise _Failure("identity_mismatch")
+        p = self._selection.salad
+        end = datetime.now(UTC).replace(microsecond=0)
+        body = dict(
+            start_time=(end - timedelta(seconds=EVENTS_WINDOW_SECONDS)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            end_time=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            page_size=EVENTS_PAGE_SIZE,
+            sort_order="desc",
+            query=(
+                'resource.type = "instance_controller" '
+                f'AND resource.labels.project_name = "{p.project}" '
+                f'AND resource.labels.container_group_name = "{p.group}"'
+            ),
+        )
+        _, data = self._request(
+            "POST", f"{self._org}/log-entries", secret, body, limit=EVENTS_LIMIT
+        )
+        items = data.get("items")
+        if type(items) is not list:
+            raise _Failure("malformed_response", field="items")
+        return self._result(dict(provider_id=provider_id, **summarize_events(items)))
+
     def send(self, operation, selection, provider_id, secret):
         self._post_sent = None  # None: no create POST attempted in this call
         try:
@@ -1047,6 +1090,8 @@ class SaladHTTPTransport:
                     )
                 self._require_stopped(group)
                 return self._result(group)
+            if operation == "read_events":
+                return self._read_events(provider_id, secret)
             if operation not in {"read_group", "read_instance", "start", "stop", "delete"}:
                 raise _Failure("admission_denied")
             if operation != "read_group" and provider_id is None:
