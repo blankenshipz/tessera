@@ -1122,6 +1122,10 @@ class SaladStageDriver:
         if digests is None:
             row, reasons = None, [failure or PREVIEW_FAILED]
         else:
+            # The candidate the digests were derived for (ADR 0066). Resolved before the write
+            # transaction: _spec reads the fallback stage through its own runner_connection(),
+            # and a second BEGIN IMMEDIATE inside this one deadlocks on the same thread.
+            provider_id = placed or self._spec(ctx, key).provider
             with self.runner.store.runner_connection() as connection:
                 row, reasons = campaign_preapproval.record_delegated_preapproval(
                     connection,
@@ -1138,8 +1142,7 @@ class SaladStageDriver:
                         {
                             "campaign_id": ctx.campaign["id"],
                             "stage_key": key,
-                            # The candidate the digests were derived for (ADR 0066).
-                            "provider_id": placed or self._spec(ctx, key).provider,
+                            "provider_id": provider_id,
                             "preapproval_id": row["id"],
                             "delegation_id": row["delegation_id"],
                             "terms_digest": row["terms_digest"],
