@@ -275,6 +275,16 @@ def recorded_profiles(connection: sqlite3.Connection, pre: dict[str, Any]) -> li
         AND json_extract(p.value, '$.id')=? LIMIT 1""",
         (pre["campaign_id"], pre["id"]),
     ).fetchone()
+    if row is None:
+        # A pre-approval a delegation wrote (ADR 0150) records its per-profile digests on its
+        # own event, in the transaction that recorded it.
+        row = connection.execute(
+            """SELECT json_extract(e.payload_json, '$.profiles') AS profiles
+            FROM events e WHERE e.event_type=?
+            AND json_extract(e.payload_json, '$.campaign_id')=?
+            AND json_extract(e.payload_json, '$.preapproval_id')=? LIMIT 1""",
+            (DELEGATED_PREAPPROVAL_EVENT, pre["campaign_id"], pre["id"]),
+        ).fetchone()
     if row is None or not row["profiles"]:
         return None
     return list(json.loads(row["profiles"]))
@@ -527,13 +537,18 @@ def record_delegated_preapproval(
     approval_id: str,
     stage_key: str,
     digests: dict[str, str],
+    alternate_profiles: list[dict[str, str]] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Inside the runner's write transaction, at a stage's first review stop: record the review
     pre-approval the delegation the campaign was approved under writes for this stage, or the
     reasons it does not (nothing is written then).
 
     The row is the same one an approve body records (ADR 0044) and is enforced by the same
-    exact-digest ``evaluate``: the digests are the ones the runner itself derives from the
+    exact-digest ``evaluate``. ``alternate_profiles`` names every profile the approved spec
+    lists, the candidate's own first (``plan_digest`` binds it), with each other one's plan
+    digest (ADR 0151); they are returned as ``profiles`` for the caller to record on the event,
+    and bind ``UNCOVERED_DIGEST`` when the plan kind is not covered. The digests are the ones
+    the runner itself derives from the
     approved spec and profile, a kind the rule does not cover binds ``UNCOVERED_DIGEST``, the
     attempt cap is the stage's own hold (never the rule's larger cap), the total is the
     smaller of the campaign's cap and the delegation's per-run cap, and it expires with the
@@ -609,6 +624,22 @@ def record_delegated_preapproval(
         row,
     )
     row["covered_kinds"] = covered
+    if alternate_profiles:
+        plan_covered = KIND_PLAN in covered
+        # The first entry is the candidate's own profile, bound to ``plan_digest``.
+        row["profiles"] = [
+            {
+                "profile": item["profile"],
+                "plan_digest": (
+                    row["plan_digest"]
+                    if index == 0
+                    else item["plan_digest"]
+                    if plan_covered
+                    else UNCOVERED_DIGEST
+                ),
+            }
+            for index, item in enumerate(alternate_profiles)
+        ]
     row["delegation_id"] = delegation["id"]
     row["terms_digest"] = delegation["terms_digest"]
     return row, []

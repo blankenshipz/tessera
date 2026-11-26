@@ -1117,6 +1117,7 @@ class SaladStageDriver:
         placed = self._placed_alternate(ctx, key)
         try:
             digests = self.preview_review_digests(ctx, key, placed)
+            alternates = self._alternate_profile_digests(ctx, key, placed)
         except Exception as error:  # noqa: BLE001 - a stage the driver cannot preview is not covered
             digests, failure = None, _preview_failure(error)
         if digests is None:
@@ -1133,6 +1134,7 @@ class SaladStageDriver:
                     approval_id=ctx.approval["id"],
                     stage_key=key,
                     digests=digests,
+                    alternate_profiles=alternates,
                 )
                 if row is not None and "covered_kinds" in row:
                     self.runner.store.record_runner_event(
@@ -1147,6 +1149,7 @@ class SaladStageDriver:
                             "delegation_id": row["delegation_id"],
                             "terms_digest": row["terms_digest"],
                             "kinds": row["covered_kinds"],
+                            **({"profiles": row["profiles"]} if "profiles" in row else {}),
                             "max_attempt_cents": row["max_attempt_cents"],
                             "max_total_cents": row["max_total_cents"],
                             "expires_at": row["expires_at"],
@@ -1155,6 +1158,25 @@ class SaladStageDriver:
         if row is None:
             self._declined(ctx, key, None, "delegated_review", delegation_id, ",".join(reasons))
         return row
+
+    def _alternate_profile_digests(
+        self, ctx: _Ctx, key: str, placed: str | None
+    ) -> list[dict[str, str]] | None:
+        """The plan digest of each profile the approved spec lists after the candidate's own
+        (ADR 0151), derived as the approve-body preview does, the own profile first; None for
+        a candidate that lists none. A failure to derive them propagates to the caller's
+        preview guard: nothing is recorded then."""
+        stage = ctx.spec.stage(key)
+        if placed is not None:
+            stage = stage_on_candidate(stage, placed)
+        found = campaign_preapproval.alternate_profile_digests(
+            self, ctx.campaign, ctx.spec, stage
+        ).get("alternate_profiles")
+        if not found:
+            return None
+        from .salad_alternate_profiles import covered_profiles
+
+        return [{"profile": covered_profiles(stage)[0], "plan_digest": ""}, *found]
 
     def _placed_alternate(self, ctx: _Ctx, key: str) -> str | None:
         """The Salad alternate the stage was placed on (ADR 0060/0066), else None for the stage's

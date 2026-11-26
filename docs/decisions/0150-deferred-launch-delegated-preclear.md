@@ -157,3 +157,17 @@ The owner's decision: an agent, not the owner, should resolve these so nobody wa
    plus the refusal's closed detail code when it has one, never its message.
 
 Tests: `tests/test_owner_bound_review_delegation.py`, `tests/test_delegated_review_placed_alternate.py`.
+
+## Amendment (2026-11-25): a delegated pre-approval covers every profile the spec lists
+
+A stage that lists `alternate_profiles` (ADR 0151) is covered by a pre-approval only per
+profile, so a delegation-written pre-approval that recorded no per-profile digests covered no
+profile at all, the primary included, and every plan/source-use review declined
+`wrong_profile`. The delegation now records, on its `campaign.review_preapproval_delegated`
+event, a `profiles` list: the candidate's own profile bound to the row's `plan_digest`, then
+each other listed profile with the plan digest the driver derives for the stage on that
+profile (the same derivation as the approve-body preview). `recorded_profiles` reads that
+event when no approve event holds the row. A kind the delegation does not cover binds the
+uncovered digest for every profile. A profile the approved spec does not list still declines
+`wrong_profile`; digest, expiry and cent checks are unchanged. Pre-approvals already recorded
+without `profiles` are not rewritten.
