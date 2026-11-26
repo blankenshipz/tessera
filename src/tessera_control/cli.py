@@ -479,10 +479,11 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
             transport.identity = identity
         action = arguments.campaign_action
         key = getattr(arguments, "idempotency_key", None)
+        if action == "reconcile-completion-cancels":
+            # Its --campaign-id is a repeatable list; it quotes each id itself.
+            return _reconcile_completion_cancels(arguments, transport, key)
         project = quote(getattr(arguments, "project_id", "") or "", safe="")
         campaign = quote(getattr(arguments, "campaign_id", "") or "", safe="")
-        if action == "reconcile-completion-cancels":
-            return _reconcile_completion_cancels(arguments, transport, key)
         if action == "standing":
             call = _standing_call(arguments, project, key)
         elif action == "submit":

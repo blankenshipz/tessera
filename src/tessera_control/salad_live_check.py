@@ -1291,8 +1291,10 @@ RUNNING_PROVIDER_STATUS = "running"
 # the control database, a bounded local call that ran out) or a timed-out read is not a reason
 # for this driver to stop it: the guardian keeps its own deadline, budget and silence authority,
 # and stops the group itself. The driver skips the beat or read and tries again at the next
-# interval, inside the run deadline and poll bound. Outside "running" (pre-start, unknown)
-# the earlier bounds apply unchanged.
+# interval, inside the run deadline and poll bound. That holds past the guardian's silence
+# bound too: a keepalive whose control write (or guardian beat) stalled on a running route with
+# no guardian stop cause is a control stall, never a silence_bound cancel. Outside "running"
+# (pre-start, unknown) or once the guardian recorded a stop cause the earlier bounds apply.
 MAX_TRANSIENT_CONTROL_STALLS = 3
 # Bounded local wall time of one observe dispatch, so a slow read cannot keep the next
 # guardian heartbeat past its silence bound (other dispatches keep the 45 s bound).
@@ -1373,7 +1375,8 @@ def _is_read_stall(error):
 # other Forbidden (a generic "Unauthorized", an empty or unreadable detail, "Authenticated
 # exact Salad route required.") or any Forbidden while control's readiness probe fails is a
 # transient control stall: it takes the stall path above (skip to the next interval; a
-# keepalive that kept the beat from the guardian is tolerated only inside the silence bound).
+# keepalive that kept the beat from the guardian is tolerated past the silence bound only while
+# control is unready and the guardian has recorded no stop cause, else inside that bound).
 # The guardian keeps its own deadline, budget, silence and stop authority meanwhile.
 # Every refusal (Forbidden, 401/403, a store Conflict) leaves bounded evidence on the receipt:
 # the driver step, the control call, the HTTP status when there was one and the detail.
@@ -1777,7 +1780,11 @@ def _drive(
                 # refusal while running). When the guardian still took its beat, only the lease
                 # renewal was skipped: tolerated while the route runs (the next beat re-runs
                 # authority), else a few times in a row. Without a delivered beat it is
-                # tolerated only inside the silence bound.
+                # tolerated only inside the silence bound, except on a route last read
+                # running with no guardian stop cause: a control stall is never grounds for
+                # this driver to stop that route, however long it lasts. The guardian keeps
+                # its own silence, deadline and budget authority and stops the group itself;
+                # the run deadline still ends this loop. The beat is retried next interval.
                 if not refused_stall:
                     receipt["control_stalls"] += 1
                 beats["stalls"] += 1
@@ -1786,8 +1793,16 @@ def _drive(
                     beats["ok_at"], beats["transient"] = started, 0
                 silent = clock() - beats["ok_at"] + interval
                 quiet = silent <= GUARDIAN_SILENCE_SECONDS - GUARDIAN_SILENCE_MARGIN_SECONDS
-                if (delivered or quiet) and (
-                    running() or beats["stalls"] <= MAX_TRANSIENT_CONTROL_STALLS
+                # Held: a lock / bounded-call stall, or a refusal while control is unready (an
+                # unverified refusal from a ready control keeps the silence bound).
+                held = (
+                    running()
+                    and receipt["guardian_stop_cause"] is None
+                    and (not refused_stall or refused["control_readiness"] not in {None, "ready"})
+                )
+                if held or (
+                    (delivered or quiet)
+                    and (running() or beats["stalls"] <= MAX_TRANSIENT_CONTROL_STALLS)
                 ):
                     if refused_stall:
                         skip_refusal(refused)

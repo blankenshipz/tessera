@@ -205,17 +205,87 @@ def test_heartbeat_stop_only_on_a_running_route_is_recorded_not_a_preemption():
     assert receipt["reason"] != PRECUSTODY_REALLOCATION
 
 
-def test_heartbeat_silence_on_a_blocked_control_is_recorded_as_silence_bound():
-    # Control is write-locked and the guardian beat cannot go out either: tolerated only while
-    # the next beat still lands inside the silence bound, then cancelled with that reason.
-    locked = [None] + [sqlite3.OperationalError("database is locked") for _ in range(10)]
-    session = RunningSession(beat_errors=locked)
+def locked():
+    return sqlite3.OperationalError("database is locked")
+
+
+def test_a_locked_control_past_the_silence_bound_never_cancels_a_running_route():
+    # The incident shape: control is write-locked and neither the renewal nor the guardian
+    # beat can go out for ten beats (well past the 30 s silence bound) while the group reads
+    # running and the guardian has recorded no stop cause. That is a control stall, never a
+    # silence_bound cancel: the beat is retried and the run completes once control is back.
+    session = RunningSession(retain_after=12, beat_errors=[None] + [locked() for _ in range(10)])
+    receipt = drive(session)
+    assert receipt["status"] == "passed", receipt
+    assert receipt["cancel_cause"]["class"] == "execution_complete"
+    assert receipt["control_stalls"] == 10
+    assert receipt["guardian_refusal"] is None
+    assert not receipt["reason"].startswith(RUNNING_CANCEL_PREFIX)
+    # Every stalled beat was retried at the next interval.
+    assert session.keepalives >= 12
+
+
+@pytest.mark.parametrize(
+    "error",
+    [locked, lambda: TimeoutError("bounded live operation expired"), lambda: ControlStall(False)],
+)
+def test_a_control_stall_that_outlasts_the_run_ends_at_the_deadline_not_silence(error):
+    # Control never recovers: the driver still does not stop the running group for silence;
+    # only the run deadline ends the loop, and that cancel is a deadline cancel.
+    session = RunningSession(beat_errors=[None] + [error() for _ in range(200)])
+    receipt = drive(session, max_polls=40, max_seconds=100)
+    cause = receipt["cancel_cause"]
+    assert cause["class"] == "deadline", cause
+    assert cause["last_provider_status"] == "running"
+    assert cause["heartbeat_silent_seconds"] > 30
+    assert receipt["control_stalls"] >= 8
+    assert not receipt["reason"].startswith(RUNNING_CANCEL_PREFIX)
+
+
+def test_a_locked_control_with_a_guardian_stop_cause_keeps_the_silence_bound():
+    # Once the guardian recorded its own stop cause the hold no longer applies: the earlier
+    # silence bound ends the run, and the cancel keeps the guardian's word.
+    session = RunningSession(beat_errors=[None] + [locked() for _ in range(10)])
+    session.stop_cause = "missed_poll"
+    receipt = drive(session)
+    assert cancelled_before_output(session)
+    assert receipt["guardian_stop_cause"] == "missed_poll"
+    assert receipt["cancel_cause"]["class"] == "guardian_stop_cause"
+    assert receipt["cancel_cause"]["exception"] == "OperationalError"
+    assert not receipt["reason"].startswith(RUNNING_CANCEL_PREFIX)
+
+
+class DeployingSession(RunningSession):
+    """After start the group never reads running (still deploying)."""
+
+    def dispatch(self, route, action):
+        state = super().dispatch(route, action)
+        if action == "observe" and state.get("provider_status") == "running":
+            return dict(state, provider_status="deploying")
+        return state
+
+
+def test_a_locked_control_before_running_is_still_a_silence_bound_cancel():
+    # Not last read running: a blocked beat is tolerated only inside the silence bound.
+    session = DeployingSession(beat_errors=[None] + [locked() for _ in range(40)])
+    receipt = drive(session)
+    assert cancelled_before_output(session)
+    cause = receipt["cancel_cause"]
+    assert cause["class"] == "silence_bound"
+    assert cause["exception"] == "OperationalError"
+    assert cause["last_provider_status"] == "deploying"
+    assert cause["heartbeat_silent_seconds"] >= 10
+    assert receipt["control_stalls"] >= 1
+
+
+def test_a_transient_guardian_refusal_past_the_bound_is_still_silence_bound():
+    # A guardian that answered (loop unready) is not a control stall: its bound is unchanged.
+    refusals = [None] + [GuardianRefused("guardian_loop_unready") for _ in range(10)]
+    session = RunningSession(beat_errors=refusals)
     receipt = drive(session)
     assert cancelled_before_output(session)
     assert receipt["cancel_cause"]["class"] == "silence_bound"
-    assert receipt["cancel_cause"]["heartbeat_silent_seconds"] >= 10
     assert receipt["reason"] == RUNNING_CANCEL_PREFIX + "silence_bound"
-    assert receipt["control_stalls"] >= 1
 
 
 def test_a_guardian_stop_cause_keeps_the_guardians_word():

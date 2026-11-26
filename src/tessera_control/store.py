@@ -88,12 +88,24 @@ def _database_path(state_dir: Path) -> Path:
     return state_dir / DATABASE_NAME
 
 
+# How long an official control connection waits out another writer's lock before raising
+# "database is locked". A transient control write lock has been observed to last about 30 s
+# (a runner tick or campaign cancel holding the rollback journal), so 10 s turned it into
+# failed heartbeats and readiness errors. The database stays in rollback-journal mode: official
+# backup/restore (recovery.py) normalizes snapshots to journal_mode=DELETE and rejects -wal/-shm
+# sidecars, so WAL is not used. Intentionally non-blocking paths (compaction, recovery probes)
+# keep their own busy_timeout=0 and are not affected.
+CONTROL_BUSY_TIMEOUT_SECONDS = 45
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     require_sqlite_runtime()
-    connection = sqlite3.connect(database_path, timeout=10, isolation_level=None)
+    connection = sqlite3.connect(
+        database_path, timeout=CONTROL_BUSY_TIMEOUT_SECONDS, isolation_level=None
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 10000")
+    connection.execute(f"PRAGMA busy_timeout = {CONTROL_BUSY_TIMEOUT_SECONDS * 1000}")
     return connection
 
 

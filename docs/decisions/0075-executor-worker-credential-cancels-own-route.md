@@ -85,6 +85,21 @@ issue, and in a shared executor project it reaches every route in the project.
   `Unauthorized`; a lock stays an `OperationalError`. A timed-out licence-label read stays a
   `TimeoutError`, not a `Forbidden`.
 
+## Amendment: a control stall past the silence bound on a running route
+
+- While the last post-start observe read `running` and the guardian has recorded no stop
+  cause, a keepalive that a control stall keeps from the guardian (a control database lock,
+  a bounded local call that ran out, or a refusal while control is unready) is never a
+  `silence_bound` cancel, however long it lasts: it is counted in `control_stalls` and the
+  beat is retried at the next interval. The guardian keeps its own heartbeat-silence,
+  deadline and budget stops, and the run deadline still ends the loop. Before `running`, once
+  the guardian recorded a stop cause, for an unverified refusal from a ready control and for a
+  transient guardian refusal, the silence bound is unchanged.
+- The official control connection waits up to 45 s for a lock (`busy_timeout`, was 10 s).
+  The journal mode stays `DELETE`: official backup/restore normalizes snapshots to it and
+  rejects `-wal`/`-shm` sidecars, so WAL is not used. Non-blocking compaction and recovery
+  connections keep `busy_timeout=0`.
+
 ## Amendment: the completion stop is not an execution cancellation
 
 - The live check's own cancel after a verified pass fences the grant and its operation
