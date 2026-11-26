@@ -46,3 +46,19 @@ issue, and in a shared executor project it reaches every route in the project.
 - Human `cancel`, `pause` and every approval path are unchanged and still need a human.
 - Not done: a separate cancel-only credential kind. The worker's own-route scope already
   gives least privilege without a migration.
+
+## Amendment: when the live check cancels, and a cancel that is not recorded
+
+- The live check does not cancel a route whose last post-start observe read `running` for a
+  control stall (a control database write lock, a bounded local call that ran out) or a
+  transient read failure; it retries at the next interval inside the run deadline and poll
+  bound. The guardian keeps its own deadline, budget and heartbeat-silence stops. A lease
+  renewal that stalls does not hold back the guardian heartbeat, which re-runs use-time
+  authority.
+- Every cancel records a closed `cancel_cause` on the receipt; a cancel of a running route
+  for any reason other than completion, the guardian's recorded stop cause, the deadline or
+  the budget has the reason `running_route_cancelled_<class>`.
+- When `worker_cancel` is not recorded, the guardian cancel is still sent, the receipt
+  records `cancel_recorded: false`, `cancel_failure` and the reason `cancel_unrecorded`, and
+  the run never passes. The executor holds the outcome, for a bounded time, until the
+  guardian's confirmed stop of the exact group is reported (ADR 0160).

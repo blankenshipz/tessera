@@ -466,7 +466,9 @@ class SaladLiveSession:
                 > execution["max_cost_cents"]
             ):
                 raise ValueError("unknown exposure blocks new work")
-        with _wall_bound(45):
+        # An observe is a read: its tighter bound keeps the next heartbeat inside the
+        # guardian's silence bound (a timeout is a skippable read stall in the driver).
+        with _wall_bound(OBSERVE_WALL_SECONDS if action == "observe" else DISPATCH_WALL_SECONDS):
             return self.dispatcher.dispatch(route, action)
 
     def keepalive(self, route):
@@ -482,20 +484,36 @@ class SaladLiveSession:
 
         state = self.state(route)
         proposal = state["proposal"]
-        # Registry liveness first: a worker unseen for 60s is "disconnected" and
-        # can no longer renew lease authority.
-        self._registry_heartbeat()
-        payload = {"lease_id": proposal["lease_id"], "expected_epoch": proposal["epoch"]}
-        with _wall_bound(5):
-            self.server.store.renew_execution_lease(
-                self.server.worker,
-                proposal["lease_id"],
-                "salad-live-renew-" + uuid.uuid4().hex,
-                canonical_digest(payload),
-                proposal["epoch"],
-            )
-        with _wall_bound(15):
-            self.server.heartbeat(route)
+        stalled = None
+        try:
+            # Registry liveness first: a worker unseen for 60s is "disconnected" and
+            # can no longer renew lease authority.
+            self._registry_heartbeat()
+            payload = {"lease_id": proposal["lease_id"], "expected_epoch": proposal["epoch"]}
+            with _wall_bound(5):
+                self.server.store.renew_execution_lease(
+                    self.server.worker,
+                    proposal["lease_id"],
+                    "salad-live-renew-" + uuid.uuid4().hex,
+                    canonical_digest(payload),
+                    proposal["epoch"],
+                )
+        except Exception as error:
+            if not _is_stall(error):
+                raise
+            # A control write lock (another campaign's cancel, a runner tick) must not
+            # silence the guardian: its heartbeat still goes out below and re-runs use-time
+            # authority (lease included), so nothing is skipped but this one renewal.
+            stalled = error
+        try:
+            with _wall_bound(15):
+                self.server.heartbeat(route)
+        except Exception as error:
+            if stalled is None or not _is_stall(error):
+                raise
+            raise ControlStall(beat_delivered=False) from stalled
+        if stalled is not None:
+            raise ControlStall(beat_delivered=True) from stalled
 
     def _registry_heartbeat(self):
         import uuid
@@ -594,18 +612,35 @@ class SaladLiveSession:
 
     def cancel(self, route):
         state = self.state(route)
+        unrecorded = None
         if state["desired"] != "stop":
             # The executor's own worker credential (reduce-only, own route): no human
             # session credential exists for this path.
-            self.server.store.worker_cancel(
-                self.server.worker,
-                route,
-                "salad-live-cancel-" + route,
-                expected_revision=state["revision"],
-                proposal_digest=state["proposal_digest"],
-            )
-        with _wall_bound(15):
-            self.server.safety.cancel(self.state(route))
+            try:
+                self.server.store.worker_cancel(
+                    self.server.worker,
+                    route,
+                    "salad-live-cancel-" + route,
+                    expected_revision=state["revision"],
+                    proposal_digest=state["proposal_digest"],
+                )
+            except Exception as error:
+                unrecorded = error
+        if unrecorded is None:
+            with _wall_bound(15):
+                self.server.safety.cancel(self.state(route))
+            return
+        # Control did not record the cancel (e.g. a write lock). The guardian's own cancel
+        # (reduce-only: it fences the reservation and stops the exact group) still goes out,
+        # so no group is left running on a refused control write; the failure stays visible.
+        sent = False
+        try:
+            with _wall_bound(15):
+                self.server.safety.cancel(state)
+            sent = True
+        except Exception:
+            pass
+        raise CancelUnrecorded(guardian_cancel_sent=sent) from unrecorded
 
     def evidence(self, route):
         state = self.state(route)
@@ -1135,7 +1170,8 @@ PRESTART_PROVIDER_STATUSES = frozenset({"unknown", "pending", "deploying"})
 # rate_unknown is terminal here: on the heartbeat path the guardian raises it only
 # after fencing the reservation (recovery=1, provider cancel), so it is never "not
 # fenced". Non-guardian keepalive failures (registry, lease renewal, use-time
-# authority) are terminal as before.
+# authority) are terminal as before, except a control stall (a write lock, a bounded local
+# call that ran out): see RUNNING_PROVIDER_STATUS below.
 # A transient refusal is retried at the next interval only while the next beat can
 # still land inside the silence bound with a margin, and at most
 # MAX_TRANSIENT_GUARDIAN_REFUSALS times in a row.
@@ -1203,6 +1239,91 @@ def _guardian_code(error):
     return guardian_refusal_code(error)
 
 
+# --- a still-running route is not cancelled for a stall ----------------------------------------
+# The provider status a post-start observe reports for a group whose instance is running.
+RUNNING_PROVIDER_STATUS = "running"
+# While the last post-start observe read the group running, a control stall (a write lock on
+# the control database, a bounded local call that ran out) or a timed-out read is not a reason
+# for this driver to stop it: the guardian keeps its own deadline, budget and silence authority,
+# and stops the group itself. The driver skips the beat or read and tries again at the next
+# interval, inside the run deadline and poll bound. Outside "running" (pre-start, unknown)
+# the earlier bounds apply unchanged.
+MAX_TRANSIENT_CONTROL_STALLS = 3
+# Bounded local wall time of one observe dispatch, so a slow read cannot keep the next
+# guardian heartbeat past its silence bound (other dispatches keep the 45 s bound).
+OBSERVE_WALL_SECONDS = 25
+DISPATCH_WALL_SECONDS = 45
+# A session.cancel that fails on a control stall is retried this many times in all, with a short
+# pause; the guardian cancel is sent even when the control write fails (SaladLiveSession.cancel).
+CANCEL_ATTEMPTS = 3
+CANCEL_RETRY_SECONDS = 2
+# Receipt reason when the reduce-only cancel was never recorded at control: visible, never
+# folded into custody_stop_or_reconnect_unresolved.
+CANCEL_UNRECORDED_REASON = "cancel_unrecorded"
+# Receipt reason prefix when this driver cancelled a route whose last post-start observe read
+# "running": the suffix is the closed cancel class (never a provider move or preemption).
+RUNNING_CANCEL_PREFIX = "running_route_cancelled_"
+# Closed classes of the receipt's ``cancel_cause`` (why this driver sent its cancel).
+CANCEL_CAUSE_CLASSES = frozenset(
+    {
+        "execution_complete",  # output retained (or the guardian's own recorded end)
+        "guardian_stop_cause",  # the guardian recorded why it stopped the group
+        "deadline",  # the run deadline passed
+        "budget",  # a budget / rate refusal from the guardian
+        "guardian_refusal",  # any other terminal guardian heartbeat refusal
+        "silence_bound",  # no heartbeat reached the guardian within its silence bound
+        "guardian_unavailable",  # the guardian did not answer
+        "control_stall",  # control writes stalled past their bound before the route ran
+        "observe_timeout",  # the observe read failed past its bound
+        "control_refused",  # control refused (use-time authority, lease, route revision)
+        "prestart",  # a pre-start step failed (see prestart_failure)
+        "poll_bound",  # the poll bound ran out with no output
+        "output_unavailable",  # the loop ended with no retained output
+        "error",  # anything else (exception class name only)
+    }
+)
+
+
+class ControlStall(Exception):
+    """A keepalive's control write (worker registry, lease renewal) stalled.
+
+    ``beat_delivered`` says whether the guardian heartbeat was still sent after it."""
+
+    def __init__(self, beat_delivered):
+        super().__init__("control stall")
+        self.beat_delivered = beat_delivered
+
+
+class CancelUnrecorded(Exception):
+    """The reduce-only cancel was not recorded at control; ``guardian_cancel_sent`` says
+    whether the guardian's own cancel (which stops the provider group) still went out."""
+
+    def __init__(self, guardian_cancel_sent):
+        super().__init__("cancel unrecorded")
+        self.guardian_cancel_sent = guardian_cancel_sent
+
+
+def _is_stall(error):
+    """A control write lock, a local bounded call that ran out, or a control stall."""
+    import sqlite3
+
+    return isinstance(error, (sqlite3.OperationalError, TimeoutError, ControlStall))
+
+
+def _is_read_stall(error):
+    """A stall, or a fresh provider read that failed transiently (not deterministically)."""
+    from .salad_guardian import is_deterministic_read_failure
+    from .salad_server import ProviderReadUnavailable
+
+    if isinstance(error, ProviderReadUnavailable):
+        return not is_deterministic_read_failure(error)
+    return _is_stall(error)
+
+
+def _budget_code(code):
+    return type(code) is str and (code.startswith("budget_") or code == "rate_unknown")
+
+
 def _drive(
     session,
     *,
@@ -1246,6 +1367,18 @@ def _drive(
         # (ADR 0075); True once the route state recorded it, False if it was refused.
         "cancel_authority": "executor_worker",
         "cancel_recorded": None,
+        # Why this driver sent its cancel: {"class": one of CANCEL_CAUSE_CLASSES, "exception":
+        # the ending error's class name or None, "guardian_refusal": closed code or None,
+        # "last_provider_status": the last post-start observe's status or None,
+        # "heartbeat_silent_seconds": seconds since the last heartbeat the guardian took}.
+        "cancel_cause": None,
+        # Set only when the cancel failed: {"exception", "attempts", "guardian_cancel_sent"}.
+        "cancel_failure": None,
+        # Keepalives whose control writes stalled (write lock, bounded call ran out); the
+        # guardian heartbeat is still sent when it can be.
+        "control_stalls": 0,
+        # The provider status of the last post-start observe (closed token), or None.
+        "last_provider_status": None,
         # ADR 0039: the delivered input's recorded class (None when nothing is
         # delivered or the session cannot read it); outputs are always private_derived.
         "input_data_class": None,
@@ -1357,8 +1490,57 @@ def _drive(
                 heartbeat()
                 sleep(min(START_PREFLIGHT_BACKOFF_SECONDS[attempt], max(0, deadline - clock())))
 
-    beats = {"ok_at": None, "transient": 0}
+    beats = {"ok_at": None, "transient": 0, "stalls": 0}
     observes = {"failed": 0}
+    # The class a bounded helper gave up with (heartbeat, observe), read by the cancel cause.
+    ended = {"class": None}
+
+    def running():
+        return receipt["last_provider_status"] == RUNNING_PROVIDER_STATUS
+
+    failure = {"error": None}
+
+    def cancel_cause(error):
+        """The closed reason this driver sends its cancel (receipt ``cancel_cause``)."""
+        from .salad_server import ProviderReadUnavailable
+        from .store import Conflict, Forbidden
+
+        refusal = receipt["guardian_refusal"]
+        code = refusal["code"] if refusal else (None if error is None else _guardian_code(error))
+        if execution_complete or _final_reason(receipt["reason"]):
+            kind = "execution_complete" if execution_complete else "guardian_stop_cause"
+        elif receipt["guardian_stop_cause"] is not None:
+            kind = "guardian_stop_cause"
+        elif clock() >= deadline:
+            kind = "deadline"
+        elif _budget_code(code):
+            kind = "budget"
+        elif ended["class"] is not None:
+            kind = ended["class"]
+        elif code == "unavailable":
+            kind = "guardian_unavailable"
+        elif code is not None:
+            kind = "guardian_refusal"
+        elif step["name"] is not None or receipt["create_rejection"] is not None:
+            kind = "prestart"
+        elif isinstance(error, (Conflict, Forbidden)) and not isinstance(
+            error, ProviderReadUnavailable
+        ):
+            kind = "control_refused"
+        else:
+            kind = "error"
+        try:
+            silent = None if beats["ok_at"] is None else round(max(0, clock() - beats["ok_at"]), 1)
+        except Exception:
+            silent = None
+        return {
+            "class": kind,
+            "exception": None if error is None else _exception_type_name(error),
+            "guardian_refusal": _closed_token(code),
+            "last_provider_status": receipt["last_provider_status"],
+            "heartbeat_silent_seconds": silent,
+        }
+
     evidence = {"output_retained": False}
     # Successful observe-and-evidence passes; read only by the optional watch snapshot.
     watch = {"polls": 0}
@@ -1367,17 +1549,32 @@ def _drive(
         watch["polls"] += 1
         _observe_watch(watch_signals_file, state=polled, evidence=proof, polls=watch["polls"])
 
-    def observe():
-        """dispatch("observe"), or None after a bounded transient provider read failure."""
+    def skip_read(error):
+        """True when a failed post-start read may be skipped to the next interval.
+
+        A provider read failure or a stall is skipped at most MAX_TRANSIENT_OBSERVE_FAILURES - 1
+        times in a row; while the route last read running, a transient one (timeout, control
+        stall, non-deterministic read failure) is skipped without that bound: the guardian,
+        not this driver, decides to stop a running group."""
         from .salad_server import ProviderReadUnavailable
 
+        if not isinstance(error, ProviderReadUnavailable) and not _is_stall(error):
+            return False
+        if not (running() and _is_read_stall(error)):
+            if observes["failed"] >= MAX_TRANSIENT_OBSERVE_FAILURES - 1:
+                ended["class"] = "observe_timeout"
+                return False
+        observes["failed"] += 1
+        receipt["observe_transient_failures"] += 1
+        return True
+
+    def observe():
+        """dispatch("observe"), or None after a skippable read failure (skip_read)."""
         try:
             observed = dispatch("observe")
-        except ProviderReadUnavailable:
-            if observes["failed"] >= MAX_TRANSIENT_OBSERVE_FAILURES - 1:
+        except Exception as error:
+            if not skip_read(error):
                 raise
-            observes["failed"] += 1
-            receipt["observe_transient_failures"] += 1
             return None
         observes["failed"] = 0
         return observed
@@ -1391,7 +1588,24 @@ def _drive(
         except Exception as error:
             code = _guardian_code(error)
             cause = "terminal_code"
-            if code in TRANSIENT_GUARDIAN_CODES:
+            if code is None and _is_stall(error):
+                # A control stall (write lock, bounded local call ran out). When the guardian
+                # still took its beat, only the lease renewal was skipped: tolerated while the
+                # route runs (the next beat re-runs authority), else a few times in a row.
+                # Without a delivered beat it is tolerated only inside the silence bound.
+                receipt["control_stalls"] += 1
+                beats["stalls"] += 1
+                delivered = isinstance(error, ControlStall) and error.beat_delivered
+                if delivered:
+                    beats["ok_at"], beats["transient"] = started, 0
+                silent = clock() - beats["ok_at"] + interval
+                quiet = silent <= GUARDIAN_SILENCE_SECONDS - GUARDIAN_SILENCE_MARGIN_SECONDS
+                if (delivered or quiet) and (
+                    running() or beats["stalls"] <= MAX_TRANSIENT_CONTROL_STALLS
+                ):
+                    return
+                ended["class"] = "control_stall" if delivered or quiet else "silence_bound"
+            elif code in TRANSIENT_GUARDIAN_CODES:
                 # The next beat starts about one interval from now; it must still
                 # reach the guardian well inside its silence bound.
                 silent = clock() - beats["ok_at"] + interval
@@ -1403,6 +1617,7 @@ def _drive(
                     receipt["guardian_transient_refusals"] += 1
                     return
                 cause = "silence_bound"
+                ended["class"] = "silence_bound"
             # Once the approved output is retained the guardian stops the
             # group and closes writers, so it refuses further heartbeats.
             # That is completion; any other refusal is still a failure.
@@ -1411,7 +1626,7 @@ def _drive(
                     receipt["guardian_refusal"] = {"code": code, "cause": cause}
                 raise
             return
-        beats["ok_at"], beats["transient"] = started, 0
+        beats["ok_at"], beats["transient"], beats["stalls"] = started, 0, 0
 
     def note_settle(call, error, attempts, elapsed=0.0):
         reason, status_class, transient = _settle_read_failure(error)
@@ -1578,12 +1793,23 @@ def _drive(
                 break
             if launched:
                 heartbeat()
+            began = clock()
             observed = observe()
             if observed is None:
                 sleep(min(interval, max(0, deadline - clock())))
                 continue
             state = observed
-            evidence = session.evidence(route_id)
+            receipt["last_provider_status"] = _closed_token(state.get("provider_status"))
+            try:
+                polled = session.evidence(route_id)
+            except Exception as error:
+                # The guardian status read is a read too: a stall skips this pass like a
+                # failed observe (a dead guardian still ends the run at the next heartbeat).
+                if not skip_read(error):
+                    raise
+                sleep(min(interval, max(0, deadline - clock())))
+                continue
+            evidence = polled
             watch_poll(state, evidence)
             receipt["financial"] = _financial(evidence.get("financial", {}))
             receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
@@ -1628,8 +1854,9 @@ def _drive(
             if evidence["output_retained"]:
                 break
             # Spread polls over the approved window; stay well inside the guardian's
-            # 30s heartbeat staleness bound so a live run is not stopped for silence.
-            sleep(min(interval, max(0, deadline - clock())))
+            # 30s heartbeat staleness bound so a live run is not stopped for silence. A slow
+            # observe or evidence read spends part of the interval, so only the rest is slept.
+            sleep(min(max(0, interval - (clock() - began)), max(0, deadline - clock())))
             if state["provider_status"] in PRESTART_PROVIDER_STATUSES:
                 # Stretch only the observe cadence: keep heartbeating at the normal
                 # interval until the backed-off observe is due.
@@ -1641,11 +1868,14 @@ def _drive(
                     sleep(min(slice_seconds, max(0, deadline - clock())))
                     waited += slice_seconds
         else:
+            ended["class"] = "poll_bound"
             raise ValueError("poll bound")
         if clock() >= deadline or not evidence["output_retained"]:
+            ended["class"] = ended["class"] or "output_unavailable"
             raise ValueError("output unavailable")
         execution_complete = True
     except Exception as error:
+        failure["error"] = error
         if not _final_reason(receipt["reason"]):
             receipt["reason"] = "execution_or_output_unresolved"
         if step["name"] is not None and receipt["create_rejection"] is None:
@@ -1653,11 +1883,31 @@ def _drive(
     finally:
         # Even a failed dispatch/preflight or existing uncertain group gets one
         # exact stop attempt. Never delete, choose a new target, or retry stop.
-        try:
-            session.cancel(route_id)
-            receipt["cancel_recorded"] = True
-        except Exception:
-            receipt["cancel_recorded"] = False
+        # Why it is sent is recorded first, as a closed class (never exception text).
+        receipt["cancel_cause"] = cancel_cause(failure["error"])
+        for attempt in range(1, CANCEL_ATTEMPTS + 1):
+            try:
+                session.cancel(route_id)
+                receipt["cancel_recorded"] = True
+                receipt["cancel_failure"] = None
+                break
+            except Exception as error:
+                receipt["cancel_recorded"] = False
+                root = error
+                if isinstance(error, CancelUnrecorded) and error.__cause__ is not None:
+                    root = error.__cause__
+                receipt["cancel_failure"] = {
+                    "exception": _exception_type_name(root),
+                    "attempts": attempt,
+                    "guardian_cancel_sent": getattr(error, "guardian_cancel_sent", None),
+                }
+                # Only a control stall is retried (the same idempotent cancel); a refusal
+                # is final. The failure stays on the receipt and in its reason either way.
+                if attempt == CANCEL_ATTEMPTS or not _is_stall(root):
+                    break
+                sleep(CANCEL_RETRY_SECONDS)
+        if receipt["cancel_recorded"] is False and not _final_reason(receipt["reason"]):
+            receipt["reason"] = CANCEL_UNRECORDED_REASON
         # Completion, failure and cancel alike: drop the guardian's ticket and revoke it at
         # control. Best effort; the ticket's own expiry (at most an hour) bounds a failure.
         try:
@@ -1670,9 +1920,24 @@ def _drive(
                 dispatch("stop")
             # One exact stop/reconciliation may extend past the scheduling deadline.
             stop_deadline = max(deadline, clock() + STOP_CONFIRM_SECONDS)
+            stop_read_failures = 0
             for _ in range(max_polls):
-                state = dispatch("observe")
-                evidence = session.evidence(route_id)
+                try:
+                    state = dispatch("observe")
+                    evidence = session.evidence(route_id)
+                except Exception as error:
+                    # A stalled read while confirming the stop is retried a bounded number
+                    # of times in a row; anything else (or the last) leaves it unresolved.
+                    stop_read_failures += 1
+                    if (
+                        not _is_read_stall(error)
+                        or stop_read_failures >= MAX_TRANSIENT_OBSERVE_FAILURES
+                        or clock() >= stop_deadline
+                    ):
+                        raise
+                    sleep(min(interval, max(0, stop_deadline - clock())))
+                    continue
+                stop_read_failures = 0
                 watch_poll(state, evidence)
                 receipt["financial"] = _financial(evidence.get("financial", {}))
                 receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
@@ -1705,11 +1970,16 @@ def _drive(
                     break
                 if evidence.get("provider_stop_confirmed"):
                     # Spend closed but custody can never seal: waiting cannot help.
-                    if not _final_reason(receipt["reason"]):
+                    precustody = (
+                        receipt["guardian_stop_cause"] == "allocation_changed"
+                        and receipt["custody_work_begun"] is False
+                    )
+                    if not _final_reason(receipt["reason"]) and (
+                        precustody or receipt["reason"] != CANCEL_UNRECORDED_REASON
+                    ):
                         receipt["reason"] = (
                             PRECUSTODY_REALLOCATION
-                            if receipt["guardian_stop_cause"] == "allocation_changed"
-                            and receipt["custody_work_begun"] is False
+                            if precustody
                             else "provider_stopped_custody_unsealed"
                         )
                     break
@@ -1717,10 +1987,17 @@ def _drive(
                     break
                 sleep(min(interval, max(0, stop_deadline - clock())))
         except Exception:
-            if not _final_reason(receipt["reason"]):
+            if not _final_reason(receipt["reason"]) and (
+                receipt["reason"] != CANCEL_UNRECORDED_REASON
+            ):
                 receipt["reason"] = "stop_unresolved"
     try:
-        if not execution_complete or not receipt["stop_confirmed"]:
+        # A cancel control never recorded is not a settled stop, whatever else was seen.
+        if (
+            not execution_complete
+            or not receipt["stop_confirmed"]
+            or receipt["cancel_recorded"] is not True
+        ):
             raise ValueError("stop unresolved")
         evidence = session.evidence(route_id)
         receipt["financial"] = _financial(evidence.get("financial", {}))
@@ -1798,12 +2075,31 @@ def _drive(
                 if receipt["create_rejection"].get("status") == 0
                 else "provider_rejected_request"
             )
-        elif not _final_reason(receipt["reason"]) and receipt["reason"] not in {
-            "provider_stopped_custody_unsealed",
+        elif _final_reason(receipt["reason"]) or receipt["reason"] in {
             PRECUSTODY_REALLOCATION,
+            CANCEL_UNRECORDED_REASON,
         }:
+            pass
+        elif _running_cancel(receipt):
+            # This driver cancelled a route whose last post-start observe read running, and the
+            # guardian recorded no stop of its own: say why, never as a provider move.
+            receipt["reason"] = RUNNING_CANCEL_PREFIX + receipt["cancel_cause"]["class"]
+        elif receipt["reason"] != "provider_stopped_custody_unsealed":
             receipt["reason"] = "custody_stop_or_reconnect_unresolved"
     return receipt
+
+
+def _running_cancel(receipt):
+    """True when the driver's own cancel ended a route whose last observe read running, for a
+    reason other than completion, the guardian's recorded stop, the deadline or the budget."""
+    cause = receipt.get("cancel_cause")
+    return (
+        type(cause) is dict
+        and cause.get("last_provider_status") == RUNNING_PROVIDER_STATUS
+        and cause.get("class")
+        not in {"execution_complete", "guardian_stop_cause", "deadline", "budget"}
+        and receipt.get("guardian_stop_cause") is None
+    )
 
 
 def run(session, *, route_id, source_revision, receipt_directory, max_seconds=300, max_polls=30):

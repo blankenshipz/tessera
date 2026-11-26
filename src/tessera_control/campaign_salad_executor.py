@@ -347,6 +347,30 @@ def live_check_exit_detail(stdout: bytes | None) -> str:
     return LIVE_CHECK_NO_RECEIPT
 
 
+_STDERR_CLASS = re.compile(r"(?:[a-z_][a-z0-9_]*\.)*([A-Z][A-Za-z0-9_]{0,63})(?::.*)?")
+LIVE_CHECK_STDERR_UNCLASSIFIED = "stderr_unclassified"
+
+
+def live_check_stderr_class(stderr: bytes | None) -> str | None:
+    """The exception class name the live check's stderr ended with, else a fixed code.
+
+    None for empty stderr. Only a class-name token is ever taken (the last line shaped like
+    ``module.ClassName: ...`` or ``ClassName``); its message, other lines and any value are
+    dropped, so nothing the child printed is echoed."""
+    tail = (stderr or b"")[-_REPORT_SCAN_BYTES:]
+    if not tail.strip():
+        return None
+    for raw in reversed(tail.splitlines()):
+        line = raw.decode("ascii", "replace").strip()
+        if not line:
+            continue
+        match = _STDERR_CLASS.fullmatch(line)
+        if match:
+            return match.group(1)
+        break
+    return LIVE_CHECK_STDERR_UNCLASSIFIED
+
+
 def subprocess_route_runner(config_path: Path, receipt_dir: Path, timeout: int):
     """Run the unchanged live driver in a fresh interpreter; return its receipt, if any."""
     try:
@@ -368,6 +392,11 @@ def subprocess_route_runner(config_path: Path, receipt_dir: Path, timeout: int):
         )
     except subprocess.TimeoutExpired:
         raise RouteTimeout from None
+    stderr_class = live_check_stderr_class(completed.stderr)
+    if stderr_class is not None:
+        # The child's stderr is otherwise discarded; keep only its closed class so a failed
+        # cancel or an unexpected exit is diagnosable without echoing any text.
+        _LOG.warning("live check stderr: %s", stderr_class)
     receipt = read_receipt(receipt_dir)
     if receipt is None:
         detail = live_check_exit_detail(completed.stdout)
@@ -401,6 +430,10 @@ MAX_TERMINATION_OBSERVE_FAILURES = 3
 
 
 GROUP_STOP_MARKER = "group-stop.json"
+# A receipt whose reduce-only cancel was never recorded at control is held (the attempt stays
+# executing) until the guardian confirms the exact group stopped and that stop is reported, for
+# at most this long; then the outcome is recorded with the failure visible.
+CANCEL_UNRECORDED_HOLD_SECONDS = 600.0
 GROUP_STOP_MAX_FAILURES = 5
 GROUP_STOP_RECHECK_SECONDS = 30.0
 
@@ -524,6 +557,7 @@ class SaladCampaignExecutor:
         self._group_stop_failures: dict[str, int] = {}
         self._group_stop_given_up: set[str] = set()
         self._group_stop_next: dict[str, float] = {}
+        self._cancel_unrecorded_since: dict[str, float] = {}
         self.log: list[dict[str, Any]] = []
         # Concurrent mode only (``max_concurrent_paid_routes`` above 1): the routes whose child
         # runs now, by attempt. Every field of the executor is read and written by the pass's own
@@ -1110,8 +1144,43 @@ class SaladCampaignExecutor:
 
     # -- step 5: custody import, upload, observation, outcome -------------------------------
 
+    def _cancel_unrecorded_held(self, item: dict[str, Any], receipt: dict[str, Any]) -> bool:
+        """True while a receipt whose cancel control never recorded must wait for the guardian.
+
+        The live check's reduce-only cancel failed (control write lock, refusal), so the route
+        may still say ``desired`` run with the group up. The failure is noted every time; the
+        guardian's confirmed stop of the exact group is reported as termination evidence
+        (ADR 0160) before any outcome, so the attempt never ends ``unknown`` behind a group that
+        may still run. Holding ends once that is reported, the provider's own read confirmed the
+        stop, the report was given up, or after CANCEL_UNRECORDED_HOLD_SECONDS."""
+        attempt = item["attempt_id"]
+        failure = receipt.get("cancel_failure")
+        exception = failure.get("exception") if type(failure) is dict else None
+        self._note("cancel_unrecorded", attempt, str(exception or "")[:64])
+        if receipt.get("provider_stop_confirmed") is True:
+            self._cancel_unrecorded_since.pop(attempt, None)
+            return False
+        try:
+            self._report_group_stop(item)
+        except Exception as error:  # noqa: BLE001 - a failed check holds, bounded below
+            self._note("group_stop_held", attempt, type(error).__name__)
+        marker = _read_private_json(self._route_dir(item["route_id"]) / GROUP_STOP_MARKER)
+        reported = marker is not None and marker.get("reported") is True
+        since = self._cancel_unrecorded_since.setdefault(attempt, self.clock())
+        if (
+            reported
+            or attempt in self._group_stop_given_up
+            or self.clock() - since >= CANCEL_UNRECORDED_HOLD_SECONDS
+        ):
+            self._cancel_unrecorded_since.pop(attempt, None)
+            return False
+        self._note("cancel_unrecorded_held", attempt)
+        return True
+
     def _finish(self, item: dict[str, Any], receipt: dict[str, Any]) -> None:
         attempt, route_id = item["attempt_id"], item["route_id"]
+        if receipt.get("cancel_recorded") is False and self._cancel_unrecorded_held(item, receipt):
+            return
         manifest_id = None
         provider_id = None
         state = self.control.route(route_id)
