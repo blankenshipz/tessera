@@ -2132,6 +2132,7 @@ FAILURE_CLASSES = (
     "infra_allocation_timeout",
     "start_failure_suspected",
     "provider_reallocated_before_custody",
+    "salad_interrupted",
     "not_started",
     "exit_confirmed_unresolved",
     "exited_without_report",

@@ -38,6 +38,7 @@ from . import campaign_placement as placement
 from . import campaign_salad_fallback as salad_fallback
 from . import execution_frames as frames
 from . import late_bound_inputs as late_bound
+from .artifact_manifests import grant_manifest_is_partial
 from .campaign_autoreconcile import (
     MAX_AUTO_REQUEUES,
     NOT_STARTED,
@@ -45,6 +46,15 @@ from .campaign_autoreconcile import (
     assess,
     not_started_count,
     repeat_count,
+)
+from .campaign_checkpoint import (
+    CHECKPOINT_EVENT,
+    COMPOSED_EVENT,
+    composed_checkpoint,
+    ever_composed,
+    retry_checkpoint,
+    retry_checkpoint_from,
+    salvaged_checkpoint,
 )
 from .campaign_delegation import approver_is_live
 from .campaign_exit_without_report import EXIT_REPORT_GRACE_SECONDS
@@ -60,11 +70,12 @@ from .campaign_exited_resolve import assess as assess_exited
 from .campaign_infra_retry import (
     INFRA_ALLOCATION_TIMEOUT,
     INFRA_CONTAINER_KILLED,
-    INFRA_PREFIX,
     INFRA_RESOURCE_LIMIT,
     REALLOCATED_PRECUSTODY,
     RESOURCE_LIMIT_CLASSES,
+    SALAD_INTERRUPTED,
     infra_attempts,
+    is_infra_class,
     reallocation_attempts,
     resource_limit_stop,
 )
@@ -1084,7 +1095,13 @@ class CampaignRunner:
         """The stage-output inputs bound when the stage started (ADR 0140): only resolved
         digests, sizes, classes and labels, never a reference a provider must resolve."""
         with self.store.runner_connection() as connection:
-            return late_bound.bound_inputs(connection, ctx.campaign, key)
+            bound = late_bound.bound_inputs(connection, ctx.campaign, key)
+            # A retry of an interrupted attempt also gets that attempt's salvaged checkpoint,
+            # bound by digest under its declared name; a stage with none starts clean.
+            checkpoint = retry_checkpoint(connection, ctx.campaign, key)
+        if checkpoint is None or any(item.name == checkpoint.name for item in bound):
+            return bound
+        return (*bound, checkpoint)
 
     def set_stage(self, ctx: _Ctx, key: str, **fields: Any) -> None:
         self._set_stage(ctx, key, **fields)
@@ -2327,7 +2344,7 @@ class CampaignRunner:
         if refused is not None:
             return refused
         hold = spec_stage.max_exposure_cents
-        if attempts and str(attempts[-1]["failure_class"] or "").startswith(INFRA_PREFIX):
+        if attempts and is_infra_class(attempts[-1]["failure_class"]):
             self.emit_once(
                 ctx,
                 "campaign.stage_infra_retry",
@@ -2969,6 +2986,24 @@ class CampaignRunner:
                         lineage_node_id=resolved.lineage_node_id,
                     )
                 )
+        with self.store.runner_connection() as connection:
+            checkpoint = composed_checkpoint(
+                connection, ctx.campaign, spec_stage.key, input_snapshot_id
+            )
+        if checkpoint is not None:
+            # ADR 0197: the interrupted attempt's checkpoint is part of this attempt's snapshot.
+            entries.append(
+                IoEntry(
+                    name=f"{checkpoint.name}/{checkpoint.path}",
+                    kind="other",
+                    sha256=checkpoint.digest,
+                    size_bytes=checkpoint.bytes,
+                    data_class=checkpoint.data_class,
+                    manifest_id=checkpoint.manifest_id,
+                    path=checkpoint.path,
+                    lineage_node_id=self._node_for(project, checkpoint.digest),
+                )
+            )
         return entries
 
     def _resolve_artifact(self, ctx: _Ctx, item: Any) -> Any:
@@ -3217,6 +3252,95 @@ class CampaignRunner:
                 ctx, stage, spec_stage, source.snapshot_id, source.digest, attempt
             )
 
+        build = self._compose_build(ctx, custody, pinned)
+
+        result = self._step(ctx, stage["stage_key"], None, "compose_snapshot", 0, build)
+        return self._input_ready(
+            ctx, stage, spec_stage, result.response["id"], result.response["digest"], attempt
+        )
+
+    def _manifest_digest(self, manifest_id: str | None) -> str:
+        row = self._one("SELECT manifest_digest FROM artifact_manifests WHERE id=?", (manifest_id,))
+        if row is None:
+            raise StepFailed("compose_snapshot", "step_refused", "checkpoint manifest is missing")
+        return row["manifest_digest"]
+
+    def _compose_for_retry(
+        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage, attempt: dict[str, Any]
+    ) -> dict[str, Any]:
+        """ADR 0197: the stage row for a retry attempt, its input snapshot composed with the
+        checkpoint the immediately preceding interrupted attempt left in custody.
+
+        A retry with no such checkpoint gets the base composition: unchanged when no attempt
+        ever carried one, restored (the first composition replays) when an earlier retry did.
+        The checkpoint rides as one more manifest source under its declared output name, bound
+        by the digest recorded when it was salvaged."""
+        key = stage["stage_key"]
+        custody = custody_inputs(spec_stage)
+        if not custody:
+            return stage
+        with self.store.runner_connection() as connection:
+            found = retry_checkpoint_from(connection, ctx.campaign, key)
+            composed_before = ever_composed(connection, ctx.campaign, key)
+            bound = late_bound.bound_inputs(connection, ctx.campaign, key)
+        checkpoint = None if found is None else found[0]
+        if checkpoint is None and not composed_before:
+            return stage
+        pinned = {(item.name, item.path): item.digest for item in bound}
+        if checkpoint is None and not needs_composition(spec_stage):
+            snapshot_id, digest = custody[0].snapshot_id, custody[0].digest
+        else:
+            if checkpoint is not None:
+                # Composition reads released custody only: release the interrupted attempt's
+                # manifest under the same spec pre-approval a collected attempt gets. That is
+                # custody, not acceptance: its verdict stays failed and only the checkpoint
+                # path is composed.
+                self._release_manifest(ctx, key, found[1], checkpoint.manifest_id)
+            result = self._step(
+                ctx,
+                key,
+                None if checkpoint is None else attempt["attempt"],
+                "compose_snapshot",
+                0,
+                self._compose_build(ctx, custody, pinned, checkpoint),
+            )
+            snapshot_id, digest = result.response["id"], result.response["digest"]
+        data_class = self._recorded_class(ctx, key, snapshot_id)
+        with self.store.runner_connection() as connection:
+            if checkpoint is not None:
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    COMPOSED_EVENT,
+                    {"stage_key": key, "attempt": attempt["attempt"]},
+                    {
+                        "snapshot_id": snapshot_id,
+                        "snapshot_digest": digest,
+                        "input": checkpoint.to_json(),
+                    },
+                )
+            self._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=?",
+                (ctx.campaign["id"], key),
+                input_snapshot_id=snapshot_id,
+                input_snapshot_digest=digest,
+                input_data_class=data_class,
+            )
+        return self._stage_row(ctx, key)
+
+    def _compose_build(
+        self,
+        ctx: _Ctx,
+        custody: tuple[Any, ...],
+        pinned: dict[tuple[str, str], str],
+        checkpoint: late_bound.ResolvedStageInput | None = None,
+    ) -> Callable[[], tuple[dict[str, str], dict[str, Any]]]:
+        """The ``compose_snapshot`` request for a stage's custody inputs, plus (for a retry of an
+        interrupted attempt, ADR 0197) the checkpoint that attempt left in custody, as one more
+        manifest source under its declared output name."""
+
         def build() -> tuple[dict[str, str], dict[str, Any]]:
             sources: list[dict[str, Any]] = []
             entries: list[tuple[str, str, int, str]] = []
@@ -3289,16 +3413,31 @@ class CampaignRunner:
                             "imported_unverified",
                         )
                     )
+            if checkpoint is not None:
+                sources.append(
+                    {
+                        "name": checkpoint.name,
+                        "kind": "manifest",
+                        "manifest_id": checkpoint.manifest_id,
+                        "expected_manifest_digest": self._manifest_digest(checkpoint.manifest_id),
+                        "relative_paths": [checkpoint.path],
+                    }
+                )
+                entries.append(
+                    (
+                        f"{checkpoint.name}/{checkpoint.path}",
+                        checkpoint.digest,
+                        checkpoint.bytes,
+                        "imported_unverified",
+                    )
+                )
             digest = inventory_digest(composed_inventory(entries))
             return {"project_id": ctx.campaign["project_id"]}, {
                 "sources": sources,
                 "expected_snapshot_digest": digest,
             }
 
-        result = self._step(ctx, stage["stage_key"], None, "compose_snapshot", 0, build)
-        return self._input_ready(
-            ctx, stage, spec_stage, result.response["id"], result.response["digest"], attempt
-        )
+        return build
 
     # -- attempt lifecycle: authority -----------------------------------------------
 
@@ -3306,7 +3445,9 @@ class CampaignRunner:
         self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage, attempt: dict[str, Any]
     ) -> bool:
         if attempt.get("trust_policy_digest") is None:
-            # A retry: re-check the stage's input snapshot under the setting in force now.
+            # A retry: compose its input snapshot (with the interrupted predecessor's
+            # checkpoint when one was salvaged), then re-check it under the setting in force now.
+            stage = self._compose_for_retry(ctx, stage, spec_stage, attempt)
             stamped = self._stamp_trust(ctx, stage, spec_stage, attempt)
             if stamped is not None:
                 return stamped
@@ -4035,6 +4176,10 @@ class CampaignRunner:
             "reconciliation": reconciliation,
             "receipt": dict(receipt) if receipt else None,
             "manifest": dict(manifest) if manifest else None,
+            # A manifest that lists fewer files than the plan declares never stands for a
+            # complete run (it is written only for an interrupted or retryable attempt).
+            "manifest_partial": manifest is not None
+            and grant_manifest_is_partial(connection, grant, manifest["artifacts_json"]),
         }
 
     def _outputs_arriving(self, ctx: _Ctx, attempt: dict[str, Any], seen: dict[str, Any]) -> bool:
@@ -4143,13 +4288,17 @@ class CampaignRunner:
                 )
                 return True
             raise _Waiting
-        if manifest is None and receipt["exit_code"] == 0:
+        if (manifest is None or seen["manifest_partial"]) and receipt["exit_code"] == 0:
             self._set_attempt(
                 attempt["id"],
                 status="unknown",
                 failure_class="missing_manifest",
                 operation_id=seen["operation_id"],
-                failure_detail="successful exit without a quarantined output manifest",
+                failure_detail=(
+                    "successful exit without a quarantined output manifest"
+                    if manifest is None
+                    else "successful exit with a partial output manifest"
+                ),
             )
             return True
         self._set_attempt(
@@ -4194,47 +4343,47 @@ class CampaignRunner:
         key = stage["stage_key"]
         manifest_id = attempt["manifest_id"]
         if manifest_id is not None:
-            rationale = (
-                f"Pre-approved by campaign {ctx.campaign['id']} spec {ctx.campaign['spec_digest']}"
-            )
-            self._step(
-                ctx,
-                key,
-                attempt["attempt"],
-                "record_disposition",
-                0,
-                lambda: (
-                    {"manifest_id": manifest_id},
-                    {
-                        "expected_manifest_digest": attempt["manifest_digest"],
-                        "expected_revision": self._latest_revision(
-                            "artifact_dispositions", manifest_id
-                        ),
-                        "disposition": "retain_quarantined",
-                        "rationale": rationale,
-                    },
-                ),
-            )
-            self._step(
-                ctx,
-                key,
-                attempt["attempt"],
-                "custody_release",
-                0,
-                lambda: (
-                    {"manifest_id": manifest_id},
-                    {
-                        "expected_manifest_digest": attempt["manifest_digest"],
-                        "expected_revision": self._latest_revision(
-                            "artifact_custody_releases", manifest_id
-                        ),
-                        "action": "release",
-                        "rationale": rationale,
-                    },
-                ),
+            self._release_manifest(
+                ctx, key, attempt["attempt"], manifest_id, attempt["manifest_digest"]
             )
         self._set_attempt(attempt["id"], status="collected")
         return True
+
+    def _release_manifest(
+        self,
+        ctx: _Ctx,
+        key: str,
+        attempt_number: int,
+        manifest_id: str,
+        manifest_digest: str | None = None,
+    ) -> None:
+        """Record the pre-approved ``retain_quarantined`` disposition and release the manifest's
+        custody (the two steps that make its files composable as an input)."""
+        if manifest_digest is None:
+            manifest_digest = self._manifest_digest(manifest_id)
+        rationale = (
+            f"Pre-approved by campaign {ctx.campaign['id']} spec {ctx.campaign['spec_digest']}"
+        )
+        for step, table, extra in (
+            ("record_disposition", "artifact_dispositions", {"disposition": "retain_quarantined"}),
+            ("custody_release", "artifact_custody_releases", {"action": "release"}),
+        ):
+            self._step(
+                ctx,
+                key,
+                attempt_number,
+                step,
+                0,
+                lambda table=table, extra=extra: (
+                    {"manifest_id": manifest_id},
+                    {
+                        "expected_manifest_digest": manifest_digest,
+                        "expected_revision": self._latest_revision(table, manifest_id),
+                        **extra,
+                        "rationale": rationale,
+                    },
+                ),
+            )
 
     def _latest_revision(self, table: str, manifest_id: str) -> int:
         row = self._one(
@@ -4564,10 +4713,40 @@ class CampaignRunner:
             status, detail = self._placement_failure(
                 ctx, stage["stage_key"], spec_stage, attempt, detail
             )
+        elif failure_class == SALAD_INTERRUPTED and status == "failed_transient":
+            # Spends one infra retry; with none left the attempt (and so the stage) fails
+            # permanently under the same class. The salvaged checkpoint, if custody holds one,
+            # is recorded first (once, idempotently) so a replay after a crash never loses it.
+            self._record_interrupted_checkpoint(ctx, stage["stage_key"], spec_stage, attempt)
+            status, detail = self._placement_failure(
+                ctx, stage["stage_key"], spec_stage, attempt, detail
+            )
         self._set_attempt(
             attempt["id"], status=status, failure_class=failure_class, failure_detail=detail
         )
         return True
+
+    def _record_interrupted_checkpoint(
+        self, ctx: _Ctx, key: str, spec_stage: NormalStage, attempt: dict[str, Any]
+    ) -> None:
+        """``interrupted_checkpointed``: the digest and size of the checkpoint custody salvaged
+        from an interrupted attempt, recorded once. Nothing else of the attempt is accepted."""
+        with self.store.runner_connection() as connection:
+            found = salvaged_checkpoint(connection, ctx.campaign, spec_stage, attempt)
+            if found is None:
+                return
+            self._emit_once_in(
+                connection,
+                ctx,
+                CHECKPOINT_EVENT,
+                {"stage_key": key, "attempt": attempt["attempt"]},
+                {
+                    "outcome": "interrupted_checkpointed",
+                    "digest": found.digest,
+                    "bytes": found.bytes,
+                    "input": found.to_json(),
+                },
+            )
 
     def _allocation_timeout_fallback(
         self, ctx: _Ctx, key: str, attempt: Mapping[str, Any], observed_detail: str | None

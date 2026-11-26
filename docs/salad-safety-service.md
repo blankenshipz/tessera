@@ -545,3 +545,19 @@ stopped, and the status says `custody_work_begun: false`. The campaign runner ma
 fresh attempt (never a re-bind of the old instance), bounded by `retry.max_reallocation_retries`
 and the budget cap ([ADR 0179](decisions/0179-precustody-reallocation-retry.md)). After custody
 work began, or when the guardian cannot say, the stop keeps `provider_stopped_custody_unsealed`.
+
+## Allocation change after custody began
+
+When the guardian stops on `allocation_changed` after custody work began (`custody_work_begun` is
+true) and the provider's own read confirms the stop, control records the attempt as
+`failed_transient` with failure class `salad_interrupted`
+([ADR 0197](decisions/0197-salad-post-start-interruption-retry.md)). It spends one
+`retry.infra_retries`, settles at the guardian's accrued estimate (provisional, like the bounded
+hold), and its other outputs are never accepted. A checkpoint that custody already holds as the
+reserved `checkpoint.bin` output reaches control through a partial manifest (the executor
+imports the sealed, incomplete custody and lists only the hash-verified files that arrived; the
+diagnostic is not required, and such a manifest never verifies as a pass). It is recorded by digest and size and listed in the campaign receipt.
+The retry's input snapshot is composed with it (under the declared output's name), only for the
+attempt right after the one that produced it, and the retry's recorded inputs list it by digest;
+the snapshot is private-derived data, so the provider must be trusted to receive that class. The
+retry is a new operation with its own claim and hold. Without the provider's confirmation the attempt stays unknown and held.

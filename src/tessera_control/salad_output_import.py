@@ -53,12 +53,24 @@ def _signed(value):
     ) == value.get("digest")
 
 
-def verify_manifest(manifest, *, binding, declared, max_total):
-    """Verify a sealed, complete chunked-import manifest; return its file entries."""
+def verify_manifest(manifest, *, binding, declared, max_total, partial=False):
+    """Verify a sealed chunked-import manifest; return its file entries.
+
+    By default the manifest must be complete: exactly the declared files. With ``partial`` (an
+    attempt that ended interrupted or retryable) the diagnostic and any other declared file
+    may be missing: the manifest is still signed, sealed and bound, and lists only distinct
+    declared files, each checked below and later re-hashed by ``stream_files``. A partial
+    manifest is never a complete one: the caller keeps it out of any success verdict."""
+    required = (
+        ("writers_closed", "quarantine")
+        if partial
+        else ("writers_closed", "quarantine", "complete")
+    )
     if (
         not _signed(manifest)
         or set(manifest) != {"inventories", "writers_closed", "quarantine", "complete", "digest"}
-        or not all(manifest[k] is True for k in ("writers_closed", "quarantine", "complete"))
+        or not all(manifest[k] is True for k in required)
+        or type(manifest["complete"]) is not bool
         or type(manifest["inventories"]) is not list
         or len(manifest["inventories"]) != 1
     ):
@@ -67,13 +79,16 @@ def verify_manifest(manifest, *, binding, declared, max_total):
     if (
         not _signed(inventory)
         or inventory.get("binding") != binding
-        or not all(inventory.get(k) is True for k in ("writers_closed", "quarantine", "complete"))
+        or not all(inventory.get(k) is True for k in required)
         or type(inventory.get("files")) is not list
     ):
         raise OutputImportError("exact custody binding required")
     files = inventory["files"]
-    if declared is None or [f.get("name") if type(f) is dict else None for f in files] != sorted(
-        declared
+    names = [f.get("name") if type(f) is dict else None for f in files]
+    if declared is None or (
+        names != sorted(declared)
+        if not partial
+        else names != sorted(set(names)) or not set(names) <= set(declared)
     ):
         raise OutputImportError("declared output set required")
     total = 0

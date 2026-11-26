@@ -552,18 +552,43 @@ class SaladWorld:
         state["revision"] += 1
         self._append("remote_execution.state", state, state["revision"])
 
-    def upload_manifest(self, content: bytes = b'{"score": 1}') -> dict[str, Any]:
+    def upload_manifest(
+        self,
+        content: bytes = b'{"score": 1}',
+        relative_path: str = "output.json",
+        *,
+        placed: bool = False,
+        partial: bool = False,
+    ) -> dict[str, Any]:
+        """Upload one file and its manifest; ``placed`` stores it under project custody (what a
+        composed input snapshot needs, as a real worker upload does). ``partial`` is the
+        executor's manifest for an interrupted attempt: it may list fewer files than declared."""
+        from tessera_control.project_artifact_store import ProjectArtifactStore
+
         row = self.salad()
         payload = {
             "expected_epoch": row["epoch"],
             "operation_id": row["operation_id"],
-            "relative_path": "output.json",
+            "relative_path": relative_path,
             "sha256": hashlib.sha256(content).hexdigest(),
             "content_base64": base64.b64encode(content).decode(),
         }
         _, artifact = ArtifactStore(self.env.state).upload_artifact(
             self.worker, row["lease_id"], self.key("artifact"), canonical_digest(payload), payload
         )
+        if placed:
+            placement = {
+                "expected_epoch": row["epoch"],
+                "operation_id": row["operation_id"],
+                "artifacts": [{key: artifact[key] for key in ("id", "sha256", "size")}],
+            }
+            ProjectArtifactStore(self.env.state).commit_project_artifacts(
+                self.worker,
+                row["lease_id"],
+                self.key("place"),
+                canonical_digest(placement),
+                placement,
+            )
         body = {
             "expected_epoch": row["epoch"],
             "operation_id": row["operation_id"],
@@ -571,6 +596,8 @@ class SaladWorld:
                 {key: artifact[key] for key in ("id", "relative_path", "sha256", "size")}
             ],
         }
+        if partial:
+            body["partial"] = True
         _, manifest = ArtifactManifestStore(self.env.state).create_manifest(
             self.worker, row["lease_id"], self.key("manifest"), canonical_digest(body), body
         )

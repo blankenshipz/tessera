@@ -672,7 +672,13 @@ class SaladHTTPTransport:
             # including the case where the approved environment is empty.
             if key not in container or container[key] != expected["container"][key]:
                 raise _mismatch(f"container.{key}")
-        if data["priority"] != "high":
+        if self._selection.resources.gpu_count == 0:
+            # Salad runs a group without a GPU at its lowest priority whatever was sent and
+            # may echo that level (``batch``) or nothing (``null``) back, so a CPU readback
+            # accepts the sent value, ``batch`` or no value. Any other level is drift.
+            if data.get("priority") not in (None, "high", "batch"):
+                raise _mismatch("priority")
+        elif data["priority"] != "high":
             raise _mismatch("priority")
         if type(data["pending_change"]) is not bool:
             raise _mismatch("pending_change")

@@ -300,7 +300,7 @@ class ControlPort(Protocol):
 
 RouteRunner = Callable[[Path, Path, int], "dict[str, Any] | None"]
 # ``(route id, destination, the profile the attempt's stage names)``.
-Importer = Callable[[str, Path, SaladCampaignProfile], "list[dict[str, Any]]"]
+Importer = Callable[..., "list[dict[str, Any]]"]
 
 
 class RouteTimeout(Exception):
@@ -1119,9 +1119,13 @@ class SaladCampaignExecutor:
         waiting = provider_termination(state)
         if waiting.status == "unconfirmed" and waiting.reason != "no_stop_requested":
             state = self._confirm_termination(attempt, route_id, self._profile_for(item))
-        if receipt.get("stop_confirmed") is True and lease is not None:
+        # An attempt the provider moved after custody began has no diagnostic and maybe no other
+        # declared file. It gets a partial manifest of what reached custody (each file
+        # hash-verified); it never counts as a pass.
+        partial = _interrupted_after_custody(receipt)
+        if (receipt.get("stop_confirmed") is True or partial) and lease is not None:
             try:
-                manifest_id = self._import_and_upload(item, state, lease)
+                manifest_id = self._import_and_upload(item, state, lease, partial=partial)
             except Exception as error:
                 self._note("import_failed", attempt, type(error).__name__)
         if (
@@ -1236,20 +1240,39 @@ class SaladCampaignExecutor:
             self._note("guardian_not_stopped", attempt, str(final.get("status"))[:40])
         return final
 
-    def _import_and_upload(self, item, state, lease) -> str:
+    def _import_and_upload(self, item, state, lease, partial=False) -> str:
         profile = self._profile_for(item)
         if profile is None:
             raise ValueError("the attempt's profile is not served here")
         directory = self._route_dir(item["route_id"]) / "outputs"
-        files = self.importer(item["route_id"], directory, profile)
+        if partial:
+            files = self.importer(item["route_id"], directory, profile, partial=True)
+        else:
+            files = self.importer(item["route_id"], directory, profile)
         for entry in files:
             data = (directory / entry["name"]).read_bytes()
             if hashlib.sha256(data).hexdigest() != entry["sha256"] or len(data) != entry["bytes"]:
                 raise ValueError("imported file differs from its manifest entry")
-        manifest = self.control.upload_outputs(
-            lease[0], lease[1], item["operation_id"], directory, files
-        )
+        if partial:
+            manifest = self.control.upload_outputs(
+                lease[0], lease[1], item["operation_id"], directory, files, partial=True
+            )
+        else:
+            manifest = self.control.upload_outputs(
+                lease[0], lease[1], item["operation_id"], directory, files
+            )
         return manifest["id"]
+
+
+def _interrupted_after_custody(receipt: Mapping[str, Any]) -> bool:
+    """The live receipt's own word that the guardian stopped on an allocation change after
+    custody work began, with the provider's stop confirmed (the evidence the campaign driver
+    classifies as a retryable interruption)."""
+    return (
+        receipt.get("guardian_stop_cause") == "allocation_changed"
+        and receipt.get("custody_work_begun") is True
+        and receipt.get("provider_stop_confirmed") is True
+    )
 
 
 def _last_provider_observation(state: dict[str, Any]) -> str | None:
@@ -1389,7 +1412,7 @@ class StoreControl:
             self.worker, attempt_id, _key("mark-executing", attempt_id)
         )
 
-    def upload_outputs(self, lease_id, epoch, operation_id, directory, files):
+    def upload_outputs(self, lease_id, epoch, operation_id, directory, files, partial=False):
         entries = []
         for entry in files:
             data = (Path(directory) / entry["name"]).read_bytes()
@@ -1425,6 +1448,8 @@ class StoreControl:
             placement,
         )
         payload = dict(expected_epoch=epoch, operation_id=operation_id, artifacts=entries)
+        if partial:
+            payload["partial"] = True
         return self.artifacts.create_manifest(
             self.worker,
             lease_id,
@@ -1614,7 +1639,7 @@ def trusted_importer(config: ExecutorConfig, worker, state_dir):
     """Importer over a TrustedSaladServer using the independent custody HTTPS client."""
 
     def import_route(
-        route_id: str, destination: Path, profile: SaladCampaignProfile
+        route_id: str, destination: Path, profile: SaladCampaignProfile, partial: bool = False
     ) -> list[dict[str, Any]]:
         from .remote_execution import RemoteExecutionStore
         from .salad_live_check import _private_bytes
@@ -1636,7 +1661,10 @@ def trusted_importer(config: ExecutorConfig, worker, state_dir):
                 resolver=resolver,
                 safety=SaladSafetyHTTPSClient(**config.custody.client_fields()),
             )
-            reply = server.import_retained(route_id, destination=str(destination))
+            if partial:
+                reply = server.import_retained(route_id, destination=str(destination), partial=True)
+            else:
+                reply = server.import_retained(route_id, destination=str(destination))
         finally:
             resolver.close()
         return reply["files"]

@@ -19,7 +19,7 @@ from typing import Any
 from . import provider_trust
 from .campaign_delegation import STEP_TABLE
 from .campaign_image_pull import DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES
-from .campaign_infra_retry import REALLOCATED_PRECUSTODY
+from .campaign_infra_retry import REALLOCATED_PRECUSTODY, SALAD_INTERRUPTED
 from .campaign_models import SALAD_BACKEND, SALAD_RUNTIME, SALAD_TARGET, SaladStageSpec
 from .campaign_providers import (
     ComputeProvider,
@@ -739,6 +739,17 @@ class SaladRouteProvider:
             return Observation(
                 "failed_transient",
                 failure_class=REALLOCATED_PRECUSTODY,
+                detail=f"salad:{failure_detail}"[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        if stored_class == SALAD_INTERRUPTED or failure_detail.startswith(SALAD_INTERRUPTED):
+            # Moved after custody began, stop confirmed by the provider's own read: a fresh
+            # attempt (new operation, own claim and hold) may retry within ``infra_retries``.
+            return Observation(
+                "failed_transient",
+                failure_class=SALAD_INTERRUPTED,
                 detail=f"salad:{failure_detail}"[:500],
                 evidence_kind="salad_live_receipt",
                 evidence_digest=evidence,

@@ -37,6 +37,7 @@ from typing import Any
 from . import campaign_placement_preference as preference
 from .campaign_heavy_remote import FIELD as RECORD_SOURCE
 from .campaign_heavy_remote import NOT_ADDED_REASONS, records
+from .campaign_infra_retry import is_infra_class
 from .campaign_models import NormalStage
 
 EVENT = "campaign.heavy_stage_local_fallback"
@@ -56,7 +57,6 @@ CREDENTIAL_REASONS = frozenset(
         "safety_service_down",
     }
 )
-INFRA_PREFIX = "infra_"
 PROFILE_REASONS = frozenset({"not_enrolled", "provider_invalid"})
 STEERING_REASONS = frozenset({"excluded_by_steering", "not_pinned"})
 # Reason codes, in the order they are reported.
@@ -345,7 +345,7 @@ def reasons(
     for attempt in attempts:
         failure = str(attempt["failure_class"] or "")
         pid = attempt["provider_id"] or base.provider
-        if failure.startswith(INFRA_PREFIX) and guard.is_remote(pid):
+        if is_infra_class(failure) and guard.is_remote(pid):
             infra_failed[pid] = failure
     for pid, failure in infra_failed.items():
         found.add("remote_failed_infra")

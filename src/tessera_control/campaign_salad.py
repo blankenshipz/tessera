@@ -23,7 +23,8 @@ from pydantic import ValidationError
 
 from . import campaign_preapproval, operator_config_freshness, provider_trust
 from . import execution_frames as frames
-from .campaign_infra_retry import REALLOCATED_PRECUSTODY
+from .artifact_manifests import grant_manifest_is_partial
+from .campaign_infra_retry import REALLOCATED_PRECUSTODY, SALAD_INTERRUPTED
 from .campaign_models import (
     SALAD_TARGET,
     TERMINAL_CAMPAIGN,
@@ -301,6 +302,26 @@ def _guardian_precustody_evidence(
         and receipt.get("custody_work_begun") is False
         and (not provider_confirmed or receipt.get("provider_stop_confirmed") is True)
     )
+
+
+def _guardian_interruption_evidence(
+    receipt: dict[str, Any], *, provider_confirmed: bool = True
+) -> bool:
+    """Fail closed: the live receipt's own word that custody work HAD begun (literally True,
+    not None) when the guardian stopped on an allocation change, and (unless the route's own
+    provider read already confirmed it) the provider's stop confirmed."""
+    return (
+        receipt.get("guardian_stop_cause") == "allocation_changed"
+        and receipt.get("custody_work_begun") is True
+        and (not provider_confirmed or receipt.get("provider_stop_confirmed") is True)
+    )
+
+
+def _was_interrupted(attempt: dict[str, Any]) -> bool:
+    """The attempt ended on a post-custody interruption: its class, or (before the runner has
+    recorded the class) the detail the verdict step wrote."""
+    detail = str(attempt.get("failure_detail") or "").removeprefix("salad:")
+    return attempt.get("failure_class") == SALAD_INTERRUPTED or detail.startswith(SALAD_INTERRUPTED)
 
 
 class SaladStageDriver:
@@ -1714,9 +1735,29 @@ class SaladStageDriver:
                     "allocation changed before custody; termination confirmed by provider read",
                     digest,
                 )
+            if _guardian_interruption_evidence(receipt):
+                # The provider moved the instance after custody began and its own read
+                # confirmed the stop: a retryable interruption. Outputs are never accepted.
+                return (
+                    "failed",
+                    f"{SALAD_INTERRUPTED}: signal={SIGNAL_GUARDIAN}; "
+                    "allocation changed after custody began; termination confirmed by "
+                    "provider read",
+                    digest,
+                )
             return "failed", f"live receipt not passed: {reason}", digest
         if manifest is None or not self._outputs_match(receipt, manifest):
             return "unknown", "manifest does not match the imported output hashes", None
+        with self.runner.store.runner_connection() as connection:
+            grant = connection.execute(
+                "SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],)
+            ).fetchone()
+            partial = grant is None or grant_manifest_is_partial(
+                connection, grant, manifest["artifacts_json"]
+            )
+        if partial:
+            # A manifest that lacks a declared output (an interrupted attempt's) is never a pass.
+            return "unknown", "manifest lists fewer files than the plan declares", None
         return "ok", "verified_journey", self._evidence(row, state, provider, manifest)
 
     def scoped_route(self, campaign: dict[str, Any], route_id: str | None) -> dict[str, Any] | None:
@@ -1760,6 +1801,10 @@ class SaladStageDriver:
             # ADR 0179: the guardian's own word that no custody work began. The class rides on
             # the detail so the provider adapter reports a retryable interruption.
             detail = f"{REALLOCATED_PRECUSTODY}: signal={SIGNAL_ROUTE_FLAG}; {detail}"
+        elif _guardian_interruption_evidence(receipt, provider_confirmed=False):
+            # Custody began, then the provider moved the instance, and its own read confirmed
+            # the stop: a retryable interruption on a NEW operation. Outputs stay unaccepted.
+            detail = f"{SALAD_INTERRUPTED}: signal={SIGNAL_ROUTE_FLAG}; {detail}"
         return "failed", detail, self._evidence(row, state, provider, None)
 
     def _termination_unconfirmed(
@@ -2056,9 +2101,15 @@ class SaladStageDriver:
         self._await_charge(attempt)
         raise _waiting()()
 
-    def _clean_guardian(self, attempt: dict[str, Any], row: dict[str, Any]) -> Decimal | None:
+    def _clean_guardian(
+        self, attempt: dict[str, Any], row: dict[str, Any], *, interrupted: bool = False
+    ) -> Decimal | None:
         """The estimate (cents) when the guardian final is clean and the verdict is
-        ``ok``/``failed``; None for anything missing, malformed or not clean."""
+        ``ok``/``failed``; None for anything missing, malformed or not clean.
+
+        ``interrupted`` (the guardian stopped on an allocation change after custody began, the
+        provider's read confirmed) tolerates exactly the ``allocation_uncertain`` flag that cause
+        sets, and only when the final's own reason is that cause."""
         if attempt.get("salad_verdict") not in ("ok", "failed"):
             return None
         if row.get("guardian_final_json") is None:
@@ -2069,9 +2120,14 @@ class SaladStageDriver:
             estimate = Decimal(final.estimated_exposure_cents or "")
         except (ValueError, InvalidOperation):
             return None
+        # Fails safe: if a real final words its reason differently, the flag is not tolerated
+        # and the attempt waits for a charge (held), never under-recorded. Not checked live.
+        uncertain = final.allocation_uncertain and not (
+            interrupted and final.reason == "allocation_changed"
+        )
         flags = (
             final.orphan,
-            final.allocation_uncertain,
+            uncertain,
             final.escalation_pending,
             final.budget_fenced,
             final.rate_unknown,
@@ -2089,9 +2145,18 @@ class SaladStageDriver:
         return estimate
 
     def bounded_hold(self, attempt: dict[str, Any], row: dict[str, Any]) -> int | None:
-        """The attempt's hold when guardian evidence bounds it (ADR 0038); pure read."""
-        estimate = self._clean_guardian(attempt, row)
+        """The attempt's hold when guardian evidence bounds it (ADR 0038); pure read.
+
+        An interrupted attempt (``salad_interrupted``) settles at its accrued guardian estimate
+        instead (rounded up, at least one cent, within the hold), still provisional: a recorded
+        charge raises or confirms it later. An estimate above the hold bounds nothing."""
         hold = int(attempt["hold_cents"])
+        if _was_interrupted(attempt):
+            estimate = self._clean_guardian(attempt, row, interrupted=True)
+            if estimate is None or hold < 1 or math.ceil(estimate) > hold:
+                return None
+            return max(1, math.ceil(estimate))
+        estimate = self._clean_guardian(attempt, row)
         if estimate is None or hold < 1 or math.ceil(estimate) > hold:
             return None
         return hold

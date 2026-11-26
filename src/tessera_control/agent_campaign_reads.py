@@ -18,7 +18,7 @@ from typing import Any
 from . import license_labels
 from .agent_stage_status import salad_profile_views
 from .campaign_holdout import campaign_claims, project_claims
-from .campaign_infra_retry import infra_attempts
+from .campaign_infra_retry import infra_attempts, is_infra_class
 from .campaign_models import TERMINAL_CAMPAIGN, normalize, parse_spec_json
 from .campaign_read_scope import own_clause, reads_every_campaign
 from .campaign_rerun import custody_released
@@ -326,9 +326,7 @@ class AgentCampaignReads(CampaignStore):
                         "reroute_providers": list(policy.retry.reroute_providers),
                         "provider": policy.provider,
                         "infra_failures": [
-                            a
-                            for a in attempts
-                            if str(a["failure_class"] or "").startswith("infra_")
+                            a for a in attempts if is_infra_class(a["failure_class"])
                         ],
                         "attempts": len(attempts),
                     }

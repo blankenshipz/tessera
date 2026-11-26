@@ -36,6 +36,20 @@ RESOURCE_LIMIT_CLASSES = frozenset({INFRA_CONTAINER_KILLED, INFRA_RESOURCE_LIMIT
 REALLOCATED_PRECUSTODY = "provider_reallocated_before_custody"
 
 
+# ADR (post-start interruption): the provider moved or interrupted the instance AFTER custody
+# work began and its own read confirmed the stop. Outputs of that attempt are never accepted
+# (the verdict is never ``ok``) and its claim is single-use, so the retry is a new operation with
+# its own claim and hold. It spends one ``retry.infra_retries`` like any infrastructure failure,
+# so ``max_attempts + infra_retries + max_class_fallbacks`` stays the upper bound.
+SALAD_INTERRUPTED = "salad_interrupted"
+
+
+def is_infra_class(failure_class: object) -> bool:
+    """True for a failure class that counts against ``retry.infra_retries``."""
+    text = str(failure_class or "")
+    return text.startswith(INFRA_PREFIX) or text == SALAD_INTERRUPTED
+
+
 def reallocation_attempts(attempts: Sequence[Mapping[str, Any]]) -> int:
     """Attempts of a stage that ended on a reallocation before custody began."""
     return sum(1 for a in attempts if (a["failure_class"] or "") == REALLOCATED_PRECUSTODY)
@@ -43,7 +57,7 @@ def reallocation_attempts(attempts: Sequence[Mapping[str, Any]]) -> int:
 
 def infra_attempts(attempts: Sequence[Mapping[str, Any]]) -> int:
     """Attempts of a stage that ended for an infrastructure reason."""
-    return sum(1 for a in attempts if str(a["failure_class"] or "").startswith(INFRA_PREFIX))
+    return sum(1 for a in attempts if is_infra_class(a["failure_class"]))
 
 
 def resource_limit_stop(

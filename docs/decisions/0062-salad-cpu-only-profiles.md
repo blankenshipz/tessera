@@ -73,3 +73,12 @@ shape), the CPU route (no GPU fields, rates reviewed, digest and byte stability 
 stored routes still parsing), the transport wire (empty GPU list, group match, operator rate with
 no provider call, preflight without the availability read, refusals), the guardian's basis checks
 in both directions, placement both ways, and the cap at admission.
+
+## Priority (addendum, ADR 0197)
+
+Salad runs a container group without a GPU at its lowest priority and may be preempted by any GPU
+request, whatever priority was sent. CPU runs are therefore lowest priority and preemptible, and
+an interruption after the start is a retryable infrastructure outcome
+([ADR 0197](0197-salad-post-start-interruption-retry.md)). The create body still sends `high`;
+the readback of a CPU-only group accepts `high`, `batch` or no priority, and a GPU group still
+requires `high`.

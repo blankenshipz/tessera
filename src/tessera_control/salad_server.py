@@ -310,8 +310,12 @@ class SaladSafetyClient:
             raise ValueError("independent service unavailable")
         return result
 
-    def import_retained(self, state, destination=None):
+    def import_retained(self, state, destination=None, partial=False):
         """Import sealed custody after confirmed stop and verify it against the profile.
+
+        ``partial`` (an attempt that ended interrupted or retryable) accepts a sealed manifest
+        that lacks some declared files, such as the diagnostic; every listed file is still
+        hash-verified. It needs the chunked shape: the single-object reply stays complete-only.
 
         Return shapes (callers rely on ``files`` for chunked imports):
 
@@ -353,6 +357,7 @@ class SaladSafetyClient:
                     binding=expected_binding(state),
                     declared=declared,
                     max_total=profile["max_output_bytes"],
+                    partial=partial,
                 )
 
                 def fetch(name, seq):
@@ -1113,17 +1118,21 @@ class TrustedSaladServer:
         cleanup._require_no_transaction()
         return cleanup.apply(max_groups=max_groups, port=port, accept=self.store._bound)
 
-    def import_retained(self, route_id, destination=None):
+    def import_retained(self, route_id, destination=None, partial=False):
         state = self.store.get(self.worker, route_id)
+        # A partial import is only for an attempt the provider moved after custody began: the
+        # route is flagged reallocated (and must be, for a partial import), and the provider's
+        # own read still has to confirm the stop. A complete import needs an unmoved route.
         if (
             not self.store._bound(state)
             or not state["termination_confirmed"]
-            or state["reallocated"]
+            or bool(state["reallocated"]) != bool(partial)
         ):
             raise Conflict("Exact terminal Salad route required for retained import.")
         # The job is complete: revoke the input ticket at control and clear this route's
         # input state so refresh_inputs can never re-mint after completion.
         self._revoke_inputs(state)
+        extra = {"partial": True} if partial else {}
         if destination is None:
-            return self.safety.import_retained(state)
-        return self.safety.import_retained(state, destination=destination)
+            return self.safety.import_retained(state, **extra)
+        return self.safety.import_retained(state, destination=destination, **extra)

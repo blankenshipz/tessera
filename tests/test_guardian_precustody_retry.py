@@ -55,16 +55,18 @@ def test_guardian_evidence_with_a_false_route_flag_is_retried_once(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "change",
+    ("change", "failure_class"),
     [
-        dict(custody_work_begun=True),  # post-custody
-        dict(custody_work_begun=None),  # unknown
-        dict(guardian_stop_cause="deadline"),
-        dict(provider_stop_confirmed=False),
-        dict(reason="provider_stopped_custody_unsealed"),
+        # post-custody allocation change with a confirmed stop: the retryable interruption
+        # class, here with no retry left to spend
+        (dict(custody_work_begun=True), "salad_interrupted"),
+        (dict(custody_work_begun=None), "salad_not_passed"),  # unknown
+        (dict(guardian_stop_cause="deadline"), "salad_not_passed"),
+        (dict(provider_stop_confirmed=False), "salad_not_passed"),
+        (dict(reason="provider_stopped_custody_unsealed"), "salad_not_passed"),
     ],
 )
-def test_post_custody_unknown_or_other_evidence_stays_permanent(tmp_path, change):
+def test_post_custody_unknown_or_other_evidence_stays_permanent(tmp_path, change, failure_class):
     world = SaladWorld(tmp_path, stages=_stages(1))
     _first_outcome(world, **{**GUARDIAN, **change})
     world.tick_until_phase("awaiting_charge")
@@ -72,7 +74,7 @@ def test_post_custody_unknown_or_other_evidence_stays_permanent(tmp_path, change
     world.tick_until(lambda: world.status() == "failed")
     failed = world.attempt()
     assert failed["status"] == "failed_permanent"
-    assert failed["failure_class"] == "salad_not_passed"
+    assert failed["failure_class"] == failure_class
     assert world.attempt()["attempt"] == 1
 
 

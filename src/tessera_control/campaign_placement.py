@@ -41,7 +41,7 @@ from . import (
     campaign_slot_reclaim,
     program_budget,
 )
-from .campaign_infra_retry import INFRA_PREFIX
+from .campaign_infra_retry import is_infra_class
 from .campaign_models import NormalStage, _validate_provider, stage_on_candidate, stage_provider
 from .campaign_providers import PINNED_FETCH_MANIFEST, runtime_capabilities_of
 from .concurrency_ceiling import operator_concurrency_ceiling
@@ -409,7 +409,7 @@ def _check(
 
 
 def _infra(attempt: Mapping[str, Any] | None) -> bool:
-    return attempt is not None and str(attempt["failure_class"] or "").startswith(INFRA_PREFIX)
+    return attempt is not None and is_infra_class(attempt["failure_class"])
 
 
 def reroute_due(base: NormalStage, attempts: list[Mapping[str, Any]]) -> bool:

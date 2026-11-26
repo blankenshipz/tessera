@@ -72,6 +72,57 @@ class CreateArtifactManifest(BaseModel):
     expected_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
     operation_id: str = Field(pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
     artifacts: list[ManifestArtifact] = Field(max_length=MAX_MANIFEST_ENTRIES)
+    # An attempt that ended interrupted or retryable lists only the declared outputs that
+    # reached custody (the diagnostic may be missing). Admission still hash-verifies each one.
+    partial: bool = False
+
+
+def manifest_is_partial(artifacts: list[dict[str, Any]], output_paths: Any) -> bool:
+    """True when a manifest lists fewer files than the plan declares.
+
+    The signal is the content itself, not a stored flag: a manifest that lacks any declared
+    output can never stand for a complete run, whoever wrote it."""
+    return {item["relative_path"] for item in artifacts} != set(output_paths)
+
+
+def _attempt_interrupted(connection: sqlite3.Connection, lease_id: str, operation_id: str) -> bool:
+    """True when the Salad attempt holding this lease and operation ended interrupted: its
+    route is flagged reallocated and the provider's own reads confirmed the stop. A lease with
+    no Salad attempt (any ordinary run) is never interrupted."""
+    from .salad_termination import provider_termination
+
+    attempt = connection.execute(
+        "SELECT route_id FROM campaign_salad_attempts WHERE lease_id=? AND operation_id=?",
+        (lease_id, operation_id),
+    ).fetchone()
+    if attempt is None or attempt["route_id"] is None:
+        return False
+    row = connection.execute(
+        """SELECT payload_json FROM events WHERE event_type='remote_execution.state'
+        AND json_extract(payload_json,'$.id')=? ORDER BY cursor DESC LIMIT 1""",
+        (attempt["route_id"],),
+    ).fetchone()
+    if row is None:
+        return False
+    route = json.loads(row["payload_json"])
+    return route.get("reallocated") is True and provider_termination(route).confirmed
+
+
+def grant_manifest_is_partial(
+    connection: sqlite3.Connection, grant: sqlite3.Row | dict[str, Any], artifacts_json: str
+) -> bool:
+    """Whether the manifest stored for ``grant`` lists fewer files than its approved plan
+    declares. An unreadable plan counts as partial: nothing then passes as complete."""
+    revision = connection.execute(
+        """SELECT execution_spec_json FROM task_revisions WHERE task_id = ? AND plan_digest = ?
+        AND revision < ? ORDER BY revision DESC LIMIT 1""",
+        (grant["task_id"], grant["plan_digest"], grant["task_revision"]),
+    ).fetchone()
+    try:
+        declared = json.loads(revision["execution_spec_json"])["output_paths"]
+        return manifest_is_partial(json.loads(artifacts_json), declared)
+    except (TypeError, KeyError, ValueError):
+        return True
 
 
 def _metadata(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -194,7 +245,12 @@ class ArtifactManifestStore(ArtifactStore):
             plan, _ = self._plan(connection, grant)
             spec = plan["execution_spec"]
             paths = [entry["relative_path"] for entry in body["artifacts"]]
-            if len(paths) != len(set(paths)) or set(paths) != set(spec["output_paths"]):
+            declared = set(spec["output_paths"])
+            if len(paths) != len(set(paths)) or (
+                not (set(paths) <= declared and paths)
+                if body["partial"]
+                else set(paths) != declared
+            ):
                 raise Conflict("Artifact manifest does not match declared output paths.")
             entries = sorted(body["artifacts"], key=lambda entry: entry["relative_path"])
             total = sum(entry["size"] for entry in entries)
@@ -274,7 +330,19 @@ class ArtifactManifestStore(ArtifactStore):
                     require_project_artifact_reference_admissible(
                         connection, grant["project_id"], entry["id"]
                     )
+            if (
+                body["partial"]
+                and manifest_is_partial(verified, declared)
+                and not _attempt_interrupted(connection, lease_id, body["operation_id"])
+            ):
+                # Control's own record decides, never the worker's say-so: a partial manifest
+                # is admitted only after the provider moved the instance after custody began.
+                raise Conflict("A partial artifact manifest needs an interrupted attempt.")
             canonical = self._canonical_payload(lease, grant, actor, verified, body["operation_id"])
+            if body["partial"] and manifest_is_partial(verified, declared):
+                # Part of the digest only when files are missing, so every complete manifest
+                # keeps its digest.
+                canonical["partial"] = True
             manifest_digest = canonical_digest(canonical)
             existing = connection.execute(
                 """SELECT id, project_id, task_id, grant_id, lease_id, worker_principal_id,

@@ -10,6 +10,7 @@ from typing import Any
 
 from . import campaign_allocation_instability, campaign_salad_fallback
 from . import campaign_class_fallback as class_fallback
+from .campaign_checkpoint import recorded_checkpoints
 from .campaign_gates import unlock_receipt_section
 from .campaign_heavy_guard import recorded as recorded_heavy_guards
 from .campaign_heavy_guard import refusals as recorded_heavy_refusals
@@ -17,6 +18,7 @@ from .campaign_heavy_remote import records as heavy_remote_records
 from .campaign_holdout import receipt_section as holdout_receipt_section
 from .campaign_image_pull import SECTION as IMAGE_PULL_SECTION
 from .campaign_image_pull import recorded as recorded_image_pulls
+from .campaign_infra_retry import is_infra_class
 from .campaign_io import stage_io
 from .campaign_models import (
     PUBLIC_FETCH_UNREPORTED,
@@ -687,7 +689,7 @@ def _attempt_entry(
     scratch = _scratch(connection, attempt, spec_stage)
     if scratch is not None:
         entry["scratch"] = scratch
-    if str(attempt["failure_class"] or "").startswith("infra_"):
+    if is_infra_class(attempt["failure_class"]):
         # ADR 0058: the attempt ended for an infrastructure reason and was retried (or, when
         # the bound was spent, the stage failed); the reason is the recorded detail.
         entry["infrastructure_retry"] = {"reason": attempt["failure_detail"]}
@@ -807,6 +809,8 @@ def _bound_section(connection: sqlite3.Connection, campaign: Any, stage_key: str
     entries = bound_receipt_entries(connection, campaign, stage_key) + refused_receipt_entries(
         connection, campaign, stage_key
     )
+    # ADR 0197: a checkpoint salvaged from an interrupted attempt is listed by digest too.
+    entries = entries + recorded_checkpoints(connection, campaign, stage_key)
     return {LAUNCH_INPUTS_KEY: entries} if entries else {}
 
 
