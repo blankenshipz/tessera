@@ -1766,53 +1766,13 @@ class ExperimentStore(EvidenceIngestMixin, ProviderFetchRecordMixin, Store):
                 raise Conflict("Admitted experiment attempt revision is no longer current.")
             if attempt["outcome"] is not None:
                 raise Conflict("Admitted experiment attempt is already resolved.")
-            self._validate_admitted_resolution_evidence(connection, attempt, body["outcome"])
-            now = utc_now()
-            connection.execute(
-                """INSERT INTO research_experiment_admitted_attempt_resolutions
-                (attempt_id,outcome,reason,expected_revision,decided_at,decided_by_principal_id)
-                VALUES (?,?,?,?,?,?)""",
-                (
-                    attempt_id,
-                    body["outcome"],
-                    body["reason"],
-                    body["expected_revision"],
-                    now,
-                    actor["id"],
-                ),
-            )
-            updated = _append_admitted_attempt_state(
-                connection,
-                attempt,
-                body["outcome"],
-                actor["id"],
-                reason=body["reason"],
-                operation_id=attempt["operation_id"],
-                outcome=body["outcome"],
-                resolved=True,
-            )
-            updated["result_assessment"] = None
-            updated["human_outcome"] = {
-                "outcome": body["outcome"],
-                "reason": body["reason"],
-                "expected_revision": body["expected_revision"],
-                "decided_at": now,
-                "decided_by_principal_id": actor["id"],
-            }
-            experiment = self._experiment(connection, actor, attempt["experiment_id"])
-            self._event(
+            updated = self.record_admitted_resolution(
                 connection,
                 actor,
-                experiment,
-                "experiment.admitted_attempt_resolved",
-                updated["revision"],
-                {
-                    "experiment_id": attempt["experiment_id"],
-                    "admitted_attempt_id": attempt_id,
-                    "operation_id": attempt["operation_id"],
-                    "outcome": body["outcome"],
-                    "scientific_validity": "not_assessed",
-                },
+                attempt,
+                body["outcome"],
+                body["reason"],
+                expected_revision=body["expected_revision"],
             )
             return 200, updated
 
@@ -1824,6 +1784,73 @@ class ExperimentStore(EvidenceIngestMixin, ProviderFetchRecordMixin, Store):
             digest,
             command,
         )
+
+    def record_admitted_resolution(
+        self,
+        connection: sqlite3.Connection,
+        actor: dict[str, Any],
+        attempt: dict[str, Any],
+        outcome: str,
+        reason: str | None,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Validate and record one resolution inside the caller's transaction.
+
+        The caller has scoped the attempt to the actor and checked it is unresolved; the
+        evidence rule (``_validate_admitted_resolution_evidence``) is applied here for every
+        caller, so a recovery takes the same path as ``resolve_admitted_attempt``."""
+        if expected_revision is None:
+            expected_revision = attempt["revision"]
+        self._validate_admitted_resolution_evidence(connection, attempt, outcome)
+        now = utc_now()
+        connection.execute(
+            """INSERT INTO research_experiment_admitted_attempt_resolutions
+            (attempt_id,outcome,reason,expected_revision,decided_at,decided_by_principal_id)
+            VALUES (?,?,?,?,?,?)""",
+            (
+                attempt["id"],
+                outcome,
+                reason,
+                expected_revision,
+                now,
+                actor["id"],
+            ),
+        )
+        updated = _append_admitted_attempt_state(
+            connection,
+            attempt,
+            outcome,
+            actor["id"],
+            reason=reason,
+            operation_id=attempt["operation_id"],
+            outcome=outcome,
+            resolved=True,
+        )
+        updated["result_assessment"] = None
+        updated["human_outcome"] = {
+            "outcome": outcome,
+            "reason": reason,
+            "expected_revision": expected_revision,
+            "decided_at": now,
+            "decided_by_principal_id": actor["id"],
+        }
+        experiment = self._experiment(connection, actor, attempt["experiment_id"])
+        self._event(
+            connection,
+            actor,
+            experiment,
+            "experiment.admitted_attempt_resolved",
+            updated["revision"],
+            {
+                "experiment_id": attempt["experiment_id"],
+                "admitted_attempt_id": attempt["id"],
+                "operation_id": attempt["operation_id"],
+                "outcome": outcome,
+                "scientific_validity": "not_assessed",
+            },
+        )
+        return updated
 
     def assess_attempt_result(
         self,
@@ -1945,7 +1972,14 @@ class ExperimentStore(EvidenceIngestMixin, ProviderFetchRecordMixin, Store):
                 "Execution success or cancellation requires a confirmed attributed terminal observation."
             )
         if outcome == "succeeded" and operation["desired_state"] != "admitted":
-            raise Conflict("Execution success cannot override a requested cancellation.")
+            # ADR 0075 amendment: the Salad live check's own reduce-only stop of a verified pass
+            # (cancel_cause.class "execution_complete") is the run's end, not a cancellation.
+            # Every other cancel, and any doubt about this one, still refuses the success.
+            from .campaign_completion_cancel import completion_evidence
+
+            evidence, _refusal = completion_evidence(connection, attempt["operation_id"])
+            if evidence is None:
+                raise Conflict("Execution success cannot override a requested cancellation.")
         if outcome == "cancelled" and operation["desired_state"] != "cancel_requested":
             raise Conflict("Cancelled outcome requires a requested cancellation.")
 

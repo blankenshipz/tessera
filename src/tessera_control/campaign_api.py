@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .api import idempotency_key
+from .campaign_completion_cancel import ReconcileCompletionCancels
 from .campaign_gate_models import RecordGateDecision
 from .campaign_models import ApproveCampaign, CancelCampaign, SubmitCampaign, approve_payload
 from .campaign_rerun import RerunCampaign
@@ -88,6 +89,25 @@ def cancel_campaign(
     payload = body.model_dump(mode="json")
     return result(
         store.cancel_campaign(actor, campaign_id, key, canonical_digest(payload), payload)
+    )
+
+
+@router.get("/campaigns/{campaign_id}/completion-cancels")
+def list_completion_cancels(campaign_id: str, actor: Actor, store: Campaigns) -> dict[str, Any]:
+    """Dry run (ADR 0075 amendment): each Salad attempt's completion-cancel recovery verdict."""
+    return store.list_completion_cancels(actor, campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/reconcile-completion-cancels")
+def reconcile_completion_cancels(
+    campaign_id: str, body: ReconcileCompletionCancels, actor: Actor, key: Key, store: Campaigns
+) -> JSONResponse:
+    """Recover attempts a completion shutdown cancel failed; idempotent, audited, no charge."""
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_completion_cancels(
+            actor, campaign_id, key, canonical_digest(payload), payload
+        )
     )
 
 

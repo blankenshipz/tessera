@@ -201,7 +201,9 @@ def resolve_artifact(
     """Resolve a pinned ``artifact`` input or raise Conflict (409).
 
     It resolves only to an output row of the same org and project, from a succeeded attempt
-    that the source campaign's terminal receipt lists, whose manifest is custody-released
+    that the source campaign's terminal receipt lists (or, for an attempt recovered after a
+    completion shutdown cancel, a sealed recovery addendum to exactly that receipt; ADR 0075
+    amendment), whose manifest is custody-released
     and ``retain_quarantined`` and holds a file with that sha256. Anything else is refused.
     It needs the source receipt's v2 ``io`` list, so a campaign that finished before schema
     v65 (a v1 receipt) can never be an artifact source.
@@ -250,6 +252,23 @@ def resolve_artifact(
                     and item.get("sha256") == source.sha256
                     for item in attempt.get("io", [])
                 )
+    if not listed:
+        # ADR 0075 amendment: an attempt a completion shutdown cancel failed, recovered after
+        # its campaign's receipt was written, is listed by a sealed recovery addendum bound to
+        # exactly that receipt's digest (the receipt itself is immutable).
+        from .campaign_completion_cancel import recovered_listing
+
+        listed = recovered_listing(
+            connection,
+            campaign["org_id"],
+            campaign["project_id"],
+            source.campaign_id,
+            verified.digest,
+            source.stage,
+            row["attempt_number"],
+            source.output,
+            source.sha256,
+        )
     if not listed:
         raise _refuse(source, "the source campaign receipt does not list it")
     manifest = connection.execute(

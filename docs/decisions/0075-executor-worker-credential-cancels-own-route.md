@@ -84,3 +84,39 @@ issue, and in a shared executor project it reaches every route in the project.
   committed between the two reads can no longer be read half-applied and refused as
   `Unauthorized`; a lock stays an `OperationalError`. A timed-out licence-label read stays a
   `TimeoutError`, not a `Forbidden`.
+
+## Amendment: the completion stop is not an execution cancellation
+
+- The live check's own cancel after a verified pass fences the grant and its operation
+  (`cancel_requested`) like any cancel. `resolve_attempt` read that fence as a request to
+  abandon the run and refused the success ("Execution success cannot override a requested
+  cancellation."), so the attempt failed `step_refused` and no output was indexed.
+- Control now records an execution success over a `cancel_requested` operation only when its
+  own records show the fence is exactly that completion stop: the campaign Salad attempt's
+  stored live receipt is `passed` / `verified_journey` with `stop_confirmed`,
+  `cancel_recorded` and `cancel_cause.class` exactly `execution_complete`; the exit is
+  confirmed; the route's stop provenance is the route's own dispatcher worker
+  (`cancel_authority: executor_worker`), the provider stop is confirmed and the route was
+  never reallocated; the grant's one cancel transition was that worker's; and the manifest is
+  the operation's own, lists exactly the receipt's outputs, is complete, custody-released at
+  its digest and retained, with every file's custody row at the listed sha256 and size. Any
+  other cancel (a person, an operator grant revoke, a campaign cancel, the deadline, the
+  budget, a guardian refusal, an error) or any missing piece still refuses. No receipt status
+  is added.
+- Attempts an earlier build failed this way are recovered by `POST
+  /campaigns/{id}/reconcile-completion-cancels` (`tessera campaign
+  reconcile-completion-cancels`; `GET /campaigns/{id}/completion-cancels` is the dry run),
+  for the owner's control credential only and only on a finished campaign. It requires the
+  exact refusal on a `failed_permanent` / `step_refused` attempt with Salad verdict `ok` and no
+  output rows, the same evidence as above, and a re-hash of every output's bytes in custody
+  (checked again, by chunk list, in the write transaction). In one transaction it resolves the
+  admitted attempt `succeeded` through the same evidence rule, writes the stage's output rows,
+  moves the attempt and stage to `succeeded` (the campaign too, with its stop reason cleared,
+  once every stage has succeeded) and appends a `campaign.completion_cancel_recovered` event
+  sealed by its own digest and bound to the terminal receipt's digest, listing before and
+  after states, the evidence and each output's name and sha256. Charges, holds and
+  settlements are left as they are. A second run is a no-op success.
+- The terminal receipt stays immutable. `resolve_artifact` accepts an output that receipt does
+  not list only when a sealed recovery event bound to exactly that receipt's digest lists the
+  same stage, attempt, output name and sha256; every other check is unchanged. The
+  human-only `reconcile-unclaimed-salad` hold is untouched.

@@ -465,6 +465,19 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   reduce-only: the cancel transaction fences never-leased grants, workers are not listed or
   leased grants of a campaign that is not `running`, and the runner revokes active grants, waits for confirmed termination,
   reconciles, revokes its own releases and ends the campaign `cancelled` (or `blocked`).
+- **Completion-cancel recovery (ADR 0075 amendment).** The Salad live check's own stop of a
+  verified pass (`cancel_cause.class` exactly `execution_complete`) no longer blocks the
+  attempt's success. An attempt an earlier build failed for it (`failed_permanent` /
+  `step_refused`, "Execution success cannot override a requested cancellation.") is recovered
+  with `tessera campaign reconcile-completion-cancels --campaign-id ID [--campaign-id ID2]
+  [--dry-run] --owner-header FILE` (the owner's control credential; an automation label is
+  allowed). It re-checks the evidence, re-hashes each output from custody, registers the
+  official output rows, moves the attempt and stage (and the campaign, once every stage has
+  succeeded) to `succeeded`, and appends one sealed `campaign.completion_cancel_recovered`
+  event bound to the immutable terminal receipt, which an `artifact` input then resolves
+  through. It never charges, never changes a settlement, refuses anything else (a real
+  cancel, a missing or mismatched digest, a receipt that is not a verified pass) and is a
+  no-op on a second run.
 - **Restart.** State lives in SQLite. After a restart the runner replays a `pending`
   intent with the same key, applies a `done` one, and never issues a second grant while
   an attempt's grant is unreconciled.

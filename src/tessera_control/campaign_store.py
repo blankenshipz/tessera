@@ -31,6 +31,7 @@ from . import (
 )
 from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_comparison import ComparisonRefused, compare_arms
+from .campaign_completion_cancel import CompletionCancelRecovery
 from .campaign_gates import (
     CampaignGateCommands,
     evaluate_unlock,
@@ -207,6 +208,7 @@ def _verified_spec_stages(spec_json: str, stored_digest: str) -> list | None:
 
 
 class CampaignStore(
+    CompletionCancelRecovery,
     CampaignGateCommands,
     CampaignSteeringCommands,
     StandingApprovalCommands,

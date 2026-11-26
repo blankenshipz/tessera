@@ -248,6 +248,26 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
     receipt = actions.add_parser("receipt", help="terminal campaign receipt")
     receipt.add_argument("--campaign-id", required=True)
     common(receipt, mutating=False)
+    recover = actions.add_parser(
+        "reconcile-completion-cancels",
+        help="recover Salad attempts a completion shutdown cancel failed (verified pass, "
+        "custody digests re-hashed); idempotent and audited, never charges",
+    )
+    recover.add_argument(
+        "--campaign-id",
+        required=True,
+        action="append",
+        help="a finished campaign to recover; repeat for several (never a warehouse walk)",
+    )
+    recover.add_argument(
+        "--reason",
+        default="Salad completion shutdown cancel recorded as success",
+        help="recorded on the audit event and the admitted attempt's resolution",
+    )
+    recover.add_argument(
+        "--dry-run", action="store_true", help="list each attempt's verdict; change nothing"
+    )
+    common(recover, mutating=True, label=True, optional_key=True)
     _add_standing_commands(actions, common)
 
 
@@ -353,6 +373,30 @@ def _cancel_running(transport, response: dict, key: str) -> list[dict]:
     return outcomes
 
 
+def _reconcile_completion_cancels(arguments: argparse.Namespace, transport, key) -> int:
+    """One call per named campaign: the dry-run read, or the idempotent recovery POST."""
+    from urllib.parse import quote
+
+    if not arguments.dry_run and not key:
+        key = "completion-cancels-" + uuid.uuid4().hex
+        print(f"idempotency-key: {key}", file=sys.stderr)
+    results, ok = [], True
+    for campaign_id in dict.fromkeys(arguments.campaign_id):
+        path = f"/campaigns/{quote(campaign_id, safe='')}"
+        if arguments.dry_run:
+            status, response = transport("GET", path + "/completion-cancels", None, None)
+        else:
+            body = {"reason": arguments.reason, "dry_run": False}
+            call_key = f"{key}-{campaign_id}"[:200]
+            status, response = transport(
+                "POST", path + "/reconcile-completion-cancels", body, call_key
+            )
+        ok = ok and 200 <= status < 300
+        results.append({"campaign_id": campaign_id, "status": status, "body": response})
+    print(json.dumps({"results": results}, sort_keys=True))
+    return 0 if ok else 1
+
+
 def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
     from urllib.parse import quote
 
@@ -437,6 +481,8 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
         key = getattr(arguments, "idempotency_key", None)
         project = quote(getattr(arguments, "project_id", "") or "", safe="")
         campaign = quote(getattr(arguments, "campaign_id", "") or "", safe="")
+        if action == "reconcile-completion-cancels":
+            return _reconcile_completion_cancels(arguments, transport, key)
         if action == "standing":
             call = _standing_call(arguments, project, key)
         elif action == "submit":
