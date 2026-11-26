@@ -59,6 +59,16 @@ keeps accruing past a deadline while a stop is unconfirmed.
   the provisioning deadline. Image pull and allocation (up to about 45 minutes
   on a cold node) happen inside it and are unbilled. If the instance is never
   seen running, the guardian stops the group at this deadline.
+  The window must cover the declared run **plus** a named provisioning allowance
+  (`SALAD_PROVISIONING_ALLOWANCE_SECONDS`, 1500 s: the guardian's default 600 s
+  allocation deadline plus 900 s for image pull and input fetch; Salad documents
+  that bringing containers up can take 20 minutes or more). The guardian's deadline is
+  wall-clock, so a window equal to the run silently takes provisioning out of the end of
+  the run. A stage whose run plus allowance exceeds the profile's `route_max_seconds` is
+  refused at submit (`check_stage`) and at route derivation, with a reason naming the
+  declared run, the allowance and the ceiling; the window is never silently shortened.
+  The plan, its approval digest and the receipt show the window, the allowance and the
+  window's source (`profile_route_max_seconds` or `plan_bound`).
 - **Running window** (`running_seconds`): the billed-time bound. Source: the
   smoke workload's own runtime argument (`MAX_SECONDS` in the approved
   `profile.execution.argv`, parsed by the existing `_request`). It is already

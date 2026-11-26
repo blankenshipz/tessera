@@ -31,6 +31,7 @@ _FAILURES = {
     "t2_declared_exit_code": "the program exited with a code the campaign declares as a failure",
     "undeclared_exit_code": "the program exited with a code the campaign did not declare",
     "salad_not_passed": "the cloud run did not pass its checks",
+    "route_deadline_reached": "the cloud run was stopped at its route deadline",
     "observed_unknown": "the platform could not confirm what happened to the run",
     "quarantine_failed": "the outputs could not be collected safely",
     "missing_receipt": "the worker never sent its run receipt",

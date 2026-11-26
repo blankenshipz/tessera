@@ -41,7 +41,7 @@ def cpu(name: str = "cpu-main", **over):
         cpu_millicores=2000,
         memory_mb=4096,
         disk_mb=1024,
-        route_max_seconds=900,
+        route_max_seconds=3600,
         capability_environment_id="salad-cpu-campaign",
         artifact_destination="artifact-ref:quarantine",
         checkpoint_destination="checkpoint-ref:external",
@@ -186,7 +186,7 @@ def test_a_fallback_may_differ_in_country_shape_rates_and_ceilings():
             cpu_rate=dict(vcpu_hour_usd="0.05", memory_gb_hour_usd="0.02"),
             max_run_cents=50,
             max_task_cents=60,
-            route_max_seconds=1200,
+            route_max_seconds=1800,
             salad_project="other-project",
         ),
     )

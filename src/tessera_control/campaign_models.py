@@ -2118,6 +2118,7 @@ FAILURE_CLASSES = (
     "t2_declared_exit_code",
     "undeclared_exit_code",
     "salad_not_passed",
+    "route_deadline_reached",
     "observed_unknown",
     "quarantine_failed",
     "missing_receipt",

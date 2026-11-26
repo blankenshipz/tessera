@@ -239,8 +239,9 @@ It is reviewed profile data, never an execution grant.
   one. `custody_host` is the reviewed destination the safety service checks and
   the one custody accepts, not a network restriction.
 - **Route window versus plan.** The plan's `max_duration_seconds` stays within
-  the shared 3600 s limit; Salad routes may exceed it by a fixed 3600 s unbilled
-  provisioning allowance (`route_window_limit`), up to 7200 s.
+  the shared 3600 s limit; Salad routes may exceed it by up to 3600 s of window headroom
+  (`route_window_limit`, at most 7200 s). The stage's own admission needs the declared run
+  plus the 1500 s provisioning allowance to fit the profile's `route_max_seconds`.
 - **Safety service.** `_request_for(proposal)` dispatches: smoke profiles keep
   parsing their argv; `workload_v1` derives the same request dictionary
   (operation, epoch, destination, watchdog, `max_seconds`, output caps) from the

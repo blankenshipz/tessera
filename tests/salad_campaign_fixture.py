@@ -48,7 +48,7 @@ def profile_data(env: Env, **over: Any) -> dict[str, Any]:
         cpu_millicores=1000,
         memory_mb=1024,
         disk_mb=1024,
-        route_max_seconds=900,
+        route_max_seconds=3600,
         capability_environment_id="salad-gpu-campaign",
         artifact_destination="artifact-ref:quarantine",
         checkpoint_destination="checkpoint-ref:external",

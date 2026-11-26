@@ -39,7 +39,11 @@ from .campaign_store import _GuardianFinal
 from .external_operations import current_operation_reconciliation
 from .guardian_record_reader import validate_frame_record
 from .programs import program_context
-from .remote_execution_models import ExecutionSelection, TargetPolicy
+from .remote_execution_models import (
+    ExecutionSelection,
+    TargetPolicy,
+    salad_route_window_description,
+)
 from .salad_campaign_profiles import (
     DATA_POLICY_PUBLIC,
     DATA_POLICY_TRUST,
@@ -888,7 +892,14 @@ class SaladStageDriver:
                     "max_wall_seconds": max_seconds,
                     "max_gpu_hours": round(max_seconds / 3600, 6),
                     "target": SALAD_TARGET,
-                    "resources": "One Salad GPU container, exact reviewed class",
+                    "resources": (
+                        "One Salad GPU container, exact reviewed class; "
+                        + salad_route_window_description(
+                            max_seconds,
+                            stage_workload(stage, spec_stage).workload_seconds,
+                            profile.route_max_seconds,
+                        )
+                    ),
                 },
                 "missing_prerequisites": [],
             },

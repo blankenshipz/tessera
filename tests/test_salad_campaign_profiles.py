@@ -47,7 +47,7 @@ def profile_data(**over):
         cpu_millicores=1000,
         memory_mb=1024,
         disk_mb=1024,
-        route_max_seconds=900,
+        route_max_seconds=3600,
         capability_environment_id="salad-gpu-campaign",
         artifact_destination="artifact-ref:quarantine",
         checkpoint_destination="checkpoint-ref:external",
@@ -159,9 +159,9 @@ def test_selection_is_deterministic_and_matches_the_setup_script():
     assert first.model_dump_json() == second.model_dump_json()
     assert first.salad.group == "attempt-" + OPERATION
     # Billed plan time plus the unbilled provisioning allowance, capped by the profile.
-    assert first.resources.max_seconds == 900
+    assert first.resources.max_seconds == 3600
     long = derive_selection(profile, contract, **{**arguments, "plan_max_seconds": 100})
-    assert long.resources.max_seconds == min(900, 100 + 3600)
+    assert long.resources.max_seconds == min(3600, 100 + 3600)
 
     args = types.SimpleNamespace(
         workload=contract,

@@ -51,6 +51,7 @@ from pydantic import (
 )
 
 from . import maintenance_lock
+from .remote_execution_models import SALAD_PROVISIONING_ALLOWANCE_SECONDS
 from .salad_campaign_profiles import (
     DATA_POLICIES,
     DATA_POLICY_PUBLIC,
@@ -59,6 +60,7 @@ from .salad_campaign_profiles import (
     derive_selection,
     load_profiles,
     proxy_policy,
+    route_window_source,
 )
 from .salad_termination import provider_termination
 from .salad_workload_contract import WorkloadContractV1
@@ -772,6 +774,11 @@ class SaladCampaignExecutor:
             max_seconds=max_seconds,
             max_polls=min(MAX_POLLS, max(30, -(-max_seconds // 5))),
             source_revision=self.config.source_revision,
+        )
+        config["route_window"] = dict(
+            seconds=max_seconds,
+            provisioning_allowance_seconds=SALAD_PROVISIONING_ALLOWANCE_SECONDS,
+            source=route_window_source(profile, max_seconds),
         )
         if watch_signals_file is not None:
             config["watch_signals_file"] = str(watch_signals_file)
@@ -1568,6 +1575,19 @@ def project_guardian_final(
         projected["allocation_timeout"] = {
             "elapsed_seconds": timeout.get("elapsed_seconds"),
             "deadline_seconds": timeout.get("deadline_seconds"),
+        }
+    cut = status.get("route_deadline")
+    if (
+        status.get("stop_cause") == "deadline"
+        and type(cut) is dict
+        and type(cut.get("running_seconds")) is int
+        and cut["running_seconds"] >= 0
+        and cut.get("limit") in {"running_cap", "route_deadline"}
+        and "allocation_timeout" not in projected
+    ):
+        projected["route_deadline"] = {
+            "running_seconds": cut["running_seconds"],
+            "limit": cut["limit"],
         }
     rebinds = _project_rebinds(status.get("prestart_rebinds"))
     if rebinds is not None:

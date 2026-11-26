@@ -486,6 +486,15 @@ attempt is recorded as the retryable `infra_allocation_timeout` rather than a pe
 `salad_not_passed`. In that case `deadline_seconds` repeats the elapsed time (the route limit, not
 the allocation setting).
 
+When the route limit stops a run after an instance was seen (the guardian's `deadline` stop with
+no allocation-timeout evidence), the status carries `route_deadline.running_seconds` (elapsed
+running seconds) and `route_deadline.limit`: `route_deadline` when the route window itself ran
+out, `running_cap` when the run overran its own declared-run cap. Only the former is recorded as
+`failed_permanent` with failure class `route_deadline_reached`; a `running_cap` stop stays
+`salad_not_passed` (the workload overran). It is not retried here. A trainer that stops
+itself and exits 0 remains `succeeded` at platform level; the receipt carries
+`completeness_guard: "experiment"` because output completeness is the experiment's own guard.
+
 ## Allocation change before anything ran
 
 Salad can reschedule a container group while its image is still being pulled. An allocation change

@@ -63,6 +63,15 @@ class _AllocationTimeout(BaseModel):
     deadline_seconds: Annotated[int, Field(ge=1, le=86400)]
 
 
+class _RouteDeadline(BaseModel):
+    """The route deadline cut a run after an instance was seen (elapsed running seconds)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    running_seconds: Annotated[int, Field(ge=0, le=86400)]
+    # Which limit stopped the run: the declared-run cap or the route window itself.
+    limit: Literal["running_cap", "route_deadline"]
+
+
 class _PrestartRebind(BaseModel):
     """One re-bind of the guardian to a new allocation before anything ran (bounded text)."""
 
@@ -97,6 +106,8 @@ class _GuardianFinal(BaseModel):
     # Present only for a group cancelled at its allocation deadline (stop cause
     # ``allocation_timeout``), so the stored shape of every other run is unchanged.
     allocation_timeout: _AllocationTimeout | None = None
+    # Present only for a deadline stop after an instance was seen (and which limit fired).
+    route_deadline: _RouteDeadline | None = None
     # Present only when the guardian re-bound its allocation before anything ran.
     prestart_rebinds: _PrestartRebinds | None = None
 
@@ -318,7 +329,7 @@ class SaladWorkerCommands:
                         for key, value in body.guardian_final.model_dump().items()
                         # Absent unless used, so the stored shape (and its digest) of every
                         # run without an allocation timeout or a pre-start re-bind is unchanged.
-                        if key not in ("allocation_timeout", "prestart_rebinds")
+                        if key not in ("allocation_timeout", "prestart_rebinds", "route_deadline")
                         or value is not None
                     },
                     sort_keys=True,

@@ -33,7 +33,7 @@ def make(name, gpu_class=GPU_A, org="org-1", run=50, **over):
         cpu_millicores=2000,
         memory_mb=2048,
         disk_mb=1024,
-        route_max_seconds=900,
+        route_max_seconds=3600,
         capability_environment_id="salad-campaign",
         artifact_destination="artifact-ref:quarantine",
         checkpoint_destination="checkpoint-ref:external",

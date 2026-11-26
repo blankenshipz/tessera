@@ -31,7 +31,13 @@ from .campaign_image_pull import (
     MAX_IMAGE_PULL_BYTES,
 )
 from .campaign_models import SaladProgramTemplate
-from .remote_execution_models import CpuRate, ExecutionSelection, TargetPolicy, route_window_limit
+from .remote_execution_models import (
+    CpuRate,
+    ExecutionSelection,
+    TargetPolicy,
+    route_window_limit,
+    salad_route_window_refusal,
+)
 from .salad_proxy_contract import ManagementCredential, ProxyPolicy
 from .salad_workload_contract import WorkloadContractV1
 from .store import canonical_digest
@@ -440,6 +446,13 @@ def derived_digests(
     )
 
 
+def route_window_source(profile: SaladCampaignProfile, window_seconds: int) -> str:
+    """Which bound set the window: the profile's ceiling, or the plan's own headroom."""
+    return (
+        "profile_route_max_seconds" if window_seconds == profile.route_max_seconds else "plan_bound"
+    )
+
+
 def derive_selection(
     profile: SaladCampaignProfile,
     contract: WorkloadContractV1,
@@ -452,6 +465,11 @@ def derive_selection(
     plan_max_seconds: int,
     data_policy: str = DATA_POLICY_PUBLIC,
 ) -> ExecutionSelection:
+    refusal = salad_route_window_refusal(
+        contract.workload_seconds, profile.route_max_seconds, "profile route_max_seconds"
+    )
+    if refusal is not None:
+        raise ValueError(refusal)
     declaration = capability_declaration(profile, contract, image)
     execution = execution_profile(
         profile,

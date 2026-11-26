@@ -243,7 +243,7 @@ def _spec(world, names, **over):
 
 def test_registered_alternates_submit_and_the_stored_spec_lists_them(tmp_path):
     world = SaladWorld(tmp_path)
-    _multi(world, _alt("gpu-alt", route_max_seconds=300))
+    _multi(world, _alt("gpu-alt", route_max_seconds=1600))
     status, result = _submit(world, _spec(world, ["gpu-alt"]))
     assert status == 201
     stored = world.row("SELECT spec_json FROM campaigns WHERE id=?", result["id"])["spec_json"]
@@ -256,7 +256,9 @@ def test_alternates_need_the_prestart_move_bound(tmp_path):
     lists alternates with that bound at 0 could never reach them: refused at submit, however
     many scientific attempts it allows."""
     world = SaladWorld(tmp_path)
-    _multi(world, _alt("gpu-alt", route_max_seconds=300), _alt("gpu-third", route_max_seconds=200))
+    _multi(
+        world, _alt("gpu-alt", route_max_seconds=1600), _alt("gpu-third", route_max_seconds=1700)
+    )
     for attempts in (1, 3):
         spec = _spec(world, ["gpu-alt", "gpu-third"], retry={"max_attempts": attempts})
         with pytest.raises(Conflict, match=r"retry\.max_class_fallbacks is 0"):
@@ -420,8 +422,8 @@ class AltWorld(SaladWorld):
         # A shorter route window gives the alternate its own plan digest.
         _multi(
             self,
-            _alt("gpu-alt", route_max_seconds=300, preapprove_reviews=True),
-            _alt("gpu-third", route_max_seconds=200, preapprove_reviews=True),
+            _alt("gpu-alt", route_max_seconds=1600, preapprove_reviews=True),
+            _alt("gpu-third", route_max_seconds=1700, preapprove_reviews=True),
         )
 
     def submitted(self) -> dict:

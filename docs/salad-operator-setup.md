@@ -353,6 +353,16 @@ amendment) additionally need an owner-only campaign profile file
 image is not on that list is refused at submit, approval and dispatch. See
 [campaigns](campaigns.md).
 
+### Route window arithmetic (`route_max_seconds`)
+
+A stage is admitted only when its declared run plus the 1500 s
+provisioning allowance (600 s allocation + 900 s image pull and input fetch) fits the profile's
+`route_max_seconds`. With `route_max_seconds: 3600` the longest admitted run is 2100 s; a 3600 s
+run needs `route_max_seconds` of at least 5100 (7200 is the schema ceiling and leaves 5700 s).
+Raising a profile's `route_max_seconds` is a separate reviewed operator step: it changes the
+profile's plan digest and any pre-approval bound to it. The platform's own 3600 s cap on
+declared adapted runs is unchanged.
+
 ### CPU capacity fallback (`fallback_profiles`)
 
 A CPU profile may name up to three other profiles of the same file that a stage running on it may

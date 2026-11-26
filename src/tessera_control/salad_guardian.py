@@ -399,6 +399,10 @@ class SaladGuardian:
             node_writers="unknown",
             quarantine=True,
         )
+        deadline_run = self._deadline_after_instance(operation, result["stop_cause"])
+        if deadline_run is not None:
+            # Additive: the route deadline cut a run after an instance was seen.
+            result["route_deadline"] = deadline_run
         timeout = self._allocation_timeout_record(operation)
         if timeout is not None:
             # Additive: present only for a group cancelled because nothing was ever allocated.
@@ -421,6 +425,37 @@ class SaladGuardian:
             post["limit"] = POSTSTART_READ_RETRY_LIMIT
             result["poststart_read_retries"] = post
         return result
+
+    def _deadline_after_instance(self, operation: str, cause) -> dict | None:
+        """Elapsed running seconds and the limit that fired (``running_cap`` or
+        ``route_deadline``) when the deadline stop came after an instance was seen
+        (never for a group that never showed one: that is an allocation timeout)."""
+        if cause != "deadline":
+            return None
+        found = self.db.execute(
+            "SELECT instance_seen,first_running,assignment FROM assignments WHERE operation=?",
+            (operation,),
+        ).fetchone()
+        if found is None or not (found[0] or found[1] is not None):
+            return None
+        stopped = self.db.execute(
+            "SELECT at FROM events WHERE operation=? AND kind=? ORDER BY sequence LIMIT 1",
+            (operation, STOP_CAUSE_PREFIX + "deadline"),
+        ).fetchone()
+        if stopped is None:
+            return None
+        running = 0 if found[1] is None else max(0, int(stopped[0] - found[1]))
+        # Which limit fired: the declared-run cap (first running + running_seconds) or the
+        # route deadline itself. Only the latter is the route window running out.
+        limit = "route_deadline"
+        try:
+            assigned = json.loads(found[2])
+            cap = assigned.get("running_seconds")
+            if found[1] is not None and cap is not None and found[1] + cap < assigned["deadline"]:
+                limit = "running_cap"
+        except (ValueError, KeyError, TypeError):
+            limit = "unknown"
+        return {"running_seconds": running, "limit": limit}
 
     def _allocation_timeout_record(self, operation: str) -> dict | None:
         found = self.db.execute(
@@ -873,8 +908,7 @@ class SaladGuardian:
                                     "elapsed_seconds": int(allocation_waited),
                                     "deadline_seconds": (
                                         int(allocation_waited)
-                                        if self.allocation_seconds is None
-                                        or reason == "deadline"
+                                        if self.allocation_seconds is None or reason == "deadline"
                                         else self.allocation_seconds
                                     ),
                                 },

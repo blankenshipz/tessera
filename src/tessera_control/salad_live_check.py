@@ -228,7 +228,7 @@ def _config(path):
     }
     if (
         type(value) is not dict
-        or set(value) - {WATCH_SIGNALS_KEY} != keys
+        or set(value) - {WATCH_SIGNALS_KEY, ROUTE_WINDOW_KEY} != keys
         or value["schema"] != "tessera.salad.live-config.v1"
     ):
         raise ValueError("closed server config required")
@@ -279,6 +279,16 @@ def _config(path):
     socket_path = Path(value["guardian_socket"])
     if not socket_path.is_absolute() or ".." in socket_path.parts:
         raise ValueError("explicit guardian socket required")
+    if ROUTE_WINDOW_KEY in value:
+        window = value[ROUTE_WINDOW_KEY]
+        if (
+            type(window) is not dict
+            or set(window) != {"seconds", "provisioning_allowance_seconds", "source"}
+            or type(window["seconds"]) is not int
+            or type(window["provisioning_allowance_seconds"]) is not int
+            or window["source"] not in {"profile_route_max_seconds", "plan_bound"}
+        ):
+            raise ValueError("closed route window required")
     if WATCH_SIGNALS_KEY in value:
         _watch_signals_path(value[WATCH_SIGNALS_KEY])
     return value, policy, hashlib.sha256(raw).hexdigest()
@@ -287,6 +297,9 @@ def _config(path):
 # Optional, off when absent (ADR 0111): where the stage watcher reads this route's
 # non-secret signal snapshot. The file need not exist yet; its directory must be private.
 WATCH_SIGNALS_KEY = "watch_signals_file"
+# Optional closed record of the approved route window (seconds, provisioning allowance, source),
+# shown on the receipt so a reviewer reads the window the run really had.
+ROUTE_WINDOW_KEY = "route_window"
 
 
 def _watch_signals_path(value):
@@ -1159,6 +1172,7 @@ def _drive(
     clock,
     watch_signals_file=None,
     wall_clock=_wall_now,
+    route_window=None,
 ):
     """Internal orchestration seam; isolated fake sessions prove only local behavior.
 
@@ -1169,6 +1183,10 @@ def _drive(
     receipt = {
         "schema": "tessera.salad.live-check.v1",
         "source_revision": source_revision,
+        # The window the run had (None when the caller did not name it), and who guards
+        # completeness: a trainer that stops itself and exits 0 passes at platform level.
+        "route_window": route_window,
+        "completeness_guard": "experiment",
         "status": "inconclusive",
         "reason": "journey_incomplete",
         "stop_confirmed": False,
@@ -1796,6 +1814,7 @@ def run(session, *, route_id, source_revision, receipt_directory, max_seconds=30
         sleep=time.sleep,
         clock=time.monotonic,
         watch_signals_file=session.config.get(WATCH_SIGNALS_KEY),
+        route_window=session.config.get(ROUTE_WINDOW_KEY),
     )
     _write_receipt(receipt_directory, receipt)
     return receipt

@@ -51,17 +51,64 @@ class RemoteResources(Frozen):
         return self
 
 
-# Salad routes bill only running time; the route window may exceed the approved plan
-# duration by this unbilled provisioning (allocation + image pull) allowance. The
-# shared Kubernetes plan limit stays 3600 s.
-SALAD_PROVISIONING_ALLOWANCE_SECONDS = 3600
+# Salad routes bill only running time, but the guardian's route deadline is wall-clock from
+# arming: allocation, image pull and input fetch all spend it before the workload's own
+# clock starts. A stage's route window must therefore cover the declared run PLUS this
+# provisioning allowance; the guardian never shortens the run to fit.
+#
+# Allocation: the guardian's default allocation deadline (a group with no machine after this
+# long is cancelled, ``salad_guardian.DEFAULT_ALLOCATION_SECONDS``).
+SALAD_ALLOCATION_ALLOWANCE_SECONDS = 600
+# Image pull + input fetch after a machine is assigned: Salad documents that bringing
+# containers up "can occasionally take 20 minutes or more" (container-group deployment
+# lifecycle); the allowance is 15 minutes of that after the allocation share above.
+SALAD_IMAGE_PULL_INPUT_ALLOWANCE_SECONDS = 900
+SALAD_PROVISIONING_ALLOWANCE_SECONDS = (
+    SALAD_ALLOCATION_ALLOWANCE_SECONDS + SALAD_IMAGE_PULL_INPUT_ALLOWANCE_SECONDS
+)
+# Schema headroom: the largest route window a plan may carry beyond its own duration. The
+# profile's ``route_max_seconds`` (itself at most 7200) is the operative ceiling.
+SALAD_ROUTE_WINDOW_HEADROOM_SECONDS = 3600
 
 
 def route_window_limit(target, plan_max_duration_seconds):
     """Largest route window a plan admits for this target."""
     if target == "salad_container":
-        return plan_max_duration_seconds + SALAD_PROVISIONING_ALLOWANCE_SECONDS
+        return plan_max_duration_seconds + SALAD_ROUTE_WINDOW_HEADROOM_SECONDS
     return plan_max_duration_seconds
+
+
+def salad_route_need_seconds(declared_run_seconds):
+    """Route window one Salad stage needs: declared run plus the provisioning allowance."""
+    return declared_run_seconds + SALAD_PROVISIONING_ALLOWANCE_SECONDS
+
+
+def salad_route_window_refusal(declared_run_seconds, ceiling_seconds, label="route_max_seconds"):
+    """Reason text when the declared run cannot fit its route window ceiling, else None."""
+    need = salad_route_need_seconds(declared_run_seconds)
+    if need <= ceiling_seconds:
+        return None
+    return (
+        f"declared run {declared_run_seconds}s plus the {SALAD_PROVISIONING_ALLOWANCE_SECONDS}s "
+        f"provisioning allowance (allocation {SALAD_ALLOCATION_ALLOWANCE_SECONDS}s + image pull "
+        f"and input fetch {SALAD_IMAGE_PULL_INPUT_ALLOWANCE_SECONDS}s) needs a {need}s route "
+        f"window, above the {ceiling_seconds}s ceiling ({label}); shorten the run or have the "
+        "operator raise the profile's route_max_seconds (at most 7200)"
+    )
+
+
+def salad_route_window_description(window_seconds, declared_run_seconds, profile_ceiling):
+    """Plan/review text: effective window, its source and the allowance."""
+    source = (
+        f"profile route_max_seconds {profile_ceiling}"
+        if window_seconds == profile_ceiling
+        else f"plan bound (declared run {declared_run_seconds}s "
+        f"+ {SALAD_ROUTE_WINDOW_HEADROOM_SECONDS}s)"
+    )
+    return (
+        f"route window {window_seconds}s (source: {source}); provisioning allowance "
+        f"{SALAD_PROVISIONING_ALLOWANCE_SECONDS}s; declared run {declared_run_seconds}s"
+    )
 
 
 _Rate = Annotated[str, StringConstraints(pattern=r"^(?:0|[1-9][0-9]{0,3})(?:\.[0-9]{1,6})?$")]

@@ -47,6 +47,7 @@ from .campaign_salad import (
 from .campaign_salad_adapter import CUSTODY_KINDS, bind_workload, is_late_bound
 from .campaign_store import SALAD_REFUSAL
 from .models import ExecutionSpec
+from .remote_execution_models import salad_route_window_refusal
 from .salad_alternate_profiles import operator_chain, profile_order
 from .salad_campaign_profiles import (
     PROFILES_SCHEMA,
@@ -510,6 +511,14 @@ class SaladRouteProvider:
             )
         self._check_worker(connection, project["org_id"], project_id, config.worker_principal_id)
         self._check_credential(profile)
+        # The route window must cover provisioning plus the declared run; never shortened.
+        refusal = salad_route_window_refusal(
+            config.workload.workload_seconds,
+            profile.route_max_seconds,
+            f"profile {profile.name!r} route_max_seconds",
+        )
+        if refusal is not None:
+            raise Conflict(f"Salad stage refused: {refusal}.")
         refusal = public_artifact_refusal(stage, config)
         if refusal is not None:
             raise Conflict(f"Salad stage refused: {refusal}.")
@@ -657,6 +666,21 @@ class SaladRouteProvider:
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
             )
+        deadline = self._route_deadline(rt, attempt)
+        if deadline is not None:
+            # The guardian stopped a run after an instance was seen because the route window
+            # ran out: not a workload bug, and not retried here (retry policy is separate).
+            return Observation(
+                "failed_permanent",
+                failure_class="route_deadline_reached",
+                detail=(
+                    f"route_deadline_reached: stopped at the route deadline after "
+                    f"{deadline['running_seconds']}s running"
+                )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         failure_detail = str(attempt.get("failure_detail") or "")
         # The class is durable: before the runner records its observation the detail carries it;
         # afterwards the stored failure_class (and the ``salad:``-prefixed detail) do, so a
@@ -684,6 +708,29 @@ class SaladRouteProvider:
             evidence_digest=evidence,
             manifest_id=attempt.get("manifest_id"),
         )
+
+    @staticmethod
+    def _route_deadline(rt: RunnerServices, attempt: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The guardian's recorded route-deadline cut after an instance was seen, or None."""
+        if rt is None or attempt.get("id") is None:
+            return None
+        row = rt._one(
+            "SELECT guardian_final_json FROM campaign_salad_attempts WHERE attempt_id=?",
+            (attempt["id"],),
+        )
+        if row is None or row["guardian_final_json"] is None:
+            return None
+        try:
+            found = json.loads(row["guardian_final_json"]).get("route_deadline")
+        except ValueError:
+            return None
+        if (
+            type(found) is dict
+            and type(found.get("running_seconds")) is int
+            and found.get("limit") == "route_deadline"
+        ):
+            return found  # a declared-run cap overrun is the workload's, not the route's
+        return None
 
     @staticmethod
     def _allocation_timeout(
