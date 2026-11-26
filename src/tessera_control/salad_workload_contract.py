@@ -40,6 +40,21 @@ OUTPUT_NAME_RE = re.compile(OUTPUT_NAME_PATTERN)
 # Platform total across all declared outputs: SaladExecution and ExecutionSpec cap
 # max_output_bytes at 16 MiB, so custody never reserves more than that per operation.
 MAX_TOTAL_OUTPUT_BYTES = 16 * 1024 * 1024
+# Reserved declared output names of the gpu_runtime_v1 failure custody. The checkpoint is
+# written atomically by the entry and re-uploaded (superseded) while it runs; the diagnostic
+# is the runtime's header plus the bounded tail of the entry's stdout/stderr.
+CHECKPOINT_OUTPUT_NAME = "checkpoint.bin"
+DIAGNOSTIC_OUTPUT_NAME = "runtime-diagnostic.log"
+DIAGNOSTIC_MIN_BYTES = 1024
+# Custody accepts at most this many uploads of the checkpoint under one operation (periodic
+# ones plus the final one); each supersedes the previous.
+MAX_CHECKPOINT_UPLOADS = 10
+# Closed reasons of POST /v1/workload/failed; the guardian records ``workload_failed:<reason>``.
+WORKLOAD_FAILURE_REASONS = (
+    "entry", "entry_timeout", "output", "output_plan", "custody", "deadline", "input", "fetch",
+    "install", "manifest", "internal",
+)  # fmt: skip
+WORKLOAD_FAILED_CAUSE_PREFIX = "workload_failed:"
 # Shape the original single-object endpoint (/v1/workload/output) still accepts.
 LEGACY_OUTPUT_NAME = "output.json"
 LEGACY_OUTPUT_MAX_BYTES = 65536
@@ -642,6 +657,17 @@ class WorkloadContractV1(Closed):
         return self
 
     @model_validator(mode="after")
+    def reserved_outputs(self):
+        sizes = {o.name: o.max_bytes for o in self.outputs}
+        if CHECKPOINT_OUTPUT_NAME in sizes and DIAGNOSTIC_OUTPUT_NAME not in sizes:
+            # The final upload of the diagnostic is what completes the outputs, so a
+            # checkpoint uploaded while the entry runs can never end the run early.
+            raise ValueError("a declared checkpoint output requires the diagnostic output")
+        if sizes.get(DIAGNOSTIC_OUTPUT_NAME, DIAGNOSTIC_MIN_BYTES) < DIAGNOSTIC_MIN_BYTES:
+            raise ValueError("the diagnostic output must allow at least 1 KiB")
+        return self
+
+    @model_validator(mode="after")
     def runtime_binding(self):
         if self.runtime == GPU_RUNTIME_V1:
             check_gpu_runtime_argv(self)
@@ -688,6 +714,18 @@ class WorkloadContractV1(Closed):
 def output_chunk_count(size):
     """Chunks a file of ``size`` bytes uploads as; an empty file is one empty chunk."""
     return max(1, -(-size // OUTPUT_CHUNK_BYTES))
+
+
+def output_call_budget(declared):
+    """Authenticated chunk calls one operation may make, for ``{name: max_bytes}``.
+
+    Twice the planned chunks (retries and replays), plus the superseding uploads of a
+    declared checkpoint. Custody and the service charge the same number."""
+    budget = 2 * sum(output_chunk_count(cap) for cap in declared.values())
+    checkpoint = declared.get(CHECKPOINT_OUTPUT_NAME)
+    if checkpoint is not None:
+        budget += MAX_CHECKPOINT_UPLOADS * output_chunk_count(checkpoint)
+    return budget
 
 
 def capability_network_matches(execution, declaration):

@@ -29,9 +29,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
 from .salad_workload_contract import (
+    CHECKPOINT_OUTPUT_NAME,
     MAX_TOTAL_OUTPUT_BYTES,
     OUTPUT_CHUNK_BYTES,
     OUTPUT_NAME_RE,
+    output_call_budget,
     output_chunk_count,
 )
 
@@ -324,7 +326,7 @@ class SaladCustody:
             if not row or row[0] or row[1] is None:
                 raise ValueError("inventory_closed_or_missing")
             declared = dict(json.loads(row[1]))
-            budget = 2 * sum(output_chunk_count(cap) for cap in declared.values())
+            budget = output_call_budget(declared)
             if row[2] >= budget + CHUNK_RETRY_SLACK:
                 raise ValueError("chunk_budget_exhausted")
             self.db.execute(
@@ -345,6 +347,17 @@ class SaladCustody:
                 "SELECT digest,checksum,size,consumed FROM tickets WHERE binding=? AND name=?",
                 (key, name),
             ).fetchone()
+            if (
+                ticket is not None
+                and name == CHECKPOINT_OUTPUT_NAME
+                and ticket[:3] != (upload, checksum, size)
+            ):
+                # The one superseding output: a newer checkpoint replaces the previous
+                # one (complete or not) under the same operation. The chunk-call budget
+                # bounds how often; every other output stays write-once.
+                for table in ("parts", "files", "tickets"):
+                    self.db.execute(f"DELETE FROM {table} WHERE binding=? AND name=?", (key, name))
+                ticket = None
             if ticket is None:
                 reserved = self.db.execute(
                     "SELECT COALESCE(SUM(size),0),COUNT(*) FROM tickets WHERE binding=?", (key,)

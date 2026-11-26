@@ -23,6 +23,10 @@ from .salad_custody import CustodyBinding, SaladCustody, private_database
 
 # Guardian event kind prefix recording why a tick first decided to stop.
 STOP_CAUSE_PREFIX = "stop_cause:"
+# The workload reported its own failure (POST /v1/workload/failed): the stop cause is
+# ``workload_failed:<closed reason>`` and the child's exit code is kept beside it.
+WORKLOAD_FAILED_REASON = "workload_failed"
+WORKLOAD_EXIT_PREFIX = "workload_exit:"
 # No instance allocated within the allocation deadline (armed -> first allocation or running
 # instant): the group is cancelled through the ordinary stop path and the record below is kept.
 ALLOCATION_TIMEOUT_REASON = "allocation_timeout"
@@ -346,6 +350,31 @@ class SaladGuardian:
                 (operation,),
             )
 
+    def fail(self, operation: str, reason: str, exit_code: int | None) -> bool:
+        """The bound workload reported a failure: record the cause and stop at once.
+
+        Only the first stop decision of an operation records a cause; a report that
+        arrives after another stop (deadline, cancel, an earlier report) changes
+        nothing. Like cancel, this can only start a stop. Returns whether this call
+        was the one that started it."""
+        with self.db:
+            changed = self.db.execute(
+                "UPDATE assignments SET stopping=1,reason=? "
+                "WHERE operation=? AND stopping=0 AND status!='stopped'",
+                (WORKLOAD_FAILED_REASON, operation),
+            ).rowcount
+            if changed == 1:
+                now = self.clock()
+                self.db.execute(
+                    "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                    (operation, now, f"{STOP_CAUSE_PREFIX}{WORKLOAD_FAILED_REASON}:{reason}"),
+                )
+                self.db.execute(
+                    "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                    (operation, now, f"{WORKLOAD_EXIT_PREFIX}{exit_code}"),
+                )
+        return changed == 1
+
     def reconcile(self, operation: str, *, reason: str = RECONCILE_OPERATOR):
         """Close the orphan exposure of an uncertain operation the provider reports stopped.
 
@@ -403,6 +432,15 @@ class SaladGuardian:
         if deadline_run is not None:
             # Additive: the route deadline cut a run after an instance was seen.
             result["route_deadline"] = deadline_run
+        exit_event = self.db.execute(
+            "SELECT kind FROM events WHERE operation=? AND substr(kind,1,?)=? "
+            "ORDER BY sequence LIMIT 1",
+            (operation, len(WORKLOAD_EXIT_PREFIX), WORKLOAD_EXIT_PREFIX),
+        ).fetchone()
+        if exit_event is not None:
+            # Additive: present only when the workload reported its own failure.
+            code = exit_event[0][len(WORKLOAD_EXIT_PREFIX) :]
+            result["workload_exit_code"] = None if code == "None" else int(code)
         timeout = self._allocation_timeout_record(operation)
         if timeout is not None:
             # Additive: present only for a group cancelled because nothing was ever allocated.

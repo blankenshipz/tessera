@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .salad_workload_contract import WORKLOAD_FAILED_CAUSE_PREFIX, WORKLOAD_FAILURE_REASONS
+
 # Route window from create through output and stop.
 # GPU node allocation plus a multi-GB CUDA image pull exceeds 5 minutes. Polls stay
 # <=10s apart for guardian heartbeats, so the poll cap scales with the window.
@@ -637,7 +639,7 @@ class SaladLiveSession:
             financial=_financial(status),
             rate_read_retries=_count(status.get("rate_read_retries")),
             provider_read_retries=_count(status.get("provider_read_retries")),
-            stop_cause=_cause(status.get("stop_cause")),
+            stop_cause=_stop_cause(status.get("stop_cause")),
             allocation_timeout=_allocation_timeout(status.get("allocation_timeout")),
             custody_work_begun=(
                 status.get("custody_work_begun")
@@ -949,6 +951,20 @@ def _allocation_timeout(value):
             "deadline_seconds": value["deadline_seconds"],
         }
     return None
+
+
+def _final_reason(reason):
+    """A receipt reason later steps must not overwrite: the guardian's own recorded end."""
+    return reason == "allocation_timeout" or str(reason).startswith(WORKLOAD_FAILED_CAUSE_PREFIX)
+
+
+def _stop_cause(value):
+    """The guardian's stop cause: a closed token, or ``workload_failed:<closed reason>``
+    when the workload reported its own failure (never an echoed free-form string)."""
+    prefix = WORKLOAD_FAILED_CAUSE_PREFIX
+    if type(value) is str and value.startswith(prefix):
+        return value if value[len(prefix) :] in WORKLOAD_FAILURE_REASONS else "invalid_code"
+    return _cause(value)
 
 
 def _cause(value):
@@ -1572,6 +1588,11 @@ def _drive(
                 receipt["reason"] = "allocation_timeout"
                 receipt["allocation_timeout"] = evidence.get("allocation_timeout")
                 break
+            if str(evidence.get("stop_cause") or "").startswith(WORKLOAD_FAILED_CAUSE_PREFIX):
+                # The workload reported its own failure and the guardian stopped the group:
+                # the run failed for that reason (never a provider move). Stop polling.
+                receipt["reason"] = evidence["stop_cause"]
+                break
             if evidence["output_retained"]:
                 break
             # Spread polls over the approved window; stay well inside the guardian's
@@ -1593,7 +1614,7 @@ def _drive(
             raise ValueError("output unavailable")
         execution_complete = True
     except Exception as error:
-        if receipt["reason"] != "allocation_timeout":
+        if not _final_reason(receipt["reason"]):
             receipt["reason"] = "execution_or_output_unresolved"
         if step["name"] is not None and receipt["create_rejection"] is None:
             receipt["prestart_failure"] = _prestart_failure(error, step["name"])
@@ -1651,7 +1672,7 @@ def _drive(
                     break
                 if evidence.get("provider_stop_confirmed"):
                     # Spend closed but custody can never seal: waiting cannot help.
-                    if receipt["reason"] != "allocation_timeout":
+                    if not _final_reason(receipt["reason"]):
                         receipt["reason"] = (
                             PRECUSTODY_REALLOCATION
                             if receipt["guardian_stop_cause"] == "allocation_changed"
@@ -1663,7 +1684,7 @@ def _drive(
                     break
                 sleep(min(interval, max(0, stop_deadline - clock())))
         except Exception:
-            if receipt["reason"] != "allocation_timeout":
+            if not _final_reason(receipt["reason"]):
                 receipt["reason"] = "stop_unresolved"
     try:
         if not execution_complete or not receipt["stop_confirmed"]:
@@ -1743,9 +1764,8 @@ def _drive(
                 if receipt["create_rejection"].get("status") == 0
                 else "provider_rejected_request"
             )
-        elif receipt["reason"] not in {
+        elif not _final_reason(receipt["reason"]) and receipt["reason"] not in {
             "provider_stopped_custody_unsealed",
-            "allocation_timeout",
             PRECUSTODY_REALLOCATION,
         }:
             receipt["reason"] = "custody_stop_or_reconnect_unresolved"

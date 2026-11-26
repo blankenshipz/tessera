@@ -35,6 +35,7 @@ import binascii
 import fcntl
 import hashlib
 import http.client
+import inspect
 import json
 import os
 import re
@@ -44,6 +45,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -66,6 +68,26 @@ OUTPUT_JSON = "output.json"
 _OUTPUT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 MIN_CLAIM_SECONDS = 60  # never spend the single claim with less than this left
 UPLOAD_GRACE_SECONDS = 100  # inside the guardian's 120 s billed upload grace
+# Reserved declared output names (ADR for runtime failure custody); equal to the contract's.
+CHECKPOINT_NAME = "checkpoint.bin"  # the entry writes it atomically: temp, fsync, rename
+DIAGNOSTIC_NAME = "runtime-diagnostic.log"  # header line plus the tail of entry output
+DIAGNOSTIC_SCHEMA = "tessera.gpu-runtime-diagnostic.v1"
+DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+MAX_CHECKPOINT_UPLOADS = 10  # custody's superseding-upload allowance; one is the final upload
+CHECKPOINT_UPLOAD_INTERVAL_SECONDS = 120
+ENTRY_POLL_SECONDS = 5
+ENTRY_TERM_GRACE_SECONDS = 20  # SIGTERM this long before the entry's hard SIGKILL
+SOFT_DEADLINE_ENV = "TESSERA_ENTRY_SOFT_DEADLINE_SECONDS"  # seconds from entry start to SIGTERM
+HARD_DEADLINE_ENV = "TESSERA_ENTRY_HARD_DEADLINE_SECONDS"  # seconds from entry start to SIGKILL
+LINGER_SECONDS = 120  # after the last chunk or a failure report: wait for the guardian's stop
+FAILED_PATH = "/v1/workload/failed"
+FAILURE_REASONS = (
+    "entry", "entry_timeout", "output", "output_plan", "custody", "deadline", "input", "fetch",
+    "install", "manifest", "internal",
+)  # fmt: skip
+MONOTONIC = time.monotonic  # hooks, so a test can run the linger on a fake clock
+SLEEP = time.sleep
+_STOP = threading.Event()  # set by SIGTERM: the guardian (or Salad) is ending the container
 KINDS = ("wheel", "file", "entry")
 INPUT_SOURCE = "input"
 INPUT_ITEM_KEYS = {"kind", "source", "path"}
@@ -125,6 +147,24 @@ class Failure(Exception):
     def __init__(self, code="failed"):
         super().__init__(code)
         self.code = code
+        self.exit_code = None  # the entry's exit status when the entry itself failed
+        self.partial = False  # declared outputs that existed were uploaded, marked partial
+        self.outputs = None  # what that partial upload retained
+        self.reported = False  # the guardian recorded the failure and will stop the container
+
+
+def failure_reason(code):
+    """Map a detail-free failure code onto the closed set the guardian accepts."""
+    if code in FAILURE_REASONS:
+        return code
+    for prefix in ("input", "manifest", "fetch"):
+        if isinstance(code, str) and code.startswith(prefix + "_"):
+            return prefix
+    if code in {"redirect", "size"}:
+        return "fetch"
+    if code == "argv":
+        return "manifest"
+    return "internal"
 
 
 def encode(value):
@@ -1420,6 +1460,23 @@ class HTTPSCustody:
             timeout=30,
         )
 
+    def report_failed(self, reason, exit_code):
+        """Closed failure report: binding, a closed reason token, the child's exit code.
+
+        The guardian records the stop cause ``workload_failed:<reason>`` and stops the
+        group at once. Nothing else travels: no message, path, traceback or output."""
+        self._refresh()
+        result = self.post(
+            FAILED_PATH,
+            {"binding": self.binding, "reason": reason, "exit_code": exit_code},
+        )
+        return result == {
+            "schema": "tessera.workload-failed.v1",
+            "operation": self.binding["operation"],
+            "epoch": self.binding["epoch"],
+            "recorded": True,
+        }
+
     def output_plan(self):
         """The guardian's declared outputs for this operation (after begin-once)."""
         result = self.post("/v1/workload/outputs", {"binding": self.binding})
@@ -1475,36 +1532,166 @@ class HTTPSCustody:
 # ---------------------------------------------------------------- entry run
 
 
-def run_entry(entry, work, site, out_dir, deadline, runner=subprocess.Popen, args=None):
+class EntrySupervisor:
+    """Bounded diagnostics and periodic checkpoint custody while the entry runs.
+
+    Keeps only the last ``tail_limit`` bytes of the entry's combined stdout/stderr. The
+    optional ``upload`` callable (checkpoint custody) runs from the wait loop, at most
+    once per ``interval`` seconds; a failed upload is never fatal to the entry."""
+
+    def __init__(self, upload=None, tail_limit=DIAGNOSTIC_TAIL_BYTES, interval=None):
+        self.tail_limit = tail_limit
+        self.upload = upload
+        self.interval = CHECKPOINT_UPLOAD_INTERVAL_SECONDS if interval is None else interval
+        self.clock = MONOTONIC
+        self._tail = bytearray()
+        self._lock = threading.Lock()
+        self._reader = None
+        self._last = None
+        self.truncated = False
+        self.terminated = False  # the soft deadline was reached and SIGTERM was sent
+
+    def attach(self, stream):
+        if stream is None:
+            return
+        self._reader = threading.Thread(target=self._pump, args=(stream,), daemon=True)
+        self._reader.start()
+
+    def _pump(self, stream):
+        try:
+            while True:
+                data = os.read(stream.fileno(), 65536)
+                if not data:
+                    return
+                self.feed(data)
+        except (OSError, ValueError):
+            return
+
+    def feed(self, data):
+        with self._lock:
+            self._tail += data
+            if len(self._tail) > self.tail_limit:
+                self.truncated = True
+                del self._tail[: len(self._tail) - self.tail_limit]
+
+    def finish(self):
+        if self._reader is not None:
+            self._reader.join(timeout=2)
+
+    def tail(self):
+        with self._lock:
+            return bytes(self._tail), self.truncated
+
+    def tick(self):
+        if self.upload is None:
+            return
+        now = self.clock()
+        if self._last is None:
+            self._last = now
+        if now - self._last < self.interval:
+            return
+        self._last = now
+        try:
+            self.upload()
+        except Exception:
+            pass  # the final upload (or the next interval) retries; never fatal
+
+
+def run_entry(
+    entry, work, site, out_dir, deadline, runner=subprocess.Popen, args=None, supervisor=None
+):
     """Run the verified entry: ``python entry WORK_DIR OUT_DIR`` with a hard wall clock.
 
-    An image entry (ADR 0076) also gets ``-- ARGV...``, the manifest's reviewed argv."""
+    An image entry (ADR 0076) also gets ``-- ARGV...``, the manifest's reviewed argv.
+    With a supervisor the entry's stdout/stderr tail is captured (stdin stays closed),
+    the entry sees its deadlines in ``TESSERA_ENTRY_SOFT_DEADLINE_SECONDS`` and
+    ``TESSERA_ENTRY_HARD_DEADLINE_SECONDS`` and gets SIGTERM at the soft one (a chance
+    to write a final checkpoint) before SIGKILL at the hard one. A failure carries the
+    entry's exit status in ``exit_code``."""
+    started = MONOTONIC()
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise Failure("deadline")
     env = _entry_env(work, site)
+    soft = (
+        remaining - ENTRY_TERM_GRACE_SECONDS
+        if remaining >= 2 * ENTRY_TERM_GRACE_SECONDS
+        else remaining / 2
+    )
+    if supervisor is not None:
+        env[SOFT_DEADLINE_ENV] = str(int(soft))
+        env[HARD_DEADLINE_ENV] = str(int(remaining))
     try:
         proc = runner(
             [sys.executable, "-B", entry, work, out_dir, *(["--", *args] if args else [])],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL if supervisor is None else subprocess.PIPE,
+            stderr=subprocess.DEVNULL if supervisor is None else subprocess.STDOUT,
             env=env,
             cwd=work,
             start_new_session=True,
         )
     except Exception:
         raise Failure("entry") from None
+    if supervisor is None:
+        try:
+            code = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            raise Failure("entry_timeout") from None
+        except BaseException:
+            _kill(proc)
+            raise
+        if code != 0:
+            error = Failure("entry")
+            error.exit_code = code
+            raise error
+        return
+    supervisor.attach(getattr(proc, "stdout", None))
+    soft_at, hard_at = started + soft, started + remaining
     try:
-        code = proc.wait(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        _kill(proc)
-        raise Failure("entry_timeout") from None
+        while True:
+            now = MONOTONIC()
+            if now >= hard_at:
+                break
+            if not supervisor.terminated and now >= soft_at:
+                supervisor.terminated = True
+                _signal_group(proc, signal.SIGTERM)
+            wait = hard_at - now if supervisor.terminated else min(hard_at, soft_at) - now
+            try:
+                code = proc.wait(timeout=max(0.01, min(ENTRY_POLL_SECONDS, wait)))
+            except subprocess.TimeoutExpired:
+                supervisor.tick()
+                continue
+            _signal_group(proc, signal.SIGKILL)  # nothing the entry started outlives it
+            supervisor.finish()
+            if supervisor.terminated:
+                error = Failure("entry_timeout")
+                error.exit_code = code
+                raise error
+            if code != 0:
+                error = Failure("entry")
+                error.exit_code = code
+                raise error
+            return
+    except Failure:
+        raise
     except BaseException:
         _kill(proc)
+        supervisor.finish()
         raise
-    if code != 0:
-        raise Failure("entry")
+    _kill(proc)
+    supervisor.finish()
+    error = Failure("entry_timeout")
+    error.exit_code = proc.returncode if isinstance(getattr(proc, "returncode", None), int) else -9
+    raise error
+
+
+def _signal_group(proc, signum):
+    try:
+        os.killpg(proc.pid, signum)
+    except (OSError, AttributeError):
+        pass
 
 
 def _kill(proc):
@@ -1586,70 +1773,195 @@ def read_output(out_dir, fetched, max_bytes):
     return output
 
 
-def stage_outputs(out_dir, stage_dir, plan, fetched):
+def _stage_file(out_dir, target, name, cap):
+    """Copy one declared regular file from out_dir into the staging area, capped."""
+    digest, size = hashlib.sha256(), 0
+    with open(target, "xb") as out, _open_output(out_dir, name) as source:
+        while True:
+            chunk = source.read(min(_CHUNK, cap + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > cap:
+                raise Failure("output")
+            digest.update(chunk)
+            out.write(chunk)
+    os.chmod(target, 0o400)
+    return size, digest.hexdigest()
+
+
+def _stage_bytes(target, data):
+    with open(target, "xb") as out:
+        out.write(data)
+    os.chmod(target, 0o400)
+    return len(data), hashlib.sha256(data).hexdigest()
+
+
+def diagnostic_bytes(tail, truncated, status, exit_code, cap):
+    """One JSON header line plus the tail of the entry's output, at most ``cap`` bytes.
+
+    The tail is cut from the front to fit. No environment, path or credential of the
+    runtime is added; the tail is whatever the entry itself printed."""
+    header = (
+        encode(
+            {
+                "schema": DIAGNOSTIC_SCHEMA,
+                "status": status,
+                "exit_code": exit_code,
+                "truncated": bool(truncated),
+            }
+        )
+        + b"\n"
+    )
+    room = max(0, cap - len(header))
+    if len(tail) > room:
+        header = header.replace(b'"truncated":false', b'"truncated":true')
+        room = max(0, cap - len(header))
+        tail = tail[len(tail) - room :] if room else b""
+    return (header + tail)[:cap]
+
+
+def stage_outputs(out_dir, stage_dir, plan, fetched, partial=None, diagnostic=None, skipped=None):
     """Snapshot every declared output into stage_dir before any byte is uploaded.
 
-    All-or-nothing: a missing, non-regular or oversize declared file fails before
-    the first chunk. Undeclared files in out_dir are never uploaded. output.json,
-    when declared, gets the runtime's ``fetched`` record. Returns
+    Complete mode (``partial`` is None): all-or-nothing. A missing, non-regular or
+    oversize declared file fails before the first chunk. Partial mode (the entry failed
+    or was cut off; ``partial`` = {"reason", "exit_code"}): a declared file that is
+    missing, not a regular file or over its cap is skipped and named in ``skipped``;
+    every per-file cap still holds. Undeclared files in out_dir are never uploaded.
+    output.json, when declared, gets the runtime's ``fetched`` record, and in partial
+    mode ``partial: true`` with the reason, exit code and skipped names. The reserved
+    diagnostic output, when declared, is built from ``diagnostic`` =
+    (tail, truncated, status, exit_code) instead of read from out_dir. Returns
     ``[(name, staged_path, size, sha256)]`` in plan order.
     """
     os.makedirs(stage_dir, mode=0o700)
-    staged = []
+    staged = {}
+    skipped = [] if skipped is None else skipped
     for name, cap in plan:
+        if name == OUTPUT_JSON:
+            continue
         target = os.path.join(stage_dir, name)
-        digest, size = hashlib.sha256(), 0
-        with open(target, "xb") as out:
-            if name == OUTPUT_JSON:
-                data = read_output(out_dir, fetched, cap)
-                out.write(data)
-                digest.update(data)
-                size = len(data)
-            else:
-                with _open_output(out_dir, name) as source:
-                    while True:
-                        chunk = source.read(min(_CHUNK, cap + 1 - size))
-                        if not chunk:
-                            break
-                        size += len(chunk)
-                        if size > cap:
-                            raise Failure("output")
-                        digest.update(chunk)
-                        out.write(chunk)
-        os.chmod(target, 0o400)
-        staged.append((name, target, size, digest.hexdigest()))
-    return staged
+        if name == DIAGNOSTIC_NAME and diagnostic is not None:
+            tail, truncated, status, exit_code = diagnostic
+            data = diagnostic_bytes(tail, truncated, status, exit_code, cap)
+            staged[name] = (name, target, *_stage_bytes(target, data))
+            continue
+        try:
+            staged[name] = (name, target, *_stage_file(out_dir, target, name, cap))
+        except Failure:
+            if partial is None:
+                raise
+            if os.path.lexists(target):
+                os.unlink(target)
+            skipped.append(name)
+    for name, cap in plan:
+        if name != OUTPUT_JSON:
+            continue
+        target = os.path.join(stage_dir, name)
+        if partial is None:
+            data = read_output(out_dir, fetched, cap)
+        else:
+            try:
+                value = json.loads(read_output(out_dir, fetched, cap))
+            except Failure:
+                value = {"fetched": fetched}
+            value.update(
+                partial=True,
+                partial_reason=partial["reason"],
+                partial_exit_code=partial["exit_code"],
+                partial_skipped=sorted(skipped),
+            )
+            data = encode(value)
+            if len(data) > cap:
+                data = encode({"partial": True})
+        staged[name] = (name, target, *_stage_bytes(target, data))
+    # The diagnostic goes last: its upload is what completes the declared outputs, so
+    # every other file (a final checkpoint included) is in custody before the stop starts.
+    ordered = [name for name, _ in plan if name != DIAGNOSTIC_NAME and name in staged]
+    ordered += [DIAGNOSTIC_NAME] if DIAGNOSTIC_NAME in staged else []
+    return [staged[name] for name in ordered]
 
 
-def upload_outputs(custody, staged):
+def snapshot_checkpoint(out_dir, stage_dir, cap, serial):
+    """Copy the latest complete checkpoint aside; None when there is none to upload.
+
+    Only the exact declared name is ever opened (a regular file, no symlink), so a
+    temp file the entry is still writing is never read; the entry's atomic rename is
+    what publishes a checkpoint. An oversize checkpoint is not uploaded."""
+    os.makedirs(stage_dir, mode=0o700, exist_ok=True)
+    target = os.path.join(stage_dir, f"{serial}.{CHECKPOINT_NAME}")
+    try:
+        size, digest = _stage_file(out_dir, target, CHECKPOINT_NAME, cap)
+    except (Failure, OSError):
+        if os.path.lexists(target):
+            os.unlink(target)
+        return None
+    return CHECKPOINT_NAME, target, size, digest
+
+
+def _put_file(custody, name, path, size, digest, spare):
+    """Upload one staged file in idempotent chunks; returns (spare, complete flag)."""
+    chunks = max(1, -(-size // OUTPUT_CHUNK_BYTES))
+    file_complete = complete = False
+    with open(path, "rb") as handle:
+        for seq in range(chunks):
+            data = handle.read(OUTPUT_CHUNK_BYTES)
+            for attempt in range(CHUNK_ATTEMPTS):
+                try:
+                    file_complete, complete = custody.put_chunk(name, size, digest, seq, data)
+                    break
+                except Failure:
+                    if attempt + 1 == CHUNK_ATTEMPTS or spare == 0:
+                        raise
+                    spare -= 1
+    if not file_complete:
+        raise Failure("custody")
+    return spare, complete
+
+
+def upload_outputs(custody, staged, require_complete=True):
     """Chunked, idempotent upload of every staged output, with bounded retries.
 
     One chunk is in memory at a time. Each chunk is retried at most
     CHUNK_ATTEMPTS times and UPLOAD_RETRY_BUDGET extra attempts in total; the
     guardian independently bounds chunk calls. Success requires every file to be
-    reported complete and the final chunk to report all declared outputs complete.
+    reported complete and, unless ``require_complete`` is False (a partial upload,
+    where declared files may be absent), the final chunk to report all declared
+    outputs complete.
     """
     spare = UPLOAD_RETRY_BUDGET
     complete = False
     for name, path, size, digest in staged:
-        chunks = max(1, -(-size // OUTPUT_CHUNK_BYTES))
-        file_complete = False
-        with open(path, "rb") as handle:
-            for seq in range(chunks):
-                data = handle.read(OUTPUT_CHUNK_BYTES)
-                for attempt in range(CHUNK_ATTEMPTS):
-                    try:
-                        file_complete, complete = custody.put_chunk(name, size, digest, seq, data)
-                        break
-                    except Failure:
-                        if attempt + 1 == CHUNK_ATTEMPTS or spare == 0:
-                            raise
-                        spare -= 1
-        if not file_complete:
-            raise Failure("custody")
-    if not complete:
+        spare, complete = _put_file(custody, name, path, size, digest, spare)
+    if require_complete and not complete:
         raise Failure("custody")
     return [{"name": n, "sha256": d, "bytes": z} for n, _, z, d in staged]
+
+
+def _accepts(function, name):
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters  # only a runner that names it; a bare **kwargs one is left alone
+
+
+def _report(custody, exc):
+    """Best-effort closed failure report; at most two attempts, never raises."""
+    report = getattr(custody, "report_failed", None)
+    if report is None or getattr(exc, "report_attempted", False):
+        return
+    exc.report_attempted = True
+    code = exc.code if isinstance(exc, Failure) else "internal"
+    exit_code = getattr(exc, "exit_code", None)
+    for _ in range(2):
+        try:
+            if report(failure_reason(code), exit_code) is True:
+                exc.reported = True
+                return
+        except BaseException:
+            pass
 
 
 def execute(
@@ -1670,6 +1982,7 @@ def execute(
         raise Failure("manifest")  # an input-sourced item needs a declared input
     work = os.path.realpath(work)
     out_dir = prepare_work(work)
+    paths = site = fetched = None
     if manifest is not None:
         # Inline manifest: everything is fetched and verified before the claim.
         paths, fetched = fetch_all(manifest, work, deadline, opener)
@@ -1680,7 +1993,51 @@ def execute(
     custody = custody_factory(binding_of(request), deadline + UPLOAD_GRACE_SECONDS)
     if custody.begin_once() is not True:
         raise Failure("custody")
+    # The claim is spent: from here a failure is reported to the guardian, which stops
+    # the group at once, so the exit is never taken for a provider move.
+    try:
+        return _run_claimed(
+            request, deadline, work, out_dir, custody, opener, installer, entry_runner,
+            manifest, expected_input, from_input, paths, site, fetched,
+        )  # fmt: skip
+    except BaseException as exc:
+        _report(custody, exc)
+        raise
+
+
+def _run_claimed(
+    request, deadline, work, out_dir, custody, opener, installer, entry_runner,
+    manifest, expected_input, from_input, paths, site, fetched,
+):  # fmt: skip
     plan = validate_plan(custody.output_plan(), request)
+    names = {name for name, _ in plan}
+    caps = dict(plan)
+    ckpt_dir = os.path.join(work, "ckpt")
+    state = {"digest": None, "uploads": 0, "serial": 0}
+
+    def upload_checkpoint():
+        """One superseding upload of the latest complete checkpoint (never fatal)."""
+        if state["uploads"] >= MAX_CHECKPOINT_UPLOADS - 2:
+            return
+        state["serial"] += 1
+        found = snapshot_checkpoint(out_dir, ckpt_dir, caps[CHECKPOINT_NAME], state["serial"])
+        if found is None:
+            return
+        name, path, size, digest = found
+        try:
+            if digest != state["digest"]:
+                _put_file(custody, name, path, size, digest, 0)
+                state["digest"] = digest
+                state["uploads"] += 1
+        finally:
+            os.unlink(path)
+
+    periodic = (
+        upload_checkpoint
+        if CHECKPOINT_NAME in names and DIAGNOSTIC_NAME in names and len(names) > 1
+        else None
+    )
+    supervisor = EntrySupervisor(upload=periodic)
     input_root = None
     if expected_input is not None:
         # Only a reviewed input declaration fetches; none declared means none fetched.
@@ -1690,19 +2047,77 @@ def execute(
             paths, fetched = fetch_all(manifest, work, deadline, opener)
             site = installer(paths["wheel"], work, deadline)
     image = image_items(manifest)
-    if image:
-        entry = os.path.join(IMAGE_ENTRY_DIR, image[0]["path"])
-        entry_runner(entry, work, site, out_dir, deadline, args=list(image[0]["argv"]))
-    else:
-        entry = resolve_input_items(manifest, input_root) or paths["entry"][0]
-        entry_runner(entry, work, site, out_dir, deadline)
-    staged = stage_outputs(out_dir, os.path.join(work, "staged"), plan, fetched)
-    return upload_outputs(custody, staged)
+    extra = {"supervisor": supervisor} if _accepts(entry_runner, "supervisor") else {}
+    failure = None
+    try:
+        if image:
+            entry = os.path.join(IMAGE_ENTRY_DIR, image[0]["path"])
+            entry_runner(entry, work, site, out_dir, deadline, args=list(image[0]["argv"]), **extra)
+        else:
+            entry = resolve_input_items(manifest, input_root) or paths["entry"][0]
+            entry_runner(entry, work, site, out_dir, deadline, **extra)
+    except Failure as exc:
+        if exc.code not in {"entry", "entry_timeout"}:
+            raise
+        failure = exc  # the entry ran and failed: salvage what it declared
+    skipped = []
+    tail, truncated = supervisor.tail()
+    status = "complete" if failure is None else "partial"
+    exit_code = None if failure is None else failure.exit_code
+    staged = stage_outputs(
+        out_dir,
+        os.path.join(work, "staged"),
+        plan,
+        fetched,
+        partial=None if failure is None else {"reason": failure.code, "exit_code": exit_code},
+        diagnostic=(tail, truncated, status, 0 if failure is None else exit_code),
+        skipped=skipped,
+    )
+    if failure is None:
+        return upload_outputs(custody, staged)
+    # Upload every file but the last, report, then upload the last. The last file is the
+    # one that would complete the declared outputs and start a stop with cause
+    # ``output_retained``; reporting first makes the guardian's first stop decision (and
+    # so the verdict) ``workload_failed:<reason>``. The guardian still takes the last
+    # file while it stops, within the upload grace. A custody error here never replaces
+    # the entry's own failure as the reason.
+    outputs = []
+    try:
+        outputs += upload_outputs(custody, staged[:-1], require_complete=False)
+    except Failure:
+        pass
+    _report(custody, failure)
+    if failure.reported:
+        # Only under a recorded failure cause: without it, the last file would complete
+        # the outputs and a lost report would let the failed run verify as a pass.
+        try:
+            outputs += upload_outputs(custody, staged[-1:], require_complete=False)
+        except Failure:
+            pass
+    failure.partial, failure.outputs = bool(outputs), outputs
+    raise failure
+
+
+def linger(seconds, clock=None, sleep=None, stopped=None):
+    """Stay alive until the guardian's stop ends the container, or ``seconds`` pass.
+
+    A one-shot container that exits is replaced by Salad, and the replacement would be
+    taken for an unapproved second allocation. Returns True when SIGTERM ended it."""
+    clock, sleep = clock or MONOTONIC, sleep or SLEEP
+    stopped = _STOP if stopped is None else stopped
+    end = clock() + seconds
+    while not stopped.is_set():
+        left = end - clock()
+        if left <= 0:
+            return False
+        sleep(min(1.0, left))
+    return True
 
 
 def main(argv):
     armed = False
     work = WORK_ROOT
+    stay = False
     try:
         request = parse_argv(argv)
 
@@ -1715,17 +2130,33 @@ def main(argv):
         deadline = time.monotonic() + request["max_seconds"]
         outputs = execute(request, deadline, work)
         print(encode({"schema": STATUS_SCHEMA, "status": "retained", "outputs": outputs}).decode())
-        return 0
+        code, stay = 0, True
     except BaseException as exc:
-        code = exc.code if isinstance(exc, Failure) else "failed"
-        print(encode({"schema": STATUS_SCHEMA, "status": "failed", "reason": code}).decode())
-        return 1
+        reason = exc.code if isinstance(exc, Failure) else "failed"
+        line = {"schema": STATUS_SCHEMA, "status": "failed", "reason": reason}
+        exit_code = getattr(exc, "exit_code", None)
+        if exit_code is not None:
+            line["exit_code"] = exit_code
+        if getattr(exc, "partial", False):
+            line.update(partial=True, outputs=exc.outputs)
+        print(encode(line).decode())
+        code, stay = 1, bool(getattr(exc, "reported", False))
     finally:
         if armed:
             signal.setitimer(signal.ITIMER_REAL, 0)
-        shutil.rmtree(os.path.join(work, "out"), ignore_errors=True)
-        shutil.rmtree(os.path.join(work, "staged"), ignore_errors=True)
+        for name in ("out", "staged", "ckpt"):
+            shutil.rmtree(os.path.join(work, name), ignore_errors=True)
         _remove_tree(os.path.join(work, INPUT_DIR))
+    if stay:
+        # Never exit on our own after the last chunk or a failure report: the guardian
+        # stops the group (its stop can take minutes), SIGTERM ends us, or the bound does.
+        try:
+            signal.signal(signal.SIGTERM, lambda signum, frame: _STOP.set())
+        except (ValueError, OSError):
+            pass
+        linger(LINGER_SECONDS)
+        return 0
+    return code
 
 
 if __name__ == "__main__":

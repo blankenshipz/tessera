@@ -46,6 +46,7 @@ from .salad_guardian import (
     POSTSTART_READ_WINDOW_SECONDS,
     RECONCILE_OPERATOR,
     RECONCILE_PROVIDER,
+    WORKLOAD_FAILED_REASON,
     GuardianAssignment,
     ProviderObservation,
     SaladGuardian,
@@ -60,7 +61,8 @@ from .salad_workload_contract import (
     LEGACY_OUTPUT_NAME,
     OUTPUT_CHUNK_BYTES,
     RESERVED_UPLOAD_GRACE_SECONDS,
-    output_chunk_count,
+    WORKLOAD_FAILURE_REASONS,
+    output_call_budget,
 )
 from .salad_workload_jwt import SaladWorkloadJWT, normalized_uuid, strict_json
 from .store import _parse_utc, canonical_digest
@@ -402,6 +404,7 @@ OUTPUT_REQUEST_SLACK = 32
 # this slack. Before the manifest is verified only the manifest read is planned.
 INPUT_REQUEST_SLACK = 32
 OUTPUT_PLAN_PATH = "/v1/workload/outputs"
+FAILED_PATH = "/v1/workload/failed"
 WORKLOAD_PATHS = frozenset(
     {
         "/v1/workload/begin-once",
@@ -409,6 +412,7 @@ WORKLOAD_PATHS = frozenset(
         "/v1/workload/input",
         OUTPUT_PLAN_PATH,
         OUTPUT_CHUNK_PATH,
+        FAILED_PATH,
     }
 )
 
@@ -2724,9 +2728,25 @@ class SaladSafetyService:
         # A crash between guardian.complete and the output flag leaves the guardian
         # in this state with output=0; the replay then repairs the flag.
         acknowledging = (
-            path == OUTPUT_CHUNK_PATH
-            and status["status"] == "unknown"
-            and status["reason"] == "output_retained"
+            (
+                path == OUTPUT_CHUNK_PATH
+                and status["status"] == "unknown"
+                and status["reason"] == "output_retained"
+            )
+            or (
+                # After a failure report the stop is under way, but the last file of a partial
+                # upload (the diagnostic) still lands within the upload grace; the cause is
+                # already recorded, so completing the outputs cannot change the verdict.
+                path == OUTPUT_CHUNK_PATH
+                and status["status"] == "unknown"
+                and status["reason"] == WORKLOAD_FAILED_REASON
+            )
+            or (
+                # A replayed failure report (lost response) is acknowledged once the stop began.
+                path == FAILED_PATH
+                and status["status"] == "unknown"
+                and status["reason"] == WORKLOAD_FAILED_REASON
+            )
         )
         if status["allocation_uncertain"] or not (status["status"] == "armed" or acknowledging):
             raise ValueError("workload_rejected")
@@ -2795,6 +2815,8 @@ class SaladSafetyService:
             raise ValueError("workload_rejected")
         if path == "/v1/workload/input":
             return self._input(row, body)
+        if path == FAILED_PATH:
+            return self._failed(row, request, body)
         if path == "/v1/workload/begin-once":
             self._budget(row, refresh=True)
             if set(body) != {"binding"}:
@@ -2856,6 +2878,37 @@ class SaladSafetyService:
             epoch=request["epoch"],
         )
 
+    def _failed(self, row, request, body):
+        """The bound workload reports its own failure: closed reason and exit code only.
+
+        Records the stop cause ``workload_failed:<reason>`` and stops at once, so the
+        exited container's replacement is never taken for a provider move. Only after
+        begin-once; the first stop decision wins (a report after another stop, or with a
+        different reason than the recorded one, is refused). Idempotent for a replay."""
+        reason, exit_code = body.get("reason"), body.get("exit_code")
+        if (
+            set(body) != {"binding", "reason", "exit_code"}
+            or not row["begun"]
+            or reason not in WORKLOAD_FAILURE_REASONS
+            or not (exit_code is None or (type(exit_code) is int and -255 <= exit_code <= 255))
+        ):
+            raise ValueError("workload_rejected")
+        self.guardian.fail(row["operation"], reason, exit_code)
+        cause = self.guardian.status(row["operation"])["stop_cause"]
+        if cause != f"{WORKLOAD_FAILED_REASON}:{reason}":
+            raise ValueError("workload_rejected")
+        if self.inputs:
+            self.inputs.drop(row["operation"])
+        # The stop intent is durable now; the group is stopped on the next guardian poll
+        # (within seconds), not forced on this very pass, so the partial upload's last
+        # file (the diagnostic) has one call's worth of time to land first.
+        return dict(
+            schema="tessera.workload-failed.v1",
+            operation=request["operation"],
+            epoch=request["epoch"],
+            recorded=True,
+        )
+
     def _outputs_complete(self, row):
         """Every approved output is durable: stop now, before the exited one-shot
         container can be replaced by a second, unapproved allocation.
@@ -2893,7 +2946,7 @@ class SaladSafetyService:
             machine_id=row["machine"],
         )
         declared = self._declared_outputs(proposal) or []
-        budget = 2 * sum(output_chunk_count(o["max_bytes"]) for o in declared)
+        budget = output_call_budget({o["name"]: o["max_bytes"] for o in declared})
         with self.db:
             charged = self.db.execute(
                 "UPDATE reservations SET output_requests=output_requests+1 "

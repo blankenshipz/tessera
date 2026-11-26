@@ -246,16 +246,19 @@ redirect hosts produce the same argv as before and run on older images.
    before the claim. Any failure stops before the entry.
 5. Resolve input-sourced items in the verified tree (regular files, no links);
    an input entry runs from `<work>/input/<path>`.
-   Run `python -B <entry> <work_dir> <out_dir>` (stdin/stdout/stderr discarded,
-   own process group) with a wall clock of `WORKLOAD_SECONDS` measured from
-   start, covering fetching. Timeout kills the group.
+   Run `python -B <entry> <work_dir> <out_dir>` (stdin closed, stdout and stderr
+   captured to a bounded tail, own process group) with a wall clock of
+   `WORKLOAD_SECONDS` measured from start, covering fetching. The entry gets SIGTERM
+   at its soft deadline and SIGKILL (the whole group) at the hard one; see "Failure
+   custody" below.
 6. Snapshot every declared output from `<out_dir>/<name>` into a private staging
    directory before uploading anything: each must be a regular file (no
    symlinks) within its declared cap, or the run fails with nothing uploaded.
    Undeclared files are ignored. A declared `output.json` must be a JSON object
    without its own `fetched` key; the runtime adds `fetched: [{url, sha256,
    bytes}, ...]` and re-encodes it canonically within its cap. Other files are
-   uploaded byte for byte.
+   uploaded byte for byte. (When the entry failed or was cut off the snapshot is
+   partial: see "Failure custody".)
 7. Upload each staged file in 1 MiB chunks (`/v1/workload/output-chunk`) with its
    whole-file sha256 and each chunk's sha256. A chunk is idempotent at the
    guardian, so a failed call is retried (at most 3 attempts per chunk, 8 extra
@@ -276,10 +279,58 @@ full 16 MiB upload is 16 such requests: about 45-60 s at 5 Mbit/s, near the
 100 s runtime upload window at 2 Mbit/s, and impossible below that. Keep total
 declared outputs well under 16 MiB until a live run has measured the uplink.
 
+8. After the last chunk the runtime does not exit: it waits up to 120 s for the
+   guardian's stop (SIGTERM ends the wait) and exits 0 only at that bound, so
+   Salad never sees an exited container and never places a replacement.
+
 Success prints `{"schema":"tessera.gpu-runtime-status.v1","status":"retained",
 "outputs":[{name, sha256, bytes}, ...]}`. Failures print only
-`{"schema":"tessera.gpu-runtime-status.v1","status":"failed","reason":<closed code>}`;
-no exception text or provider detail.
+`{"schema":"tessera.gpu-runtime-status.v1","status":"failed","reason":<closed code>}`
+plus, when the entry itself failed, its `exit_code` and, for a partial upload,
+`"partial":true` and the uploaded `outputs`; no exception text or provider detail.
+
+## Failure custody (ADR 0198)
+
+After begin-once, any failure is reported to the guardian with one closed call,
+`POST /v1/workload/failed` `{binding, reason, exit_code}`. `reason` is one of
+`entry, entry_timeout, output, output_plan, custody, deadline, input, fetch, install,
+manifest, internal`; `exit_code` is the entry's exit status or null. The guardian
+records the stop cause `workload_failed:<reason>` and stops the group at once; the
+route ends `failed` with that reason, never as a provider move. A report is
+attempted at most twice. When the guardian confirmed it, the runtime waits up to
+120 s for the stop (exit 0 at the bound); an unconfirmed report, or a failure
+before the claim, exits 1 at once as before.
+
+**Partial outputs.** If the entry exits non-zero or is cut off, each declared
+output that exists as a regular file within its cap is staged and uploaded inside
+the upload grace; missing, non-regular and oversize ones are skipped and named.
+A declared `output.json` gains `partial: true`, `partial_reason`,
+`partial_exit_code` and `partial_skipped`. A skipped file means the outputs stay
+incomplete, so the failure report (not the last chunk) is what stops the group.
+
+**Soft deadline.** The entry sees `TESSERA_ENTRY_SOFT_DEADLINE_SECONDS` and
+`TESSERA_ENTRY_HARD_DEADLINE_SECONDS` (seconds from its start). SIGTERM arrives at
+the soft one (20 s before the hard one; halfway when under 40 s remain), SIGKILL at
+the hard one. An entry that exits after SIGTERM, even with status 0, was cut off:
+the run is `entry_timeout`, with whatever it wrote uploaded as partial.
+
+**Checkpoint.** An optional declared output named `checkpoint.bin` (own byte cap,
+counted in the 16 MiB / 16-file totals; requires `runtime-diagnostic.log` to be
+declared too). Write it atomically: a temp file in the output directory, `fsync`,
+`rename` onto `checkpoint.bin`. The runtime opens only that exact name (regular
+file, no symlink), so a temp file is never read. While the entry runs, the latest
+checkpoint is uploaded when it changed, at most every 120 s (superseding the
+previous upload under the same operation; custody allows at most 10 uploads), and
+once more at the end or on failure. A successful run must leave one when declared.
+A superseding upload interrupted midway leaves no complete checkpoint until the
+next completes.
+
+**Diagnostic.** `runtime-diagnostic.log` (declared cap at least 1 KiB) is one JSON
+header line (`schema tessera.gpu-runtime-diagnostic.v1`, `status`, `exit_code`,
+`truncated`) plus the last 64 KiB of the entry's merged stdout and stderr, cut to
+the cap. It is uploaded on success, failure and timeout. It is untrusted entry
+output held in custody like any other output; the runtime never prints it and
+adds no environment, path or token (ADR 0198).
 
 ## Provider-side cache
 
@@ -419,6 +470,10 @@ and the manifest carried in the input also need a rebuilt image; they are
 offline-tested against fake custody and the real guardian handler only.
 Reviewed redirects are offline-tested against a fake single-hop transport
 (`tests/test_gpu_runtime_redirects.py`) and need a rebuilt image.
+Failure custody (ADR 0198: failure report, stop wait, partial outputs, checkpoint,
+diagnostic tail) needs a rebuilt image and is offline-tested in
+`tests/test_gpu_runtime_failure_custody.py`, `tests/test_salad_workload_failed.py`
+and `tests/test_salad_checkpoint_custody.py`.
 No live cold-start has been run.
 
 ## CPU runtime variant and baked wheels
