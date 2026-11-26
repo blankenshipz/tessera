@@ -50,7 +50,8 @@ def _require_license_labels(
         return
     try:
         labels = license_labels.snapshot_labels(connection, snapshot_id)
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, TimeoutError):
+        # A lock or a bounded call that ran out is a stall, never an authority refusal.
         raise
     except Exception:  # noqa: BLE001 - unreadable labels are a refusal, never an admit
         raise Forbidden(

@@ -10,6 +10,8 @@ import secrets
 import sqlite3
 import stat
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -93,6 +95,33 @@ def _connect(database_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 10000")
     return connection
+
+
+@contextmanager
+def _read_snapshot(connection: sqlite3.Connection) -> Iterator[None]:
+    """Run several reads as one consistent snapshot.
+
+    In autocommit mode every SELECT is its own read transaction, so a writer that commits
+    between two reads (a worker credential renewal updates ``credentials.expires_at`` and
+    inserts the matching ``worker_credential_renewals`` row) is seen half-applied: the
+    credential and renewal checks then disagree and refuse a live credential as
+    ``Forbidden("Unauthorized")`` although nothing was revoked. A deferred read transaction
+    keeps the reads on one snapshot; a lock still surfaces as ``sqlite3.OperationalError``
+    (a stall), never as an authority refusal. A caller already inside a transaction keeps
+    its own snapshot unchanged.
+    """
+    if connection.in_transaction:
+        yield
+        return
+    connection.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    if connection.in_transaction:
+        connection.execute("COMMIT")
 
 
 @lru_cache(maxsize=1)
@@ -576,14 +605,15 @@ class Store:
     def _authenticate(self, token: str, audience: str) -> dict[str, Any]:
         connection = _connect(self.database_path)
         try:
-            row = connection.execute(
-                """SELECT p.id, p.org_id, p.role, c.id AS credential_id, c.kind,
-                c.audience, c.project_id, c.expires_at, c.revoked_at, c.parent_id
-                FROM principals p LEFT JOIN credentials c ON c.principal_id = p.id
-                WHERE p.token_hash = ? AND p.revoked_at IS NULL""",
-                (_token_hash(token),),
-            ).fetchone()
-            actor = self._credential_principal(connection, row, audience)
+            with _read_snapshot(connection):
+                row = connection.execute(
+                    """SELECT p.id, p.org_id, p.role, c.id AS credential_id, c.kind,
+                    c.audience, c.project_id, c.expires_at, c.revoked_at, c.parent_id
+                    FROM principals p LEFT JOIN credentials c ON c.principal_id = p.id
+                    WHERE p.token_hash = ? AND p.revoked_at IS NULL""",
+                    (_token_hash(token),),
+                ).fetchone()
+                actor = self._credential_principal(connection, row, audience)
             # The campaign delegation marker may only be attached in-process by the runner.
             actor.pop(CAMPAIGN_DELEGATION_KEY, None)
             # Likewise the owner-delegation marker (ADR 0122): only the delegated-decision
@@ -1576,25 +1606,28 @@ class Store:
         audience: str = "control",
         external_allowed: bool = False,
     ) -> dict[str, Any]:
-        row = connection.execute(
-            """SELECT p.id, p.org_id, p.role, c.id AS credential_id, c.kind,
-            c.audience, c.project_id, c.expires_at, c.revoked_at, c.parent_id
-            FROM principals p LEFT JOIN credentials c ON c.principal_id = p.id
-            WHERE p.id = ? AND p.org_id = ? AND p.revoked_at IS NULL""",
-            (principal["id"], principal["org_id"]),
-        ).fetchone()
-        actor = Store._credential_principal(connection, row, audience)
+        # One snapshot: a concurrent renewal must not be read half-applied (_read_snapshot).
+        with _read_snapshot(connection):
+            row = connection.execute(
+                """SELECT p.id, p.org_id, p.role, c.id AS credential_id, c.kind,
+                c.audience, c.project_id, c.expires_at, c.revoked_at, c.parent_id
+                FROM principals p LEFT JOIN credentials c ON c.principal_id = p.id
+                WHERE p.id = ? AND p.org_id = ? AND p.revoked_at IS NULL""",
+                (principal["id"], principal["org_id"]),
+            ).fetchone()
+            actor = Store._credential_principal(connection, row, audience)
+            external = (
+                not external_allowed
+                and connection.execute(
+                    "SELECT 1 FROM external_agent_scopes WHERE credential_id=?",
+                    (actor["credential_id"],),
+                ).fetchone()
+            )
         if principal.get(AUTOMATION_KEY):
             actor[AUTOMATION_KEY] = principal[AUTOMATION_KEY]
         if principal.get(DELEGATION_KEY):
             actor[DELEGATION_KEY] = principal[DELEGATION_KEY]
-        if (
-            not external_allowed
-            and connection.execute(
-                "SELECT 1 FROM external_agent_scopes WHERE credential_id=?",
-                (actor["credential_id"],),
-            ).fetchone()
-        ):
+        if external:
             raise Forbidden("External agents must use scoped external-agent endpoints.")
         return actor
 

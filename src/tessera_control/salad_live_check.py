@@ -94,6 +94,34 @@ def _closed_token(value):
     )
 
 
+# Closed names of the in-process control (Store / API) calls a live-check refusal is attributed
+# to (receipt ``control_refusal.call``). The session tags the error with the innermost one.
+CONTROL_CALLS = frozenset(
+    {
+        "Store.get",
+        "Store.preflight_authority",
+        "Store.renew_execution_lease",
+        "WorkerRegistryStore.heartbeat",
+        "TrustedSaladServer.heartbeat",
+        "RemoteDispatcher.dispatch",
+    }
+)
+
+
+@contextmanager
+def _calling(name):
+    """Tag an error raised inside with the control call it came from (innermost tag wins)."""
+    try:
+        yield
+    except Exception as error:
+        if getattr(error, "live_check_call", None) is None:
+            try:
+                error.live_check_call = name
+            except Exception:
+                pass
+        raise
+
+
 # Closed reasons a refused pre-start dispatch/observe (a store Conflict) carries on the receipt.
 CONFLICT_REASONS = frozenset({"route_revision_changed", "provider_read_unavailable", "conflict"})
 # Only these are retried (once): the route moved under the read; the next read sees the new state.
@@ -395,10 +423,20 @@ class SaladLiveSession:
     def close(self):
         self.resolver.close()
 
+    def control_readiness(self):
+        """Control's own readiness probe (the HTTP API gate's ``backend_status``): ``"ready"``
+        or its closed unready reason (``state_unavailable``, ``schema_mismatch``,
+        ``recovery_hold``). Read only; asked only after control refused a call."""
+        from .deployment import backend_status
+
+        status = backend_status(Path(self.config["state_dir"]))
+        return "ready" if status["status"] == "ready" else status["reason"]
+
     def state(self, route):
         if route != self.config["route_id"]:
             raise ValueError("exact route required")
-        state = self.server.store.get(self.server.worker, route)
+        with _calling("Store.get"):
+            state = self.server.store.get(self.server.worker, route)
         if (
             (state["org_id"], state["project_id"], state["task_id"], state["proposal_digest"])
             != tuple(self.config[k] for k in ("org_id", "project_id", "task_id", "proposal_digest"))
@@ -425,9 +463,13 @@ class SaladLiveSession:
             # Registry liveness before use-time authority: a long-lived executor's last
             # sighting may be older than the 60 s disconnect bound (keepalive starts later).
             self._registry_heartbeat()
-            state = self.server.store.preflight_authority(
-                self.server.worker, route, RemoteProposal.model_validate(state["proposal"]), action
-            )
+            with _calling("Store.preflight_authority"):
+                state = self.server.store.preflight_authority(
+                    self.server.worker,
+                    route,
+                    RemoteProposal.model_validate(state["proposal"]),
+                    action,
+                )
             execution = state["proposal"]["selection"]["salad"]["execution"]
             with _connect(self.server.store.database_path) as db:
                 live = self.server.store._live_principal(db, self.server.worker, audience="worker")
@@ -468,8 +510,11 @@ class SaladLiveSession:
                 raise ValueError("unknown exposure blocks new work")
         # An observe is a read: its tighter bound keeps the next heartbeat inside the
         # guardian's silence bound (a timeout is a skippable read stall in the driver).
-        with _wall_bound(OBSERVE_WALL_SECONDS if action == "observe" else DISPATCH_WALL_SECONDS):
-            return self.dispatcher.dispatch(route, action)
+        with _calling("RemoteDispatcher.dispatch"):
+            with _wall_bound(
+                OBSERVE_WALL_SECONDS if action == "observe" else DISPATCH_WALL_SECONDS
+            ):
+                return self.dispatcher.dispatch(route, action)
 
     def keepalive(self, route):
         """Heartbeat the worker registry, renew the exact soft lease, heartbeat the guardian.
@@ -490,7 +535,7 @@ class SaladLiveSession:
             # can no longer renew lease authority.
             self._registry_heartbeat()
             payload = {"lease_id": proposal["lease_id"], "expected_epoch": proposal["epoch"]}
-            with _wall_bound(5):
+            with _calling("Store.renew_execution_lease"), _wall_bound(5):
                 self.server.store.renew_execution_lease(
                     self.server.worker,
                     proposal["lease_id"],
@@ -506,7 +551,7 @@ class SaladLiveSession:
             # authority (lease included), so nothing is skipped but this one renewal.
             stalled = error
         try:
-            with _wall_bound(15):
+            with _calling("TrustedSaladServer.heartbeat"), _wall_bound(15):
                 self.server.heartbeat(route)
         except Exception as error:
             if stalled is None or not _is_stall(error):
@@ -521,7 +566,7 @@ class SaladLiveSession:
         from .store import canonical_digest
         from .workers import WorkerRegistryStore
 
-        with _wall_bound(5):
+        with _calling("WorkerRegistryStore.heartbeat"), _wall_bound(5):
             WorkerRegistryStore(Path(self.config["state_dir"])).heartbeat(
                 self.server.worker,
                 "salad-live-worker-" + uuid.uuid4().hex,
@@ -1320,6 +1365,66 @@ def _is_read_stall(error):
     return _is_stall(error)
 
 
+# --- a control refusal while running: verified revocation, or a stall ----------------------------
+# While the last post-start observe read the group running, a Forbidden (or an HTTP 401/403)
+# cancels the route only when it is a verified revocation: control is ready and the refusal's
+# detail is exactly one of control's authority-gone details (``AUTHORITY_GONE_DETAILS`` in
+# tessera_worker.control_channel; for an HTTP refusal, the channel's own exact check). Any
+# other Forbidden (a generic "Unauthorized", an empty or unreadable detail, "Authenticated
+# exact Salad route required.") or any Forbidden while control's readiness probe fails is a
+# transient control stall: it takes the stall path above (skip to the next interval; a
+# keepalive that kept the beat from the guardian is tolerated only inside the silence bound).
+# The guardian keeps its own deadline, budget, silence and stop authority meanwhile.
+# Every refusal (Forbidden, 401/403, a store Conflict) leaves bounded evidence on the receipt:
+# the driver step, the control call, the HTTP status when there was one and the detail.
+REFUSAL_STEPS = frozenset({"keepalive", "observe", "evidence", "run"})
+REFUSAL_KINDS = frozenset({"forbidden", "conflict"})
+UNRECOGNIZED_DETAIL = "unrecognized_detail"
+# Plain sentence text only (a "/" only between words, as in "lease/epoch"): no URL, path,
+# query, header or token-shaped run survives.
+_REFUSAL_DETAIL_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9 ,.'():;_/-]{0,159}")
+_UNSAFE_DETAIL = re.compile(r"[A-Za-z0-9_-]{24,}|(?<![A-Za-z0-9])/|/(?![A-Za-z0-9])|:/")
+
+
+def _refusal_detail(value):
+    """A refusal's detail if it is bounded plain text, else UNRECOGNIZED_DETAIL (None if none)."""
+    from tessera_worker.control_channel import AUTHORITY_GONE_DETAILS
+
+    if value is None or value == "":
+        return None
+    if type(value) is not str:
+        return UNRECOGNIZED_DETAIL
+    if value in AUTHORITY_GONE_DETAILS:
+        return value
+    if not _REFUSAL_DETAIL_SHAPE.fullmatch(value) or _UNSAFE_DETAIL.search(value):
+        return UNRECOGNIZED_DETAIL
+    return value
+
+
+def _refusal(error):
+    """(kind, http_status, detail, verified) of a control refusal, or None for anything else.
+
+    ``verified`` is True only for an exact authority-gone detail (in-process) or a channel
+    error that control's 403 body verified as authority gone (HTTP). Never a substring match."""
+    from tessera_worker.control_channel import AUTHORITY_GONE_DETAILS, ControlChannelError
+
+    from .salad_server import ProviderReadUnavailable
+    from .store import Conflict, Forbidden
+
+    if isinstance(error, Forbidden):
+        detail = error.args[0] if len(error.args) == 1 else None
+        verified = type(detail) is str and detail in AUTHORITY_GONE_DETAILS
+        return "forbidden", None, _refusal_detail(detail), verified
+    if isinstance(error, Conflict) and not isinstance(error, ProviderReadUnavailable):
+        detail = error.args[0] if len(error.args) == 1 else None
+        return "conflict", None, _refusal_detail(detail), False
+    if isinstance(error, ControlChannelError) and error.status in {401, 403, 409}:
+        kind = "conflict" if error.status == 409 else "forbidden"
+        verified = error.status == 403 and error.authority_gone is True
+        return kind, error.status, _refusal_detail(error.refusal_reason), verified
+    return None
+
+
 def _budget_code(code):
     return type(code) is str and (code.startswith("budget_") or code == "rate_unknown")
 
@@ -1372,6 +1477,15 @@ def _drive(
         # "last_provider_status": the last post-start observe's status or None,
         # "heartbeat_silent_seconds": seconds since the last heartbeat the guardian took}.
         "cancel_cause": None,
+        # ``cancel_cause["refusal"]``: the control refusal behind the cancel (see
+        # ``control_refusal`` below) or None.
+        # Added only when control refused a call (absent otherwise): ``control_refusal`` is the
+        # latest refusal {"kind": forbidden|conflict, "step": keepalive|observe|evidence|run,
+        # "call": the Store/API call (CONTROL_CALLS) or None, "http_status": int or None,
+        # "detail": control's bounded plain-text detail or "unrecognized_detail" or None,
+        # "verified_authority_gone": bool, "control_readiness": "ready", a closed unready
+        # reason or None when not probed, "skipped": True when it was skipped as a stall};
+        # ``control_refusals_skipped`` counts refusals skipped as a stall while running.
         # Set only when the cancel failed: {"exception", "attempts", "guardian_cancel_sent"}.
         "cancel_failure": None,
         # Keepalives whose control writes stalled (write lock, bounded call ran out); the
@@ -1500,6 +1614,67 @@ def _drive(
 
     failure = {"error": None}
 
+    def readiness():
+        """Control's readiness token, or None when the session has no probe; a probe that
+        cannot answer reads as ``state_unavailable`` (unready)."""
+        probe = getattr(session, "control_readiness", None)
+        if not callable(probe):
+            return None
+        try:
+            return _closed_token(probe()) or "state_unavailable"
+        except Exception:
+            return "state_unavailable"
+
+    def note_refusal(error, step):
+        """Bounded evidence of a control refusal (also kept as the receipt's latest), or None."""
+        if error is None:
+            return None
+        cached = getattr(error, "live_check_refusal", None)
+        if isinstance(cached, dict):
+            return cached
+        try:
+            refusal = _refusal(error)
+            if refusal is None:
+                return None
+            kind, http_status, detail, verified = refusal
+            call = getattr(error, "live_check_call", None)
+            evidence = {
+                "kind": kind,
+                "step": step if step in REFUSAL_STEPS else "run",
+                "call": call if call in CONTROL_CALLS else None,
+                "http_status": http_status,
+                "detail": detail,
+                "verified_authority_gone": verified,
+                "control_readiness": readiness() if kind == "forbidden" else None,
+                "skipped": False,
+            }
+        except Exception:
+            return None
+        try:
+            error.live_check_refusal = evidence
+        except Exception:
+            pass
+        receipt["control_refusal"] = evidence
+        receipt.setdefault("control_refusals_skipped", 0)
+        return evidence
+
+    def refusal_stall(evidence):
+        """True when a refusal on a running route is a transient control stall, not a cancel:
+        a Forbidden/401/403 without a verified revocation, or any while control is unready."""
+        return (
+            evidence is not None
+            and evidence["kind"] == "forbidden"
+            and running()
+            and (
+                not evidence["verified_authority_gone"]
+                or evidence["control_readiness"] not in {None, "ready"}
+            )
+        )
+
+    def skip_refusal(evidence):
+        evidence["skipped"] = True
+        receipt["control_refusals_skipped"] += 1
+
     def cancel_cause(error):
         """The closed reason this driver sends its cancel (receipt ``cancel_cause``)."""
         from .salad_server import ProviderReadUnavailable
@@ -1523,9 +1698,10 @@ def _drive(
             kind = "guardian_refusal"
         elif step["name"] is not None or receipt["create_rejection"] is not None:
             kind = "prestart"
-        elif isinstance(error, (Conflict, Forbidden)) and not isinstance(
-            error, ProviderReadUnavailable
-        ):
+        elif (
+            isinstance(error, (Conflict, Forbidden))
+            and not isinstance(error, ProviderReadUnavailable)
+        ) or _refusal(error) is not None:
             kind = "control_refused"
         else:
             kind = "error"
@@ -1539,6 +1715,8 @@ def _drive(
             "guardian_refusal": _closed_token(code),
             "last_provider_status": receipt["last_provider_status"],
             "heartbeat_silent_seconds": silent,
+            # Which call control refused, its HTTP status and detail (bounded, never secret).
+            "refusal": note_refusal(error, "run"),
         }
 
     evidence = {"output_retained": False}
@@ -1549,15 +1727,19 @@ def _drive(
         watch["polls"] += 1
         _observe_watch(watch_signals_file, state=polled, evidence=proof, polls=watch["polls"])
 
-    def skip_read(error):
+    def skip_read(error, step):
         """True when a failed post-start read may be skipped to the next interval.
 
         A provider read failure or a stall is skipped at most MAX_TRANSIENT_OBSERVE_FAILURES - 1
         times in a row; while the route last read running, a transient one (timeout, control
-        stall, non-deterministic read failure) is skipped without that bound: the guardian,
-        not this driver, decides to stop a running group."""
+        stall, non-deterministic read failure, an unverified refusal) is skipped without that
+        bound: the guardian, not this driver, decides to stop a running group."""
         from .salad_server import ProviderReadUnavailable
 
+        evidence = note_refusal(error, step)
+        if refusal_stall(evidence):
+            skip_refusal(evidence)
+            return True
         if not isinstance(error, ProviderReadUnavailable) and not _is_stall(error):
             return False
         if not (running() and _is_read_stall(error)):
@@ -1573,7 +1755,7 @@ def _drive(
         try:
             observed = dispatch("observe")
         except Exception as error:
-            if not skip_read(error):
+            if not skip_read(error, "observe"):
                 raise
             return None
         observes["failed"] = 0
@@ -1588,12 +1770,16 @@ def _drive(
         except Exception as error:
             code = _guardian_code(error)
             cause = "terminal_code"
-            if code is None and _is_stall(error):
-                # A control stall (write lock, bounded local call ran out). When the guardian
-                # still took its beat, only the lease renewal was skipped: tolerated while the
-                # route runs (the next beat re-runs authority), else a few times in a row.
-                # Without a delivered beat it is tolerated only inside the silence bound.
-                receipt["control_stalls"] += 1
+            refused = note_refusal(error, "keepalive") if code is None else None
+            refused_stall = refusal_stall(refused)
+            if code is None and (_is_stall(error) or refused_stall):
+                # A control stall (write lock, bounded local call ran out, or an unverified
+                # refusal while running). When the guardian still took its beat, only the lease
+                # renewal was skipped: tolerated while the route runs (the next beat re-runs
+                # authority), else a few times in a row. Without a delivered beat it is
+                # tolerated only inside the silence bound.
+                if not refused_stall:
+                    receipt["control_stalls"] += 1
                 beats["stalls"] += 1
                 delivered = isinstance(error, ControlStall) and error.beat_delivered
                 if delivered:
@@ -1603,6 +1789,8 @@ def _drive(
                 if (delivered or quiet) and (
                     running() or beats["stalls"] <= MAX_TRANSIENT_CONTROL_STALLS
                 ):
+                    if refused_stall:
+                        skip_refusal(refused)
                     return
                 ended["class"] = "control_stall" if delivered or quiet else "silence_bound"
             elif code in TRANSIENT_GUARDIAN_CODES:
@@ -1805,7 +1993,7 @@ def _drive(
             except Exception as error:
                 # The guardian status read is a read too: a stall skips this pass like a
                 # failed observe (a dead guardian still ends the run at the next heartbeat).
-                if not skip_read(error):
+                if not skip_read(error, "evidence"):
                     raise
                 sleep(min(interval, max(0, deadline - clock())))
                 continue

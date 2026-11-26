@@ -241,12 +241,15 @@ def test_the_deadline_is_a_deadline_cancel():
     assert not receipt["reason"].startswith(RUNNING_CANCEL_PREFIX)
 
 
-def test_cancel_cause_is_closed_and_never_carries_text():
+def test_cancel_cause_is_closed_and_a_non_refusal_carries_no_text():
+    # Only a control refusal adds bounded evidence (cancel_cause["refusal"]); any other
+    # error keeps its class name only.
     session = RunningSession(observe_errors=[None, RuntimeError(SECRET)])
     receipt = drive(session)
     assert receipt["cancel_cause"]["class"] in CANCEL_CAUSE_CLASSES
     assert receipt["cancel_cause"]["class"] == "error"
     assert receipt["cancel_cause"]["exception"] == "RuntimeError"
+    assert receipt["cancel_cause"]["refusal"] is None
     assert SECRET not in json.dumps(receipt)
 
 

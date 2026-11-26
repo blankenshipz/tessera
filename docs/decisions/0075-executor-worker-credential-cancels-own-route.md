@@ -62,3 +62,25 @@ issue, and in a shared executor project it reaches every route in the project.
   records `cancel_recorded: false`, `cancel_failure` and the reason `cancel_unrecorded`, and
   the run never passes. The executor holds the outcome, for a bounded time, until the
   guardian's confirmed stop of the exact group is reported (ADR 0160).
+
+## Amendment: a control refusal on a running route
+
+- While the last post-start observe read `running`, a `Forbidden` (or an HTTP 401/403)
+  cancels the route only when it is a verified revocation: control's readiness probe answers
+  ready and the refusal's detail is exactly one of control's authority-gone details
+  (`AUTHORITY_GONE_DETAILS` in `tessera_worker/control_channel.py`), never a substring. Any
+  other `Forbidden` (a generic `Unauthorized`, an empty or unreadable detail, `Authenticated
+  exact Salad route required.`), or any `Forbidden` while control is unready, takes the
+  control-stall path above. A refused keepalive keeps the beat from the guardian, so it is
+  still tolerated only inside the guardian silence bound. Deadline, budget, a store
+  `Conflict` and the guardian's recorded stop cause cancel as before; before `running`
+  nothing changes.
+- Every refusal leaves bounded evidence: `cancel_cause.refusal` and the receipt's
+  `control_refusal` name the driver step, the in-process control call, the HTTP status when
+  there was one, control's plain-text detail (anything URL-, path- or token-shaped, or over
+  160 characters, is replaced by `unrecognized_detail`), whether it was verified, control's
+  readiness, and whether it was skipped. `cancel_cause.class` stays closed.
+- Control reads a credential and its latest renewal in one read snapshot, so a renewal
+  committed between the two reads can no longer be read half-applied and refused as
+  `Unauthorized`; a lock stays an `OperationalError`. A timed-out licence-label read stays a
+  `TimeoutError`, not a `Forbidden`.
