@@ -135,3 +135,37 @@ issue, and in a shared executor project it reaches every route in the project.
   not list only when a sealed recovery event bound to exactly that receipt's digest lists the
   same stage, attempt, output name and sha256; every other check is unchanged. The
   human-only `reconcile-unclaimed-salad` hold is untouched.
+
+## Amendment: no cancel of a running route on an unexpected or transient error
+
+- A live run lost a running route to a bare `ValueError`: the guardian admin status read the
+  live check makes every pass (`SaladLiveSession.evidence`, through `SafetyHTTPSClient.exchange`)
+  timed out while the guardian waited on its own provider read, the client turned the timeout
+  into `ValueError("service_unavailable")`, and the driver, which did not classify it, ended
+  the run as `running_route_cancelled_error` with only the class name on the receipt.
+- The admin client now raises `ServiceUnavailable` (still a `ValueError("service_unavailable")`
+  for every caller) carrying a closed `detail` (`timeout`, `reset`, `connect`, `tls`,
+  `protocol`, `malformed_response`, `non_200`, `oversize`, `identity_mismatch`, `other`). A
+  timeout, reset, connect, protocol or malformed-reply failure of the status read is a read
+  stall like a timed-out provider read.
+- While the last post-start observe read `running` and the guardian has recorded no stop cause,
+  only a genuine terminal cause ends the run and sends the driver's cancel: the run deadline, a
+  budget refusal, an explicit operator cancel or revocation (a verified authority-gone refusal
+  from a ready control, or a control `Conflict` other than a route-revision race), the
+  guardian's own decision (its recorded stop cause, or a terminal refusal code it returned, such
+  as `stop_only`) or a verified `execution_complete`. Any other error raised in the post-start
+  loop (any exception class, a malformed or partial provider or guardian reply, a read timeout,
+  a control stall, a guardian that did not answer or whose own request ran out, an unverified
+  refusal, a transient guardian refusal past the silence bound) is held: recorded and retried at
+  the next interval. The guardian keeps its own silence, deadline and budget stops. Before
+  `running` and once the guardian recorded a stop cause, the earlier bounds are unchanged. A
+  reply that names no provider status never turns a running route into an unknown one.
+- The receipt records the error behind a cancel as `cancel_cause.error`, the latest held error
+  as `last_held_error` (with `running_errors_held`), and the latest skipped read as
+  `last_skipped_read` (the last two only when present). Each holds the class name, the message
+  only when it is short plain text (else `unrecognized_detail`: no path, URL, query, long token
+  or secret-looking word survives), the class of the error it was raised from (also a
+  suppressed context), the error's closed `detail` token, the raising `module.function` and the
+  tagged control call. When the live check exits without a receipt its JSON report carries the
+  same `error`, and the executor logs it and any held or cancel error from a receipt. No receipt
+  status is added and no schema changes.

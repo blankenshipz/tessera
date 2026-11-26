@@ -3306,6 +3306,56 @@ class SafetyHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+# Closed ``detail`` of a failed admin HTTPS exchange (ServiceUnavailable). Only these classes of
+# failure are told apart; never the exception text, the URL, a header or a body.
+SERVICE_UNAVAILABLE_DETAILS = frozenset(
+    {
+        "timeout",  # connect or read timed out (socket timeout or the caller's wall bound)
+        "reset",  # the peer closed or reset the connection mid-exchange
+        "connect",  # the connection could not be made (refused, unreachable, other OSError)
+        "tls",  # the TLS handshake or record layer failed
+        "protocol",  # the HTTP response was malformed (status line, headers, short body)
+        "malformed_response",  # the 200 body was not strict JSON
+        "non_200",  # the service answered with another HTTP status
+        "oversize",  # the reply exceeded its byte cap
+        "identity_mismatch",  # the pinned service certificate did not match
+        "other",  # anything else
+    }
+)
+# The details a caller may treat as transient (the next exchange may well succeed).
+TRANSIENT_SERVICE_DETAILS = frozenset(
+    {"timeout", "reset", "connect", "protocol", "malformed_response"}
+)
+
+
+class ServiceUnavailable(ValueError):
+    """The admin HTTPS exchange failed. ``str(error)`` stays ``service_unavailable``; the
+    closed ``detail`` (SERVICE_UNAVAILABLE_DETAILS) says how, without any text."""
+
+    def __init__(self, detail):
+        super().__init__("service_unavailable")
+        self.detail = detail if detail in SERVICE_UNAVAILABLE_DETAILS else "other"
+
+
+def _exchange_failure(error):
+    """Closed detail of an exchange failure (class only; never its message)."""
+    if isinstance(error, TimeoutError):  # socket.timeout and the SIGALRM wall bound
+        return "timeout"
+    if isinstance(error, ssl.SSLError):
+        return "tls"
+    if isinstance(error, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+        return "reset"
+    if isinstance(error, (http.client.RemoteDisconnected, http.client.IncompleteRead)):
+        return "reset"
+    if isinstance(error, OSError):
+        return "connect"
+    if isinstance(error, http.client.HTTPException):
+        return "protocol"
+    if isinstance(error, ValueError):
+        return "malformed_response"
+    return "other"
+
+
 class SafetyHTTPSClient:
     def __init__(self, host, port, *, token_file, ca_file, certificate_sha256):
         self.host, self.port, self.token_file = host, port, token_file
@@ -3324,7 +3374,7 @@ class SafetyHTTPSClient:
                 hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest()
                 != self.pin
             ):
-                raise ValueError("service_identity_mismatch")
+                raise ServiceUnavailable("identity_mismatch")
             connection.request(
                 "POST",
                 "/v1/admin",
@@ -3336,11 +3386,18 @@ class SafetyHTTPSClient:
             )
             response = connection.getresponse()
             raw = response.read(cap + 1)
-            if response.status != 200 or len(raw) > cap:
-                raise ValueError("service_unavailable")
+            if response.status != 200:
+                raise ServiceUnavailable("non_200")
+            if len(raw) > cap:
+                raise ServiceUnavailable("oversize")
             return strict_json(raw)
-        except Exception:
-            raise ValueError("service_unavailable") from None
+        except ServiceUnavailable:
+            raise
+        except Exception as error:
+            # Still a ValueError("service_unavailable") for every caller, but with a closed
+            # detail: a read timeout (the guardian busy on its own provider read) is told
+            # apart from a pin mismatch or a refusal, so a live check can retry it.
+            raise ServiceUnavailable(_exchange_failure(error)) from None
         finally:
             connection.close()
 

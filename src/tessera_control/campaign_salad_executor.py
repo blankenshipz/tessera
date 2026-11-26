@@ -347,6 +347,44 @@ def live_check_exit_detail(stdout: bytes | None) -> str:
     return LIVE_CHECK_NO_RECEIPT
 
 
+# The sanitized error fields the live check puts on its report or receipt (salad_live_check.
+# _error_detail) that the executor repeats in its journal, each re-checked against a closed shape.
+_ERROR_FIELD_SHAPES = {
+    "exception": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}"),
+    "cause": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}"),
+    "detail": re.compile(r"[a-z][a-z0-9_]{0,63}"),
+    "site": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\.[A-Za-z_<>][A-Za-z0-9_<>]{0,63}"),
+    "step": re.compile(r"[a-z][a-z0-9_]{0,31}"),
+    "message": re.compile(r"[A-Za-z][A-Za-z0-9 ,.'():;_/-]{0,159}"),
+}
+
+
+def live_check_error_summary(error: Any) -> str | None:
+    """``key=value`` pairs of a live-check error detail, each value re-checked; else None.
+
+    The child already sanitized these (no secrets, paths or bodies); anything that does not
+    fit its closed shape here is dropped rather than echoed."""
+    if type(error) is not dict:
+        return None
+    parts = []
+    for key, shape in _ERROR_FIELD_SHAPES.items():
+        value = error.get(key)
+        if type(value) is str and shape.fullmatch(value) and "://" not in value:
+            parts.append(f"{key}={value!r}" if key == "message" else f"{key}={value}")
+    return " ".join(parts) or None
+
+
+def live_check_report_error(stdout: bytes | None) -> str | None:
+    """The sanitized ``error`` of the live check's last JSON report line (no receipt case)."""
+    for line in reversed((stdout or b"")[-_REPORT_SCAN_BYTES:].splitlines()):
+        try:
+            report = json.loads(line)
+        except ValueError:
+            continue
+        return live_check_error_summary(report.get("error")) if type(report) is dict else None
+    return None
+
+
 _STDERR_CLASS = re.compile(r"(?:[a-z_][a-z0-9_]*\.)*([A-Z][A-Za-z0-9_]{0,63})(?::.*)?")
 LIVE_CHECK_STDERR_UNCLASSIFIED = "stderr_unclassified"
 
@@ -400,8 +438,30 @@ def subprocess_route_runner(config_path: Path, receipt_dir: Path, timeout: int):
     receipt = read_receipt(receipt_dir)
     if receipt is None:
         detail = live_check_exit_detail(completed.stdout)
-        _LOG.warning("live check exited without a receipt: %s", detail)
+        error = live_check_report_error(completed.stdout)
+        _LOG.warning(
+            "live check exited without a receipt: %s%s", detail, f" ({error})" if error else ""
+        )
         raise RouteExitedWithoutReceipt(detail)
+    # Errors the child held on a running route, and the error behind its own cancel, are on
+    # the receipt (sanitized); repeat them here so the journal is never blind to them.
+    held = live_check_error_summary(receipt.get("last_held_error"))
+    if held is not None:
+        _LOG.warning(
+            "live check held %s error(s) on a running route; last: %s",
+            receipt.get("running_errors_held")
+            if type(receipt.get("running_errors_held")) is int
+            else "?",
+            held,
+        )
+    cause = receipt.get("cancel_cause")
+    ended = live_check_error_summary(cause.get("error")) if type(cause) is dict else None
+    if ended is not None:
+        _LOG.warning(
+            "live check cancel cause %s: %s",
+            cause.get("class") if _REPORT_TOKEN.fullmatch(str(cause.get("class"))) else "?",
+            ended,
+        )
     return receipt
 
 

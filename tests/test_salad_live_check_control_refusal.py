@@ -126,20 +126,21 @@ def test_unverified_keepalive_refusal_inside_the_silence_bound_is_a_stall(make):
     assert receipt["control_stalls"] == 0
 
 
-def test_a_persistent_keepalive_refusal_still_ends_at_the_silence_bound():
-    # A refused beat never reaches the guardian: tolerated only inside the silence bound.
-    refusals = [None] + [tagged(Forbidden("Unauthorized")) for _ in range(10)]
+def test_a_persistent_keepalive_refusal_on_a_running_route_is_held_to_the_deadline():
+    # A refused beat never reaches the guardian, but an unverified refusal is not a genuine
+    # terminal cause: on a running route with no guardian stop cause it is held past the
+    # silence bound (the guardian keeps its own silence authority); the deadline ends the run.
+    refusals = [None] + [tagged(Forbidden("Unauthorized")) for _ in range(200)]
     session = ProbedSession(beat_errors=refusals)
-    receipt = drive(session)
-    assert cancelled_before_output(session)
+    receipt = drive(session, max_polls=40, max_seconds=100)
     cause = receipt["cancel_cause"]
-    assert cause["class"] == "silence_bound"
-    assert cause["exception"] == "Forbidden"
-    assert cause["refusal"]["call"] == "Store.get"
-    assert cause["refusal"]["detail"] == "Unauthorized"
-    assert cause["refusal"]["skipped"] is False
-    assert receipt["control_refusals_skipped"] >= 1
-    assert receipt["reason"] == RUNNING_CANCEL_PREFIX + "silence_bound"
+    assert cause["class"] == "deadline"
+    assert cause["refusal"] is None
+    assert receipt["control_refusal"]["call"] == "Store.get"
+    assert receipt["control_refusal"]["detail"] == "Unauthorized"
+    assert receipt["control_refusal"]["skipped"] is True
+    assert receipt["control_refusals_skipped"] >= 8
+    assert not receipt["reason"].startswith(RUNNING_CANCEL_PREFIX)
 
 
 # --- control unready: even an exact revocation detail is a stall -----------------------------
@@ -284,10 +285,13 @@ def test_refusal_detail_never_carries_secret_or_unbounded_text(detail):
     assert receipt["cancel_cause"]["class"] in CANCEL_CAUSE_CLASSES
 
 
-def test_a_non_refusal_error_carries_no_text():
-    session = ProbedSession(observe_errors=[None, RuntimeError(SECRET)])
+def test_a_non_refusal_error_carries_no_secret_text():
+    # On a running route it is held (not a cancel); its recorded detail drops the text.
+    session = ProbedSession(retain_after=2, observe_errors=[None, RuntimeError(SECRET)])
     receipt = drive(session)
-    assert receipt["cancel_cause"]["class"] == "error"
+    assert receipt["status"] == "passed", receipt
+    assert receipt["last_held_error"]["exception"] == "RuntimeError"
+    assert receipt["last_held_error"]["message"] == "unrecognized_detail"
     assert receipt["cancel_cause"]["refusal"] is None
     assert SECRET not in json.dumps(receipt)
 

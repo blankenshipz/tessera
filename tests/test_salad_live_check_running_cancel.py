@@ -156,18 +156,23 @@ def test_running_route_survives_control_stalls_while_the_guardian_takes_its_beat
     assert receipt["guardian_refusal"] is None
 
 
-def test_a_deterministic_read_failure_while_running_stays_bounded():
+def test_a_deterministic_read_failure_while_running_is_held_not_cancelled():
+    # Past its bound of three a deterministic read failure is no longer skipped as a read
+    # stall, but on a running route it is held (the guardian, which stops a mismatching group
+    # itself, decides): the run continues and completes once the reads come back.
     def mismatch():
         error = ProviderReadUnavailable("x")
         error.failure, error.detail = "identity_mismatch", None
         return error
 
-    session = RunningSession(observe_errors=[None] + [mismatch() for _ in range(5)])
+    session = RunningSession(retain_after=2, observe_errors=[None] + [mismatch() for _ in range(5)])
     receipt = drive(session)
-    assert cancelled_before_output(session)
+    assert receipt["status"] == "passed", receipt
     assert receipt["observe_transient_failures"] == 2
-    assert receipt["cancel_cause"]["class"] == "observe_timeout"
-    assert receipt["reason"] == RUNNING_CANCEL_PREFIX + "observe_timeout"
+    assert receipt["running_errors_held"] == 3
+    assert receipt["last_held_error"]["step"] == "observe"
+    assert receipt["last_held_error"]["exception"] == "ProviderReadUnavailable"
+    assert receipt["cancel_cause"]["class"] == "execution_complete"
 
 
 def test_observe_stalls_before_running_keep_the_earlier_bound():
@@ -278,14 +283,25 @@ def test_a_locked_control_before_running_is_still_a_silence_bound_cancel():
     assert receipt["control_stalls"] >= 1
 
 
-def test_a_transient_guardian_refusal_past_the_bound_is_still_silence_bound():
-    # A guardian that answered (loop unready) is not a control stall: its bound is unchanged.
+def test_a_transient_guardian_refusal_past_the_bound_is_held_on_a_running_route():
+    # A guardian whose loop is not fresh keeps its own silence authority: on a running route
+    # with no stop cause, refusals past the bound are held, never a silence_bound cancel.
     refusals = [None] + [GuardianRefused("guardian_loop_unready") for _ in range(10)]
-    session = RunningSession(beat_errors=refusals)
+    session = RunningSession(retain_after=12, beat_errors=refusals)
+    receipt = drive(session)
+    assert receipt["status"] == "passed", receipt
+    assert receipt["running_errors_held"] >= 1
+    assert receipt["last_held_error"]["guardian_refusal"] == "guardian_loop_unready"
+    assert receipt["guardian_refusal"] is None
+
+
+def test_a_transient_guardian_refusal_before_running_is_still_silence_bound():
+    refusals = [None] + [GuardianRefused("guardian_loop_unready") for _ in range(40)]
+    session = DeployingSession(beat_errors=refusals)
     receipt = drive(session)
     assert cancelled_before_output(session)
     assert receipt["cancel_cause"]["class"] == "silence_bound"
-    assert receipt["reason"] == RUNNING_CANCEL_PREFIX + "silence_bound"
+    assert "running_errors_held" not in receipt
 
 
 def test_a_guardian_stop_cause_keeps_the_guardians_word():
@@ -311,15 +327,16 @@ def test_the_deadline_is_a_deadline_cancel():
     assert not receipt["reason"].startswith(RUNNING_CANCEL_PREFIX)
 
 
-def test_cancel_cause_is_closed_and_a_non_refusal_carries_no_text():
-    # Only a control refusal adds bounded evidence (cancel_cause["refusal"]); any other
-    # error keeps its class name only.
-    session = RunningSession(observe_errors=[None, RuntimeError(SECRET)])
+def test_cancel_cause_is_closed_and_a_non_refusal_carries_no_secret_text():
+    # Before the route reads running an unexpected error still cancels; only a control refusal
+    # adds refusal evidence, and the error detail never carries secret-looking text.
+    session = DeployingSession(observe_errors=[RuntimeError(SECRET)])
     receipt = drive(session)
     assert receipt["cancel_cause"]["class"] in CANCEL_CAUSE_CLASSES
     assert receipt["cancel_cause"]["class"] == "error"
     assert receipt["cancel_cause"]["exception"] == "RuntimeError"
     assert receipt["cancel_cause"]["refusal"] is None
+    assert receipt["cancel_cause"]["error"]["message"] == "unrecognized_detail"
     assert SECRET not in json.dumps(receipt)
 
 

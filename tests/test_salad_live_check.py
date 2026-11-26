@@ -274,10 +274,21 @@ def test_explicit_invalid_run_has_closed_error_and_no_network(capsys):
             )
             == 2
         )
-    assert json.loads(capsys.readouterr().out) == {
+    out = capsys.readouterr().out
+    report = json.loads(out)
+    assert report.pop("error") == {
+        "exception": "ValueError",
+        "message": "private authenticated config unavailable",
+        "cause": "FileNotFoundError",
+        "detail": None,
+        "site": "salad_live_check.__init__",
+        "call": None,
+    }
+    assert report == {
         "status": "inconclusive",
         "reason": "secure_setup_or_execution_unresolved",
     }
+    assert "/nonexistent" not in out
 
 
 def test_private_loader_rejects_permissions_symlink_and_hardlink(tmp_path):

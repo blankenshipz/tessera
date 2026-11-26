@@ -1326,7 +1326,7 @@ CANCEL_CAUSE_CLASSES = frozenset(
         "prestart",  # a pre-start step failed (see prestart_failure)
         "poll_bound",  # the poll bound ran out with no output
         "output_unavailable",  # the loop ended with no retained output
-        "error",  # anything else (exception class name only)
+        "error",  # anything else (see cancel_cause["error"] for the sanitized detail)
     }
 )
 
@@ -1360,11 +1360,24 @@ def _is_stall(error):
 def _is_read_stall(error):
     """A stall, or a fresh provider read that failed transiently (not deterministically)."""
     from .salad_guardian import is_deterministic_read_failure
+    from .salad_safety_service import TRANSIENT_SERVICE_DETAILS, ServiceUnavailable
     from .salad_server import ProviderReadUnavailable
 
     if isinstance(error, ProviderReadUnavailable):
         return not is_deterministic_read_failure(error)
+    if isinstance(error, ServiceUnavailable):
+        # The guardian status read (``SaladLiveSession.evidence``) timed out or was cut off:
+        # a read that changes nothing, retried like a timed-out provider read.
+        return error.detail in TRANSIENT_SERVICE_DETAILS
     return _is_stall(error)
+
+
+def _is_read_failure(error):
+    """A failed read the post-start loop may skip (bounded unless the route is running)."""
+    from .salad_safety_service import ServiceUnavailable
+    from .salad_server import ProviderReadUnavailable
+
+    return isinstance(error, (ProviderReadUnavailable, ServiceUnavailable)) or _is_stall(error)
 
 
 # --- a control refusal while running: verified revocation, or a stall ----------------------------
@@ -1428,6 +1441,93 @@ def _refusal(error):
     return None
 
 
+# --- a running route is never cancelled on an unexpected or transient error -------------------
+# While the last post-start observe read the group running and the guardian has recorded no stop
+# cause, only a genuine terminal cause ends the run and sends this driver's cancel: the run
+# deadline, a budget refusal, an explicit operator cancel or revocation (a verified authority-gone
+# refusal from a ready control, or a control Conflict other than a route-revision race), the
+# guardian's own decision (its recorded stop cause, or a terminal refusal code it returned) or a
+# verified execution_complete. Anything else raised inside the post-start loop (a ValueError, a
+# malformed or partial provider or guardian reply, a read timeout, a control stall, an
+# OperationalError, any new class) is recorded on the receipt (``running_errors_held`` and
+# ``last_held_error``, sanitized) and the pass is retried at the next interval; the guardian keeps
+# its own deadline, budget and silence authority meanwhile and stops the group itself.
+# Guardian heartbeat codes that are not a guardian decision: it did not answer, its loop or
+# verifier was not fresh, or its own request ran out of time (e.g. while it waited on a slow
+# provider read). Every other code is the guardian's refusal and stays terminal.
+HELD_GUARDIAN_CODES = TRANSIENT_GUARDIAN_CODES | frozenset(
+    {"unavailable", "internal", "service_deadline", "admin_deadline_exceeded"}
+)
+# Closed steps of the post-start loop a held error is attributed to.
+HELD_ERROR_STEPS = frozenset({"keepalive", "observe", "evidence", "record"})
+ERROR_MESSAGE_CAP = 160
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_ERROR_SITE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\.[A-Za-z_<>][A-Za-z0-9_<>]{0,63}")
+# Words that never appear in a recorded message, whatever its shape.
+_SECRET_WORDS = re.compile(r"(?i)bearer|token|secret|passw|api.?key|authoriz|cookie|credential")
+
+
+def _error_message(error):
+    """The error's message if it is short plain text, else UNRECOGNIZED_DETAIL (None if empty).
+
+    Only a single string argument is read. A closed token (``service_unavailable``) or a plain
+    sentence (``exact retained metadata required``) survives; a path, URL, query, long token-
+    shaped run, secret-looking word or anything over ERROR_MESSAGE_CAP characters does not."""
+    args = getattr(error, "args", ())
+    if not args:
+        return None
+    if len(args) != 1 or type(args[0]) is not str:
+        return UNRECOGNIZED_DETAIL
+    text = args[0].strip()
+    if not text:
+        return None
+    if (
+        len(text) > ERROR_MESSAGE_CAP
+        or not _REFUSAL_DETAIL_SHAPE.fullmatch(text)
+        or _UNSAFE_DETAIL.search(text)
+        or _SECRET_WORDS.search(text)
+    ):
+        return UNRECOGNIZED_DETAIL
+    return text
+
+
+def _error_site(error):
+    """``module.function`` of the innermost frame that raised (no path, no line), or None."""
+    tb = getattr(error, "__traceback__", None)
+    if tb is None:
+        return None
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    code = tb.tb_frame.f_code
+    site = Path(code.co_filename).stem + "." + code.co_name
+    return site if _ERROR_SITE.fullmatch(site) else None
+
+
+def _error_detail(error):
+    """Sanitized, bounded diagnosis of an error for the receipt; never secrets, paths or bodies.
+
+    ``exception``: class name; ``message``: _error_message; ``cause``: the class name of the
+    error it was raised from (also a suppressed ``from None`` context, e.g. the socket timeout
+    behind ``ValueError("service_unavailable")``); ``detail``: the error's own closed ``detail``
+    token when it carries one (a transport's ``timeout``, ``non_200``...); ``site``: the raising
+    ``module.function``; ``call``: the tagged control call (CONTROL_CALLS) or None."""
+    if error is None:
+        return None
+    try:
+        inner = error.__cause__ if error.__cause__ is not None else error.__context__
+        call = getattr(error, "live_check_call", None)
+        return {
+            "exception": _exception_type_name(error),
+            "message": _error_message(error),
+            "cause": None if inner is None else _exception_type_name(inner),
+            "detail": _closed_token(getattr(error, "detail", None)),
+            "site": _error_site(error),
+            "call": call if call in CONTROL_CALLS else None,
+        }
+    except Exception:
+        return {"exception": _exception_type_name(error), "message": UNRECOGNIZED_DETAIL}
+
+
 def _budget_code(code):
     return type(code) is str and (code.startswith("budget_") or code == "rate_unknown")
 
@@ -1478,7 +1578,10 @@ def _drive(
         # Why this driver sent its cancel: {"class": one of CANCEL_CAUSE_CLASSES, "exception":
         # the ending error's class name or None, "guardian_refusal": closed code or None,
         # "last_provider_status": the last post-start observe's status or None,
-        # "heartbeat_silent_seconds": seconds since the last heartbeat the guardian took}.
+        # "heartbeat_silent_seconds": seconds since the last heartbeat the guardian took,
+        # "error": the ending error's sanitized, bounded detail (_error_detail) or None}.
+        # Added only when present: ``running_errors_held`` / ``last_held_error`` (errors held
+        # on a running route, see HELD_GUARDIAN_CODES) and ``last_skipped_read``.
         "cancel_cause": None,
         # ``cancel_cause["refusal"]``: the control refusal behind the cancel (see
         # ``control_refusal`` below) or None.
@@ -1720,7 +1823,63 @@ def _drive(
             "heartbeat_silent_seconds": silent,
             # Which call control refused, its HTTP status and detail (bounded, never secret).
             "refusal": note_refusal(error, "run"),
+            # The ending error, sanitized and bounded (_error_detail): message, cause class,
+            # closed detail and raising site, so the cancel is diagnosable from the receipt.
+            "error": _error_detail(error),
         }
+
+    def terminal(error, refusal):
+        """True when ``error`` is a genuine terminal cause even on a running route: a guardian
+        refusal that is its own decision (budget included), or an explicit control decision
+        (a verified revocation from a ready control, a Conflict other than a revision race)."""
+        code = _guardian_code(error)
+        if code is not None:
+            return code not in HELD_GUARDIAN_CODES
+        if refusal is None:
+            return False
+        if refusal["kind"] == "conflict":
+            return conflict_reason(error) not in TRANSIENT_CONFLICT_REASONS
+        ready = refusal["control_readiness"] in {None, "ready"}
+        return refusal["verified_authority_gone"] and ready
+
+    def hold(error, where):
+        """True when an error in the post-start loop leaves a running route running.
+
+        Only while the last observe read running, the guardian has recorded no stop cause, the
+        deadline has not passed and the error is not a genuine terminal cause (``terminal``).
+        The error is recorded sanitized; the caller retries at the next interval."""
+        if (
+            not isinstance(error, Exception)
+            or not running()
+            or receipt["guardian_stop_cause"] is not None
+            or clock() >= deadline
+        ):
+            return False
+        try:
+            refusal = note_refusal(error, where if where in REFUSAL_STEPS else "run")
+            if terminal(error, refusal):
+                return False
+            if refusal is not None and not refusal["skipped"]:
+                skip_refusal(refusal)
+            detail = _error_detail(error)
+            code = _guardian_code(error)
+        except Exception:
+            return False
+        # A held beat or read is not the ending cause: no bound a helper gave up with, and no
+        # guardian refusal, may linger into a later cancel's class.
+        ended["class"] = None
+        if code is not None:
+            receipt["guardian_refusal"] = None
+        receipt["running_errors_held"] = receipt.get("running_errors_held", 0) + 1
+        receipt["last_held_error"] = dict(
+            detail,
+            step=where if where in HELD_ERROR_STEPS else "record",
+            guardian_refusal=_closed_token(code),
+            heartbeat_silent_seconds=(
+                None if beats["ok_at"] is None else round(max(0, clock() - beats["ok_at"]), 1)
+            ),
+        )
+        return True
 
     evidence = {"output_retained": False}
     # Successful observe-and-evidence passes; read only by the optional watch snapshot.
@@ -1736,14 +1895,14 @@ def _drive(
         A provider read failure or a stall is skipped at most MAX_TRANSIENT_OBSERVE_FAILURES - 1
         times in a row; while the route last read running, a transient one (timeout, control
         stall, non-deterministic read failure, an unverified refusal) is skipped without that
-        bound: the guardian, not this driver, decides to stop a running group."""
-        from .salad_server import ProviderReadUnavailable
-
+        bound: the guardian, not this driver, decides to stop a running group. Anything else
+        that reaches the post-start loop on a running route is held there (``hold``)."""
         evidence = note_refusal(error, step)
         if refusal_stall(evidence):
             skip_refusal(evidence)
+            note_skipped(error, step)
             return True
-        if not isinstance(error, ProviderReadUnavailable) and not _is_stall(error):
+        if not _is_read_failure(error):
             return False
         if not (running() and _is_read_stall(error)):
             if observes["failed"] >= MAX_TRANSIENT_OBSERVE_FAILURES - 1:
@@ -1751,7 +1910,14 @@ def _drive(
                 return False
         observes["failed"] += 1
         receipt["observe_transient_failures"] += 1
+        note_skipped(error, step)
         return True
+
+    def note_skipped(error, step):
+        """The latest skipped read's sanitized detail (``last_skipped_read``; absent until one)."""
+        detail = _error_detail(error)
+        if detail is not None:
+            receipt["last_skipped_read"] = dict(detail, step=step)
 
     def observe():
         """dispatch("observe"), or None after a skippable read failure (skip_read)."""
@@ -1824,7 +1990,17 @@ def _drive(
             # Once the approved output is retained the guardian stops the
             # group and closes writers, so it refuses further heartbeats.
             # That is completion; any other refusal is still a failure.
-            if not session.evidence(route_id)["output_retained"]:
+            try:
+                retained = session.evidence(route_id)["output_retained"] is True
+            except Exception:
+                # The status read failed too (e.g. the guardian admin read timed out): the
+                # beat's own error decides, never this read's.
+                retained = False
+            if not retained:
+                if hold(error, "keepalive"):
+                    # Running, no guardian stop cause, not a genuine terminal cause: the beat
+                    # is retried next interval and this pass still observes the group.
+                    return
                 if code is not None:
                     receipt["guardian_refusal"] = {"code": code, "cause": cause}
                 raise
@@ -1994,82 +2170,98 @@ def _drive(
         for _ in range(max_polls):
             if clock() >= deadline:
                 break
-            if launched:
-                heartbeat()
-            began = clock()
-            observed = observe()
-            if observed is None:
-                sleep(min(interval, max(0, deadline - clock())))
-                continue
-            state = observed
-            receipt["last_provider_status"] = _closed_token(state.get("provider_status"))
+            # A pass on a running route that raises anything but a genuine terminal cause is
+            # held (``hold``): recorded sanitized, retried next interval, never a cancel.
+            where = {"step": "keepalive"}
             try:
-                polled = session.evidence(route_id)
+                if launched:
+                    heartbeat()
+                began = clock()
+                where["step"] = "observe"
+                observed = observe()
+                if observed is None:
+                    sleep(min(interval, max(0, deadline - clock())))
+                    continue
+                state = observed
+                # A partial reply that names no status never turns a running route into an
+                # unknown one (that would lift the hold below); it is held on its own.
+                if state.get("provider_status") is not None or not running():
+                    receipt["last_provider_status"] = _closed_token(state.get("provider_status"))
+                where["step"] = "evidence"
+                try:
+                    polled = session.evidence(route_id)
+                except Exception as error:
+                    # The guardian status read is a read too: a stall skips this pass like a
+                    # failed observe (a dead guardian still ends the run at the next heartbeat).
+                    if not skip_read(error, "evidence"):
+                        raise
+                    sleep(min(interval, max(0, deadline - clock())))
+                    continue
+                where["step"] = "record"
+                evidence = polled
+                watch_poll(state, evidence)
+                receipt["financial"] = _financial(evidence.get("financial", {}))
+                receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
+                receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
+                receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
+                receipt["guardian_stop_cause"] = evidence.get("stop_cause")
+                _note_start_evidence(receipt, evidence)
+                receipt["custody_work_begun"] = evidence.get("custody_work_begun")
+                receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
+                receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
+                receipt["guardian_last_provider_read_failure"] = evidence.get(
+                    "last_provider_read_failure"
+                )
+                receipt["guardian_last_provider_read_failure_reason"] = evidence.get(
+                    "last_provider_read_failure_reason"
+                )
+                receipt["guardian_last_provider_read_failure_detail"] = evidence.get(
+                    "last_provider_read_failure_detail"
+                )
+                receipt["guardian_last_provider_read_failure_field"] = evidence.get(
+                    "last_provider_read_failure_field"
+                )
+                receipt["guardian_last_provider_read_failure_request_kind"] = evidence.get(
+                    "last_provider_read_failure_request_kind"
+                )
+                if evidence.get("stop_cause") == "allocation_timeout":
+                    # The guardian cancelled the group: no instance was ever allocated in time.
+                    # Nothing more can happen, so stop polling; the reason is kept below.
+                    receipt["reason"] = "allocation_timeout"
+                    receipt["allocation_timeout"] = evidence.get("allocation_timeout")
+                    break
+                if str(evidence.get("stop_cause") or "").startswith(WORKLOAD_FAILED_CAUSE_PREFIX):
+                    # The workload reported its own failure and the guardian stopped the group:
+                    # the run failed for that reason (never a provider move). Stop polling.
+                    receipt["reason"] = evidence["stop_cause"]
+                    break
+                if evidence.get("stop_cause") == START_FAILURE_REASON:
+                    # The guardian saw the container fail to start on several machines before any
+                    # custody began: stop polling; the reason is kept below.
+                    receipt["reason"] = START_FAILURE_REASON
+                    break
+                if evidence["output_retained"]:
+                    break
+                # Spread polls over the approved window; stay well inside the guardian's
+                # 30s heartbeat staleness bound so a live run is not stopped for silence. A slow
+                # observe or evidence read spends part of the interval, so only the rest is slept.
+                sleep(min(max(0, interval - (clock() - began)), max(0, deadline - clock())))
+                if state["provider_status"] in PRESTART_PROVIDER_STATUSES:
+                    # Stretch only the observe cadence: keep heartbeating at the normal
+                    # interval until the backed-off observe is due.
+                    waited = interval
+                    where["step"] = "keepalive"
+                    while waited < PRESTART_POLL_INTERVAL_SECONDS and clock() < deadline:
+                        if launched:
+                            heartbeat()
+                        slice_seconds = min(interval, PRESTART_POLL_INTERVAL_SECONDS - waited)
+                        sleep(min(slice_seconds, max(0, deadline - clock())))
+                        waited += slice_seconds
             except Exception as error:
-                # The guardian status read is a read too: a stall skips this pass like a
-                # failed observe (a dead guardian still ends the run at the next heartbeat).
-                if not skip_read(error, "evidence"):
+                if not hold(error, where["step"]):
                     raise
                 sleep(min(interval, max(0, deadline - clock())))
                 continue
-            evidence = polled
-            watch_poll(state, evidence)
-            receipt["financial"] = _financial(evidence.get("financial", {}))
-            receipt["guardian_rate_read_retries"] = evidence.get("rate_read_retries")
-            receipt["guardian_provider_read_retries"] = evidence.get("provider_read_retries")
-            receipt["guardian_prestart_read_retries"] = evidence.get("prestart_read_retries")
-            receipt["guardian_stop_cause"] = evidence.get("stop_cause")
-            _note_start_evidence(receipt, evidence)
-            receipt["custody_work_begun"] = evidence.get("custody_work_begun")
-            receipt["guardian_last_workload_refusal"] = evidence.get("last_workload_refusal")
-            receipt["guardian_last_rate_read_failure"] = evidence.get("last_rate_read_failure")
-            receipt["guardian_last_provider_read_failure"] = evidence.get(
-                "last_provider_read_failure"
-            )
-            receipt["guardian_last_provider_read_failure_reason"] = evidence.get(
-                "last_provider_read_failure_reason"
-            )
-            receipt["guardian_last_provider_read_failure_detail"] = evidence.get(
-                "last_provider_read_failure_detail"
-            )
-            receipt["guardian_last_provider_read_failure_field"] = evidence.get(
-                "last_provider_read_failure_field"
-            )
-            receipt["guardian_last_provider_read_failure_request_kind"] = evidence.get(
-                "last_provider_read_failure_request_kind"
-            )
-            if evidence.get("stop_cause") == "allocation_timeout":
-                # The guardian cancelled the group: no instance was ever allocated in time.
-                # Nothing more can happen, so stop polling; the reason is kept below.
-                receipt["reason"] = "allocation_timeout"
-                receipt["allocation_timeout"] = evidence.get("allocation_timeout")
-                break
-            if str(evidence.get("stop_cause") or "").startswith(WORKLOAD_FAILED_CAUSE_PREFIX):
-                # The workload reported its own failure and the guardian stopped the group:
-                # the run failed for that reason (never a provider move). Stop polling.
-                receipt["reason"] = evidence["stop_cause"]
-                break
-            if evidence.get("stop_cause") == START_FAILURE_REASON:
-                # The guardian saw the container fail to start on several machines before any
-                # custody began: stop polling; the reason is kept below.
-                receipt["reason"] = START_FAILURE_REASON
-                break
-            if evidence["output_retained"]:
-                break
-            # Spread polls over the approved window; stay well inside the guardian's
-            # 30s heartbeat staleness bound so a live run is not stopped for silence. A slow
-            # observe or evidence read spends part of the interval, so only the rest is slept.
-            sleep(min(max(0, interval - (clock() - began)), max(0, deadline - clock())))
-            if state["provider_status"] in PRESTART_PROVIDER_STATUSES:
-                # Stretch only the observe cadence: keep heartbeating at the normal
-                # interval until the backed-off observe is due.
-                waited = interval
-                while waited < PRESTART_POLL_INTERVAL_SECONDS and clock() < deadline:
-                    if launched:
-                        heartbeat()
-                    slice_seconds = min(interval, PRESTART_POLL_INTERVAL_SECONDS - waited)
-                    sleep(min(slice_seconds, max(0, deadline - clock())))
-                    waited += slice_seconds
         else:
             ended["class"] = "poll_bound"
             raise ValueError("poll bound")
@@ -2395,10 +2587,13 @@ def main(argv=None):
                     max_seconds=session.config["max_seconds"],
                     max_polls=session.config["max_polls"],
                 )
-            except Exception:
+            except Exception as error:
+                # No receipt may exist: the report still says what failed, sanitized and
+                # bounded (_error_detail), so the executor's journal is never blind.
                 report = {
                     "status": "inconclusive",
                     "reason": "secure_setup_or_execution_unresolved",
+                    "error": _error_detail(error),
                 }
             finally:
                 if session is not None:
