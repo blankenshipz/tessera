@@ -1096,13 +1096,20 @@ MAX_TRANSIENT_OBSERVE_FAILURES = 3
 # after a read observed the group) and the pauses between them.
 START_PREFLIGHT_ATTEMPTS = 4
 START_PREFLIGHT_BACKOFF_SECONDS = (2, 4, 8)
-# Attempts at one pre-start settle read (an exact observe of the new group) and the pauses
-# between them. Only a transient failure is retried: a timeout, or a failed fresh provider
-# read that is not deterministic and carries a 5xx or no HTTP status class. A route conflict,
-# a 3xx/4xx refusal, a deterministic read failure or any other error fails at once. Every
-# retry also stops at the run deadline, and the guardian is heartbeat between attempts.
-SETTLE_READ_ATTEMPTS = 3
-SETTLE_READ_BACKOFF_SECONDS = (2, 4)
+# One pre-start settle read (an exact observe of the new group) is retried while it fails
+# transiently, inside a time window measured from its first attempt. Salad's first GET of a
+# freshly created group can lag the create by longer than one 2 s read deadline, so a fixed
+# handful of attempts gave up on a group that became readable moments later. The window covers
+# about ten 2 s reads plus pauses, then fails closed; it is a post-create budget only and does
+# not loosen any other read. Pauses grow to a cap (the last entry repeats); the attempt count is
+# a second hard bound should a clock or read return instantly. Only a transient failure is
+# retried: a timeout, or a failed fresh provider read that is not deterministic and carries a
+# 5xx or no HTTP status class. A route conflict, a 3xx/4xx refusal, a deterministic read failure
+# or any other error fails at once. Every retry also stops at the run deadline, and the guardian
+# is heartbeat between attempts (each pause stays well inside the guardian silence bound).
+SETTLE_READ_WINDOW_SECONDS = 60
+SETTLE_READ_BACKOFF_SECONDS = (2, 4, 5)
+SETTLE_READ_ATTEMPTS = 20
 # Closed vocabulary of the receipt's ``prestart_settle_read`` block.
 SETTLE_READ_CALLS = frozenset({"observe", "keepalive"})
 SETTLE_READ_REASONS = frozenset({"read_unavailable", "conflict_state", "timeout", "other"})
@@ -1244,7 +1251,8 @@ def _drive(
         # receipts without such a failure keep their digests): ``prestart_settle_read`` is
         # {"call": observe|keepalive, "reason": read_unavailable|conflict_state|timeout|
         # other, "http_status_class": 2xx|3xx|4xx|5xx|none, "attempts": n, "outcome":
-        # recovered|failed} for the latest such failure. Closed values only.
+        # recovered|failed, "elapsed_seconds": s since the first attempt} for the latest such
+        # failure. Closed values only.
     }
     step = {"name": None}
 
@@ -1345,7 +1353,7 @@ def _drive(
             return
         beats["ok_at"], beats["transient"] = started, 0
 
-    def note_settle(call, error, attempts):
+    def note_settle(call, error, attempts, elapsed=0.0):
         reason, status_class, transient = _settle_read_failure(error)
         receipt["prestart_settle_read"] = {
             "call": call,
@@ -1353,6 +1361,7 @@ def _drive(
             "http_status_class": status_class,
             "attempts": attempts,
             "outcome": "failed",
+            "elapsed_seconds": elapsed,
         }
         return transient
 
@@ -1367,27 +1376,40 @@ def _drive(
     def settle_read():
         """One exact observe of the new group during the settle wait.
 
-        A transient failure (see SETTLE_READ_ATTEMPTS) is retried at most that many times
-        in all, never past the run deadline, heartbeating the guardian in between; anything
-        else, or the last failure, propagates unchanged (the run then fails closed as
-        group_unsettled and the group is never treated as settled). Each failure leaves its
-        closed reason on the receipt; a read that succeeded after a retry is marked
-        recovered."""
+        A transient failure is retried inside SETTLE_READ_WINDOW_SECONDS (and
+        SETTLE_READ_ATTEMPTS), never past the run deadline, heartbeating the guardian in
+        between; anything else, or the last failure, propagates unchanged (the run then fails
+        closed as group_unsettled and the group is never treated as settled). Each failure
+        leaves its closed reason, attempts and elapsed seconds on the receipt; a read that
+        succeeded after a retry is marked recovered."""
         attempts = 0
+        started = clock()
         while True:
             attempts += 1
             try:
                 observed = dispatch("observe")
             except Exception as error:
-                transient = note_settle("observe", error, attempts)
-                if not transient or attempts >= SETTLE_READ_ATTEMPTS or clock() >= deadline:
+                elapsed = round(clock() - started, 1)
+                transient = note_settle("observe", error, attempts, elapsed)
+                pause = SETTLE_READ_BACKOFF_SECONDS[
+                    min(attempts - 1, len(SETTLE_READ_BACKOFF_SECONDS) - 1)
+                ]
+                if (
+                    not transient
+                    or attempts >= SETTLE_READ_ATTEMPTS
+                    or clock() >= deadline
+                    or clock() - started + pause >= SETTLE_READ_WINDOW_SECONDS
+                ):
                     raise
                 settle_beat()
-                pause = SETTLE_READ_BACKOFF_SECONDS[attempts - 1]
                 sleep(min(pause, max(0, deadline - clock())))
                 continue
             if attempts > 1:
-                receipt["prestart_settle_read"].update(attempts=attempts, outcome="recovered")
+                receipt["prestart_settle_read"].update(
+                    attempts=attempts,
+                    outcome="recovered",
+                    elapsed_seconds=round(clock() - started, 1),
+                )
             return observed
 
     try:
