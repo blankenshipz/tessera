@@ -126,7 +126,7 @@ def test_default_is_one_and_a_second_reserve_is_refused(tmp_path):
     try:
         first = _reserve(service, clock, "a" * 32)
         assert service.max_open_billable_frames == 1
-        assert service.unseen_run_gap_seconds == UNSEEN_RUN_GAP_SECONDS == 45
+        assert service.unseen_run_gap_seconds == UNSEEN_RUN_GAP_SECONDS == 60
         second = _body("b" * 32, clock[0])
         service.loop()
         with pytest.raises(ValueError, match="single_operation_orphan_exposure"):
@@ -135,7 +135,7 @@ def test_default_is_one_and_a_second_reserve_is_refused(tmp_path):
         assert _count(service) == 1
         status = _status(service, first)
         assert status["max_open_billable_frames"] == 1
-        assert status["unseen_run_gap_seconds"] == 45
+        assert status["unseen_run_gap_seconds"] == 60
     finally:
         service.close()
 
@@ -394,10 +394,10 @@ def test_a_provider_group_held_by_an_open_frame_is_never_bound_to_another(tmp_pa
 # The unseen-run gap grows with the frames one pass may read, and every charge uses it.
 def test_the_unseen_gap_grows_with_the_setting():
     assert [unseen_run_gap_seconds(n) for n in range(1, MAX_OPEN_BILLABLE_FRAMES_LIMIT + 1)] == [
-        45,
-        45 + EXTRA_FRAME_PASS_SECONDS,
-        45 + 2 * EXTRA_FRAME_PASS_SECONDS,
-        45 + 3 * EXTRA_FRAME_PASS_SECONDS,
+        60,
+        60 + EXTRA_FRAME_PASS_SECONDS,
+        60 + 2 * EXTRA_FRAME_PASS_SECONDS,
+        60 + 3 * EXTRA_FRAME_PASS_SECONDS,
     ]
     assert EXTRA_FRAME_PASS_SECONDS == 16
 
@@ -405,14 +405,14 @@ def test_the_unseen_gap_grows_with_the_setting():
 @pytest.mark.parametrize("frames,admitted", [(1, True), (2, False)])
 def test_admission_charges_the_configured_gap(tmp_path, frames, admitted):
     provider = Provider()
-    provider.rate = "5"  # 10 cents buy 72 s: 20 s + 45 s fits, 20 s + 61 s does not
+    provider.rate = "5"  # 10 cents buy 72 s: 10 s + 60 s fits, 10 s + 76 s does not
     service, clock, _ = _service(tmp_path, provider, max_open_billable_frames=frames)
     try:
         if admitted:
-            _reserve(service, clock, "a" * 32, seconds=20)
+            _reserve(service, clock, "a" * 32, seconds=10)
         else:
             with pytest.raises(ValueError, match="budget_insufficient"):
-                _reserve(service, clock, "a" * 32, seconds=20)
+                _reserve(service, clock, "a" * 32, seconds=10)
     finally:
         service.close()
 
@@ -425,7 +425,7 @@ def test_backdated_accrual_uses_the_configured_gap(tmp_path):
         _bind(service, a)
         clock[0] += 1
         service.loop()
-        assert service._row(a["reservation"])["first_running_at"] == clock[0] - 61
+        assert service._row(a["reservation"])["first_running_at"] == clock[0] - 76
     finally:
         service.close()
 

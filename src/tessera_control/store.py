@@ -97,15 +97,36 @@ def _database_path(state_dir: Path) -> Path:
 # keep their own busy_timeout=0 and are not affected.
 CONTROL_BUSY_TIMEOUT_SECONDS = 45
 
+# A caller that must not sit in a SQLite lock wait (the Salad live check's keepalive: its guardian
+# beat may not wait behind another writer) lowers the wait for the connections it opens. A
+# Python timer (SIGALRM) cannot interrupt a lock wait inside the C library, so the busy timeout
+# itself is the bound. Lowering only: the override can never raise the wait above the default,
+# and the journal mode is unchanged. A lock past the bound raises ``sqlite3.OperationalError``
+# ("database is locked"), which callers already treat as a transient stall.
+_LOCK_WAIT_SECONDS: ContextVar[float | None] = ContextVar("control_lock_wait", default=None)
+
+
+@contextmanager
+def bounded_lock_wait(seconds: float) -> Iterator[None]:
+    """Cap the SQLite lock wait of every control connection opened inside this block."""
+    if not 0 < seconds <= CONTROL_BUSY_TIMEOUT_SECONDS:
+        raise ValueError("lock wait must be positive and within the control default")
+    current = _LOCK_WAIT_SECONDS.get()
+    token = _LOCK_WAIT_SECONDS.set(seconds if current is None else min(current, seconds))
+    try:
+        yield
+    finally:
+        _LOCK_WAIT_SECONDS.reset(token)
+
 
 def _connect(database_path: Path) -> sqlite3.Connection:
     require_sqlite_runtime()
-    connection = sqlite3.connect(
-        database_path, timeout=CONTROL_BUSY_TIMEOUT_SECONDS, isolation_level=None
-    )
+    override = _LOCK_WAIT_SECONDS.get()
+    wait = CONTROL_BUSY_TIMEOUT_SECONDS if override is None else override
+    connection = sqlite3.connect(database_path, timeout=wait, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute(f"PRAGMA busy_timeout = {CONTROL_BUSY_TIMEOUT_SECONDS * 1000}")
+    connection.execute(f"PRAGMA busy_timeout = {int(wait * 1000)}")
     return connection
 
 
@@ -466,6 +487,13 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     create_output_lookup_indexes(connection)
 
 
+def _lock_wait_ran_out(error: sqlite3.Error) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED: another connection held the lock past the wait."""
+    return isinstance(error, sqlite3.OperationalError) and (
+        getattr(error, "sqlite_errorcode", None) in {5, 6} or "locked" in str(error)
+    )
+
+
 def validate_database(database_path: Path) -> None:
     # A local operator may have fenced this old home for an explicit active
     # transfer. Old binaries are blocked by absence of the moved database;
@@ -482,6 +510,8 @@ def validate_database(database_path: Path) -> None:
             "SELECT schema_version FROM schema_meta WHERE singleton = 1"
         ).fetchone()
     except sqlite3.Error as error:
+        if _lock_wait_ran_out(error):
+            raise  # a writer holds the lock: a transient stall, never a missing schema
         raise ValueError("Control-plane database has no supported schema.") from error
     finally:
         connection.close()
@@ -497,6 +527,8 @@ def validate_database(database_path: Path) -> None:
             "SELECT state FROM control_recovery WHERE singleton = 1"
         ).fetchone()
     except sqlite3.Error as error:
+        if _lock_wait_ran_out(error):
+            raise
         raise ValueError("Control-plane database has no recovery state.") from error
     finally:
         connection.close()

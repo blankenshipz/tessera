@@ -82,18 +82,21 @@ class RemoteDispatcher:
             getattr(adapter, "trusted_composition", False) is True
             and getattr(adapter, "trusted_store", None) is self.store
         )
-        preflight_for = getattr(adapter, "preflight_for", None)
-        preflight = (
-            preflight_for(action, proposal)
-            if callable(preflight_for)
-            else adapter.preflight(proposal)
-        )
-        if (
-            not preflight.admissible
-            or preflight.mode != ("trusted_server" if trusted else "offline")
-            or preflight.selection_digest
-            != canonical_digest(proposal.selection.model_dump(mode="json"))
-        ):
+        preflight = self._preflight(adapter, action, proposal, trusted)
+        # An adapter that knows its use-time claim will refuse says so before the intent is
+        # committed (ADR 0205): a refused claim would leave an effect that was never sent. A
+        # preflight too old for the claim is read again once; still too old, it is a slow read
+        # and nothing was committed.
+        refusal_for = getattr(adapter, "intent_refusal", None)
+        refusal = refusal_for(action) if callable(refusal_for) else None
+        if refusal == "preflight_stale":
+            preflight = self._preflight(adapter, action, proposal, trusted)
+            refusal = refusal_for(action)
+            if refusal == "preflight_stale":
+                from tessera_control.salad_precreate import PreflightStale
+
+                raise PreflightStale()
+        if refusal is not None:
             raise Conflict("Target-specific preflight blocked remote execution.")
         intent = self.store.begin(
             self.worker, route_id, action, preflight_digest=canonical_digest(vars(preflight))
@@ -120,6 +123,23 @@ class RemoteDispatcher:
             # only when they validate against their closed vocabularies.
             readback = _failed_readback(error, trusted)
         return self.store.record(self.worker, route_id, effect_id, readback.model_dump(mode="json"))
+
+    @staticmethod
+    def _preflight(adapter, action, proposal, trusted):
+        preflight_for = getattr(adapter, "preflight_for", None)
+        preflight = (
+            preflight_for(action, proposal)
+            if callable(preflight_for)
+            else adapter.preflight(proposal)
+        )
+        if (
+            not preflight.admissible
+            or preflight.mode != ("trusted_server" if trusted else "offline")
+            or preflight.selection_digest
+            != canonical_digest(proposal.selection.model_dump(mode="json"))
+        ):
+            raise Conflict("Target-specific preflight blocked remote execution.")
+        return preflight
 
 
 class FakeRemoteAdapter:

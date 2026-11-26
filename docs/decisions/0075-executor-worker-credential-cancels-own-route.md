@@ -169,3 +169,71 @@ issue, and in a shared executor project it reaches every route in the project.
   tagged control call. When the live check exits without a receipt its JSON report carries the
   same `error`, and the executor logs it and any held or cancel error from a receipt. No receipt
   status is added and no schema changes.
+
+## Amendment: the guardian beat is independent of control write locks
+
+The previous amendment kept the live check from cancelling a running route on a control stall,
+but the guardian still stopped the group: the beat could only be sent after a registry write, a
+lease renewal and a use-time authority check that took the control write lock, so a write lock
+of about 30 s silenced the guardian past its 30 s bound. Raising the lock wait to 45 s made
+control wait the lock out, but the guardian had already stopped the group.
+
+- **Beat first.** The live check's keepalive sends the guardian beat before any control write;
+  the worker-registry write and the lease renewal follow it, each with its own bound, so a slow
+  registry write never skips the renewal. Both writes are attempted even when the beat is
+  refused, so a refusal the driver holds does not also let the registry or the lease go stale.
+  The guardian's 30 s silence bound is unchanged.
+- **Authority is a read.** On the heartbeat, the trusted server re-runs use-time authority in a
+  deferred read transaction, not `BEGIN IMMEDIATE`, so another writer holding the write lock
+  cannot keep the beat waiting. Use-time admission before create and start keeps the write lock.
+- **A stalled read, never a refusal, beats on the last verification.** If the authority read
+  itself waits out its lock (SQLite busy or locked, not any other database error), the beat is
+  sent on the last authority that heartbeat verified, only while the soft lease that
+  verification saw is unexpired (never past the hard expiry). The keepalive reports it as a
+  control stall with the beat delivered. A refusal (`Conflict` or `Forbidden`) blocks the beat
+  and drops the cached verification.
+- **No server-side cancel on a launched route.** On a refusal for a route with a start effect,
+  the trusted server no longer cancels the guardian or revokes inputs itself; it raises, and the
+  live driver classifies (it still cancels on a verified revocation or a control `Conflict`).
+  Before launch the earlier best-effort cancel and revoke are unchanged.
+- **A lapsed soft lease is not a revocation of a running route.** The soft lease (150 s) is a
+  liveness signal that the guardian's own silence bound already enforces. On the heartbeat of a
+  launched route, a soft lease that lapsed because renewals stalled is tolerated; the epoch, the
+  hard expiry, the grant, the admission state, the worker's readiness, reviews and policy are
+  still enforced. The route's own worker may renew such a lease through the trusted
+  in-process store (same worker and epoch, grant active, no reported launch error, hard expiry
+  not passed); the event records `renewed_after_lapse`. The HTTP renewal route still refuses a
+  lapsed lease.
+- **Lock waits are bounded by the lock wait, not a timer.** A Python timer cannot interrupt a
+  SQLite lock wait. Control connections the keepalive opens wait at most 2 s for a lock
+  (`bounded_lock_wait`, which can only lower the 45 s default; journal mode unchanged), and a
+  lock is then a stall. A schema or recovery check that waits out a lock now raises that lock
+  error instead of reporting a missing schema. Remaining limit: a wall-bound timeout can still
+  surface just after a keepalive write returned; both writes use fresh idempotency keys, so that
+  only counts one stall and the write is repeated at the next interval. The worker registry's
+  60 s liveness bound still applies, so a control write outage much longer than about 50 s
+  refuses the next authority read.
+- **Receipt.** The live receipt records `guardian_beats`: beats the guardian took, how many went
+  out on the last verified authority, and the largest and latest gap between two delivered beats
+  (seconds).
+- **Service-initiated stop causes.** Every stop the safety service starts records its first
+  closed cause, in the transaction that first sets `recovery` on the reservation (a `stop_cause`
+  column) and, when the guardian first sets `stopping`, as a guardian `stop_cause:<cause>` event:
+  `heartbeat_silence`, `deadline`, `clock_uncertain`, `rate_unknown`, `cost_cap`, `total_cap`,
+  `loop_frame_failed`, `guardian_restart`, `control_cancel`, or `stop_only_recovery` for a
+  recovery that names no other cause. The first cause wins, and a cancel that arrives after
+  another stop (an output already retained, the guardian's own decision) records nothing. The
+  live check treats `control_cancel` from its own cancel as no guardian stop of its own, so such
+  a receipt still reads `running_route_cancelled_<class>`; an operator cancel the guardian
+  recorded as `control_cancel` is likewise never classed `guardian_stop_cause`.
+- **Completion cancel recorded as `control_cancel`.** When the live check's own completion
+  cancel reaches the guardian before the output is recorded as retained, the guardian's first
+  stop cause is `control_cancel`. The custody-seal wait after the provider confirms the stop, and
+  the undecided-refusal skip, accept that cause only when `cancel_cause.class` is exactly
+  `execution_complete` and this driver's own worker cancel recorded it at control (receipt
+  `cancel_recorded_by_driver`; the route did not already say stop). A `control_cancel` from an
+  operator, a campaign or an earlier party never gets the wait, any other guardian stop cause
+  keeps its word, and a pre-custody reallocation still ends
+  `provider_reallocated_before_custody`. When control recorded the cancel and the guardian
+  answers `reservation_missing` the cancel is complete (ADR 0205); any other guardian failure
+  after control recorded it is retried as an undelivered guardian cancel.

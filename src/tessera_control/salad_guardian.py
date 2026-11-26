@@ -25,6 +25,25 @@ from .salad_events import closed_record
 
 # Guardian event kind prefix recording why a tick first decided to stop.
 STOP_CAUSE_PREFIX = "stop_cause:"
+# Closed causes of a stop the safety service (not this guardian's own tick) started; the first
+# cause of an operation's stop is kept, in the transaction that first set ``stopping``.
+CONTROL_CANCEL_CAUSE = "control_cancel"  # control (the trusted server) asked for the stop
+GUARDIAN_RESTART_CAUSE = "guardian_restart"  # every open frame is stop-only after a restart
+STOP_ONLY_RECOVERY_CAUSE = "stop_only_recovery"  # recovery the service set with no other cause
+SERVICE_STOP_CAUSES = frozenset(
+    {
+        "heartbeat_silence",  # no control heartbeat reached the service for 30 s
+        "deadline",  # the service's stop deadline (route deadline or running cap) passed
+        "clock_uncertain",  # the service clock read before the last heartbeat
+        "rate_unknown",  # the published rate could not be read fresh or changed
+        "cost_cap",  # the frame's worst-case exposure passed its approved cost cap
+        "total_cap",  # the aggregate cap over every frame was breached
+        "loop_frame_failed",  # the frame's loop pass raised and it was failed closed
+        GUARDIAN_RESTART_CAUSE,
+        CONTROL_CANCEL_CAUSE,
+        STOP_ONLY_RECOVERY_CAUSE,
+    }
+)
 # The workload reported its own failure (POST /v1/workload/failed): the stop cause is
 # ``workload_failed:<closed reason>`` and the child's exit code is kept beside it.
 WORKLOAD_FAILED_REASON = "workload_failed"
@@ -82,15 +101,21 @@ MAX_PRESTART_READ_DEADLINE_SECONDS = 600.0
 # Seconds before the next poll after the n-th consecutive failed read (bounded backoff).
 PRESTART_READ_BACKOFF_SECONDS = (5.0, 10.0, 15.0)
 # After the run began (custody started, an allocation bound, or the instance seen running) a
-# transient read failure is retried at the next poll too, but only briefly: at most
-# POSTSTART_READ_RETRY_LIMIT consecutive failures (the last one stops) and only within
-# POSTSTART_READ_WINDOW_SECONDS of the first. The window equals the safety service's
-# UNSEEN_RUN_GAP_SECONDS (asserted there), the margin every admission already adds to billed
-# time, so the spend caps are unchanged. The assignment's deadline, heartbeat and stop clocks
-# are not extended: a retry is only taken while the guardian is not already stopping.
+# transient read failure is retried at the next poll too, but bounded: only within
+# POSTSTART_READ_WINDOW_SECONDS of the first consecutive failure, and at most
+# POSTSTART_READ_RETRY_LIMIT consecutive failures (the last one stops). The window equals the
+# safety service's UNSEEN_RUN_GAP_SECONDS (asserted there), the margin every admission already
+# adds to billed time, so the spend caps are unchanged. The limit is one failure per poll at
+# the fastest poll pace (5 s) over the whole window plus the stopping one, so the window, not
+# the count, is what ends a brief provider brown-out (ADR 0204; ADR 0181 had 3 in 45 s). The
+# assignment's deadline, heartbeat and stop clocks are not extended: a retry is only taken
+# while the guardian is not already stopping.
 POSTSTART_READ_RETRY_PREFIX = "poststart_read_retry:"
-POSTSTART_READ_RETRY_LIMIT = 3
-POSTSTART_READ_WINDOW_SECONDS = 45.0
+POSTSTART_READ_WINDOW_SECONDS = 60.0
+POSTSTART_READ_MIN_POLL_SECONDS = 5.0
+POSTSTART_READ_RETRY_LIMIT = (
+    int(POSTSTART_READ_WINDOW_SECONDS // POSTSTART_READ_MIN_POLL_SECONDS) + 1
+)  # 13
 # Allowlist of transient read failure reasons worth retrying while unallocated. Every other
 # reason (identity_mismatch, group_not_found, group_gone, provider_identity_changed,
 # reallocation_uncertain, credential_rejected, admission_denied, redirect_denied,
@@ -243,7 +268,12 @@ class SaladGuardian:
         prestart_read_deadline_seconds: float = DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
         start_failure_machines: int = DEFAULT_START_FAILURE_MACHINES,
         custody_work_started: Callable[[str], bool] | None = None,
+        service_stop_cause: Callable[[str], str | None] | None = None,
     ):
+        # ``service_stop_cause(operation)``: the closed cause the composing safety service
+        # recorded when it put the frame into stop-only recovery (or None). Asked only when a
+        # stop-only arm or a cancel is the first stop decision of an operation.
+        self.service_stop_cause = service_stop_cause
         if type(start_failure_machines) is not int or not (
             start_failure_machines == 0
             or MIN_START_FAILURE_MACHINES <= start_failure_machines <= MAX_START_FAILURE_MACHINES
@@ -320,10 +350,20 @@ class SaladGuardian:
         # Every process recovery is stop-only, even if a prior owner died before
         # recording an effect. Never renew running authority from saved state.
         with self.db:
+            restarted = [
+                operation
+                for (operation,) in self.db.execute(
+                    "SELECT operation FROM assignments "
+                    "WHERE stopping=0 AND status NOT IN ('stopped','reconciled')"
+                ).fetchall()
+            ]
             self.db.execute(
                 "UPDATE assignments SET stopping=1,reason='guardian_restart' "
                 "WHERE status NOT IN ('stopped','reconciled')"
             )
+            for operation in restarted:
+                # The restart is the first stop decision of these operations only.
+                self._first_stop_cause(operation, GUARDIAN_RESTART_CAUSE)
 
     def close(self):
         if self._lock_fd is not None:
@@ -331,7 +371,30 @@ class SaladGuardian:
             os.close(self._lock_fd)
             self._lock_fd = None
 
-    def arm(self, assignment: GuardianAssignment, *, stop_only=False):
+    def _service_cause(self, operation: str, cause: str | None) -> str | None:
+        """The explicit cause, else the composing service's recorded one (closed tokens only)."""
+        if cause is None and self.service_stop_cause is not None:
+            try:
+                cause = self.service_stop_cause(operation)
+            except Exception:
+                cause = None
+        return cause if cause in SERVICE_STOP_CAUSES else None
+
+    def _first_stop_cause(self, operation: str, cause: str) -> None:
+        """Inside the caller's transaction: keep ``cause`` unless a stop cause already exists."""
+        if (
+            self.db.execute(
+                "SELECT 1 FROM events WHERE operation=? AND substr(kind,1,?)=? LIMIT 1",
+                (operation, len(STOP_CAUSE_PREFIX), STOP_CAUSE_PREFIX),
+            ).fetchone()
+            is None
+        ):
+            self.db.execute(
+                "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                (operation, self.clock(), STOP_CAUSE_PREFIX + cause),
+            )
+
+    def arm(self, assignment: GuardianAssignment, *, stop_only=False, cause=None):
         encoded = assignment.serialized()
         now = self.clock()
         if now >= assignment.deadline and not stop_only:
@@ -351,11 +414,17 @@ class SaladGuardian:
             ):
                 raise ValueError("assignment_mismatch")
             if stop_only:
-                self.db.execute(
+                changed = self.db.execute(
                     "UPDATE assignments SET stopping=1,reason='stop_only_recovery' "
                     "WHERE operation=? AND stopping=0 AND status!='stopped'",
                     (assignment.binding.operation,),
-                )
+                ).rowcount
+                if changed == 1:
+                    self._first_stop_cause(
+                        assignment.binding.operation,
+                        self._service_cause(assignment.binding.operation, cause)
+                        or STOP_ONLY_RECOVERY_CAUSE,
+                    )
 
     def heartbeat(self, operation: str):
         """Authenticated control composition only; cannot undo a stop decision."""
@@ -366,13 +435,21 @@ class SaladGuardian:
                 (self.clock(), operation),
             )
 
-    def cancel(self, operation: str):
+    def cancel(self, operation: str, *, cause: str | None = None):
+        """Start a stop. When this is the operation's first stop decision its cause is kept:
+        the explicit closed cause, else the composing service's recorded one, else
+        ``control_cancel``. A cancel after another stop (an output retained, a tick's own
+        decision) records nothing."""
         with self.db:
-            self.db.execute(
+            changed = self.db.execute(
                 "UPDATE assignments SET stopping=1,reason='cancelled' "
                 "WHERE operation=? AND stopping=0 AND status!='stopped'",
                 (operation,),
-            )
+            ).rowcount
+            if changed == 1:
+                self._first_stop_cause(
+                    operation, self._service_cause(operation, cause) or CONTROL_CANCEL_CAUSE
+                )
 
     def complete(self, operation: str):
         """Stop as soon as the single approved output is retained.
@@ -849,11 +926,12 @@ class SaladGuardian:
         by the profile's deadline from the first consecutive failure (no adapter or no answer:
         fail closed). After the run began (custody started, an allocation bound or the instance
         seen running): bounded by POSTSTART_READ_RETRY_LIMIT consecutive failures within
-        POSTSTART_READ_WINDOW_SECONDS of the first. Only a transient read failure qualifies, and
-        never while the guardian is already stopping, so the assignment's deadline, heartbeat and
-        stop clocks are not extended and a deterministic failure (identity mismatch, group gone)
-        stops at once. Charging is the safety service's own reservation (running window plus the
-        unseen-run gap, which this window equals); a retry only delays the stop within it."""
+        POSTSTART_READ_WINDOW_SECONDS (60 s, ADR 0204) of the first. Only a transient read
+        failure qualifies, and never while the guardian is already stopping, so the assignment's
+        deadline, heartbeat and stop clocks are not extended and a deterministic failure
+        (identity mismatch, group gone) stops at once. Charging is the safety service's own
+        reservation (running window plus the unseen-run gap, which this window equals); a retry
+        only delays the stop within it."""
         if stopping or not is_transient_read_failure(error):
             return None
         started = first_running is not None or allocation != "unallocated"

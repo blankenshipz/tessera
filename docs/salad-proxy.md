@@ -329,11 +329,13 @@ client, including one that reconnects and trickles header bytes, holds the
 guardian thread for at most 3 s per connection; the loop runs between requests.
 An authenticated chunk upload may hold it up to 20 s. `UNSEEN_RUN_GAP_SECONDS`
 (the billed time a run may hide between two guardian polls, used to backdate
-accrual and in admission budgeting) is 45 s: between two loop passes the guardian
+accrual and in admission budgeting) is 60 s: between two loop passes the guardian
 may handle one unix admin frame (2 s read plus the 10 s admin budget) and one
 authenticated chunk request (20 s), plus a worst-case 12 s loop pass (two 4.5 s
 provider-read retry windows, one first-attempt read at the 2 s transport deadline and
-1 s of local work), i.e. 44 s; module asserts keep these consistent. The reply resets the
+1 s of local work), i.e. 44 s. It is 60 s, not 45 s, because the same gap is the
+post-start tolerance for transient provider and rate reads (ADR 0204); module asserts keep
+these consistent. The reply resets the
 socket timeout to 2 s.
 
 `status.retained_outputs` is read-only progress for declared outputs (exact

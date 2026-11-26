@@ -928,7 +928,10 @@ def test_prestart_observes_back_off_but_heartbeats_keep_cadence_then_normal_when
 
 
 class RefusingSession(LocalSession):
-    """Keepalive refuses with the scripted guardian errors once the group is started."""
+    """Keepalive refuses with the scripted guardian errors once the group is started and a
+    post-start observe has read it ``stopped`` (an affirmative read that clears the running
+    latch, so these are the unlatched bounds; a started route is held, see
+    test_salad_running_latch)."""
 
     def __init__(self, refusals, *, retain_after=None, beat_seconds=0):
         super().__init__()
@@ -952,7 +955,8 @@ class RefusingSession(LocalSession):
     def keepalive(self, route):
         self.keepalives += 1
         self.now += self.beat_seconds
-        if "start" in self.actions and self.refusals:
+        started = "start" in self.actions
+        if started and "observe" in self.actions[self.actions.index("start") :] and self.refusals:
             error = self.refusals.pop(0)
             if error is not None:
                 raise error
@@ -1016,8 +1020,8 @@ def test_terminal_guardian_refusal_cancels_at_once(code):
     assert receipt["guardian_refusal"] == {"code": code, "cause": "terminal_code"}
     assert receipt["guardian_transient_refusals"] == 0
     assert session.cancelled and "stop" in session.actions
-    # Cancelled on the first refused beat: nothing is observed before the stop path.
-    assert session.actions[session.actions.index("start") + 1] == "stop"
+    # Cancelled on the first refused beat: nothing more is observed before the stop path.
+    assert session.actions[session.actions.index("start") + 1 :][:2] == ["observe", "stop"]
 
 
 def test_transient_refusals_cancel_before_guardian_silence():
@@ -1035,10 +1039,10 @@ def test_transient_refusals_cancel_before_guardian_silence():
         "cause": "silence_bound",
     }
     assert session.cancelled and "stop" in session.actions
-    # Last good beat at t=0, 10 s interval: refusals at t=0 and t=10 are skipped (the
-    # next beat still lands by t=20 <= 30 - 5); at t=20 the next beat would be at 30 > 25,
-    # so the run is cancelled while the guardian has not yet gone silent.
-    assert receipt["guardian_transient_refusals"] == 2
+    # Last good beat at t=0, 10 s interval: the refusal at t=10 is skipped (the next beat
+    # still lands by t=20 <= 30 - 5); at t=20 the next beat would be at 30 > 25, so the run
+    # is cancelled while the guardian has not yet gone silent.
+    assert receipt["guardian_transient_refusals"] == 1
     assert session.cancelled_at < GUARDIAN_SILENCE_SECONDS
     assert GUARDIAN_SILENCE_SECONDS - GUARDIAN_SILENCE_MARGIN_SECONDS == 25
 
@@ -1067,7 +1071,8 @@ def test_unanswered_guardian_is_terminal():
     receipt = drive_clocked(session)
     assert receipt["guardian_refusal"] == {"code": "unavailable", "cause": "terminal_code"}
     assert receipt["guardian_transient_refusals"] == 0
-    assert session.cancelled and session.actions[session.actions.index("start") + 1] == "stop"
+    assert session.cancelled
+    assert session.actions[session.actions.index("start") + 1 :][:2] == ["observe", "stop"]
 
 
 @pytest.mark.parametrize("error", ["forbidden", "conflict"])
@@ -1079,7 +1084,8 @@ def test_revoked_authority_cancels_at_once(error):
     )
     receipt = drive_clocked(session)
     assert receipt["guardian_refusal"] is None and receipt["guardian_transient_refusals"] == 0
-    assert session.cancelled and session.actions[session.actions.index("start") + 1] == "stop"
+    assert session.cancelled
+    assert session.actions[session.actions.index("start") + 1 :][:2] == ["observe", "stop"]
 
 
 def test_guardian_silence_matches_assignment_default():
@@ -1207,14 +1213,18 @@ def test_rate_read_retry_count_is_projected_strictly(value, expected):
 
 
 class FlakyObserveSession(LocalSession):
-    """Observe's fresh provider read times out for the next ``failures`` calls after start."""
+    """Observe's fresh provider read times out for the next ``failures`` calls after start
+    (after ``after`` successful post-start observes, which read ``stopped`` and so clear the
+    running latch)."""
 
-    def __init__(self, failures, error=None):
+    def __init__(self, failures, error=None, after=0):
         super().__init__()
-        self.failures, self.error = failures, error
+        self.failures, self.error, self.after = failures, error, after
 
     def dispatch(self, route, action):
-        if action == "observe" and "start" in self.actions and self.failures:
+        if action == "observe" and "start" in self.actions and self.after:
+            self.after -= 1
+        elif action == "observe" and "start" in self.actions and self.failures:
             self.failures -= 1
             self.actions.append(action)
             from tessera_control.salad_server import ProviderReadUnavailable
@@ -1233,7 +1243,9 @@ def test_a_transient_observe_read_failure_is_skipped_not_fatal(failures):
 
 
 def test_consecutive_observe_read_failures_past_the_bound_still_fail():
-    session = FlakyObserveSession(3)
+    # The bound applies to an unlatched route (an affirmative stopped read cleared the latch).
+    session = FlakyObserveSession(3, after=1)
+    session.proof["output_retained"] = False
     receipt = drive(session, max_polls=10)
     assert receipt["status"] == "inconclusive"
     assert receipt["observe_transient_failures"] == 2
@@ -1241,7 +1253,8 @@ def test_consecutive_observe_read_failures_past_the_bound_still_fail():
 
 
 def test_other_observe_errors_stay_fatal():
-    session = FlakyObserveSession(1, error=RuntimeError("SECRET must not appear"))
+    session = FlakyObserveSession(1, error=RuntimeError("SECRET must not appear"), after=1)
+    session.proof["output_retained"] = False
     receipt = drive(session, max_polls=10)
     assert receipt["status"] == "inconclusive"
     assert receipt["observe_transient_failures"] == 0

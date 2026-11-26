@@ -55,6 +55,7 @@ from .salad_campaign_profiles import (
     stage_data_policy,
     target_policy,
 )
+from .salad_precreate import sent_launch_effects
 from .salad_termination import (
     UNCONFIRMED_CODE,
     UNCONFIRMED_EVENT,
@@ -63,6 +64,10 @@ from .salad_termination import (
 )
 from .salad_unclaimed import create_claimed
 from .store import Conflict, _parse_utc, canonical_digest
+
+# Failure detail of an attempt whose live receipt shows the run ended before any create was
+# sent (ADR 0205); it is unwound as unclaimed (``t1_salad_unclaimed``).
+CREATE_NOT_SENT = "live_check_create_not_sent"
 
 if TYPE_CHECKING:
     from .campaign_runner import CampaignRunner, _Ctx
@@ -1606,13 +1611,12 @@ class SaladStageDriver:
         if (
             row["phase"] == "executing"
             and row["waiting_reason"] == LIVE_CHECK_NO_RECEIPT
-            and state is not None
-            and not any(e.get("action") in {"create", "start"} for e in state["effects"])
-            and not self.claimed(ctx, row["operation_id"])
+            and self._never_sent(ctx, row, state)
         ):
             # The live check exited with no receipt and control holds no create/start claim
-            # or route effect: the existing unclaimed unwind (cancel route, revoke, reconcile
-            # at 0 with the store's own no-claim proof) ends it. Anything else waits as before.
+            # or sent route effect: the existing unclaimed unwind (cancel route, revoke,
+            # reconcile at 0 with the store's own no-claim proof) ends it. Anything else waits
+            # as before.
             return self._abandon(ctx, stage, spec_stage, attempt, LIVE_CHECK_NO_RECEIPT)
         window = (
             state["proposal"]["selection"]["resources"]["max_seconds"]
@@ -1626,6 +1630,27 @@ class SaladStageDriver:
             self._unknown(attempt, "executor silent past the route window")
             return True
         raise _waiting()()
+
+    def _never_sent(self, ctx: _Ctx, row: dict[str, Any], state: dict[str, Any] | None) -> bool:
+        """True when control's own records prove no provider create or start was sent.
+
+        The route exists and names no provider resource; each of its create/start effects (if
+        any) was refused by the trusted server before its use-time claim; control holds no
+        create/start claim for the operation; and the attempt has no manifest, provider id or
+        passed live receipt (ADR 0205). A pure read."""
+        if (
+            state is None
+            or state.get("provider_id") is not None
+            or sent_launch_effects(state)
+            or row["provider_id"] is not None
+            or row["manifest_id"] is not None
+        ):
+            return False
+        if row["live_receipt_json"] is not None:
+            receipt = json.loads(row["live_receipt_json"])
+            if receipt.get("status") == "passed" or receipt.get("provider_id"):
+                return False
+        return not self.claimed(ctx, row["operation_id"])
 
     def _unknown(self, attempt: dict[str, Any], detail: str) -> None:
         self._move(attempt["id"], phase="unknown", waiting_reason=detail[:300])
@@ -1646,6 +1671,11 @@ class SaladStageDriver:
         attempt: dict[str, Any],
         row: dict[str, Any],
     ) -> bool:
+        if self._never_sent(ctx, row, self.route_state(row["route_id"])):
+            # An honest receipt of a run that ended before any create was sent (a pre-create
+            # read timeout, a refused reserve): nothing was allocated or spent, so it takes
+            # the same unclaimed unwind as a run with no receipt, with no person (ADR 0205).
+            return self._abandon(ctx, stage, spec_stage, attempt, CREATE_NOT_SENT)
         verdict, detail, evidence = self.verify_outcome(ctx, attempt, row)
         if verdict == "unknown" and detail in (UNCONFIRMED_CODE, UNCONFIRMED_NEW_ALLOCATION_CODE):
             self._termination_unconfirmed(ctx, attempt, row)

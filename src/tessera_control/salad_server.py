@@ -125,6 +125,29 @@ class GuardianUnavailable(ValueError):
         super().__init__("independent service unavailable")
 
 
+class AuthorityStalled(TimeoutError):
+    """The heartbeat's use-time authority read stalled on a control lock (it did not refuse).
+
+    ``beat_delivered`` says whether the guardian beat still went out on the last verified
+    authority (only while the soft lease that verification saw is unexpired). A stall, never a
+    refusal: the live driver handles it like any other control stall."""
+
+    def __init__(self, beat_delivered):
+        super().__init__("control authority read stalled")
+        self.beat_delivered = beat_delivered
+
+
+def _lock_stall(error):
+    """A SQLite busy/locked wait that ran out (not a disk, schema or programming error)."""
+    import sqlite3
+
+    return isinstance(error, sqlite3.OperationalError) and (
+        getattr(error, "sqlite_errorcode", None) in {5, 6}  # SQLITE_BUSY, SQLITE_LOCKED
+        or "locked" in str(error)
+        or "busy" in str(error)
+    )
+
+
 def guardian_refusal_code(error):
     """The guardian refusal code carried by ``error``, "unavailable", or None."""
     if isinstance(error, GuardianRefused):
@@ -472,6 +495,14 @@ class SaladSafetyHTTPSClient(SaladSafetyClient):
 class TrustedSaladExecutionStore(RemoteExecutionStore):
     """Server-private store; provider intake is bound to the concrete composition."""
 
+    def renew_execution_lease(self, *args, **kwargs):
+        # The trusted live check's own worker renews its exact soft lease even after renewals
+        # stalled past it (same epoch, inside the hard expiry, grant still active): a control
+        # lock must not turn into a lease that can never be renewed (ADR 0075 amendment). The
+        # HTTP renewal route keeps refusing a lapsed lease.
+        kwargs.setdefault("renew_lapsed", True)
+        return super().renew_execution_lease(*args, **kwargs)
+
     def _bound(self, state):
         server = getattr(self, "_salad_server", None)
         return type(server) is TrustedSaladServer and (
@@ -521,7 +552,11 @@ class TrustedSaladExecutionStore(RemoteExecutionStore):
 
     def preflight_authority(self, worker, ident, proposal, action, *, admit=True):
         with _connect(self.database_path) as db:
-            db.execute("BEGIN IMMEDIATE")
+            # The heartbeat (admit=False) only reads: a deferred read transaction keeps one
+            # snapshot without taking the write lock, so another control writer holding it
+            # (a runner tick, a campaign cancel) cannot keep the guardian beat waiting. A
+            # use-time admission before create/start keeps the write lock it always had.
+            db.execute("BEGIN IMMEDIATE" if admit else "BEGIN")
             live = self._live_principal(db, worker, audience="worker")
             state = self._load(db, live, ident)
             op, package = self._operation(db, live, state["proposal"])
@@ -536,8 +571,11 @@ class TrustedSaladExecutionStore(RemoteExecutionStore):
             ):
                 raise Forbidden("Authenticated exact Salad route required.")
             if action in {"create", "start"}:
-                self._current(db, live, state)
                 launched = any(e["action"] == "start" for e in state["effects"])
+                # A launched route's heartbeat: a soft lease that lapsed because renewals
+                # stalled is not a revocation (the guardian's 30 s silence bound is its
+                # liveness); everything else in use-time authority still refuses.
+                self._current(db, live, state, soft_lease_lapse_ok=launched and not admit)
                 if admit and not launched:
                     from .remote_execution import _admit_workload
 
@@ -594,9 +632,16 @@ class TrustedSaladExecutionStore(RemoteExecutionStore):
                 ):
                     raise Conflict("Salad runtime capabilities unsupported.")
                 lease = db.execute(
-                    "SELECT hard_expires_at FROM execution_leases WHERE id=?",
+                    "SELECT expires_at, hard_expires_at FROM execution_leases WHERE id=?",
                     (op["lease_id"],),
                 ).fetchone()
+                # The soft lease verified by this read (bounded by the hard expiry): how long
+                # the trusted server may still beat on this verification if a later
+                # authority read stalls (never extended by a beat).
+                state["verified_lease_expires_at"] = min(
+                    _parse_utc(lease["expires_at"]).timestamp(),
+                    _parse_utc(lease["hard_expires_at"]).timestamp(),
+                )
                 # The renewable soft lease (30s) is a liveness signal enforced by the
                 # guardian's own 30s heartbeat staleness stop; the run-wide deadline is
                 # bounded by the lease's hard expiry, never the soft renewal window.
@@ -606,6 +651,19 @@ class TrustedSaladExecutionStore(RemoteExecutionStore):
                     time.time() + proposal.selection.resources.max_seconds,
                 )
             return state
+
+
+# Exact provider reads a route's observe sends through ``TrustedSaladServer.request``.
+READ_OPERATIONS = frozenset({"read_group", "read_instance"})
+
+
+def _reraise_read_timeout(error, request):
+    """Re-raise a ``TimeoutError`` (a caller's local bound, e.g. the live check's wall bound,
+    ran out) out of a read's blanket handler, so the caller's stall path sees a timeout instead
+    of a recorded "blocked"/"unknown" status. Create, start, stop and delete keep their
+    closed results unchanged."""
+    if isinstance(error, TimeoutError) and getattr(request, "operation", None) in READ_OPERATIONS:
+        raise error
 
 
 class TrustedSaladServer:
@@ -633,6 +691,10 @@ class TrustedSaladServer:
         # route_id -> dict(attempts, next_at, dropped): backoff and guardian-drop bookkeeping.
         self._revoke_meta: dict[str, dict] = {}
         self.input_log = []
+        # route_id -> {"state", "lease_expires_at"}: the last use-time authority a heartbeat
+        # verified. In memory only; used solely to keep beating through a stalled (never a
+        # refused) authority read until that verification's soft lease expires.
+        self._verified_authority: dict[str, dict] = {}
 
     def _credential(self):
         credential = self.policy.management
@@ -707,7 +769,8 @@ class TrustedSaladServer:
             state = self.store.claim_proxy(
                 self.worker, request.route_id, request.effect_id, self.policy, preflight
             )
-        except Exception:
+        except Exception as error:
+            _reraise_read_timeout(error, request)
             return ProxyResult(status="blocked", reason="admission_denied")
         failure_reason = "credential_unavailable"
         try:
@@ -785,12 +848,14 @@ class TrustedSaladServer:
                 ):
                     try:
                         self.safety.bind(state, observation)
-                    except Exception:
+                    except Exception as error:
+                        _reraise_read_timeout(error, request)
                         # Durable reservation still enforces reserved-name recovery.
                         # Never retry create/start or turn binding failure into success.
                         return ProxyResult(status="unknown", reason="provider_unavailable")
                 return result
-        except Exception:
+        except Exception as error:
+            _reraise_read_timeout(error, request)
             return ProxyResult(status="unknown", reason=failure_reason)
 
     # ---- input delivery (ADR 0036 phase 2) -------------------------------------------------
@@ -1037,52 +1102,66 @@ class TrustedSaladServer:
         )
 
     def heartbeat(self, route_id):
-        """Trusted control-owner polling; never extends a lease or guardian deadline."""
+        """Trusted control-owner polling; never extends a lease or guardian deadline.
+
+        Heartbeat independence (ADR 0075 amendment): the guardian beat goes out before any
+        control write. Use-time authority is a read (no write lock), so another control writer
+        holding the lock cannot keep the beat waiting. If that read itself stalls on a lock (it
+        did not refuse), the beat is sent on the last verified authority while the soft lease
+        seen by that verification is unexpired, and ``AuthorityStalled`` reports it. A refusal
+        (Conflict/Forbidden) blocks the beat and is raised for the live driver to classify: on a
+        launched route this server never cancels the guardian itself (a verified revocation is
+        cancelled by the driver; anything else is held there). Revoke retries and ticket upkeep
+        (control writes) come after the beat and never break it.
+        """
+        try:
+            self._beat_route(route_id)
+        finally:
+            try:
+                # Periodic retry of failed revokes for every route, not just this one; after
+                # the beat (or its refusal), never in front of it.
+                self.retry_pending_revokes()
+            except Exception:
+                self.input_log.append(dict(route_id=route_id, event="revoke_retry_failed"))
+
+    def _beat_route(self, route_id):
         from .remote_execution_models import RemoteProposal
 
+        verified = getattr(self, "_verified_authority", {}).get(route_id)
+        state = None
         try:
-            # Periodic retry of failed revokes for every route, not just this one.
-            self.retry_pending_revokes()
-        except Exception:
-            self.input_log.append(dict(route_id=route_id, event="revoke_retry_failed"))
-        state = self.store.get(self.worker, route_id)
-        proposal = RemoteProposal.model_validate(state["proposal"])
-        try:
+            state = self.store.get(self.worker, route_id)
+            proposal = RemoteProposal.model_validate(state["proposal"])
             state = self.store.preflight_authority(
                 self.worker, route_id, proposal, "start", admit=False
             )
         except (Conflict, Forbidden):
-            # Revoked authority is terminal. Best-effort cancel/revoke must never replace
-            # it: a guardian error here (unavailable, a refusal code, a timeout) would
-            # otherwise reach the driver as if the heartbeat itself had been refused.
-            try:
-                self.safety.cancel(state)
-            except Exception as error:
-                record = dict(route_id=route_id, event="authority_cancel_failed", at=utc_now())
-                if guardian_refusal_code(error) is not None:
-                    record["code"] = guardian_refusal_code(error)
-                self.input_log.append(record)
-            try:
-                self._revoke_inputs(state)
-            except Exception:
-                self.input_log.append(
-                    dict(route_id=route_id, event="authority_revoke_failed", at=utc_now())
-                )
+            # A refusal ends beating on any earlier verification.
+            getattr(self, "_verified_authority", {}).pop(route_id, None)
+            launched = state is not None and any(
+                effect["action"] == "start" for effect in state["effects"]
+            )
+            if not launched:
+                self._authority_refused(route_id, state)
             raise
+        except Exception as error:
+            if not _lock_stall(error):
+                # Not a lock stall (not found, invalid state, ...): never beat on the earlier
+                # verification after a read that failed for a reason of its own.
+                getattr(self, "_verified_authority", {}).pop(route_id, None)
+                raise
+            if verified is None or time.time() >= verified["lease_expires_at"]:
+                raise AuthorityStalled(beat_delivered=False) from error
+            self._beat(route_id, verified["state"])
+            raise AuthorityStalled(beat_delivered=True) from error
         if not any(effect["action"] == "create" for effect in state["effects"]):
             raise Conflict("Guardian heartbeat requires existing create intent.")
-        try:
-            self.safety.heartbeat(state)
-        except Exception as error:
-            # The guardian's closed refusal code (or "unavailable") lets the driver tell a
-            # transient refusal from a terminal one; nothing else of the error is kept.
-            # Only this call's errors are refusals; authority failures above are not.
-            code = guardian_refusal_code(error)
-            if code is not None:
-                self.input_log.append(
-                    dict(route_id=route_id, event="heartbeat_refused", code=code, at=utc_now())
-                )
-            raise
+        self._beat(route_id, state)
+        expires = state.get("verified_lease_expires_at")
+        if expires is not None:
+            self.__dict__.setdefault("_verified_authority", {})[route_id] = dict(
+                state=state, lease_expires_at=expires
+            )
         try:
             self.refresh_inputs(route_id)
         except Exception as error:
@@ -1091,6 +1170,42 @@ class TrustedSaladServer:
             if guardian_refusal_code(error) is not None:
                 record["code"] = guardian_refusal_code(error)
             self.input_log.append(record)
+
+    def _beat(self, route_id, state):
+        try:
+            self.safety.heartbeat(state)
+        except Exception as error:
+            # The guardian's closed refusal code (or "unavailable") lets the driver tell a
+            # transient refusal from a terminal one; nothing else of the error is kept.
+            # Only this call's errors are refusals; authority failures are not.
+            code = guardian_refusal_code(error)
+            if code is not None:
+                self.input_log.append(
+                    dict(route_id=route_id, event="heartbeat_refused", code=code, at=utc_now())
+                )
+            raise
+
+    def _authority_refused(self, route_id, state):
+        """Before launch only: best-effort guardian cancel and input revoke on a refusal.
+
+        Revoked authority is terminal there. Best-effort cancel/revoke must never replace it: a
+        guardian error here (unavailable, a refusal code, a timeout) would otherwise reach the
+        driver as if the heartbeat itself had been refused."""
+        if state is None:
+            return
+        try:
+            self.safety.cancel(state)
+        except Exception as error:
+            record = dict(route_id=route_id, event="authority_cancel_failed", at=utc_now())
+            if guardian_refusal_code(error) is not None:
+                record["code"] = guardian_refusal_code(error)
+            self.input_log.append(record)
+        try:
+            self._revoke_inputs(state)
+        except Exception:
+            self.input_log.append(
+                dict(route_id=route_id, event="authority_revoke_failed", at=utc_now())
+            )
 
     def cleanup_settled(self, cleanup=None, *, port=None, max_groups=1):
         """Opt-in hook: audited cleanup of settled (stopped, zero-instance) groups.

@@ -248,15 +248,14 @@ def test_a_guardian_stop_cause_still_cancels_after_skipped_refusals():
     assert not receipt["reason"].startswith(RUNNING_CANCEL_PREFIX)
 
 
-def test_an_unverified_refusal_before_the_route_runs_still_cancels():
-    # No post-start observe read running yet: the earlier behaviour is unchanged.
-    session = ProbedSession(observe_errors=[Forbidden("Unauthorized")])
+def test_an_unverified_refusal_after_start_before_the_route_runs_is_skipped():
+    # The start effect is recorded (running latch): no observe read running yet, but an
+    # unverified refusal is a control stall, skipped to the next interval.
+    session = ProbedSession(retain_after=1, observe_errors=[Forbidden("Unauthorized")])
     receipt = drive(session)
-    assert cancelled_before_output(session)
-    assert receipt["last_provider_status"] is None
-    assert receipt["cancel_cause"]["class"] == "control_refused"
-    assert receipt["cancel_cause"]["refusal"]["skipped"] is False
-    assert "control_refusals_skipped" in receipt and receipt["control_refusals_skipped"] == 0
+    assert receipt["status"] == "passed", receipt
+    assert receipt["control_refusals_skipped"] == 1
+    assert receipt["control_refusal"]["skipped"] is True
 
 
 def test_a_write_lock_still_stalls_and_is_not_a_refusal():

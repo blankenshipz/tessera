@@ -172,8 +172,10 @@ def test_a_timeout_or_a_restart_never_reports_no_receipt(tmp_path):
     h = Harness(tmp_path, ReportingControl(), runner=runner)
     h.control.items = [item("route_started")]
     h.executor.run_once()
-    # After a restart nothing shows the live check exited on its own: no report.
+    # After a restart nothing shows the live check exited on its own: no report while the
+    # route has a create effect (a route with none is reported, ADR 0205).
     h2 = Harness(tmp_path / "b", ReportingControl())
+    h2.control.state = dict(h2.control.state, effects=[{"id": "e1", "action": "create"}])
     h2.control.items = [item("executing")]
     h2.executor.run_once()
     assert "record_no_receipt" not in h.names() + h2.names()

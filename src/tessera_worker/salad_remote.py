@@ -176,6 +176,26 @@ class SaladTrustedAdapter:
             reason="independent_readiness_required",
         )
 
+    def intent_refusal(self, action):
+        """The use-time claim's own refusal of the last preflight, read before any intent.
+
+        A closed reason (``remote_execution_salad.preflight_refusal``, with a margin under the
+        claim's age bound for the intent write in between), or None. Only create and start
+        are claimed; every other action is admitted here as before."""
+        from tessera_control.remote_execution_salad import (
+            PREFLIGHT_INTENT_MAX_AGE_SECONDS,
+            preflight_refusal,
+        )
+
+        if action not in {"create", "start"} or self._preflight is None:
+            return None
+        provider_id = None
+        if action == "start":
+            provider_id = self._server.store.get(self._server.worker, self._route_id)["provider_id"]
+        return preflight_refusal(
+            self._preflight, action, provider_id, max_age=PREFLIGHT_INTENT_MAX_AGE_SECONDS
+        )
+
     def perform(self, action, proposal, state):
         from tessera_control.salad_proxy_contract import ProxyRequest
 

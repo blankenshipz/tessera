@@ -1529,7 +1529,18 @@ class ExecutionStore(Store):
         key: str,
         digest: str,
         expected_epoch: int,
+        *,
+        renew_lapsed: bool = False,
     ) -> tuple[int, dict[str, Any]]:
+        """Renew the exact soft lease by its own worker, bounded by the hard expiry.
+
+        ``renew_lapsed`` is an in-process opt-in for the trusted Salad live check only (never
+        the HTTP route): a soft lease that lapsed only because renewals stalled behind a control
+        write lock is renewed again by the same worker, same epoch, while the grant is active,
+        the worker is ready and the hard expiry has not passed. Nothing else is relaxed: a new
+        epoch, a fenced or expired grant, a reported launch error or a passed hard expiry still
+        refuse (ADR 0075 amendment).
+        """
         renewal = self._body(
             RenewExecutionLease, {"lease_id": lease_id, "expected_epoch": expected_epoch}
         )
@@ -1544,7 +1555,10 @@ class ExecutionStore(Store):
             ).fetchone()
             if lease is None or lease["worker_principal_id"] != worker["id"]:
                 raise NotFound("Execution lease was not found.")
-            if lease["epoch"] != expected_epoch or _parse_utc(lease["expires_at"]) <= self._now():
+            lapsed = _parse_utc(lease["expires_at"]) <= self._now()
+            if lease["epoch"] != expected_epoch or (
+                lapsed and (not renew_lapsed or _parse_utc(lease["hard_expires_at"]) <= self._now())
+            ):
                 raise Conflict("Execution lease is no longer current.")
             grant = self._active_worker_grant(connection, worker, lease["grant_id"])
             if grant["epoch"] != expected_epoch:
@@ -1580,6 +1594,8 @@ class ExecutionStore(Store):
                     "lease_id": lease_id,
                     "epoch": expected_epoch,
                     "operational_only": True,
+                    # Additive: present only when a lapsed soft lease was renewed.
+                    **({"renewed_after_lapse": True} if lapsed else {}),
                 },
             )
             return 200, self._lease_response(updated)

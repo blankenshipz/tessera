@@ -43,6 +43,7 @@ So the stop path is entirely Tessera's guardian plus the operator.
 | Single-operation orphan fence | no new reservation while another is not stopped/reconciled | Existing; an uncertain orphan closes automatically on an exact provider read of the group stopped (`provider_confirmed_exact_group_stopped`), or by operator `reconcile` |
 | Lost-create resolution | a never-bound reservation (create failed, no `provider_id`) becomes `reconciled` (`lost_create_absent`) only after route deadline + 900 s, a definite ProblemDetails 404 on the exact reserved name and a complete project group list without it; operator `reconcile` needs the same margin and 404 plus a list read that reached the project; a 24 h watch voids it on any non-absent read | Done; see "Lost create" |
 | Create-rejected release | a create answered with a fully read HTTP 400/422 ProblemDetails body is classified `provider_rejected_request` (a create that provably never left the process, `request_not_sent` with status 0, takes the same release) (not `provider_unavailable`) with a bounded summary (status, `title`/`detail` <= 200 chars, `errors` field names) in the dispatch receipt and live-check receipt; the trusted server reports it (admin `create_rejected`), which fences at once, and the guardian releases the never-bound reservation as `reconciled` (`create_rejected_absent`) 30 s after max(report, last `ready`), only on its own exact-name 404 and complete project list | Done; see "Create rejected" |
+| Pre-create failure release | a run that ends before any create was sent retries its transient pre-create steps (at most 4 dispatches, only while the route shows no create effect), then ends `create_not_attempted`; control unwinds it at zero (`unclaimed_zero`, no person) on its own claim and route records, a create refused before its use-time claim counts as never sent, and the guardian releases a reservation that never answered `ready` 30 s after its last heartbeat on its own absence reads (`never_ready_absent`) | Done; see "Lost create" and [ADR 0205](decisions/0205-salad-precreate-auto-release.md) |
 | Create shape pre-validation | Salad's documented create limits (whole vCPUs 1..16, memory 1024..61440 MB, storage a whole GiB within 1..250 GiB, GPU class UUIDs) checked at setup, route proposal/approval, the create action and in the transport before the POST (never at start of an existing group); refused before any reservation exists; stored proposals keep parsing | Done; see "Create rejected" |
 | Estimate-only labelling | every status/receipt carries `actual_billed_cost_cents: null`, `financial_hard_cap: false`, `price_basis: published_gpu_hourly_rate_not_actual_cost` | Existing; verified |
 
@@ -125,6 +126,11 @@ operation `reconciled` with reason `provider_confirmed_exact_group_stopped`
 freezes and the orphan fence releases. Custody stays unsealed and outputs stay
 unimportable; the live driver reports `provider_stop_confirmed` (never
 `stop_confirmed`) and ends its stop wait with reason
+`provider_stopped_custody_unsealed`. A run that completed (its output was retained, and
+the guardian recorded no stop cause other than `output_retained`) is different: the
+provider confirms the stop first and the guardian seals custody after, so the live driver
+keeps reading for up to 300 s (`CUSTODY_SEAL_SECONDS`, the group is stopped meanwhile)
+and verifies the sealed output once it seals; only past that window does it end as
 `provider_stopped_custody_unsealed`. An operator `reconcile` before that close
 records its attestation under `operator_reconciled_exact_group_stopped`.
 
@@ -198,6 +204,17 @@ with well-formed items, no pagination keys, and no group of that name (100+
 items allowed). A failed list read or a listed name refuses it; the result is
 `reason: "operator_lost_create_absent"` and event
 `operator_lost_create_absent_reconciled`. Guardian state is never hand-edited.
+
+Never ready ([ADR 0205](decisions/0205-salad-precreate-auto-release.md)): a reservation
+that never answered `ready` (`last_ready_at` unset) cannot have sent a create, because the
+trusted server asks for `ready` before every create and `ready` is refused once recovery is
+set. Once in recovery, with preconditions 1, 3 and 4 above, no reported rejection and no
+earlier late-group void, it is released `NEVER_READY_SETTLE_SECONDS` (30 s) after its last
+heartbeat instead of at the route deadline plus the margin: `reason: "never_ready_absent"`,
+a `lost_create` record of kind `never_ready`, the event `never_ready_absent_reconciled`, and
+the same 24 h watch. Status shows `never_ready_eligible_at` until then. A repeated `reserve`
+of such a reservation (the live check's pre-create retry) refreshes its heartbeat, so the
+retry cannot push it into recovery; nothing else changes the silence bound.
 
 Residual risk: nothing watches the reserved name more than 24 hours after
 resolution. A group that first appears later (only possible if a create request

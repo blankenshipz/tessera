@@ -36,7 +36,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any, Protocol
 
@@ -63,6 +63,7 @@ from .salad_campaign_profiles import (
     route_window_source,
 )
 from .salad_events import closed_record
+from .salad_precreate import launch_effects
 from .salad_termination import provider_termination
 from .salad_workload_contract import WorkloadContractV1
 from .store import canonical_digest
@@ -70,7 +71,10 @@ from .store import canonical_digest
 CONFIG_SCHEMA = "tessera.salad.campaign-executor.v1"
 RECEIPT_NAME = "salad-live-receipt.json"
 LIVE_RECEIPT_SCHEMA = "tessera.salad.live-check.v1"
-SUBPROCESS_GRACE_SECONDS = 300
+# The child's completion tail (cancel, stop, custody seal, verification) retries transients
+# inside bounded windows (salad_live_check.CUSTODY_SEAL_SECONDS, VERIFY_RETRY_SECONDS); this
+# grace past the route window covers them. The group is stopped while the tail runs.
+SUBPROCESS_GRACE_SECONDS = 900
 KEEPALIVE_PHASES = ("leased", "route_started", "executing")
 _IDENT = re.compile(r"[a-zA-Z0-9_-]{1,200}\Z")
 _Path = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
@@ -496,6 +500,30 @@ GROUP_STOP_MARKER = "group-stop.json"
 CANCEL_UNRECORDED_HOLD_SECONDS = 600.0
 GROUP_STOP_MAX_FAILURES = 5
 GROUP_STOP_RECHECK_SECONDS = 30.0
+# A passed receipt whose idempotent finish steps (import, upload, exit report, guardian final)
+# failed transiently is not recorded yet: the attempt stays ``executing`` and ``_resume`` retries
+# the steps from the receipt on disk, at most FINISH_MAX_DEFERRALS times and within
+# FINISH_RETRY_SECONDS of the first deferral (per process), then records with what it has.
+FINISH_MARKER = "finish.json"
+FINISH_MAX_DEFERRALS = 30
+FINISH_RETRY_SECONDS = 1800.0
+# Receipt reasons of a run whose exact stop could not be confirmed in the child (M9).
+STOP_UNRESOLVED_REASONS = frozenset({"stop_unresolved", "custody_stop_or_reconnect_unresolved"})
+
+
+def _finish_transient(error: BaseException) -> bool:
+    """A failed finish step worth retrying: a timeout, lock, connection or transient guardian or
+    provider read. Integrity, binding and refusals are not (they are recorded as before)."""
+    import sqlite3
+
+    from .salad_live_check import _tail_transient
+
+    if isinstance(error, (TimeoutError, ConnectionError, sqlite3.OperationalError)):
+        return True
+    try:
+        return _tail_transient(error)
+    except Exception:  # noqa: BLE001 - an unclassifiable error is not retried
+        return False
 
 
 def _same_group(left: Any, right: Any) -> bool:
@@ -611,6 +639,8 @@ class SaladCampaignExecutor:
         # Attempts whose live check exited on its own with no receipt, until control has the
         # report (a failed report is re-sent on the next pass of this process only).
         self.no_receipt: set[str] = set()
+        # Executing attempts resumed with no receipt and no launch effect, reported once.
+        self._no_receipt_resumed: set[str] = set()
         # Whether this pass already sent its pre-lease registry heartbeat.
         self._heartbeat_sent = False
         # ADR 0160: failed group-stop reports per attempt; bounded, in memory only.
@@ -618,6 +648,9 @@ class SaladCampaignExecutor:
         self._group_stop_given_up: set[str] = set()
         self._group_stop_next: dict[str, float] = {}
         self._cancel_unrecorded_since: dict[str, float] = {}
+        # Deferred finishes per attempt: (first deferral clock, deferrals); in memory only.
+        self._finish_deferred: dict[str, tuple[float, int]] = {}
+        self._final_retryable: dict[str, bool] = {}
         self.log: list[dict[str, Any]] = []
         # Concurrent mode only (``max_concurrent_paid_routes`` above 1): the routes whose child
         # runs now, by attempt. Every field of the executor is read and written by the pass's own
@@ -1099,6 +1132,7 @@ class SaladCampaignExecutor:
             self._note("no_receipt_report_failed", attempt, type(error).__name__)
             return
         self.no_receipt.discard(attempt)
+        self._no_receipt_resumed.add(attempt)  # delivered: a later resume never repeats it
         self._note("no_receipt_reported", attempt)
 
     def _watch_begin(self, watch: Any, item: dict[str, Any], derived: Any) -> Path | None:
@@ -1130,7 +1164,25 @@ class SaladCampaignExecutor:
             return
         if item["attempt_id"] in self.no_receipt:
             self._report_no_receipt(item)
+        elif item["attempt_id"] not in self._no_receipt_resumed and self._never_launched(item):
+            # Marked executing, but no receipt on disk, no child of this process (a resumed
+            # attempt has none) and no create or start effect on the route: report the
+            # idempotent no-receipt marker so the runner's unclaimed unwind ends it without a
+            # person (M8, ADR 0205). Once per process; the runner's own proof decides.
+            self._no_receipt_resumed.add(item["attempt_id"])
+            self._note("no_receipt", item["attempt_id"], "resumed_without_launch_effect")
+            self._report_no_receipt(item)
         self._report_group_stop(item)
+
+    def _never_launched(self, item: dict[str, Any]) -> bool:
+        """True when the route has no create or start effect and names no provider group (a
+        fresh read; fails closed)."""
+        try:
+            state = self.control.route(item["route_id"])
+        except Exception as error:  # noqa: BLE001 - unreadable: assume an effect may exist
+            self._note("route_unreadable", item["attempt_id"], type(error).__name__)
+            return False
+        return type(state) is dict and not state.get("provider_id") and not launch_effects(state)
 
     def _report_group_stop(self, item: dict[str, Any]) -> None:
         """Report the guardian's confirmed stop of the route's exact group (ADR 0160).
@@ -1217,7 +1269,9 @@ class SaladCampaignExecutor:
         failure = receipt.get("cancel_failure")
         exception = failure.get("exception") if type(failure) is dict else None
         self._note("cancel_unrecorded", attempt, str(exception or "")[:64])
-        if receipt.get("provider_stop_confirmed") is True:
+        if receipt.get("provider_stop_confirmed") is True or self._never_launched(item):
+            # A route with no create or start effect has no group to wait for (M10): the
+            # outcome is recorded now and the runner unwinds it on control's own records.
             self._cancel_unrecorded_since.pop(attempt, None)
             return False
         try:
@@ -1241,14 +1295,23 @@ class SaladCampaignExecutor:
         attempt, route_id = item["attempt_id"], item["route_id"]
         if receipt.get("cancel_recorded") is False and self._cancel_unrecorded_held(item, receipt):
             return
-        manifest_id = None
-        provider_id = None
+        # A passed receipt is never recorded behind a transient finish failure (H6, H11): the
+        # failed steps are retried from the receipt on disk (``_resume``), bounded.
+        passed = receipt.get("status") == "passed"
+        deferred: list[str] = []
         state = self.control.route(route_id)
         provider_id = state.get("provider_id")
         lease = self._lease_for(item)
         waiting = provider_termination(state)
         if waiting.status == "unconfirmed" and waiting.reason != "no_stop_requested":
             state = self._confirm_termination(attempt, route_id, self._profile_for(item))
+        if not passed and self._unconfirmed_stop_held(item, receipt, state):
+            return
+        marker_path = self._route_dir(route_id) / FINISH_MARKER
+        progress = (_read_private_json(marker_path) or {}) if passed else {}
+        manifest_id = (
+            progress.get("manifest_id") if type(progress.get("manifest_id")) is str else None
+        )
         # An attempt the provider moved after custody began has no diagnostic and maybe no other
         # declared file. It gets a partial manifest of what reached custody (each file
         # hash-verified); it never counts as a pass.
@@ -1261,16 +1324,26 @@ class SaladCampaignExecutor:
             except Exception as error:
                 self._note("custody_evidence_failed", attempt, type(error).__name__)
                 partial = False
-        if (receipt.get("stop_confirmed") is True or partial) and lease is not None:
+        if (
+            manifest_id is None
+            and (receipt.get("stop_confirmed") is True or partial)
+            and lease is not None
+        ):
             try:
                 manifest_id = self._import_and_upload(item, state, lease, partial=partial)
+                if passed:
+                    progress["manifest_id"] = manifest_id
+                    self._save_progress(marker_path, progress)
             except Exception as error:
                 self._note("import_failed", attempt, type(error).__name__)
+                if passed and _finish_transient(error):
+                    deferred.append("import")
         if (
             lease is not None
             and provider_id
             and state.get("termination_confirmed") is True
             and not state.get("reallocated")
+            and progress.get("exited_reported") is not True
         ):
             observed_at = _last_provider_observation(state)
             if observed_at is not None:
@@ -1278,8 +1351,13 @@ class SaladCampaignExecutor:
                     self.control.report_exited(
                         lease[0], lease[1], item["operation_id"], provider_id, observed_at
                     )
+                    if passed:
+                        progress["exited_reported"] = True
+                        self._save_progress(marker_path, progress)
                 except Exception as error:
                     self._note("observation_failed", attempt, type(error).__name__)
+                    if passed and _finish_transient(error):
+                        deferred.append("exit_report")
         reading = provider_termination(state)
         if lease is not None and provider_id and reading.confirmed and reading.observed_at:
             # ADR 0149: the provider's own read confirmed the reallocated group stopped. The
@@ -1296,6 +1374,13 @@ class SaladCampaignExecutor:
             self._note("termination_unconfirmed", attempt, reading.code)
         financial = receipt.get("financial")
         guardian_final = self._read_guardian_final(attempt, route_id)
+        if passed and self._final_retryable.pop(attempt, False):
+            # The read failed, or the guardian has not reached ``stopped`` yet: read it again
+            # on a later pass rather than record a stale snapshot (H11). No guardian, or a status
+            # that cannot be projected, is not retried.
+            deferred.append("guardian_final")
+        if deferred and self._defer_finish(attempt, deferred):
+            return
         self.control.record_outcome(
             attempt,
             dict(
@@ -1307,7 +1392,63 @@ class SaladCampaignExecutor:
                 guardian_final=guardian_final,
             ),
         )
+        self._finish_deferred.pop(attempt, None)
         self._note("outcome_recorded", attempt, "manifest" if manifest_id else "no_manifest")
+
+    @staticmethod
+    def _save_progress(path: Path, progress: dict[str, Any]) -> None:
+        """Keep which idempotent finish steps already succeeded (best effort: every step is
+        idempotent at control, the marker only saves repeating a full import)."""
+        try:
+            if path.parent.is_dir():
+                _write_private_json(path, progress)
+        except Exception:  # noqa: BLE001 - a lost marker only repeats an idempotent step
+            pass
+
+    def _defer_finish(self, attempt: str, steps: list[str]) -> bool:
+        """True when the outcome waits for another pass (bounded); False once the bound ran out,
+        then the outcome is recorded with what the finish has, and that is noted."""
+        now = self.clock()
+        first, count = self._finish_deferred.get(attempt, (now, 0))
+        count += 1
+        detail = ",".join(steps)
+        if count > FINISH_MAX_DEFERRALS or now - first >= FINISH_RETRY_SECONDS:
+            self._finish_deferred.pop(attempt, None)
+            self._note("finish_retries_exhausted", attempt, detail)
+            return False
+        self._finish_deferred[attempt] = (first, count)
+        self._note("finish_deferred", attempt, detail)
+        return True
+
+    def _unconfirmed_stop_held(
+        self, item: dict[str, Any], receipt: dict[str, Any], state: dict[str, Any]
+    ) -> bool:
+        """True while a non-passed receipt whose exact stop the child could not confirm (M9: a
+        group created, maybe never started, and one stop read failed) waits for the guardian's
+        confirmed stop of the exact group, reported as termination evidence (ADR 0160).
+
+        Bounded like a deferred finish; never for a stop the receipt or control already
+        confirmed, nor for a route with no create effect (there is no group to wait for)."""
+        attempt = item["attempt_id"]
+        if (
+            receipt.get("reason") not in STOP_UNRESOLVED_REASONS
+            or receipt.get("stop_confirmed") is True
+            or receipt.get("provider_stop_confirmed") is True
+            or state.get("termination_confirmed") is True
+            or provider_termination(state).confirmed
+            or not any(effect.get("action") == "create" for effect in state.get("effects", []))
+        ):
+            return False
+        try:
+            self._report_group_stop(item)
+        except Exception as error:  # noqa: BLE001 - a failed check holds, bounded below
+            self._note("group_stop_held", attempt, type(error).__name__)
+        marker = _read_private_json(self._route_dir(item["route_id"]) / GROUP_STOP_MARKER)
+        if (marker is not None and marker.get("reported") is True) or (
+            attempt in self._group_stop_given_up
+        ):
+            return False
+        return self._defer_finish(attempt, ["group_stop"])
 
     def _confirm_termination(
         self, attempt: str, route_id: str, profile: SaladCampaignProfile | None
@@ -1359,19 +1500,24 @@ class SaladCampaignExecutor:
         a miswired status client is visible rather than silently disabling the bound."""
         final: dict[str, Any] | None = None
         reason = "unprojectable"
+        failed = False
         for index in range(1 + self.config.guardian_retries):
-            failed = False
+            failed = raised = False
             try:
                 final = self.control.guardian_final(route_id)
             except Exception as error:
-                final, reason, failed = None, type(error).__name__, True
+                final, reason, raised = None, type(error).__name__, True
+                failed = _finish_transient(error)
             if final is not None and final.get("status") == "stopped":
                 return final
-            if final is None and not failed:
+            if final is None and not raised:
                 # No guardian is configured (or nothing projectable): re-reading cannot help.
                 break
             if index < self.config.guardian_retries:
                 self.sleep(self.config.guardian_retry_seconds)
+        # Worth another read later: the read failed transiently, or the final is not
+        # ``stopped`` yet.
+        self._final_retryable[attempt] = failed or final is not None
         if final is None:
             self._note("guardian_final_unavailable", attempt, reason)
         else:
@@ -1705,6 +1851,28 @@ def _text(value: Any) -> str | None:
     return None
 
 
+# Decimal places the recorded guardian final keeps (control's ``_CentsText`` shape).
+GUARDIAN_TEXT_PLACES = 12
+_LONG_DECIMAL = re.compile(r"[0-9]{1,12}\.[0-9]{13,}")
+
+
+def _cents_text(value: Any) -> str | None:
+    """``_text``, with a longer decimal fraction rounded UP to GUARDIAN_TEXT_PLACES places.
+
+    The guardian accrues with exact decimal division (rate x seconds x 100 / 3600), so its
+    estimate often carries 28 significant digits; recorded as is, it fails control's 12-place
+    shape and the whole final was dropped as unprojectable. Rounding up never under-states a
+    cost or a rate; anything else is passed through for validation unchanged."""
+    text = _text(value)
+    if text is None or not _LONG_DECIMAL.fullmatch(text):
+        return text
+    try:
+        number = Decimal(text).quantize(Decimal(1).scaleb(-GUARDIAN_TEXT_PLACES), ROUND_CEILING)
+    except InvalidOperation:
+        return text
+    return format(number, "f")
+
+
 def _project_rebinds(value: Any) -> dict[str, Any] | None:
     """The guardian's pre-start re-binds (count and the last three), or None when it has none
     or the shape is not the expected one (then nothing is recorded, never a guess)."""
@@ -1738,8 +1906,8 @@ def project_guardian_final(
         status=status.get("status"),
         reason=str(status.get("reason") or "")[:80],
         **{flag: status.get(flag) is not False for flag in _GUARDIAN_FLAGS},
-        published_hourly_rate_usd=_text(status.get("published_hourly_rate_usd")),
-        estimated_exposure_cents=_text(status.get("estimated_exposure_cents")),
+        published_hourly_rate_usd=_cents_text(status.get("published_hourly_rate_usd")),
+        estimated_exposure_cents=_cents_text(status.get("estimated_exposure_cents")),
         actual_billed_cost_cents=billed if type(billed) is int and billed >= 0 else None,
         observed_at=(now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )

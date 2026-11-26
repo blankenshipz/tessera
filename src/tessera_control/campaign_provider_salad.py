@@ -188,6 +188,24 @@ def _hosts_declared(config: SaladStageSpec) -> bool:
 
 # A Salad attempt in one of these phases ran, or may have run, past the provider create: it
 # is never reconciled automatically as unclaimed (ADR 0157).
+def _receipt_sent_nothing(row: Mapping[str, Any]) -> bool:
+    """True when the attempt's live receipt names no provider resource and did not pass.
+
+    Such a receipt is an honest report, not evidence of a provider effect (ADR 0205): whether
+    a create or start was sent is then decided only by control's own claim and route records
+    (``unclaimed_proof``), exactly as for an attempt with no receipt."""
+    try:
+        receipt = json.loads(row["live_receipt_json"])
+    except (TypeError, ValueError):
+        return False
+    return (
+        type(receipt) is dict
+        and receipt.get("status") != "passed"
+        and not receipt.get("provider_id")
+        and receipt.get("create_rejection") is None
+    )
+
+
 UNCLAIMABLE_PHASES = frozenset(
     {"executing", "outcome_recorded", "awaiting_charge", "settled", "unclaimed"}
 )
@@ -887,13 +905,8 @@ class SaladRouteProvider:
             return CreateClaim("claimed", "provider_reference")
         if any(
             row[name] is not None
-            for name in (
-                "live_receipt_digest",
-                "manifest_id",
-                "salad_evidence_digest",
-                "charged_cents",
-            )
-        ):
+            for name in ("manifest_id", "salad_evidence_digest", "charged_cents")
+        ) or (row["live_receipt_digest"] is not None and not _receipt_sent_nothing(row)):
             return CreateClaim("unknown", "salad_record_has_evidence")
         if row["phase"] in UNCLAIMABLE_PHASES:
             return CreateClaim("unknown", "salad_phase")

@@ -187,7 +187,11 @@ class RemoteExecutionStore(CapabilityStore):
         ):
             raise Forbidden("Exact execution target/resources/manifests are not allowlisted.")
 
-    def _current(self, db, actor, state):
+    def _current(self, db, actor, state, *, soft_lease_lapse_ok=False):
+        """Use-time authority. ``soft_lease_lapse_ok`` is for the trusted Salad heartbeat of a
+        launched route only: its liveness is the guardian's own 30 s heartbeat bound, so a soft
+        lease that lapsed because renewals stalled behind a control lock is not a revocation.
+        The epoch, hard expiry, grant, admission state, reviews and policy are still enforced."""
         if (
             db.execute("SELECT state FROM control_recovery WHERE singleton=1").fetchone()[0]
             != "active"
@@ -207,7 +211,7 @@ class RemoteExecutionStore(CapabilityStore):
         if (
             grant["epoch"] != proposal["epoch"]
             or lease["epoch"] != proposal["epoch"]
-            or _parse_utc(lease["expires_at"]) <= datetime.now(UTC)
+            or (not soft_lease_lapse_ok and _parse_utc(lease["expires_at"]) <= datetime.now(UTC))
             or _parse_utc(lease["hard_expires_at"]) <= datetime.now(UTC)
             or op["desired_state"] != "admitted"
         ):

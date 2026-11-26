@@ -53,7 +53,14 @@ def test_each_class_is_reached_and_status_stays_inconclusive(step):
     receipt = drive(failing(step))
     assert receipt["prestart_failure"]["class"] == step
     assert receipt["status"] == "inconclusive"
-    assert receipt["reason"] == "custody_stop_or_reconnect_unresolved"
+    # A create that failed with no create effect sent nothing: its own reason, no stop
+    # (ADR 0205); every later step keeps the stop/reconnect reason.
+    expected = (
+        "create_not_attempted"
+        if step == "create_failed"
+        else "custody_stop_or_reconnect_unresolved"
+    )
+    assert receipt["reason"] == expected
     assert "start" not in failing(step).actions
     assert SECRET not in json.dumps(receipt)
 

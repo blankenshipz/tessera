@@ -720,12 +720,26 @@ def test_one_transient_rate_read_failure_is_retried_not_fenced(service_case):
     assert provider.calls.count("gpu_class") - before == 2 and slept == [0.2]
 
 
+def _last_rate_past_stale_window(s, b):
+    """ADR 0204 tolerates a transient rate-read failure on a running frame while the last good
+    rate is under RATE_STALE_WINDOW_SECONDS old; age it past the window so these retry tests
+    still see the fail-closed give-up they pin."""
+    from tessera_control.salad_safety_service import RATE_STALE_WINDOW_SECONDS
+
+    with s.db:
+        s.db.execute(
+            "UPDATE reservations SET rate_at=rate_at-? WHERE reservation=?",
+            (RATE_STALE_WINDOW_SECONDS, b["reservation"]),
+        )
+
+
 @pytest.mark.parametrize("failures", [3, 10])
 def test_rate_reads_failing_every_attempt_still_fence_and_stop(service_case, failures):
     s, b, request, token, clock, provider, *_ = service_case
     slept = []
     s.retry_sleep = slept.append
     provider.rate_failures = failures
+    _last_rate_past_stale_window(s, b)
     clock[0] += 5
     s.loop()
     status = s.admin(dict(operation="status", reservation=b["reservation"]))
@@ -749,6 +763,7 @@ def test_a_slow_failed_rate_read_is_not_retried_past_the_budget(service_case):
     slept = []
     s.retry_sleep = slept.append
     provider.rate_failures = 1
+    _last_rate_past_stale_window(s, b)
     clock[0] += 5
     s.loop()
     status = s.admin(dict(operation="status", reservation=b["reservation"]))
@@ -782,10 +797,21 @@ def test_one_transient_group_read_failure_is_retried_not_stopped(service_case):
 
 
 def _more_failed_polls(s, b, clock, waits=(5, 10)):
-    """The run already began, so the first failed poll is retried (q-2505, ADR 0181) and the
-    third consecutive failed poll stops it: advance by the guardian's growing backoff."""
-    for wait in waits:
+    """The run already began, so a failed poll is retried (ADR 0181, ADR 0204) until the post-start
+    window (60 s since the first failure, ADR 0204) ends; the next failed poll stops it. This
+    route is only 30 s long, so the window's start is aged past it before the last poll instead
+    of waiting a minute: advance by the guardian's growing backoff."""
+    from tessera_control.salad_guardian import POSTSTART_READ_WINDOW_SECONDS
+
+    for index, wait in enumerate(waits):
         s.admin(dict(operation="heartbeat", reservation=b["reservation"]))
+        if index == len(waits) - 1:
+            with s.guardian.db:
+                s.guardian.db.execute(
+                    "UPDATE assignments SET read_fail_since=read_fail_since-? "
+                    "WHERE read_fail_since IS NOT NULL",
+                    (POSTSTART_READ_WINDOW_SECONDS,),
+                )
         clock[0] += wait
         s.loop()
     return s.admin(dict(operation="status", reservation=b["reservation"]))
@@ -864,6 +890,7 @@ def test_a_rate_read_that_gives_up_records_its_closed_reason(service_case, setup
         provider.rate_age = 6
     else:
         provider.rate_failures = 3
+    _last_rate_past_stale_window(s, b)
     clock[0] += 5
     s.loop()
     status = s.admin(dict(operation="status", reservation=b["reservation"]))
@@ -922,6 +949,7 @@ def test_worst_case_loop_pass_stays_inside_the_allowance(service_case):
 
     s.admin(dict(operation="heartbeat", reservation=b["reservation"]))
     s._send = timed_send
+    _last_rate_past_stale_window(s, b)
     clock[0] += 5
     s.loop()
     status = s.admin(dict(operation="status", reservation=b["reservation"]))
@@ -929,11 +957,11 @@ def test_worst_case_loop_pass_stays_inside_the_allowance(service_case):
     assert status["provider_read_retries"] == 1
     assert status["last_rate_read_failure"] == "timeout"
     assert status["last_rate_read_failure_at"] is not None
-    # The failed rate read already put the reservation into stop-only recovery, so the
-    # guardian's own poll records no first stop decision (stop_cause stays None); the
-    # provider failure is what the guardian reports as the reason.
+    # The failed rate read put the reservation into stop-only recovery first: that is the
+    # recorded first stop cause; the provider failure is what the guardian reports as
+    # the reason.
     assert status["status"] == "unknown" and status["reason"] == "provider_unavailable"
-    assert status["stop_cause"] is None
+    assert status["stop_cause"] == "rate_unknown"
     assert elapsed[0] <= LOOP_PASS_ALLOWANCE_SECONDS - 1.0
 
 
@@ -2102,10 +2130,10 @@ def test_pre_create_admission_checks_billed_window_not_route_window(tmp_path):
     provider = Provider()
     from tessera_control.salad_safety_service import UNSEEN_RUN_GAP_SECONDS
 
-    # 5 USD/h (10 cents buys 72 s), billed = running + UNSEEN_RUN_GAP_SECONDS (45 s):
-    # 40 s running bills 85 s = 11.8 cents > 10; 2 s running bills 47 s = 6.5 cents < 10.
-    # The 90 s route window would bill 135 s = 18.8 cents: only the billed window counts.
-    assert UNSEEN_RUN_GAP_SECONDS == 45
+    # 5 USD/h (10 cents buys 72 s), billed = running + UNSEEN_RUN_GAP_SECONDS (60 s):
+    # 40 s running bills 100 s = 13.9 cents > 10; 2 s running bills 62 s = 8.6 cents < 10.
+    # The 90 s route window would bill 150 s = 20.8 cents: only the billed window counts.
+    assert UNSEEN_RUN_GAP_SECONDS == 60
     provider.rate = "5"
     s = make_service(tmp_path, lambda: 100, ec.generate_private_key(ec.SECP256R1()), provider)
     try:
@@ -2497,7 +2525,9 @@ def test_unix_admin_frame_accepts_a_real_sized_reserve_and_bounds_the_rest():
 
 
 def _lost_create(tmp_path):
-    """Reserve, then the create fails and the driver cancels: recovery=1, no provider_id."""
+    """Reserve, ready (so a create may have been sent), then the create fails and the driver
+    cancels: recovery=1, no provider_id. A reservation never made ready takes the faster
+    never-ready release instead (ADR 0205)."""
     tmp_path.chmod(0o700)
     clock = [100.0]
     key = ec.generate_private_key(ec.SECP256R1())
@@ -2508,6 +2538,7 @@ def _lost_create(tmp_path):
     b = reservation()
     s.loop()
     s.admin(b)
+    s.admin(dict(operation="ready", reservation=b["reservation"]))
     s.admin(dict(operation="cancel", reservation=b["reservation"]))
     s.loop()
     row = s._row(b["reservation"])
@@ -2948,10 +2979,15 @@ def test_create_rejected_releases_early_on_the_guardians_own_absence_reads(tmp_p
         # The orphan fence reopens; the late-group watch keeps running.
         clock[0] += 1
         s.loop()
-        s.admin(_next_reservation(s, clock))
+        second = _next_reservation(s, clock)
+        s.admin(second)
         clock[0] += 61
         s.loop()
-        assert _absence_reads(provider) == 2
+        # One watch read of the released frame, plus (ADR 0205) the never-ready release read
+        # of the second reservation, which went silent without ever answering ready.
+        assert _absence_reads(provider) == 3
+        released = json.loads(s._row(second["reservation"])["lost_create_resolution"])
+        assert released["kind"] == "never_ready"
     finally:
         s.close()
 

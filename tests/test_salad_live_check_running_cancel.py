@@ -175,15 +175,16 @@ def test_a_deterministic_read_failure_while_running_is_held_not_cancelled():
     assert receipt["cancel_cause"]["class"] == "execution_complete"
 
 
-def test_observe_stalls_before_running_keep_the_earlier_bound():
-    # The group never read running after start: three failed reads still end the run.
-    session = RunningSession(observe_errors=[read_timeout() for _ in range(5)])
+def test_observe_stalls_after_start_before_running_are_skipped_not_bounded():
+    # The start effect is recorded (running latch): failed reads before the group first reads
+    # running are skipped past the earlier bound of three, and the run completes. The earlier
+    # bound still applies to a route with no start effect (test_salad_running_latch).
+    session = RunningSession(retain_after=1, observe_errors=[read_timeout() for _ in range(5)])
     receipt = drive(session)
-    assert cancelled_before_output(session)
-    assert receipt["last_provider_status"] is None
-    assert receipt["observe_transient_failures"] == 2
-    assert receipt["cancel_cause"]["class"] == "observe_timeout"
-    assert receipt["reason"] == "custody_stop_or_reconnect_unresolved"
+    assert receipt["status"] == "passed", receipt
+    assert receipt["observe_transient_failures"] == 5
+    assert receipt["cancel_cause"]["class"] == "execution_complete"
+    assert receipt["running_latch"] == {"state": "seen_running", "cleared_by": None}
 
 
 # --- a cancel that does happen records a closed reason ----------------------------------------
@@ -270,15 +271,39 @@ class DeployingSession(RunningSession):
         return state
 
 
-def test_a_locked_control_before_running_is_still_a_silence_bound_cancel():
-    # Not last read running: a blocked beat is tolerated only inside the silence bound.
+class StoppedSession(RunningSession):
+    """After start the group affirmatively reads ``stopped``: the running latch is cleared, so
+    the earlier (pre-running) bounds apply again."""
+
+    def dispatch(self, route, action):
+        state = super().dispatch(route, action)
+        if action == "observe" and state.get("provider_status") == "running":
+            return dict(state, provider_status="stopped")
+        return state
+
+
+def test_a_locked_control_after_start_before_running_is_held_not_a_silence_bound_cancel():
+    # The start effect is recorded (running latch): a blocked beat while the group deploys is a
+    # control stall, never a silence_bound cancel; the guardian keeps its own silence bound.
     session = DeployingSession(beat_errors=[None] + [locked() for _ in range(40)])
+    receipt = drive(session)
+    assert cancelled_before_output(session)
+    cause = receipt["cancel_cause"]
+    assert cause["class"] == "deadline"
+    assert cause["last_provider_status"] == "deploying"
+    assert receipt["control_stalls"] >= 1
+
+
+def test_a_locked_control_after_an_affirmative_stop_is_still_a_silence_bound_cancel():
+    # Latch cleared by the provider's own stopped read: a blocked beat is tolerated only inside
+    # the silence bound.
+    session = StoppedSession(beat_errors=[None] + [locked() for _ in range(40)])
     receipt = drive(session)
     assert cancelled_before_output(session)
     cause = receipt["cancel_cause"]
     assert cause["class"] == "silence_bound"
     assert cause["exception"] == "OperationalError"
-    assert cause["last_provider_status"] == "deploying"
+    assert cause["last_provider_status"] == "stopped"
     assert cause["heartbeat_silent_seconds"] >= 10
     assert receipt["control_stalls"] >= 1
 
@@ -295,9 +320,18 @@ def test_a_transient_guardian_refusal_past_the_bound_is_held_on_a_running_route(
     assert receipt["guardian_refusal"] is None
 
 
-def test_a_transient_guardian_refusal_before_running_is_still_silence_bound():
+def test_a_transient_guardian_refusal_after_start_before_running_is_held():
     refusals = [None] + [GuardianRefused("guardian_loop_unready") for _ in range(40)]
     session = DeployingSession(beat_errors=refusals)
+    receipt = drive(session)
+    assert cancelled_before_output(session)
+    assert receipt["cancel_cause"]["class"] == "deadline"
+    assert receipt["running_errors_held"] >= 1
+
+
+def test_a_transient_guardian_refusal_after_an_affirmative_stop_is_still_silence_bound():
+    refusals = [None] + [GuardianRefused("guardian_loop_unready") for _ in range(40)]
+    session = StoppedSession(beat_errors=refusals)
     receipt = drive(session)
     assert cancelled_before_output(session)
     assert receipt["cancel_cause"]["class"] == "silence_bound"
@@ -328,9 +362,9 @@ def test_the_deadline_is_a_deadline_cancel():
 
 
 def test_cancel_cause_is_closed_and_a_non_refusal_carries_no_secret_text():
-    # Before the route reads running an unexpected error still cancels; only a control refusal
-    # adds refusal evidence, and the error detail never carries secret-looking text.
-    session = DeployingSession(observe_errors=[RuntimeError(SECRET)])
+    # Once the running latch is cleared an unexpected error still cancels; only a control
+    # refusal adds refusal evidence, and the error detail never carries secret-looking text.
+    session = StoppedSession(observe_errors=[None, RuntimeError(SECRET)])
     receipt = drive(session)
     assert receipt["cancel_cause"]["class"] in CANCEL_CAUSE_CLASSES
     assert receipt["cancel_cause"]["class"] == "error"
@@ -472,7 +506,8 @@ def test_concrete_keepalive_beats_the_guardian_through_a_control_stall():
     with pytest.raises(ControlStall) as raised:
         session.keepalive("route")
     assert raised.value.beat_delivered is True
-    assert session.server.store.calls == ["renew", "guardian_heartbeat"]
+    # The beat goes out first; the lease write comes after it (ADR 0075 amendment).
+    assert session.server.store.calls == ["guardian_heartbeat", "renew"]
 
 
 def test_concrete_keepalive_refusal_is_never_hidden_by_a_stall():
@@ -490,7 +525,8 @@ def test_concrete_keepalive_other_renewal_errors_stay_terminal():
     session = concrete(renew_error=Conflict("lease expired"))
     with pytest.raises(Conflict):
         session.keepalive("route")
-    assert "guardian_heartbeat" not in session.server.store.calls
+    # The beat precedes the renewal; the renewal's refusal still reaches the driver.
+    assert session.server.store.calls == ["guardian_heartbeat", "renew"]
 
 
 # --- the executor: stderr is classified, an unrecorded cancel is held and reconciled ---------

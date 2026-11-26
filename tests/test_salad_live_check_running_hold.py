@@ -20,6 +20,7 @@ from test_salad_live_check_running_cancel import (
     SECRET,
     DeployingSession,
     RunningSession,
+    StoppedSession,
     cancelled_before_output,
     drive,
 )
@@ -215,7 +216,8 @@ def test_status_read_timeouts_before_running_are_skipped_like_other_read_stalls(
 
 
 def test_status_read_timeouts_with_failing_observes_keep_the_bound():
-    session = DeployingSession(observe_errors=[ServiceUnavailable("timeout")] * 5)
+    # The bound applies once the running latch is cleared (an affirmative stopped read).
+    session = StoppedSession(observe_errors=[None] + [ServiceUnavailable("timeout")] * 5)
     receipt = drive(session)
     assert cancelled_before_output(session)
     assert receipt["cancel_cause"]["class"] == "observe_timeout"
@@ -405,8 +407,8 @@ def test_execution_complete_still_completes_through_held_errors():
     assert receipt["cancel_cause"]["error"] is None
 
 
-def test_an_unexpected_error_before_running_still_cancels_with_its_detail():
-    session = DeployingSession(observe_errors=[ValueError("not yet running")])
+def test_an_unexpected_error_after_an_affirmative_stop_still_cancels_with_its_detail():
+    session = StoppedSession(observe_errors=[None, ValueError("not yet running")])
     receipt = drive(session)
     assert cancelled_before_output(session)
     assert receipt["cancel_cause"]["class"] == "error"

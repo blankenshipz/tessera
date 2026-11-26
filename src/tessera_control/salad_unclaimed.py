@@ -4,9 +4,10 @@ A leased and packaged Salad operation cannot use the Kubernetes never-submitted
 attestations, and an ordinary reconcile needs a confirmed-terminated observation. This
 store closes the narrow case in between (ADR 0038 amendment): the grant was cancelled,
 exactly one ``kubernetes-job-v1`` operation exists, control holds no ``salad_proxy.claim``
-for a create or start of that operation, and no route of the operation still wants to run.
-Control writes the claim in the same transaction as the intent to call the provider, so
-no claim means no provider mutation can have happened. It never infers a stop.
+for a create or start of that operation, and no route of the operation still wants to run or
+has a create or start effect, other than one the trusted server refused before its use-time
+claim (ADR 0205). Control writes the claim before any call to the provider, so no claim means
+no provider mutation can have happened. It never infers a stop.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from pydantic import ValidationError
 
 from .execution import ExecutionStore, reconcile_grant_row
 from .execution_models import ExecutionRequest, Revision
+from .salad_precreate import sent_launch_effects
 from .store import Conflict, StoreError, utc_now
 
 ADAPTER = "kubernetes-job-v1"
@@ -81,7 +83,9 @@ def unclaimed_proof(
         if state["id"] in seen:
             continue  # newest state per route only
         seen.add(state["id"])
-        if any(effect.get("action") in {"create", "start"} for effect in state["effects"]):
+        if sent_launch_effects(state):
+            # A create/start effect the trusted server refused before its use-time claim (and
+            # no claim exists for the operation, checked above) was never sent (ADR 0205).
             return "route_effect", proof
         if state.get("desired") == "run":
             return "route_wants_run", proof

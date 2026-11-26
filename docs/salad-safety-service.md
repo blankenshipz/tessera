@@ -304,7 +304,7 @@ With `max_open_billable_frames` above 1 the guardian keeps these rules:
 - *Longer unseen gap.* One loop pass reads every open frame. Beyond the first frame, each
   can add up to 8 provider requests (rate, group, instance, observe, stop and close check),
   each bounded by the 2 s transport deadline. So the unseen-run gap is
-  `45 + (N - 1) * 16` seconds: 45, 61, 77 or 93. Admission, accrual backdating and
+  `60 + (N - 1) * 16` seconds: 60, 76, 92 or 108. Admission, accrual backdating and
   begin-once all charge it. A longer pass can also make the guardian stop a healthy frame
   as `missed_poll`, or deny it a read retry because the pass's shared retry window is
   spent. Both stop the frame, so they cost a run, never money.
@@ -321,10 +321,20 @@ timeout) is retried at most twice (0.2 s, then 0.4 s backoff) and only while ano
 read (the transport's request timeout, 2 s) fits a 4.5 s budget inside the loop pass,
 so a read that failed by timing out still gets one retry. A stale or mismatched observation, a
 credential refusal or any other error is never retried. Each attempt must still return an
-exact observation at most 5 s old, and when every attempt fails the rate is unknown exactly
-as before: no grace and no reuse of an earlier rate
-([ADR 0031](decisions/0031-salad-single-container-gpu.md) unchanged). The next rate poll is
-paced from the end of the sequence. Retries are added to the reservation's cumulative
+exact observation at most 5 s old. When every attempt fails, the rate is unknown and the
+frame is fenced and stopped, with one bounded exception
+([ADR 0204](decisions/0204-guardian-transient-read-tolerance.md), amending
+[ADR 0031](decisions/0031-salad-single-container-gpu.md)): on a running frame (bound, billing
+begun, rate known and not fenced), a read that gave up on a transient failure (timeout or
+`provider_unknown`) keeps the last known rate while that rate's observation is under
+`RATE_STALE_WINDOW_SECONDS` (60 s) old. Only the guardian loop and the driver heartbeat take
+this tolerance; reserve, bind, ready and begin-once stay strict. Accrual and the per-run cap
+check continue at the last rate, and the frame is fenced when the window ends, a fresh read
+shows a changed price, or required exposure at the last rate exceeds the cap. The route
+deadline, heartbeat loss and the total cap are unchanged. A frame that is already stopping
+(stop-only recovery set, or its guardian assignment no longer `armed`, for example after the
+output was retained) is neither re-read nor fenced; accrual at the last rate continues until
+the stop is confirmed. The next rate poll is paced from the end of the sequence. Retries are added to the reservation's cumulative
 `rate_read_retries` (status) whether or not a later attempt succeeds, and appear on the
 live receipt as `guardian_rate_read_retries`. The guardian's group/instance reads follow
 the same rule (cumulative `provider_read_retries`, receipt
@@ -335,7 +345,8 @@ has room for its backoff and a full read, so retries never run past the window's
 first attempts are unchanged and may still take the pass past it. The loop-pass
 allowance (`LOOP_PASS_ALLOWANCE_SECONDS`, 12 s) covers that worst case: both windows, one
 first-attempt read started at the end of a window (2 s transport deadline) and 1 s of
-local work; the 45 s unseen-run gap that backdates accrual is sized with it. The retry
+local work; the 60 s unseen-run gap that backdates accrual is sized with it (it needs only
+44 s for the pass; ADR 0204 widened it to equal the guardian's post-start read window). The retry
 windows add up to 4.5 s of stop latency on a pass whose reads keep failing; that is
 accepted, as at pilot rates it costs a negligible amount. Group and instance reads share
 one failure kind (`provider_read_failed`) and so one window: the module pins the set of
@@ -343,8 +354,13 @@ kinds to two (`rate_read_failed`, `provider_read_failed`), and a third would put
 case past the gap. The allowance covers the polled reservation; first attempts for any
 further reservation are bounded by the transport deadline only, not by the windows. One window
 of each kind serves all reservations in the pass, so an early reservation's retries can
-leave none for a later one, which then fails closed. When every attempt fails the poll stops
-exactly as before, and the closed reason the read gave up with (`timeout`,
+leave none for a later one, which then fails closed. When every attempt fails, the rate read
+follows the rule above and a failed group/instance read is the guardian's: before start it
+is retried within the pre-start read deadline, and after the run began it is retried at
+each poll for at most `POSTSTART_READ_WINDOW_SECONDS` (60 s, equal to the one-frame
+unseen-run gap admission charges) and `POSTSTART_READ_RETRY_LIMIT` (13) consecutive
+failures, then stops as `provider_unavailable` (ADR 0181, widened by ADR 0204). The closed
+reason the read gave up with (`timeout`,
 `provider_unknown`, `rate_stale`, `rate_observation_invalid`, ...) is kept, at most once
 per reason per minute, as `last_rate_read_failure` / `last_provider_read_failure` in status
 (the most recent ever, not cleared by later successful reads; `*_at` is the time of the
@@ -353,7 +369,11 @@ and `guardian_last_rate_read_failure` / `guardian_last_provider_read_failure` on
 receipt. The first cause of a guardian's own stop decision
 (`provider_unavailable`, `provider_unknown`, `missed_poll`, `control_disconnect`,
 `deadline`, ...) is kept as `stop_cause` in status, even after the operation later turns
-`stopped`, and as `guardian_stop_cause` on the live receipt. A refused workload call
+`stopped`, and as `guardian_stop_cause` on the live receipt. A stop the service itself
+starts records its first closed cause the same way (`heartbeat_silence`, `deadline`,
+`clock_uncertain`, `rate_unknown`, `cost_cap`, `total_cap`, `loop_frame_failed`,
+`guardian_restart`, `control_cancel`, or `stop_only_recovery` when a recovery names no other
+cause), also kept on the reservation as `stop_cause` (ADR 0075). A refused workload call
 (begin-once, input, output) records its closed refusal code (never the token or body) as a
 `workload_refused` event, at most once per code per reservation per minute; the latest is
 `last_workload_refusal` in status and `guardian_last_workload_refusal` on the receipt, so a

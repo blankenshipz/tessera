@@ -48,6 +48,8 @@ from .salad_guardian import (
     POSTSTART_READ_WINDOW_SECONDS,
     RECONCILE_OPERATOR,
     RECONCILE_PROVIDER,
+    SERVICE_STOP_CAUSES,
+    STOP_ONLY_RECOVERY_CAUSE,
     WORKLOAD_FAILED_REASON,
     GuardianAssignment,
     ProviderObservation,
@@ -143,11 +145,21 @@ PRE_START = frozenset({"allocating", "downloading", "creating"})
 # frame (UNIX_ADMIN_FRAME_SECONDS read + UNIX_ADMIN_BUDGET_SECONDS) and then one HTTPS
 # request (at most CHUNK_REQUEST_SECONDS) between loop passes, so the gap must cover
 # all three plus one worst-case loop pass (LOOP_PASS_ALLOWANCE_SECONDS, below):
-# 2 + 10 + 20 + 12 = 44 <= 45; asserted below from the constants.
-UNSEEN_RUN_GAP_SECONDS = 45
+# 2 + 10 + 20 + 12 = 44 <= 60; asserted below from the constants. The gap is 60, not 45, because
+# it is also the post-start tolerance for transient provider and rate reads (ADR 0204).
+UNSEEN_RUN_GAP_SECONDS = 60
 # The guardian's post-start read-retry window is part of the same unseen gap, so retrying a
 # transient status read never lets billed time exceed what admission already counted.
 assert POSTSTART_READ_WINDOW_SECONDS == UNSEEN_RUN_GAP_SECONDS
+# A transient published-rate read failure on a running frame with a known last rate is
+# tolerated (ADR 0204, amending ADR 0031's price-read rule) while the last good observation is
+# at most this old: accrual and the per-run cap check continue at the last known rate, and the
+# frame is fenced when the window ends, a read shows the price changed, or required exposure
+# at the last rate exceeds the cap. Deterministic failures (stale or mismatched observation,
+# credential refusal, any other error) still fence at once. Same bound as the guardian's
+# post-start read window, so one brief provider outage is tolerated for one charged gap.
+RATE_STALE_WINDOW_SECONDS = POSTSTART_READ_WINDOW_SECONDS
+assert RATE_STALE_WINDOW_SECONDS <= UNSEEN_RUN_GAP_SECONDS
 # Provider reads (published rate, group/instance): one fast transient failure (a Salad
 # 5xx or reset, reported as provider_unknown) is retried, still fail-closed. At most
 # len(BACKOFF) + 1 attempts per read; a retry starts only if another full read (the
@@ -391,6 +403,13 @@ LOST_CREATE_MARGIN_SECONDS = 900
 # complete project list without the name, read by the guardian itself.
 CREATE_REJECTED_SETTLE_SECONDS = 30
 assert CREATE_REJECTED_SETTLE_SECONDS >= DISPATCH_CHAIN_SECONDS
+# A reservation that never admitted a create (no "ready", ADR 0205) cannot have sent one: the
+# trusted server asks for "ready" before every create, and "ready" is refused once recovery is
+# set. Once in recovery, it may be released this long after its last heartbeat (covering a
+# request still in flight), on the same exact-name 404 and complete project-list reads as the
+# automatic lost-create path, instead of waiting out the route window plus the margin.
+NEVER_READY_SETTLE_SECONDS = 30
+assert NEVER_READY_SETTLE_SECONDS >= DISPATCH_CHAIN_SECONDS
 assert LOST_CREATE_MARGIN_SECONDS >= 10 * DISPATCH_CHAIN_SECONDS
 # Seconds between lost-create absence reads, and between late-group watch reads.
 LOST_CREATE_READ_SECONDS = 15
@@ -528,11 +547,13 @@ FRAME_VERDICTS = ("open", "stopped", "reconciled", "absent")
 REASON_LOST_CREATE_ABSENT = "lost_create_absent"
 REASON_CREATE_REJECTED_ABSENT = "create_rejected_absent"
 REASON_OPERATOR_LOST_CREATE_ABSENT = "operator_lost_create_absent"
+REASON_NEVER_READY_ABSENT = "never_ready_absent"
 ABSENT_REASONS = frozenset(
     {
         REASON_LOST_CREATE_ABSENT,
         REASON_CREATE_REJECTED_ABSENT,
         REASON_OPERATOR_LOST_CREATE_ABSENT,
+        REASON_NEVER_READY_ABSENT,
     }
 )
 
@@ -663,6 +684,9 @@ class SaladSafetyService:
             "rate_read_retries": "INTEGER DEFAULT 0",
             # Group/instance reads that needed a bounded retry (receipt evidence only).
             "provider_read_retries": "INTEGER DEFAULT 0",
+            # First closed cause with which this service put the frame into stop-only recovery
+            # (SERVICE_STOP_CAUSES), written in the transaction that first set ``recovery``.
+            "stop_cause": "TEXT",
         }.items():
             if name not in columns:
                 self.db.execute(f"ALTER TABLE reservations ADD COLUMN {name} {declaration}")
@@ -678,6 +702,11 @@ class SaladSafetyService:
         )
         self.db.executescript(FRAME_RECORD_SCHEMA)
         with self.db:
+            # A restart is the first stop cause of every frame not already in recovery.
+            for (name,) in self.db.execute(
+                "SELECT reservation FROM reservations WHERE recovery=0"
+            ).fetchall():
+                self._first_recovery_cause(name, "guardian_restart")
             self.db.execute("UPDATE reservations SET recovery=1")
         self.guardian = SaladGuardian(
             root / "guardian.db",
@@ -690,6 +719,7 @@ class SaladSafetyService:
             custody_work_started=self._custody_work_started,
             max_prestart_rebinds=max_prestart_rebinds,
             prestart_read_deadline_seconds=prestart_read_deadline_seconds,
+            service_stop_cause=self._recorded_stop_cause,
         )
         self.loop_at = None
         # Real-time pacing for bounded rate-read retries (tests may replace both).
@@ -760,6 +790,29 @@ class SaladSafetyService:
             sequence=rows[-1][0] if rows else 0,
             record_digest=digest,
         )
+
+    def _first_recovery_cause(self, reservation, cause):
+        """Inside the caller's transaction, before it sets ``recovery``: keep the frame's first
+        stop cause (closed token). Nothing is written for a frame already in recovery or with a
+        recorded cause: the first cause wins."""
+        if cause not in SERVICE_STOP_CAUSES:
+            raise ValueError("stop_cause")
+        self.db.execute(
+            "UPDATE reservations SET stop_cause=? "
+            "WHERE reservation=? AND recovery=0 AND stop_cause IS NULL",
+            (cause, reservation),
+        )
+
+    def _recorded_stop_cause(self, operation):
+        """The guardian's question: why did this service put ``operation`` into stop-only
+        recovery? The first recorded cause; ``stop_only_recovery`` for a frame in recovery
+        with none recorded (a path that names no cause); None when it is not in recovery."""
+        found = self.db.execute(
+            "SELECT recovery, stop_cause FROM reservations WHERE operation=?", (operation,)
+        ).fetchone()
+        if found is None or not found[0]:
+            return None
+        return found[1] if found[1] in SERVICE_STOP_CAUSES else STOP_ONLY_RECOVERY_CAUSE
 
     def _cancel(self, operation):
         """``guardian.cancel``, then record that a stop was requested for the frame."""
@@ -961,6 +1014,9 @@ class SaladSafetyService:
                             error,
                         )
                         if give_up is not None:
+                            # Callers that tolerate a brief outage (ADR 0204) need to know
+                            # whether the last failure was transient; never its text.
+                            give_up.transient_read = transient
                             raise give_up from None
                         raise
                     retries += 1
@@ -1130,22 +1186,64 @@ class SaladSafetyService:
             total += max(accrued, Decimal(cap))
         return total
 
-    def _budget(self, row, *, refresh):
+    def _already_stopping(self, row):
+        """True when the frame is already stopping: stop-only recovery is set, or its guardian
+        assignment has left ``armed`` (a stop decision, a cancel, or retained output)."""
+        if row["recovery"]:
+            return True
+        if not row["provider_id"]:
+            return False
+        try:
+            state = self.guardian.status(row["operation"])
+        except ValueError:
+            return False  # no assignment yet: nothing is stopping it
+        return state["status"] != "armed" or state["reason"] != "armed"
+
+    def _stale_rate_tolerated(self, row, error):
+        """ADR 0204: a transient rate-read failure on a running frame whose last good rate
+        observation is within RATE_STALE_WINDOW_SECONDS keeps the last known rate."""
+        if not getattr(error, "transient_read", False):
+            return False
+        if not row["provider_id"] or row["first_running_at"] is None:
+            return False  # not running (billing not begun): fail closed as before
+        if row["rate"] is None or row["rate_at"] is None or row["rate_unknown"]:
+            return False
+        if row["budget_fenced"]:
+            return False
+        return 0 <= self.clock() - row["rate_at"] < RATE_STALE_WINDOW_SECONDS
+
+    def _budget(self, row, *, refresh, tolerate=False):
+        """Account, then (``refresh``) re-read the published rate and fence on a stale,
+        unknown or changed rate or on planned exposure past the per-run cap.
+
+        ``tolerate`` (the guardian loop and the driver heartbeat on a bound frame, ADR 0204):
+        a frame that is already stopping is neither refreshed nor fenced (accrual at the last
+        rate continues), and a transient rate-read failure on a running frame keeps the last
+        known rate within RATE_STALE_WINDOW_SECONDS of its observation."""
         self._account(row)
         row = self._row(row["reservation"])
+        if tolerate and self._already_stopping(row):
+            return
+        stale = False
         try:
             price, at = (
                 self._rate(row)
                 if refresh
                 else (Decimal(row["rate"]) if row["rate"] else None, row["rate_at"])
             )
-        except Exception:
-            self._exposure_fence(row)
-            raise ValueError("rate_unknown") from None
+        except Exception as error:
+            if not (tolerate and self._stale_rate_tolerated(row, error)):
+                self._exposure_fence(row)
+                raise ValueError("rate_unknown") from None
+            price, at, stale = Decimal(row["rate"]), row["rate_at"], True
         changed = row["rate"] is not None and price is not None and price != Decimal(row["rate"])
         if changed:
             price = max(price, Decimal(row["rate"]))
-        fresh = price is not None and at is not None and 0 <= self.clock() - at <= 5
+        fresh = (
+            price is not None
+            and at is not None
+            and 0 <= self.clock() - at <= (RATE_STALE_WINDOW_SECONDS if stale else 5)
+        )
         required = (
             Decimal(row["accrued_cents"])
             + (price or Decimal(0)) * Decimal(str(max(0, self._billed_remaining(row)))) * 100 / 3600
@@ -1164,7 +1262,9 @@ class SaladSafetyService:
                 ),
             )
         if fenced:
-            self._exposure_fence(row)
+            self._exposure_fence(
+                row, cause="cost_cap" if required > row["cost_cap"] else "rate_unknown"
+            )
             raise ValueError("exposure_fenced")
 
     def _open_billable_frames(self, operation, *, account=True):
@@ -1231,7 +1331,7 @@ class SaladSafetyService:
                         (name, row["operation"], self.clock(), str(self.total_cap_cents)),
                     )
                     self._frame_note(name, "total_cap_breached", once=True)
-                self._exposure_fence(row)
+                self._exposure_fence(row, cause="total_cap")
             except Exception:
                 # Never let one frame's failure skip the others; the next pass retries.
                 self.diagnostic_write_failures += 1
@@ -1254,8 +1354,9 @@ class SaladSafetyService:
         except Exception:
             self.diagnostic_write_failures += 1
 
-    def _exposure_fence(self, row):
+    def _exposure_fence(self, row, cause="rate_unknown"):
         with self.db:
+            self._first_recovery_cause(row["reservation"], cause)
             self.db.execute(
                 "UPDATE reservations SET recovery=1,budget_fenced=1,rate_unknown=1 "
                 "WHERE reservation=?",
@@ -1302,6 +1403,7 @@ class SaladSafetyService:
                 reason={
                     "automatic": REASON_LOST_CREATE_ABSENT,
                     "create_rejected": REASON_CREATE_REJECTED_ABSENT,
+                    "never_ready": REASON_NEVER_READY_ABSENT,
                 }.get(record["kind"], REASON_OPERATOR_LOST_CREATE_ABSENT),
                 orphan=False,
                 allocation_uncertain=False,
@@ -1320,6 +1422,15 @@ class SaladSafetyService:
             if row["create_rejection"]:
                 status["create_rejection"] = json.loads(row["create_rejection"])
                 status["create_rejected_eligible_at"] = self._rejection_eligible_at(row)
+            elif (
+                row["recovery"]
+                and self._never_bound(row)
+                and row["last_ready_at"] is None
+                and not row["create_rejection_voided"]
+            ):
+                # Never admitted a create (ADR 0205): released after this instant on the
+                # guardian's own absence reads.
+                status["never_ready_eligible_at"] = row["heartbeat"] + NEVER_READY_SETTLE_SECONDS
         status["input_delivery"] = (
             self.inputs.status(row["operation"]) if self.inputs else dict(ticket_held=False)
         )
@@ -1611,7 +1722,20 @@ class SaladSafetyService:
                 raise ValueError("invalid_admin_request")
         return dict(rejection)
 
-    def _resolve_lost_create(self, row, *, attestation=None, rejected=False):
+    def _never_ready_eligible(self, row, now):
+        """True when the never-ready fast release may be tried (ADR 0205): a never-bound
+        reservation in recovery that never admitted a create, whose fast release was never
+        voided by a group seen under its name, past its settle after the last heartbeat."""
+        return bool(
+            self._never_bound(row)
+            and row["recovery"]
+            and row["last_ready_at"] is None
+            and not row["create_rejection"]
+            and not row["create_rejection_voided"]
+            and now >= row["heartbeat"] + NEVER_READY_SETTLE_SECONDS
+        )
+
+    def _resolve_lost_create(self, row, *, attestation=None, rejected=False, never_ready=False):
         """Make a never-bound recovering reservation terminal on proven absence.
 
         Automatic (attestation None) and operator paths share every precondition:
@@ -1629,12 +1753,22 @@ class SaladSafetyService:
         CREATE_REJECTED_SETTLE_SECONDS after max(report, last ready); a voided fast
         release never applies again. Every other precondition and
         both reads are the automatic path's, with a complete-page list read.
+
+        ``never_ready`` is the never-admitted path (ADR 0205): the reservation never answered
+        "ready", so no create can have been sent for it, and the margin is replaced by
+        NEVER_READY_SETTLE_SECONDS after its last heartbeat (``_never_ready_eligible``). Every
+        other precondition and both reads are the automatic path's.
         """
         if not self._never_bound(row) or not row["recovery"]:
             raise ValueError("reconcile_not_applicable")
         now = self.clock()
         rejection = json.loads(row["create_rejection"]) if row["create_rejection"] else None
-        if rejected:
+        if never_ready:
+            if attestation is not None or rejected:
+                raise ValueError("reconcile_not_applicable")
+            if not self._never_ready_eligible(row, now):
+                raise ValueError("never_ready_settle_pending")
+        elif rejected:
             eligible = self._rejection_eligible_at(row)
             if attestation is not None or eligible is None:
                 raise ValueError("reconcile_not_applicable")
@@ -1665,6 +1799,8 @@ class SaladSafetyService:
         now = self.clock()
         if rejected:
             kind, label = "create_rejected", "create_rejected_absent"
+        elif never_ready:
+            kind, label = "never_ready", "never_ready_absent"
         elif attestation is None:
             kind, label = "automatic", "lost_create_absent"
         else:
@@ -1676,7 +1812,11 @@ class SaladSafetyService:
             resolved_at=now,
             deadline=row["deadline"],
             margin_seconds=(
-                CREATE_REJECTED_SETTLE_SECONDS if rejected else LOST_CREATE_MARGIN_SECONDS
+                CREATE_REJECTED_SETTLE_SECONDS
+                if rejected
+                else NEVER_READY_SETTLE_SECONDS
+                if never_ready
+                else LOST_CREATE_MARGIN_SECONDS
             ),
             name_read="not_found",
             list_read=o["list_read"],
@@ -1695,6 +1835,9 @@ class SaladSafetyService:
                 + (
                     " AND create_rejection IS NOT NULL AND create_rejection_voided=0"
                     if rejected
+                    else " AND last_ready_at IS NULL AND create_rejection IS NULL "
+                    "AND create_rejection_voided=0"
+                    if never_ready
                     else ""
                 ),
                 (
@@ -1713,6 +1856,8 @@ class SaladSafetyService:
                     now,
                     "create_rejected_absent_reconciled"
                     if rejected
+                    else "never_ready_absent_reconciled"
+                    if never_ready
                     else "lost_create_absent_reconciled"
                     if attestation is None
                     else "operator_lost_create_absent_reconciled",
@@ -2281,6 +2426,16 @@ class SaladSafetyService:
                         or body["deadline"] < row["deadline"]
                     ):
                         raise ValueError("reservation_mismatch")
+                    # A repeated reserve before any create admission is the trusted server's
+                    # own pre-create retry (ADR 0205): it counts as a heartbeat, so the retry
+                    # spacing cannot push the frame into recovery. Never after "ready", a
+                    # binding or recovery: those keep the ordinary silence bound.
+                    self.db.execute(
+                        "UPDATE reservations SET heartbeat=? WHERE reservation=? "
+                        "AND last_ready_at IS NULL AND recovery=0 AND provider_id IS NULL "
+                        "AND heartbeat<=?",
+                        (now, reservation, now),
+                    )
                     if row["accounted_at"] is None:
                         self.db.execute(
                             "UPDATE reservations SET rate=?,rate_at=?,accounted_at=?,cost_cap=?,"
@@ -2336,7 +2491,8 @@ class SaladSafetyService:
         elif action in {"heartbeat", "ready"}:
             if row["recovery"] or now >= self._stop_deadline(row):
                 raise ValueError("stop_only")
-            self._budget(row, refresh=True)
+            # A running route's heartbeat keeps the ADR 0204 tolerance; ready stays strict.
+            self._budget(row, refresh=True, tolerate=action == "heartbeat")
             if action == "heartbeat":
                 with self.db:
                     self.db.execute(
@@ -2374,6 +2530,7 @@ class SaladSafetyService:
             if self.inputs:
                 self.inputs.drop(row["operation"])
             with self.db:
+                self._first_recovery_cause(reservation, "control_cancel")
                 self.db.execute(
                     "UPDATE reservations SET recovery=1 WHERE reservation=?", (reservation,)
                 )
@@ -2513,11 +2670,12 @@ class SaladSafetyService:
         row = None
         try:
             row = self._row(reservation)
-            self._exposure_fence(row)
+            self._exposure_fence(row, cause="loop_frame_failed")
         except Exception:
             self.diagnostic_write_failures += 1
             try:  # the flags alone, when the row or the fence's later steps failed
                 with self.db:
+                    self._first_recovery_cause(reservation, "loop_frame_failed")
                     self.db.execute(
                         "UPDATE reservations SET recovery=1,budget_fenced=1,rate_unknown=1 "
                         "WHERE reservation=?",
@@ -2596,16 +2754,20 @@ class SaladSafetyService:
                     return
             except ValueError:
                 pass
-        expired = (
-            now >= self._stop_deadline(row)
-            or now - row["heartbeat"] >= 30
-            or now < row["heartbeat"]
-        )
+        # The first reason this pass finds is the frame's stop cause, never left unrecorded.
+        if now < row["heartbeat"]:
+            expired = "clock_uncertain"
+        elif now >= self._stop_deadline(row):
+            expired = "deadline"
+        elif now - row["heartbeat"] >= 30:
+            expired = "heartbeat_silence"
+        else:
+            expired = None
         if now >= self.next_rate.get(reservation, 0):
             try:
-                self._budget(row, refresh=True)
+                self._budget(row, refresh=True, tolerate=True)
             except Exception:
-                expired = True
+                expired = expired or "rate_unknown"
                 with self.db:
                     self.db.execute(
                         "UPDATE reservations SET budget_fenced=1,rate_unknown=1 "
@@ -2615,6 +2777,7 @@ class SaladSafetyService:
             self.next_rate[reservation] = self.clock() + 5
         if expired and not row["recovery"]:
             with self.db:
+                self._first_recovery_cause(reservation, expired)
                 self.db.execute(
                     "UPDATE reservations SET recovery=1 WHERE reservation=?", (reservation,)
                 )
@@ -2634,16 +2797,22 @@ class SaladSafetyService:
                     margin = now >= row["deadline"] + LOST_CREATE_MARGIN_SECONDS
                     eligible = self._rejection_eligible_at(row)
                     rejected = eligible is not None and now >= eligible
+                    never_ready = self._never_ready_eligible(row, now)
                     if (
                         not row["provider_id"]
-                        and (margin or rejected)
+                        and (margin or rejected or never_ready)
                         and now >= self.next_absence.get(reservation, 0)
                     ):
                         self.next_absence[reservation] = now + LOST_CREATE_READ_SECONDS
                         try:
                             # Past the margin the ordinary path applies even after
-                            # a reported rejection; before it only the fast path.
-                            self._resolve_lost_create(row, rejected=not margin)
+                            # a reported rejection; before it only a fast path: a
+                            # reported rejection, else a reservation never made ready.
+                            self._resolve_lost_create(
+                                row,
+                                rejected=not margin and rejected,
+                                never_ready=not margin and not rejected,
+                            )
                         except Exception:
                             pass  # stays reserved and blocking
                     return

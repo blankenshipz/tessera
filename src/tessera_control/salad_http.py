@@ -231,6 +231,11 @@ def _mismatch(field, reason="identity_mismatch"):
     return _Failure(reason, field=field)
 
 
+# Exact provider reads (``send`` operations): a local bound that runs out inside one is
+# re-raised as ``TimeoutError``, never turned into an "unknown" readback.
+READ_OPERATIONS = frozenset({"read_group", "read_instance"})
+
+
 def _unexpected(error):
     """The closed failure for an unexpected parsing error (a missing key names the key)."""
     field = _field_name(error.args[0]) if isinstance(error, KeyError) and error.args else None
@@ -1190,4 +1195,9 @@ class SaladHTTPTransport:
         except Exception as error:
             if self._post_sent is False:
                 return self._failed(_not_sent())
+            if isinstance(error, TimeoutError) and operation in READ_OPERATIONS:
+                # A caller's own bound ran out (the live check's wall bound) inside an exact
+                # read: re-raise it so the caller's stall path sees a timeout, never a recorded
+                # "unknown" status (which a running route's hold must not be keyed on).
+                raise
             return self._failed(_unexpected(error))

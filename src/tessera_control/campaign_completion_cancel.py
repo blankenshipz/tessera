@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -536,6 +537,7 @@ class CompletionCancelRecovery:
             ).rowcount
             if updated != 1:
                 raise Conflict("The attempt changed while it was recovered; nothing was recovered.")
+            self._register_lineage(connection, live, campaign, attempt, item["evidence"])
             entries = output_entries(
                 connection, campaign, spec.stage(attempt["stage_key"]), attempt["manifest_id"]
             )
@@ -626,6 +628,170 @@ class CompletionCancelRecovery:
             source_receipt_digest=verified.digest,
         )
         return result
+
+    def _register_lineage(
+        self,
+        connection: sqlite3.Connection,
+        live: dict[str, Any],
+        campaign: Mapping[str, Any],
+        attempt: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> None:
+        """Register what the forward ``_lineage`` step registers, in the recovery transaction:
+        a ``tessera_attempt`` node for each manifest output (producing the admitted attempt)
+        and a ``derived_from`` edge to each recorded input. Existing nodes and edges are
+        reused, so a replay writes nothing and a node already registered is never rewritten."""
+        from .artifact_lineage import _EDGE_COLUMNS, _NODE_COLUMNS, _created_at
+
+        project = campaign["project_id"]
+        operation_id = evidence["operation_id"]
+        manifest = connection.execute(
+            "SELECT artifacts_json FROM artifact_manifests WHERE id=? AND project_id=?",
+            (attempt["manifest_id"], project),
+        ).fetchone()
+        outputs = sorted(
+            json.loads(manifest["artifacts_json"]) if manifest else [],
+            key=lambda entry: entry["relative_path"],
+        )
+        produced = connection.execute(
+            """SELECT a.operation_id FROM research_experiment_admitted_attempts a
+            JOIN tasks t ON t.id = a.task_id WHERE a.id=? AND t.project_id=?""",
+            (attempt["admitted_attempt_id"], project),
+        ).fetchone()
+        if produced is None:
+            raise Conflict("The admitted attempt was not found in the campaign's project.")
+        if produced["operation_id"] not in (None, operation_id):
+            raise Conflict("The admitted attempt names a different operation.")
+        inputs = connection.execute(
+            """SELECT name, sha256, snapshot_id FROM campaign_stage_io
+            WHERE campaign_id=? AND stage_key=? AND attempt_id=? AND direction='input'
+            ORDER BY name""",
+            (campaign["id"], attempt["stage_key"], attempt["id"]),
+        ).fetchall()
+
+        def register(body: dict[str, Any]) -> str:
+            existing = connection.execute(
+                "SELECT id FROM artifact_lineage_nodes WHERE project_id=? AND sha256=?",
+                (project, body["sha256"]),
+            ).fetchone()
+            if existing is not None:
+                return existing["id"]
+            row = {
+                "framework": None,
+                "format": None,
+                "artifact_id": None,
+                "result_checkpoint_id": None,
+                "producing_attempt_id": None,
+                "operation_id": None,
+                "source_uri": None,
+                **body,
+                "id": "lineage_node_" + uuid.uuid4().hex,
+                "org_id": live["org_id"],
+                "project_id": project,
+                "created_by_principal_id": live["id"],
+                "created_at": _created_at(connection, "artifact_lineage_nodes", project),
+            }
+            if row["artifact_id"] is not None:
+                artifact = connection.execute(
+                    "SELECT sha256, operation_id FROM artifacts WHERE id=? AND project_id=?",
+                    (row["artifact_id"], project),
+                ).fetchone()
+                if artifact is None or artifact["sha256"] != row["sha256"]:
+                    raise Conflict("A recovered output does not match its custody artifact.")
+                if artifact["operation_id"] not in (None, operation_id):
+                    raise Conflict("A recovered output names a different operation.")
+            columns = [name.strip() for name in _NODE_COLUMNS.split(",")]
+            connection.execute(
+                f"INSERT INTO artifact_lineage_nodes ({', '.join(columns)}) "
+                f"VALUES ({', '.join(':' + name for name in columns)})",
+                row,
+            )
+            self._event(
+                connection,
+                live,
+                project,
+                None,
+                "human.artifact_lineage_node_registered",
+                1,
+                {"node_id": row["id"], "kind": row["kind"], "sha256": row["sha256"]},
+            )
+            return row["id"]
+
+        parents = [
+            register(
+                {
+                    "kind": "other" if entry["snapshot_id"] is None else "dataset",
+                    "sha256": entry["sha256"],
+                    "label": entry["name"][:200],
+                    "origin": "external_import",
+                }
+            )
+            for entry in inputs
+        ]
+        for item in outputs:
+            child = register(
+                {
+                    "kind": "other",
+                    "sha256": item["sha256"],
+                    "label": f"{attempt['stage_key']}/{item['relative_path']}"[:200],
+                    "origin": "tessera_attempt",
+                    "artifact_id": item["id"],
+                    "producing_attempt_id": attempt["admitted_attempt_id"],
+                    "operation_id": operation_id,
+                }
+            )
+            for parent in dict.fromkeys(parents):
+                if (
+                    child == parent
+                    or connection.execute(
+                        "SELECT 1 FROM artifact_lineage_edges WHERE child_node_id=? "
+                        "AND parent_node_id=? AND relation='derived_from'",
+                        (child, parent),
+                    ).fetchone()
+                ):
+                    continue
+                if connection.execute(
+                    """WITH RECURSIVE up(node_id) AS (
+                        SELECT ? UNION
+                        SELECT e.parent_node_id FROM artifact_lineage_edges e
+                        JOIN up ON e.child_node_id = up.node_id WHERE e.project_id = ?
+                    ) SELECT 1 FROM up WHERE node_id = ?""",
+                    (parent, project, child),
+                ).fetchone():
+                    raise Conflict("A recovered lineage edge would create a cycle.")
+                edge = {
+                    "id": "lineage_edge_" + uuid.uuid4().hex,
+                    "org_id": live["org_id"],
+                    "project_id": project,
+                    "child_node_id": child,
+                    "parent_node_id": parent,
+                    "relation": "derived_from",
+                    "rationale": f"Output of campaign {campaign['id']} stage "
+                    f"{attempt['stage_key']} attempt {attempt['attempt']} (completion-cancel "
+                    "recovery)",
+                    "created_by_principal_id": live["id"],
+                    "created_at": _created_at(connection, "artifact_lineage_edges", project),
+                }
+                columns = [name.strip() for name in _EDGE_COLUMNS.split(",")]
+                connection.execute(
+                    f"INSERT INTO artifact_lineage_edges ({', '.join(columns)}) "
+                    f"VALUES ({', '.join(':' + name for name in columns)})",
+                    edge,
+                )
+                self._event(
+                    connection,
+                    live,
+                    project,
+                    None,
+                    "human.artifact_lineage_edge_recorded",
+                    1,
+                    {
+                        "edge_id": edge["id"],
+                        "child_node_id": child,
+                        "parent_node_id": parent,
+                        "relation": "derived_from",
+                    },
+                )
 
     def _resolve_admitted_success(
         self,

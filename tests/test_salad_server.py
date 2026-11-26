@@ -51,7 +51,7 @@ def resolver(tmp_path):
     return backend
 
 
-def fixture(tmp_path, monkeypatch, *, capability=True, safety=None, smoke=False):
+def fixture(tmp_path, monkeypatch, *, capability=True, safety=None, smoke=False, run_seconds=60):
     from tessera_control.experiment_budgets import authorize_budget
     from tessera_control.experiments import ExperimentStore
 
@@ -94,7 +94,7 @@ def fixture(tmp_path, monkeypatch, *, capability=True, safety=None, smoke=False)
             "operation-epoch",
             "localhost",
             execution["watchdog_profile"],
-            "60",
+            str(run_seconds),
             "1024",
             "1",
             "4",
@@ -142,7 +142,7 @@ def fixture(tmp_path, monkeypatch, *, capability=True, safety=None, smoke=False)
                 gpu_class=GPU,
                 gpu_count=1,
                 disk_mb=1024,
-                max_seconds=60,
+                max_seconds=run_seconds,
             ),
             manifests=dict(
                 image=package["pinned_image"],
@@ -854,7 +854,9 @@ def test_real_independent_tls_service_custody_stop_reconnect(tmp_path, monkeypat
                 ca_file=root / "cert.pem",
                 certificate_sha256=pin,
             )
-            h = fixture(tmp_path, monkeypatch, safety=safety, smoke=True)
+            # A created group that stops unseen is charged one unseen-run gap (60 s, ADR 0204)
+            # backdated; the run window must outlast it or the loop ends the frame at once.
+            h = fixture(tmp_path, monkeypatch, safety=safety, smoke=True, run_seconds=75)
 
             def connections(host, *, port, timeout):
                 assert (host, port) == ("api.salad.com", 443)

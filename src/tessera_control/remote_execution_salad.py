@@ -11,6 +11,35 @@ from .remote_execution_models import derived_salad_argv
 from .salad_workload_contract import capability_network_matches
 from .store import Conflict, Forbidden, _parse_utc, canonical_digest
 
+# Use-time admission accepts a preflight at most this old (its earliest read's stamp).
+PREFLIGHT_MAX_AGE_SECONDS = 5
+# Before the intent is committed the preflight must be younger than this, leaving the rest of
+# the claim's bound for the intent write and the claim itself; older, it is read again once.
+PREFLIGHT_INTENT_MAX_AGE_SECONDS = 3
+
+
+def preflight_refusal(preflight, action, provider_id, *, max_age=PREFLIGHT_MAX_AGE_SECONDS):
+    """The closed reason a fresh Salad preflight cannot admit ``action``, or None.
+
+    The one reading shared by the use-time claim (``claim_proxy``) and the dispatcher's check
+    before it commits a create or start intent (ADR 0205): a preflight that would be refused at
+    the claim is refused before any effect exists, so no route is left with an effect that was
+    never sent. ``preflight_stale`` is the only reason a fresh re-read can change."""
+    age = (datetime.now(UTC) - _parse_utc(preflight["observed_at"])).total_seconds()
+    if not 0 <= age <= max_age:
+        return "preflight_stale"
+    if action in {"create", "start"} and (
+        preflight["available"] is not True or preflight["quota_ok"] is not True
+    ):
+        return "capacity_unavailable"
+    if action == "create" and preflight["group_absent"] is not True:
+        return "group_present"
+    if action == "start" and (
+        preflight["state"] != "stopped" or preflight["provider_id"] != provider_id
+    ):
+        return "group_not_startable"
+    return None
+
 
 class SaladRouteHooks(RouteHooks):
     group_cleanup = True
@@ -137,23 +166,10 @@ class SaladRouteHooks(RouteHooks):
                 )
         # The current base package is deliberately a rejecting Kubernetes contract.
         # This overlay cannot reinterpret its network-none claim as Salad isolation.
-        age = (datetime.now(UTC) - _parse_utc(preflight["observed_at"])).total_seconds()
         if (
-            not 0 <= age <= 5
-            or preflight["selection_digest"] != canonical_digest(proposal["selection"])
+            preflight["selection_digest"] != canonical_digest(proposal["selection"])
             or preflight["route_digest"] != state["proposal_digest"]
-            or (
-                action in {"create", "start"}
-                and (preflight["available"] is not True or preflight["quota_ok"] is not True)
-            )
-            or (action == "create" and preflight["group_absent"] is not True)
-            or (
-                action == "start"
-                and (
-                    preflight["state"] != "stopped"
-                    or preflight["provider_id"] != state["provider_id"]
-                )
-            )
+            or preflight_refusal(preflight, action, state["provider_id"]) is not None
         ):
             raise Conflict("Fresh exact Salad target preflight required.")
         claimed = db.execute(

@@ -60,6 +60,7 @@ def test_the_verdict_mapping_is_closed():
     assert frame_verdict("reconciled", "lost_create_absent") == "absent"
     assert frame_verdict("reconciled", "create_rejected_absent") == "absent"
     assert frame_verdict("reconciled", "operator_lost_create_absent") == "absent"
+    assert frame_verdict("reconciled", "never_ready_absent") == "absent"
     assert frame_verdict("reconciled", "operator") == "reconciled"
     # A reason only maps to absent by exact code, never by containing the word.
     assert frame_verdict("reconciled", "not_absent_really") == "reconciled"
@@ -68,6 +69,7 @@ def test_the_verdict_mapping_is_closed():
         "lost_create_absent",
         "create_rejected_absent",
         "operator_lost_create_absent",
+        "never_ready_absent",
     }
     for status in ("reserved", "armed", "running", "stopping", "unknown", None):
         assert frame_verdict(status, "lost_create_absent") == "open"

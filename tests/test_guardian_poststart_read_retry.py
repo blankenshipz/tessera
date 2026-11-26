@@ -77,8 +77,8 @@ def events(guardian, prefix=POSTSTART_READ_RETRY_PREFIX):
 
 
 def test_the_window_is_the_unseen_run_gap_the_admission_margin_already_counts():
-    assert POSTSTART_READ_WINDOW_SECONDS == UNSEEN_RUN_GAP_SECONDS
-    assert POSTSTART_READ_RETRY_LIMIT == 3
+    assert POSTSTART_READ_WINDOW_SECONDS == UNSEEN_RUN_GAP_SECONDS == 60  # ADR 0204
+    assert POSTSTART_READ_RETRY_LIMIT == 13
 
 
 def test_one_timeout_after_custody_began_is_retried_and_the_window_resets(world):
@@ -89,7 +89,7 @@ def test_one_timeout_after_custody_began_is_retried_and_the_window_resets(world)
     assert stops == [] and status["status"] == "armed" and status["stop_cause"] is None
     assert len(events(guardian)) == 1
     retries = status["poststart_read_retries"]
-    assert retries["count"] == 1 and retries["limit"] == 3 and retries["window_seconds"] == 45.0
+    assert retries["count"] == 1 and retries["limit"] == 13 and retries["window_seconds"] == 60.0
     assert guardian.read_retry_backoff(OPERATION) == 5.0
     seen["fail"] = None
     status = poll(guardian, clock)
@@ -113,7 +113,7 @@ def test_an_instance_seen_running_gets_the_same_retry(world):
     assert len(events(guardian)) == 1
 
 
-def test_the_third_consecutive_transient_failure_stops_as_provider_unavailable(world):
+def test_the_last_allowed_consecutive_transient_failure_stops_as_provider_unavailable(world):
     guardian, clock, seen, started, stops = world
     seen["fail"] = Unknown()
     for _ in range(POSTSTART_READ_RETRY_LIMIT - 1):
@@ -128,7 +128,7 @@ def test_the_window_closing_stops_even_before_the_count_is_spent(world):
     guardian, clock, seen, started, stops = world
     seen["fail"] = Unknown()
     assert poll(guardian, clock, 30)["stop_cause"] is None  # first failure opens the window
-    status = poll(guardian, clock, POSTSTART_READ_WINDOW_SECONDS + 1)  # second, past 45 s
+    status = poll(guardian, clock, POSTSTART_READ_WINDOW_SECONDS + 1)  # second, past 60 s
     assert status["stop_cause"] == "provider_unavailable" and len(stops) == 1
     assert len(events(guardian)) == 1
 
@@ -187,7 +187,7 @@ def test_stop_never_comes_later_than_the_window_plus_one_poll(world):
     seen["fail"] = Unknown()
     first = clock[0] + 5
     stopped_at = None
-    for _ in range(6):
+    for _ in range(POSTSTART_READ_RETRY_LIMIT + 1):
         status = poll(guardian, clock)
         if status["stop_cause"] == "provider_unavailable":
             stopped_at = clock[0]
